@@ -51,3 +51,8 @@ Apache-2.0. See [LICENSE](LICENSE).
 ## Maintainers
 
 See [MAINTAINERS.md](MAINTAINERS.md). Security reports: see [SECURITY.md](SECURITY.md).
+
+## Report a bug or vulnerability
+
+* Bugs: open a GitHub Issue with steps to reproduce.
+* Vulnerabilities (private, staff-only): [Report a vulnerability privately](https://github.com/Ryme-Labs/rymeDB/security/advisories/new). Do not open a public Issue for unpatched vulnerabilities.
