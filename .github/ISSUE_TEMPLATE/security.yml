@@ -2,7 +2,6 @@ name: Security report
 description: Report a potential vulnerability. STOP — read first, GitHub Issues are PUBLIC.
 title: "[SECURITY] <short description>"
 labels: ["security", "triage"]
-assignees: []
 body:
   - type: markdown
     attributes:
