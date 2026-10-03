@@ -1,0 +1,280 @@
+use futures_util::StreamExt;
+use std::time::Duration;
+
+const KEY: &str = "ryme-query-e2e-key-4b8d2f0a9c13";
+
+async fn bind_listener() -> tokio::net::TcpListener {
+    tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
+}
+
+fn test_config(dir: &std::path::Path) -> ryme_config::Config {
+    let mut base = ryme_config::Config::default();
+    base.archive.interval_secs = 0;
+    base.sweep_interval_secs = 0;
+    ryme_config::Config { node_id: String::from("query-e2e"), data_dir: dir.to_path_buf(), ..base }
+}
+
+async fn http_request(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {KEY}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    socket.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse::<u16>()
+        .unwrap_or(0);
+    let body = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|index| raw[index + 4..].to_vec())
+        .unwrap_or_default();
+    (status, body)
+}
+
+async fn next_text(
+    stream: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> serde_json::Value {
+    let message = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match message {
+        tokio_tungstenite::tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+fn row_pks(message: &serde_json::Value) -> Vec<String> {
+    message["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row["pk"].as_str().map(String::from))
+        .collect()
+}
+
+#[tokio::test]
+async fn live_query_snapshot_update_reconnect() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!("ryme-query-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, _) = http_request(http, "PUT /v1/kv/docs/k1", b"one").await;
+    assert_eq!(status, 200);
+    let url = format!("ws://{http}/v1/query-stream?table=docs&limit=100&api_key={KEY}");
+    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let snapshot = next_text(&mut stream).await;
+    assert_eq!(snapshot["type"], "snapshot");
+    assert!(row_pks(&snapshot).contains(&String::from("k1")));
+    let snapshot_commit = snapshot["commit"].as_u64().unwrap();
+    let (status, _) = http_request(http, "PUT /v1/kv/docs/k2", b"two").await;
+    assert_eq!(status, 200);
+    let update = next_text(&mut stream).await;
+    assert_eq!(update["type"], "update");
+    assert!(update["commit"].as_u64().unwrap() > snapshot_commit);
+    let pks = row_pks(&update);
+    assert!(pks.contains(&String::from("k1")));
+    assert!(pks.contains(&String::from("k2")));
+    stream.close(None).await.unwrap();
+    let url = format!("ws://{http}/v1/query-stream?table=docs&limit=100&api_key={KEY}");
+    let (mut second, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let snapshot = next_text(&mut second).await;
+    assert_eq!(snapshot["type"], "snapshot");
+    let pks = row_pks(&snapshot);
+    assert!(pks.contains(&String::from("k1")));
+    assert!(pks.contains(&String::from("k2")));
+    let (status, _) = http_request(http, "DELETE /v1/kv/docs/k1", b"").await;
+    assert_eq!(status, 200);
+    let update = next_text(&mut second).await;
+    assert_eq!(update["type"], "update");
+    let pks = row_pks(&update);
+    assert!(!pks.contains(&String::from("k1")));
+    assert!(pks.contains(&String::from("k2")));
+    second.close(None).await.unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+async fn put_commit(http: std::net::SocketAddr, table: &str, key: &str, value: &str) -> u64 {
+    let (status, body) =
+        http_request(http, &format!("PUT /v1/kv/{table}/{key}"), value.as_bytes()).await;
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    parsed.get("commit").and_then(|v| v.as_u64()).unwrap()
+}
+
+fn change_pk(message: &serde_json::Value) -> String {
+    let bytes: Vec<u8> =
+        serde_json::from_value(message.get("pk").cloned().unwrap_or_default()).unwrap_or_default();
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn live_broadcast_stream_receives_posts() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!("ryme-cast-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let url = format!("ws://{http}/v1/broadcast/lobby?api_key={KEY}");
+    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    assert_eq!(response.status(), 101);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/broadcast",
+        b"{\"channel\":\"lobby\",\"payload\":{\"hello\":true}}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let message = next_text(&mut stream).await;
+    assert_eq!(message.get("channel").and_then(|v| v.as_str()), Some("lobby"));
+    assert_eq!(
+        message.get("payload").and_then(|v| v.get("hello")),
+        Some(&serde_json::Value::Bool(true))
+    );
+    assert!(message.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0) > 0);
+    stream.close(None).await.unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn live_cdc_stream_resumes_from_commit() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root =
+        std::env::temp_dir().join(format!("ryme-resume-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = put_commit(http, "docs", "r1", "one").await;
+    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}");
+    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = put_commit(http, "docs", "r2", "two").await;
+    let second = next_text(&mut stream).await;
+    let commit2 = second.get("commit_ts").and_then(|v| v.as_u64()).unwrap();
+    assert_eq!(change_pk(&second), "r2", "{second}");
+    stream.close(None).await.unwrap();
+    let commit3 = put_commit(http, "docs", "r3", "three").await;
+    assert!(commit3 > commit2);
+    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}&from={commit2}");
+    let (mut resumed, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let replayed = next_text(&mut resumed).await;
+    assert_eq!(change_pk(&replayed), "r3", "{replayed}");
+    assert_eq!(replayed.get("commit_ts").and_then(|v| v.as_u64()), Some(commit3));
+    let _ = put_commit(http, "docs", "r4", "four").await;
+    let live = next_text(&mut resumed).await;
+    assert_eq!(change_pk(&live), "r4", "{live}");
+    resumed.close(None).await.unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn live_query_snapshot_limit_capped() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!("ryme-qlim-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut rows = String::from("{\"table\":\"big\",\"rows\":[");
+    for index in 0..1200 {
+        if index > 0 {
+            rows.push(',');
+        }
+        rows.push_str(&format!("{{\"key\":\"q-{index:04}\",\"value\":\"v\"}}"));
+    }
+    rows.push_str("]}");
+    let (status, _) = http_request(http, "POST /v1/sql/copy", rows.as_bytes()).await;
+    assert_eq!(status, 200);
+    let url = format!("ws://{http}/v1/query-stream?table=big&limit=999999&api_key={KEY}");
+    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let snapshot = next_text(&mut stream).await;
+    assert_eq!(snapshot["type"], "snapshot");
+    assert_eq!(row_pks(&snapshot).len(), 1000, "snapshot capped at 1000");
+    stream.close(None).await.unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}

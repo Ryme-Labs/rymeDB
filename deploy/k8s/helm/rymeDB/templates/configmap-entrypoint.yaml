@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rymedb.fullname" . }}-entrypoint
+  labels:
+    {{- include "rymedb.labels" . | nindent 4 }}
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    ordinal="${HOSTNAME##*-}"
+    headless="{{ include "rymedb.headless" . }}.${POD_NAMESPACE}.svc.cluster.local"
+    peers=""
+    i=0
+    while [ "$i" -lt "{{ .Values.replicaCount }}" ]; do
+      if [ "$i" != "$ordinal" ]; then
+        addr="{{ include "rymedb.fullname" . }}-$i.$headless:{{ .Values.service.raft }}"
+        entry="{\"id\":$i,\"addr\":\"$addr\"}"
+        if [ -z "$peers" ]; then
+          peers="$entry"
+        else
+          peers="$peers,$entry"
+        fi
+      fi
+      i=$((i + 1))
+    done
+    node="{{ include "rymedb.fullname" . }}-$ordinal.$headless"
+    cat > /etc/rymedb/config.json <<EOF
+    {"node_id":"$node","pg_listen":"0.0.0.0:{{ .Values.service.pg }}","resp_listen":"0.0.0.0:{{ .Values.service.resp }}","http_listen":"0.0.0.0:{{ .Values.service.http }}","data_dir":"/var/lib/rymedb","durability":"{{ .Values.config.durability }}","cache_bytes":{{ .Values.config.cacheBytes | printf "%.0f" }},"max_connections":{{ .Values.config.maxConnections }},"sweep_interval_secs":{{ .Values.config.sweepIntervalSecs }},"shards":{{ .Values.config.shards }},"replicated_tables":[],"archive":{"interval_secs":0},"cluster":{"node_index":$ordinal,"raft_listen":"0.0.0.0:{{ .Values.service.raft }}","peers":[$peers],"learner":false}}
+    EOF
+    exec /usr/local/bin/ryme-server --config /etc/rymedb/config.json --advertise-addr "$node:{{ .Values.service.raft }}"

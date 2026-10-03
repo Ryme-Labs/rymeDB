@@ -1,0 +1,5 @@
+packages:
+  - "apps/*"
+  - "sdks/js"
+  - "services/*"
+  - "tools/*"

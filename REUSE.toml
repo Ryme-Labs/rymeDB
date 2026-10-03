@@ -1,0 +1,5 @@
+version = 1
+
+[[dep]]
+name = "REUSE"
+version = "3.0"

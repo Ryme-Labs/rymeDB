@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+ARG VERSION=dev
+ARG GIT_SHA=unknown
+
+FROM rust:1.89-bookworm AS build
+ARG VERSION
+ARG GIT_SHA
+WORKDIR /src
+
+# tonic-build needs protoc; keep builder layer cached unless toolchain changes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+# NOTE: `COPY . .` (not selective manifests) is intentional:
+# ryme-server embeds ../../../apps/dashboard/web/index.html via include_str!,
+# so apps/ must be present in the build context.
+
+# BuildKit cache mounts keep rebuilds fast in CI and locally.
+# Only the server binary is shipped (bench is CI-only, not copied).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p ryme-server \
+    && cp /src/target/release/ryme-server /tmp/ryme-server
+
+FROM debian:bookworm-slim
+ARG VERSION
+ARG GIT_SHA
+LABEL org.opencontainers.image.title="ryme-server" \
+      org.opencontainers.image.description="rymeDB server (Postgres wire + RESP + REST operator API)" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.source="https://github.com/Ryme-labs/rymedb"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 65532 -m -d /var/lib/rymedb -s /usr/sbin/nologin ryme \
+    && mkdir -p /var/lib/rymedb && chown ryme:ryme /var/lib/rymedb
+
+COPY --from=build /tmp/ryme-server /usr/local/bin/ryme-server
+
+USER ryme
+EXPOSE 5433 6380 8080
+VOLUME ["/var/lib/rymedb"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://127.0.0.1:8080/health || exit 1
+ENTRYPOINT ["ryme-server"]

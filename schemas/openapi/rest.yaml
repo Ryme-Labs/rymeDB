@@ -1,0 +1,2373 @@
+openapi: 3.0.3
+info:
+  title: rymeDB REST API
+  version: 0.1.0
+  description: Operator and data-plane HTTP API for a rymeDB node.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+  - apiKeyHeader: []
+tags:
+  - name: node
+  - name: kv
+  - name: sql
+  - name: rest
+  - name: auth
+  - name: migrate
+  - name: index
+  - name: branches
+  - name: backups
+  - name: shards
+  - name: cluster
+  - name: streams
+paths:
+  /health:
+    get:
+      tags: [node]
+      security: []
+      responses:
+        '200':
+          description: ok
+  /dashboard:
+    get:
+      tags: [node]
+      security: []
+      description: Static admin web UI (no auth on the shell itself; every API call carries the key).
+      responses:
+        '200':
+          description: html admin console
+  /ready:
+    get:
+      tags: [node]
+      security: []
+      responses:
+        '200':
+          description: readiness plus leadership view
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ready'
+  /metrics:
+    get:
+      tags: [node]
+      security: []
+      responses:
+        '200':
+          description: latency histogram snapshot plus node counters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Metrics'
+  /metrics/prometheus:
+    get:
+      tags: [node]
+      security: []
+      responses:
+        '200':
+          description: prometheus text exposition
+  /v1/observe/slow:
+    get:
+      tags: [node]
+      description: "Recent slow operations (over 5ms) newest-first with kind, fingerprint, table, micros and unix timestamp. Only fingerprints are stored, never raw statements."
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+          description: max entries, default 100
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: only entries for this table
+      responses:
+        '200':
+          description: slow entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SlowLog'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/traces:
+    get:
+      tags: [node]
+      description: "Recent request spans newest-first with trace/span ids, name, timing and attributes. Backed by the in-memory trace collector fed by the kv/sql/copy handlers."
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+          description: max spans, default 100
+        - in: query
+          name: name
+          schema:
+            type: string
+          description: only spans with this operation name
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: only spans carrying this table attribute
+      responses:
+        '200':
+          description: trace spans
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/metering:
+    get:
+      tags: [node]
+      responses:
+        '200':
+          description: idempotent usage aggregates
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/billing/summary:
+    get:
+      tags: [node]
+      description: Per-tenant usage rollup for downstream invoicing. Aggregation is idempotent; billing outages never block the data path.
+      responses:
+        '200':
+          description: tenant bills
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/billing/invoice:
+    get:
+      tags: [node]
+      description: Priced invoice for one tenant in micro-USD. Non-owners may only invoice their own tenant. Feed lines to Stripe; rymeDB never calls Stripe from the data path.
+      parameters:
+        - name: tenant
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: invoice with line items and micro-USD total
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/autoscale:
+    get:
+      tags: [node]
+      security: []
+      responses:
+        '200':
+          description: autoscale pressure advice
+  /v1/qos:
+    get:
+      tags: [node]
+      responses:
+        '200':
+          description: per-tenant QoS tiers and usage
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/qos/tier:
+    post:
+      tags: [node]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QosTierRequest'
+      responses:
+        '200':
+          description: tier updated
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/migrate/supabase:
+    post:
+      tags: [migrate]
+      description: Analyze a Supabase Postgres dump into tables and RLS policies with detected tenant columns.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SupabaseAnalyzeRequest'
+      responses:
+        '200':
+          description: extracted schema plan
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/migrate/neon:
+    post:
+      tags: [migrate]
+      description: Map a Neon branch list (name/parent/LSN) into rymeDB branch create plans.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NeonAnalyzeRequest'
+      responses:
+        '200':
+          description: branch plans with base commit timestamps
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/migrate/apply:
+    post:
+      tags: [migrate]
+      description: "Execute one write SQL statement and record it in the hash-chained migration ledger. Read-only statements get 400; duplicate ids get 409 before anything runs twice."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MigrateApplyRequest'
+      responses:
+        '201':
+          description: recorded ledger entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/migrate/ledger:
+    get:
+      tags: [migrate]
+      description: "Migration ledger entries in apply order with the schema version and chain validity."
+      responses:
+        '200':
+          description: ledger state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries, version, valid]
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LedgerEntry'
+                  version:
+                    type: integer
+                  valid:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRegisterRequest'
+      responses:
+        '201':
+          description: user registered
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: id already registered; re-registration never overwrites
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/auth/verify:
+    post:
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthVerifyRequest'
+      responses:
+        '200':
+          description: password verification receipt
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/auth/token:
+    post:
+      tags: [auth]
+      security: []
+      description: "Verify id/password (plus TOTP code when the account enrolled one) and issue a usable API key. The key carries the account tenant and roles."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthTokenRequest'
+      responses:
+        '201':
+          description: issued key and tenant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, tenant]
+                properties:
+                  key:
+                    type: string
+                  tenant:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/auth/keys:
+    delete:
+      tags: [auth]
+      description: "Revoke an API key by value. Requires a write-capable principal; the body carries the key so it never appears in access logs."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key:
+                  type: string
+      responses:
+        '200':
+          description: revocation receipt
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/auth/otp/setup:
+    post:
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OtpSetupRequest'
+      responses:
+        '200':
+          description: TOTP secret
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/auth/otp/verify:
+    post:
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OtpVerifyRequest'
+      responses:
+        '200':
+          description: OTP verification receipt
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/auth/passkey/challenge:
+    post:
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasskeyChallengeRequest'
+      responses:
+        '200':
+          description: WebAuthn challenge
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/auth/passkey/register:
+    post:
+      tags: [auth]
+      description: "Enroll a P-256 credential for a user. Requires a write-capable principal; the public key must be a valid SEC1 point. No attestation verification in v1 (self-enrollment by an authenticated admin)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasskeyRegisterRequest'
+      responses:
+        '201':
+          description: enrollment receipt
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/auth/passkey/verify:
+    post:
+      tags: [auth]
+      security: []
+      description: "Verify a WebAuthn assertion (rpId hash, user-presence flag, origin allow-list, challenge freshness with one-shot consumption, sign-count monotonicity, ECDSA over authenticatorData and clientData hash) and issue a usable API key."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasskeyVerifyRequest'
+      responses:
+        '201':
+          description: issued key and tenant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, tenant]
+                properties:
+                  key:
+                    type: string
+                  tenant:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/auth/oidc/login:
+    post:
+      tags: [auth]
+      security: []
+      description: Build a provider authorization URL. HS256 providers only in v1; RS256 discovery is future work.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcLoginRequest'
+      responses:
+        '200':
+          description: authorization URL and state
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/auth/oidc/token:
+    post:
+      tags: [auth]
+      security: []
+      description: Verify a provider ID token and issue a usable API key carrying the identity tenant and roles.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcTokenRequest'
+      responses:
+        '201':
+          description: issued key and tenant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, tenant]
+                properties:
+                  key:
+                    type: string
+                  tenant:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/auth/mask:
+    post:
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MaskRequest'
+      responses:
+        '200':
+          description: column mask updated
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/presence/join:
+    post:
+      tags: [streams]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresenceJoinRequest'
+      responses:
+        '200':
+          description: member count
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/presence/leave:
+    post:
+      tags: [streams]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresenceLeaveRequest'
+      responses:
+        '200':
+          description: removal receipt
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/presence/{channel}:
+    get:
+      tags: [streams]
+      parameters:
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: live members
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/broadcast:
+    post:
+      tags: [streams]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BroadcastRequest'
+      responses:
+        '200':
+          description: broadcast sequence
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/broadcast/{channel}:
+    get:
+      tags: [streams]
+      description: "Live broadcast subscription for one channel, tenant-scoped like posts. Frames are BroadcastMsg JSON (channel, from, payload, commit_ts, sequence)."
+      parameters:
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: api_key
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: broadcast stream
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/topics/append:
+    post:
+      tags: [streams]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DurableAppendRequest'
+      responses:
+        '200':
+          description: durable cursor
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/regions:
+    get:
+      tags: [node]
+      security: []
+      description: Region placement and follower status. Followers run read_only and reject mutations with 503; strong cross-region writes are WAN-RTT bound by physics.
+      responses:
+        '200':
+          description: region view
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/topics/read:
+    get:
+      tags: [streams]
+      parameters:
+        - name: partition
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: messages from cursor
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/vector/upsert:
+    post:
+      tags: [index]
+      description: Upsert a dense vector. Exact brute-force cosine search; v1 limits documented in schemas.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VectorUpsertRequest'
+      responses:
+        '200':
+          description: stored
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/vector/search:
+    post:
+      tags: [index]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VectorSearchRequest'
+      responses:
+        '200':
+          description: nearest hits by cosine score
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/vector/ann-search:
+    post:
+      tags: [index]
+      description: Approximate HNSW search. Higher ef trades latency for recall; ef >= 64 recommended.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnnSearchRequest'
+      responses:
+        '200':
+          description: approximate nearest hits by cosine score
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/vector/{table}/{id}:
+    delete:
+      tags: [index]
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: removal receipt
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/text/index:
+    post:
+      tags: [index]
+      description: Index a document for TF-IDF ranked full-text search.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TextIndexRequest'
+      responses:
+        '200':
+          description: indexed term count
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/text/search:
+    post:
+      tags: [index]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TextSearchRequest'
+      responses:
+        '200':
+          description: ranked hits
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/text/{table}/{id}:
+    delete:
+      tags: [index]
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: removal receipt
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/index/stats:
+    get:
+      tags: [index]
+      description: Index partition count and namespaces. Writes hash-route by id; reads fan out and merge.
+      responses:
+        '200':
+          description: partition layout
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/kv/{table}/{key}:
+    get:
+      tags: [kv]
+      description: Fetch a raw value. The response body is the stored bytes.
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+        - $ref: '#/components/parameters/KeyParam'
+      responses:
+        '200':
+          description: value bytes
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [kv]
+      description: Store a raw value. The request body is the value bytes.
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+        - $ref: '#/components/parameters/KeyParam'
+        - name: ttl
+          in: query
+          description: expiry in seconds
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: commit receipt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitReceipt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    delete:
+      tags: [kv]
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+        - $ref: '#/components/parameters/KeyParam'
+      responses:
+        '200':
+          description: commit receipt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitReceipt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/kv/{table}/{key}/ttl:
+    get:
+      tags: [kv]
+      description: Remaining TTL in seconds, or -1 when the key never expires.
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+        - $ref: '#/components/parameters/KeyParam'
+      responses:
+        '200':
+          description: ttl
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KvTtl'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/sql:
+    post:
+      tags: [sql]
+      description: Execute one statement in the KEY/VALUE dialect, for example INSERT INTO docs KEY 'k' VALUE 'v' or SELECT * FROM docs KEY 'k'.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SqlRequest'
+      responses:
+        '200':
+          description: ok, single row, or row set depending on the statement
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SqlOk'
+                  - $ref: '#/components/schemas/SqlRow'
+                  - $ref: '#/components/schemas/SqlRows'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/sql/copy:
+    post:
+      tags: [sql]
+      description: Bulk ingest up to 10000 rows in 500-row transactions.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CopyRequest'
+      responses:
+        '200':
+          description: ingest receipt
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/sql/explain:
+    post:
+      tags: [sql]
+      description: Return the planned access path without executing writes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SqlRequest'
+      responses:
+        '200':
+          description: plan
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /rest/v1/{table}:
+    get:
+      tags: [rest]
+      description: Supabase-style list with select, key=eq.<id>, order, limit, offset.
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+      responses:
+        '200':
+          description: rows as JSON objects
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [rest]
+      description: Insert one row or a rows array.
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+      responses:
+        '201':
+          description: created rows
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    patch:
+      tags: [rest]
+      description: Upsert one row or a rows array.
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+      responses:
+        '201':
+          description: upserted rows
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    delete:
+      tags: [rest]
+      description: Delete with key=eq.<id> required.
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+      responses:
+        '200':
+          description: commit receipt
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /graphql:
+    post:
+      tags: [rest]
+      description: Minimal GraphQL with table(key:) or table(limit:) selection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphqlRequest'
+      responses:
+        '200':
+          description: data envelope
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/scan/{table}:
+    get:
+      tags: [sql]
+      parameters:
+        - $ref: '#/components/parameters/TableParam'
+        - name: limit
+          in: query
+          description: max rows, default 100, capped at 10000
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SqlRows'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/branches:
+    get:
+      tags: [branches]
+      responses:
+        '200':
+          description: all branches sorted by id
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [branches]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BranchRequest'
+      responses:
+        '200':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkReceipt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/branches/{id}:
+    get:
+      tags: [branches]
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: branch record with id, parent_id, base_commit_ts, manifest_id and schema_version
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [branches]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: deleted, reporting reclaimed garbage rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  garbage:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/branches/{id}/reset:
+    post:
+      tags: [branches]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BranchResetRequest'
+      responses:
+        '200':
+          description: branch with moved base commit
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/branches/{id}/promote:
+    post:
+      tags: [branches]
+      description: Swap a child branch into its parent slot and bump schema version.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: promoted parent branch record
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/branches/{id}/diff:
+    get:
+      tags: [branches]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: against
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: segment sets unique to each side
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/backups/checkpoint:
+    post:
+      tags: [backups]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckpointRequest'
+      responses:
+        '200':
+          description: checkpoint record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Checkpoint'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/backups/latest:
+    get:
+      tags: [backups]
+      security: []
+      responses:
+        '200':
+          description: newest checkpoint manifest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Checkpoint'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/backups/pitr:
+    get:
+      tags: [backups]
+      security: []
+      parameters:
+        - name: target
+          in: query
+          required: true
+          description: unix timestamp to cover
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: checkpoint covering the target
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Checkpoint'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/snapshots:
+    post:
+      tags: [backups]
+      description: Snapshot backend files. Returns the max commit plus file names.
+      responses:
+        '200':
+          description: snapshot receipt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotReceipt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/backups/restore:
+    post:
+      tags: [backups]
+      description: Restore to a timestamp. Unavailable in cluster mode.
+      parameters:
+        - name: target
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: replay counts per shard
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  target:
+                    type: integer
+                  replayed:
+                    type: array
+                    items:
+                      type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/backups/archive:
+    post:
+      tags: [backups]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArchiveRequest'
+      responses:
+        '200':
+          description: archive manifest
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/backups/archives:
+    get:
+      tags: [backups]
+      responses:
+        '200':
+          description: archive manifests
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/backups/copy:
+    post:
+      tags: [backups]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [backup_id]
+              properties:
+                backup_id:
+                  type: string
+      responses:
+        '200':
+          description: copied archive manifest
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/backups/verify:
+    get:
+      tags: [backups]
+      description: Restore drill without disk writes. Verifies manifest sha256 plus envelope decryption per file.
+      parameters:
+        - name: backup_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: verified file count and commit
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/backups/drill:
+    get:
+      tags: [backups]
+      description: Latest scheduled restore-drill report. 404 until the first drill completes.
+      responses:
+        '200':
+          description: drill report with backup id, verified file count, timestamp and optional error
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/shards:
+    get:
+      tags: [shards]
+      description: "Layout varies by mode: single returns {mode, shards}; sharded adds a placement list with per-table shard and bytes; hybrid returns {mode, placement} with per-table tier."
+      responses:
+        '200':
+          description: layout
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShardLayout'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/shards/move:
+    post:
+      tags: [shards]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveShardRequest'
+      responses:
+        '200':
+          description: move report with table, from, to, bytes and commit
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/ranges:
+    get:
+      tags: [ranges]
+      description: "List placement ranges, or look up the owning range with ?key=. Ranges carry leader and epoch; splits and merges bump epochs."
+      parameters:
+        - in: query
+          name: key
+          schema:
+            type: string
+          description: UTF-8 key text to route to its owning range
+      responses:
+        '200':
+          description: range list, or a single range for ?key=
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RangeList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/ranges/loads:
+    get:
+      tags: [ranges]
+      description: "Per-range counted write load driving auto-split: id, epoch and writes since the range was created (splits and merges reset children to zero)."
+      responses:
+        '200':
+          description: write load per range
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RangeLoad'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/ranges/split:
+    post:
+      tags: [ranges]
+      description: "Split a range at mid into left_id and right_id. Requires expected_epoch to match: stale callers get 409 with the current epoch so they can re-read placement and retry."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SplitRangeRequest'
+      responses:
+        '200':
+          description: the two child ranges
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RangeList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/ranges/merge:
+    post:
+      tags: [ranges]
+      description: "Merge two adjacent same-leader ranges into merged_id. Both expected epochs must match; stale callers get 409."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeRangesRequest'
+      responses:
+        '200':
+          description: the merged range
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlacementRange'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/ranges/autosplit:
+    post:
+      tags: [ranges]
+      description: "Split every range whose counted REST write load reaches min_writes (defaults to autosplit_writes). Splits use the key-space midpoint with epoch fencing; unsplittable or contended ranges are skipped. Returns the created child range ids."
+      parameters:
+        - in: query
+          name: min_writes
+          schema:
+            type: integer
+          description: write-load threshold override for this call
+      responses:
+        '200':
+          description: created child range ids, empty when nothing was hot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  split:
+                    type: array
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/cluster/members:
+    get:
+      tags: [cluster]
+      description: Raft term, local leadership, commit index, member list and any in-flight joint config.
+      responses:
+        '200':
+          description: cluster status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterStatus'
+        '400':
+          description: node is not running in cluster mode
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [cluster]
+      description: Admit a member with log catch-up followed by a joint-consensus transition. Send to the leader.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClusterMemberRequest'
+      responses:
+        '200':
+          description: admitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/cluster/members/{id}:
+    delete:
+      tags: [cluster]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/cluster/transfer:
+    post:
+      tags: [cluster]
+      description: Hand leadership to another member. Send to the leader.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClusterTransferRequest'
+      responses:
+        '200':
+          description: transfer started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/cluster/replace:
+    post:
+      tags: [cluster]
+      description: Swap the member set in one joint-consensus transition. Send to the leader.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClusterReplaceRequest'
+      responses:
+        '200':
+          description: replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/stream:
+    get:
+      tags: [streams]
+      parameters:
+        - name: table
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: api_key
+          in: query
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: integer
+          description: exclusive commit watermark; replays retained changes after it, then continues live without duplicates
+      responses:
+        '200':
+          description: change stream
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/query-stream:
+    get:
+      tags: [streams]
+      parameters:
+        - name: table
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: api_key
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: live query stream
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+  parameters:
+    TableParam:
+      name: table
+      in: path
+      required: true
+      schema:
+        type: string
+    KeyParam:
+      name: key
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: invalid argument
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: missing or invalid credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: valid credentials without the required permission
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: unknown row, branch or checkpoint
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: stale epoch or duplicate id; retry against current placement
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unavailable:
+      description: operation not available in this mode
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    OkReceipt:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+    CommitReceipt:
+      type: object
+      required: [commit]
+      properties:
+        commit:
+          type: integer
+    Ready:
+      type: object
+      properties:
+        ready:
+          type: boolean
+        node:
+          type: string
+        commit:
+          type: integer
+        leader:
+          type: boolean
+        cluster:
+          type: boolean
+    SlowLog:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items:
+            type: object
+            required: [kind, fingerprint, table, micros, at_unix]
+            properties:
+              kind:
+                type: string
+              fingerprint:
+                type: string
+              table:
+                type: string
+              micros:
+                type: integer
+              at_unix:
+                type: integer
+    TraceList:
+      type: object
+      required: [spans]
+      properties:
+        spans:
+          type: array
+          items:
+            type: object
+            required: [trace_id, span_id, name, started_unix, duration_micros, attributes]
+            properties:
+              trace_id:
+                type: string
+              span_id:
+                type: string
+              parent:
+                type: string
+              name:
+                type: string
+              started_unix:
+                type: integer
+              duration_micros:
+                type: integer
+              attributes:
+                type: array
+                items:
+                  type: array
+                  items:
+                    type: string
+    Metrics:
+      type: object
+      properties:
+        node:
+          type: string
+        uptime_secs:
+          type: integer
+        commit:
+          type: integer
+        rest_count:
+          type: integer
+        rest_mean_micros:
+          type: number
+        rest_max_micros:
+          type: integer
+        p50_micros:
+          type: integer
+        p90_micros:
+          type: integer
+        p95_micros:
+          type: integer
+        p99_micros:
+          type: integer
+    CopyRequest:
+      type: object
+      required: [table, rows]
+      properties:
+        table:
+          type: string
+        rows:
+          type: array
+          items:
+            type: object
+            required: [key, value]
+            properties:
+              key:
+                type: string
+              value:
+                type: string
+    GraphqlRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+    QosTierRequest:
+      type: object
+      required: [tenant, tier]
+      properties:
+        tenant:
+          type: string
+        tier:
+          type: string
+          enum: [shared, dedicated_shard, dedicated_cluster]
+    AuthRegisterRequest:
+      type: object
+      required: [id, password]
+      properties:
+        id:
+          type: string
+        tenant:
+          type: string
+        password:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+    AuthVerifyRequest:
+      type: object
+      required: [id, password]
+      properties:
+        id:
+          type: string
+        password:
+          type: string
+    AuthTokenRequest:
+      type: object
+      required: [id, password]
+      properties:
+        id:
+          type: string
+        password:
+          type: string
+        code:
+          type: string
+          description: TOTP code, required when the account enrolled one
+    OtpSetupRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+    OtpVerifyRequest:
+      type: object
+      required: [id, code]
+      properties:
+        id:
+          type: string
+        code:
+          type: string
+    PasskeyChallengeRequest:
+      type: object
+      required: [user]
+      properties:
+        user:
+          type: string
+    PasskeyRegisterRequest:
+      type: object
+      required: [user, credential_id, public_key]
+      properties:
+        user:
+          type: string
+        credential_id:
+          type: string
+        public_key:
+          type: string
+          description: base64url SEC1-encoded P-256 public key
+    PasskeyVerifyRequest:
+      type: object
+      required: [user, credential_id, authenticator_data, client_data_json, signature]
+      properties:
+        user:
+          type: string
+        credential_id:
+          type: string
+        authenticator_data:
+          type: string
+          description: base64url authenticator data
+        client_data_json:
+          type: string
+          description: base64url client data JSON
+        signature:
+          type: string
+          description: base64url DER ECDSA signature
+    OidcLoginRequest:
+      type: object
+      required: [redirect_uri]
+      properties:
+        redirect_uri:
+          type: string
+        state:
+          type: string
+    OidcTokenRequest:
+      type: object
+      required: [id_token]
+      properties:
+        id_token:
+          type: string
+    SupabaseAnalyzeRequest:
+      type: object
+      required: [dump]
+      properties:
+        dump:
+          type: string
+    NeonAnalyzeRequest:
+      type: object
+      required: [branches]
+      properties:
+        branches:
+          type: string
+    MigrateApplyRequest:
+      type: object
+      required: [id, sql]
+      properties:
+        id:
+          type: string
+        sql:
+          type: string
+        author:
+          type: string
+    LedgerEntry:
+      type: object
+      required: [migration_id, checksum, parent_checksum, applied_unix, result_schema_version, author]
+      properties:
+        migration_id:
+          type: string
+        checksum:
+          type: string
+        parent_checksum:
+          type: string
+        applied_unix:
+          type: integer
+        result_schema_version:
+          type: integer
+        author:
+          type: string
+    MaskRequest:
+      type: object
+      required: [table, fields]
+      properties:
+        table:
+          type: string
+        fields:
+          type: array
+          items:
+            type: string
+    PresenceJoinRequest:
+      type: object
+      required: [channel, member]
+      properties:
+        channel:
+          type: string
+        member:
+          type: string
+        state:
+          type: object
+        ttl_secs:
+          type: integer
+    PresenceLeaveRequest:
+      type: object
+      required: [channel, member]
+      properties:
+        channel:
+          type: string
+        member:
+          type: string
+    BroadcastRequest:
+      type: object
+      required: [channel, payload]
+      properties:
+        channel:
+          type: string
+        from:
+          type: string
+        payload: {}
+    DurableAppendRequest:
+      type: object
+      required: [partition, key, value]
+      properties:
+        partition:
+          type: string
+        key:
+          type: string
+        value:
+          type: string
+        retention:
+          type: integer
+    VectorUpsertRequest:
+      type: object
+      required: [table, id, vector]
+      properties:
+        table:
+          type: string
+        id:
+          type: string
+        vector:
+          type: array
+          items:
+            type: number
+          maxItems: 4096
+    VectorSearchRequest:
+      type: object
+      required: [table, vector]
+      properties:
+        table:
+          type: string
+        vector:
+          type: array
+          items:
+            type: number
+          maxItems: 4096
+        top_k:
+          type: integer
+    AnnSearchRequest:
+      type: object
+      required: [table, vector]
+      properties:
+        table:
+          type: string
+        vector:
+          type: array
+          items:
+            type: number
+          maxItems: 4096
+        top_k:
+          type: integer
+        ef:
+          type: integer
+    TextIndexRequest:
+      type: object
+      required: [table, id, text]
+      properties:
+        table:
+          type: string
+        id:
+          type: string
+        text:
+          type: string
+    TextSearchRequest:
+      type: object
+      required: [table, query]
+      properties:
+        table:
+          type: string
+        query:
+          type: string
+        top_k:
+          type: integer
+    KvTtl:
+      type: object
+      required: [ttl]
+      properties:
+        ttl:
+          type: integer
+          description: seconds remaining, -1 when persistent
+    SqlRequest:
+      type: object
+      required: [sql]
+      properties:
+        sql:
+          type: string
+        params:
+          type: array
+          items:
+            type: string
+    SqlOk:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+    SqlRow:
+      type: object
+      properties:
+        pk:
+          type: string
+        value:
+          type: string
+    SqlRows:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/SqlRow'
+    BranchRequest:
+      type: object
+      required: [id, parent, base_commit_ts]
+      properties:
+        id:
+          type: string
+        parent:
+          type: string
+        base_commit_ts:
+          type: integer
+    BranchResetRequest:
+      type: object
+      required: [base_commit_ts]
+      properties:
+        base_commit_ts:
+          type: integer
+    CheckpointRequest:
+      type: object
+      properties:
+        manifest_id:
+          type: string
+    Checkpoint:
+      type: object
+      properties:
+        id:
+          type: string
+        commit_ts:
+          type: integer
+        manifest_id:
+          type: string
+        created_unix:
+          type: integer
+    ArchiveRequest:
+      type: object
+      properties:
+        backup_id:
+          type: string
+    SnapshotReceipt:
+      type: object
+      properties:
+        commit:
+          type: integer
+        files:
+          type: array
+          items:
+            type: string
+    MoveShardRequest:
+      type: object
+      required: [table]
+      properties:
+        tenant:
+          type: string
+        database:
+          type: string
+        table:
+          type: string
+        target:
+          type: integer
+    SplitRangeRequest:
+      type: object
+      required: [id, mid, left_id, right_id, expected_epoch]
+      properties:
+        id:
+          type: string
+        mid:
+          type: string
+        left_id:
+          type: string
+        right_id:
+          type: string
+        expected_epoch:
+          type: integer
+    MergeRangesRequest:
+      type: object
+      required: [left_id, right_id, merged_id, expected_left_epoch, expected_right_epoch]
+      properties:
+        left_id:
+          type: string
+        right_id:
+          type: string
+        merged_id:
+          type: string
+        expected_left_epoch:
+          type: integer
+        expected_right_epoch:
+          type: integer
+    PlacementRange:
+      type: object
+      required: [id, start, end, leader, epoch]
+      properties:
+        id:
+          type: string
+        start:
+          type: array
+          items:
+            type: integer
+        end:
+          type: array
+          items:
+            type: integer
+        leader:
+          type: string
+        epoch:
+          type: integer
+    RangeList:
+      type: array
+      items:
+        $ref: '#/components/schemas/PlacementRange'
+    RangeLoad:
+      type: object
+      required: [id, epoch, writes]
+      properties:
+        id:
+          type: string
+        epoch:
+          type: integer
+        writes:
+          type: integer
+          description: counted REST and wire-gateway writes routed to this range since it was created
+    ShardLayout:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [single, sharded, hybrid]
+        shards:
+          type: integer
+        placement:
+          type: array
+          items:
+            type: object
+            properties:
+              tenant:
+                type: string
+              database:
+                type: string
+              table:
+                type: string
+              shard:
+                type: integer
+              tier:
+                type: string
+              bytes:
+                type: integer
+    ClusterMemberRequest:
+      type: object
+      required: [id, addr]
+      properties:
+        id:
+          type: integer
+        addr:
+          type: string
+          example: 127.0.0.1:9000
+    ClusterTransferRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          type: integer
+    ClusterReplaceRequest:
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterMemberRequest'
+    ClusterMember:
+      type: object
+      properties:
+        id:
+          type: integer
+        addr:
+          type: string
+        self:
+          type: boolean
+    ClusterStatus:
+      type: object
+      properties:
+        term:
+          type: integer
+        leader:
+          type: boolean
+        commit:
+          type: integer
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterMember'
+        joint:
+          type: array
+          items:
+            type: integer

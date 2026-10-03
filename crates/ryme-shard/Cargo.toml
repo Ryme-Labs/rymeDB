@@ -1,0 +1,16 @@
+[package]
+name = "ryme-shard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-raft = { workspace = true }
+ryme-wal = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

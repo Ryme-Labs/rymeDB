@@ -1,0 +1,11 @@
+[package]
+name = "ryme-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+bytes = { workspace = true }
+crc32fast = "1"
+serde = { workspace = true }

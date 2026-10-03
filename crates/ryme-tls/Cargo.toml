@@ -1,0 +1,12 @@
+[package]
+name = "ryme-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+tokio = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }

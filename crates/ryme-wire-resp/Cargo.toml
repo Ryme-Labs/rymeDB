@@ -1,0 +1,19 @@
+[package]
+name = "ryme-wire-resp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-router = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-realtime = { workspace = true }
+ryme-qos = { workspace = true }
+ryme-metering = { workspace = true }
+ryme-observe = { workspace = true }
+ryme-wire-native = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }

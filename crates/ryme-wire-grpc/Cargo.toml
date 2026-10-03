@@ -1,0 +1,26 @@
+[package]
+name = "ryme-wire-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-router = { workspace = true }
+ryme-auth = { workspace = true }
+ryme-gateway = { workspace = true }
+ryme-realtime = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-sql = { workspace = true }
+ryme-qos = { workspace = true }
+ryme-metering = { workspace = true }
+ryme-observe = { workspace = true }
+ryme-tls = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

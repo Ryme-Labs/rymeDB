@@ -1,0 +1,16 @@
+target
+node_modules
+.turbo/
+.ruff_cache/
+dist
+build
+.next
+coverage
+*.log
+.env
+.env.local
+.DS_Store
+/var/lib/rymedb
+*.db
+*.wal
+*.sst

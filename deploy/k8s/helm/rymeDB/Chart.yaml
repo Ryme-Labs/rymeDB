@@ -1,0 +1,5 @@
+apiVersion: v2
+name: rymedb
+version: 0.1.0
+description: rymeDB distributed relational database
+type: application

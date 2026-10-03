@@ -1,0 +1,60 @@
+[package]
+name = "ryme-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ryme_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ryme-server"
+path = "src/main.rs"
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-config = { workspace = true }
+ryme-wire-pg = { workspace = true }
+ryme-wire-resp = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-sql = { workspace = true }
+ryme-gateway = { workspace = true }
+ryme-auth = { workspace = true }
+ryme-realtime = { workspace = true }
+ryme-branch = { workspace = true }
+ryme-backup = { workspace = true }
+ryme-control = { workspace = true }
+ryme-crypto = { workspace = true }
+ryme-archive = { workspace = true }
+ryme-raft = { workspace = true }
+ryme-shard = { workspace = true }
+ryme-observe = { workspace = true }
+ryme-metering = { workspace = true }
+ryme-migrate = { workspace = true }
+ryme-qos = { workspace = true }
+ryme-index = { workspace = true }
+ryme-router = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-wire-native = { workspace = true }
+ryme-wire-grpc = { workspace = true }
+ryme-tls = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+clap = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = "0.21"
+hmac = "0.12"
+sha2 = "0.10"
+p256 = { version = "0.14", features = ["ecdsa"] }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+futures-util = { workspace = true }

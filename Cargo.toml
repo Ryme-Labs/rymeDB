@@ -1,0 +1,89 @@
+[workspace]
+members = [
+  "crates/ryme-error",
+  "crates/ryme-config",
+  "crates/ryme-wal",
+  "crates/ryme-storage",
+  "crates/ryme-txn",
+  "crates/ryme-sql",
+  "crates/ryme-wire-pg",
+  "crates/ryme-wire-resp",
+  "crates/ryme-realtime",
+  "crates/ryme-auth",
+  "crates/ryme-branch",
+  "crates/ryme-backup",
+  "crates/ryme-metering",
+  "crates/ryme-observe",
+  "crates/ryme-router",
+  "crates/ryme-raft",
+  "crates/ryme-gateway",
+  "crates/ryme-control",
+  "crates/ryme-shard",
+  "crates/ryme-archive",
+  "crates/ryme-server",
+  "crates/ryme-bench",
+  "crates/ryme-migrate",
+  "crates/ryme-qos",
+  "crates/ryme-wire-native",
+  "crates/ryme-wire-grpc",
+  "crates/ryme-crypto",
+  "crates/ryme-index",
+  "crates/ryme-tls",
+  "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/rymelabs/rymeDB"
+rust-version = "1.89"
+
+[workspace.dependencies]
+ryme-error = { path = "crates/ryme-error", version = "0.1.0" }
+ryme-config = { path = "crates/ryme-config", version = "0.1.0" }
+ryme-wal = { path = "crates/ryme-wal", version = "0.1.0" }
+ryme-storage = { path = "crates/ryme-storage", version = "0.1.0" }
+ryme-txn = { path = "crates/ryme-txn", version = "0.1.0" }
+ryme-sql = { path = "crates/ryme-sql", version = "0.1.0" }
+ryme-wire-pg = { path = "crates/ryme-wire-pg", version = "0.1.0" }
+ryme-wire-resp = { path = "crates/ryme-wire-resp", version = "0.1.0" }
+ryme-realtime = { path = "crates/ryme-realtime", version = "0.1.0" }
+ryme-auth = { path = "crates/ryme-auth", version = "0.1.0" }
+ryme-branch = { path = "crates/ryme-branch", version = "0.1.0" }
+ryme-backup = { path = "crates/ryme-backup", version = "0.1.0" }
+ryme-metering = { path = "crates/ryme-metering", version = "0.1.0" }
+ryme-observe = { path = "crates/ryme-observe", version = "0.1.0" }
+ryme-router = { path = "crates/ryme-router", version = "0.1.0" }
+ryme-raft = { path = "crates/ryme-raft", version = "0.1.0" }
+ryme-gateway = { path = "crates/ryme-gateway", version = "0.1.0" }
+ryme-control = { path = "crates/ryme-control", version = "0.1.0" }
+ryme-shard = { path = "crates/ryme-shard", version = "0.1.0" }
+ryme-archive = { path = "crates/ryme-archive", version = "0.1.0" }
+ryme-migrate = { path = "crates/ryme-migrate", version = "0.1.0" }
+ryme-qos = { path = "crates/ryme-qos", version = "0.1.0" }
+ryme-wire-native = { path = "crates/ryme-wire-native", version = "0.1.0" }
+ryme-wire-grpc = { path = "crates/ryme-wire-grpc", version = "0.1.0" }
+ryme-crypto = { path = "crates/ryme-crypto", version = "0.1.0" }
+ryme-index = { path = "crates/ryme-index", version = "0.1.0" }
+ryme-tls = { path = "crates/ryme-tls", version = "0.1.0" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+bytes = "1"
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
+getrandom = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tonic = { version = "0.13", features = ["transport", "tls-ring"] }
+tonic-build = "0.13"
+prost = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }

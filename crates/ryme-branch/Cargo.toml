@@ -1,0 +1,10 @@
+[package]
+name = "ryme-branch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

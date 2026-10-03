@@ -1,0 +1,10 @@
+[package]
+name = "ryme-txn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-wal = { workspace = true }

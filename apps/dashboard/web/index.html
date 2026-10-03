@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rymeDB Admin</title>
+<style>
+:root { color-scheme: dark; --bg: #0d1117; --panel: #161b22; --line: #30363d; --txt: #e6edf3; --dim: #8b949e; --acc: #2f81f7; --ok: #3fb950; --bad: #f85149; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--txt); font: 14px/1.5 system-ui, sans-serif; }
+header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0 12px 0 0; }
+input, textarea, select { background: #0d1117; color: var(--txt); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+button { background: var(--acc); color: #fff; border: 0; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button.ghost { background: transparent; border: 1px solid var(--line); color: var(--txt); }
+main { display: grid; grid-template-columns: 180px 1fr; min-height: calc(100vh - 53px); }
+nav { border-right: 1px solid var(--line); padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+nav button { text-align: left; background: transparent; color: var(--txt); }
+nav button.on { background: #1f6feb33; }
+section { padding: 16px; display: none; max-width: 1100px; }
+section.on { display: block; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.card h3 { margin: 0 0 8px; font-size: 14px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+pre { background: #0d1117; border: 1px solid var(--line); border-radius: 6px; padding: 8px; overflow: auto; max-height: 420px; white-space: pre-wrap; }
+.pill { border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+.pill.ok { background: #3fb95033; color: var(--ok); }
+.pill.bad { background: #f8514933; color: var(--bad); }
+table { border-collapse: collapse; width: 100%; }
+td, th { border: 1px solid var(--line); padding: 4px 8px; text-align: left; font-size: 13px; }
+.dim { color: var(--dim); }
+#log { font-family: monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+<h1>rymeDB Admin</h1>
+<input id="base" size="28" value="http://127.0.0.1:8080" placeholder="base URL">
+<input id="key" size="20" type="password" placeholder="API key">
+<button id="connect">Connect</button>
+<span id="status" class="pill bad">offline</span>
+</header>
+<main>
+<nav id="tabs"></nav>
+<div id="views">
+<section id="v-overview"><div class="card"><h3>Node</h3><div id="node"></div></div><div class="card"><h3>Cluster</h3><div id="cluster"></div></div><div class="card"><h3>Shards</h3><div id="shards"></div></div><div class="card"><h3>Latency</h3><div id="latency"></div></div><div class="card"><h3>Autoscale</h3><div id="autoscale"></div></div></section>
+<section id="v-kv"><div class="card"><h3>Key / Value</h3><div class="row"><input id="kv-table" value="docs" size="10"><input id="kv-key" value="hello" size="16"><input id="kv-value" value='{"a":1}' size="30"><button data-run="kvPut">PUT</button><button class="ghost" data-run="kvGet">GET</button><button class="ghost" data-run="kvDel">DEL</button><button class="ghost" data-run="kvTtl">TTL</button></div><pre id="kv-out" class="dim">—</pre></div></section>
+<section id="v-sql"><div class="card"><h3>SQL</h3><div class="row"><textarea id="sql" rows="3" cols="70">SELECT * FROM docs LIMIT 10</textarea></div><div class="row"><button data-run="sqlRun">Run</button><button class="ghost" data-run="sqlExplain">Explain</button><button class="ghost" data-run="sqlCopy">COPY demo rows</button></div><pre id="sql-out" class="dim">—</pre></div><div class="card"><h3>REST / GraphQL</h3><div class="row"><input id="rest-table" value="docs" size="10"><input id="rest-q" value="limit=10" size="24"><button class="ghost" data-run="restList">REST list</button><input id="gql" value='{ docs(limit: 5) }' size="24"><button class="ghost" data-run="gqlRun">GraphQL</button></div><pre id="rest-out" class="dim">—</pre></div></section>
+<section id="v-branches"><div class="card"><h3>Branches</h3><div class="row"><button class="ghost" data-run="branchList">List</button><input id="br-id" value="preview-1" size="12"><input id="br-parent" value="main" size="8"><input id="br-ts" value="1" size="6"><button data-run="branchCreate">Create</button><button class="ghost" data-run="branchPromote">Promote</button><button class="ghost" data-run="branchDelete">Delete</button></div><pre id="br-out" class="dim">—</pre></div></section>
+<section id="v-backups"><div class="card"><h3>Backups</h3><div class="row"><button class="ghost" data-run="ckpt">Checkpoint</button><button class="ghost" data-run="latest">Latest</button><button class="ghost" data-run="snap">Snapshot</button><input id="bk-id" value="" size="14" placeholder="backup id"><button class="ghost" data-run="archive">Archive</button><button class="ghost" data-run="verify">Verify drill</button><button class="ghost" data-run="drill">Scheduled drill</button></div><pre id="bk-out" class="dim">—</pre></div></section>
+<section id="v-stream"><div class="card"><h3>Live stream</h3><div class="row"><input id="st-table" value="docs" size="12"><button data-run="streamGo">Watch</button><button class="ghost" data-run="streamStop">Stop</button></div><pre id="log" class="dim">—</pre></div><div class="card"><h3>Topics</h3><div class="row"><input id="tp-part" value="orders" size="10"><input id="tp-key" value="k1" size="8"><input id="tp-val" value="v1" size="12"><button class="ghost" data-run="topicAppend">Append</button><button class="ghost" data-run="topicRead">Read</button></div><pre id="tp-out" class="dim">—</pre></div><div class="card"><h3>Broadcast</h3><div class="row"><input id="bc-channel" value="lobby" size="10"><input id="bc-msg" value='{"hello":true}' size="18" placeholder="payload JSON"><button class="ghost" data-run="castPost">Post</button><button data-run="castGo">Watch</button><button class="ghost" data-run="castStop">Stop</button></div><pre id="cast-out" class="dim">—</pre></div><div class="card"><h3>Presence</h3><div class="row"><input id="ps-channel" value="room:1" size="10"><input id="ps-member" value="ada" size="8" placeholder="member"><button class="ghost" data-run="presenceJoin">Join</button><button class="ghost" data-run="presenceList">List</button></div><pre id="ps-out" class="dim">—</pre></div></section>
+<section id="v-search"><div class="card"><h3>Vector</h3><div class="row"><input id="vx-table" value="emb" size="8"><input id="vx-id" value="a" size="6"><input id="vx-vec" value="1,0" size="12"><button class="ghost" data-run="vecUpsert">Upsert</button><button class="ghost" data-run="vecSearch">Search</button><button class="ghost" data-run="vecAnn">ANN search</button></div><pre id="vx-out" class="dim">—</pre></div><div class="card"><h3>Full text</h3><div class="row"><input id="tx-table" value="docs" size="8"><input id="tx-id" value="d1" size="6"><input id="tx-text" value="the quick brown fox" size="26"><button class="ghost" data-run="textIndex">Index</button><button class="ghost" data-run="textSearch">Search</button></div><pre id="tx-out" class="dim">—</pre></div><div class="card"><h3>Index layout</h3><div class="row"><button class="ghost" data-run="indexStats">Stats</button></div><pre id="ix-out" class="dim">—</pre></div></section>
+<section id="v-ops"><div class="card"><h3>Tenancy / Billing</h3><div class="row"><button class="ghost" data-run="qos">QoS</button><button class="ghost" data-run="metering">Metering</button><button class="ghost" data-run="billing">Billing summary</button><button class="ghost" data-run="invoice">Invoice</button><button class="ghost" data-run="regions">Regions</button></div><pre id="ops-out" class="dim">—</pre></div><div class="card"><h3>Auth</h3><div class="row"><input id="au-id" value="ada" size="10"><input id="au-pw" value="correct-horse" size="14" type="password"><button class="ghost" data-run="authReg">Register</button><button class="ghost" data-run="authVerify">Verify</button><button class="ghost" data-run="authToken">Token</button></div><pre id="au-out" class="dim">—</pre></div></section>
+<section id="v-observe"><div class="card"><h3>Placement ranges</h3><div class="row"><button class="ghost" data-run="rangeList">List</button><input id="rg-key" value="" size="12" placeholder="route key"><button class="ghost" data-run="rangeRoute">Route</button><button class="ghost" data-run="rangeAutosplit">Split hot</button><button class="ghost" data-run="rangeLoads">Loads</button></div><pre id="rg-out" class="dim">—</pre></div><div class="card"><h3>Slow log</h3><div class="row"><button class="ghost" data-run="slowLog">Recent slow</button><input id="sl-table" value="" size="12" placeholder="table filter"></div><pre id="sl-out" class="dim">—</pre></div><div class="card"><h3>Traces</h3><div class="row"><button class="ghost" data-run="traceList">Recent spans</button><input id="tr-table" value="" size="12" placeholder="table filter"></div><pre id="tr-out" class="dim">—</pre></div></section>
+</div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const tabs = ["overview", "kv", "sql", "branches", "backups", "stream", "search", "ops", "observe"];
+let ws = null;
+function base() { return $("base").value.replace(/\/$/, ""); }
+function headers(json) {
+  const h = {};
+  if ($("key").value) h["authorization"] = "Bearer " + $("key").value;
+  if (json) h["content-type"] = "application/json";
+  return h;
+}
+async function call(method, path, body) {
+  const res = await fetch(base() + path, { method, headers: headers(body !== undefined), body: body === undefined ? undefined : JSON.stringify(body) });
+  const text = await res.text();
+  let parsed = text;
+  try { parsed = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* raw */ }
+  if (!res.ok) throw new Error("HTTP " + res.status + " " + parsed);
+  return parsed;
+}
+function show(id, text) { $(id).textContent = text; $(id).classList.remove("dim"); }
+function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+async function refresh() {
+  try {
+    const h = await fetch(base() + "/health");
+    if (!h.ok) throw new Error("down");
+    $("status").textContent = "online";
+    $("status").className = "pill ok";
+    const ready = await (await fetch(base() + "/ready")).json();
+    const metrics = await call("GET", "/metrics");
+    const m = JSON.parse(metrics);
+    $("node").innerHTML = "node <b>" + esc(ready.node) + "</b> commit " + ready.commit + (ready.leader ? " (leader)" : "") + (ready.cluster ? " clustered" : " single");
+    $("latency").textContent = "p50 " + m.p50_micros + "us p90 " + m.p90_micros + "us p95 " + m.p95_micros + "us p99 " + m.p99_micros + "us count " + m.rest_count;
+    try {
+      const c = JSON.parse(await call("GET", "/v1/cluster/members"));
+      $("cluster").innerHTML = "<table><tr><th>id</th><th>addr</th><th>self</th></tr>" + c.members.map((x) => "<tr><td>" + x.id + "</td><td>" + esc(x.addr) + "</td><td>" + (x.self ? "yes" : "") + "</td></tr>").join("") + "</table><span class='dim'>term " + c.term + " commit " + c.commit + "</span>";
+    } catch (e) { $("cluster").innerHTML = "<span class='dim'>" + esc(e.message) + "</span>"; }
+    const shards = JSON.parse(await call("GET", "/v1/shards"));
+    $("shards").textContent = shards.mode + " " + JSON.stringify(shards.placement || shards.shards || "");
+    $("autoscale").textContent = await call("GET", "/v1/autoscale");
+  } catch (e) {
+    $("status").textContent = "offline";
+    $("status").className = "pill bad";
+  }
+}
+const actions = {
+  sqlRun: () => call("POST", "/v1/sql", { sql: $("sql").value }),
+  sqlExplain: () => call("POST", "/v1/sql/explain", { sql: $("sql").value }),
+  restList: () => call("GET", "/rest/v1/" + $("rest-table").value + "?limit=10"),
+  gqlRun: () => call("POST", "/graphql", { query: "{ " + $("rest-table").value + "(limit: 5) }" }),
+  branchList: () => call("GET", "/v1/branches"),
+  branchCreate: () => call("POST", "/v1/branches", { id: $("br-id").value, parent: $("br-parent").value, base_commit_ts: Number($("br-ts").value) }),
+  branchPromote: () => call("POST", "/v1/branches/" + $("br-id").value + "/promote"),
+  branchDelete: () => call("DELETE", "/v1/branches/" + $("br-id").value),
+  ckpt: () => call("POST", "/v1/backups/checkpoint", {}),
+  latest: () => call("GET", "/v1/backups/latest"),
+  snap: () => call("POST", "/v1/snapshots"),
+  archive: () => call("POST", "/v1/backups/archive", { backup_id: $("bk-id").value || null }),
+  verify: () => call("GET", "/v1/backups/verify?backup_id=" + encodeURIComponent($("bk-id").value)),
+  drill: () => call("GET", "/v1/backups/drill"),
+  topicAppend: () => call("POST", "/v1/topics/append", { partition: $("tp-part").value, key: $("tp-key").value, value: $("tp-val").value }),
+  topicRead: () => call("GET", "/v1/topics/read?partition=" + encodeURIComponent($("tp-part").value) + "&from=0&limit=20"),
+  presenceJoin: () => call("POST", "/v1/presence/join", { channel: $("ps-channel").value, member: $("ps-member").value }),
+  presenceList: () => call("GET", "/v1/presence/" + encodeURIComponent($("ps-channel").value)),
+  castPost: () => call("POST", "/v1/broadcast", { channel: $("bc-channel").value, payload: JSON.parse($("bc-msg").value) }),
+  vecUpsert: () => call("POST", "/v1/vector/upsert", { table: $("vx-table").value, id: $("vx-id").value, vector: $("vx-vec").value.split(",").map(Number) }),
+  vecSearch: () => call("POST", "/v1/vector/search", { table: $("vx-table").value, vector: $("vx-vec").value.split(",").map(Number), top_k: 5 }),
+  vecAnn: () => call("POST", "/v1/vector/ann-search", { table: $("vx-table").value, vector: $("vx-vec").value.split(",").map(Number), top_k: 5, ef: 64 }),
+  textIndex: () => call("POST", "/v1/text/index", { table: $("tx-table").value, id: $("tx-id").value, text: $("tx-text").value }),
+  textSearch: () => call("POST", "/v1/text/search", { table: $("tx-table").value, query: $("tx-text").value, top_k: 5 }),
+  indexStats: () => call("GET", "/v1/index/stats"),
+  qos: () => call("GET", "/v1/qos"),
+  metering: () => call("GET", "/v1/metering"),
+  billing: () => call("GET", "/v1/billing/summary"),
+  invoice: () => call("GET", "/v1/billing/invoice"),
+  regions: () => call("GET", "/v1/regions"),
+  authReg: () => call("POST", "/v1/auth/register", { id: $("au-id").value, password: $("au-pw").value }),
+  authVerify: () => call("POST", "/v1/auth/verify", { id: $("au-id").value, password: $("au-pw").value }),
+  authToken: () => call("POST", "/v1/auth/token", { id: $("au-id").value, password: $("au-pw").value }),
+  rangeList: () => call("GET", "/v1/ranges"),
+  rangeRoute: () => call("GET", "/v1/ranges?key=" + encodeURIComponent($("rg-key").value)),
+  rangeAutosplit: () => call("POST", "/v1/ranges/autosplit"),
+  rangeLoads: () => call("GET", "/v1/ranges/loads"),
+  slowLog: () => {
+    const table = $("sl-table").value;
+    return call("GET", "/v1/observe/slow?limit=20" + (table ? "&table=" + encodeURIComponent(table) : ""));
+  },
+  traceList: () => {
+    const table = $("tr-table").value;
+    return call("GET", "/v1/traces?limit=20" + (table ? "&table=" + encodeURIComponent(table) : ""));
+  },
+  sqlCopy: () => call("POST", "/v1/sql/copy", { table: "docs", rows: [{ key: "demo-1", value: "hello" }] }),
+};
+async function rawKv(method, extra) {
+  const h = {};
+  if ($("key").value) h["authorization"] = "Bearer " + $("key").value;
+  const res = await fetch(base() + "/v1/kv/" + $("kv-table").value + "/" + $("kv-key").value + (extra || ""), { method, headers: h, body: method === "PUT" ? $("kv-value").value : undefined });
+  const text = await res.text();
+  if (!res.ok) throw new Error("HTTP " + res.status + " " + text);
+  return text;
+}
+const outFor = { kvPut: "kv-out", kvGet: "kv-out", kvDel: "kv-out", kvTtl: "kv-out", sqlRun: "sql-out", sqlExplain: "sql-out", sqlCopy: "sql-out", restList: "rest-out", gqlRun: "rest-out", branchList: "br-out", branchCreate: "br-out", branchPromote: "br-out", branchDelete: "br-out", ckpt: "bk-out", latest: "bk-out", snap: "bk-out", archive: "bk-out", verify: "bk-out", drill: "bk-out", topicAppend: "tp-out", topicRead: "tp-out", castPost: "cast-out", presenceJoin: "ps-out", presenceList: "ps-out", vecUpsert: "vx-out", vecSearch: "vx-out", vecAnn: "vx-out", textIndex: "tx-out", textSearch: "tx-out", indexStats: "ix-out", qos: "ops-out", metering: "ops-out", billing: "ops-out", invoice: "ops-out", regions: "ops-out", authReg: "au-out", authVerify: "au-out", authToken: "au-out", rangeList: "rg-out", rangeRoute: "rg-out", slowLog: "sl-out", traceList: "tr-out" };
+document.querySelectorAll("[data-run]").forEach((b) => {
+  b.addEventListener("click", async () => {
+    const name = b.getAttribute("data-run");
+    const out = outFor[name] || "ops-out";
+    try {
+      let result;
+      if (name === "kvGet") result = await rawKv("GET");
+      else if (name === "kvDel") result = await rawKv("DELETE");
+      else if (name === "kvTtl") result = await rawKv("GET", "/ttl");
+      else if (name === "kvPut") result = await rawKv("PUT");
+      else result = await actions[name]();
+      show(out, typeof result === "string" ? result : JSON.stringify(result, null, 2));
+    } catch (e) { show(out, String(e.message || e)); }
+  });
+});
+document.querySelector("[data-run='streamGo']").addEventListener("click", () => {
+  streamStop();
+  const url = base().replace(/^http/, "ws") + "/v1/stream?table=" + encodeURIComponent($("st-table").value) + ($("key").value ? "&api_key=" + encodeURIComponent($("key").value) : "");
+  ws = new WebSocket(url);
+  $("log").textContent = "";
+  ws.onmessage = (ev) => { $("log").textContent += ev.data + "\n"; };
+  ws.onerror = () => { $("log").textContent += "[socket error]\n"; };
+});
+function streamStop() { if (ws) { try { ws.close(); } catch (e) { /* closed */ } ws = null; } }
+document.querySelector("[data-run='streamStop']").addEventListener("click", streamStop);
+let castWs = null;
+document.querySelector("[data-run='castGo']").addEventListener("click", () => {
+  castStop();
+  const url = base().replace(/^http/, "ws") + "/v1/broadcast/" + encodeURIComponent($("bc-channel").value) + ($("key").value ? "?api_key=" + encodeURIComponent($("key").value) : "");
+  castWs = new WebSocket(url);
+  $("cast-out").textContent = "";
+  castWs.onmessage = (ev) => { $("cast-out").textContent += ev.data + "\n"; };
+  castWs.onerror = () => { $("cast-out").textContent += "[socket error]\n"; };
+});
+function castStop() { if (castWs) { try { castWs.close(); } catch (e) { /* closed */ } castWs = null; } }
+document.querySelector("[data-run='castStop']").addEventListener("click", castStop);
+$("connect").addEventListener("click", refresh);
+(function init() {
+  const nav = $("tabs");
+  tabs.forEach((t, i) => {
+    const b = document.createElement("button");
+    b.textContent = t;
+    if (i === 0) b.classList.add("on");
+    b.addEventListener("click", () => {
+      document.querySelectorAll("nav button").forEach((x) => x.classList.remove("on"));
+      b.classList.add("on");
+      document.querySelectorAll("section").forEach((s) => s.classList.remove("on"));
+      $("v-" + t).classList.add("on");
+    });
+    nav.appendChild(b);
+  })();
+refresh();
+</script>
+</body>
+</html>

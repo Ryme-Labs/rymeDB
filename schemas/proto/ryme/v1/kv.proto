@@ -1,0 +1,26 @@
+syntax = "proto3";
+package ryme.v1;
+service RymeKv {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+}
+message GetRequest {
+  string tenant = 1;
+  string database = 2;
+  string table = 3;
+  bytes key = 4;
+}
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+}
+message PutRequest {
+  string tenant = 1;
+  string database = 2;
+  string table = 3;
+  bytes key = 4;
+  bytes value = 5;
+}
+message PutResponse {
+  uint64 commit_ts = 1;
+}

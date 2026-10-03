@@ -1,0 +1,33 @@
+name: preview
+on:
+  pull_request:
+jobs:
+  preview-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked -p ryme-server
+      - run: |
+          export RYME_API_KEY=ryme-ci-key
+          ./target/debug/ryme-server --data-dir /tmp/ryme-preview-${{ github.event.pull_request.number }} \
+            --pg-listen 127.0.0.1:5433 --resp-listen 127.0.0.1:6380 --http-listen 127.0.0.1:8080 &
+          echo $! > /tmp/ryme-preview.pid
+          for attempt in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+      - run: |
+          export BASE=http://127.0.0.1:8080 KEY=ryme-ci-key PR=pr-${{ github.event.pull_request.number }}
+          auth() { curl -sf -H "authorization: Bearer $KEY" "$@"; }
+          auth -X POST $BASE/v1/branches \
+            -H 'content-type: application/json' \
+            -d "{\"id\":\"$PR\",\"parent\":\"main\",\"base_commit_ts\":1}"
+          auth $BASE/v1/branches | grep -q "$PR"
+          auth -X POST $BASE/v1/sql/copy \
+            -H 'content-type: application/json' \
+            -d '{"table":"preview_smoke","rows":[{"key":"k","value":"v"}]}'
+          auth "$BASE/rest/v1/preview_smoke?limit=10" | grep -q '"k"'
+          auth -X POST $BASE/v1/branches/$PR/promote | grep -q '"id":"main"'
+      - run: cargo test --locked -p ryme-branch -p ryme-migrate -p ryme-metering
+      - run: kill $(cat /tmp/ryme-preview.pid) || true

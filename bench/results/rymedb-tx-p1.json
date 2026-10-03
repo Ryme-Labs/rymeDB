@@ -1,0 +1,1 @@
+{"errors":0,"max_us":1959,"mean_us":240,"ops":20000,"p50_us":207,"p90_us":390,"p95_us":483,"p999_us":1216,"p99_us":782,"pipeline":1,"qps":32739,"seconds":0.611,"target":"127.0.0.1:6391","workload":"tx"}

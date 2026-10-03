@@ -1,0 +1,13 @@
+[package]
+name = "ryme-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-branch = { workspace = true }
+ryme-backup = { workspace = true }
+ryme-router = { workspace = true }
+ryme-migrate = { workspace = true }
+serde = { workspace = true }

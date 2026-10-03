@@ -1,0 +1,15 @@
+[package]
+name = "ryme-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-auth = { workspace = true }
+ryme-realtime = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

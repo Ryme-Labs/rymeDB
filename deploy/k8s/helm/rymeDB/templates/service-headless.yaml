@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rymedb.headless" . }}
+  labels:
+    {{- include "rymedb.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: rymedb
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: pg
+      port: {{ .Values.service.pg }}
+    - name: resp
+      port: {{ .Values.service.resp }}
+    - name: http
+      port: {{ .Values.service.http }}
+    - name: raft
+      port: {{ .Values.service.raft }}

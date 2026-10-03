@@ -1,0 +1,17 @@
+[package]
+name = "ryme-wire-pg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-router = { workspace = true }
+ryme-sql = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-qos = { workspace = true }
+ryme-metering = { workspace = true }
+ryme-observe = { workspace = true }
+ryme-wire-native = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }

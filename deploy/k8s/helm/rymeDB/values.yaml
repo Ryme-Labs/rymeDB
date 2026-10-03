@@ -1,0 +1,32 @@
+replicaCount: 3
+image:
+  repository: rymelabs/rymedb
+  tag: 0.1.0
+  pullPolicy: IfNotPresent
+service:
+  pg: 5433
+  resp: 6380
+  http: 8080
+  raft: 9080
+apiKeySecret:
+  name: rymedb-api-key
+  key: api-key
+config:
+  durability: local-durable
+  cacheBytes: 268435456
+  maxConnections: 10000
+  sweepIntervalSecs: 30
+  shards: 1
+persistence:
+  size: 100Gi
+  storageClass: nvme
+resources:
+  requests:
+    cpu: 4
+    memory: 16Gi
+  limits:
+    cpu: 16
+    memory: 64Gi
+nodeSelector: {}
+affinity: {}
+tolerations: []

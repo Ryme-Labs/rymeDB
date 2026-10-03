@@ -1,0 +1,25 @@
+[package]
+name = "ryme-wire-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-router = { workspace = true }
+ryme-auth = { workspace = true }
+ryme-gateway = { workspace = true }
+ryme-realtime = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-sql = { workspace = true }
+ryme-qos = { workspace = true }
+ryme-metering = { workspace = true }
+ryme-observe = { workspace = true }
+ryme-tls = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }

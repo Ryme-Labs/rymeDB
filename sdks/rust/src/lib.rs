@@ -1,0 +1,934 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error("http: {0}")]
+    Http(String),
+    #[error("status {0}: {1}")]
+    Status(u16, String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RymeClient {
+    base: String,
+    api_key: String,
+    http: reqwest::Client,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyRow {
+    pub key: String,
+    pub value: String,
+}
+
+impl RymeClient {
+    pub fn new(base: String, api_key: String) -> Self {
+        Self { base, api_key, http: reqwest::Client::new() }
+    }
+
+    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.is_empty() {
+            request
+        } else {
+            request.header("authorization", format!("Bearer {}", self.api_key))
+        }
+    }
+
+    async fn check(response: reqwest::Response) -> Result<serde_json::Value, ClientError> {
+        let status = response.status().as_u16();
+        let text = response.text().await.map_err(|e| ClientError::Http(e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(ClientError::Status(status, text));
+        }
+        if text.is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text)
+            .map_err(|_| ClientError::Status(status, text.clone()))
+            .or(Ok(serde_json::Value::String(text)))
+    }
+
+    pub async fn health(&self) -> Result<bool, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}/health", self.base))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Ok(response.status().is_success())
+    }
+
+    pub async fn kv_get(&self, table: &str, key: &str) -> Result<Vec<u8>, ClientError> {
+        let response = self
+            .auth(self.http.get(format!("{}/v1/kv/{table}/{key}", self.base)))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await.map_err(|e| ClientError::Http(e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(ClientError::Status(status, String::from_utf8_lossy(&bytes).to_string()));
+        }
+        Ok(bytes.to_vec())
+    }
+
+    pub async fn kv_put(&self, table: &str, key: &str, value: Vec<u8>) -> Result<u64, ClientError> {
+        let response = self
+            .auth(self.http.put(format!("{}/v1/kv/{table}/{key}", self.base)).body(value))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        match Self::check(response).await? {
+            serde_json::Value::Object(mut map) => map
+                .remove("commit")
+                .and_then(|v| v.as_u64())
+                .ok_or(ClientError::Status(200, String::from("commit"))),
+            _ => Err(ClientError::Status(200, String::from("commit"))),
+        }
+    }
+
+    pub async fn sql(&self, sql: &str) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.post(format!("{}/v1/sql", self.base)))
+            .json(&serde_json::json!({ "sql": sql }))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn sql_copy(&self, table: &str, rows: Vec<CopyRow>) -> Result<u64, ClientError> {
+        let response = self
+            .auth(self.http.post(format!("{}/v1/sql/copy", self.base)))
+            .json(&serde_json::json!({ "table": table, "rows": rows }))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        match Self::check(response).await? {
+            serde_json::Value::Object(mut map) => map
+                .remove("rows")
+                .and_then(|v| v.as_u64())
+                .ok_or(ClientError::Status(200, String::from("rows"))),
+            _ => Err(ClientError::Status(200, String::from("rows"))),
+        }
+    }
+
+    pub async fn explain(&self, sql: &str) -> Result<String, ClientError> {
+        let response = self
+            .auth(self.http.post(format!("{}/v1/sql/explain", self.base)))
+            .json(&serde_json::json!({ "sql": sql }))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        match Self::check(response).await? {
+            serde_json::Value::Object(mut map) => map
+                .remove("plan")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .ok_or(ClientError::Status(200, String::from("plan"))),
+            _ => Err(ClientError::Status(200, String::from("plan"))),
+        }
+    }
+
+    pub async fn rest_list(
+        &self,
+        table: &str,
+        query: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let url = if query.is_empty() {
+            format!("{}/rest/v1/{table}", self.base)
+        } else {
+            format!("{}/rest/v1/{table}?{query}", self.base)
+        };
+        let response = self
+            .auth(self.http.get(url))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn graphql(&self, query: &str) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.post(format!("{}/graphql", self.base)))
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn metering(&self) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.get(format!("{}/v1/metering", self.base)))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn slow_log(
+        &self,
+        limit: Option<usize>,
+        table: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut url = reqwest::Url::parse(&format!("{}/v1/observe/slow", self.base))
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if let Some(limit) = limit {
+            url.query_pairs_mut().append_pair("limit", &limit.to_string());
+        }
+        if let Some(table) = table {
+            url.query_pairs_mut().append_pair("table", table);
+        }
+        let response =
+            self.auth(self.http.get(url)).send().await.map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn traces(
+        &self,
+        limit: Option<usize>,
+        name: Option<&str>,
+        table: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut url = reqwest::Url::parse(&format!("{}/v1/traces", self.base))
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if let Some(limit) = limit {
+            url.query_pairs_mut().append_pair("limit", &limit.to_string());
+        }
+        if let Some(name) = name {
+            url.query_pairs_mut().append_pair("name", name);
+        }
+        if let Some(table) = table {
+            url.query_pairs_mut().append_pair("table", table);
+        }
+        let response =
+            self.auth(self.http.get(url)).send().await.map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    async fn post_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.post(format!("{}{}", self.base, path)))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    async fn post_path(&self, path: &str) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.post(format!("{}{}", self.base, path)))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    async fn delete_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.delete(format!("{}{}", self.base, path)))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    async fn get_path(&self, path: &str) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.get(format!("{}{}", self.base, path)))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn qos(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/qos").await
+    }
+
+    pub async fn qos_set_tier(
+        &self,
+        tenant: &str,
+        tier: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/qos/tier", serde_json::json!({ "tenant": tenant, "tier": tier })).await
+    }
+
+    pub async fn auth_register(
+        &self,
+        id: &str,
+        password: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/register", serde_json::json!({ "id": id, "password": password }))
+            .await
+    }
+
+    pub async fn auth_verify(
+        &self,
+        id: &str,
+        password: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/verify", serde_json::json!({ "id": id, "password": password }))
+            .await
+    }
+
+    pub async fn auth_token(
+        &self,
+        id: &str,
+        password: &str,
+        code: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/token", serde_json::json!({ "id": id, "password": password, "code": code }))
+            .await
+    }
+
+    pub async fn auth_revoke(&self, key: &str) -> Result<serde_json::Value, ClientError> {
+        self.delete_json("/v1/auth/keys", serde_json::json!({ "key": key })).await
+    }
+
+    pub async fn otp_setup(&self, id: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/otp/setup", serde_json::json!({ "id": id })).await
+    }
+
+    pub async fn otp_verify(&self, id: &str, code: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/otp/verify", serde_json::json!({ "id": id, "code": code })).await
+    }
+
+    pub async fn passkey_challenge(&self, user: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/passkey/challenge", serde_json::json!({ "user": user })).await
+    }
+
+    pub async fn passkey_register(
+        &self,
+        user: &str,
+        credential_id: &str,
+        public_key: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/auth/passkey/register",
+            serde_json::json!({ "user": user, "credential_id": credential_id, "public_key": public_key }),
+        )
+        .await
+    }
+
+    pub async fn passkey_verify(
+        &self,
+        user: &str,
+        credential_id: &str,
+        authenticator_data: &str,
+        client_data_json: &str,
+        signature: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/auth/passkey/verify",
+            serde_json::json!({
+                "user": user,
+                "credential_id": credential_id,
+                "authenticator_data": authenticator_data,
+                "client_data_json": client_data_json,
+                "signature": signature,
+            }),
+        )
+        .await
+    }
+
+    pub async fn mask_set(
+        &self,
+        table: &str,
+        fields: Vec<String>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/mask", serde_json::json!({ "table": table, "fields": fields }))
+            .await
+    }
+
+    pub async fn presence_join(
+        &self,
+        channel: &str,
+        member: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/presence/join",
+            serde_json::json!({ "channel": channel, "member": member }),
+        )
+        .await
+    }
+
+    pub async fn presence_list(&self, channel: &str) -> Result<serde_json::Value, ClientError> {
+        self.get_path(&format!("/v1/presence/{channel}")).await
+    }
+
+    pub async fn broadcast(
+        &self,
+        channel: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/broadcast",
+            serde_json::json!({ "channel": channel, "payload": payload }),
+        )
+        .await
+    }
+
+    pub async fn topic_append(
+        &self,
+        partition: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/topics/append",
+            serde_json::json!({ "partition": partition, "key": key, "value": value }),
+        )
+        .await
+    }
+
+    pub async fn topic_read(
+        &self,
+        partition: &str,
+        from: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.get_path(&format!("/v1/topics/read?partition={partition}&from={from}")).await
+    }
+
+    pub async fn branch_list(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/branches").await
+    }
+
+    pub async fn branch_reset(
+        &self,
+        id: &str,
+        base_commit_ts: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            &format!("/v1/branches/{id}/reset"),
+            serde_json::json!({ "base_commit_ts": base_commit_ts }),
+        )
+        .await
+    }
+
+    pub async fn branch_promote(&self, id: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json(&format!("/v1/branches/{id}/promote"), serde_json::Value::Null).await
+    }
+
+    pub async fn branch_diff(
+        &self,
+        id: &str,
+        against: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.get_path(&format!("/v1/branches/{id}/diff?against={against}")).await
+    }
+
+    pub async fn billing_summary(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/billing/summary").await
+    }
+
+    pub async fn index_stats(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/index/stats").await
+    }
+
+    pub async fn billing_invoice(&self, tenant: &str) -> Result<serde_json::Value, ClientError> {
+        let path = if tenant.is_empty() {
+            String::from("/v1/billing/invoice")
+        } else {
+            format!("/v1/billing/invoice?tenant={tenant}")
+        };
+        self.get_path(&path).await
+    }
+
+    pub async fn regions(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/regions").await
+    }
+
+    pub async fn migrate_supabase(&self, dump: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/migrate/supabase", serde_json::json!({ "dump": dump })).await
+    }
+
+    pub async fn backup_verify(&self, backup_id: &str) -> Result<serde_json::Value, ClientError> {
+        self.get_path(&format!("/v1/backups/verify?backup_id={backup_id}")).await
+    }
+
+    pub async fn backup_drill(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/backups/drill").await
+    }
+
+    pub async fn backup_copy(&self, backup_id: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/backups/copy", serde_json::json!({ "backup_id": backup_id })).await
+    }
+
+    pub async fn checkpoint(
+        &self,
+        manifest_id: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/backups/checkpoint", serde_json::json!({ "manifest_id": manifest_id }))
+            .await
+    }
+
+    pub async fn snapshot(&self) -> Result<serde_json::Value, ClientError> {
+        self.post_path("/v1/snapshots").await
+    }
+
+    pub async fn latest_checkpoint(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/backups/latest").await
+    }
+
+    pub async fn pitr(&self, target: u64) -> Result<serde_json::Value, ClientError> {
+        self.get_path(&format!("/v1/backups/pitr?target={target}")).await
+    }
+
+    pub async fn restore(&self, target: u64) -> Result<serde_json::Value, ClientError> {
+        self.post_path(&format!("/v1/backups/restore?target={target}")).await
+    }
+
+    pub async fn archive(&self, backup_id: Option<&str>) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/backups/archive", serde_json::json!({ "backup_id": backup_id })).await
+    }
+
+    pub async fn archives(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/backups/archives").await
+    }
+
+    pub async fn shard_layout(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/shards").await
+    }
+
+    pub async fn shard_move(
+        &self,
+        table: &str,
+        target: Option<u64>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/shards/move", serde_json::json!({ "table": table, "target": target }))
+            .await
+    }
+
+    pub async fn ranges(&self, key: Option<&str>) -> Result<serde_json::Value, ClientError> {
+        match key {
+            Some(key) => {
+                let mut url = reqwest::Url::parse(&format!("{}/v1/ranges", self.base))
+                    .map_err(|e| ClientError::Http(e.to_string()))?;
+                url.query_pairs_mut().append_pair("key", key);
+                let response = self
+                    .auth(self.http.get(url))
+                    .send()
+                    .await
+                    .map_err(|e| ClientError::Http(e.to_string()))?;
+                Self::check(response).await
+            }
+            None => self.get_path("/v1/ranges").await,
+        }
+    }
+
+    pub async fn range_split(
+        &self,
+        id: &str,
+        mid: &str,
+        left_id: &str,
+        right_id: &str,
+        expected_epoch: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/ranges/split",
+            serde_json::json!({
+                "id": id,
+                "mid": mid,
+                "left_id": left_id,
+                "right_id": right_id,
+                "expected_epoch": expected_epoch,
+            }),
+        )
+        .await
+    }
+
+    pub async fn range_merge(
+        &self,
+        left_id: &str,
+        right_id: &str,
+        merged_id: &str,
+        expected_left_epoch: u64,
+        expected_right_epoch: u64,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/ranges/merge",
+            serde_json::json!({
+                "left_id": left_id,
+                "right_id": right_id,
+                "merged_id": merged_id,
+                "expected_left_epoch": expected_left_epoch,
+                "expected_right_epoch": expected_right_epoch,
+            }),
+        )
+        .await
+    }
+
+    pub async fn range_autosplit(
+        &self,
+        min_writes: Option<u64>,
+    ) -> Result<serde_json::Value, ClientError> {
+        match min_writes {
+            Some(min) => self.post_path(&format!("/v1/ranges/autosplit?min_writes={min}")).await,
+            None => self.post_path("/v1/ranges/autosplit").await,
+        }
+    }
+
+    pub async fn range_loads(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/ranges/loads").await
+    }
+
+    pub async fn migrate_neon(&self, branches: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/migrate/neon", serde_json::json!({ "branches": branches })).await
+    }
+
+    pub async fn migrate_apply(
+        &self,
+        id: &str,
+        sql: &str,
+        author: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/migrate/apply",
+            serde_json::json!({ "id": id, "sql": sql, "author": author }),
+        )
+        .await
+    }
+
+    pub async fn migrate_ledger(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_path("/v1/migrate/ledger").await
+    }
+
+    pub async fn vector_ann_search(
+        &self,
+        table: &str,
+        vector: Vec<f32>,
+        top_k: usize,
+        ef: usize,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/vector/ann-search",
+            serde_json::json!({ "table": table, "vector": vector, "top_k": top_k, "ef": ef }),
+        )
+        .await
+    }
+
+    pub async fn oidc_login(
+        &self,
+        redirect_uri: &str,
+        state: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/auth/oidc/login",
+            serde_json::json!({ "redirect_uri": redirect_uri, "state": state }),
+        )
+        .await
+    }
+
+    pub async fn oidc_token(&self, id_token: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json("/v1/auth/oidc/token", serde_json::json!({ "id_token": id_token })).await
+    }
+
+    pub async fn vector_upsert(
+        &self,
+        table: &str,
+        id: &str,
+        vector: Vec<f32>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/vector/upsert",
+            serde_json::json!({ "table": table, "id": id, "vector": vector }),
+        )
+        .await
+    }
+
+    pub async fn vector_search(
+        &self,
+        table: &str,
+        vector: Vec<f32>,
+        top_k: usize,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/vector/search",
+            serde_json::json!({ "table": table, "vector": vector, "top_k": top_k }),
+        )
+        .await
+    }
+
+    pub async fn text_index(
+        &self,
+        table: &str,
+        id: &str,
+        text: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/text/index",
+            serde_json::json!({ "table": table, "id": id, "text": text }),
+        )
+        .await
+    }
+
+    pub async fn text_search(
+        &self,
+        table: &str,
+        query: &str,
+        top_k: usize,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/text/search",
+            serde_json::json!({ "table": table, "query": query, "top_k": top_k }),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug, Default, Clone)]
+    struct Seen {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    async fn stub() -> (String, Arc<Mutex<Seen>>) {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let state = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut chunk = vec![0u8; 4096];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                raw.extend_from_slice(&chunk[..read]);
+                                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&raw).into_owned();
+                    let mut lines = text.lines();
+                    let head = lines.next().unwrap_or("").to_string();
+                    let mut parts = head.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    let mut length = 0usize;
+                    for line in text.lines().skip(1).take_while(|line| !line.is_empty()) {
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let header_end =
+                        raw.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                    let mut body = raw.get(header_end..).map(|s| s.to_vec()).unwrap_or_default();
+                    while body.len() < length {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(read) => body.extend_from_slice(&chunk[..read]),
+                            Err(_) => break,
+                        }
+                    }
+                    if let Ok(mut guard) = state.lock() {
+                        *guard = Seen {
+                            method,
+                            path,
+                            body: String::from_utf8_lossy(&body).into_owned(),
+                        };
+                    }
+                    let reply = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}";
+                    let _ = socket.write_all(reply).await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    fn seen(state: &Arc<Mutex<Seen>>) -> Seen {
+        state.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn backup_lifecycle_paths_and_bodies() {
+        let (base, state) = stub().await;
+        let client = RymeClient::new(base, String::from("k"));
+        client.checkpoint(None).await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/backups/checkpoint");
+        assert_eq!(seen(&state).body, "{\"manifest_id\":null}");
+        client.checkpoint(Some("m1")).await.unwrap();
+        assert_eq!(seen(&state).body, "{\"manifest_id\":\"m1\"}");
+        client.snapshot().await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/snapshots"));
+        client.latest_checkpoint().await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/backups/latest"));
+        client.pitr(1735689600).await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/backups/pitr?target=1735689600");
+        client.restore(1735689600).await.unwrap();
+        let got = seen(&state);
+        assert_eq!(
+            (got.method.as_str(), got.path.as_str()),
+            ("POST", "/v1/backups/restore?target=1735689600")
+        );
+        client.archive(None).await.unwrap();
+        assert_eq!(seen(&state).body, "{\"backup_id\":null}");
+        client.archives().await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/backups/archives"));
+        client.backup_verify("nightly-042").await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/backups/verify?backup_id=nightly-042");
+        client.backup_drill().await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/backups/drill");
+        client.backup_copy("nightly-042").await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/backups/copy"));
+        assert_eq!(got.body, "{\"backup_id\":\"nightly-042\"}");
+    }
+
+    #[tokio::test]
+    async fn slow_log_paths() {
+        let (base, state) = stub().await;
+        let client = RymeClient::new(base, String::from("k"));
+        client.slow_log(None, None).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/observe/slow"));
+        client.slow_log(Some(5), None).await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/observe/slow?limit=5");
+        client.slow_log(Some(5), Some("docs")).await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/observe/slow?limit=5&table=docs");
+    }
+
+    #[tokio::test]
+    async fn traces_paths() {
+        let (base, state) = stub().await;
+        let client = RymeClient::new(base, String::from("k"));
+        client.traces(None, None, None).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/traces"));
+        client.traces(Some(5), None, None).await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/traces?limit=5");
+        client.traces(Some(5), Some("kv_put"), Some("docs")).await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/traces?limit=5&name=kv_put&table=docs");
+    }
+
+    #[tokio::test]
+    async fn auth_token_paths_and_bodies() {
+        let (base, state) = stub().await;
+        let client = RymeClient::new(base, String::from("k"));
+        client.auth_token("ada", "correct-horse", None).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/auth/token"));
+        assert_eq!(got.body, "{\"code\":null,\"id\":\"ada\",\"password\":\"correct-horse\"}");
+        client.auth_token("ada", "correct-horse", Some("123456")).await.unwrap();
+        let got = seen(&state);
+        assert_eq!(got.body, "{\"code\":\"123456\",\"id\":\"ada\",\"password\":\"correct-horse\"}");
+        client.auth_revoke("ryme_deadbeef").await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("DELETE", "/v1/auth/keys"));
+        assert_eq!(got.body, "{\"key\":\"ryme_deadbeef\"}");
+        client.passkey_register("ada", "cred-9", "cHVi").await.unwrap();
+        let got = seen(&state);
+        assert_eq!(
+            (got.method.as_str(), got.path.as_str()),
+            ("POST", "/v1/auth/passkey/register")
+        );
+        assert_eq!(
+            got.body,
+            "{\"credential_id\":\"cred-9\",\"public_key\":\"cHVi\",\"user\":\"ada\"}"
+        );
+        client
+            .passkey_verify("ada", "cred-9", "YXV0aA", "Y2xpZW50", "c2ln")
+            .await
+            .unwrap();
+        let got = seen(&state);
+        assert_eq!(got.path.as_str(), "/v1/auth/passkey/verify");
+        client.passkey_register("ada", "cred-9", "cHVi").await.unwrap();
+        let got = seen(&state);
+        assert_eq!(
+            (got.method.as_str(), got.path.as_str()),
+            ("POST", "/v1/auth/passkey/register")
+        );
+        client
+            .passkey_verify("ada", "cred-9", "YXV0aA", "Y2xpZW50", "c2ln")
+            .await
+            .unwrap();
+        let got = seen(&state);
+        assert_eq!(got.path.as_str(), "/v1/auth/passkey/verify");
+    }
+
+    #[tokio::test]
+    async fn shard_and_range_paths_and_bodies() {
+        let (base, state) = stub().await;
+        let client = RymeClient::new(base, String::from("k"));
+        client.shard_layout().await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/shards"));
+        client.shard_move("docs", None).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/shards/move"));
+        assert_eq!(got.body, "{\"table\":\"docs\",\"target\":null}");
+        client.shard_move("docs", Some(2)).await.unwrap();
+        assert_eq!(seen(&state).body, "{\"table\":\"docs\",\"target\":2}");
+        client.ranges(None).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/ranges"));
+        client.ranges(Some("m")).await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/ranges?key=m");
+        client.range_split("range-0", "m", "range-a", "range-b", 0).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/ranges/split"));
+        assert_eq!(
+            got.body,
+            "{\"expected_epoch\":0,\"id\":\"range-0\",\"left_id\":\"range-a\",\"mid\":\"m\",\"right_id\":\"range-b\"}"
+        );
+        client.range_merge("range-a", "range-b", "range-c", 1, 1).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/ranges/merge"));
+        assert_eq!(
+            got.body,
+            "{\"expected_left_epoch\":1,\"expected_right_epoch\":1,\"left_id\":\"range-a\",\"merged_id\":\"range-c\",\"right_id\":\"range-b\"}"
+        );
+        client.range_autosplit(None).await.unwrap();
+        let got = seen(&state);
+        assert_eq!(
+            (got.method.as_str(), got.path.as_str()),
+            ("POST", "/v1/ranges/autosplit")
+        );
+        client.range_autosplit(Some(10)).await.unwrap();
+        let got = seen(&state);
+        assert_eq!(got.path.as_str(), "/v1/ranges/autosplit?min_writes=10");
+        client.range_loads().await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/ranges/loads"));
+        client.migrate_apply("m1", "INSERT INTO docs KEY 'k1' VALUE 'v1'", None).await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/migrate/apply"));
+        assert_eq!(
+            got.body,
+            "{\"author\":null,\"id\":\"m1\",\"sql\":\"INSERT INTO docs KEY 'k1' VALUE 'v1'\"}"
+        );
+        client.migrate_ledger().await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/migrate/ledger"));
+    }
+}

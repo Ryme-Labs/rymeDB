@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ChangeRecord",
+  "type": "object",
+  "required": ["tenant", "database", "branch", "table", "op", "commit_ts", "sequence"],
+  "properties": {
+    "tenant": {"type": "string"},
+    "database": {"type": "string"},
+    "branch": {"type": "string"},
+    "table": {"type": "string"},
+    "op": {"type": "string", "enum": ["INSERT", "UPDATE", "DELETE"]},
+    "commit_ts": {"type": "integer"},
+    "sequence": {"type": "integer"}
+  }
+}

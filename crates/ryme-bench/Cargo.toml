@@ -1,0 +1,17 @@
+[package]
+name = "ryme-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ryme-bench"
+path = "src/main.rs"
+
+[dependencies]
+ryme-error = { workspace = true }
+ryme-txn = { workspace = true }
+ryme-storage = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

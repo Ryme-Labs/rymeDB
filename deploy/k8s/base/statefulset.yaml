@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rymedb
+  labels:
+    app.kubernetes.io/name: rymedb
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rymedb-api-key
+  namespace: rymedb
+type: Opaque
+stringData:
+  api-key: CHANGE-ME-ryme-dev-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rymedb-headless
+  namespace: rymedb
+  labels:
+    app.kubernetes.io/name: rymedb
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: rymedb
+  ports:
+    - name: pg
+      port: 5433
+    - name: resp
+      port: 6380
+    - name: http
+      port: 8080
+    - name: raft
+      port: 9080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rymedb
+  namespace: rymedb
+  labels:
+    app.kubernetes.io/name: rymedb
+spec:
+  selector:
+    app.kubernetes.io/name: rymedb
+  ports:
+    - name: pg
+      port: 5433
+    - name: resp
+      port: 6380
+    - name: http
+      port: 8080
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rymedb
+  namespace: rymedb
+  labels:
+    app.kubernetes.io/name: rymedb
+spec:
+  serviceName: rymedb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rymedb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rymedb
+    spec:
+      containers:
+        - name: ryme-server
+          image: rymelabs/rymedb:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RYME_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rymedb-api-key
+                  key: api-key
+          args:
+            - --data-dir
+            - /var/lib/rymedb
+          ports:
+            - name: pg
+              containerPort: 5433
+            - name: resp
+              containerPort: 6380
+            - name: http
+              containerPort: 8080
+            - name: raft
+              containerPort: 9080
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 4
+              memory: 16Gi
+            limits:
+              cpu: 16
+              memory: 64Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rymedb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: nvme
+        resources:
+          requests:
+            storage: 100Gi

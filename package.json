@@ -1,0 +1,23 @@
+{
+  "name": "rymedb-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "check": "turbo run check",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint"
+  },
+  "devDependencies": {
+    "turbo": "2.11.3",
+    "typescript": "7.0.2"
+  },
+  "description": "rymeDB is an open-source, ultra-low-latency distributed relational database and backend platform. One static `ryme-server` binary serves PostgreSQL wire protocol clients, RESP (Valkey-compatible) clients, and a REST operator API.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "keywords": [],
+  "type": "commonjs"
+}
