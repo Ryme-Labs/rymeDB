@@ -1,16 +1,6 @@
 name: docker
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - "deploy/docker/**"
-      - "crates/ryme-server/**"
-      - "crates/ryme-gateway/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/docker.yml"
   workflow_dispatch:
 
 env:
