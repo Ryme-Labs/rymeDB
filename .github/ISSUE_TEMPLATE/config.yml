@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Private security report (staff-only)
+    url: https://github.com/Ryme-Labs/rymeDB/security/advisories/new
+    about: Report a vulnerability privately. Only Rymelabs staff can read it. Do NOT open a public issue.
+  - name: Security policy
+    url: https://github.com/Ryme-Labs/rymeDB/blob/main/SECURITY.md
+    about: Read the security policy before reporting.

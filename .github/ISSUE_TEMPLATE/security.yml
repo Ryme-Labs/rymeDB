@@ -1,0 +1,100 @@
+name: Security report
+description: Report a potential vulnerability. STOP — read first, GitHub Issues are PUBLIC.
+title: "[SECURITY] <short description>"
+labels: ["security", "triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > ## STOP — DO NOT PASTE EXPLOITS OR SECRETS HERE
+        >
+        > **GitHub Issues are PUBLIC. There is no per-template private Issue on GitHub.**
+        >
+        > For staff-only visibility, use **Private Vulnerability Reporting** instead:
+        > **https://github.com/Ryme-Labs/rymeDB/security/advisories/new**
+        >
+        > Only Rymelabs staff (repo maintainers with security access) can read
+        > advisories submitted there. See `SECURITY.md` for the full policy.
+        >
+        > Only continue here for non-sensitive security chores (e.g. asking for
+        > `SECURITY.md` clarification). Never include PoC exploit code, tokens,
+        > keys, or customer data in an Issue.
+
+  - type: checkboxes
+    id: private-report-check
+    attributes:
+      label: Reporting channel
+      description: Confirm you understand Issues are public.
+      options:
+        - label: I understand GitHub Issues are public and readable by everyone.
+          required: true
+        - label: This issue contains NO exploit code, secrets, credentials, or customer data.
+          required: true
+        - label: If this is a real vulnerability, I already reported it privately via Security Advisories (or emailed rymedb@rymelabs.dev) and this issue is only a non-sensitive placeholder.
+          required: false
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Suspected severity
+      description: Your best guess. Staff triage makes the final call.
+      options:
+        - Not sure
+        - Low
+        - Medium
+        - High
+        - Critical
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - Auth / RLS / masking (`ryme-auth`)
+        - Gateways (`ryme-wire-pg`, `ryme-wire-resp`, `ryme-wire-native`, `ryme-server`)
+        - Replication / Raft (`ryme-raft`, `ryme-shard`, `ryme-router`)
+        - Storage / transactions / WAL (`ryme-storage`, `ryme-txn`, `ryme-wal`)
+        - Crypto / backup / snapshot (`ryme-crypto`, `ryme-backup`, `ryme-archive`)
+        - SDK / dashboard / CLI (`sdks/*`, `apps/*`)
+        - Deploy / CI (`deploy/*`, `.github/workflows/*`)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Affected version
+      description: Output of `ryme-server --version`, or commit SHA if built from source.
+      placeholder: e.g. v0.1.3 / commit abc1234
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Non-sensitive description
+      description: High-level description only. No exploit steps, payloads, or secrets.
+      placeholder: What kind of weakness do you suspect, and what is the impact (confidentiality / integrity / availability)?
+    validations:
+      required: true
+
+  - type: textarea
+    id: advisory-ref
+    attributes:
+      label: Private advisory reference
+      description: If you already filed privately, paste the advisory link or email date so staff can correlate.
+      placeholder: e.g. https://github.com/Ryme-Labs/rymeDB/security/advisories/GHSA-xxxx-xxxx-xxxx, or "emailed 2026-10-03"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Ground rules
+      options:
+        - label: I have read `SECURITY.md` and will not disclose this before a fix is available.
+          required: true

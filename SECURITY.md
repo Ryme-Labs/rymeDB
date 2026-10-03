@@ -8,15 +8,31 @@
 
 ## Reporting a vulnerability
 
-Email **security@rymelabs.example** with:
+> **Do not open a public GitHub Issue for a vulnerability — Issues are
+> public and readable by everyone. GitHub has no per-template private
+> Issue.** The `Security report` Issue template is for non-sensitive
+> chores only and says so up front.
+
+For staff-only visibility, use one of these private channels. Only
+Rymelabs staff (repo maintainers with security access) can read reports
+submitted this way:
+
+1. **Preferred: GitHub Private Vulnerability Reporting**
+   `https://github.com/Ryme-Labs/rymeDB/security/advisories/new`
+   (Security tab -> Report a vulnerability). This creates a private
+   Security Advisory visible only to you and Rymelabs staff until a fix
+   is published.
+
+2. **Fallback: email rymedb@rymelabs.dev** with:
 
 - Affected component and version (`ryme-server --version`, commit if built from source).
 - Steps to reproduce against a default single-node config.
 - Impact assessment (confidentiality, integrity, availability).
 
 Expect an acknowledgement within 3 business days and a fix timeline within
-14 days for confirmed high-severity issues. Do not open public issues for
-unpatched vulnerabilities.
+14 days for confirmed high-severity issues. Reports stay private between
+you and Rymelabs staff until a patch is available — do not disclose
+publicly (Issues, Discussions, social media) before then.
 
 ## Scope
 
