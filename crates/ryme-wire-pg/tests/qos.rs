@@ -83,6 +83,43 @@ async fn pg_qos_throttles_writes() {
 }
 
 #[tokio::test]
+async fn pg_qos_throttles_response_bytes() {
+    let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
+    {
+        let mut registry = qos.lock().unwrap();
+        registry.set_quota(
+            "t",
+            ryme_qos::Quota {
+                egress_bytes_per_sec: 1024,
+                ..ryme_qos::Quota::for_tier(ryme_qos::Tier::Shared)
+            },
+            now_nanos(),
+        );
+    }
+    let gateway =
+        ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d")).with_qos(qos.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+    let big = "v".repeat(200);
+    let inserted = query(addr, &format!("INSERT INTO docs KEY 'big' VALUE '{big}'")).await;
+    assert!(!String::from_utf8_lossy(&inserted).contains("quota"), "{inserted:?}");
+    let first = query(addr, "SELECT * FROM docs KEY 'big'").await;
+    let text = String::from_utf8_lossy(&first).into_owned();
+    assert!(text.contains(&big), "{text}");
+    for _ in 0..4 {
+        let denied = query(addr, "SELECT * FROM docs KEY 'big'").await;
+        let text = String::from_utf8_lossy(&denied).into_owned();
+        if text.contains("egress") {
+            return;
+        }
+    }
+    panic!("shared egress bucket never throttled 200B PG reads");
+}
+
+#[tokio::test]
 async fn pg_observe_records_statements() {
     let latency = ryme_observe::LatencyWindow::new();
     let histogram = ryme_observe::Histogram::new(128);

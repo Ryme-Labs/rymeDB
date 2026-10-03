@@ -1038,7 +1038,7 @@ paths:
         - $ref: '#/components/parameters/TableParam'
         - name: limit
           in: query
-          description: max rows, default 100, capped at 10000
+          description: max rows, default 100, capped at 1000
           schema:
             type: integer
       responses:

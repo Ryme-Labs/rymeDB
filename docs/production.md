@@ -72,11 +72,21 @@ policy to protect replication and cache efficiency.
   admission on reads, writes, egress, realtime and connections (`GET /v1/qos`).
   Tier changes (`POST /v1/qos/tier`) and shard moves (`POST /v1/shards/move`)
   are scoped to the caller's own tenant; cross-tenant targets get `403`, so
-  one tenant cannot retune or relocate another's capacity.
+  one tenant cannot retune or relocate another's capacity. On REST, reads
+  draw from the read bucket (including `GET`, scan, GraphQL, SQL reads and
+  TTL), deletes and SQL writes draw from the write bucket, and every
+  materialized response draws its pk/value bytes from the egress bucket
+  (`429` when exhausted).
   Enforced on every gateway: REST, native, RESP (per-command, classified by
   staged writes so reads and `MULTI`/`EXEC` batches are metered precisely) and
   PostgreSQL wire (per statement via `Statement::is_write`, throttle surfaces
-  as `53400`). Denied RESP commands answer `-ERR ... quota`; denied writes
+  as `53400`). RESP and native gateways additionally charge response bytes
+  to the egress bucket, so bulk reads cannot outrun the tier. The PG wire
+  gateway charges full simple-query and extended-execute responses the
+  same way (denial keeps protocol sync via error plus ready-for-query),
+  and gRPC charges exact encoded reply bytes per RPC
+  (`resource_exhausted` on exhaustion). Denied RESP
+  commands answer `-ERR ... quota`; denied writes
   never reach commit. Each admitted command also records a read/write unit in
   metering, so wire-protocol traffic is billed like REST. The native gateway
   meters and times every op too, and its `sql` op classifies statements so

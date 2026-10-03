@@ -241,6 +241,65 @@ async fn grpc_read_only_rejects_sql_writes() {
     assert!(reply.ok, "{}", reply.error);
 }
 
+#[tokio::test]
+async fn grpc_egress_throttles_responses() {
+    use ryme_wire_grpc::proto::ryme_server::Ryme;
+    use std::sync::{Arc, Mutex};
+    let gateway = Gateway::new(
+        String::from("t"),
+        String::from("d"),
+        String::from("main"),
+        PolicyEngine::new(),
+        Realtime::new(16),
+    );
+    let mut roles = HashSet::new();
+    roles.insert(Role::Owner);
+    let keys = ApiKeyStore::new();
+    keys.insert(
+        String::from("k"),
+        Principal { id: String::from("u"), tenant: String::from("t"), roles },
+    );
+    let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
+    {
+        let mut registry = qos.lock().unwrap();
+        registry.set_quota(
+            "t",
+            ryme_qos::Quota {
+                egress_bytes_per_sec: 512,
+                ..ryme_qos::Quota::for_tier(ryme_qos::Tier::Shared)
+            },
+            0,
+        );
+    }
+    let grpc = GrpcGateway::with_qos(gateway, keys, qos);
+    let big = "v".repeat(200);
+    let reply = grpc
+        .kv_put(authed(
+            proto::KvPutRequest {
+                table: String::from("docs"),
+                pk: b"a".to_vec(),
+                value: big.into_bytes(),
+                ttl_secs: 0,
+            },
+            "k",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.ok, "{}", reply.error);
+    let reply = grpc
+        .kv_get(authed(proto::KvGetRequest { table: String::from("docs"), pk: b"a".to_vec() }, "k"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.found);
+    let err = grpc
+        .kv_get(authed(proto::KvGetRequest { table: String::from("docs"), pk: b"a".to_vec() }, "k"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err}");
+}
+
 fn traced<T>(message: T, traceparent: &str) -> Request<T> {
     let mut request = authed(message, "k");
     request.metadata_mut().insert("traceparent", traceparent.parse().unwrap());

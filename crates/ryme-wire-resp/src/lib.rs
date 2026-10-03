@@ -212,6 +212,16 @@ where
         None
     }
 
+    fn admit_response(&self, bytes: u64) -> Option<Vec<u8>> {
+        let qos = self.qos.as_ref()?;
+        let now = qos_now_nanos();
+        let denied = match qos.lock() {
+            Ok(mut registry) => registry.admit_egress(&self.tenant, bytes, now).err(),
+            Err(_) => Some(RymeError::Internal(String::from("qos lock"))),
+        };
+        denied.map(|e| encode_error(e.to_string()))
+    }
+
     fn observe(&self, write: bool) {
         let Some(metering) = self.metering.as_ref() else { return };
         let metric = if write { Metric::WriteUnit } else { Metric::ReadUnit };
@@ -438,6 +448,10 @@ where
             while let Some((command, consumed)) = decode_command(&pending)? {
                 pending.drain(0..consumed);
                 let reply = self.dispatch_conn(command, &mut multi, &mut client).await;
+                let reply = match self.admit_response(reply.len() as u64) {
+                    Some(denied) => denied,
+                    None => reply,
+                };
                 socket.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             if pending.len() > 1024 * 1024 {

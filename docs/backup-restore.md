@@ -97,8 +97,9 @@ decrypts each envelope with the ring, and returns
 `{backup_id, commit, verified, encrypted}`. Run it at least weekly; alert
 when `verified` drops below the file count or the call fails.
 
-Set `archive.verify_interval_secs` (config file only, `0` disables) to run
-the same verification automatically against the latest backup on a cadence
+Set `archive.verify_interval_secs` (`--verify-interval-secs`, `0`
+disables) to run the same verification automatically against the latest
+backup on a cadence
 (weekly `604800` in production). The last report is served at
 `GET /v1/backups/drill` (`404` until the first drill completes) as
 `{backup_id, verified_files, at_unix, error}`; alert when `error` is set

@@ -81,6 +81,17 @@ impl Response {
     }
 }
 
+fn response_bytes(response: &Response) -> u64 {
+    let mut bytes = response.error.as_ref().map(|e| e.len()).unwrap_or(0) as u64;
+    bytes += response.value.as_ref().map(|v| v.len()).unwrap_or(0) as u64;
+    if let Some(rows) = response.rows.as_ref() {
+        for row in rows {
+            bytes += (row.pk.len() + row.value.len()) as u64;
+        }
+    }
+    bytes
+}
+
 pub fn encode_frame(body: &[u8]) -> Result<Vec<u8>> {
     if body.len() > MAX_FRAME {
         return Err(RymeError::Overload(String::from("frame")));
@@ -288,7 +299,7 @@ where
             Ok(principal) => principal,
             Err(_) => return Response::err(String::from("unauthorized")),
         };
-        match request.op.as_str() {
+        let response = match request.op.as_str() {
             "ping" => {
                 let start = std::time::Instant::now();
                 let response = Response::ok();
@@ -302,7 +313,11 @@ where
             "scan" => self.op_scan(&principal, &request).await,
             "sql" => self.op_sql(&principal, &request).await,
             _ => Response::err(String::from("unknown op")),
+        };
+        if self.admit_egress(&principal, response_bytes(&response)).is_err() {
+            return Response::err(String::from("overload: egress quota"));
         }
+        response
     }
 
     fn admit_read(&self, principal: &Principal) -> Result<()> {
@@ -317,6 +332,14 @@ where
         let now = qos_now();
         match self.qos.lock() {
             Ok(mut qos) => qos.admit_write(&principal.tenant, bytes, now),
+            Err(_) => Err(RymeError::Internal(String::from("qos lock"))),
+        }
+    }
+
+    fn admit_egress(&self, principal: &Principal, bytes: u64) -> Result<()> {
+        let now = qos_now();
+        match self.qos.lock() {
+            Ok(mut qos) => qos.admit_egress(&principal.tenant, bytes, now),
             Err(_) => Err(RymeError::Internal(String::from("qos lock"))),
         }
     }
@@ -694,5 +717,64 @@ mod tests {
         let get_response = native.dispatch(&get).await;
         assert!(get_response.ok);
         assert_eq!(get_response.value, Some(String::from("1")));
+    }
+
+    #[tokio::test]
+    async fn native_egress_throttles_responses() {
+        use std::collections::HashSet;
+        let gateway = Gateway::new(
+            String::from("t"),
+            String::from("d"),
+            String::from("main"),
+            ryme_auth::PolicyEngine::new(),
+            ryme_realtime::Realtime::new(16),
+        );
+        let keys = ApiKeyStore::new();
+        let mut roles = HashSet::new();
+        roles.insert(ryme_auth::Role::Owner);
+        keys.insert(
+            String::from("k"),
+            Principal { id: String::from("u"), tenant: String::from("t"), roles },
+        );
+        let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
+        {
+            let mut registry = qos.lock().unwrap();
+            registry.set_quota(
+                "t",
+                ryme_qos::Quota {
+                    egress_bytes_per_sec: 512,
+                    ..ryme_qos::Quota::for_tier(ryme_qos::Tier::Shared)
+                },
+                0,
+            );
+        }
+        let native = NativeGateway::with_qos(gateway, keys, qos);
+        let put = serde_json::to_vec(&Request {
+            key: String::from("k"),
+            op: String::from("put"),
+            table: String::from("docs"),
+            pk: String::from("a"),
+            value: "v".repeat(200),
+            sql: String::new(),
+            limit: 0,
+            ttl_secs: 0,
+        })
+        .unwrap();
+        assert!(native.dispatch(&put).await.ok);
+        let get = serde_json::to_vec(&Request {
+            key: String::from("k"),
+            op: String::from("get"),
+            table: String::from("docs"),
+            pk: String::from("a"),
+            value: String::new(),
+            sql: String::new(),
+            limit: 0,
+            ttl_secs: 0,
+        })
+        .unwrap();
+        assert!(native.dispatch(&get).await.ok);
+        let denied = native.dispatch(&get).await;
+        assert!(!denied.ok);
+        assert!(denied.error.unwrap_or_default().contains("egress"));
     }
 }

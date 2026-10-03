@@ -554,10 +554,47 @@ All notable changes to rymeDB are recorded here. Format follows
   requires admin rights or a matching caller id, and duplicate
   credential ids are `409` instead of silent overwrite; covered by
   registry unit asserts and extended privilege-boundary e2e.
+- OTP-enrollment ownership: `POST /v1/auth/otp/setup` generated and
+  returned a fresh secret for any user id to any writer, hijacking the
+  victim's second factor (and locking them out); now admin-or-self like
+  passkeys; covered in the privilege-boundary e2e.
 - Strict role names on register: unknown `roles` entries now fail with
   `400` instead of silently degrading to the default, so typos like
   `"owenr"` cannot grant unintended access levels; covered in the
   privilege-boundary e2e.
+- Complete REST admission: reads (`GET`, scan, GraphQL, SQL reads, TTL),
+  deletes, and SQL writes now draw from the read/write buckets, and every
+  materialized response charges its bytes to the egress bucket (`429` on
+  exhaustion); previously large-read exfiltration loops ran unthrottled
+  at shared tier. Covered by `e2e_read_egress_throttled` and the
+  `admit_egress` bucket unit test.
+- Wire-protocol response egress: RESP charges reply bytes at the socket
+  loop and native charges framed-response bytes in dispatch, so bulk
+  reads on both binary protocols draw down the tier egress bucket;
+  covered by `qos_throttles_response_bytes` and
+  `native_egress_throttles_responses`. The PG wire gateway charges
+  simple-query and extended-execute responses the same way without
+  breaking protocol sync; covered by `pg_qos_throttles_response_bytes`.
+  gRPC charges exact encoded reply bytes per RPC; covered by
+  `grpc_egress_throttles_responses`.
+- Bounded auth identifiers: user ids capped at 256 bytes
+  (`MAX_USER_LEN`) on register, passkey enroll, and challenge issue,
+  and the challenge map prunes expired entries plus caps at 4096 pending
+  (`429` beyond); covered by registry unit tests and a live `400` on an
+  oversize challenge user.
+- Durable-topic shape policy: `POST /v1/topics/append` enforces the
+  shared 1 KiB key / 4 MiB value caps instead of relying solely on the
+  2 MiB body limit; covered by a `400` on a 2 KiB message key.
+- Realtime naming bounds: channel/partition/member names capped at
+  256 bytes and presence state at 4 KiB, keeping the 1000-member room
+  cap meaningful; covered by live `400`s.
+- Spec/docs catch-up for enforced caps: query-stream clamp and
+  `/v1/scan` limit corrected to 1000 in `docs/streaming.md` and
+  `schemas/openapi/rest.yaml`.
+- Manual verify requires write auth: `GET /v1/backups/verify` re-reads
+  and decrypts the whole archive but accepted any authenticated
+  principal; read-only callers now get `403`, matching the cost of the
+  operation; covered by `e2e_verify_requires_write`.
 - First live PITR coverage: `e2e_pitr_restore_roundtrip` writes a row,
   snapshots, checkpoints, writes a second row, restores to the checkpoint
   commit, and asserts the first row survives while the second is gone.

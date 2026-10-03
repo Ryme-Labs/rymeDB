@@ -202,6 +202,15 @@ impl QosRegistry {
         }
     }
 
+    pub fn admit_egress(&mut self, tenant: &str, bytes: u64, now_nanos: u64) -> Result<()> {
+        let state = self.state_mut(tenant, now_nanos);
+        if state.egress_bucket.take(bytes as f64, now_nanos) {
+            Ok(())
+        } else {
+            Err(RymeError::Overload(String::from("egress quota")))
+        }
+    }
+
     pub fn connection_open(&mut self, tenant: &str, now_nanos: u64) -> Result<()> {
         let state = self.state_mut(tenant, now_nanos);
         if state.active_connections >= state.quota.max_connections {
@@ -287,6 +296,26 @@ mod tests {
         let dedicated = Quota::for_tier(Tier::DedicatedShard);
         assert!(dedicated.write_qps > shared.write_qps);
         assert!(dedicated.max_connections > shared.max_connections);
+    }
+
+    #[test]
+    fn egress_bytes_throttle() {
+        let mut registry = QosRegistry::new();
+        registry.set_quota(
+            "t",
+            Quota {
+                read_qps: 1000,
+                write_qps: 1000,
+                egress_bytes_per_sec: 100,
+                realtime_msg_per_sec: 1000,
+                max_connections: 10,
+                max_storage_bytes: u64::MAX,
+            },
+            0,
+        );
+        assert!(registry.admit_egress("t", 60, 0).is_ok());
+        assert!(registry.admit_egress("t", 60, 0).is_err());
+        assert!(registry.admit_egress("t", 60, 1_000_000_000).is_ok());
     }
 
     #[test]

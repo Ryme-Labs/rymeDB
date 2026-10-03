@@ -171,6 +171,21 @@ where
         }
     }
 
+    #[allow(clippy::result_large_err)]
+    fn admit_response<T: prost::Message>(
+        &self,
+        principal: &Principal,
+        reply: T,
+    ) -> std::result::Result<Response<T>, Status> {
+        let now = qos_now();
+        match self.qos.lock() {
+            Ok(mut qos) => qos.admit_egress(&principal.tenant, reply.encoded_len() as u64, now),
+            Err(_) => Err(RymeError::Internal(String::from("qos lock"))),
+        }
+        .map_err(status_of)?;
+        Ok(Response::new(reply))
+    }
+
     fn observe(&self, principal: &Principal, write: bool) {
         let Some(metering) = self.metering.as_ref() else { return };
         let metric = if write { Metric::WriteUnit } else { Metric::ReadUnit };
@@ -324,7 +339,7 @@ where
         };
         self.observe(&principal, false);
         self.record_timing("kv_get", &inner.table, start.elapsed().as_micros() as u64, parent);
-        Ok(Response::new(reply))
+        self.admit_response(&principal, reply)
     }
 
     async fn kv_put(
@@ -370,7 +385,7 @@ where
         }
         self.observe(&principal, true);
         self.record_timing("kv_put", &inner.table, start.elapsed().as_micros() as u64, parent);
-        Ok(Response::new(reply))
+        self.admit_response(&principal, reply)
     }
 
     async fn kv_delete(
@@ -401,7 +416,7 @@ where
         }
         self.observe(&principal, true);
         self.record_timing("kv_delete", &inner.table, start.elapsed().as_micros() as u64, parent);
-        Ok(Response::new(reply))
+        self.admit_response(&principal, reply)
     }
 
     async fn scan(
@@ -430,7 +445,7 @@ where
         };
         self.observe(&principal, false);
         self.record_timing("scan", &inner.table, start.elapsed().as_micros() as u64, parent);
-        Ok(Response::new(reply))
+        self.admit_response(&principal, reply)
     }
 
     async fn sql(
@@ -508,6 +523,6 @@ where
             start.elapsed().as_micros() as u64,
             parent,
         );
-        Ok(Response::new(response))
+        self.admit_response(&principal, response)
     }
 }

@@ -1,0 +1,7 @@
+set -e
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace --locked
+cargo run -p xtask -- check-no-comments
+pnpm -r --if-present check
+python3 schemas/openapi/validate.py

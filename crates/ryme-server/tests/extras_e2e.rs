@@ -288,6 +288,52 @@ async fn extras_auth_presence_topics_mask() {
         http_request(http, "GET /v1/topics/read?partition=orders&from=0&limit=10", b"").await;
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&body).contains("k1"));
+    let big_key = "k".repeat(2048);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/topics/append",
+        format!("{{\"partition\":\"orders\",\"key\":\"{big_key}\",\"value\":\"v\"}}").as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let big_name = "n".repeat(300);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/presence/join",
+        format!("{{\"channel\":\"{big_name}\",\"member\":\"ada\"}}").as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/presence/join",
+        format!("{{\"channel\":\"room:1\",\"member\":\"{big_name}\"}}").as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let big_state = "s".repeat(5000);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/presence/join",
+        format!("{{\"channel\":\"room:1\",\"member\":\"ada\",\"state\":\"{big_state}\"}}")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/broadcast",
+        format!("{{\"channel\":\"{big_name}\",\"payload\":true}}").as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/topics/append",
+        format!("{{\"partition\":\"{big_name}\",\"key\":\"k\",\"value\":\"v\"}}").as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 400);
     let (status, _) =
         http_request(http, "POST /v1/auth/passkey/challenge", b"{\"user\":\"ada\"}").await;
     assert_eq!(status, 200);
@@ -1281,6 +1327,20 @@ async fn extras_auth_privilege_boundaries() {
     )
     .await;
     assert_eq!(status, 409);
+    let big_user = "u".repeat(300);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/auth/passkey/challenge",
+        format!("{{\"user\":\"{big_user}\"}}").as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) =
+        bearer_request(http, &app_key, "POST /v1/auth/otp/setup", b"{\"id\":\"boss\"}").await;
+    assert_eq!(status, 403);
+    let (status, _) =
+        bearer_request(http, &app_key, "POST /v1/auth/otp/setup", b"{\"id\":\"app\"}").await;
+    assert_eq!(status, 200);
     let (status, _) = bearer_request(
         http,
         &app_key,

@@ -44,7 +44,7 @@ any valid credential; no read-permission check is performed. Each frame is a
 ## `GET /v1/query-stream?table=<name>[&limit=<n>]` — live query
 
 Requires a read-capable principal (`403` otherwise). `limit` defaults to 100
-and is clamped to 1–10000. The first frame is always a full snapshot of the
+and is clamped to 1–1000. The first frame is always a full snapshot of the
 table at the current commit:
 
 ```json
@@ -76,6 +76,10 @@ read and join, and the TTL sweep loop prunes dead members across all rooms
 abandoned presence state cannot accumulate. Each room holds at most 1000
 members; joins beyond the cap get `429`, and re-joining an existing member
 always succeeds.
+
+Channel, partition, and member names are capped at 256 bytes and presence
+state payloads at 4 KiB (`400` beyond), so rooms stay small enough for the
+1000-member cap to mean something.
 
 Idle realtime scopes are reclaimed on the sweep cadence: change-feed and
 broadcast senders with no receivers and no retained history, and query

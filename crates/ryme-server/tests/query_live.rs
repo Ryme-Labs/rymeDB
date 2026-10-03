@@ -278,3 +278,42 @@ async fn live_query_snapshot_limit_capped() {
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn live_stream_sheds_on_egress_quota() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!("ryme-shed-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}");
+    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let big = "v".repeat(512 * 1024);
+    let mut received = 0usize;
+    let start = tokio::time::Instant::now();
+    for index in 0..4 {
+        let _ = http_request(http, &format!("PUT /v1/kv/docs/shed-{index}"), big.as_bytes()).await;
+        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))) => {
+                received += 1;
+            }
+            _ => break,
+        }
+    }
+    assert!((1..4).contains(&received), "shed {received} of 4 bulk messages");
+    assert!(start.elapsed() < Duration::from_secs(14), "stream never shed");
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}

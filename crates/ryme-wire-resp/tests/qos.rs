@@ -68,6 +68,34 @@ async fn qos_throttles_writes_not_reads() {
 }
 
 #[tokio::test]
+async fn qos_throttles_response_bytes() {
+    let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
+    {
+        let mut registry = qos.lock().unwrap();
+        registry.set_quota(
+            "t",
+            ryme_qos::Quota {
+                egress_bytes_per_sec: 512,
+                ..ryme_qos::Quota::for_tier(ryme_qos::Tier::Shared)
+            },
+            now_nanos(),
+        );
+    }
+    let gateway = ryme_wire_resp::RespGateway::new(String::from("t"), String::from("d"))
+        .with_qos(qos.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+    let big = "v".repeat(200);
+    assert_eq!(command(addr, &["SET", "big", &big]).await, "+OK");
+    assert!(command(addr, &["GET", "big"]).await.starts_with("$200"));
+    let denied = command(addr, &["GET", "big"]).await;
+    assert!(denied.contains("egress"), "{denied}");
+}
+
+#[tokio::test]
 async fn qos_absent_means_unlimited() {
     let gateway = ryme_wire_resp::RespGateway::new(String::from("t"), String::from("d"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

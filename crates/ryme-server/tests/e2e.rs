@@ -203,6 +203,40 @@ async fn app_key_for(addr: std::net::SocketAddr, id: &str) -> String {
 }
 
 #[tokio::test]
+async fn e2e_verify_requires_write() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root =
+        std::env::temp_dir().join(format!("ryme-e2e-verify-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let config = test_config(&root, pg, resp, http);
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let body = "{\"id\":\"ro\",\"password\":\"correct-horse\",\"roles\":[\"readonly\"]}";
+    let (status, _) = http_request(http, "POST /v1/auth/register", body.as_bytes()).await;
+    assert_eq!(status, 201);
+    let (status, raw) = http_request(http, "POST /v1/auth/token", body.as_bytes()).await;
+    assert_eq!(status, 201);
+    let ro_key = serde_json::from_slice::<serde_json::Value>(&raw)
+        .unwrap()
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    let status = bearer_status(http, &ro_key, "GET /v1/backups/verify?backup_id=x", b"").await;
+    assert_eq!(status, 403);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn e2e_scan_pagination_bounds() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root =
@@ -422,6 +456,7 @@ async fn e2e_scheduled_drill_verifies_latest_backup() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     let (status, _) = http_request(http, "GET /v1/backups/drill", b"").await;
     assert_eq!(status, 404);
+    assert_eq!(http_status_no_auth(http, "GET /v1/backups/drill").await, 401);
     let (status, _) = http_request(http, "PUT /v1/kv/docs/drill", b"{\"n\":1}").await;
     assert_eq!(status, 200);
     let (status, _) = http_request(http, "POST /v1/backups/checkpoint", b"{}").await;
@@ -525,6 +560,42 @@ async fn e2e_drill_reports_corruption() {
         assert!(tokio::time::Instant::now() < deadline, "no drill completed");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn e2e_read_egress_throttled() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root =
+        std::env::temp_dir().join(format!("ryme-e2e-egress-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let config = test_config(&root, pg, resp, http);
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let big = "v".repeat(1024 * 1024);
+    let (status, _) = http_request(http, "PUT /v1/kv/docs/big", big.as_bytes()).await;
+    assert_eq!(status, 200);
+    let (status, _) = http_request(http, "GET /v1/kv/docs/big", b"").await;
+    assert_eq!(status, 200);
+    let mut denied = false;
+    for _ in 0..7 {
+        let (status, _) = http_request(http, "GET /v1/kv/docs/big", b"").await;
+        if status == 429 {
+            denied = true;
+            break;
+        }
+        assert_eq!(status, 200);
+    }
+    assert!(denied, "shared egress bucket never throttled 1MiB reads");
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }

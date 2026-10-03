@@ -67,6 +67,16 @@ fn admit_statement(limits: &ConnLimits, statement: &Statement, bytes: u64) -> Op
     admitted.err().map(|e| encode_error_code("53400", e.to_string()))
 }
 
+fn admit_response(limits: &ConnLimits, bytes: u64) -> Option<Vec<u8>> {
+    let qos = limits.qos.as_ref()?;
+    let now = qos_now_nanos();
+    let denied = match qos.lock() {
+        Ok(mut registry) => registry.admit_egress(&limits.tenant, bytes, now).err(),
+        Err(_) => Some(RymeError::Internal(String::from("qos lock"))),
+    };
+    denied.map(|e| encode_error_code("53400", e.to_string()))
+}
+
 fn observe_statement(limits: &ConnLimits, write: bool) {
     let Some(metering) = limits.metering.as_ref() else { return };
     let metric = if write { Metric::WriteUnit } else { Metric::ReadUnit };
@@ -456,6 +466,10 @@ where
                 if out.is_empty() {
                     out.extend_from_slice(&frame(b'I', b""));
                 }
+                let out = match admit_response(&limits, out.len() as u64) {
+                    Some(denied) => denied,
+                    None => out,
+                };
                 socket.write_all(&out).await.map_err(|e| RymeError::Io(e.to_string()))?;
                 send_ready(&mut socket).await?;
             }
@@ -572,6 +586,10 @@ where
                         None => encode_error(String::from("unknown statement")),
                     },
                     None => encode_error(String::from("unknown portal")),
+                };
+                let response = match admit_response(&limits, response.len() as u64) {
+                    Some(denied) => denied,
+                    None => response,
                 };
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }

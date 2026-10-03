@@ -326,6 +326,8 @@ pub struct PasswordHash {
 
 pub const PASSWORD_ROUNDS: u32 = 210_000;
 pub const MAX_PASSWORD_LEN: usize = 256;
+pub const MAX_USER_LEN: usize = 256;
+pub const MAX_CHALLENGES: usize = 4096;
 
 pub fn hash_password(password: &str) -> PasswordHash {
     let salt = random_bytes(16);
@@ -415,7 +417,7 @@ impl PasskeyRegistry {
         Self { challenges: HashMap::new(), credentials: HashMap::new() }
     }
 
-    pub fn challenge(&mut self, user: &str) -> String {
+    pub fn challenge(&mut self, user: &str) -> Result<String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -423,15 +425,27 @@ impl PasskeyRegistry {
         self.challenge_at(user, now)
     }
 
-    pub fn challenge_at(&mut self, user: &str, now_secs: u64) -> String {
+    pub fn challenge_at(&mut self, user: &str, now_secs: u64) -> Result<String> {
+        if user.is_empty() || user.len() > MAX_USER_LEN {
+            return Err(RymeError::InvalidArgument(String::from("user")));
+        }
+        self.challenges.retain(|_, (_, issued_at)| {
+            issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) >= now_secs
+        });
+        if self.challenges.len() >= MAX_CHALLENGES && !self.challenges.contains_key(user) {
+            return Err(RymeError::Overload(String::from("challenges")));
+        }
         let raw = random_bytes(32);
         let encoded = base64_url_encode(&raw);
         self.challenges.insert(user.to_string(), (raw, now_secs));
-        encoded
+        Ok(encoded)
     }
 
     pub fn register(&mut self, user: &str, credential_id: String, public_key: &[u8]) -> Result<()> {
         use p256::elliptic_curve::sec1::FromSec1Point;
+        if user.is_empty() || user.len() > MAX_USER_LEN {
+            return Err(RymeError::InvalidArgument(String::from("user")));
+        }
         if credential_id.is_empty() || credential_id.len() > 256 {
             return Err(RymeError::InvalidArgument(String::from("credential")));
         }
@@ -593,7 +607,11 @@ impl CredentialStore {
         password: &str,
         roles: HashSet<Role>,
     ) -> Result<()> {
-        if id.is_empty() || password.len() < 8 || password.len() > MAX_PASSWORD_LEN {
+        if id.is_empty()
+            || id.len() > MAX_USER_LEN
+            || password.len() < 8
+            || password.len() > MAX_PASSWORD_LEN
+        {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
         if self.users.contains_key(&id) {
@@ -817,7 +835,7 @@ mod tests {
     #[test]
     fn passkey_challenge_registers() {
         let mut registry = PasskeyRegistry::new();
-        let challenge = registry.challenge("ada");
+        let challenge = registry.challenge("ada").unwrap();
         assert!(!challenge.is_empty());
         assert!(registry.register("ada", String::from("cred-1"), b"nope").is_err());
         let secret = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
@@ -827,6 +845,23 @@ mod tests {
         assert_eq!(registry.owner_of("missing"), None);
         assert!(registry.register("mallory", String::from("cred-1"), &public).is_err());
         assert_eq!(registry.owner_of("cred-1"), Some(String::from("ada")));
+        assert!(registry
+            .register(&"u".repeat(MAX_USER_LEN + 1), String::from("cred-2"), &public)
+            .is_err());
+    }
+
+    #[test]
+    fn challenge_bounds_users_and_map() {
+        let mut registry = PasskeyRegistry::new();
+        assert!(registry.challenge("").is_err());
+        assert!(registry.challenge(&"u".repeat(MAX_USER_LEN + 1)).is_err());
+        assert!(registry.challenge(&"u".repeat(MAX_USER_LEN)).is_ok());
+        for index in 0..MAX_CHALLENGES - 1 {
+            registry.challenge_at(&format!("user-{index}"), 1000).unwrap();
+        }
+        assert!(registry.challenge_at("one-more", 1000).is_err());
+        assert!(registry.challenge_at("user-0", 1000).is_ok());
+        assert!(registry.challenge_at("fresh", 1000 + PASSKEY_CHALLENGE_TTL_SECS + 1).is_ok());
     }
 
     #[test]
@@ -839,7 +874,7 @@ mod tests {
         let origins = vec![String::from("https://auth.test")];
         let mut registry = PasskeyRegistry::new();
         registry.register("ada", String::from("cred-1"), &public).unwrap();
-        let challenge = registry.challenge_at("ada", 1000);
+        let challenge = registry.challenge_at("ada", 1000).unwrap();
         let client_data = format!(
             "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"https://auth.test\"}}"
         );
@@ -868,10 +903,10 @@ mod tests {
         };
         assert!(attempt(&mut registry, &auth_data, client_data.as_bytes(), &signature).is_ok());
         assert!(attempt(&mut registry, &auth_data, client_data.as_bytes(), &signature).is_err());
-        let fresh = registry.challenge_at("ada", 1200);
+        let fresh = registry.challenge_at("ada", 1200).unwrap();
         let tampered = client_data.replace(&fresh, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert!(attempt(&mut registry, &auth_data, tampered.as_bytes(), &signature).is_err());
-        let stale = registry.challenge_at("ada", 0);
+        let stale = registry.challenge_at("ada", 0).unwrap();
         let stale_client = format!(
             "{{\"type\":\"webauthn.get\",\"challenge\":\"{stale}\",\"origin\":\"https://auth.test\"}}"
         );
@@ -882,7 +917,7 @@ mod tests {
         let stale_sig: p256::ecdsa::Signature = secret.sign(&stale_signed);
         let stale_sig = stale_sig.to_der().as_bytes().to_vec();
         assert!(attempt(&mut registry, &auth_data, stale_client.as_bytes(), &stale_sig).is_err());
-        let fresh = registry.challenge_at("ada", 1300);
+        let fresh = registry.challenge_at("ada", 1300).unwrap();
         let bad_origin = format!(
             "{{\"type\":\"webauthn.get\",\"challenge\":\"{fresh}\",\"origin\":\"https://evil.test\"}}"
         );
@@ -899,7 +934,7 @@ mod tests {
                 now_secs: 1400,
             })
             .is_err());
-        let replay_challenge = registry.challenge_at("ada", 1500);
+        let replay_challenge = registry.challenge_at("ada", 1500).unwrap();
         let replay_client = format!(
             "{{\"type\":\"webauthn.get\",\"challenge\":\"{replay_challenge}\",\"origin\":\"https://auth.test\"}}"
         );
@@ -957,6 +992,14 @@ mod tests {
         assert!(store.verify_password("ada", "correct-horse").is_ok());
         assert!(store.verify_password("ada", "attacker-password").is_err());
         assert_eq!(store.principal("ada").unwrap().tenant, "t");
+        assert!(store
+            .register_password(
+                "u".repeat(MAX_USER_LEN + 1),
+                String::from("t"),
+                "correct-horse",
+                HashSet::new()
+            )
+            .is_err());
     }
 
     #[test]

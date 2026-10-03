@@ -2078,6 +2078,12 @@ fn admit_write(state: &SharedState, tenant: &str, bytes: u64) -> ryme_error::Res
         Err(_) => Err(ryme_error::RymeError::Internal(String::from("qos lock"))),
     }
 }
+fn admit_egress(state: &SharedState, tenant: &str, bytes: u64) -> ryme_error::Result<()> {
+    match state.qos.lock() {
+        Ok(mut qos) => qos.admit_egress(tenant, bytes, qos_now_nanos()),
+        Err(_) => Err(ryme_error::RymeError::Internal(String::from("qos lock"))),
+    }
+}
 
 fn admit_realtime(state: &SharedState, tenant: &str, messages: u64) -> ryme_error::Result<()> {
     match state.qos.lock() {
@@ -2162,6 +2168,10 @@ async fn rest_list(
     let filtered = rest_list_filtered(rows, raw.as_deref().unwrap_or(""));
     let ordered = order_rows(filtered, query.order.as_deref());
     let paged: Vec<(Vec<u8>, Vec<u8>)> = ordered.into_iter().skip(offset).take(limit).collect();
+    let egress: u64 = paged.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
+    if let Err(e) = admit_egress(&state, &principal.tenant, egress) {
+        return error_response(e);
+    }
     let items: Vec<serde_json::Value> = paged
         .iter()
         .map(|(pk, value)| rest_row_to_json(pk, &state.gateway.masked(&table, value.clone())))
@@ -2322,6 +2332,9 @@ async fn rest_delete(
             "key=eq.<id> required",
         )));
     };
+    if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {
+        return error_response(e);
+    }
     match state.gateway.delete(&principal, &table, key.into_bytes()).await {
         Ok(commit) => {
             record_meter(&state, Metric::WriteUnit, 1);
@@ -2366,6 +2379,9 @@ async fn graphql_exec(
     if !principal.can_read() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    if let Err(e) = admit_read(&state, &principal.tenant) {
+        return error_response(e);
+    }
     match execute_graphql(&state, &principal, &body.query).await {
         Ok(value) => (StatusCode::OK, Json(serde_json::json!({ "data": value }))).into_response(),
         Err(e) => error_response(e),
@@ -2383,6 +2399,7 @@ async fn execute_graphql(
     if let Some(key) = parse_graphql_key(query) {
         match state.gateway.get(principal, &table, key.as_bytes())? {
             Some(value) => {
+                admit_egress(state, &principal.tenant, value.len() as u64)?;
                 let masked = state.gateway.masked(&table, value);
                 Ok(serde_json::json!({ table: rest_row_to_json(key.as_bytes(), &masked) }))
             }
@@ -2392,6 +2409,8 @@ async fn execute_graphql(
         let limit = parse_graphql_limit(query).unwrap_or(100).min(1000);
         let mut txn = state.backend.begin();
         let rows = state.backend.scan(&mut txn, &state.tenant, &state.database, &table, limit)?;
+        let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
+        admit_egress(state, &principal.tenant, egress)?;
         let items: Vec<serde_json::Value> = rows
             .iter()
             .map(|(pk, value)| rest_row_to_json(pk, &state.gateway.masked(&table, value.clone())))
@@ -3060,6 +3079,9 @@ async fn otp_setup(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    if !principal.can_admin() && principal.id != request.id {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let secret = ryme_auth::random_bytes(20);
     let encoded = ryme_auth::base64_url_encode(&secret);
     match state.credentials.lock() {
@@ -3108,10 +3130,11 @@ async fn passkey_challenge(
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
     }
     match state.passkeys.lock() {
-        Ok(mut registry) => {
-            let challenge = registry.challenge(&request.user);
-            (StatusCode::OK, Json(serde_json::json!({ "challenge": challenge }))).into_response()
-        }
+        Ok(mut registry) => match registry.challenge(&request.user) {
+            Ok(challenge) => (StatusCode::OK, Json(serde_json::json!({ "challenge": challenge })))
+                .into_response(),
+            Err(e) => error_response(e),
+        },
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     }
 }
@@ -3350,6 +3373,18 @@ async fn presence_join(
     if request.channel.is_empty() || request.member.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
     }
+    if request.channel.len() > 256 || request.member.len() > 256 {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
+    }
+    if request
+        .state
+        .as_ref()
+        .map(|state| serde_json::to_string(state).map(|text| text.len()).unwrap_or(0))
+        .unwrap_or(0)
+        > 4096
+    {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
+    }
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
     }
@@ -3423,6 +3458,9 @@ async fn broadcast_post(
     if request.channel.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("channel")));
     }
+    if request.channel.len() > 256 {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("channel")));
+    }
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
     }
@@ -3460,14 +3498,16 @@ async fn broadcast_stream(
     }
     let realtime = state.realtime.clone();
     let tenant = principal.tenant.clone();
+    let qos = state.qos.clone();
     upgrade.on_upgrade(move |socket| async move {
-        forward_broadcast(socket, realtime, &tenant, &channel).await;
+        forward_broadcast(socket, realtime, qos, &tenant, &channel).await;
     })
 }
 
 async fn forward_broadcast(
     socket: axum::extract::ws::WebSocket,
     realtime: Realtime,
+    qos: Arc<Mutex<QosRegistry>>,
     tenant: &str,
     channel: &str,
 ) {
@@ -3479,6 +3519,9 @@ async fn forward_broadcast(
                 match message {
                     Ok(record) => {
                         let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
+                        if !stream_egress(&qos, tenant, text.len() as u64) {
+                            break;
+                        }
                         if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
                             break;
                         }
@@ -3515,6 +3558,15 @@ async fn durable_append(
     }
     if request.partition.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("partition")));
+    }
+    if request.partition.len() > 256 {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("partition")));
+    }
+    if request.key.is_empty() || request.key.len() > ryme_gateway::MAX_KEY_BYTES {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("key")));
+    }
+    if request.value.len() > ryme_gateway::MAX_VALUE_BYTES {
+        return error_response(ryme_error::RymeError::Overload(String::from("value")));
     }
     let bytes = (request.key.len() + request.value.len()) as u64;
     if let Err(e) = admit_write(&state, &principal.tenant, bytes) {
@@ -3554,6 +3606,10 @@ async fn durable_read(
         query.from.unwrap_or(0),
         query.limit.unwrap_or(100),
     );
+    let egress: u64 = messages.iter().map(|msg| (msg.key.len() + msg.value.len()) as u64).sum();
+    if let Err(e) = admit_egress(&state, &principal.tenant, egress) {
+        return error_response(e);
+    }
     let items: Vec<serde_json::Value> = messages
         .into_iter()
         .map(|msg| {
@@ -3858,8 +3914,14 @@ fn inner_kv_get(state: &SharedState, headers: &HeaderMap, table: &str, key: &[u8
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if let Err(e) = admit_read(state, &principal.tenant) {
+        return error_response(e);
+    }
     match state.gateway.get(&principal, table, key) {
         Ok(Some(value)) => {
+            if let Err(e) = admit_egress(state, &principal.tenant, value.len() as u64) {
+                return error_response(e);
+            }
             let masked = state.gateway.masked(table, value);
             (StatusCode::OK, masked).into_response()
         }
@@ -3950,6 +4012,9 @@ async fn kv_ttl(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if let Err(e) = admit_read(&state, &principal.tenant) {
+        return error_response(e);
+    }
     match state.gateway.ttl_of(&principal, &table, key.as_bytes()) {
         Ok(ryme_gateway::Ttl::Missing) => {
             error_response(ryme_error::RymeError::NotFound(String::from("row")))
@@ -3975,6 +4040,9 @@ async fn kv_delete(
         Err(e) => return error_response(e),
     };
     let key_bytes = key.into_bytes();
+    if let Err(e) = admit_write(&state, &principal.tenant, key_bytes.len() as u64) {
+        return error_response(e);
+    }
     let result = match state.gateway.delete(&principal, &table, key_bytes.clone()).await {
         Ok(commit) => {
             (StatusCode::OK, Json(serde_json::json!({ "commit": commit }))).into_response()
@@ -4027,29 +4095,53 @@ async fn sql_exec(
     {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    if statement.is_write() {
+        if let Err(e) = admit_write(&state, &principal.tenant, sql.len() as u64) {
+            return error_response(e);
+        }
+    } else if let Err(e) = admit_read(&state, &principal.tenant) {
+        return error_response(e);
+    }
     let table_name = statement.table().to_string();
     let write_statement = statement.is_write();
     let result = match state.executor.execute(statement).await {
         Ok(QueryResult::Ok) => {
             (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
         }
-        Ok(QueryResult::Row { pk, value }) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "pk": String::from_utf8_lossy(&pk),
-                "value": String::from_utf8_lossy(&state.gateway.masked(&table_name, value)),
-            })),
-        )
-            .into_response(),
-        Ok(QueryResult::Scalar { label, value }) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "scalar": label,
-                "value": String::from_utf8_lossy(&value),
-            })),
-        )
-            .into_response(),
+        Ok(QueryResult::Row { pk, value }) => {
+            if let Err(e) = admit_egress(&state, &principal.tenant, (pk.len() + value.len()) as u64)
+            {
+                return error_response(e);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "pk": String::from_utf8_lossy(&pk),
+                    "value": String::from_utf8_lossy(&state.gateway.masked(&table_name, value)),
+                })),
+            )
+                .into_response()
+        }
+        Ok(QueryResult::Scalar { label, value }) => {
+            if let Err(e) =
+                admit_egress(&state, &principal.tenant, (label.len() + value.len()) as u64)
+            {
+                return error_response(e);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "scalar": label,
+                    "value": String::from_utf8_lossy(&value),
+                })),
+            )
+                .into_response()
+        }
         Ok(QueryResult::Rows { rows }) => {
+            let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
+            if let Err(e) = admit_egress(&state, &principal.tenant, egress) {
+                return error_response(e);
+            }
             let items: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|(pk, value)| {
@@ -4102,9 +4194,16 @@ async fn scan(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    if let Err(e) = admit_read(&state, &principal.tenant) {
+        return error_response(e);
+    }
     let mut txn = state.backend.begin();
     match state.backend.scan(&mut txn, &state.tenant, &state.database, &table, limit) {
         Ok(rows) => {
+            let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
+            if let Err(e) = admit_egress(&state, &principal.tenant, egress) {
+                return error_response(e);
+            }
             let items: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|(pk, value)| {
@@ -4604,8 +4703,12 @@ async fn backup_verify(
     headers: HeaderMap,
     Query(query): Query<VerifyQuery>,
 ) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
+    if !principal.can_write() {
+        return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(target) = state.archive.clone() else {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("archive")));
@@ -5064,14 +5167,23 @@ async fn stream(
     let database = state.database.clone();
     let table = query.table.clone();
     let from = query.from.unwrap_or(u64::MAX);
+    let qos = state.qos.clone();
     upgrade.on_upgrade(move |socket| async move {
-        forward_changes(socket, realtime, &tenant, &database, &table, from).await;
+        forward_changes(socket, realtime, qos, &tenant, &database, &table, from).await;
     })
+}
+
+fn stream_egress(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64) -> bool {
+    match qos.lock() {
+        Ok(mut registry) => registry.admit_egress(tenant, bytes, qos_now_nanos()).is_ok(),
+        Err(_) => false,
+    }
 }
 
 async fn forward_changes(
     socket: axum::extract::ws::WebSocket,
     realtime: Realtime,
+    qos: Arc<Mutex<QosRegistry>>,
     tenant: &str,
     database: &str,
     table: &str,
@@ -5084,6 +5196,9 @@ async fn forward_changes(
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
         let text = serde_json::to_string(record).unwrap_or_else(|_| String::from("{}"));
+        if !stream_egress(&qos, tenant, text.len() as u64) {
+            return;
+        }
         if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
             return;
         }
@@ -5098,6 +5213,9 @@ async fn forward_changes(
                         }
                         seen_sequence = seen_sequence.max(record.sequence);
                         let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
+                        if !stream_egress(&qos, tenant, text.len() as u64) {
+                            break;
+                        }
                         if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
                             break;
                         }
@@ -5138,15 +5256,18 @@ async fn query_stream(
     let tenant = state.tenant.clone();
     let database = state.database.clone();
     let table = query.table.clone();
+    let qos = state.qos.clone();
     upgrade.on_upgrade(move |socket| async move {
-        forward_query(socket, backend, realtime, &tenant, &database, &table, limit).await;
+        forward_query(socket, backend, realtime, qos, &tenant, &database, &table, limit).await;
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_query(
     socket: axum::extract::ws::WebSocket,
     backend: Backend,
     realtime: Realtime,
+    qos: Arc<Mutex<QosRegistry>>,
     tenant: &str,
     database: &str,
     table: &str,
@@ -5155,7 +5276,7 @@ async fn forward_query(
     let mut receiver = realtime.query_subscribe(tenant, database, table, limit);
     let (mut sender, mut incoming) = socket.split();
     let mut snapshot_commit =
-        send_query_snapshot(&mut sender, &backend, tenant, database, table, limit).await;
+        send_query_snapshot(&mut sender, &backend, &qos, tenant, database, table, limit).await;
     loop {
         tokio::select! {
             message = receiver.recv() => {
@@ -5175,6 +5296,9 @@ async fn forward_query(
                             "truncated": update.truncated,
                         }))
                         .unwrap_or_else(|_| String::from("{}"));
+                        if !stream_egress(&qos, tenant, text.len() as u64) {
+                            break;
+                        }
                         if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
                             break;
                         }
@@ -5183,6 +5307,7 @@ async fn forward_query(
                         snapshot_commit = send_query_snapshot(
                             &mut sender,
                             &backend,
+                            &qos,
                             tenant,
                             database,
                             table,
@@ -5209,6 +5334,7 @@ async fn send_query_snapshot(
         axum::extract::ws::Message,
     >,
     backend: &Backend,
+    qos: &Arc<Mutex<QosRegistry>>,
     tenant: &str,
     database: &str,
     table: &str,
@@ -5229,7 +5355,11 @@ async fn send_query_snapshot(
             }))
             .collect::<Vec<_>>(),
     });
-    let _ = sender.send(axum::extract::ws::Message::Text(snapshot.to_string())).await;
+    let text = snapshot.to_string();
+    if !stream_egress(qos, tenant, text.len() as u64) {
+        return commit;
+    }
+    let _ = sender.send(axum::extract::ws::Message::Text(text)).await;
     commit
 }
 
