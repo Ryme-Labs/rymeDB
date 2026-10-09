@@ -851,12 +851,22 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
     let kind =
         if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES") {
             "tables"
-        } else if upper.contains("INFORMATION_SCHEMA.COLUMNS")
-            || upper.contains("PG_CATALOG.PG_ATTRIBUTE")
-        {
+        } else if upper.contains("INFORMATION_SCHEMA.COLUMNS") {
             "columns"
+        } else if upper.contains("PG_CATALOG.PG_ATTRIBUTE") {
+            "attributes"
         } else if upper.contains("PG_CATALOG.PG_INDEXES") {
             "indexes"
+        } else if upper.contains("PG_CATALOG.PG_NAMESPACE") {
+            "namespaces"
+        } else if upper.contains("PG_CATALOG.PG_CLASS") {
+            "classes"
+        } else if upper.contains("PG_CATALOG.PG_TYPE") {
+            "types"
+        } else if upper.contains("PG_CATALOG.PG_CONSTRAINT") {
+            "constraints"
+        } else if upper.contains("PG_CATALOG.PG_INDEX") {
+            "index"
         } else {
             return None;
         };
@@ -865,6 +875,12 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
     let defaults = match kind {
         "tables" => vec![String::from("table_name")],
         "indexes" => vec![String::from("indexname")],
+        "namespaces" => vec![String::from("nspname")],
+        "classes" => vec![String::from("relname")],
+        "types" => vec![String::from("typname")],
+        "constraints" => vec![String::from("conname")],
+        "index" => vec![String::from("indexrelid")],
+        "attributes" => vec![String::from("attname")],
         _ => vec![String::from("column_name")],
     };
     if selected.is_empty() || selected.iter().any(|item| item == "*") {
@@ -881,11 +897,62 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("tablespace"),
                 String::from("indexdef"),
             ],
+            "namespaces" => vec![
+                String::from("oid"),
+                String::from("nspname"),
+                String::from("nspowner"),
+                String::from("nspacl"),
+            ],
+            "classes" => vec![
+                String::from("oid"),
+                String::from("relname"),
+                String::from("relnamespace"),
+                String::from("relkind"),
+                String::from("relpersistence"),
+                String::from("relhasindex"),
+            ],
+            "types" => vec![
+                String::from("oid"),
+                String::from("typname"),
+                String::from("typnamespace"),
+                String::from("typtype"),
+                String::from("typrelid"),
+                String::from("typlen"),
+            ],
+            "constraints" => vec![
+                String::from("oid"),
+                String::from("conname"),
+                String::from("connamespace"),
+                String::from("contype"),
+                String::from("conrelid"),
+                String::from("conindid"),
+                String::from("convalidated"),
+            ],
+            "index" => vec![
+                String::from("indexrelid"),
+                String::from("indrelid"),
+                String::from("indisunique"),
+                String::from("indisprimary"),
+                String::from("indnatts"),
+                String::from("indnkeyatts"),
+                String::from("indkey"),
+            ],
+            "attributes" => vec![
+                String::from("attrelid"),
+                String::from("attname"),
+                String::from("atttypid"),
+                String::from("attlen"),
+                String::from("attnum"),
+                String::from("attnotnull"),
+                String::from("atthasdef"),
+                String::from("attisdropped"),
+            ],
             _ => vec![
                 String::from("column_name"),
                 String::from("data_type"),
                 String::from("is_nullable"),
                 String::from("ordinal_position"),
+                String::from("column_default"),
             ],
         });
     }
@@ -915,6 +982,83 @@ fn sql_literal_after(query: &str, keyword: &str) -> Option<String> {
 
 fn catalog_table_parts(table: &str) -> (&str, &str) {
     table.rsplit_once('.').map_or(("public", table), |(schema, name)| (schema, name))
+}
+
+fn catalog_oid(name: &str) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in name.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash.max(1)
+}
+
+fn catalog_namespace_oid(schema: &str) -> u32 {
+    if schema.eq_ignore_ascii_case("public") {
+        2200
+    } else {
+        catalog_oid(&format!("namespace:{schema}"))
+    }
+}
+
+fn catalog_relation_oid(table: &str) -> u32 {
+    catalog_oid(&format!("relation:{table}"))
+}
+
+fn catalog_index_oid(name: &str) -> u32 {
+    catalog_oid(&format!("index:{name}"))
+}
+
+fn postgres_type_oid(data_type: &str) -> u32 {
+    match data_type.to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => 16,
+        "int2" | "smallint" => 21,
+        "int4" | "integer" => 23,
+        "int8" | "bigint" => 20,
+        "float4" | "real" => 700,
+        "float8" | "double" | "double precision" => 701,
+        "numeric" | "decimal" => 1700,
+        "varchar" | "character varying" => 1043,
+        "text" => 25,
+        "date" => 1082,
+        "timestamp" => 1114,
+        "timestamptz" | "timestamp with time zone" => 1184,
+        "uuid" => 2950,
+        "json" => 114,
+        "jsonb" => 3802,
+        other => catalog_oid(&format!("type:{other}")),
+    }
+}
+
+fn postgres_type_length(data_type: &str) -> i16 {
+    match data_type.to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => 1,
+        "int2" | "smallint" => 2,
+        "int4" | "integer" | "float4" | "real" => 4,
+        "int8" | "bigint" | "float8" | "double" | "double precision" => 8,
+        "uuid" => 16,
+        _ => -1,
+    }
+}
+
+fn postgres_type_rows() -> Vec<(u32, &'static str, i16, &'static str)> {
+    vec![
+        (16, "bool", 1, "b"),
+        (20, "int8", 8, "b"),
+        (21, "int2", 2, "b"),
+        (23, "int4", 4, "b"),
+        (25, "text", -1, "b"),
+        (700, "float4", 4, "b"),
+        (701, "float8", 8, "b"),
+        (1043, "varchar", -1, "b"),
+        (1082, "date", 4, "b"),
+        (1114, "timestamp", 8, "b"),
+        (1184, "timestamptz", 8, "b"),
+        (1700, "numeric", -1, "b"),
+        (2950, "uuid", 16, "b"),
+        (114, "json", -1, "b"),
+        (3802, "jsonb", -1, "b"),
+    ]
 }
 
 fn information_schema_type(data_type: &str) -> &str {
@@ -962,6 +1106,95 @@ where
         return Some(encode_catalog_rows(&columns, rows));
     }
 
+    if upper.contains("PG_CATALOG.PG_NAMESPACE") {
+        let filter = sql_literal_after(query, "NSPNAME");
+        let rows: Vec<Vec<Vec<u8>>> = vec![("public", 2200u32)]
+            .into_iter()
+            .filter(|(schema, _)| filter.as_ref().is_none_or(|want| want == schema))
+            .map(|(schema, oid)| {
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => oid.to_string().into_bytes(),
+                        "nspname" => schema.as_bytes().to_vec(),
+                        "nspowner" => b"10".to_vec(),
+                        "nspacl" => Vec::new(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_CLASS") {
+        let filter = sql_literal_after(query, "RELNAME");
+        let rows: Vec<Vec<Vec<u8>>> = executor
+            .catalog_tables()
+            .into_iter()
+            .filter(|table| {
+                let (_, table_name) = catalog_table_parts(table);
+                filter.as_ref().is_none_or(|want| want == table || want == table_name)
+            })
+            .map(|table| {
+                let (schema, table_name) = catalog_table_parts(&table);
+                let oid = catalog_relation_oid(&table);
+                let has_index = !executor.catalog_indexes(&table).is_empty();
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => oid.to_string().into_bytes(),
+                        "relname" => table_name.as_bytes().to_vec(),
+                        "relnamespace" => catalog_namespace_oid(schema).to_string().into_bytes(),
+                        "relkind" => b"r".to_vec(),
+                        "relpersistence" => b"p".to_vec(),
+                        "relhasindex" => {
+                            if has_index {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        "relowner" => b"10".to_vec(),
+                        "reltuples" => b"-1".to_vec(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_TYPE") {
+        let filter = sql_literal_after(query, "TYPNAME");
+        let rows: Vec<Vec<Vec<u8>>> = postgres_type_rows()
+            .into_iter()
+            .filter(|(_, name, _, _)| filter.as_ref().is_none_or(|want| want == name))
+            .map(|(oid, name, length, kind)| {
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => oid.to_string().into_bytes(),
+                        "typname" => name.as_bytes().to_vec(),
+                        "typnamespace" => b"11".to_vec(),
+                        "typtype" => kind.as_bytes().to_vec(),
+                        "typrelid" => b"0".to_vec(),
+                        "typlen" => length.to_string().into_bytes(),
+                        "typbyval" => {
+                            if length > 0 {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
     if upper.contains("PG_CATALOG.PG_INDEXES") {
         let table = sql_literal_after(query, "TABLENAME");
         let indexes =
@@ -995,6 +1228,108 @@ where
         return Some(encode_catalog_rows(&columns, rows));
     }
 
+    if upper.contains("PG_CATALOG.PG_CONSTRAINT") {
+        let filter = sql_literal_after(query, "RELNAME");
+        let mut constraints = Vec::new();
+        for table in executor.catalog_tables() {
+            let (_, table_name) = catalog_table_parts(&table);
+            if filter
+                .as_ref()
+                .is_some_and(|want| want.as_str() != table.as_str() && want != table_name)
+            {
+                continue;
+            }
+            let relation_oid = catalog_relation_oid(&table);
+            for (ordinal, definition) in executor.catalog_columns(&table).into_iter().enumerate() {
+                if definition.primary_key {
+                    let name = format!("{}_{}_pkey", table_name, definition.name);
+                    constraints.push((
+                        name,
+                        String::from("p"),
+                        relation_oid,
+                        catalog_index_oid(&format!("constraint:{table}:{ordinal}")),
+                        ordinal + 1,
+                    ));
+                }
+            }
+            for index in executor.catalog_indexes(&table).into_iter().filter(|index| index.unique) {
+                constraints.push((
+                    index.name.clone(),
+                    String::from("u"),
+                    relation_oid,
+                    catalog_index_oid(&index.name),
+                    1,
+                ));
+            }
+        }
+        let rows: Vec<Vec<Vec<u8>>> = constraints
+            .into_iter()
+            .map(|(name, kind, relation_oid, index_oid, ordinal)| {
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => {
+                            catalog_oid(&format!("constraint:{name}")).to_string().into_bytes()
+                        }
+                        "conname" => name.as_bytes().to_vec(),
+                        "connamespace" => b"2200".to_vec(),
+                        "contype" => kind.as_bytes().to_vec(),
+                        "conrelid" => relation_oid.to_string().into_bytes(),
+                        "conindid" => index_oid.to_string().into_bytes(),
+                        "conkey" => format!("{{{ordinal}}}").into_bytes(),
+                        "convalidated" => b"t".to_vec(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_INDEX") {
+        let filter = sql_literal_after(query, "RELNAME");
+        let rows: Vec<Vec<Vec<u8>>> = executor
+            .catalog_tables()
+            .into_iter()
+            .flat_map(|table| {
+                let (_, table_name) = catalog_table_parts(&table);
+                if filter
+                    .as_ref()
+                    .is_some_and(|want| want.as_str() != table.as_str() && want != table_name)
+                {
+                    return Vec::new();
+                }
+                let relation_oid = catalog_relation_oid(&table);
+                executor
+                    .catalog_indexes(&table)
+                    .into_iter()
+                    .map(|index| {
+                        let index_oid = catalog_index_oid(&index.name);
+                        columns
+                            .iter()
+                            .map(|column| match column.as_str() {
+                                "indexrelid" => index_oid.to_string().into_bytes(),
+                                "indrelid" => relation_oid.to_string().into_bytes(),
+                                "indisunique" => {
+                                    if index.unique {
+                                        b"t".to_vec()
+                                    } else {
+                                        b"f".to_vec()
+                                    }
+                                }
+                                "indisprimary" => b"f".to_vec(),
+                                "indnatts" | "indnkeyatts" => b"1".to_vec(),
+                                "indkey" => b"1".to_vec(),
+                                _ => Vec::new(),
+                            })
+                            .collect()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
     let table =
         sql_literal_after(query, "TABLE_NAME").or_else(|| sql_literal_after(query, "RELNAME"))?;
     let definitions = executor.catalog_columns(&table);
@@ -1005,8 +1340,10 @@ where
             columns
                 .iter()
                 .map(|field| match field.as_str() {
+                    "attrelid" => catalog_relation_oid(&table).to_string().into_bytes(),
                     "column_name" | "attname" => column.name.as_bytes().to_vec(),
                     "data_type" => information_schema_type(&column.data_type).as_bytes().to_vec(),
+                    "atttypid" => postgres_type_oid(&column.data_type).to_string().into_bytes(),
                     "is_nullable" => {
                         if column.nullable {
                             b"YES".to_vec()
@@ -1018,6 +1355,23 @@ where
                         column.column_default.as_deref().unwrap_or("").as_bytes().to_vec()
                     }
                     "ordinal_position" | "attnum" => (index + 1).to_string().into_bytes(),
+                    "attlen" => postgres_type_length(&column.data_type).to_string().into_bytes(),
+                    "attnotnull" => {
+                        if column.nullable {
+                            b"f".to_vec()
+                        } else {
+                            b"t".to_vec()
+                        }
+                    }
+                    "atthasdef" => {
+                        if column.column_default.is_some() {
+                            b"t".to_vec()
+                        } else {
+                            b"f".to_vec()
+                        }
+                    }
+                    "attisdropped" => b"f".to_vec(),
+                    "attidentity" | "attgenerated" => Vec::new(),
                     _ => Vec::new(),
                 })
                 .collect()

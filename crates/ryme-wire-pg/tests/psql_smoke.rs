@@ -99,6 +99,17 @@ async fn psql_smoke() {
     assert!(out.contains("hello"), "{out}");
     let (ok, out) = psql(
         addr,
+        "SELECT nspname, oid FROM pg_catalog.pg_namespace WHERE nspname = 'public'; SELECT relname, relkind FROM pg_catalog.pg_class WHERE relname = 'messages'; SELECT attname, atttypid, attnotnull FROM pg_catalog.pg_attribute WHERE relname = 'messages' ORDER BY attnum; SELECT typname, oid FROM pg_catalog.pg_type WHERE typname = 'uuid'; SELECT conname, contype FROM pg_catalog.pg_constraint WHERE relname = 'messages'; SELECT indexrelid, indrelid, indisunique FROM pg_catalog.pg_index WHERE relname = 'messages';",
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(out.contains("public|2200"), "{out}");
+    assert!(out.contains("messages|r"), "{out}");
+    assert!(out.contains("id|2950|t"), "{out}");
+    assert!(out.contains("uuid|2950"), "{out}");
+    assert!(out.contains("messages_id_pkey|p"), "{out}");
+    let (ok, out) = psql(
+        addr,
         "CREATE INDEX messages_payload_idx ON public.messages (payload); SELECT indexname, tablename FROM pg_catalog.pg_indexes WHERE tablename = 'messages';",
     )
     .await;

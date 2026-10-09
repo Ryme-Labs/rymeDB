@@ -63,7 +63,9 @@ and `DEFAULT` values), with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
 `CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields,
-with `pg_catalog.pg_indexes` introspection and indexed equality lookup,
+with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
+(`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, and `pg_index`),
+and indexed equality lookup,
 `SELECT * FROM t KEY 'k'`, `SELECT * FROM t LIMIT n`, `UPDATE`, `DELETE`,
 `COPY t FROM stdin` (bulk path), `EXPLAIN <sql>` (planned access path),
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:

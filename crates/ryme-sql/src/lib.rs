@@ -1449,7 +1449,9 @@ where
                 return Err(RymeError::InvalidArgument(format!("duplicate column {column}")));
             }
             if !definitions.is_empty()
-                && !definitions.iter().any(|definition| definition.name.eq_ignore_ascii_case(column))
+                && !definitions
+                    .iter()
+                    .any(|definition| definition.name.eq_ignore_ascii_case(column))
             {
                 return Err(RymeError::InvalidArgument(format!("unknown column {column}")));
             }
