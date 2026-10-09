@@ -316,6 +316,8 @@ pub enum Cmp {
     Between,
     NotBetween,
     AnyOf,
+    IsDistinct,
+    IsNotDistinct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +416,29 @@ impl Predicate {
                 .iter()
                 .any(|branch| branch.iter().all(|predicate| predicate.matches(pk, value)));
         }
+        if matches!(self.op, Cmp::IsDistinct | Cmp::IsNotDistinct) {
+            let Some(target_is_null) = self.target_is_null(pk, value) else { return false };
+            let operand_is_null = is_null_bytes(&self.operand);
+            let equal = if target_is_null || operand_is_null {
+                target_is_null && operand_is_null
+            } else {
+                let target = if let Some(column) = self.column.as_deref() {
+                    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value)
+                    else {
+                        return false;
+                    };
+                    let Some(selected) = json_column_value(column, &object) else { return false };
+                    json_result_bytes(selected)
+                } else {
+                    match self.field {
+                        Field::Key => pk.to_vec(),
+                        Field::Value => value.to_vec(),
+                    }
+                };
+                target == self.operand
+            };
+            return if self.op == Cmp::IsDistinct { !equal } else { equal };
+        }
         if matches!(self.op, Cmp::IsNull | Cmp::IsNotNull) {
             let is_null = if let Some(column) = self.column.as_deref() {
                 let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
@@ -480,8 +505,28 @@ impl Predicate {
                 }
             }
             Cmp::AnyOf => false,
+            Cmp::IsDistinct | Cmp::IsNotDistinct => false,
         }
     }
+
+    fn target_is_null(&self, pk: &[u8], value: &[u8]) -> Option<bool> {
+        if let Some(column) = self.column.as_deref() {
+            let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
+                return None;
+            };
+            return Some(
+                json_column_value(column, &object).map_or(true, serde_json::Value::is_null),
+            );
+        }
+        Some(match self.field {
+            Field::Key => is_null_bytes(pk),
+            Field::Value => is_null_bytes(value),
+        })
+    }
+}
+
+fn is_null_bytes(value: &[u8]) -> bool {
+    value.is_empty() || value.eq_ignore_ascii_case(b"null")
 }
 
 fn sql_like(value: &str, pattern: &str) -> bool {
@@ -2010,6 +2055,37 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
             op: Cmp::NotIn,
             operand: Vec::new(),
             operands,
+            alternatives: Vec::new(),
+        });
+    }
+    if parts.len() == 5
+        && parts[1].eq_ignore_ascii_case("IS")
+        && parts[2].eq_ignore_ascii_case("DISTINCT")
+        && parts[3].eq_ignore_ascii_case("FROM")
+    {
+        let (field, column) = parse_predicate_field(&parts[0]);
+        return Ok(Predicate {
+            field,
+            column,
+            op: Cmp::IsDistinct,
+            operand: unquote(&parts[4]).into_bytes(),
+            operands: Vec::new(),
+            alternatives: Vec::new(),
+        });
+    }
+    if parts.len() == 6
+        && parts[1].eq_ignore_ascii_case("IS")
+        && parts[2].eq_ignore_ascii_case("NOT")
+        && parts[3].eq_ignore_ascii_case("DISTINCT")
+        && parts[4].eq_ignore_ascii_case("FROM")
+    {
+        let (field, column) = parse_predicate_field(&parts[0]);
+        return Ok(Predicate {
+            field,
+            column,
+            op: Cmp::IsNotDistinct,
+            operand: unquote(&parts[5]).into_bytes(),
+            operands: Vec::new(),
             alternatives: Vec::new(),
         });
     }
@@ -7092,6 +7168,45 @@ mod tests {
             matches!(result, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"m1".as_slice(), b"m2".as_slice()])
         );
         assert!(parse("SELECT * FROM messages WHERE room = 'lobby' OR").is_err());
+    }
+
+    #[tokio::test]
+    async fn where_is_distinct_from_is_null_safe() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        for (id, value) in
+            [("m1", r#"{"state":null}"#), ("m2", r#"{"state":"ready"}"#), ("m3", r#"{}"#)]
+        {
+            executor
+                .execute(
+                    parse(&format!("INSERT INTO messages KEY '{id}' VALUE '{value}'")).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let statement = parse("SELECT * FROM messages WHERE state IS DISTINCT FROM NULL").unwrap();
+        let Statement::SelectScan { filter, .. } = &statement else {
+            panic!("expected select scan")
+        };
+        assert_eq!(filter[0].op, Cmp::IsDistinct);
+        let result = executor.execute(statement).await.unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"m2".as_slice()])
+        );
+
+        let result = executor
+            .execute(parse("SELECT * FROM messages WHERE state IS NOT DISTINCT FROM NULL").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"m1".as_slice(), b"m3".as_slice()])
+        );
+
+        let result = executor
+            .execute(parse("SELECT * FROM messages WHERE state IS DISTINCT FROM 'ready'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 2));
     }
 
     #[test]
