@@ -58,8 +58,8 @@ at the logical level; internal page formats are never imported.
 
 ## SQL dialect
 
-`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, and
-`NOT NULL` metadata), with PostgreSQL `information_schema.tables` and
+`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, `NOT NULL`,
+and `DEFAULT` metadata), with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
 `CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields,

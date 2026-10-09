@@ -1014,6 +1014,9 @@ where
                             b"NO".to_vec()
                         }
                     }
+                    "column_default" => {
+                        column.column_default.as_deref().unwrap_or("").as_bytes().to_vec()
+                    }
                     "ordinal_position" | "attnum" => (index + 1).to_string().into_bytes(),
                     _ => Vec::new(),
                 })

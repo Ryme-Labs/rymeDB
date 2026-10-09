@@ -91,6 +91,7 @@ pub struct ColumnDefinition {
     pub data_type: String,
     pub nullable: bool,
     pub primary_key: bool,
+    pub column_default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,11 +446,36 @@ fn parse_column_definitions(raw: &str) -> Vec<ColumnDefinition> {
                 return None;
             }
             let upper = definition.to_ascii_uppercase();
+            let column_default = words
+                .iter()
+                .position(|word| word.eq_ignore_ascii_case("DEFAULT"))
+                .and_then(|default_pos| {
+                    let mut expression = Vec::new();
+                    for word in words.iter().skip(default_pos + 1) {
+                        if [
+                            "NOT",
+                            "PRIMARY",
+                            "UNIQUE",
+                            "CHECK",
+                            "REFERENCES",
+                            "COLLATE",
+                            "GENERATED",
+                        ]
+                        .iter()
+                        .any(|keyword| word.eq_ignore_ascii_case(keyword))
+                        {
+                            break;
+                        }
+                        expression.push(*word);
+                    }
+                    (!expression.is_empty()).then(|| expression.join(" "))
+                });
             Some(ColumnDefinition {
                 name: unquote(words[0]),
                 data_type: words[1].to_ascii_lowercase(),
                 nullable: !upper.contains("NOT NULL") && !upper.contains("PRIMARY KEY"),
                 primary_key: upper.contains("PRIMARY KEY"),
+                column_default,
             })
         })
         .collect()
@@ -2375,7 +2401,7 @@ mod tests {
     #[tokio::test]
     async fn create_table_keeps_column_metadata_for_introspection() {
         let statement = parse(
-            "CREATE TABLE IF NOT EXISTS public.messages (id UUID PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ)",
+            "CREATE TABLE IF NOT EXISTS public.messages (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payload JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT now())",
         )
         .unwrap();
         let (table, columns) = match &statement {
@@ -2388,13 +2414,30 @@ mod tests {
         assert_eq!(columns[0].data_type, "uuid");
         assert!(columns[0].primary_key);
         assert!(!columns[0].nullable);
+        assert_eq!(columns[0].column_default.as_deref(), Some("gen_random_uuid()"));
         assert_eq!(columns[1].data_type, "jsonb");
         assert!(!columns[1].nullable);
+        assert_eq!(columns[2].column_default.as_deref(), Some("now()"));
 
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor.execute(statement).await.unwrap();
         assert_eq!(executor.catalog_tables(), vec![String::from("public.messages")]);
         assert_eq!(executor.catalog_columns("public.messages"), columns);
+    }
+
+    #[test]
+    fn parses_column_defaults_without_consuming_constraints() {
+        let statement = parse(
+            "CREATE TABLE events (name TEXT DEFAULT 'new event' NOT NULL, count INTEGER DEFAULT 0, active BOOLEAN DEFAULT true)",
+        )
+        .unwrap();
+        let Statement::CreateTable { columns, .. } = statement else {
+            panic!("expected create table")
+        };
+        assert_eq!(columns[0].column_default.as_deref(), Some("'new event'"));
+        assert!(!columns[0].nullable);
+        assert_eq!(columns[1].column_default.as_deref(), Some("0"));
+        assert_eq!(columns[2].column_default.as_deref(), Some("true"));
     }
 
     #[test]
