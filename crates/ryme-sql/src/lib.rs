@@ -207,6 +207,16 @@ pub enum Statement {
         assignments: Vec<(String, InsertValue)>,
         filter: Vec<Predicate>,
     },
+    UpdateFrom {
+        table: String,
+        assignments: Vec<(String, InsertValue)>,
+        source_table: String,
+        target_column: String,
+        source_column: String,
+        filter: Vec<Predicate>,
+        #[serde(default)]
+        source_filter: Vec<Predicate>,
+    },
     Delete {
         table: String,
         pk: Vec<u8>,
@@ -381,6 +391,7 @@ impl Statement {
                 | Statement::Update { .. }
                 | Statement::UpdateRow { .. }
                 | Statement::UpdateWhere { .. }
+                | Statement::UpdateFrom { .. }
                 | Statement::Delete { .. }
                 | Statement::DeleteWhere { .. }
                 | Statement::CopyFrom { .. }
@@ -765,6 +776,7 @@ impl Statement {
             | Self::Update { table, .. }
             | Self::UpdateRow { table, .. }
             | Self::UpdateWhere { table, .. }
+            | Self::UpdateFrom { table, .. }
             | Self::Delete { table, .. }
             | Self::DeleteWhere { table, .. }
             | Self::CopyFrom { table, .. } => table,
@@ -2155,6 +2167,9 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
             .find(" SET ")
             .map(|offset| offset + 5)
             .ok_or_else(|| RymeError::InvalidArgument(String::from("update assignments")))?;
+        if let Some(from_offset) = find_sql_keyword(raw, "FROM", set_offset) {
+            return parse_update_from(tokens, raw, table, set_offset, from_offset);
+        }
         let where_offset = upper[set_offset..]
             .find(" WHERE ")
             .map(|offset| set_offset + offset)
@@ -2196,6 +2211,165 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
         Ok::<(Vec<u8>, Vec<u8>), RymeError>((pk.into_bytes(), eval_operand(value)?.into_bytes()))
     })?;
     Ok(Statement::Update { table, pk, value })
+}
+
+fn parse_update_from(
+    tokens: &[String],
+    raw: &str,
+    table: String,
+    set_offset: usize,
+    from_offset: usize,
+) -> Result<Statement> {
+    let where_offset = find_sql_keyword(raw, "WHERE", from_offset + "FROM".len())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("update from predicate")))?;
+    let returning_offset = find_sql_keyword(raw, "RETURNING", where_offset + "WHERE".len());
+    let assignment_text = raw[set_offset..from_offset].trim();
+    let assignments = split_sql_items(assignment_text)
+        .into_iter()
+        .map(|assignment| {
+            let (column, value) = split_assignment(&assignment)
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("update assignment")))?;
+            let value = value.trim();
+            let parsed = parse_assignment_value(value)?;
+            let value =
+                if value.contains('.') && !value.starts_with('\'') && !value.starts_with('"') {
+                    InsertValue::Expression(value.to_string())
+                } else {
+                    parsed
+                };
+            Ok((normalize_column_reference(column.trim()), value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if assignments.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("update assignments")));
+    }
+
+    let source_spec = raw[from_offset + "FROM".len()..where_offset].trim();
+    let source_tokens = tokenize(source_spec);
+    let source_table = source_tokens
+        .first()
+        .map(|token| unquote(token))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("update source table")))?;
+    let source_alias = relation_alias(&source_tokens, &source_table);
+    let target_alias = relation_alias(
+        &tokens
+            .get(1..tokens.iter().position(|token| token.eq_ignore_ascii_case("SET")).unwrap_or(1))
+            .unwrap_or_default(),
+        &table,
+    );
+
+    let where_end = returning_offset.unwrap_or(raw.len());
+    let where_tokens = tokenize(&raw[where_offset + "WHERE".len()..where_end]);
+    let mut target_column = None;
+    let mut source_column = None;
+    let mut target_filter_tokens = Vec::new();
+    let mut source_filter_tokens = Vec::new();
+    for condition in split_and_conditions(&where_tokens) {
+        if condition.len() == 2 {
+            if let (Some((left_prefix, left_column)), Some((right_prefix, right_column))) =
+                (qualified_reference(&condition[0]), qualified_reference(&condition[1]))
+            {
+                let left_target = left_prefix.eq_ignore_ascii_case(&target_alias)
+                    || left_prefix.eq_ignore_ascii_case(&table);
+                let right_target = right_prefix.eq_ignore_ascii_case(&target_alias)
+                    || right_prefix.eq_ignore_ascii_case(&table);
+                let left_source = left_prefix.eq_ignore_ascii_case(&source_alias)
+                    || left_prefix.eq_ignore_ascii_case(&source_table);
+                let right_source = right_prefix.eq_ignore_ascii_case(&source_alias)
+                    || right_prefix.eq_ignore_ascii_case(&source_table);
+                if left_target && right_source {
+                    target_column = Some(normalize_column_reference(&left_column));
+                    source_column = Some(normalize_column_reference(&right_column));
+                    continue;
+                }
+                if right_target && left_source {
+                    target_column = Some(normalize_column_reference(&right_column));
+                    source_column = Some(normalize_column_reference(&left_column));
+                    continue;
+                }
+            }
+        }
+        let has_source_prefix = condition.iter().any(|token| {
+            qualified_reference(token).is_some_and(|(prefix, _)| {
+                prefix.eq_ignore_ascii_case(&source_alias)
+                    || prefix.eq_ignore_ascii_case(&source_table)
+            })
+        });
+        if has_source_prefix {
+            append_condition_tokens(&mut source_filter_tokens, condition);
+        } else {
+            append_condition_tokens(&mut target_filter_tokens, condition);
+        }
+    }
+    let target_column =
+        target_column.ok_or_else(|| RymeError::InvalidArgument(String::from("update join")))?;
+    let source_column =
+        source_column.ok_or_else(|| RymeError::InvalidArgument(String::from("update join")))?;
+    let filter = parse_filter(&target_filter_tokens)?;
+    let source_filter = parse_filter(&source_filter_tokens)?;
+    Ok(Statement::UpdateFrom {
+        table,
+        assignments,
+        source_table,
+        target_column,
+        source_column,
+        filter,
+        source_filter,
+    })
+}
+
+fn relation_alias(tokens: &[String], table: &str) -> String {
+    if let Some(position) = tokens.iter().position(|token| token.eq_ignore_ascii_case("AS")) {
+        if let Some(alias) = tokens.get(position + 1) {
+            return unquote(alias);
+        }
+    }
+    tokens
+        .iter()
+        .skip(1)
+        .find(|token| {
+            !token.eq_ignore_ascii_case("SET")
+                && !token.eq_ignore_ascii_case("FROM")
+                && !token.eq_ignore_ascii_case("WHERE")
+        })
+        .map(|token| unquote(token))
+        .unwrap_or_else(|| table.to_string())
+}
+
+fn qualified_reference(raw: &str) -> Option<(String, String)> {
+    let value = unquote(raw.trim());
+    let (prefix, column) = value.split_once('.')?;
+    (!prefix.is_empty() && !column.is_empty()).then_some((prefix.to_string(), column.to_string()))
+}
+
+fn split_and_conditions(tokens: &[String]) -> Vec<Vec<String>> {
+    let mut conditions = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for token in tokens {
+        let between_value_separator = token.eq_ignore_ascii_case("AND")
+            && ((current.len() == 3 && current[1].eq_ignore_ascii_case("BETWEEN"))
+                || (current.len() == 4
+                    && current[1].eq_ignore_ascii_case("NOT")
+                    && current[2].eq_ignore_ascii_case("BETWEEN")));
+        if token.eq_ignore_ascii_case("AND") && !between_value_separator {
+            if !current.is_empty() {
+                conditions.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(token.clone());
+        }
+    }
+    if !current.is_empty() {
+        conditions.push(current);
+    }
+    conditions
+}
+
+fn append_condition_tokens(target: &mut Vec<String>, condition: Vec<String>) {
+    if !target.is_empty() {
+        target.push(String::from("AND"));
+    }
+    target.extend(condition);
 }
 
 fn parse_delete(tokens: &[String]) -> Result<Statement> {
@@ -2686,17 +2860,10 @@ fn parse_predicate_field(raw: &str) -> (Field, Option<String>) {
 fn normalize_column_reference(raw: &str) -> String {
     let unquoted = unquote(raw.trim());
     let Some(operator) = unquoted.find("->") else {
-        return unquoted
-            .rsplit_once('.')
-            .map(|(_, column)| column.to_string())
-            .unwrap_or(unquoted);
+        return unquoted.rsplit_once('.').map(|(_, column)| column.to_string()).unwrap_or(unquoted);
     };
     let base = &unquoted[..operator];
-    let base = base
-        .rsplit_once('.')
-        .map(|(_, column)| column)
-        .unwrap_or(base)
-        .trim();
+    let base = base.rsplit_once('.').map(|(_, column)| column).unwrap_or(base).trim();
     format!("{}{}", base, &unquoted[operator..])
 }
 
@@ -3030,10 +3197,11 @@ fn json_update_value(
     json_insert_value(value, data_type)
 }
 
-fn expression_value(
+fn expression_value_with_source(
     expression: &str,
     current: &serde_json::Map<String, serde_json::Value>,
     incoming: Option<&[u8]>,
+    source: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<serde_json::Value> {
     let expression = expression.trim();
     if expression.is_empty() {
@@ -3042,13 +3210,23 @@ fn expression_value(
     if expression.starts_with('(')
         && matching_paren(expression, 0) == Some(expression.len().saturating_sub(1))
     {
-        return expression_value(&expression[1..expression.len() - 1], current, incoming);
+        return expression_value_with_source(
+            &expression[1..expression.len() - 1],
+            current,
+            incoming,
+            source,
+        );
     }
     for operators in [&["||"][..], &["+", "-"][..], &["*", "/"][..]] {
         if let Some((position, operator)) = find_expression_operator(expression, operators) {
-            let left = expression_value(&expression[..position], current, incoming)?;
-            let right =
-                expression_value(&expression[position + operator.len()..], current, incoming)?;
+            let left =
+                expression_value_with_source(&expression[..position], current, incoming, source)?;
+            let right = expression_value_with_source(
+                &expression[position + operator.len()..],
+                current,
+                incoming,
+                source,
+            )?;
             return apply_expression_operator(&left, &right, operator);
         }
     }
@@ -3059,7 +3237,9 @@ fn expression_value(
             if close == Some(expression.len() - 1) {
                 let args = split_sql_items(&expression[open + 1..expression.len() - 1])
                     .into_iter()
-                    .map(|argument| expression_value(&argument, current, incoming))
+                    .map(|argument| {
+                        expression_value_with_source(&argument, current, incoming, source)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 if function.eq_ignore_ascii_case("COALESCE") {
                     return args.into_iter().find(|value| !value.is_null()).ok_or_else(|| {
@@ -3110,6 +3290,11 @@ fn expression_value(
                     .unwrap_or(serde_json::Value::Null));
             }
             return Ok(serde_json::Value::String(String::from_utf8_lossy(incoming).to_string()));
+        }
+        if let Some(source) = source {
+            if let Some(value) = json_column_value(column.trim(), source) {
+                return Ok(value.clone());
+            }
         }
     }
     if let Some(value) = json_column_value(&unquoted, current) {
@@ -3626,6 +3811,16 @@ pub fn describe_plan(statement: &Statement) -> String {
         }
         Statement::UpdateWhere { table, assignments, filter } => {
             format!("write update({table}) columns {} filters {}", assignments.len(), filter.len())
+        }
+        Statement::UpdateFrom {
+            table, assignments, source_table, filter, source_filter, ..
+        } => {
+            format!(
+                "write update({table}) from {source_table} columns {} filters {}+{}",
+                assignments.len(),
+                filter.len(),
+                source_filter.len()
+            )
         }
         Statement::Delete { table, .. } => format!("write delete({table}) point"),
         Statement::DeleteWhere { table, filter } => {
@@ -4364,6 +4559,18 @@ where
                 return (!selected.is_null()).then(|| json_result_bytes(selected));
             }
         }
+        if column.eq_ignore_ascii_case("key")
+            || column.eq_ignore_ascii_case("pk")
+            || column.eq_ignore_ascii_case("id")
+        {
+            return Some(pk.to_vec());
+        }
+        if column.eq_ignore_ascii_case("value")
+            || column.eq_ignore_ascii_case("val")
+            || column.eq_ignore_ascii_case("data")
+        {
+            return Some(value.to_vec());
+        }
         let primary_keys = self
             .catalog_columns(table)
             .into_iter()
@@ -4948,6 +5155,39 @@ where
         current: &[u8],
         incoming: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
+        self.materialize_update_row_with_context(table, pk, assignments, current, incoming, None)
+    }
+
+    fn materialize_update_row_with_source(
+        &self,
+        table: &str,
+        pk: &[u8],
+        assignments: Vec<(String, InsertValue)>,
+        current: &[u8],
+        source: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.materialize_update_row_with_context(
+            table,
+            pk,
+            assignments,
+            current,
+            None,
+            Some(source),
+        )
+    }
+
+    fn materialize_update_row_with_context(
+        &self,
+        table: &str,
+        pk: &[u8],
+        assignments: Vec<(String, InsertValue)>,
+        current: &[u8],
+        incoming: Option<&[u8]>,
+        source: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let source_object = source
+            .and_then(|value| serde_json::from_slice::<serde_json::Value>(value).ok())
+            .and_then(|value| value.as_object().cloned());
         let definitions = self.catalog_columns(table);
         if definitions.is_empty() {
             if let Ok(serde_json::Value::Object(mut object)) =
@@ -4968,9 +5208,12 @@ where
                                 "EXCLUDED is only valid in conflict updates",
                             )));
                         }
-                        InsertValue::Expression(expression) => {
-                            expression_value(&expression, &object, incoming)?
-                        }
+                        InsertValue::Expression(expression) => expression_value_with_source(
+                            &expression,
+                            &object,
+                            incoming,
+                            source_object.as_ref(),
+                        )?,
                     };
                     object.insert(column, resolved);
                 }
@@ -5028,7 +5271,12 @@ where
                     )));
                 }
                 InsertValue::Expression(expression) => {
-                    let value = expression_value(&expression, &object, incoming)?;
+                    let value = expression_value_with_source(
+                        &expression,
+                        &object,
+                        incoming,
+                        source_object.as_ref(),
+                    )?;
                     (!value.is_null()).then(|| json_result_bytes(&value))
                 }
             };
@@ -5051,6 +5299,84 @@ where
         }
         serde_json::to_vec(&serde_json::Value::Object(object))
             .map_err(|error| RymeError::Internal(error.to_string()))
+    }
+
+    async fn execute_update_from_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        table: String,
+        assignments: Vec<(String, InsertValue)>,
+        source_table: String,
+        target_column: String,
+        source_column: String,
+        filter: Vec<Predicate>,
+        source_filter: Vec<Predicate>,
+    ) -> Result<Vec<TransactionChange>> {
+        self.reject_if_read_only()?;
+        let targets = self.scan_rows(txn, &table, &filter, usize::MAX)?;
+        let sources = self.scan_rows(txn, &source_table, &source_filter, usize::MAX)?;
+        let mut changes = Vec::new();
+        for (pk, before) in targets {
+            self.enforce_rls(&table, &before)?;
+            let Some((_, source_value)) = sources.iter().find(|(source_pk, source_value)| {
+                self.row_column_value(&table, &pk, &before, &target_column)
+                    .zip(self.row_column_value(
+                        &source_table,
+                        source_pk,
+                        source_value,
+                        &source_column,
+                    ))
+                    .is_some_and(|(target, source)| target == source)
+            }) else {
+                continue;
+            };
+            let after = self.materialize_update_row_with_source(
+                &table,
+                &pk,
+                assignments.clone(),
+                &before,
+                source_value,
+            )?;
+            let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
+            self.enforce_rls(&table, &after)?;
+            self.enforce_checks(&table, &new_pk, &after)?;
+            self.enforce_foreign_keys(txn, &table, &new_pk, &after)?;
+            self.check_unique_excluding(&table, &new_pk, &after, Some(&pk))?;
+            if new_pk != pk
+                && self
+                    .manager
+                    .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &new_pk))?
+                    .is_some()
+            {
+                return Err(RymeError::Conflict(String::from("primary key exists")));
+            }
+            if new_pk != pk {
+                self.manager.delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
+            }
+            self.manager.put(
+                txn,
+                RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
+                after.clone(),
+            );
+            self.update_referencing_rows(
+                txn,
+                &table,
+                &pk,
+                &before,
+                &after,
+                &mut changes,
+                &mut BTreeSet::new(),
+            )?;
+            changes.push(TransactionChange {
+                table: table.clone(),
+                previous_pk: (new_pk != pk).then_some(pk),
+                pk: new_pk,
+                op: Operation::Update,
+                before: Some(before),
+                after: Some(after),
+            });
+        }
+        Ok(changes)
     }
 
     fn primary_key_for_row(&self, table: &str, fallback: &[u8], value: &[u8]) -> Result<Vec<u8>> {
@@ -7150,6 +7476,29 @@ where
                 }
                 Ok((QueryResult::Ok, changes))
             }
+            Statement::UpdateFrom {
+                table,
+                assignments,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                let changes = self
+                    .execute_update_from_in_transaction(
+                        txn,
+                        table,
+                        assignments,
+                        source_table,
+                        target_column,
+                        source_column,
+                        filter,
+                        source_filter,
+                    )
+                    .await?;
+                Ok((QueryResult::Ok, changes))
+            }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let before_key = pk.clone();
@@ -7882,6 +8231,27 @@ where
                 let (_, changes) = self.execute_in_transaction_base(txn, statement).await?;
                 Ok((returning_changes(&fields, &changes), changes))
             }
+            Statement::UpdateFrom {
+                table,
+                assignments,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                let statement = Statement::UpdateFrom {
+                    table,
+                    assignments,
+                    source_table,
+                    target_column,
+                    source_column,
+                    filter,
+                    source_filter,
+                };
+                let (_, changes) = self.execute_in_transaction_base(txn, statement).await?;
+                Ok((returning_changes(&fields, &changes), changes))
+            }
             Statement::Delete { table, pk } => {
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let value = self
@@ -8380,6 +8750,30 @@ where
                 self.commit_transaction(txn, changes).await?;
                 Ok(result)
             }
+            Statement::UpdateFrom {
+                table,
+                assignments,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                let mut txn = self.begin_with(isolation);
+                let statement = Statement::UpdateFrom {
+                    table,
+                    assignments,
+                    source_table,
+                    target_column,
+                    source_column,
+                    filter,
+                    source_filter,
+                };
+                let (_, changes) = self.execute_in_transaction_base(&mut txn, statement).await?;
+                let result = returning_changes(&fields, &changes);
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
+            }
             Statement::Delete { table, pk } => {
                 let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -8821,6 +9215,30 @@ where
                         Statement::UpdateWhere { table, assignments, filter },
                     )
                     .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::UpdateFrom {
+                table,
+                assignments,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                self.reject_if_read_only()?;
+                let mut txn = self.begin_with(isolation);
+                let statement = Statement::UpdateFrom {
+                    table,
+                    assignments,
+                    source_table,
+                    target_column,
+                    source_column,
+                    filter,
+                    source_filter,
+                };
+                let (_, changes) = self.execute_in_transaction_base(&mut txn, statement).await?;
                 self.commit_transaction(txn, changes).await?;
                 Ok(QueryResult::Ok)
             }
@@ -9583,6 +10001,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_from_applies_source_values_and_filters_atomically() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE accounts (id TEXT PRIMARY KEY, status TEXT, score INTEGER)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("CREATE TABLE patches (id TEXT PRIMARY KEY, status TEXT, delta INTEGER, active BOOLEAN)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO accounts (id, status, score) VALUES ('1', 'old', 10), ('2', 'old', 20)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO patches (id, status, delta, active) VALUES ('1', 'ready', 3, true), ('2', 'ignored', 5, false)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(
+                parse("UPDATE accounts AS a SET score = score + p.delta, status = p.status FROM patches AS p WHERE a.id = p.id AND p.active = true RETURNING a.id, a.score, a.status")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Returning { ref rows, .. }
+                if rows == &vec![vec![b"1".to_vec(), b"13".to_vec(), b"ready".to_vec()]]
+        ));
+        assert!(matches!(
+            executor
+                .execute(parse("SELECT id, status, score FROM accounts ORDER BY id").unwrap())
+                .await
+                .unwrap(),
+            QueryResult::Table { rows, .. }
+                if rows == vec![
+                    vec![b"1".to_vec(), b"ready".to_vec(), b"13".to_vec()],
+                    vec![b"2".to_vec(), b"old".to_vec(), b"20".to_vec()],
+                ]
+        ));
+    }
+
+    #[tokio::test]
     async fn multi_row_insert_is_atomic() {
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor
@@ -10270,18 +10745,13 @@ mod tests {
             .unwrap();
         assert_eq!(executor.catalog_indexes("messages")[0].field, Field::Value);
         executor
-            .execute(
-                parse("CREATE INDEX CONCURRENTLY messages_key_idx ON messages (key)").unwrap(),
-            )
+            .execute(parse("CREATE INDEX CONCURRENTLY messages_key_idx ON messages (key)").unwrap())
             .await
             .unwrap();
         assert_eq!(executor.catalog_indexes("messages").len(), 2);
 
         executor.execute(parse("DROP INDEX messages_value_idx").unwrap()).await.unwrap();
-        executor
-            .execute(parse("DROP INDEX CONCURRENTLY messages_key_idx").unwrap())
-            .await
-            .unwrap();
+        executor.execute(parse("DROP INDEX CONCURRENTLY messages_key_idx").unwrap()).await.unwrap();
         assert!(executor.catalog_indexes("messages").is_empty());
         assert!(executor.execute(parse("DROP INDEX messages_value_idx").unwrap()).await.is_err());
         executor.execute(parse("DROP INDEX IF EXISTS messages_value_idx").unwrap()).await.unwrap();

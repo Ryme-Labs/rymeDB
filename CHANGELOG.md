@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL UPDATE ... FROM now joins source rows by qualified columns,
+  supports source-filtered updates and source-backed assignments, preserves
+  transaction/constraint/RLS checks, and returns affected rows.
 - PostgreSQL CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY syntax is
   accepted for migration compatibility while using the engine's atomic index
   builder.
