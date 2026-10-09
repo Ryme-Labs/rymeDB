@@ -80,6 +80,39 @@ async fn eval_returns_arrays_and_script_cache_supports_evalsha() {
 }
 
 #[tokio::test]
+async fn pcall_returns_command_errors_to_lua_and_preserves_error_replies() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["SET", "counter", "not-an-integer"]).await, "+OK\r\n");
+    assert_eq!(
+        command(addr, &["EVAL", "return redis.pcall('INCR', KEYS[1])", "1", "counter",],).await,
+        "-ERR value is not an integer or out of range\r\n"
+    );
+    assert_eq!(
+        command(
+            addr,
+            &[
+                "EVAL",
+                "local reply = redis.pcall('INCR', KEYS[1]); return reply.err and 'handled' or reply",
+                "1",
+                "counter",
+            ],
+        )
+        .await,
+        "$7\r\nhandled\r\n"
+    );
+}
+
+#[tokio::test]
+async fn script_flush_accepts_async_mode() {
+    let addr = serve().await;
+    let script = "return 'cached'";
+    let loaded = command(addr, &["SCRIPT", "LOAD", script]).await;
+    let sha = loaded.split("\r\n").nth(1).unwrap_or("").to_string();
+    assert_eq!(command(addr, &["SCRIPT", "FLUSH", "ASYNC"]).await, "+OK\r\n");
+    assert!(command(addr, &["EVALSHA", &sha, "0"]).await.starts_with("-NOSCRIPT "));
+}
+
+#[tokio::test]
 async fn eval_has_no_filesystem_or_process_libraries() {
     let addr = serve().await;
     let reply = command(addr, &["EVAL", "return os.execute('echo unsafe')", "0"]).await;

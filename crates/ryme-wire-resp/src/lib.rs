@@ -753,7 +753,9 @@ where
             }
             b"FLUSH"
                 if args.len() == 1
-                    || (args.len() == 2 && args[1].eq_ignore_ascii_case(b"SYNC")) =>
+                    || (args.len() == 2
+                        && (args[1].eq_ignore_ascii_case(b"SYNC")
+                            || args[1].eq_ignore_ascii_case(b"ASYNC"))) =>
             {
                 if let Ok(mut scripts) = self.scripts.lock() {
                     scripts.clear();
@@ -832,8 +834,10 @@ where
             }
             Ok(VmState::Continue)
         });
+        let transaction = std::rc::Rc::new(std::cell::RefCell::new(txn));
         let result = lua.scope(|scope| {
-            let call = scope.create_function_mut(|lua, values: MultiValue| {
+            let call_transaction = std::rc::Rc::clone(&transaction);
+            let call = scope.create_function_mut(move |lua, values: MultiValue| {
                 let mut values = values.into_iter();
                 let command =
                     values.next().map(lua_value_bytes).transpose()?.ok_or_else(|| {
@@ -851,11 +855,36 @@ where
                     )));
                 }
                 let args = values.map(lua_value_bytes).collect::<mlua::Result<Vec<_>>>()?;
-                let reply = self.dispatch_in(txn, RespCommand { name, args });
+                let reply = self
+                    .dispatch_in(&mut call_transaction.borrow_mut(), RespCommand { name, args });
                 parse_lua_resp(&reply).map_err(mlua::Error::RuntimeError)?.into_lua(lua)
+            })?;
+            let pcall_transaction = std::rc::Rc::clone(&transaction);
+            let pcall = scope.create_function_mut(move |lua, values: MultiValue| {
+                let mut values = values.into_iter();
+                let command =
+                    values.next().map(lua_value_bytes).transpose()?.ok_or_else(|| {
+                        mlua::Error::RuntimeError(String::from("missing command"))
+                    })?;
+                let name = std::str::from_utf8(&command)
+                    .map_err(|_| mlua::Error::RuntimeError(String::from("command is not UTF-8")))?
+                    .to_ascii_uppercase();
+                if matches!(
+                    name.as_str(),
+                    "EVAL" | "EVALSHA" | "SCRIPT" | "SUBSCRIBE" | "PSUBSCRIBE"
+                ) {
+                    return Err(mlua::Error::RuntimeError(String::from(
+                        "command is not allowed in scripts",
+                    )));
+                }
+                let args = values.map(lua_value_bytes).collect::<mlua::Result<Vec<_>>>()?;
+                let reply = self
+                    .dispatch_in(&mut pcall_transaction.borrow_mut(), RespCommand { name, args });
+                parse_lua_resp(&reply).map_err(mlua::Error::RuntimeError)?.into_lua_pcall(lua)
             })?;
             let redis = lua.create_table()?;
             redis.set("call", call)?;
+            redis.set("pcall", pcall)?;
             lua.globals().set("redis", redis)?;
             lua.globals().set("KEYS", lua_bytes_table(&lua, keys)?)?;
             lua.globals().set("ARGV", lua_bytes_table(&lua, argv)?)?;
@@ -4674,6 +4703,17 @@ impl LuaRespValue {
             Self::Error(error) => Err(mlua::Error::RuntimeError(error)),
         }
     }
+
+    fn into_lua_pcall(self, lua: &Lua) -> mlua::Result<LuaValue> {
+        match self {
+            Self::Error(error) => {
+                let table = lua.create_table()?;
+                table.set("err", error)?;
+                Ok(LuaValue::Table(table))
+            }
+            value => value.into_lua(lua),
+        }
+    }
 }
 
 fn lua_value_bytes(value: LuaValue) -> mlua::Result<Vec<u8>> {
@@ -4707,6 +4747,9 @@ fn lua_value_resp(value: &LuaValue) -> std::result::Result<Vec<u8>, String> {
         }
         LuaValue::String(value) => Ok(encode_bulk(value.as_bytes().as_ref())),
         LuaValue::Table(table) => {
+            if let Ok(LuaValue::String(error)) = table.get::<LuaValue>("err") {
+                return Ok(encode_raw_error(&error.as_bytes()));
+            }
             let mut values = Vec::new();
             for value in table.sequence_values::<LuaValue>() {
                 values.push(lua_value_resp(&value.map_err(|error| error.to_string())?)?);
@@ -5180,6 +5223,14 @@ fn encode_simple(value: &str) -> Vec<u8> {
 
 fn encode_error(message: String) -> Vec<u8> {
     format!("-ERR {message}\r\n").into_bytes()
+}
+
+fn encode_raw_error(message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(message.len() + 3);
+    out.extend_from_slice(b"-");
+    out.extend_from_slice(message);
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 fn encode_noscript() -> Vec<u8> {
