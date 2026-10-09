@@ -729,6 +729,11 @@ pub struct BroadcastStreamQuery {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct PresenceStreamQuery {
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct DurableStreamQuery {
     pub from: Option<u64>,
     pub api_key: Option<String>,
@@ -1479,6 +1484,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/auth/mask", post(mask_set))
         .route("/v1/presence/join", post(presence_join))
         .route("/v1/presence/leave", post(presence_leave))
+        .route("/v1/presence/:channel/stream", get(presence_stream))
         .route("/v1/presence/:channel", get(presence_list))
         .route("/v1/broadcast", post(broadcast_post))
         .route("/v1/broadcast/:channel", get(broadcast_stream))
@@ -4808,6 +4814,39 @@ async fn presence_list(
     (StatusCode::OK, Json(members)).into_response()
 }
 
+async fn presence_stream(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(channel): Path<String>,
+    Query(query): Query<PresenceStreamQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let principal = match state.principal_with_query(&headers, query.api_key.as_deref()) {
+        Ok(principal) => principal,
+        Err(error) => return error_response(error),
+    };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
+    if channel.is_empty() || channel.len() > 256 {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
+    }
+    if let Err(error) = admit_realtime(&state, &principal.tenant, 1) {
+        return error_response(error);
+    }
+    let connection = match open_realtime_connection(&state, &principal.tenant) {
+        Ok(connection) => connection,
+        Err(error) => return error_response(error),
+    };
+    let realtime = state.realtime.clone();
+    let tenant = principal.tenant.clone();
+    let qos = state.qos.clone();
+    upgrade.on_upgrade(move |socket| async move {
+        let _connection = connection;
+        forward_presence(socket, realtime, qos, &tenant, &channel).await;
+    })
+}
+
 async fn broadcast_post(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -4944,6 +4983,108 @@ async fn forward_broadcast(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(_) => break,
+                }
+            }
+            next = incoming.next() => {
+                match next {
+                    Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
+                        if !queue_realtime_message(
+                            &outgoing,
+                            axum::extract::ws::Message::Pong(payload),
+                        ) {
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+    }
+}
+
+fn queue_presence_snapshot(
+    outgoing: &RealtimeOutgoing,
+    realtime: &Realtime,
+    qos: &Arc<Mutex<QosRegistry>>,
+    tenant: &str,
+    channel: &str,
+) -> Option<u64> {
+    let (members, sequence) = realtime.presence_snapshot(tenant, channel, ryme_txn::now_unix());
+    let text = serde_json::json!({
+        "type": "presence_state",
+        "channel": channel,
+        "members": members,
+        "sequence": sequence,
+    })
+    .to_string();
+    if stream_realtime_event(qos, tenant, text.len() as u64)
+        && queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+    {
+        Some(sequence)
+    } else {
+        None
+    }
+}
+
+async fn forward_presence(
+    socket: axum::extract::ws::WebSocket,
+    realtime: Realtime,
+    qos: Arc<Mutex<QosRegistry>>,
+    tenant: &str,
+    channel: &str,
+) {
+    let mut receiver = realtime.presence_subscribe(tenant, channel);
+    let (sender, mut incoming) = socket.split();
+    let outgoing = start_realtime_writer(sender);
+    let Some(mut seen_sequence) =
+        queue_presence_snapshot(&outgoing, &realtime, &qos, tenant, channel)
+    else {
+        return;
+    };
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if !queue_realtime_message(
+                    &outgoing,
+                    axum::extract::ws::Message::Ping(Vec::new()),
+                ) {
+                    break;
+                }
+            }
+            message = receiver.recv() => {
+                match message {
+                    Ok(event) => {
+                        if event.sequence <= seen_sequence {
+                            continue;
+                        }
+                        seen_sequence = event.sequence;
+                        let text = serde_json::to_string(&event)
+                            .unwrap_or_else(|_| String::from("{}"));
+                        if !stream_realtime_event(&qos, tenant, text.len() as u64)
+                            || !queue_realtime_message(
+                                &outgoing,
+                                axum::extract::ws::Message::Text(text),
+                            )
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(sequence) = queue_presence_snapshot(
+                            &outgoing,
+                            &realtime,
+                            &qos,
+                            tenant,
+                            channel,
+                        ) else {
+                            break;
+                        };
+                        seen_sequence = sequence;
+                    }
                     Err(_) => break,
                 }
             }

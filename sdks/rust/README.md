@@ -31,7 +31,9 @@ For automatic reconnects with exact sequence-based replay, use
 `subscribe_table_resumable`. Its `recv` method keeps retrying with bounded
 backoff until the subscription is closed or the retry limit is reached.
 
-`subscribe_query` and `subscribe_broadcast` are also available. HTTP and
+`subscribe_query`, `subscribe_broadcast`, and `subscribe_presence` are also
+available. Presence streams begin with a state snapshot followed by live
+join/leave events. HTTP and
 WebSocket URLs automatically switch from `http`/`https` to `ws`/`wss`.
 
 Supabase-style REST CRUD is available through `rest_insert`, `rest_upsert`,

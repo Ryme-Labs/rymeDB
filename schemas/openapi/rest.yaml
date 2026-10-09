@@ -573,6 +573,25 @@ paths:
           description: removal receipt
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /v1/presence/{channel}/stream:
+    get:
+      tags: [streams]
+      description: "Live tenant-scoped presence WebSocket. The first frame is presence_state with the current members; later frames are join/leave events. A lagged consumer receives a fresh presence_state snapshot."
+      parameters:
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: api_key
+          in: query
+          schema:
+            type: string
+      responses:
+        '101':
+          description: presence WebSocket upgrade
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /v1/presence/{channel}:
     get:
       tags: [streams]

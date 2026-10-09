@@ -346,6 +346,17 @@ impl RymeClient {
         .await
     }
 
+    pub async fn subscribe_presence(
+        &self,
+        channel: &str,
+    ) -> Result<RealtimeSubscription, ClientError> {
+        self.subscribe(
+            &format!("/v1/presence/{}/stream", utf8_percent_encode(channel, NON_ALPHANUMERIC)),
+            Vec::new(),
+        )
+        .await
+    }
+
     pub async fn subscribe_durable_topic(
         &self,
         partition: &str,

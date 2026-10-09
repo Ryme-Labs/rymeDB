@@ -301,6 +301,61 @@ async fn live_broadcast_stream_receives_posts() {
 }
 
 #[tokio::test]
+async fn live_presence_stream_snapshots_and_follows_members() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-presence-stream-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let url = format!("ws://{http}/v1/presence/room/stream?api_key={KEY}");
+    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    assert_eq!(response.status(), 101);
+    let snapshot = next_text(&mut stream).await;
+    assert_eq!(snapshot["type"], "presence_state");
+    assert_eq!(snapshot["members"].as_array().map(Vec::len), Some(0));
+
+    let (status, _) = http_request(
+        http,
+        "POST /v1/presence/join",
+        br#"{"channel":"room","member":"ada","state":{"typing":true},"ttl_secs":60}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let joined = next_text(&mut stream).await;
+    assert_eq!(joined["type"], "join");
+    assert_eq!(joined["member"], "ada");
+    assert_eq!(joined["state"]["typing"], true);
+
+    let (status, _) =
+        http_request(http, "POST /v1/presence/leave", br#"{"channel":"room","member":"ada"}"#)
+            .await;
+    assert_eq!(status, 200);
+    let left = next_text(&mut stream).await;
+    assert_eq!(left["type"], "leave");
+    assert_eq!(left["member"], "ada");
+    stream.close(None).await.unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn live_durable_topic_stream_replays_and_follows() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root =

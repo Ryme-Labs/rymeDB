@@ -368,6 +368,14 @@ public final class RymeClient {
         return request("POST", "/v1/presence/join", "{\"channel\":" + json(channel) + ",\"member\":" + json(member) + "}");
     }
 
+    public String presenceLeave(String channel, String member) {
+        return request("POST", "/v1/presence/leave", "{\"channel\":" + json(channel) + ",\"member\":" + json(member) + "}");
+    }
+
+    public String presenceList(String channel) {
+        return request("GET", "/v1/presence/" + segment(channel), null);
+    }
+
     public String broadcast(String channel, String payloadJson) {
         return request("POST", "/v1/broadcast", "{\"channel\":" + json(channel) + ",\"payload\":" + payloadJson + "}");
     }
@@ -408,6 +416,11 @@ public final class RymeClient {
     /** Subscribe to ephemeral broadcast frames for one channel. */
     public CompletableFuture<WebSocket> subscribeBroadcast(String channel, Consumer<String> onMessage) {
         return subscribe("/v1/broadcast/" + segment(channel), List.of(), onMessage);
+    }
+
+    /** Subscribe to an initial presence snapshot and live join/leave events. */
+    public CompletableFuture<WebSocket> subscribePresence(String channel, Consumer<String> onMessage) {
+        return subscribe("/v1/presence/" + segment(channel) + "/stream", List.of(), onMessage);
     }
 
     /** Subscribe to retained and newly committed durable topic messages. */

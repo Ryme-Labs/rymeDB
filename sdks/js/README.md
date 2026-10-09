@@ -45,6 +45,9 @@ Notes:
   the bounded retry delay with `reconnectDelayMs`.
 - `subscribeBroadcast(base, channel, onMessage, { apiKey? })` tails
   `/v1/broadcast/<channel>` for ephemeral channel messages.
+- `subscribePresence(base, channel, onMessage, { apiKey? })` receives an
+  initial snapshot followed by join/leave events and reconnects with a fresh
+  snapshot when needed.
 - `slowLog(limit?, table?)` and `traces(limit?, name?, table?)` narrow the
   observability feeds; `rangeAutosplit` and `rangeLoads` cover placement
   load.

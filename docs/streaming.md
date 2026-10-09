@@ -108,6 +108,16 @@ abandoned presence state cannot accumulate. Each room holds at most 1000
 members; joins beyond the cap get `429`, and re-joining an existing member
 always succeeds.
 
+`GET /v1/presence/<channel>/stream` upgrades to a tenant-scoped WebSocket for
+live presence synchronization. The first frame is a `presence_state` snapshot
+with the current members and a monotonic `sequence` watermark. Later frames are
+`join` and `leave` events carrying the member state, expiry timestamp, and
+sequence; TTL expiry produces a `leave` event.
+If a consumer falls behind the bounded event queue, the server sends a fresh
+`presence_state` snapshot instead of leaving the client with an incomplete
+room view. The stream has the same heartbeat, QoS, and bounded outgoing queue
+behavior as the other realtime endpoints.
+
 In cluster mode, presence joins and leaves must reach the current Raft leader.
 The leader fans each mutation over the live gateway mesh, and all gateways use
 the leader's expiry timestamp so reads converge without adding ephemeral
@@ -158,17 +168,19 @@ until the socket closes or you send SIGINT.
 
 - **Java** (`sdks/java`): the dependency-free `RymeClient` covers HTTP and
   Java 17 WebSocket subscriptions through `subscribeTable`, `subscribeQuery`,
-  `subscribeBroadcast`, and `subscribeDurableTopic`; callbacks receive
+  `subscribeBroadcast`, `subscribePresence`, and `subscribeDurableTopic`; callbacks receive
   complete JSON text frames.
 - **JS** (`sdks/js/src/index.ts`): `subscribeTable(base, table, onMessage,
   {apiKey?})`
   and `subscribeQuery(base, table, onMessage, {apiKey?, limit?})`, plus
-  `subscribeBroadcast(base, channel, onMessage, {apiKey?})` and
+  `subscribeBroadcast(base, channel, onMessage, {apiKey?})`,
+  `subscribePresence(base, channel, onMessage, {apiKey?})`, and
   `subscribeDurableTopic(base, partition, onMessage, {apiKey?, from?})`, all
   returning `{ready, close}`. `onMessage` receives parsed `ChangeRecord` /
-  `QueryMessage` / `BroadcastRecord` / `DurableTopicMessage` objects.
+  `QueryMessage` / `BroadcastRecord` / `PresenceEvent` /
+  `DurableTopicMessage` objects.
 - **Rust** (`sdks/rust`): `RymeClient` exposes `subscribe_table`,
-  `subscribe_query`, `subscribe_broadcast`, and
+  `subscribe_query`, `subscribe_broadcast`, `subscribe_presence`, and
   `subscribe_durable_topic`; `RealtimeSubscription::recv` handles ping/pong
   while returning complete JSON text frames.
 

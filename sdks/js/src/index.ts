@@ -662,6 +662,22 @@ export interface BroadcastRecord {
   sequence: number;
 }
 
+export interface PresenceMember {
+  member: string;
+  state: unknown;
+  expires_unix: number;
+}
+
+export interface PresenceEvent {
+  type: "presence_state" | "join" | "leave";
+  channel: string;
+  sequence: number;
+  member?: string;
+  state?: unknown;
+  expires_unix?: number;
+  members?: PresenceMember[];
+}
+
 export interface DurableTopicMessage {
   partition: string;
   cursor: number;
@@ -730,6 +746,18 @@ export function subscribeBroadcast(
   const query = `/v1/broadcast/${encodeURIComponent(channel)}`;
   return openSocket(base, query, options, (data) => {
     onMessage(JSON.parse(data) as BroadcastRecord);
+  });
+}
+
+export function subscribePresence(
+  base: string,
+  channel: string,
+  onMessage: (event: PresenceEvent) => void,
+  options?: SubscribeOptions,
+): Subscription {
+  const query = `/v1/presence/${encodeURIComponent(channel)}/stream`;
+  return openSocket(base, query, { ...options, reconnect: options?.reconnect ?? true }, (data) => {
+    onMessage(JSON.parse(data) as PresenceEvent);
   });
 }
 

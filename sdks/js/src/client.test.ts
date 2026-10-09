@@ -3,7 +3,14 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { createServer as createTcpServer, Socket } from "node:net";
 import { describe, it } from "node:test";
-import { RymeError, RymeHttpClient, subscribeBroadcast, subscribeQuery, subscribeTable } from "./index.js";
+import {
+  RymeError,
+  RymeHttpClient,
+  subscribeBroadcast,
+  subscribePresence,
+  subscribeQuery,
+  subscribeTable,
+} from "./index.js";
 
 interface Seen {
   method: string;
@@ -301,6 +308,27 @@ describe("RymeHttpClient", () => {
     sub.close();
     assert.equal(requests[0], "/v1/broadcast/lobby");
     assert.equal((received[0] as { channel: string }).channel, "lobby");
+    close();
+  });
+
+  it("streams presence snapshots and events over websocket", async () => {
+    const frames = [
+      `{"type":"presence_state","channel":"room","members":[]}`,
+      `{"type":"join","channel":"room","member":"ada","state":{"typing":true},"expires_unix":99}`,
+    ];
+    const { server, requests, close } = wsStub(frames);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const received: Array<{ type: string; member?: string }> = [];
+    const sub = subscribePresence(`http://127.0.0.1:${port}`, "room", (event) => {
+      received.push(event);
+    });
+    await sub.ready;
+    await waitFor(() => received.length === 2);
+    sub.close();
+    assert.equal(requests[0], "/v1/presence/room/stream");
+    assert.equal(received[0]?.type, "presence_state");
+    assert.equal(received[1]?.member, "ada");
     close();
   });
 
