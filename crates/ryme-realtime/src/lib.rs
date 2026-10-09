@@ -63,6 +63,7 @@ pub struct Realtime {
 struct QueryTopic {
     sender: broadcast::Sender<QueryUpdate>,
     max_limit: usize,
+    latest_commit: u64,
 }
 
 #[derive(Debug)]
@@ -342,9 +343,29 @@ impl Realtime {
         let topic = inner.queries.entry(key).or_insert_with(|| QueryTopic {
             sender: broadcast::channel(capacity).0,
             max_limit: limit,
+            latest_commit: 0,
         });
         topic.max_limit = topic.max_limit.max(limit);
         topic.sender.subscribe()
+    }
+
+    pub fn query_latest_commit(&self, tenant: &str, database: &str, table: &str) -> u64 {
+        self.query_latest_commit_branch(tenant, database, "main", table)
+    }
+
+    pub fn query_latest_commit_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+    ) -> u64 {
+        let key = branch_topic_key(tenant, database, branch, table);
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.queries.get(&key).map(|topic| topic.latest_commit))
+            .unwrap_or(0)
     }
 
     pub fn publish_query(
@@ -369,13 +390,14 @@ impl Realtime {
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         limit: usize,
     ) -> Option<u64> {
-        let inner = self.inner.lock().ok()?;
+        let mut inner = self.inner.lock().ok()?;
         let key = branch_topic_key(tenant, database, branch, table);
         if !inner.queries.contains_key(&key) {
             return None;
         }
         let sequence = self.next_sequence();
-        let topic = inner.queries.get(&key)?;
+        let topic = inner.queries.get_mut(&key)?;
+        topic.latest_commit = topic.latest_commit.max(commit_ts);
         let truncated = rows.len() >= limit;
         let rows = rows.into_iter().take(limit).map(|(pk, value)| QueryRow { pk, value }).collect();
         let _ = topic.sender.send(QueryUpdate {
@@ -729,6 +751,7 @@ mod tests {
     fn query_refresh_flow() {
         let realtime = Realtime::new(64);
         assert_eq!(realtime.query_limit("t", "d", "docs"), None);
+        assert_eq!(realtime.query_latest_commit("t", "d", "docs"), 0);
         assert!(realtime.publish_query("t", "d", "docs", 5, Vec::new(), 100).is_none());
         let mut first = realtime.query_subscribe("t", "d", "docs", 10);
         assert_eq!(realtime.query_limit("t", "d", "docs"), Some(10));
@@ -737,6 +760,9 @@ mod tests {
         let rows = vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), b"2".to_vec())];
         let sequence = realtime.publish_query("t", "d", "docs", 7, rows, 50).unwrap();
         assert!(sequence > 0);
+        assert_eq!(realtime.query_latest_commit("t", "d", "docs"), 7);
+        realtime.publish_query("t", "d", "docs", 6, Vec::new(), 50).unwrap();
+        assert_eq!(realtime.query_latest_commit("t", "d", "docs"), 7);
         for receiver in [&mut first, &mut second] {
             let update = receiver.try_recv().unwrap();
             assert_eq!(update.commit_ts, 7);

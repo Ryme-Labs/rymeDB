@@ -6358,6 +6358,8 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
 ) {
     let mut receiver = realtime.query_subscribe_branch(tenant, database, branch, table, limit);
     let (mut sender, mut incoming) = socket.split();
+    let current_commit =
+        initial_commit.max(realtime.query_latest_commit_branch(tenant, database, branch, table));
     let mut snapshot_commit = send_query_snapshot(
         &mut sender,
         &backend,
@@ -6368,7 +6370,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
         table,
         branch,
         limit,
-        initial_commit,
+        current_commit,
     )
     .await;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -6419,6 +6421,9 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let current_commit = initial_commit.max(realtime.query_latest_commit_branch(
+                            tenant, database, branch, table,
+                        ));
                         snapshot_commit = send_query_snapshot(
                             &mut sender,
                             &backend,
@@ -6429,7 +6434,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             table,
                             branch,
                             limit,
-                            initial_commit,
+                            current_commit,
                         )
                         .await;
                     }

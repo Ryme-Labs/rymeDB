@@ -86,6 +86,9 @@ unlike the raw change feed.
 Query streams use the same branch selection rules as change feeds. A branch
 snapshot reads the branch's copy-on-write view, and later updates come only
 from that branch; omitting `branch` selects `main`.
+If a client falls behind the bounded update ring, the server sends a fresh
+snapshot labeled with the latest published topic commit before continuing live
+updates, so the client can advance its resume watermark safely.
 
 ## Tenant isolation
 

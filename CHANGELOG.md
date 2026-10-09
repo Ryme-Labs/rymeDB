@@ -20,6 +20,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Branch metadata persistence now fsyncs the replacement file, rebuilds
   manifest reference counts during recovery, rejects missing manifests or
   parents, and prevents deleting a branch that still has children.
+- Live query streams retain the latest published commit per topic, so a
+  broadcast-ring lag recovery resnapshot advances the client watermark rather
+  than replaying from the connection's original commit.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention
