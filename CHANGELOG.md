@@ -62,7 +62,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - `ORDER BY` now sorts schema columns and JSON paths in projections, scans, and
   grouped results alongside the existing key/value fields.
 - Standard predicate mutations now support updating and deleting every visible
-  row matching a `WHERE` clause in one transaction.
+  row matching a `WHERE` clause in one transaction, including multi-row
+  `RETURNING` results.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

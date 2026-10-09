@@ -102,7 +102,8 @@ with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
 and indexed equality lookup,
 `SELECT * FROM t KEY 'k'`, `SELECT * FROM t LIMIT n`, `UPDATE`, `DELETE`,
 predicate mutations such as `UPDATE t SET status = 'ready' WHERE id = '...'`
-and `DELETE FROM t WHERE status = 'expired'`,
+and `DELETE FROM t WHERE status = 'expired'`, with `RETURNING` rows for bulk
+mutations,
 named projections such as `SELECT payload, count FROM t WHERE id = '...'`,
 `COPY t FROM stdin` (bulk path), `EXPLAIN <sql>` (planned access path),
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:

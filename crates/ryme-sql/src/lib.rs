@@ -1058,7 +1058,13 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
         if assignments.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("update assignments")));
         }
-        if let Ok(pk) = value_after(&tokens[where_pos..], &["KEY", "PK", "ID"]) {
+        let where_end = tokens[where_pos..]
+            .iter()
+            .position(|token| token.eq_ignore_ascii_case("RETURNING"))
+            .map(|offset| where_pos + offset)
+            .unwrap_or(tokens.len());
+        let where_tokens = &tokens[where_pos..where_end];
+        if let Ok(pk) = value_after(where_tokens, &["KEY", "PK", "ID"]) {
             return Ok(Statement::UpdateRow { table, pk: pk.into_bytes(), assignments });
         }
         let filter = parse_where_filter(tokens)?;
@@ -2122,6 +2128,23 @@ fn returning_result(fields: &[ReturningField], pk: Vec<u8>, value: Vec<u8>) -> Q
     let columns = returning_columns(fields);
     let row = fields.iter().map(|field| returning_field_value(field, &pk, &value)).collect();
     QueryResult::Returning { columns, rows: vec![row] }
+}
+
+fn returning_changes(fields: &[ReturningField], changes: &[TransactionChange]) -> QueryResult {
+    let columns = returning_columns(fields);
+    let rows = changes
+        .iter()
+        .filter_map(|change| {
+            let value = change.after.as_ref().or(change.before.as_ref())?;
+            Some(
+                fields
+                    .iter()
+                    .map(|field| returning_field_value(field, &change.pk, value))
+                    .collect(),
+            )
+        })
+        .collect();
+    QueryResult::Returning { columns, rows }
 }
 
 fn returning_columns(fields: &[ReturningField]) -> Vec<String> {
@@ -3703,6 +3726,11 @@ where
                     .await?;
                 Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
             }
+            Statement::UpdateWhere { table, assignments, filter } => {
+                let statement = Statement::UpdateWhere { table, assignments, filter };
+                let (_, changes) = self.execute_in_transaction_base(txn, statement).await?;
+                Ok((returning_changes(&fields, &changes), changes))
+            }
             Statement::Delete { table, pk } => {
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let value = self
@@ -3713,6 +3741,11 @@ where
                     .execute_in_transaction_base(txn, Statement::Delete { table, pk: pk.clone() })
                     .await?;
                 Ok((returning_result(&fields, pk, value), changes))
+            }
+            Statement::DeleteWhere { table, filter } => {
+                let statement = Statement::DeleteWhere { table, filter };
+                let (_, changes) = self.execute_in_transaction_base(txn, statement).await?;
+                Ok((returning_changes(&fields, &changes), changes))
             }
             _ => Err(RymeError::InvalidArgument(String::from("RETURNING requires a row mutation"))),
         }
@@ -4022,6 +4055,14 @@ where
                 self.execute_with_base(Statement::Update { table, pk, value }, isolation).await?;
                 Ok(returning_result(&fields, pk_for_result, value_for_result))
             }
+            Statement::UpdateWhere { table, assignments, filter } => {
+                let mut txn = self.begin_with(isolation);
+                let statement = Statement::UpdateWhere { table, assignments, filter };
+                let (_, changes) = self.execute_in_transaction_base(&mut txn, statement).await?;
+                let result = returning_changes(&fields, &changes);
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
+            }
             Statement::Delete { table, pk } => {
                 let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -4032,6 +4073,14 @@ where
                 self.execute_with_base(Statement::Delete { table, pk: pk.clone() }, isolation)
                     .await?;
                 Ok(returning_result(&fields, pk, value))
+            }
+            Statement::DeleteWhere { table, filter } => {
+                let mut txn = self.begin_with(isolation);
+                let statement = Statement::DeleteWhere { table, filter };
+                let (_, changes) = self.execute_in_transaction_base(&mut txn, statement).await?;
+                let result = returning_changes(&fields, &changes);
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
             }
             _ => Err(RymeError::InvalidArgument(String::from("RETURNING requires a row mutation"))),
         }
@@ -4727,6 +4776,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated, QueryResult::Ok);
+        let returned = executor
+            .execute(
+                parse("UPDATE accounts SET score = 11 WHERE status = 'active' RETURNING id, score")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            returned,
+            QueryResult::Returning { rows, .. }
+                if rows == vec![
+                    vec![b"a1".to_vec(), b"11".to_vec()],
+                    vec![b"a2".to_vec(), b"11".to_vec()]
+                ]
+        ));
         let result = executor
             .execute(parse("SELECT id, score FROM accounts ORDER BY id ASC").unwrap())
             .await
@@ -4735,17 +4799,23 @@ mod tests {
             result,
             QueryResult::Table { rows, .. }
                 if rows == vec![
-                    vec![b"a1".to_vec(), b"10".to_vec()],
-                    vec![b"a2".to_vec(), b"10".to_vec()],
+                    vec![b"a1".to_vec(), b"11".to_vec()],
+                    vec![b"a2".to_vec(), b"11".to_vec()],
                     vec![b"a3".to_vec(), b"3".to_vec()]
                 ]
         ));
 
         let deleted = executor
-            .execute(parse("DELETE FROM accounts WHERE status = 'closed'").unwrap())
+            .execute(
+                parse("DELETE FROM accounts WHERE status = 'closed' RETURNING id, status").unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(deleted, QueryResult::Ok);
+        assert!(matches!(
+            deleted,
+            QueryResult::Returning { rows, .. }
+                if rows == vec![vec![b"a3".to_vec(), b"closed".to_vec()]]
+        ));
         let remaining =
             executor.execute(parse("SELECT COUNT(*) FROM accounts").unwrap()).await.unwrap();
         assert!(matches!(remaining, QueryResult::Scalar { value, .. } if value == b"2"));
