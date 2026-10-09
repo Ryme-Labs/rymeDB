@@ -3,7 +3,7 @@ use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -237,11 +237,25 @@ pub struct ColumnDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignKeyAction {
+    Restrict,
+    Cascade,
+}
+
+impl Default for ForeignKeyAction {
+    fn default() -> Self {
+        Self::Restrict
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyConstraint {
     pub columns: Vec<String>,
     pub referenced_table: String,
     #[serde(default)]
     pub referenced_columns: Vec<String>,
+    #[serde(default)]
+    pub on_delete: ForeignKeyAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1405,12 +1419,12 @@ fn parse_foreign_key(item: &str) -> Result<Option<ForeignKeyConstraint>> {
             .ok_or_else(|| RymeError::InvalidArgument(String::from("foreign key column")))?;
         (vec![local], references)
     };
-    let (referenced_table, referenced_columns) =
+    let (referenced_table, referenced_columns, on_delete) =
         parse_references_target(&item[target_start + 10..])?;
-    Ok(Some(ForeignKeyConstraint { columns, referenced_table, referenced_columns }))
+    Ok(Some(ForeignKeyConstraint { columns, referenced_table, referenced_columns, on_delete }))
 }
 
-fn parse_references_target(input: &str) -> Result<(String, Vec<String>)> {
+fn parse_references_target(input: &str) -> Result<(String, Vec<String>, ForeignKeyAction)> {
     let trimmed = input.trim();
     let tokens = tokenize(trimmed);
     let referenced_table = tokens
@@ -1429,7 +1443,31 @@ fn parse_references_target(input: &str) -> Result<(String, Vec<String>)> {
     } else {
         Vec::new()
     };
-    Ok((referenced_table, referenced_columns))
+    let close = trimmed
+        .find('(')
+        .and_then(|open| matching_paren(trimmed, open))
+        .unwrap_or_else(|| referenced_table.len());
+    let suffix = trimmed.get(close + 1..).unwrap_or_default();
+    let suffix_upper = suffix.to_ascii_uppercase();
+    let on_delete = if let Some(on_delete) = suffix_upper.find("ON DELETE") {
+        let action =
+            suffix[on_delete + "ON DELETE".len()..].split_whitespace().next().unwrap_or_default();
+        if action.eq_ignore_ascii_case("CASCADE") {
+            ForeignKeyAction::Cascade
+        } else if action.eq_ignore_ascii_case("RESTRICT")
+            || action.eq_ignore_ascii_case("NO")
+            || action.is_empty()
+        {
+            ForeignKeyAction::Restrict
+        } else {
+            return Err(RymeError::InvalidArgument(format!(
+                "unsupported foreign key delete action {action}"
+            )));
+        }
+    } else {
+        ForeignKeyAction::Restrict
+    };
+    Ok((referenced_table, referenced_columns, on_delete))
 }
 
 fn check_expressions(item: &str) -> Vec<String> {
@@ -3784,13 +3822,19 @@ where
         Ok(())
     }
 
-    fn enforce_referenced_rows(
+    fn delete_row_with_references(
         &self,
         txn: &mut Transaction,
         table: &str,
         pk: &[u8],
         value: &[u8],
+        changes: &mut Vec<TransactionChange>,
+        visited: &mut BTreeSet<(String, Vec<u8>)>,
     ) -> Result<()> {
+        let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
+        if !visited.insert((table.clone(), pk.to_vec())) {
+            return Ok(());
+        }
         let constraints = self
             .foreign_keys
             .lock()
@@ -3799,11 +3843,11 @@ where
             .flat_map(|(child_table, constraints)| {
                 constraints.iter().map(move |constraint| (child_table.clone(), constraint.clone()))
             })
-            .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(table))
+            .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(&table))
             .collect::<Vec<_>>();
         for (child_table, constraint) in constraints {
             let referenced_columns = if constraint.referenced_columns.is_empty() {
-                self.catalog_columns(table)
+                self.catalog_columns(&table)
                     .into_iter()
                     .filter(|definition| definition.primary_key)
                     .map(|definition| definition.name)
@@ -3813,21 +3857,49 @@ where
             };
             let Some(parent_values) = referenced_columns
                 .iter()
-                .map(|column| self.row_column_value(table, pk, value, column))
+                .map(|column| self.row_column_value(&table, pk, value, column))
                 .collect::<Option<Vec<_>>>()
             else {
                 continue;
             };
             let child_rows = self.scan_all_rows_in_transaction(txn, &child_table)?;
-            if child_rows.iter().any(|(child_pk, child_value)| {
-                constraint.columns.iter().zip(&parent_values).all(|(column, expected)| {
-                    self.row_column_value(&child_table, child_pk, child_value, column)
-                        .is_some_and(|actual| actual == *expected)
-                })
-            }) {
-                return Err(RymeError::Conflict(format!(
-                    "foreign key constraint failed: referenced row in {table} is still used"
-                )));
+            for (child_pk, child_value) in child_rows {
+                let matches_parent =
+                    constraint.columns.iter().zip(&parent_values).all(|(column, expected)| {
+                        self.row_column_value(&child_table, &child_pk, &child_value, column)
+                            .is_some_and(|actual| actual == *expected)
+                    });
+                if !matches_parent {
+                    continue;
+                }
+                if constraint.on_delete == ForeignKeyAction::Restrict {
+                    return Err(RymeError::Conflict(format!(
+                        "foreign key constraint failed: referenced row in {table} is still used"
+                    )));
+                }
+                let child_identity = (child_table.clone(), child_pk.clone());
+                if visited.contains(&child_identity) {
+                    continue;
+                }
+                self.delete_row_with_references(
+                    txn,
+                    &child_table,
+                    &child_pk,
+                    &child_value,
+                    changes,
+                    visited,
+                )?;
+                self.manager.delete(
+                    txn,
+                    RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
+                );
+                changes.push(TransactionChange {
+                    table: child_table.clone(),
+                    pk: child_pk,
+                    op: Operation::Delete,
+                    before: Some(child_value),
+                    after: None,
+                });
             }
         }
         Ok(())
@@ -5762,23 +5834,24 @@ where
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
-                self.enforce_referenced_rows(
+                let mut changes = Vec::new();
+                self.delete_row_with_references(
                     txn,
                     &table,
                     &pk,
                     before.as_deref().unwrap_or_default(),
+                    &mut changes,
+                    &mut BTreeSet::new(),
                 )?;
                 self.manager.delete(txn, key);
-                Ok((
-                    QueryResult::Ok,
-                    vec![TransactionChange {
-                        table,
-                        pk,
-                        op: Operation::Delete,
-                        before,
-                        after: None,
-                    }],
-                ))
+                changes.push(TransactionChange {
+                    table,
+                    pk,
+                    op: Operation::Delete,
+                    before,
+                    after: None,
+                });
+                Ok((QueryResult::Ok, changes))
             }
             Statement::DeleteWhere { table, filter } => {
                 self.reject_if_read_only()?;
@@ -5786,7 +5859,14 @@ where
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, before) in rows {
                     self.enforce_rls(&table, &before)?;
-                    self.enforce_referenced_rows(txn, &table, &pk, &before)?;
+                    self.delete_row_with_references(
+                        txn,
+                        &table,
+                        &pk,
+                        &before,
+                        &mut changes,
+                        &mut BTreeSet::new(),
+                    )?;
                     self.manager
                         .delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
                     changes.push(TransactionChange {
@@ -6287,9 +6367,15 @@ where
                     .manager
                     .get(&mut txn, &key)?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
-                self.execute_with_base(Statement::Delete { table, pk: pk.clone() }, isolation)
+                let (_, changes) = self
+                    .execute_in_transaction_base(
+                        &mut txn,
+                        Statement::Delete { table, pk: pk.clone() },
+                    )
                     .await?;
-                Ok(returning_result(&fields, pk, value))
+                let result = returning_result(&fields, pk, value);
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
             }
             Statement::DeleteWhere { table, filter } => {
                 let mut txn = self.begin_with(isolation);
@@ -6657,24 +6743,24 @@ where
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
-                self.enforce_referenced_rows(
+                let mut changes = Vec::new();
+                self.delete_row_with_references(
                     &mut txn,
                     &table,
                     &pk,
                     before.as_deref().unwrap_or_default(),
+                    &mut changes,
+                    &mut BTreeSet::new(),
                 )?;
                 self.manager.delete(&mut txn, key);
-                let commit_ts = self.manager.commit(txn).await?;
-                self.apply_index_change(&TransactionChange {
-                    table: table.clone(),
-                    pk: pk.clone(),
+                changes.push(TransactionChange {
+                    table,
+                    pk,
                     op: Operation::Delete,
-                    before: before.clone(),
+                    before,
                     after: None,
                 });
-                if self.realtime.is_some() {
-                    self.emit(&table, pk, Operation::Delete, before, None, commit_ts)?;
-                }
+                self.commit_transaction(txn, changes).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::DeleteWhere { table, filter } => {
@@ -7637,7 +7723,7 @@ mod tests {
     #[test]
     fn parses_column_and_table_foreign_keys() {
         let Statement::CreateTable { foreign_keys, .. } = parse(
-            "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id), room_id TEXT, FOREIGN KEY (room_id) REFERENCES rooms (id))",
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id), room_id TEXT, FOREIGN KEY (room_id) REFERENCES rooms (id) ON DELETE CASCADE)",
         )
         .unwrap()
         else {
@@ -7650,11 +7736,13 @@ mod tests {
                     columns: vec![String::from("user_id")],
                     referenced_table: String::from("users"),
                     referenced_columns: vec![String::from("id")],
+                    on_delete: ForeignKeyAction::Restrict,
                 },
                 ForeignKeyConstraint {
                     columns: vec![String::from("room_id")],
                     referenced_table: String::from("rooms"),
                     referenced_columns: vec![String::from("id")],
+                    on_delete: ForeignKeyAction::Cascade,
                 },
             ]
         );
@@ -7900,6 +7988,45 @@ mod tests {
         );
         restored.restore_schema_snapshot(executor.schema_snapshot()).unwrap();
         assert_eq!(restored.schema_snapshot().foreign_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cascading_foreign_keys_delete_dependent_rows() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE rooms (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id) ON DELETE CASCADE)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE messages (id TEXT PRIMARY KEY, room_id TEXT REFERENCES rooms (id) ON DELETE CASCADE)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor.execute(parse("INSERT INTO users (id) VALUES ('u1')").unwrap()).await.unwrap();
+        executor
+            .execute(parse("INSERT INTO rooms (id, user_id) VALUES ('r1', 'u1')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (id, room_id) VALUES ('m1', 'r1')").unwrap())
+            .await
+            .unwrap();
+
+        executor.execute(parse("DELETE FROM users WHERE id = 'u1'").unwrap()).await.unwrap();
+        for table in ["users", "rooms", "messages"] {
+            let result = executor.execute(parse(&format!("SELECT * FROM {table}")).unwrap()).await;
+            assert!(matches!(result, Ok(QueryResult::Rows { rows }) if rows.is_empty()));
+        }
     }
 
     #[tokio::test]

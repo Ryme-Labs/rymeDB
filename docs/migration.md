@@ -90,6 +90,7 @@ rows written directly in the branch overlay.
 `ALTER TABLE ... ADD CONSTRAINT` for `UNIQUE`, `CHECK`, and `FOREIGN KEY ... REFERENCES`,
 `DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability changes
 (including `IF [NOT] EXISTS` where supported), plus
+foreign-key delete actions `ON DELETE RESTRICT` and `ON DELETE CASCADE`,
 `DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, and `DROP INDEX [IF EXISTS]`,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style

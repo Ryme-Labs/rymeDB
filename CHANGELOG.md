@@ -63,6 +63,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Column-level and table-level `FOREIGN KEY ... REFERENCES` constraints now
   persist with schema snapshots, validate inserts and updates, and protect
   referenced rows from deletes across transactional write paths.
+- Foreign keys now support PostgreSQL-compatible `ON DELETE RESTRICT` and
+  recursive `ON DELETE CASCADE` behavior across point, filtered, and
+  transactional deletes.
 - `ALTER TABLE ... ADD CONSTRAINT` now adds and validates `UNIQUE`, `CHECK`,
   and `FOREIGN KEY ... REFERENCES` constraints against existing and future rows.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
