@@ -41,6 +41,7 @@ const BROADCAST_SHARDS: usize = 32;
 pub struct QueryUpdate {
     pub tenant: String,
     pub database: String,
+    pub branch: String,
     pub table: String,
     pub commit_ts: u64,
     pub sequence: u64,
@@ -161,7 +162,7 @@ impl Realtime {
             commit_ts: event.commit_ts,
             sequence,
         };
-        let key = topic_key(&event.tenant, &event.database, &event.table);
+        let key = branch_topic_key(&event.tenant, &event.database, &event.branch, &event.table);
         let capacity = inner.capacity;
         let sender =
             inner.topics.entry(key.clone()).or_insert_with(|| broadcast::channel(capacity).0);
@@ -175,7 +176,17 @@ impl Realtime {
     }
 
     pub fn has_subscribers(&self, tenant: &str, database: &str, table: &str) -> bool {
-        let key = topic_key(tenant, database, table);
+        self.has_subscribers_branch(tenant, database, "main", table)
+    }
+
+    pub fn has_subscribers_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+    ) -> bool {
+        let key = branch_topic_key(tenant, database, branch, table);
         self.inner
             .lock()
             .ok()
@@ -189,7 +200,17 @@ impl Realtime {
         database: &str,
         table: &str,
     ) -> broadcast::Receiver<ChangeRecord> {
-        let key = topic_key(tenant, database, table);
+        self.subscribe_branch(tenant, database, "main", table)
+    }
+
+    pub fn subscribe_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+    ) -> broadcast::Receiver<ChangeRecord> {
+        let key = branch_topic_key(tenant, database, branch, table);
         let Ok(mut inner) = self.inner.lock() else {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
@@ -206,8 +227,20 @@ impl Realtime {
         since_commit_ts: u64,
         limit: usize,
     ) -> Vec<ChangeRecord> {
+        self.replay_branch(tenant, database, "main", table, since_commit_ts, limit)
+    }
+
+    pub fn replay_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+        since_commit_ts: u64,
+        limit: usize,
+    ) -> Vec<ChangeRecord> {
         let limit = limit.clamp(1, 100000);
-        let key = topic_key(tenant, database, table);
+        let key = branch_topic_key(tenant, database, branch, table);
         let Ok(inner) = self.inner.lock() else { return Vec::new() };
         let Some(log) = inner.history.get(&key) else { return Vec::new() };
         log.iter()
@@ -228,8 +261,20 @@ impl Realtime {
         after_sequence: u64,
         limit: usize,
     ) -> Vec<ChangeRecord> {
+        self.replay_after_sequence_branch(tenant, database, "main", table, after_sequence, limit)
+    }
+
+    pub fn replay_after_sequence_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Vec<ChangeRecord> {
         let limit = limit.clamp(1, 100000);
-        let key = topic_key(tenant, database, table);
+        let key = branch_topic_key(tenant, database, branch, table);
         let Ok(inner) = self.inner.lock() else { return Vec::new() };
         let Some(log) = inner.history.get(&key) else { return Vec::new() };
         log.iter().filter(|record| record.sequence > after_sequence).take(limit).cloned().collect()
@@ -240,7 +285,17 @@ impl Realtime {
     }
 
     pub fn query_limit(&self, tenant: &str, database: &str, table: &str) -> Option<usize> {
-        let key = topic_key(tenant, database, table);
+        self.query_limit_branch(tenant, database, "main", table)
+    }
+
+    pub fn query_limit_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+    ) -> Option<usize> {
+        let key = branch_topic_key(tenant, database, branch, table);
         self.inner.lock().ok()?.queries.get(&key).map(|topic| topic.max_limit)
     }
 
@@ -251,7 +306,18 @@ impl Realtime {
         table: &str,
         limit: usize,
     ) -> broadcast::Receiver<QueryUpdate> {
-        let key = topic_key(tenant, database, table);
+        self.query_subscribe_branch(tenant, database, "main", table, limit)
+    }
+
+    pub fn query_subscribe_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+        limit: usize,
+    ) -> broadcast::Receiver<QueryUpdate> {
+        let key = branch_topic_key(tenant, database, branch, table);
         let limit = limit.clamp(1, 1000);
         let Ok(mut inner) = self.inner.lock() else {
             let (_, receiver) = broadcast::channel(16);
@@ -275,8 +341,21 @@ impl Realtime {
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         limit: usize,
     ) -> Option<u64> {
+        self.publish_query_branch(tenant, database, "main", table, commit_ts, rows, limit)
+    }
+
+    pub fn publish_query_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+        commit_ts: u64,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+        limit: usize,
+    ) -> Option<u64> {
         let inner = self.inner.lock().ok()?;
-        let key = topic_key(tenant, database, table);
+        let key = branch_topic_key(tenant, database, branch, table);
         if !inner.queries.contains_key(&key) {
             return None;
         }
@@ -287,6 +366,7 @@ impl Realtime {
         let _ = topic.sender.send(QueryUpdate {
             tenant: tenant.to_string(),
             database: database.to_string(),
+            branch: branch.to_string(),
             table: table.to_string(),
             commit_ts,
             sequence,
@@ -521,8 +601,8 @@ impl Default for Realtime {
     }
 }
 
-fn topic_key(tenant: &str, database: &str, table: &str) -> String {
-    format!("{tenant}/{database}/{table}")
+fn branch_topic_key(tenant: &str, database: &str, branch: &str, table: &str) -> String {
+    format!("{tenant}/{database}/{branch}/{table}")
 }
 
 fn scope_key(tenant: &str, name: &str) -> String {
@@ -600,6 +680,57 @@ mod tests {
         let update = receiver.try_recv().unwrap();
         assert_eq!(update.rows.len(), 2);
         assert!(update.truncated);
+    }
+
+    #[test]
+    fn change_and_query_topics_are_scoped_by_branch() {
+        let realtime = Realtime::new(64);
+        let mut main_changes = realtime.subscribe_branch("t", "d", "main", "docs");
+        let mut preview_changes = realtime.subscribe_branch("t", "d", "preview", "docs");
+        realtime
+            .publish(NewChange {
+                tenant: String::from("t"),
+                database: String::from("d"),
+                branch: String::from("main"),
+                table: String::from("docs"),
+                op: Operation::Insert,
+                pk: b"main".to_vec(),
+                after: Some(b"one".to_vec()),
+                commit_ts: 1,
+            })
+            .unwrap();
+        realtime
+            .publish(NewChange {
+                tenant: String::from("t"),
+                database: String::from("d"),
+                branch: String::from("preview"),
+                table: String::from("docs"),
+                op: Operation::Insert,
+                pk: b"preview".to_vec(),
+                after: Some(b"two".to_vec()),
+                commit_ts: 2,
+            })
+            .unwrap();
+        assert_eq!(main_changes.try_recv().unwrap().branch, "main");
+        assert!(main_changes.try_recv().is_err());
+        assert_eq!(preview_changes.try_recv().unwrap().branch, "preview");
+        assert!(preview_changes.try_recv().is_err());
+
+        let mut main_queries = realtime.query_subscribe_branch("t", "d", "main", "docs", 10);
+        let mut preview_queries = realtime.query_subscribe_branch("t", "d", "preview", "docs", 10);
+        realtime
+            .publish_query_branch(
+                "t",
+                "d",
+                "preview",
+                "docs",
+                3,
+                vec![(b"preview".to_vec(), b"two".to_vec())],
+                10,
+            )
+            .unwrap();
+        assert_eq!(preview_queries.try_recv().unwrap().rows.len(), 1);
+        assert!(main_queries.try_recv().is_err());
     }
 
     #[test]

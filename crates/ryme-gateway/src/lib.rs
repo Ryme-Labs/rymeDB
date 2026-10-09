@@ -362,14 +362,19 @@ where
     }
 
     fn refresh_table(&self, principal: &Principal, table: &str, commit_ts: u64) {
-        let Some(limit) = self.realtime.query_limit(&principal.tenant, &self.database, table)
-        else {
+        let Some(limit) = self.realtime.query_limit_branch(
+            &principal.tenant,
+            &self.database,
+            &self.branch,
+            table,
+        ) else {
             return;
         };
         let rows = self.scan(principal, table, limit).unwrap_or_default();
-        let _ = self.realtime.publish_query(
+        let _ = self.realtime.publish_query_branch(
             &principal.tenant,
             &self.database,
+            &self.branch,
             table,
             commit_ts,
             rows,

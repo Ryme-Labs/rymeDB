@@ -644,6 +644,7 @@ pub struct StreamQuery {
     pub api_key: Option<String>,
     pub from: Option<u64>,
     pub from_sequence: Option<u64>,
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -656,6 +657,7 @@ pub struct QueryStreamQuery {
     pub table: String,
     pub limit: Option<usize>,
     pub api_key: Option<String>,
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2275,11 +2277,29 @@ fn branch_snapshot(
     headers: &HeaderMap,
     tenant: &str,
 ) -> ryme_error::Result<Option<(String, u64, u64)>> {
-    let branch = headers
+    branch_snapshot_selected(state, headers, tenant, None)
+}
+
+fn branch_snapshot_selected(
+    state: &SharedState,
+    headers: &HeaderMap,
+    tenant: &str,
+    requested: Option<&str>,
+) -> ryme_error::Result<Option<(String, u64, u64)>> {
+    let header_branch = headers
         .get("x-ryme-branch")
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("main");
+        .filter(|value| !value.is_empty());
+    if let (Some(header_branch), Some(requested)) =
+        (header_branch, requested.filter(|v| !v.is_empty()))
+    {
+        if header_branch != requested {
+            return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                "branch selection mismatch",
+            )));
+        }
+    }
+    let branch = requested.filter(|value| !value.is_empty()).or(header_branch).unwrap_or("main");
     if branch == "main" {
         return Ok(None);
     }
@@ -5863,6 +5883,16 @@ async fn stream(
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
     }
+    let (branch, _, _) = match branch_snapshot_selected(
+        &state,
+        &headers,
+        &principal.tenant,
+        query.branch.as_deref(),
+    ) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => (String::from("main"), state.backend.latest_commit(), 0),
+        Err(e) => return error_response(e),
+    };
     let realtime = state.realtime.clone();
     let tenant = principal.tenant.clone();
     let database = state.database.clone();
@@ -5879,6 +5909,7 @@ async fn stream(
             &rls_tables,
             &tenant,
             &database,
+            &branch,
             &table,
             from,
             from_sequence,
@@ -5916,26 +5947,35 @@ async fn forward_changes(
     rls_tables: &HashMap<String, String>,
     tenant: &str,
     database: &str,
+    branch: &str,
     table: &str,
     from: u64,
     from_sequence: Option<u64>,
 ) {
-    let mut receiver = realtime.subscribe(tenant, database, table);
+    let mut receiver = realtime.subscribe_branch(tenant, database, branch, table);
     let replayed = match from_sequence {
-        Some(sequence) => realtime.replay_after_sequence(
+        Some(sequence) => realtime.replay_after_sequence_branch(
             tenant,
             database,
+            branch,
             table,
             sequence,
             realtime.history_capacity(),
         ),
-        None => realtime.replay(tenant, database, table, from, realtime.history_capacity()),
+        None => realtime.replay_branch(
+            tenant,
+            database,
+            branch,
+            table,
+            from,
+            realtime.history_capacity(),
+        ),
     };
     let mut seen_sequence = from_sequence.unwrap_or(0);
     let (mut sender, mut incoming) = socket.split();
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
-        if !realtime_change_allowed(rls_tables, tenant, record) {
+        if !realtime_change_allowed(rls_tables, tenant, branch, record) {
             continue;
         }
         let text = serde_json::to_string(record).unwrap_or_else(|_| String::from("{}"));
@@ -5966,7 +6006,7 @@ async fn forward_changes(
                             continue;
                         }
                         seen_sequence = seen_sequence.max(record.sequence);
-                        if !realtime_change_allowed(rls_tables, tenant, &record) {
+                        if !realtime_change_allowed(rls_tables, tenant, branch, &record) {
                             continue;
                         }
                         let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
@@ -5982,9 +6022,10 @@ async fn forward_changes(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        let recovered = realtime.replay_after_sequence(
+                        let recovered = realtime.replay_after_sequence_branch(
                             tenant,
                             database,
+                            branch,
                             table,
                             seen_sequence,
                             realtime.history_capacity(),
@@ -6000,7 +6041,7 @@ async fn forward_changes(
                                 continue;
                             }
                             seen_sequence = record.sequence;
-                            if !realtime_change_allowed(rls_tables, tenant, &record) {
+                            if !realtime_change_allowed(rls_tables, tenant, branch, &record) {
                                 continue;
                             }
                             let text = serde_json::to_string(&record)
@@ -6056,7 +6097,27 @@ async fn query_stream(
         return error_response(e);
     }
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
-    let backend = state.backend.clone();
+    let (branch, branch_commit, storage_epoch) = match branch_snapshot_selected(
+        &state,
+        &headers,
+        &principal.tenant,
+        query.branch.as_deref(),
+    ) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => (String::from("main"), state.backend.latest_commit(), 0),
+        Err(e) => return error_response(e),
+    };
+    let backend: BranchStorage = if branch == "main" {
+        ryme_branch::BranchBackend::passthrough(state.backend.clone(), state.database.clone())
+    } else {
+        ryme_branch::BranchBackend::new(
+            state.backend.clone(),
+            state.database.clone(),
+            branch.clone(),
+            branch_commit,
+            storage_epoch,
+        )
+    };
     let realtime = state.realtime.clone();
     let tenant = principal.tenant.clone();
     let database = state.database.clone();
@@ -6073,25 +6134,29 @@ async fn query_stream(
             &tenant,
             &database,
             &table,
+            &branch,
             limit,
+            branch_commit,
         )
         .await;
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn forward_query(
+async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
     socket: axum::extract::ws::WebSocket,
-    backend: Backend,
+    backend: B,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
     rls_tables: &HashMap<String, String>,
     tenant: &str,
     database: &str,
     table: &str,
+    branch: &str,
     limit: usize,
+    initial_commit: u64,
 ) {
-    let mut receiver = realtime.query_subscribe(tenant, database, table, limit);
+    let mut receiver = realtime.query_subscribe_branch(tenant, database, branch, table, limit);
     let (mut sender, mut incoming) = socket.split();
     let mut snapshot_commit = send_query_snapshot(
         &mut sender,
@@ -6101,7 +6166,9 @@ async fn forward_query(
         tenant,
         database,
         table,
+        branch,
         limit,
+        initial_commit,
     )
     .await;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -6127,6 +6194,7 @@ async fn forward_query(
                         let text = serde_json::to_string(&serde_json::json!({
                             "type": "update",
                             "commit": update.commit_ts,
+                            "branch": branch,
                             "rows": update.rows.iter().filter(|row| rls_row_allowed(
                                 rls_tables,
                                 tenant,
@@ -6159,7 +6227,9 @@ async fn forward_query(
                             tenant,
                             database,
                             table,
+                            branch,
                             limit,
+                            initial_commit,
                         )
                         .await;
                     }
@@ -6205,25 +6275,25 @@ fn rls_row_allowed(
 fn realtime_change_allowed(
     rls_tables: &HashMap<String, String>,
     tenant: &str,
+    branch: &str,
     record: &ryme_realtime::ChangeRecord,
 ) -> bool {
     record.tenant == tenant
+        && record.branch == branch
         && record
             .after
             .as_deref()
             .is_none_or(|value| rls_row_allowed(rls_tables, tenant, &record.table, value))
 }
 
-fn scan_realtime_rows(
-    backend: &Backend,
+fn scan_realtime_rows<B: TxnBackend>(
+    backend: &B,
     rls_tables: &HashMap<String, String>,
     tenant: &str,
     database: &str,
     table: &str,
     limit: usize,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use ryme_txn::TxnBackend;
-
     if limit == 0 {
         return Vec::new();
     }
@@ -6256,24 +6326,26 @@ fn scan_realtime_rows(
     visible
 }
 
-async fn send_query_snapshot(
+async fn send_query_snapshot<B: TxnBackend>(
     sender: &mut futures_util::stream::SplitSink<
         axum::extract::ws::WebSocket,
         axum::extract::ws::Message,
     >,
-    backend: &Backend,
+    backend: &B,
     qos: &Arc<Mutex<QosRegistry>>,
     rls_tables: &HashMap<String, String>,
     tenant: &str,
     database: &str,
     table: &str,
+    branch: &str,
     limit: usize,
+    commit: u64,
 ) -> u64 {
     let rows = scan_realtime_rows(backend, rls_tables, tenant, database, table, limit);
-    let commit = backend.latest_commit();
     let snapshot = serde_json::json!({
         "type": "snapshot",
         "commit": commit,
+        "branch": branch,
         "rows": rows
             .into_iter()
             .map(|(pk, value)| serde_json::json!({

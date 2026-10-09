@@ -5,7 +5,7 @@ rymeDB exposes two WebSocket endpoints for realtime data. Both upgrade from
 header, `x-api-key` header, or `?api_key=` query param (handy because
 browser `WebSocket` clients cannot set headers).
 
-## `GET /v1/stream?table=<name>` — change feed
+## `GET /v1/stream?table=<name>[&branch=<id>]` — change feed
 
 Pushes one JSON text frame per committed change to the table. Auth requires a
 read-capable credential (`readwrite`, `readonly`, `realtime_subscriber`, or an
@@ -45,6 +45,11 @@ administrative role). Each frame is a `ChangeRecord`
   commit timestamp and uses the same retained ring for recovery. The JS,
   The npm/TypeScript SDK exposes this cursor as `fromSequence`; Java and Rust
   clients can pass `from_sequence` directly to the stream endpoint.
+- Streams default to the `main` branch. Set `?branch=<id>` for browser
+  WebSocket clients, or send `X-Ryme-Branch: <id>` from clients that can set
+  headers. The query parameter and header must agree when both are present.
+  Branch streams have separate replay history and only deliver changes from
+  that branch.
 - Send a Close frame (or just disconnect) to stop; the server breaks the
   forwarding loop on close.
 - Idle stream sessions receive a WebSocket ping every 30 seconds, and client
@@ -54,26 +59,30 @@ administrative role). Each frame is a `ChangeRecord`
   consumers are disconnected so their connection task and retained buffers do
   not grow without bound.
 
-## `GET /v1/query-stream?table=<name>[&limit=<n>]` — live query
+## `GET /v1/query-stream?table=<name>[&limit=<n>][&branch=<id>]` — live query
 
 Requires a read-capable principal (`403` otherwise). `limit` defaults to 100
 and is clamped to 1–1000. The first frame is always a full snapshot of the
 table at the current commit:
 
 ```json
-{"type": "snapshot", "commit": 7, "rows": [{"pk": "k1", "value": "one"}]}
+{"type": "snapshot", "commit": 7, "branch": "main", "rows": [{"pk": "k1", "value": "one"}]}
 ```
 
 Here `pk`/`value` are UTF-8 strings. Later frames are updates carrying only
 commits newer than the snapshot:
 
 ```json
-{"type": "update", "commit": 8, "rows": [{"pk": "k2", "value": "two"}], "truncated": false}
+{"type": "update", "commit": 8, "branch": "main", "rows": [{"pk": "k2", "value": "two"}], "truncated": false}
 ```
 
 If the consumer lags, the server re-sends a fresh full snapshot instead of
 dropping data, so a query-stream consumer resynchronizes automatically —
 unlike the raw change feed.
+
+Query streams use the same branch selection rules as change feeds. A branch
+snapshot reads the branch's copy-on-write view, and later updates come only
+from that branch; omitting `branch` selects `main`.
 
 ## Tenant isolation
 

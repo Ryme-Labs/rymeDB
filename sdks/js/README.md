@@ -37,9 +37,9 @@ Notes:
   `status` and `body`.
 - `kvGet` returns the raw value bytes as text. Parse JSON yourself when your
   values are JSON.
-- `subscribeQuery(base, table, onMessage, { limit?, apiKey? })` tails
+- `subscribeQuery(base, table, onMessage, { limit?, branch?, apiKey? })` tails
   `/v1/query-stream`: first a `snapshot` message, then `update` messages.
-- `subscribeTable(base, table, onMessage, { apiKey?, from? })` tails
+- `subscribeTable(base, table, onMessage, { apiKey?, branch?, from? })` tails
   `/v1/stream`; pass the last seen `commit_ts` as `from` to replay missed
   changes, then continue live.
 - `subscribeBroadcast(base, channel, onMessage, { apiKey? })` tails

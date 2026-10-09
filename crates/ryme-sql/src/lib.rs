@@ -2193,7 +2193,9 @@ where
 
     fn refresh_table(&self, table: &str, commit_ts: u64) {
         let Some(realtime) = &self.realtime else { return };
-        let Some(limit) = realtime.query_limit(&self.tenant, &self.database, table) else {
+        let Some(limit) =
+            realtime.query_limit_branch(&self.tenant, &self.database, &self.branch, table)
+        else {
             return;
         };
         let mut txn = self.begin_with(self.isolation);
@@ -2203,7 +2205,15 @@ where
                 .scan(&mut txn, &self.tenant, &self.database, table, limit)
                 .unwrap_or_default(),
         );
-        let _ = realtime.publish_query(&self.tenant, &self.database, table, commit_ts, rows, limit);
+        let _ = realtime.publish_query_branch(
+            &self.tenant,
+            &self.database,
+            &self.branch,
+            table,
+            commit_ts,
+            rows,
+            limit,
+        );
     }
 
     pub async fn execute(&self, statement: Statement) -> Result<QueryResult> {

@@ -658,12 +658,14 @@ export interface QueryRow {
 export interface QueryMessage {
   type: "snapshot" | "update";
   commit: number;
+  branch?: string;
   rows: QueryRow[];
   truncated?: boolean;
 }
 
 export interface SubscribeOptions {
   apiKey?: string;
+  branch?: string;
   limit?: number;
   from?: number;
   fromSequence?: number;
@@ -681,6 +683,7 @@ export function subscribeTable(
   options?: SubscribeOptions,
 ): Subscription {
   let query = `/v1/stream?table=${encodeURIComponent(table)}`;
+  if (options?.branch !== undefined) query += `&branch=${encodeURIComponent(options.branch)}`;
   if (options?.from !== undefined) query += `&from=${options.from}`;
   if (options?.fromSequence !== undefined) query += `&from_sequence=${options.fromSequence}`;
   return openSocket(base, query, options, (data) => {
@@ -707,6 +710,7 @@ export function subscribeQuery(
   options?: SubscribeOptions,
 ): Subscription {
   let query = `/v1/query-stream?table=${encodeURIComponent(table)}`;
+  if (options?.branch !== undefined) query += `&branch=${encodeURIComponent(options.branch)}`;
   if (options?.limit !== undefined) query += `&limit=${options.limit}`;
   return openSocket(base, query, options, (data) => {
     onMessage(JSON.parse(data) as QueryMessage);
