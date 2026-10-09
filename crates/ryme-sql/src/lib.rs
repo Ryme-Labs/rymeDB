@@ -258,6 +258,8 @@ pub struct ForeignKeyConstraint {
     pub referenced_columns: Vec<String>,
     #[serde(default)]
     pub on_delete: ForeignKeyAction,
+    #[serde(default)]
+    pub on_update: ForeignKeyAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1421,12 +1423,20 @@ fn parse_foreign_key(item: &str) -> Result<Option<ForeignKeyConstraint>> {
             .ok_or_else(|| RymeError::InvalidArgument(String::from("foreign key column")))?;
         (vec![local], references)
     };
-    let (referenced_table, referenced_columns, on_delete) =
+    let (referenced_table, referenced_columns, on_delete, on_update) =
         parse_references_target(&item[target_start + 10..])?;
-    Ok(Some(ForeignKeyConstraint { columns, referenced_table, referenced_columns, on_delete }))
+    Ok(Some(ForeignKeyConstraint {
+        columns,
+        referenced_table,
+        referenced_columns,
+        on_delete,
+        on_update,
+    }))
 }
 
-fn parse_references_target(input: &str) -> Result<(String, Vec<String>, ForeignKeyAction)> {
+fn parse_references_target(
+    input: &str,
+) -> Result<(String, Vec<String>, ForeignKeyAction, ForeignKeyAction)> {
     let trimmed = input.trim();
     let tokens = tokenize(trimmed);
     let referenced_table = tokens
@@ -1450,40 +1460,41 @@ fn parse_references_target(input: &str) -> Result<(String, Vec<String>, ForeignK
         .and_then(|open| matching_paren(trimmed, open))
         .unwrap_or_else(|| referenced_table.len());
     let suffix = trimmed.get(close + 1..).unwrap_or_default();
-    let suffix_upper = suffix.to_ascii_uppercase();
-    let on_delete = if let Some(on_delete) = suffix_upper.find("ON DELETE") {
-        let action =
-            suffix[on_delete + "ON DELETE".len()..].split_whitespace().next().unwrap_or_default();
-        if action.eq_ignore_ascii_case("CASCADE") {
-            ForeignKeyAction::Cascade
-        } else if action.eq_ignore_ascii_case("RESTRICT")
-            || action.eq_ignore_ascii_case("NO")
-            || action.is_empty()
-        {
-            ForeignKeyAction::Restrict
-        } else if action.eq_ignore_ascii_case("SET") {
-            let set_action = suffix[on_delete + "ON DELETE".len()..]
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default();
-            if set_action.eq_ignore_ascii_case("NULL") {
-                ForeignKeyAction::SetNull
-            } else if set_action.eq_ignore_ascii_case("DEFAULT") {
-                ForeignKeyAction::SetDefault
-            } else {
-                return Err(RymeError::InvalidArgument(format!(
-                    "unsupported foreign key delete action SET {set_action}"
-                )));
-            }
-        } else {
-            return Err(RymeError::InvalidArgument(format!(
-                "unsupported foreign key delete action {action}"
-            )));
-        }
-    } else {
-        ForeignKeyAction::Restrict
+    let on_delete = parse_foreign_key_action(suffix, "ON DELETE")?;
+    let on_update = parse_foreign_key_action(suffix, "ON UPDATE")?;
+    Ok((referenced_table, referenced_columns, on_delete, on_update))
+}
+
+fn parse_foreign_key_action(suffix: &str, clause: &str) -> Result<ForeignKeyAction> {
+    let upper = suffix.to_ascii_uppercase();
+    let Some(offset) = upper.find(clause) else {
+        return Ok(ForeignKeyAction::Restrict);
     };
-    Ok((referenced_table, referenced_columns, on_delete))
+    let action_text = &suffix[offset + clause.len()..];
+    let mut actions = action_text.split_whitespace();
+    let action = actions.next().unwrap_or_default();
+    if action.eq_ignore_ascii_case("CASCADE") {
+        return Ok(ForeignKeyAction::Cascade);
+    }
+    if action.eq_ignore_ascii_case("RESTRICT")
+        || action.eq_ignore_ascii_case("NO")
+        || action.is_empty()
+    {
+        return Ok(ForeignKeyAction::Restrict);
+    }
+    if action.eq_ignore_ascii_case("SET") {
+        let set_action = actions.next().unwrap_or_default();
+        if set_action.eq_ignore_ascii_case("NULL") {
+            return Ok(ForeignKeyAction::SetNull);
+        }
+        if set_action.eq_ignore_ascii_case("DEFAULT") {
+            return Ok(ForeignKeyAction::SetDefault);
+        }
+        return Err(RymeError::InvalidArgument(format!(
+            "unsupported foreign key action {clause} SET {set_action}"
+        )));
+    }
+    Err(RymeError::InvalidArgument(format!("unsupported foreign key action {clause} {action}")))
 }
 
 fn check_expressions(item: &str) -> Vec<String> {
@@ -3961,6 +3972,126 @@ where
         Ok(())
     }
 
+    fn update_referencing_rows(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        pk: &[u8],
+        before: &[u8],
+        after: &[u8],
+        changes: &mut Vec<TransactionChange>,
+        visited: &mut BTreeSet<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
+        let identity = (table.clone(), pk.to_vec());
+        if !visited.insert(identity.clone()) {
+            return Ok(());
+        }
+        let constraints = self
+            .foreign_keys
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .iter()
+            .flat_map(|(child_table, constraints)| {
+                constraints.iter().map(move |constraint| (child_table.clone(), constraint.clone()))
+            })
+            .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(&table))
+            .collect::<Vec<_>>();
+        for (child_table, constraint) in constraints {
+            let referenced_columns = if constraint.referenced_columns.is_empty() {
+                self.catalog_columns(&table)
+                    .into_iter()
+                    .filter(|definition| definition.primary_key)
+                    .map(|definition| definition.name)
+                    .collect::<Vec<_>>()
+            } else {
+                constraint.referenced_columns.clone()
+            };
+            let old_values = referenced_columns
+                .iter()
+                .map(|column| self.row_column_value(&table, pk, before, column))
+                .collect::<Vec<_>>();
+            let new_values = referenced_columns
+                .iter()
+                .map(|column| self.row_column_value(&table, pk, after, column))
+                .collect::<Vec<_>>();
+            if old_values == new_values || old_values.iter().any(Option::is_none) {
+                continue;
+            }
+            let child_rows = self.scan_all_rows_in_transaction(txn, &child_table)?;
+            for (child_pk, child_value) in child_rows {
+                let matches_old =
+                    constraint.columns.iter().zip(&old_values).all(|(column, expected)| {
+                        self.row_column_value(&child_table, &child_pk, &child_value, column)
+                            .is_some_and(|actual| {
+                                expected.as_ref().is_some_and(|expected| actual == *expected)
+                            })
+                    });
+                if !matches_old {
+                    continue;
+                }
+                if constraint.on_update == ForeignKeyAction::Restrict {
+                    return Err(RymeError::Conflict(format!(
+                        "foreign key constraint failed: referenced key in {table} is still used"
+                    )));
+                }
+                let child_identity = (child_table.clone(), child_pk.clone());
+                if visited.contains(&child_identity) {
+                    continue;
+                }
+                let assignment = match constraint.on_update {
+                    ForeignKeyAction::Cascade => None,
+                    ForeignKeyAction::SetNull => Some(InsertValue::Null),
+                    ForeignKeyAction::SetDefault => Some(InsertValue::Default),
+                    ForeignKeyAction::Restrict => unreachable!(),
+                };
+                let assignments = constraint
+                    .columns
+                    .iter()
+                    .zip(&new_values)
+                    .map(|(column, value)| {
+                        let value = assignment.clone().unwrap_or_else(|| {
+                            value.clone().map(InsertValue::Value).unwrap_or(InsertValue::Null)
+                        });
+                        (column.clone(), value)
+                    })
+                    .collect();
+                let child_after = self.materialize_update_row(
+                    &child_table,
+                    &child_pk,
+                    assignments,
+                    &child_value,
+                )?;
+                self.enforce_checks(&child_table, &child_pk, &child_after)?;
+                self.enforce_foreign_keys(txn, &child_table, &child_pk, &child_after)?;
+                self.check_unique(&child_table, &child_pk, &child_after)?;
+                self.manager.put(
+                    txn,
+                    RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
+                    child_after.clone(),
+                );
+                self.update_referencing_rows(
+                    txn,
+                    &child_table,
+                    &child_pk,
+                    &child_value,
+                    &child_after,
+                    changes,
+                    visited,
+                )?;
+                changes.push(TransactionChange {
+                    table: child_table.clone(),
+                    pk: child_pk,
+                    op: Operation::Update,
+                    before: Some(child_value),
+                    after: Some(child_after),
+                });
+            }
+        }
+        visited.remove(&identity);
+        Ok(())
+    }
+
     fn filter_rls_rows(&self, table: &str, rows: impl IntoIterator<Item = Row>) -> Vec<Row> {
         rows.into_iter().filter(|(_, value)| self.rls_allows(table, value)).collect()
     }
@@ -5741,20 +5872,12 @@ where
                     if value.len() > 4 * 1024 * 1024 {
                         return Err(RymeError::Overload(String::from("value")));
                     }
-                    self.enforce_rls(&table, &value)?;
-                    self.enforce_checks(&table, &pk, &value)?;
-                    self.enforce_foreign_keys(txn, &table, &pk, &value)?;
-                    let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                    let before = self.manager.get(txn, &key)?;
-                    self.check_unique(&table, &pk, &value)?;
-                    self.manager.put(txn, key, value.clone());
-                    changes.push(TransactionChange {
-                        table: table.clone(),
-                        pk,
-                        op: if before.is_some() { Operation::Update } else { Operation::Insert },
-                        before,
-                        after: Some(value),
-                    });
+                    let (_, mut row_changes) = Box::pin(self.execute_in_transaction_base(
+                        txn,
+                        Statement::Upsert { table: table.clone(), pk, value },
+                    ))
+                    .await?;
+                    changes.append(&mut row_changes);
                 }
                 Ok((QueryResult::Ok, changes))
             }
@@ -5808,16 +5931,26 @@ where
                 }
                 self.check_unique(&table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
-                Ok((
-                    QueryResult::Ok,
-                    vec![TransactionChange {
-                        table,
-                        pk,
-                        op: if before.is_some() { Operation::Update } else { Operation::Insert },
-                        before,
-                        after: Some(value),
-                    }],
-                ))
+                let mut changes = Vec::new();
+                if let Some(before_value) = before.as_deref() {
+                    self.update_referencing_rows(
+                        txn,
+                        &table,
+                        &pk,
+                        before_value,
+                        &value,
+                        &mut changes,
+                        &mut BTreeSet::new(),
+                    )?;
+                }
+                changes.push(TransactionChange {
+                    table,
+                    pk,
+                    op: if before.is_some() { Operation::Update } else { Operation::Insert },
+                    before,
+                    after: Some(value),
+                });
+                Ok((QueryResult::Ok, changes))
             }
             Statement::UpdateRow { table, pk, assignments } => {
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -5848,6 +5981,15 @@ where
                         RecordKey::new(&self.tenant, &self.database, &table, &pk),
                         after.clone(),
                     );
+                    self.update_referencing_rows(
+                        txn,
+                        &table,
+                        &pk,
+                        &before,
+                        &after,
+                        &mut changes,
+                        &mut BTreeSet::new(),
+                    )?;
                     changes.push(TransactionChange {
                         table: table.clone(),
                         pk,
@@ -5871,16 +6013,26 @@ where
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
                 self.check_unique(&table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
-                Ok((
-                    QueryResult::Ok,
-                    vec![TransactionChange {
-                        table,
-                        pk,
-                        op: Operation::Update,
-                        before,
-                        after: Some(value),
-                    }],
-                ))
+                let mut changes = Vec::new();
+                if let Some(before_value) = before.as_deref() {
+                    self.update_referencing_rows(
+                        txn,
+                        &table,
+                        &pk,
+                        before_value,
+                        &value,
+                        &mut changes,
+                        &mut BTreeSet::new(),
+                    )?;
+                }
+                changes.push(TransactionChange {
+                    table,
+                    pk,
+                    op: Operation::Update,
+                    before,
+                    after: Some(value),
+                });
+                Ok((QueryResult::Ok, changes))
             }
             Statement::Delete { table, pk } => {
                 self.reject_if_read_only()?;
@@ -6557,32 +6709,11 @@ where
                 Ok(QueryResult::Ok)
             }
             Statement::Upsert { table, pk, value } => {
-                self.reject_if_read_only()?;
-                self.enforce_rls(&table, &value)?;
-                self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
-                self.enforce_foreign_keys(&mut txn, &table, &pk, &value)?;
-                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(&mut txn, &key)?;
-                let existed = before.is_some();
-                if let Some(before) = before.as_deref() {
-                    self.enforce_rls(&table, before)?;
-                }
-                self.check_unique(&table, &pk, &value)?;
-                let after = self.realtime.as_ref().map(|_| value.clone());
-                self.manager.put(&mut txn, key, value.clone());
-                let commit_ts = self.manager.commit(txn).await?;
-                self.apply_index_change(&TransactionChange {
-                    table: table.clone(),
-                    pk: pk.clone(),
-                    op: if existed { Operation::Update } else { Operation::Insert },
-                    before: before.clone(),
-                    after: Some(value.clone()),
-                });
-                if let Some(after) = after {
-                    let op = if existed { Operation::Update } else { Operation::Insert };
-                    self.emit(&table, pk, op, before, Some(after), commit_ts)?;
-                }
+                let (_, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::Upsert { table, pk, value })
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::SelectByKey { table, pk } => {
@@ -6763,31 +6894,11 @@ where
                 Ok(QueryResult::Ok)
             }
             Statement::Update { table, pk, value } => {
-                self.reject_if_read_only()?;
-                self.enforce_rls(&table, &value)?;
-                self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
-                self.enforce_foreign_keys(&mut txn, &table, &pk, &value)?;
-                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(&mut txn, &key)?;
-                if before.is_none() {
-                    return Err(RymeError::NotFound(String::from("row")));
-                }
-                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
-                self.check_unique(&table, &pk, &value)?;
-                let after = self.realtime.as_ref().map(|_| value.clone());
-                self.manager.put(&mut txn, key, value.clone());
-                let commit_ts = self.manager.commit(txn).await?;
-                self.apply_index_change(&TransactionChange {
-                    table: table.clone(),
-                    pk: pk.clone(),
-                    op: Operation::Update,
-                    before: before.clone(),
-                    after: Some(value.clone()),
-                });
-                if let Some(after) = after {
-                    self.emit(&table, pk, Operation::Update, before, Some(after), commit_ts)?;
-                }
+                let (_, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::Update { table, pk, value })
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::Delete { table, pk } => {
@@ -6849,19 +6960,17 @@ where
                 if value.len() > 4 * 1024 * 1024 {
                     return Err(RymeError::Overload(String::from("value")));
                 }
-                let key = RecordKey::new(&self.tenant, &self.database, &table, pk);
-                let before = self.manager.get(&mut txn, &key)?;
-                self.enforce_checks(&table, pk, value)?;
-                self.enforce_foreign_keys(&mut txn, &table, pk, value)?;
-                self.check_unique(&table, pk, value)?;
-                self.manager.put(&mut txn, key, value.clone());
-                staged.push(TransactionChange {
-                    table: table.clone(),
-                    pk: pk.clone(),
-                    op: if before.is_some() { Operation::Update } else { Operation::Insert },
-                    before,
-                    after: Some(value.clone()),
-                });
+                let (_, mut changes) = self
+                    .execute_in_transaction_base(
+                        &mut txn,
+                        Statement::Upsert {
+                            table: table.clone(),
+                            pk: pk.clone(),
+                            value: value.clone(),
+                        },
+                    )
+                    .await?;
+                staged.append(&mut changes);
             }
             self.check_transaction_uniqueness(&staged)?;
             let commit_ts = self.manager.commit(txn).await?;
@@ -7779,7 +7888,7 @@ mod tests {
     #[test]
     fn parses_column_and_table_foreign_keys() {
         let Statement::CreateTable { foreign_keys, .. } = parse(
-            "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id), room_id TEXT, FOREIGN KEY (room_id) REFERENCES rooms (id) ON DELETE CASCADE)",
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id), room_id TEXT, FOREIGN KEY (room_id) REFERENCES rooms (id) ON DELETE CASCADE ON UPDATE CASCADE)",
         )
         .unwrap()
         else {
@@ -7793,12 +7902,14 @@ mod tests {
                     referenced_table: String::from("users"),
                     referenced_columns: vec![String::from("id")],
                     on_delete: ForeignKeyAction::Restrict,
+                    on_update: ForeignKeyAction::Restrict,
                 },
                 ForeignKeyConstraint {
                     columns: vec![String::from("room_id")],
                     referenced_table: String::from("rooms"),
                     referenced_columns: vec![String::from("id")],
                     on_delete: ForeignKeyAction::Cascade,
+                    on_update: ForeignKeyAction::Cascade,
                 },
             ]
         );
@@ -8123,11 +8234,71 @@ mod tests {
         executor.execute(parse("DELETE FROM users WHERE id = 'u1'").unwrap()).await.unwrap();
         let profiles = executor.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
         let sessions = executor.execute(parse("SELECT * FROM sessions").unwrap()).await.unwrap();
+        let null_user = b"\"user_id\":null";
+        let default_user = b"\"user_id\":\"u2\"";
         assert!(
-            matches!(profiles, QueryResult::Rows { rows } if rows[0].1.windows(13).any(|window| window == br#"user_id":null"#))
+            matches!(profiles, QueryResult::Rows { ref rows } if rows[0].1.windows(null_user.len()).any(|window| window == null_user))
         );
         assert!(
-            matches!(sessions, QueryResult::Rows { rows } if rows[0].1.windows(13).any(|window| window == br#"user_id":"u2""#))
+            matches!(sessions, QueryResult::Rows { ref rows } if rows[0].1.windows(default_user.len()).any(|window| window == default_user))
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_key_update_actions_protect_and_cascade_parent_keys() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY, code TEXT UNIQUE)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE cascades (id TEXT PRIMARY KEY, user_code TEXT REFERENCES users (code) ON UPDATE CASCADE)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE restricted (id TEXT PRIMARY KEY, user_code TEXT REFERENCES users (code))",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO users (id, code) VALUES ('u1', 'old')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO cascades (id, user_code) VALUES ('c1', 'old')").unwrap())
+            .await
+            .unwrap();
+        let inserted = executor
+            .execute(parse("INSERT INTO restricted (id, user_code) VALUES ('r1', 'old')").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(inserted, QueryResult::Ok));
+
+        let blocked = executor
+            .execute(parse("UPDATE users SET code = 'blocked' WHERE id = 'u1'").unwrap())
+            .await;
+        assert!(
+            matches!(blocked, Err(RymeError::Conflict(message)) if message.contains("foreign key"))
+        );
+        executor.execute(parse("DELETE FROM restricted WHERE id = 'r1'").unwrap()).await.unwrap();
+        executor
+            .execute(parse("UPDATE users SET code = 'new' WHERE id = 'u1'").unwrap())
+            .await
+            .unwrap();
+        let cascaded = executor.execute(parse("SELECT * FROM cascades").unwrap()).await.unwrap();
+        let new_user = b"\"user_code\":\"new\"";
+        assert!(
+            matches!(cascaded, QueryResult::Rows { ref rows } if rows[0].1.windows(new_user.len()).any(|window| window == new_user)),
+            "{cascaded:?}"
         );
     }
 

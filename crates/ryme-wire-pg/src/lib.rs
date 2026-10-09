@@ -1078,6 +1078,7 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("conkey"),
                 String::from("confkey"),
                 String::from("confdeltype"),
+                String::from("confupdtype"),
                 String::from("convalidated"),
             ],
             "index" => vec![
@@ -1415,6 +1416,7 @@ where
                     0,
                     String::new(),
                     String::new(),
+                    String::new(),
                 ));
             }
             for index in executor.catalog_indexes(&table).into_iter().filter(|index| index.unique) {
@@ -1453,6 +1455,7 @@ where
                     0,
                     String::new(),
                     String::new(),
+                    String::new(),
                 ));
             }
             for (foreign_index, foreign_key) in
@@ -1486,6 +1489,12 @@ where
                     ForeignKeyAction::SetNull => b"n".to_vec(),
                     ForeignKeyAction::SetDefault => b"d".to_vec(),
                 };
+                let confupdtype = match foreign_key.on_update {
+                    ForeignKeyAction::Restrict => b"r".to_vec(),
+                    ForeignKeyAction::Cascade => b"c".to_vec(),
+                    ForeignKeyAction::SetNull => b"n".to_vec(),
+                    ForeignKeyAction::SetDefault => b"d".to_vec(),
+                };
                 constraints.push((
                     format!("{table_name}_fkey_{foreign_index}"),
                     String::from("f"),
@@ -1501,6 +1510,7 @@ where
                         confkey.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
                     ),
                     String::from_utf8_lossy(&confdeltype).into_owned(),
+                    String::from_utf8_lossy(&confupdtype).into_owned(),
                 ));
             }
         }
@@ -1516,6 +1526,7 @@ where
                     referenced_relation_oid,
                     confkey,
                     confdeltype,
+                    confupdtype,
                 )| {
                     columns
                         .iter()
@@ -1532,6 +1543,7 @@ where
                             "conkey" => conkey.as_bytes().to_vec(),
                             "confkey" => confkey.as_bytes().to_vec(),
                             "confdeltype" => confdeltype.as_bytes().to_vec(),
+                            "confupdtype" => confupdtype.as_bytes().to_vec(),
                             "convalidated" => b"t".to_vec(),
                             _ => Vec::new(),
                         })

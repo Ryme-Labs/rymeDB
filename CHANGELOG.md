@@ -66,6 +66,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Foreign keys now support PostgreSQL-compatible `ON DELETE RESTRICT`,
   `ON DELETE CASCADE`, `ON DELETE SET NULL`, and `ON DELETE SET DEFAULT`
   behavior across point, filtered, and transactional deletes.
+- Foreign keys now enforce `ON UPDATE RESTRICT`, `ON UPDATE CASCADE`,
+  `ON UPDATE SET NULL`, and `ON UPDATE SET DEFAULT` when referenced unique
+  keys change, including PostgreSQL constraint metadata for both actions.
 - `ALTER TABLE ... ADD CONSTRAINT` now adds and validates `UNIQUE`, `CHECK`,
   and `FOREIGN KEY ... REFERENCES` constraints against existing and future rows.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
