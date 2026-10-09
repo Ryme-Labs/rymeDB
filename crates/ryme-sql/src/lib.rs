@@ -477,6 +477,10 @@ pub enum QueryResult {
     Table { columns: Vec<String>, rows: Vec<Vec<Vec<u8>>> },
 }
 
+/// Internal marker used for SQL NULL cells in byte-oriented query results.
+/// Wire encoders translate it to their protocol-level null representation.
+pub const SQL_NULL_SENTINEL: &[u8] = b"\0";
+
 pub type Row = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3932,6 +3936,9 @@ fn eval_select_value(raw: &str) -> Result<Vec<u8>> {
     );
     if !literal && !builtin && !parameter {
         return Err(RymeError::InvalidArgument(String::from("unsupported select value")));
+    }
+    if expression.eq_ignore_ascii_case("NULL") {
+        return Ok(SQL_NULL_SENTINEL.to_vec());
     }
     let value = match lower.as_str() {
         "version()" => String::from("PostgreSQL 16.0 on rymeDB"),
@@ -13648,7 +13655,7 @@ mod tests {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], b"1");
                 assert_eq!(rows[0][1], b"true");
-                assert_eq!(rows[0][2], b"NULL");
+                assert_eq!(rows[0][2], SQL_NULL_SENTINEL);
                 assert_eq!(rows[0][3], b"hello");
                 assert!(String::from_utf8_lossy(&rows[0][4]).contains("rymeDB"));
                 assert_eq!(rows[0][5], b"public");

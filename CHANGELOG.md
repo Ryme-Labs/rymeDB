@@ -10,7 +10,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - Scalar PostgreSQL reads without `FROM` now run through the shared SQL
   executor, including literals, built-in session values, casts, and bound
-  placeholders across simple and extended wire requests.
+  placeholders across simple and extended wire requests, with protocol-level
+  null handling for `SELECT NULL`.
 - Top-level PostgreSQL `UNION`, `INTERSECT`, and `EXCEPT` queries now combine
   compatible table projections under one transaction snapshot with distinct
   and `ALL` multiset handling.

@@ -8,7 +8,7 @@ use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
     bind, parse, Executor, Field, ForeignKeyAction, QueryResult, ReturningField, Statement,
-    TransactionChange,
+    TransactionChange, SQL_NULL_SENTINEL,
 };
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use std::collections::HashMap;
@@ -2597,6 +2597,10 @@ fn data_row_values(values: &[Vec<u8>]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&(values.len() as u16).to_be_bytes());
     for value in values {
+        if value.as_slice() == SQL_NULL_SENTINEL {
+            body.extend_from_slice(&(-1i32).to_be_bytes());
+            continue;
+        }
         body.extend_from_slice(&(value.len() as u32).to_be_bytes());
         body.extend_from_slice(value);
     }
@@ -2821,5 +2825,14 @@ mod tests {
         assert_eq!(describe_query("SELECT 1, 2 AS n")[0], b'T');
         assert_eq!(describe_query("INSERT INTO t KEY '1' VALUE 'v'")[0], b'n');
         assert_eq!(describe_query("SELECT nonsense()")[0], b'n');
+    }
+
+    #[test]
+    fn null_cells_use_postgres_null_lengths() {
+        let packet = data_row_values(&[SQL_NULL_SENTINEL.to_vec(), b"value".to_vec()]);
+        assert_eq!(packet[0], b'D');
+        assert_eq!(u16::from_be_bytes([packet[5], packet[6]]), 2);
+        assert_eq!(i32::from_be_bytes(packet[7..11].try_into().unwrap()), -1);
+        assert_eq!(i32::from_be_bytes(packet[11..15].try_into().unwrap()), 5);
     }
 }

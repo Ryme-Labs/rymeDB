@@ -613,9 +613,19 @@ where
                     rows.into_iter()
                         .map(|row| {
                             let pk = row.first().cloned().unwrap_or_default();
+                            let values = row
+                                .into_iter()
+                                .map(|value| {
+                                    if value.as_slice() == ryme_sql::SQL_NULL_SENTINEL {
+                                        serde_json::Value::Null
+                                    } else {
+                                        serde_json::json!(value)
+                                    }
+                                })
+                                .collect::<Vec<_>>();
                             let value = serde_json::json!({
                                 "columns": columns.clone(),
-                                "values": row,
+                                "values": values,
                             })
                             .to_string();
                             let masked = self.gateway.masked(&table, value.into_bytes());
