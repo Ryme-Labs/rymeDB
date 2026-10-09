@@ -23,6 +23,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Live query streams retain the latest published commit per topic, so a
   broadcast-ring lag recovery resnapshot advances the client watermark rather
   than replaying from the connection's original commit.
+- Raft recovery now fsyncs metadata replacements, fails closed on malformed
+  metadata or log/apply payloads, and uses idempotent state-machine replay so
+  leader-local commits are not applied twice.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention

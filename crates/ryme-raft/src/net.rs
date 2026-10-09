@@ -303,6 +303,16 @@ fn decode_log_frame(input: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
     Ok((index, term, input[24..].to_vec()))
 }
 
+fn validate_apply_payload(input: &[u8]) -> Result<()> {
+    match decode_apply(input)? {
+        ApplyPayload::Data { writes, .. } => {
+            decode_writes(&writes)?;
+        }
+        ApplyPayload::Conf { .. } => {}
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Inner {
     term: u64,
@@ -363,7 +373,12 @@ impl Inner {
         };
         let raw = serde_json::to_vec(&meta).map_err(|e| RymeError::Internal(e.to_string()))?;
         let tmp = self.meta_path.with_extension("tmp");
-        std::fs::write(&tmp, &raw)?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&raw)?;
+            file.sync_data()?;
+        }
         std::fs::rename(&tmp, &self.meta_path)?;
         Ok(())
     }
@@ -440,13 +455,8 @@ impl Node {
         std::fs::create_dir_all(dir)?;
         let meta_path = dir.join("raft-meta.json");
         let meta = match std::fs::read(&meta_path) {
-            Ok(raw) => serde_json::from_slice::<Meta>(&raw).unwrap_or(Meta {
-                term: 0,
-                voted_for: None,
-                commit_index: 0,
-                members: Vec::new(),
-                joint: None,
-            }),
+            Ok(raw) => serde_json::from_slice::<Meta>(&raw)
+                .map_err(|error| RymeError::Corrupt(format!("raft metadata: {error}")))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Meta { term: 0, voted_for: None, commit_index: 0, members: Vec::new(), joint: None }
             }
@@ -475,28 +485,26 @@ impl Node {
         let manager = TxnManager::new();
         let mut log: Vec<LogEntry> = Vec::new();
         for record in records {
-            if let Ok((index, term, apply)) = decode_log_frame(&record.payload) {
-                if log.iter().any(|e: &LogEntry| e.index == index) {
-                    continue;
-                }
-                log.push(LogEntry { index, term, payload: apply });
+            let (index, term, apply) = decode_log_frame(&record.payload)?;
+            if log.iter().any(|e: &LogEntry| e.index == index) {
+                continue;
             }
+            validate_apply_payload(&apply)?;
+            log.push(LogEntry { index, term, payload: apply });
         }
         log.sort_by_key(|e| e.index);
         let mut applied = 0u64;
         let mut replayed: Option<crate::ConfChange> = None;
         let mut replayed_joint: Option<Vec<Member>> = None;
         for entry in log.iter().filter(|e| e.index <= meta.commit_index) {
-            match decode_apply(&entry.payload) {
-                Ok(ApplyPayload::Data { commit_ts, writes }) => {
-                    if let Ok(writes) = decode_writes(&writes) {
-                        manager.apply_at(commit_ts, &writes)?;
-                    }
+            match decode_apply(&entry.payload)? {
+                ApplyPayload::Data { commit_ts, writes } => {
+                    let writes = decode_writes(&writes)?;
+                    manager.replay_at(commit_ts, &writes)?;
                 }
-                Ok(ApplyPayload::Conf { change }) => {
+                ApplyPayload::Conf { change } => {
                     replayed = Some(change);
                 }
-                Err(_) => continue,
             }
             applied = entry.index;
         }
@@ -893,7 +901,10 @@ impl Node {
 
     async fn replicate_all(self: &Arc<Self>) {
         self.replicate_once().await;
-        self.apply_ready().await;
+        if let Err(error) = self.apply_ready().await {
+            tracing::error!(node = self.id, %error, "raft state machine apply failed");
+            self.set_isolated(true);
+        }
     }
 
     async fn replicate_once(self: &Arc<Self>) {
@@ -967,7 +978,7 @@ impl Node {
         }
     }
 
-    async fn apply_ready(&self) {
+    async fn apply_ready(&self) -> Result<()> {
         let entries = {
             let inner = self.inner.lock().await;
             inner
@@ -978,19 +989,18 @@ impl Node {
                 .collect::<Vec<_>>()
         };
         for entry in entries {
-            match decode_apply(&entry.payload) {
-                Ok(ApplyPayload::Data { commit_ts, writes }) => {
-                    if let Ok(writes) = decode_writes(&writes) {
-                        let _ = self.manager.apply_at(commit_ts, &writes);
-                    }
+            match decode_apply(&entry.payload)? {
+                ApplyPayload::Data { commit_ts, writes } => {
+                    let writes = decode_writes(&writes)?;
+                    self.manager.replay_at(commit_ts, &writes)?;
                 }
-                Ok(ApplyPayload::Conf { change }) => {
+                ApplyPayload::Conf { change } => {
                     self.apply_conf(change).await;
                 }
-                Err(_) => continue,
             }
             self.inner.lock().await.applied = entry.index;
         }
+        Ok(())
     }
 
     async fn apply_conf(&self, change: crate::ConfChange) {
@@ -1166,7 +1176,7 @@ impl Node {
                     }
                 };
                 if applied_now {
-                    self.apply_ready().await;
+                    self.apply_ready().await?;
                 }
                 Ok(result)
             }
@@ -1606,5 +1616,43 @@ impl ResetFlag for Inner {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ryme-raft-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ))
+    }
+
+    #[test]
+    fn open_rejects_corrupt_metadata() {
+        let dir = temp_dir("meta");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("raft-meta.json"), b"not-json").unwrap();
+
+        let result = Node::open(0, Vec::new(), Vec::new(), &dir);
+        assert!(
+            matches!(result, Err(RymeError::Corrupt(message)) if message.starts_with("raft metadata:"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_rejects_corrupt_log_payload() {
+        let dir = temp_dir("log");
+        let mut wal = ryme_wal::Wal::open(&dir, 1024 * 1024).unwrap();
+        wal.append(1, &encode_log_frame(1, 1, b"invalid apply payload")).unwrap();
+        wal.sync().unwrap();
+
+        let result = Node::open(0, Vec::new(), Vec::new(), &dir);
+        assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

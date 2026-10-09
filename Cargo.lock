@@ -1782,6 +1782,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
