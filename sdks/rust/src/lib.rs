@@ -1,4 +1,7 @@
+use futures_util::{SinkExt, StreamExt};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -6,6 +9,8 @@ pub enum ClientError {
     Http(String),
     #[error("status {0}: {1}")]
     Status(u16, String),
+    #[error("websocket: {0}")]
+    WebSocket(String),
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +26,36 @@ pub struct CopyRow {
     pub value: String,
 }
 
+pub struct RealtimeSubscription {
+    stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+}
+
+impl RealtimeSubscription {
+    /// Receive the next complete JSON text frame, replying to WebSocket pings automatically.
+    pub async fn recv(&mut self) -> Result<Option<String>, ClientError> {
+        while let Some(message) = self.stream.next().await {
+            match message.map_err(|error| ClientError::WebSocket(error.to_string()))? {
+                Message::Text(text) => return Ok(Some(text)),
+                Message::Ping(payload) => self
+                    .stream
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|error| ClientError::WebSocket(error.to_string()))?,
+                Message::Close(_) => return Ok(None),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn close(mut self) -> Result<(), ClientError> {
+        self.stream
+            .close(None)
+            .await
+            .map_err(|error| ClientError::WebSocket(error.to_string()))
+    }
+}
+
 impl RymeClient {
     pub fn new(base: String, api_key: String) -> Self {
         Self { base, api_key, http: reqwest::Client::new() }
@@ -32,6 +67,45 @@ impl RymeClient {
         } else {
             request.header("authorization", format!("Bearer {}", self.api_key))
         }
+    }
+
+    fn websocket_url(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<reqwest::Url, ClientError> {
+        let mut url = reqwest::Url::parse(&self.base).map_err(|e| ClientError::Http(e.to_string()))?;
+        let scheme = match url.scheme() {
+            "https" => "wss",
+            "http" => "ws",
+            other => other,
+        }
+        .to_string();
+        url.set_scheme(&scheme).map_err(|_| ClientError::Http(String::from("websocket scheme")))?;
+        url.set_path(path);
+        url.set_query(None);
+        {
+            let mut query = url.query_pairs_mut();
+            for (key, value) in params {
+                query.append_pair(key, value);
+            }
+            if !self.api_key.is_empty() {
+                query.append_pair("api_key", &self.api_key);
+            }
+        }
+        Ok(url)
+    }
+
+    async fn subscribe(
+        &self,
+        path: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<RealtimeSubscription, ClientError> {
+        let url = self.websocket_url(path, &params)?;
+        let (stream, _) = connect_async(url)
+            .await
+            .map_err(|error| ClientError::WebSocket(error.to_string()))?;
+        Ok(RealtimeSubscription { stream })
     }
 
     async fn check(response: reqwest::Response) -> Result<serde_json::Value, ClientError> {
@@ -56,6 +130,53 @@ impl RymeClient {
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
         Ok(response.status().is_success())
+    }
+
+    pub async fn subscribe_table(
+        &self,
+        table: &str,
+        branch: Option<&str>,
+        from: Option<u64>,
+        from_sequence: Option<u64>,
+    ) -> Result<RealtimeSubscription, ClientError> {
+        let mut params = vec![(String::from("table"), table.to_string())];
+        if let Some(branch) = branch {
+            params.push((String::from("branch"), branch.to_string()));
+        }
+        if let Some(from) = from {
+            params.push((String::from("from"), from.to_string()));
+        }
+        if let Some(sequence) = from_sequence {
+            params.push((String::from("from_sequence"), sequence.to_string()));
+        }
+        self.subscribe("/v1/stream", params).await
+    }
+
+    pub async fn subscribe_broadcast(
+        &self,
+        channel: &str,
+    ) -> Result<RealtimeSubscription, ClientError> {
+        self.subscribe(
+            &format!("/v1/broadcast/{}", utf8_percent_encode(channel, NON_ALPHANUMERIC)),
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn subscribe_query(
+        &self,
+        table: &str,
+        branch: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<RealtimeSubscription, ClientError> {
+        let mut params = vec![(String::from("table"), table.to_string())];
+        if let Some(branch) = branch {
+            params.push((String::from("branch"), branch.to_string()));
+        }
+        if let Some(limit) = limit {
+            params.push((String::from("limit"), limit.to_string()));
+        }
+        self.subscribe("/v1/query-stream", params).await
     }
 
     pub async fn kv_get(&self, table: &str, key: &str) -> Result<Vec<u8>, ClientError> {
@@ -765,6 +886,22 @@ mod tests {
 
     fn seen(state: &Arc<Mutex<Seen>>) -> Seen {
         state.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn websocket_urls_use_ws_and_encode_replay_params() {
+        let client = RymeClient::new(String::from("https://db.example.test"), String::from("key/1"));
+        let url = client
+            .websocket_url(
+                "/v1/stream",
+                &[
+                    (String::from("table"), String::from("room messages")),
+                    (String::from("from_sequence"), String::from("7")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.as_str(), "wss://db.example.test/v1/stream?table=room+messages&from_sequence=7&api_key=key%2F1");
     }
 
     #[tokio::test]

@@ -6,11 +6,15 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
@@ -343,6 +347,69 @@ public final class RymeClient {
                 + ",\"key\":" + json(key) + ",\"value\":" + json(value) + "}");
     }
 
+    /** Subscribe to committed table changes. Each complete text frame is passed to {@code onMessage}. */
+    public CompletableFuture<WebSocket> subscribeTable(String table, Consumer<String> onMessage) {
+        return subscribeTable(table, null, null, null, onMessage);
+    }
+
+    /** Subscribe to committed table changes with branch and replay cursors. */
+    public CompletableFuture<WebSocket> subscribeTable(String table, String branch, Long from,
+                                                       Long fromSequence, Consumer<String> onMessage) {
+        List<String> params = new ArrayList<>();
+        params.add("table=" + encode(table));
+        if (branch != null) params.add("branch=" + encode(branch));
+        if (from != null) params.add("from=" + from);
+        if (fromSequence != null) params.add("from_sequence=" + fromSequence);
+        return subscribe("/v1/stream", params, onMessage);
+    }
+
+    /** Subscribe to ephemeral broadcast frames for one channel. */
+    public CompletableFuture<WebSocket> subscribeBroadcast(String channel, Consumer<String> onMessage) {
+        return subscribe("/v1/broadcast/" + segment(channel), List.of(), onMessage);
+    }
+
+    /** Subscribe to a live query snapshot/update stream. */
+    public CompletableFuture<WebSocket> subscribeQuery(String table, String branch, Integer limit,
+                                                        Consumer<String> onMessage) {
+        List<String> params = new ArrayList<>();
+        params.add("table=" + encode(table));
+        if (branch != null) params.add("branch=" + encode(branch));
+        if (limit != null) params.add("limit=" + limit);
+        return subscribe("/v1/query-stream", params, onMessage);
+    }
+
+    private CompletableFuture<WebSocket> subscribe(String path, List<String> params,
+                                                    Consumer<String> onMessage) {
+        Objects.requireNonNull(onMessage, "onMessage");
+        List<String> query = new ArrayList<>(params);
+        if (!apiKey.isEmpty()) query.add("api_key=" + encode(apiKey));
+        String suffix = query.isEmpty() ? "" : "?" + String.join("&", query);
+        return http.newWebSocketBuilder().buildAsync(websocketUri(path + suffix), new WebSocket.Listener() {
+            private final StringBuilder frame = new StringBuilder();
+
+            @Override
+            public void onOpen(WebSocket webSocket) {
+                webSocket.request(1);
+            }
+
+            @Override
+            public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+                frame.append(data);
+                if (last) {
+                    onMessage.accept(frame.toString());
+                    frame.setLength(0);
+                }
+                webSocket.request(1);
+                return CompletableFuture.completedFuture(null);
+            }
+
+            @Override
+            public void onError(WebSocket webSocket, Throwable error) {
+                webSocket.abort();
+            }
+        });
+    }
+
     public String requestJson(String method, String path, String body) {
         return request(method, path, body);
     }
@@ -372,6 +439,15 @@ public final class RymeClient {
 
     private URI uri(String path) {
         return URI.create(base + (path.startsWith("/") ? path : "/" + path));
+    }
+
+    private URI websocketUri(String path) {
+        String websocketBase = base.startsWith("https://")
+                ? "wss://" + base.substring("https://".length())
+                : base.startsWith("http://")
+                    ? "ws://" + base.substring("http://".length())
+                    : base;
+        return URI.create(websocketBase + (path.startsWith("/") ? path : "/" + path));
     }
 
     private static String segment(String value) {

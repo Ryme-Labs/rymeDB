@@ -148,16 +148,18 @@ until the socket closes or you send SIGINT.
 
 ## SDKs
 
-- **Java** (`sdks/java`): the dependency-free `RymeClient` covers the HTTP
-  endpoints; use a WebSocket client for streaming subscriptions.
+- **Java** (`sdks/java`): the dependency-free `RymeClient` covers HTTP and
+  Java 17 WebSocket subscriptions through `subscribeTable`, `subscribeQuery`,
+  and `subscribeBroadcast`; callbacks receive complete JSON text frames.
 - **JS** (`sdks/js/src/index.ts`): `subscribeTable(base, table, onMessage,
   {apiKey?})`
   and `subscribeQuery(base, table, onMessage, {apiKey?, limit?})`, plus
   `subscribeBroadcast(base, channel, onMessage, {apiKey?})`, all returning
   `{ready, close}`. `onMessage` receives parsed `ChangeRecord` /
   `QueryMessage` / `BroadcastRecord` objects.
-- **Rust** (`sdks/rust`): use the same authenticated stream URLs with a
-  WebSocket client and the crate's HTTP client for request/response APIs.
+- **Rust** (`sdks/rust`): `RymeClient` exposes `subscribe_table`,
+  `subscribe_query`, and `subscribe_broadcast`; `RealtimeSubscription::recv`
+  handles ping/pong while returning complete JSON text frames.
 
 ## `GET /v1/broadcast/<channel>` — broadcast subscribe
 
