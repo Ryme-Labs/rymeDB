@@ -1401,26 +1401,7 @@ fn spawn_gateways(
         let jwt = state.jwt.clone();
         let default_tenant = state.tenant.clone();
         pg = pg.with_authenticator(move |_user, password| {
-            let expected = expected_password.as_bytes();
-            let presented = password.as_bytes();
-            let password_matches = expected.len() == presented.len()
-                && expected
-                    .iter()
-                    .zip(presented)
-                    .fold(0u8, |difference, (left, right)| difference | (left ^ right))
-                    == 0;
-            if password_matches {
-                return Ok(default_tenant.clone());
-            }
-            if let Ok(principal) = keys.authenticate(password) {
-                return Ok(principal.tenant);
-            }
-            if let Some(verifier) = jwt.as_ref() {
-                if let Ok(principal) = verifier.principal_from_token(password, now_secs()) {
-                    return Ok(principal.tenant);
-                }
-            }
-            Err(ryme_error::RymeError::Unauthorized)
+            wire_tenant(&expected_password, &keys, jwt.as_ref(), &default_tenant, password)
         });
     }
     let pg = pg
@@ -1428,17 +1409,21 @@ fn spawn_gateways(
         .with_metering(state.metering.clone())
         .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
         .with_range_hook(range_hook.clone());
-    let resp = ryme_wire_resp::RespGateway::with_backend(
+    let mut resp = ryme_wire_resp::RespGateway::with_backend(
         state.tenant.clone(),
         state.database.clone(),
         state.backend.clone(),
-    )
-    .with_realtime(state.realtime.clone())
-    .with_qos(state.qos.clone())
-    .with_metering(state.metering.clone())
-    .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
-    .with_range_hook(range_hook.clone())
-    .with_read_only(state.read_only);
+    );
+    if let Some(authenticator) = resp_authenticator(&state) {
+        resp = resp.with_authenticator(move |user, password| authenticator(user, password));
+    }
+    let resp = resp
+        .with_realtime(state.realtime.clone())
+        .with_qos(state.qos.clone())
+        .with_metering(state.metering.clone())
+        .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
+        .with_range_hook(range_hook.clone())
+        .with_read_only(state.read_only);
     let app = router(state.clone());
     let OptionalListeners {
         native: prebound_native,
@@ -1516,21 +1501,26 @@ fn spawn_gateways(
                 return;
             }
         };
-        let gateway = ryme_wire_resp::RespGateway::with_backend(
+        let mut gateway = ryme_wire_resp::RespGateway::with_backend(
             resp_tls_state.tenant.clone(),
             resp_tls_state.database.clone(),
             resp_tls_state.backend.clone(),
-        )
-        .with_realtime(resp_tls_state.realtime.clone())
-        .with_qos(resp_tls_state.qos.clone())
-        .with_metering(resp_tls_state.metering.clone())
-        .with_observe(
-            resp_tls_state.latency.clone(),
-            resp_tls_state.histogram.clone(),
-            resp_tls_state.slow_log.clone(),
-        )
-        .with_range_hook(resp_tls_hook)
-        .with_read_only(resp_tls_state.read_only);
+        );
+        if let Some(authenticator) = resp_authenticator(&resp_tls_state) {
+            gateway =
+                gateway.with_authenticator(move |user, password| authenticator(user, password));
+        }
+        let gateway = gateway
+            .with_realtime(resp_tls_state.realtime.clone())
+            .with_qos(resp_tls_state.qos.clone())
+            .with_metering(resp_tls_state.metering.clone())
+            .with_observe(
+                resp_tls_state.latency.clone(),
+                resp_tls_state.histogram.clone(),
+                resp_tls_state.slow_log.clone(),
+            )
+            .with_range_hook(resp_tls_hook)
+            .with_read_only(resp_tls_state.read_only);
         let _ = gateway.serve_tls(listener, max_connections, acceptor).await;
     });
     let native_state = state.clone();
@@ -5616,6 +5606,45 @@ fn error_response(error: ryme_error::RymeError) -> Response {
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn wire_tenant(
+    expected_password: &str,
+    keys: &ApiKeyStore,
+    jwt: Option<&JwtVerifier>,
+    default_tenant: &str,
+    password: &str,
+) -> ryme_error::Result<String> {
+    let expected = expected_password.as_bytes();
+    let presented = password.as_bytes();
+    let password_matches = expected.len() == presented.len()
+        && expected
+            .iter()
+            .zip(presented)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0;
+    if password_matches {
+        return Ok(default_tenant.to_string());
+    }
+    if let Ok(principal) = keys.authenticate(password) {
+        return Ok(principal.tenant);
+    }
+    if let Some(verifier) = jwt {
+        if let Ok(principal) = verifier.principal_from_token(password, now_secs()) {
+            return Ok(principal.tenant);
+        }
+    }
+    Err(ryme_error::RymeError::Unauthorized)
+}
+
+fn resp_authenticator(state: &SharedState) -> Option<ryme_wire_resp::RespAuthenticator> {
+    let expected_password = std::env::var("RYME_RESP_PASSWORD").ok()?;
+    let keys = state.keys.clone();
+    let jwt = state.jwt.clone();
+    let default_tenant = state.tenant.clone();
+    Some(Arc::new(move |_user, password| {
+        wire_tenant(&expected_password, &keys, jwt.as_ref(), &default_tenant, password)
+    }))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

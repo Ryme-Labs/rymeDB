@@ -80,3 +80,10 @@ the normal PostgreSQL `user` and `password` startup fields; the configured
 password selects the default tenant, while an API key or JWT supplied as the
 password selects its authenticated tenant. When unset, the embedded wire
 gateway retains trust-mode behavior for local development.
+
+Set `RYME_RESP_PASSWORD` to enable RESP `AUTH` and the same tenant selection
+behavior. Without it, RESP remains in trust mode for local development and
+returns the normal compatibility error for `AUTH`.
+
+Both mechanisms use the protocol’s password exchange; use the TLS listeners
+for non-loopback deployments.

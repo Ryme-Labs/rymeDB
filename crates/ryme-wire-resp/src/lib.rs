@@ -14,12 +14,15 @@ use tokio::net::TcpListener;
 
 const KV_TABLE: &str = "_kv";
 
-#[derive(Debug, Clone)]
+pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct RespGateway<B = TxnManager> {
     manager: B,
     tenant: String,
     database: String,
     branch: String,
+    authenticator: Option<RespAuthenticator>,
     realtime: Option<Realtime>,
     qos: Option<Arc<Mutex<QosRegistry>>>,
     metering: Option<Arc<Mutex<MeterRegistry>>>,
@@ -32,10 +35,25 @@ pub struct RespGateway<B = TxnManager> {
     read_only: bool,
 }
 
+impl<B: std::fmt::Debug> std::fmt::Debug for RespGateway<B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RespGateway")
+            .field("manager", &self.manager)
+            .field("tenant", &self.tenant)
+            .field("database", &self.database)
+            .field("branch", &self.branch)
+            .field("authenticator_configured", &self.authenticator.is_some())
+            .field("read_only", &self.read_only)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ClientState {
     name: Option<Vec<u8>>,
     id: u64,
+    authenticated: bool,
 }
 
 impl RespGateway<TxnManager> {
@@ -45,6 +63,7 @@ impl RespGateway<TxnManager> {
             tenant,
             database,
             branch: String::from("main"),
+            authenticator: None,
             realtime: None,
             qos: None,
             metering: None,
@@ -64,6 +83,7 @@ impl RespGateway<TxnManager> {
             tenant,
             database,
             branch: String::from("main"),
+            authenticator: None,
             realtime: None,
             qos: None,
             metering: None,
@@ -88,6 +108,7 @@ where
             tenant,
             database,
             branch: String::from("main"),
+            authenticator: None,
             realtime: None,
             qos: None,
             metering: None,
@@ -103,6 +124,14 @@ where
 
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    pub fn with_authenticator<F>(mut self, authenticator: F) -> Self
+    where
+        F: Fn(&str, &str) -> Result<String> + Send + Sync + 'static,
+    {
+        self.authenticator = Some(Arc::new(authenticator));
         self
     }
 
@@ -236,10 +265,39 @@ where
         ClientState {
             name: None,
             id: self.next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            authenticated: self.authenticator.is_none(),
         }
     }
 
-    fn hello(&self, command: &RespCommand, client: &mut ClientState) -> Vec<u8> {
+    fn authenticate(&mut self, args: &[Vec<u8>], client: &mut ClientState) -> Vec<u8> {
+        let Some(authenticator) = self.authenticator.clone() else {
+            return encode_error(String::from("Client sent AUTH, but no password is set"));
+        };
+        let (user, password) = match args {
+            [password] => ("default", password.as_slice()),
+            [user, password] => match std::str::from_utf8(user) {
+                Ok(user) => (user, password.as_slice()),
+                Err(_) => return encode_error(String::from("WRONGPASS invalid username")),
+            },
+            _ => return encode_error(String::from("wrong args")),
+        };
+        let password = match std::str::from_utf8(password) {
+            Ok(password) => password,
+            Err(_) => return encode_error(String::from("WRONGPASS invalid password")),
+        };
+        match authenticator(user, password) {
+            Ok(tenant) if !tenant.is_empty() => {
+                self.tenant = tenant;
+                client.authenticated = true;
+                encode_simple("OK")
+            }
+            Ok(_) | Err(_) => {
+                encode_error(String::from("WRONGPASS invalid username-password pair"))
+            }
+        }
+    }
+
+    fn hello(&mut self, command: &RespCommand, client: &mut ClientState) -> Vec<u8> {
         let mut index = 0;
         if let Some(version) = command.args.first() {
             if version.as_slice() != b"2" {
@@ -253,7 +311,11 @@ where
                     if index + 2 >= command.args.len() {
                         return encode_error(String::from("wrong args"));
                     }
-                    return encode_error(String::from("Client sent AUTH, but no password is set"));
+                    let reply = self.authenticate(&command.args[index + 1..index + 3], client);
+                    if reply != encode_simple("OK") {
+                        return reply;
+                    }
+                    index += 3;
                 }
                 b"SETNAME" => {
                     let Some(name) = command.args.get(index + 1) else {
@@ -264,6 +326,9 @@ where
                 }
                 _ => return encode_error(String::from("syntax error")),
             }
+        }
+        if !client.authenticated {
+            return encode_error(String::from("NOAUTH Authentication required"));
         }
         Self::encode_hello(client.id)
     }
@@ -440,10 +505,11 @@ where
         // turns a single read into a syscall storm, while an unbounded reply
         // buffer would let a client consume arbitrary memory.
         const WRITE_BATCH_BYTES: usize = 64 * 1024;
+        let mut service = self.clone();
         let mut buffer = vec![0u8; 65536];
         let mut pending: Vec<u8> = Vec::new();
         let mut multi: Option<Multi> = None;
-        let mut client = self.fresh_client();
+        let mut client = service.fresh_client();
         loop {
             let read = socket.read(&mut buffer).await.map_err(|e| RymeError::Io(e.to_string()))?;
             if read == 0 {
@@ -458,8 +524,8 @@ where
                     socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     replies.clear();
                 }
-                let reply = self.dispatch_conn(command, &mut multi, &mut client).await;
-                let reply = match self.admit_response(reply.len() as u64) {
+                let reply = service.dispatch_conn(command, &mut multi, &mut client).await;
+                let reply = match service.admit_response(reply.len() as u64) {
                     Some(denied) => denied,
                     None => reply,
                 };
@@ -496,11 +562,14 @@ where
     }
 
     async fn dispatch_conn(
-        &self,
+        &mut self,
         command: RespCommand,
         multi: &mut Option<Multi>,
         client: &mut ClientState,
     ) -> Vec<u8> {
+        if !client.authenticated && !matches!(command.name.as_str(), "AUTH" | "HELLO" | "PING") {
+            return encode_error(String::from("NOAUTH Authentication required"));
+        }
         match command.name.as_str() {
             "HELLO" => {
                 let start = std::time::Instant::now();
@@ -514,6 +583,7 @@ where
                 self.record_timing("HELLO", start.elapsed().as_micros() as u64);
                 reply
             }
+            "AUTH" => self.authenticate(&command.args, client),
             "CLIENT" => {
                 let start = std::time::Instant::now();
                 let bytes = Self::command_bytes(&command);

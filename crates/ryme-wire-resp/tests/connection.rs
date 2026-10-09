@@ -188,3 +188,64 @@ async fn hello_full_shape() {
         assert!(text.contains(part), "{text}");
     }
 }
+
+#[tokio::test]
+async fn auth_routes_commands_to_the_authenticated_tenant() {
+    let manager = ryme_txn::TxnManager::new();
+    let gateway = ryme_wire_resp::RespGateway::with_manager(
+        String::from("default"),
+        String::from("d"),
+        manager.clone(),
+    )
+    .with_authenticator(|user, password| {
+        if user == "alice" && password == "secret" {
+            Ok(String::from("alpha"))
+        } else {
+            Err(ryme_error::RymeError::Unauthorized)
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let frame = |parts: &[&str]| {
+        let mut out = format!("*{}\r\n", parts.len());
+        for part in parts {
+            out.push_str(&format!("${}\r\n{part}\r\n", part.len()));
+        }
+        out
+    };
+    socket.write_all(frame(&["GET", "key"]).as_bytes()).await.unwrap();
+    let reply = read_frame(&mut socket).await;
+    assert!(String::from_utf8_lossy(&reply).contains("NOAUTH"));
+    socket.write_all(frame(&["AUTH", "alice", "secret"]).as_bytes()).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&read_frame(&mut socket).await), "+OK\r\n");
+    socket.write_all(frame(&["SET", "key", "value"]).as_bytes()).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&read_frame(&mut socket).await), "+OK\r\n");
+    socket.write_all(frame(&["GET", "key"]).as_bytes()).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&read_frame(&mut socket).await), "$5\r\nvalue\r\n");
+
+    let mut txn = manager.begin();
+    assert_eq!(manager.scan(&mut txn, "alpha", "d", "_kv", 10).unwrap().len(), 1);
+    assert!(manager.scan(&mut txn, "default", "d", "_kv", 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn auth_rejects_invalid_passwords() {
+    let gateway = ryme_wire_resp::RespGateway::new(String::from("default"), String::from("d"))
+        .with_authenticator(|_, password| {
+            (password == "secret")
+                .then(|| String::from("default"))
+                .ok_or(ryme_error::RymeError::Unauthorized)
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+    let reply = command(addr, &["AUTH", "wrong"]).await;
+    assert!(reply.contains("WRONGPASS"), "{reply}");
+}
