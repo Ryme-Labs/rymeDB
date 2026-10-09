@@ -35,6 +35,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Realtime broadcast, change-stream replay, lag recovery, query updates, and
   snapshots now charge both the tenant message-rate and egress-byte buckets;
   heartbeat and ping/pong control frames remain exempt.
+- SQL WHERE clauses now accept standard equality and range operators (`=`, `<>`,
+  `!=`, `>`, `>=`, `<`, and `<=`) with numeric-aware comparisons.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

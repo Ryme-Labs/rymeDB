@@ -223,6 +223,10 @@ pub enum ReturningField {
 pub enum Cmp {
     Eq,
     NotEq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
     Contains,
 }
 
@@ -313,12 +317,25 @@ impl Predicate {
         match self.op {
             Cmp::Eq => target == self.operand.as_slice(),
             Cmp::NotEq => target != self.operand.as_slice(),
+            Cmp::Gt => compare_operands(target, &self.operand).is_some_and(|order| order.is_gt()),
+            Cmp::Gte => compare_operands(target, &self.operand).is_some_and(|order| !order.is_lt()),
+            Cmp::Lt => compare_operands(target, &self.operand).is_some_and(|order| order.is_lt()),
+            Cmp::Lte => compare_operands(target, &self.operand).is_some_and(|order| !order.is_gt()),
             Cmp::Contains => {
                 let text = String::from_utf8_lossy(target);
                 let want = String::from_utf8_lossy(&self.operand);
                 text.contains(want.as_ref())
             }
         }
+    }
+}
+
+fn compare_operands(left: &[u8], right: &[u8]) -> Option<std::cmp::Ordering> {
+    let left_text = std::str::from_utf8(left).ok()?.trim();
+    let right_text = std::str::from_utf8(right).ok()?.trim();
+    match (left_text.parse::<f64>(), right_text.parse::<f64>()) {
+        (Ok(left), Ok(right)) => left.partial_cmp(&right),
+        _ => Some(left_text.as_bytes().cmp(right_text.as_bytes())),
     }
 }
 
@@ -425,10 +442,33 @@ fn tokenize(input: &str) -> Vec<String> {
             current.push(ch);
             continue;
         }
-        if ch.is_whitespace() || ch == ',' || ch == ';' || ch == '(' || ch == ')' || ch == '=' {
+        if ch.is_whitespace() || ch == ',' || ch == ';' || ch == '(' || ch == ')' {
             if !current.is_empty() {
                 out.push(current.clone());
                 current.clear();
+            }
+            continue;
+        }
+        if matches!(ch, '=' | '<' | '>') {
+            if ch == '>' && (current.ends_with('-') || current.ends_with("->")) {
+                current.push(ch);
+                continue;
+            }
+            if !current.is_empty() {
+                out.push(current.clone());
+                current.clear();
+            }
+            if let Some(previous) = out.last_mut() {
+                if (ch == '=' && previous == "!")
+                    || ((ch == '=' || ch == '>') && previous == "<")
+                    || (ch == '=' && previous == ">")
+                {
+                    previous.push(ch);
+                    continue;
+                }
+            }
+            if ch != '=' {
+                out.push(ch.to_string());
             }
             continue;
         }
@@ -1160,12 +1200,25 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
     if parts.len() == 3 {
         let field = parse_field(&parts[0])
             .ok_or_else(|| RymeError::InvalidArgument(String::from("where field")))?;
-        if parts[1] == "!" {
+        if parts[1] == "=" {
+            return Ok(Predicate { field, op: Cmp::Eq, operand: unquote(&parts[2]).into_bytes() });
+        }
+        if parts[1] == "!" || parts[1] == "!=" || parts[1] == "<>" {
             return Ok(Predicate {
                 field,
                 op: Cmp::NotEq,
                 operand: unquote(&parts[2]).into_bytes(),
             });
+        }
+        let op = match parts[1].as_str() {
+            ">" => Some(Cmp::Gt),
+            ">=" => Some(Cmp::Gte),
+            "<" => Some(Cmp::Lt),
+            "<=" => Some(Cmp::Lte),
+            _ => None,
+        };
+        if let Some(op) = op {
+            return Ok(Predicate { field, op, operand: unquote(&parts[2]).into_bytes() });
         }
         if parts[1].eq_ignore_ascii_case("CONTAINS") {
             return Ok(Predicate {
@@ -4488,6 +4541,45 @@ mod tests {
         assert!(plan.contains("filters 1"));
         assert!(plan.contains("desc"));
         assert!(parse("SELECT * FROM docs WHERE nonsense 'x'").is_err());
+    }
+
+    #[test]
+    fn parses_standard_comparison_predicates() {
+        for (sql, expected) in [
+            ("SELECT * FROM docs WHERE key <> '2'", Cmp::NotEq),
+            ("SELECT * FROM docs WHERE key > '2'", Cmp::Gt),
+            ("SELECT * FROM docs WHERE key >= '2'", Cmp::Gte),
+            ("SELECT * FROM docs WHERE key < '2'", Cmp::Lt),
+            ("SELECT * FROM docs WHERE key <= '2'", Cmp::Lte),
+        ] {
+            let Statement::SelectScan { filter, .. } = parse(sql).unwrap() else {
+                panic!("expected scan for {sql}")
+            };
+            assert_eq!(filter[0].op, expected, "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn comparison_predicates_use_numeric_order_when_possible() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        for key in ["1", "2", "3"] {
+            executor
+                .execute(parse(&format!("INSERT INTO docs KEY '{key}' VALUE 'value'")).unwrap())
+                .await
+                .unwrap();
+        }
+        let result =
+            executor.execute(parse("SELECT * FROM docs WHERE key > '2'").unwrap()).await.unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows == vec![(b"3".to_vec(), b"value".to_vec())])
+        );
+
+        let result =
+            executor.execute(parse("SELECT * FROM docs WHERE key <= '2'").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows } if rows == vec![
+            (b"1".to_vec(), b"value".to_vec()),
+            (b"2".to_vec(), b"value".to_vec()),
+        ]));
     }
 
     #[tokio::test]
