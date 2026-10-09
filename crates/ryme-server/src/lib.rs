@@ -5265,9 +5265,20 @@ async fn stream(
     let from = query.from.unwrap_or(u64::MAX);
     let from_sequence = query.from_sequence;
     let qos = state.qos.clone();
+    let rls_tables = state.rls_tables.clone();
     upgrade.on_upgrade(move |socket| async move {
-        forward_changes(socket, realtime, qos, &tenant, &database, &table, from, from_sequence)
-            .await;
+        forward_changes(
+            socket,
+            realtime,
+            qos,
+            &rls_tables,
+            &tenant,
+            &database,
+            &table,
+            from,
+            from_sequence,
+        )
+        .await;
     })
 }
 
@@ -5297,6 +5308,7 @@ async fn forward_changes(
     socket: axum::extract::ws::WebSocket,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
+    rls_tables: &HashMap<String, String>,
     tenant: &str,
     database: &str,
     table: &str,
@@ -5318,6 +5330,9 @@ async fn forward_changes(
     let (mut sender, mut incoming) = socket.split();
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
+        if !realtime_change_allowed(rls_tables, tenant, record) {
+            continue;
+        }
         let text = serde_json::to_string(record).unwrap_or_else(|_| String::from("{}"));
         if !stream_egress(&qos, tenant, text.len() as u64) {
             return;
@@ -5346,6 +5361,9 @@ async fn forward_changes(
                             continue;
                         }
                         seen_sequence = seen_sequence.max(record.sequence);
+                        if !realtime_change_allowed(rls_tables, tenant, &record) {
+                            continue;
+                        }
                         let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
                         if !stream_egress(&qos, tenant, text.len() as u64) {
                             break;
@@ -5377,6 +5395,9 @@ async fn forward_changes(
                                 continue;
                             }
                             seen_sequence = record.sequence;
+                            if !realtime_change_allowed(rls_tables, tenant, &record) {
+                                continue;
+                            }
                             let text = serde_json::to_string(&record)
                                 .unwrap_or_else(|_| String::from("{}"));
                             if !stream_egress(&qos, tenant, text.len() as u64) {
@@ -5436,8 +5457,20 @@ async fn query_stream(
     let database = state.database.clone();
     let table = query.table.clone();
     let qos = state.qos.clone();
+    let rls_tables = state.rls_tables.clone();
     upgrade.on_upgrade(move |socket| async move {
-        forward_query(socket, backend, realtime, qos, &tenant, &database, &table, limit).await;
+        forward_query(
+            socket,
+            backend,
+            realtime,
+            qos,
+            &rls_tables,
+            &tenant,
+            &database,
+            &table,
+            limit,
+        )
+        .await;
     })
 }
 
@@ -5447,6 +5480,7 @@ async fn forward_query(
     backend: Backend,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
+    rls_tables: &HashMap<String, String>,
     tenant: &str,
     database: &str,
     table: &str,
@@ -5454,8 +5488,17 @@ async fn forward_query(
 ) {
     let mut receiver = realtime.query_subscribe(tenant, database, table, limit);
     let (mut sender, mut incoming) = socket.split();
-    let mut snapshot_commit =
-        send_query_snapshot(&mut sender, &backend, &qos, tenant, database, table, limit).await;
+    let mut snapshot_commit = send_query_snapshot(
+        &mut sender,
+        &backend,
+        &qos,
+        rls_tables,
+        tenant,
+        database,
+        table,
+        limit,
+    )
+    .await;
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
     heartbeat.tick().await;
     loop {
@@ -5479,7 +5522,12 @@ async fn forward_query(
                         let text = serde_json::to_string(&serde_json::json!({
                             "type": "update",
                             "commit": update.commit_ts,
-                            "rows": update.rows.iter().map(|row| serde_json::json!({
+                            "rows": update.rows.iter().filter(|row| rls_row_allowed(
+                                rls_tables,
+                                tenant,
+                                table,
+                                &row.value,
+                            )).map(|row| serde_json::json!({
                                 "pk": String::from_utf8_lossy(&row.pk),
                                 "value": String::from_utf8_lossy(&row.value),
                             })).collect::<Vec<_>>(),
@@ -5502,6 +5550,7 @@ async fn forward_query(
                             &mut sender,
                             &backend,
                             &qos,
+                            rls_tables,
                             tenant,
                             database,
                             table,
@@ -5531,6 +5580,77 @@ async fn forward_query(
     }
 }
 
+fn rls_row_allowed(
+    rls_tables: &HashMap<String, String>,
+    tenant: &str,
+    table: &str,
+    value: &[u8],
+) -> bool {
+    let Some(column) = rls_tables.get(table) else { return true };
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
+        return false;
+    };
+    object
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(column))
+        .and_then(|(_, value)| value.as_str())
+        .is_some_and(|row_tenant| row_tenant == tenant)
+}
+
+fn realtime_change_allowed(
+    rls_tables: &HashMap<String, String>,
+    tenant: &str,
+    record: &ryme_realtime::ChangeRecord,
+) -> bool {
+    record.tenant == tenant
+        && record
+            .after
+            .as_deref()
+            .is_none_or(|value| rls_row_allowed(rls_tables, tenant, &record.table, value))
+}
+
+fn scan_realtime_rows(
+    backend: &Backend,
+    rls_tables: &HashMap<String, String>,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use ryme_txn::TxnBackend;
+
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut txn = backend.begin();
+    let mut visible = Vec::with_capacity(limit);
+    let mut start_after = None;
+    loop {
+        let page = match start_after.as_deref() {
+            Some(start_after) => backend
+                .scan_after(&mut txn, tenant, database, table, start_after, limit)
+                .unwrap_or_default(),
+            None => backend.scan(&mut txn, tenant, database, table, limit).unwrap_or_default(),
+        };
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        start_after = page.last().map(|(pk, _)| pk.clone());
+        visible.extend(
+            page.into_iter().filter(|(_, value)| rls_row_allowed(rls_tables, tenant, table, value)),
+        );
+        if visible.len() >= limit {
+            visible.truncate(limit);
+            break;
+        }
+        if page_len < limit {
+            break;
+        }
+    }
+    visible
+}
+
 async fn send_query_snapshot(
     sender: &mut futures_util::stream::SplitSink<
         axum::extract::ws::WebSocket,
@@ -5538,14 +5658,13 @@ async fn send_query_snapshot(
     >,
     backend: &Backend,
     qos: &Arc<Mutex<QosRegistry>>,
+    rls_tables: &HashMap<String, String>,
     tenant: &str,
     database: &str,
     table: &str,
     limit: usize,
 ) -> u64 {
-    use ryme_txn::TxnBackend;
-    let mut txn = backend.begin();
-    let rows = backend.scan(&mut txn, tenant, database, table, limit).unwrap_or_default();
+    let rows = scan_realtime_rows(backend, rls_tables, tenant, database, table, limit);
     let commit = backend.latest_commit();
     let snapshot = serde_json::json!({
         "type": "snapshot",
@@ -5816,5 +5935,41 @@ fn archive_target(
             )?)))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod realtime_policy_tests {
+    use super::*;
+
+    #[test]
+    fn realtime_snapshot_filters_rls_rows_across_pages() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-realtime-policy-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Never).unwrap();
+        let backend = Backend::Single(manager.clone());
+        let mut txn = manager.begin();
+        manager.put(
+            &mut txn,
+            ryme_storage::RecordKey::new("tenant-a", "default", "messages", b"a-hidden"),
+            br#"{"tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
+        );
+        manager.put(
+            &mut txn,
+            ryme_storage::RecordKey::new("tenant-a", "default", "messages", b"b-visible"),
+            br#"{"tenant_id":"tenant-a","body":"hello"}"#.to_vec(),
+        );
+        manager.commit(txn).unwrap();
+        let policies = HashMap::from([(String::from("messages"), String::from("tenant_id"))]);
+
+        let rows = scan_realtime_rows(&backend, &policies, "tenant-a", "default", "messages", 1);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, b"b-visible");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

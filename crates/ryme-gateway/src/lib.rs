@@ -165,7 +165,7 @@ where
             after: Some(value),
             commit_ts,
         })?;
-        self.refresh_table(&principal.tenant, table, commit_ts);
+        self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
     }
 
@@ -201,7 +201,7 @@ where
             after: Some(current),
             commit_ts,
         })?;
-        self.refresh_table(&principal.tenant, table, commit_ts);
+        self.refresh_table(principal, table, commit_ts);
         Ok(true)
     }
 
@@ -245,7 +245,7 @@ where
             after: None,
             commit_ts,
         })?;
-        self.refresh_table(&principal.tenant, table, commit_ts);
+        self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
     }
 
@@ -326,14 +326,20 @@ where
         &self.database
     }
 
-    fn refresh_table(&self, tenant: &str, table: &str, commit_ts: u64) {
-        let Some(limit) = self.realtime.query_limit(tenant, &self.database, table) else {
+    fn refresh_table(&self, principal: &Principal, table: &str, commit_ts: u64) {
+        let Some(limit) = self.realtime.query_limit(&principal.tenant, &self.database, table)
+        else {
             return;
         };
-        let mut txn = self.manager.begin();
-        let rows =
-            self.manager.scan(&mut txn, tenant, &self.database, table, limit).unwrap_or_default();
-        let _ = self.realtime.publish_query(tenant, &self.database, table, commit_ts, rows, limit);
+        let rows = self.scan(principal, table, limit).unwrap_or_default();
+        let _ = self.realtime.publish_query(
+            &principal.tenant,
+            &self.database,
+            table,
+            commit_ts,
+            rows,
+            limit,
+        );
     }
 }
 
@@ -429,6 +435,46 @@ mod tests {
             roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
         };
         assert!(gateway.get(&other_tenant, "messages", b"visible").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reactive_updates_filter_hidden_rows() {
+        let mut policies = PolicyEngine::new();
+        policies.allow_table(String::from("messages"), String::from("tenant_id"));
+        let gateway = Gateway::new(
+            String::from("default"),
+            String::from("d"),
+            String::from("main"),
+            policies,
+            Realtime::new(16),
+        );
+        let principal = Principal {
+            id: String::from("ada"),
+            tenant: String::from("tenant-a"),
+            roles: [ryme_auth::Role::ReadWrite].into_iter().collect(),
+        };
+        let mut updates = gateway.realtime().query_subscribe("tenant-a", "d", "messages", 10);
+        let manager = gateway.manager_clone();
+        let mut txn = manager.begin();
+        manager.put(
+            &mut txn,
+            RecordKey::new("tenant-a", "d", "messages", b"hidden"),
+            br#"{"tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
+        );
+        manager.commit(txn).unwrap();
+
+        gateway
+            .put(
+                &principal,
+                "messages",
+                b"visible".to_vec(),
+                br#"{"tenant_id":"tenant-a","body":"hello"}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let update = updates.recv().await.unwrap();
+        assert_eq!(update.rows.len(), 1);
+        assert_eq!(update.rows[0].pk, b"visible");
     }
 
     #[tokio::test]
