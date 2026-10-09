@@ -1108,6 +1108,8 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
             "attributes"
         } else if upper.contains("PG_CATALOG.PG_INDEXES") {
             "indexes"
+        } else if upper.contains("PG_CATALOG.PG_POLICIES") || upper.contains("PG_POLICIES") {
+            "policies"
         } else if upper.contains("PG_CATALOG.PG_NAMESPACE") {
             "namespaces"
         } else if upper.contains("PG_CATALOG.PG_CLASS") {
@@ -1126,6 +1128,7 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
     let defaults = match kind {
         "tables" => vec![String::from("table_name")],
         "indexes" => vec![String::from("indexname")],
+        "policies" => vec![String::from("policyname")],
         "namespaces" => vec![String::from("nspname")],
         "classes" => vec![String::from("relname")],
         "types" => vec![String::from("typname")],
@@ -1147,6 +1150,16 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("indexname"),
                 String::from("tablespace"),
                 String::from("indexdef"),
+            ],
+            "policies" => vec![
+                String::from("schemaname"),
+                String::from("tablename"),
+                String::from("policyname"),
+                String::from("permissive"),
+                String::from("roles"),
+                String::from("cmd"),
+                String::from("qual"),
+                String::from("with_check"),
             ],
             "namespaces" => vec![
                 String::from("oid"),
@@ -1480,6 +1493,50 @@ where
                             index.name, schema, table_name,
                         )
                         .into_bytes(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_POLICIES") || upper.contains("PG_POLICIES") {
+        let predicates =
+            upper.find(" WHERE ").map(|index| &query[index + " WHERE ".len()..]).unwrap_or(query);
+        let table_filter = sql_literal_after(predicates, "TABLENAME");
+        let policy_filter = sql_literal_after(predicates, "POLICYNAME");
+        let rows: Vec<Vec<Vec<u8>>> = executor
+            .schema_snapshot()
+            .rls_policies
+            .into_values()
+            .filter(|policy| !policy.name.starts_with("__config__"))
+            .filter(|policy| {
+                table_filter.as_ref().is_none_or(|want| {
+                    let (_, table_name) = catalog_table_parts(&policy.table);
+                    want == &policy.table || want == table_name
+                })
+            })
+            .filter(|policy| policy_filter.as_ref().is_none_or(|want| want == &policy.name))
+            .map(|policy| {
+                let (schema, table) = catalog_table_parts(&policy.table);
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "schemaname" => schema.as_bytes().to_vec(),
+                        "tablename" => table.as_bytes().to_vec(),
+                        "policyname" => policy.name.as_bytes().to_vec(),
+                        "permissive" => b"t".to_vec(),
+                        "roles" => b"{public}".to_vec(),
+                        "cmd" => policy.command.as_bytes().to_vec(),
+                        "qual" => policy.using.as_deref().map_or_else(
+                            || SQL_NULL_SENTINEL.to_vec(),
+                            |value| value.as_bytes().to_vec(),
+                        ),
+                        "with_check" => policy.check.as_deref().map_or_else(
+                            || SQL_NULL_SENTINEL.to_vec(),
+                            |value| value.as_bytes().to_vec(),
+                        ),
                         _ => Vec::new(),
                     })
                     .collect()
@@ -2730,6 +2787,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryme_sql::{RlsPolicy, SchemaSnapshot};
 
     #[test]
     fn split_statements_respects_quotes() {
@@ -2837,6 +2895,39 @@ mod tests {
         assert!(aliased.windows(b"total\0".len()).any(|window| window == b"total\0"));
         assert_eq!(describe_query("INSERT INTO t KEY '1' VALUE 'v'")[0], b'n');
         assert_eq!(describe_query("SELECT nonsense()")[0], b'n');
+    }
+
+    #[test]
+    fn catalog_policies_exposes_persisted_rls_metadata() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.rls_policies.insert(
+            String::from("messages\0tenant_policy"),
+            RlsPolicy {
+                name: String::from("tenant_policy"),
+                table: String::from("messages"),
+                column: String::from("tenant_id"),
+                command: String::from("SELECT"),
+                using: Some(String::from("tenant_id = auth.uid()")),
+                check: None,
+                read: true,
+                write: false,
+            },
+        );
+        executor.restore_schema_snapshot(snapshot).unwrap();
+
+        let response = catalog_query(
+            "SELECT policyname, cmd, qual, with_check FROM pg_catalog.pg_policies WHERE tablename = 'messages'",
+            &executor,
+        )
+        .unwrap();
+        assert!(response.windows(b"tenant_policy".len()).any(|window| window == b"tenant_policy"));
+        assert!(response
+            .windows(b"tenant_id = auth.uid()".len())
+            .any(|window| window == b"tenant_id = auth.uid()"));
+        assert!(response.windows(b"SELECT".len()).any(|window| window == b"SELECT"));
+        let null = (-1i32).to_be_bytes();
+        assert!(response.windows(null.len()).any(|window| window == null));
     }
 
     #[test]

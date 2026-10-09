@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL `pg_catalog.pg_policies` now exposes persisted policy names,
+  commands, roles, and `USING`/`WITH CHECK` expressions for Supabase and ORM
+  introspection.
 - PostgreSQL `DROP POLICY [IF EXISTS] ... ON ...` now removes the named RLS
   policy and persists the remaining policy state across schema snapshots.
 - Enabled RLS tables now default-deny reads and writes when no applicable

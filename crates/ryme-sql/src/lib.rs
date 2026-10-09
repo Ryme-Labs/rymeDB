@@ -472,8 +472,18 @@ pub struct RlsPolicy {
     pub name: String,
     pub table: String,
     pub column: String,
+    #[serde(default = "default_rls_policy_command")]
+    pub command: String,
+    #[serde(default)]
+    pub using: Option<String>,
+    #[serde(default)]
+    pub check: Option<String>,
     pub read: bool,
     pub write: bool,
+}
+
+fn default_rls_policy_command() -> String {
+    String::from("ALL")
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -5567,6 +5577,9 @@ where
                     name: format!("__config__{table}"),
                     table: table.clone(),
                     column: column.clone(),
+                    command: String::from("ALL"),
+                    using: None,
+                    check: None,
                     read: true,
                     write: true,
                 };
@@ -5601,6 +5614,9 @@ where
                     name: format!("__config__{table}"),
                     table: table.clone(),
                     column,
+                    command: String::from("ALL"),
+                    using: None,
+                    check: None,
                     read: true,
                     write: true,
                 };
@@ -5700,12 +5716,17 @@ where
         let column = tenant_column
             .or_else(|| allow_all.then(String::new))
             .ok_or_else(|| RymeError::InvalidArgument(String::from("create policy expression")))?;
+        let read = matches!(command.as_str(), "ALL" | "SELECT" | "UPDATE" | "DELETE");
+        let write = matches!(command.as_str(), "ALL" | "INSERT" | "UPDATE" | "DELETE");
         let policy = RlsPolicy {
             name: name.to_string(),
             table: table.to_string(),
             column,
-            read: matches!(command.as_str(), "ALL" | "SELECT" | "UPDATE" | "DELETE"),
-            write: matches!(command.as_str(), "ALL" | "INSERT" | "UPDATE" | "DELETE"),
+            command,
+            using: using.map(str::to_string),
+            check: check.map(str::to_string),
+            read,
+            write,
         };
         let key = format!("{table}\0{name}");
         let mut policies = self
@@ -5947,6 +5968,9 @@ where
                 name: format!("__config__{table}"),
                 table: table.clone(),
                 column: column.clone(),
+                command: String::from("ALL"),
+                using: None,
+                check: None,
                 read: true,
                 write: snapshot.rls_write_tables.contains_key(table),
             };
@@ -5958,6 +5982,9 @@ where
                     name: format!("__config__{table}"),
                     table: table.clone(),
                     column: column.clone(),
+                    command: String::from("ALL"),
+                    using: None,
+                    check: None,
                     read: false,
                     write: true,
                 }
