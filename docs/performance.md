@@ -99,6 +99,24 @@ on three nodes as the known cost.
 In-process engine probe (no socket, not comparable to networked results):
 200k sync-commit writes at ~670k qps, 10k point reads at ~1us mean.
 
+## Realtime fanout benchmark
+
+The WebSocket path can be measured against a running server with:
+
+```text
+ryme-bench realtime --addr 127.0.0.1:3000 --api-key ryme-dev-key \
+  --connections 100 --messages 10000 --payload-bytes 128 --json
+```
+
+The command opens all subscribers before publishing, sends authenticated
+`POST /v1/broadcast` requests with bounded concurrency, and waits for every
+subscriber to receive every successful publish. It reports publisher qps,
+fanout deliveries per second, delivery percentage, and errors. A run is only
+valid when `publish_errors=0`, `receive_errors=0`, and `delivery_percent=100`;
+record the CPU, memory, payload, connection count, publish concurrency, and
+server QoS tier beside the result. This is an end-to-end workload gate, not a
+claim about all realtime workloads or connection capacity.
+
 ## What we claim
 
 - Same-AZ loopback reads at p50 under 0.1 ms and p99 under 0.5 ms for hot

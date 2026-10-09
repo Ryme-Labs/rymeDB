@@ -15,3 +15,6 @@ ryme-storage = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+tokio-tungstenite = "0.21"

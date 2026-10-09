@@ -1653,11 +1653,14 @@ name = "ryme-bench"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures-util",
+ "reqwest",
  "ryme-error",
  "ryme-storage",
  "ryme-txn",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.21.0",
 ]
 
 [[package]]
