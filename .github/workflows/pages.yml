@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "schemas/openapi/validate.py"
       - "schemas/openapi/**"
       - "images/**"
       - "README.md"
@@ -13,6 +14,7 @@ on:
   pull_request:
     paths:
       - "docs/**"
+      - "schemas/openapi/validate.py"
       - "schemas/openapi/**"
       - "images/**"
       - "README.md"

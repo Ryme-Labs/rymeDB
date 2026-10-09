@@ -14,10 +14,11 @@ The `sdk-release` workflow builds and tests all three on changes to `sdks/`.
 The separate `sdk-tag-release` workflow handles `v*` tags without a path
 filter, so a tag always publishes the tested SDK set. Update the version in
 each manifest before pushing a tag. The workflow uploads npm, Cargo, and
-Maven build artifacts to the GitHub release. Java publishing deploys the
-tested JAR, sources, and Javadoc artifacts rather than rebuilding a separate
-package. Rust publishing downloads and publishes the exact tested Cargo
-package artifact rather than rebuilding from a second checkout. Publishing
+Maven build artifacts plus a `SHA256SUMS` file to the GitHub release. Java
+publishing deploys the tested JAR, sources, and Javadoc artifacts rather than
+rebuilding a separate package. Rust publishing downloads and publishes the
+exact tested Cargo package artifact rather than rebuilding from a second
+checkout. Publishing
 also requires these
 repository configuration values:
 
@@ -26,8 +27,9 @@ repository configuration values:
 - `GITHUB_TOKEN`: supplied by Actions for GitHub Packages and release uploads
 
 Java packages are published to the repository's GitHub Maven registry. npm
-and Cargo packages are published to their public registries. Release upload
-collects artifacts recursively so Maven files under `target/` are included. A
+and Cargo packages are published to their public registries. The Java job
+stages its tested POM and JARs into a flat artifact before publishing, so the
+publish job cannot accidentally rebuild or select an untested package. A
 manual run can set the `publish` input when a tag is not being pushed.
 
 The Pages builder and release workflow fail if `sdks/` contains anything other

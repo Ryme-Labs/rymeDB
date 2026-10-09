@@ -162,13 +162,18 @@ jobs:
             exit 1
           }
 
-      - name: Upload Maven artifacts
+      - name: Stage Maven artifacts
+        run: |
+          stage="$RUNNER_TEMP/sdk-maven"
+          mkdir -p "$stage/target"
+          cp sdks/java/pom.xml "$stage/pom.xml"
+          cp sdks/java/target/*.jar "$stage/target/"
+
+      - name: Store Maven artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sdk-maven
-          path: |
-            sdks/java/pom.xml
-            sdks/java/target/*.jar
+          path: ${{ runner.temp }}/sdk-maven
           if-no-files-found: error
 
   publish-npm:
@@ -296,4 +301,6 @@ jobs:
             find release -type f \( -name '*.tgz' -o -name '*.crate' -o -name '*.jar' \) -print
           )
           test "${#artifacts[@]}" -gt 0
+          (cd release && find . -type f \( -name '*.tgz' -o -name '*.crate' -o -name '*.jar' \) -print0 | sort -z | xargs -0 sha256sum) > release/SHA256SUMS
+          artifacts+=(release/SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --verify-tag --generate-notes
