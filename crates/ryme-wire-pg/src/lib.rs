@@ -10,7 +10,7 @@ use ryme_sql::{
     bind, parse, Executor, Field, ForeignKeyAction, QueryResult, ReturningField, RoleDefinition,
     Statement, TransactionChange, SQL_NULL_SENTINEL,
 };
-use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
+use ryme_txn::{Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -50,12 +50,22 @@ struct SessionTransaction {
     txn: Transaction,
     changes: Vec<TransactionChange>,
     failed: bool,
+    savepoints: Vec<Savepoint>,
+}
+
+struct Savepoint {
+    name: String,
+    checkpoint: TransactionCheckpoint,
+    changes_len: usize,
 }
 
 enum TransactionControl {
     Begin(Isolation),
     Commit,
     Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackToSavepoint(String),
 }
 
 static NEXT_BACKEND_PID: AtomicU32 = AtomicU32::new(1);
@@ -2396,6 +2406,34 @@ fn transaction_control(
 ) -> Option<TransactionControl> {
     let normalized = query.trim().trim_end_matches(';').trim();
     let upper = normalized.to_ascii_uppercase();
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    if upper.starts_with("SAVEPOINT ") && words.len() == 2 {
+        return normalize_savepoint_name(words[1]).map(TransactionControl::Savepoint);
+    }
+    if upper.starts_with("RELEASE ") {
+        let name = if words.len() == 2 {
+            words[1]
+        } else if words.len() == 3 && words[1].eq_ignore_ascii_case("SAVEPOINT") {
+            words[2]
+        } else {
+            ""
+        };
+        if !name.is_empty() {
+            return normalize_savepoint_name(name).map(TransactionControl::ReleaseSavepoint);
+        }
+    }
+    if upper.starts_with("ROLLBACK ") {
+        let explicit_to = upper.starts_with("ROLLBACK TO ")
+            || upper.starts_with("ROLLBACK SAVEPOINT ")
+            || upper.starts_with("ROLLBACK TRANSACTION TO ")
+            || upper.starts_with("ROLLBACK TRANSACTION SAVEPOINT ");
+        if explicit_to {
+            return words
+                .last()
+                .and_then(|name| normalize_savepoint_name(name))
+                .map(TransactionControl::RollbackToSavepoint);
+        }
+    }
     if upper == "BEGIN"
         || upper == "BEGIN TRANSACTION"
         || upper == "START TRANSACTION"
@@ -2420,6 +2458,21 @@ fn transaction_control(
     None
 }
 
+fn normalize_savepoint_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let name = unquote_literal(value);
+    if name.is_empty() {
+        None
+    } else if value.starts_with('"') && value.ends_with('"') {
+        Some(name)
+    } else {
+        Some(name.to_ascii_lowercase())
+    }
+}
+
 async fn handle_transaction_control<B>(
     control: TransactionControl,
     executor: &Arc<Executor<B>>,
@@ -2437,6 +2490,7 @@ where
                     txn: executor.begin_transaction(isolation),
                     changes: Vec::new(),
                     failed: false,
+                    savepoints: Vec::new(),
                 });
                 command_complete("BEGIN")
             }
@@ -2458,6 +2512,75 @@ where
         }
         TransactionControl::Rollback => {
             active.take();
+            command_complete("ROLLBACK")
+        }
+        TransactionControl::Savepoint(name) => {
+            let Some(state) = active.as_mut() else {
+                return encode_error_code(
+                    "25P01",
+                    String::from("SAVEPOINT can only be used in transaction blocks"),
+                );
+            };
+            if state.failed {
+                return encode_error_code(
+                    "25P02",
+                    String::from(
+                        "current transaction is aborted, commands ignored until end of transaction block",
+                    ),
+                );
+            }
+            if let Some(position) =
+                state.savepoints.iter().position(|savepoint| savepoint.name == name)
+            {
+                state.savepoints.truncate(position);
+            }
+            state.savepoints.push(Savepoint {
+                name,
+                checkpoint: state.txn.checkpoint(),
+                changes_len: state.changes.len(),
+            });
+            command_complete("SAVEPOINT")
+        }
+        TransactionControl::ReleaseSavepoint(name) => {
+            let Some(state) = active.as_mut() else {
+                return encode_error_code(
+                    "25P01",
+                    String::from("RELEASE SAVEPOINT can only be used in transaction blocks"),
+                );
+            };
+            if state.failed {
+                return encode_error_code(
+                    "25P02",
+                    String::from(
+                        "current transaction is aborted, commands ignored until end of transaction block",
+                    ),
+                );
+            }
+            let Some(position) =
+                state.savepoints.iter().rposition(|savepoint| savepoint.name == name)
+            else {
+                return encode_error_code("3B001", format!("savepoint \"{name}\" does not exist"));
+            };
+            state.savepoints.truncate(position);
+            command_complete("RELEASE")
+        }
+        TransactionControl::RollbackToSavepoint(name) => {
+            let Some(state) = active.as_mut() else {
+                return encode_error_code(
+                    "25P01",
+                    String::from("ROLLBACK TO SAVEPOINT can only be used in transaction blocks"),
+                );
+            };
+            let Some(position) =
+                state.savepoints.iter().rposition(|savepoint| savepoint.name == name)
+            else {
+                return encode_error_code("3B001", format!("savepoint \"{name}\" does not exist"));
+            };
+            let savepoint = &state.savepoints[position];
+            state.txn.restore_checkpoint(&savepoint.checkpoint);
+            state.changes.truncate(savepoint.changes_len);
+            state.savepoints.truncate(position + 1);
+            state.failed = false;
             command_complete("ROLLBACK")
         }
     }
@@ -2535,6 +2658,9 @@ async fn prepared_command<B>(
 where
     B: TxnBackend,
 {
+    if let Some(control) = transaction_control(query, session) {
+        return Some(handle_transaction_control(control, executor, active).await);
+    }
     let head = query.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
     match head.as_str() {
         "PREPARE" => {
@@ -3333,6 +3459,85 @@ mod tests {
         assert!(session_command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT EXTRA", &mut session)
             .is_none());
         assert!(session_command("SHOW transaction_isolation", &mut session).is_some());
+    }
+
+    #[test]
+    fn savepoint_controls_parse_and_normalize_names() {
+        let session = HashMap::new();
+        assert!(matches!(
+            transaction_control("SAVEPOINT Work;", &session),
+            Some(TransactionControl::Savepoint(name)) if name == "work"
+        ));
+        assert!(matches!(
+            transaction_control("RELEASE SAVEPOINT Work", &session),
+            Some(TransactionControl::ReleaseSavepoint(name)) if name == "work"
+        ));
+        assert!(matches!(
+            transaction_control("ROLLBACK TRANSACTION TO SAVEPOINT Work", &session),
+            Some(TransactionControl::RollbackToSavepoint(name)) if name == "work"
+        ));
+        assert!(matches!(
+            transaction_control("SAVEPOINT \"CaseSensitive\"", &session),
+            Some(TransactionControl::Savepoint(name)) if name == "CaseSensitive"
+        ));
+    }
+
+    #[tokio::test]
+    async fn savepoint_rollback_discards_only_later_changes() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap())
+            .await
+            .unwrap();
+        let mut active = Some(SessionTransaction {
+            txn: executor.begin_transaction(Isolation::Serializable),
+            changes: Vec::new(),
+            failed: false,
+            savepoints: Vec::new(),
+        });
+
+        {
+            let state = active.as_mut().unwrap();
+            let (_, changes) = executor
+                .execute_in_transaction(
+                    &mut state.txn,
+                    parse("INSERT INTO messages (id, body) VALUES ('first', 'kept')").unwrap(),
+                )
+                .await
+                .unwrap();
+            state.changes.extend(changes);
+        }
+        handle_transaction_control(
+            TransactionControl::Savepoint(String::from("after_first")),
+            &executor,
+            &mut active,
+        )
+        .await;
+        {
+            let state = active.as_mut().unwrap();
+            let (_, changes) = executor
+                .execute_in_transaction(
+                    &mut state.txn,
+                    parse("INSERT INTO messages (id, body) VALUES ('second', 'discarded')")
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            state.changes.extend(changes);
+        }
+        handle_transaction_control(
+            TransactionControl::RollbackToSavepoint(String::from("after_first")),
+            &executor,
+            &mut active,
+        )
+        .await;
+        handle_transaction_control(TransactionControl::Commit, &executor, &mut active).await;
+
+        assert!(matches!(
+            executor.execute(parse("SELECT id, body FROM messages").unwrap()).await.unwrap(),
+            QueryResult::Table { rows, .. }
+                if rows == vec![vec![b"first".to_vec(), b"kept".to_vec()]]
+        ));
     }
 
     #[test]

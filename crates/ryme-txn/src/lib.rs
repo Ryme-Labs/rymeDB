@@ -98,7 +98,40 @@ pub struct Transaction {
     pin: Arc<TxnPin>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TransactionCheckpoint {
+    read_ts: u64,
+    writes: BTreeMap<RecordKey, WriteOp>,
+    read_set: BTreeSet<RecordKey>,
+    observed: BTreeMap<RecordKey, bool>,
+    scanned: BTreeSet<(String, String, String)>,
+    isolation: Isolation,
+}
+
 impl Transaction {
+    pub fn checkpoint(&self) -> TransactionCheckpoint {
+        TransactionCheckpoint {
+            read_ts: self.read_ts,
+            writes: self.writes.clone(),
+            read_set: self.read_set.clone(),
+            observed: self.observed.clone(),
+            scanned: self.scanned.clone(),
+            isolation: self.isolation,
+        }
+    }
+
+    pub fn restore_checkpoint(&mut self, checkpoint: &TransactionCheckpoint) {
+        self.read_ts = checkpoint.read_ts;
+        self.writes.clone_from(&checkpoint.writes);
+        self.read_set.clone_from(&checkpoint.read_set);
+        self.observed.clone_from(&checkpoint.observed);
+        self.scanned.clone_from(&checkpoint.scanned);
+        self.isolation = checkpoint.isolation;
+        if let Ok(mut active) = ACTIVE.lock() {
+            active.insert(self.id, self.read_ts);
+        }
+    }
+
     pub fn restamp(&mut self, read_ts: u64) {
         self.read_ts = read_ts;
         if let Ok(mut active) = ACTIVE.lock() {
@@ -1753,6 +1786,26 @@ mod tests {
         let mut second = manager.begin();
         let value = manager.get(&mut second, &key).unwrap();
         assert_eq!(value, Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn transaction_checkpoint_restores_staged_state() {
+        let manager = TxnManager::new();
+        let first = RecordKey::new("t", "d", "s", b"first");
+        let second = RecordKey::new("t", "d", "s", b"second");
+        let mut txn = manager.begin();
+        manager.put(&mut txn, first.clone(), b"one".to_vec());
+        let checkpoint = txn.checkpoint();
+        manager.put(&mut txn, second.clone(), b"two".to_vec());
+        txn.restore_checkpoint(&checkpoint);
+
+        assert_eq!(manager.get(&mut txn, &first).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(manager.get(&mut txn, &second).unwrap(), None);
+        manager.commit(txn).unwrap();
+
+        let mut probe = manager.begin();
+        assert_eq!(manager.get(&mut probe, &first).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(manager.get(&mut probe, &second).unwrap(), None);
     }
 
     #[test]

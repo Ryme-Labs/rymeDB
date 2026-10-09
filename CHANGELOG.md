@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL wire transactions now support named `SAVEPOINT`, `RELEASE
+  SAVEPOINT`, and `ROLLBACK TO SAVEPOINT` controls, restoring staged MVCC
+  writes, read dependencies, and realtime change metadata at rollback.
 - PostgreSQL `ALTER DEFAULT PRIVILEGES` declarations now persist table and
   sequence default ACLs and apply matching grants to subsequently created
   tables, views, and sequences, including schema snapshot restoration.

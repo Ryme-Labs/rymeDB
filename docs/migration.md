@@ -18,6 +18,9 @@ not the migration ledger.
 The wire gateway advertises `BackendKeyData` and honors PostgreSQL
 `CancelRequest` packets, returning SQLSTATE `57014` for a canceled statement
 at the next execution boundary.
+Explicit wire transactions support `SAVEPOINT name`, `RELEASE SAVEPOINT name`,
+and `ROLLBACK TO SAVEPOINT name`; rollback restores staged writes and the
+transaction's conflict-tracking state before continuing.
 
 1. Export schema, then bulk load with PostgreSQL `COPY table FROM STDIN`
    through the wire gateway or `POST /v1/sql/copy` in 500-row transactions
@@ -30,7 +33,8 @@ at the next execution boundary.
 3. Validate with `validate_rows`, chunk with `chunk_rows`, gate cutover with
    `plan_cutover(snapshot_rows, cdc_lag_ms)` (ready when lag <= 1000 ms).
 4. Verify types, nulls, sequences, constraints, prepared statements,
-   timezones, JSON, arrays, `RETURNING`, `ON CONFLICT`, session variables.
+   timezones, JSON, arrays, `RETURNING`, `ON CONFLICT`, session variables,
+   and named transaction savepoints.
 
 ## Supabase
 
@@ -155,6 +159,7 @@ common migration declarations `CREATE SCHEMA IF NOT EXISTS` and
 `nextval`, `currval`, and `setval` sequence calls,
 `CREATE ROLE`, `DROP ROLE`, `GRANT`, and `REVOKE` privilege declarations,
 `ALTER DEFAULT PRIVILEGES` declarations for tables and sequences,
+named transaction savepoints with `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO`,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT (columns) DO UPDATE` uses
