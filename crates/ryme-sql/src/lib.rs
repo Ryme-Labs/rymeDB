@@ -579,22 +579,6 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
     if let Some((columns, values)) = parse_standard_insert_row(raw)? {
         let upsert = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
-        if columns.len() == 2 && values.len() == 2 {
-            let values = values
-                .into_iter()
-                .map(|value| match value {
-                    InsertValue::Value(value) => Ok(value),
-                    InsertValue::Default | InsertValue::Null => {
-                        Err(RymeError::InvalidArgument(String::from("default key/value insert")))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            return if upsert {
-                Ok(Statement::Upsert { table, pk: values[0].clone(), value: values[1].clone() })
-            } else {
-                Ok(Statement::Insert { table, pk: values[0].clone(), value: values[1].clone() })
-            };
-        }
         return Ok(Statement::InsertRow { table, columns, values, upsert });
     }
     let (pk, value) = if let Some(values) =
@@ -1566,6 +1550,17 @@ where
             return Err(RymeError::InvalidArgument(String::from("insert column/value count")));
         }
         let definitions = self.catalog_columns(table);
+        if definitions.is_empty()
+            && columns.len() == 2
+            && (columns[0].eq_ignore_ascii_case("id")
+                || columns[0].eq_ignore_ascii_case("pk")
+                || columns[0].eq_ignore_ascii_case("key"))
+        {
+            if let [InsertValue::Value(pk), InsertValue::Value(value)] = values.as_slice() {
+                return Ok((pk.clone(), value.clone()));
+            }
+            return Err(RymeError::InvalidArgument(String::from("default key/value insert")));
+        }
         let mut supplied = HashMap::new();
         for (column, value) in columns.iter().zip(values) {
             let name = column.to_ascii_lowercase();
@@ -1776,6 +1771,9 @@ where
         columns
             .iter()
             .map(|column| {
+                let schema_column = definitions
+                    .iter()
+                    .any(|definition| definition.name.eq_ignore_ascii_case(column));
                 if column.eq_ignore_ascii_case("key")
                     || column.eq_ignore_ascii_case("pk")
                     || column.eq_ignore_ascii_case("id")
@@ -1783,9 +1781,10 @@ where
                 {
                     return pk.to_vec();
                 }
-                if column.eq_ignore_ascii_case("value")
-                    || column.eq_ignore_ascii_case("val")
-                    || column.eq_ignore_ascii_case("data")
+                if !schema_column
+                    && (column.eq_ignore_ascii_case("value")
+                        || column.eq_ignore_ascii_case("val")
+                        || column.eq_ignore_ascii_case("data"))
                 {
                     return value.to_vec();
                 }
@@ -2987,15 +2986,19 @@ mod tests {
     async fn postgres_values_insert_and_conflict_upsert() {
         let executor = Executor::new(String::from("t"), String::from("d"));
         let insert = parse("INSERT INTO users (id, value) VALUES ('1', 'ada')").unwrap();
-        assert!(matches!(insert, Statement::Insert { ref table, ref pk, ref value }
-            if table == "users" && pk == b"1" && value == b"ada"));
+        assert!(
+            matches!(insert, Statement::InsertRow { ref table, ref columns, ref values, upsert: false }
+            if table == "users"
+                && columns == &[String::from("id"), String::from("value")]
+                && values == &[InsertValue::Value(b"1".to_vec()), InsertValue::Value(b"ada".to_vec())])
+        );
         executor.execute(insert).await.unwrap();
 
         let upsert = parse(
             "INSERT INTO users (id, value) VALUES ('1', 'grace') ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
         )
         .unwrap();
-        assert!(matches!(upsert, Statement::Upsert { .. }));
+        assert!(matches!(upsert, Statement::InsertRow { upsert: true, .. }));
         executor.execute(upsert).await.unwrap();
         let row = executor.execute(parse("SELECT * FROM users KEY '1'").unwrap()).await.unwrap();
         match row {
@@ -3125,6 +3128,25 @@ mod tests {
             .unwrap();
         assert!(matches!(result, QueryResult::Table { ref rows, .. }
             if rows == &vec![vec![b"after".to_vec(), b"0".to_vec()]]));
+
+        executor
+            .execute(parse("CREATE TABLE simple (id TEXT PRIMARY KEY, value TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO simple (id, value) VALUES ('s1', 'before')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("UPDATE simple SET value = 'after' WHERE id = 's1'").unwrap())
+            .await
+            .unwrap();
+        let result = executor
+            .execute(parse("SELECT value FROM simple WHERE id = 's1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Table { ref rows, .. }
+            if rows == &vec![vec![b"after".to_vec()]]));
     }
 
     #[tokio::test]
