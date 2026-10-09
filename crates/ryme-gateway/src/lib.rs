@@ -23,6 +23,7 @@ pub struct Gateway<B = TxnManager> {
     tenant: String,
     database: String,
     branch: String,
+    read_ts: Option<u64>,
     read_only: bool,
 }
 
@@ -41,6 +42,7 @@ impl Gateway<TxnManager> {
             tenant,
             database,
             branch,
+            read_ts: None,
             read_only: false,
         }
     }
@@ -60,6 +62,7 @@ impl Gateway<TxnManager> {
             tenant,
             database,
             branch,
+            read_ts: None,
             read_only: false,
         }
     }
@@ -84,6 +87,7 @@ where
             tenant,
             database,
             branch,
+            read_ts: None,
             read_only: false,
         }
     }
@@ -96,6 +100,24 @@ where
         self.read_only
     }
 
+    pub fn with_read_ts(mut self, read_ts: u64) -> Self {
+        self.read_ts = Some(read_ts);
+        self
+    }
+
+    pub fn with_branch(mut self, branch: String) -> Self {
+        self.branch = branch;
+        self
+    }
+
+    fn begin(&self) -> ryme_txn::Transaction {
+        let mut txn = self.manager.begin();
+        if let Some(read_ts) = self.read_ts {
+            txn.restamp(read_ts);
+        }
+        txn
+    }
+
     fn reject_if_read_only(&self) -> Result<()> {
         if self.read_only {
             return Err(RymeError::ReadOnly(String::from("read-only follower")));
@@ -106,7 +128,7 @@ where
     pub fn get(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Option<Vec<u8>>> {
         self.policies.predicate(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
-        let mut txn = self.manager.begin();
+        let mut txn = self.begin();
         let Some(value) = self.manager.get(&mut txn, &key)? else {
             return Ok(None);
         };
@@ -147,7 +169,7 @@ where
         }
         self.policies.check_write_row(principal, table, &value)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
-        let mut txn = self.manager.begin();
+        let mut txn = self.begin();
         let existed = self.manager.get(&mut txn, &key)?.is_some();
         match expires_at {
             Some(ts) => self.manager.put_with_ttl(&mut txn, key, value.clone(), ts),
@@ -179,7 +201,7 @@ where
         self.reject_if_read_only()?;
         self.policies.check_write(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
-        let mut txn = self.manager.begin();
+        let mut txn = self.begin();
         let Some(current) = self.manager.get(&mut txn, &key)? else {
             return Ok(false);
         };
@@ -226,7 +248,7 @@ where
         self.reject_if_read_only()?;
         self.policies.check_write(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
-        let mut txn = self.manager.begin();
+        let mut txn = self.begin();
         let Some(current) = self.manager.get(&mut txn, &key)? else {
             return Err(RymeError::NotFound(String::from("row")));
         };
@@ -264,7 +286,7 @@ where
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.policies.predicate(principal, table)?;
-        let mut txn = self.manager.begin();
+        let mut txn = self.begin();
         if !self.policies.has_table_policy(table) {
             return self.manager.scan(&mut txn, &principal.tenant, &self.database, table, limit);
         }

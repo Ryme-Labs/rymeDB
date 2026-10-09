@@ -73,6 +73,52 @@ async fn bearer_request(
     (status, json)
 }
 
+async fn bearer_branch_request(
+    addr: std::net::SocketAddr,
+    token: &str,
+    branch: &str,
+    head: &str,
+    body: &[u8],
+) -> (u16, serde_json::Value) {
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\nx-ryme-branch: {branch}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    socket.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse::<u16>()
+        .unwrap_or(0);
+    let body = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|index| raw[index + 4..].to_vec())
+        .unwrap_or_default();
+    let json = serde_json::from_slice(&body).unwrap_or_default();
+    (status, json)
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -172,6 +218,28 @@ async fn tenants_share_no_presence_or_partitions() {
     let (status, body) = bearer_request(http, &alpha, "GET /v1/branches/preview", b"").await;
     assert_eq!(status, 200);
     assert_eq!(body.get("tenant").and_then(|value| value.as_str()), Some("alpha"));
+    let (status, body) = bearer_branch_request(
+        http,
+        &alpha,
+        "preview",
+        "POST /v1/sql",
+        br#"{"sql":"SELECT * FROM sql_docs KEY 'shared'"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body.get("pk"), None);
+    let (status, _) =
+        bearer_branch_request(http, &alpha, "preview", "GET /v1/kv/docs/alpha", b"").await;
+    assert_eq!(status, 404);
+    let (status, _) = bearer_branch_request(
+        http,
+        &alpha,
+        "preview",
+        "PUT /v1/kv/docs/branch-write",
+        br#""branch-write""#,
+    )
+    .await;
+    assert_eq!(status, 503);
     let (status, _) = bearer_request(http, &beta, "POST /v1/branches", branch.as_bytes()).await;
     assert_eq!(status, 200);
     let (status, _) = bearer_request(http, KEY, "GET /v1/branches/preview", b"").await;

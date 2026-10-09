@@ -6,9 +6,9 @@
 control-plane hash-chained ledger (`{id, sql, author, checksum,
 parent_checksum, schema_version}`); duplicate ids get `409` before anything
 runs twice, and `GET /v1/migrate/ledger` returns entries in apply order
-with the schema version and chain validity. The ledger is process-local
-like the rest of the control plane (branches, placement); snapshots and
-archives cover data, not control metadata.
+with the schema version and chain validity. Branch metadata is persisted under
+`data_dir/branches.json`; snapshots and archives cover data, not the migration
+ledger.
 
 ## PostgreSQL
 
@@ -55,7 +55,14 @@ maps to `allow_table` RLS). CLI: `ryme migrate supabase dump.sql`.
 Map branch JSON (`[{name, parent, lsn}]`) with `POST /v1/migrate/neon` into
 `{id, parent, base_commit_ts}` plans (LSN `high/low` hex to u64), then create
 branches and cut over. CLI: `ryme migrate neon branches.json`. Migrate data
-at the logical level; internal page formats are never imported.
+at the logical level; internal page formats are never imported. A branch created
+with `base_commit_ts` set to zero pins the current commit automatically.
+
+Branch reads use MVCC snapshots without copying rows. Send
+`X-Ryme-Branch: <id>` to `/v1/sql`, `/v1/kv`, `/rest/v1`, or `/graphql` to
+read the selected tenant's branch at its base commit. These snapshots are
+read-only and return `503` for writes until copy-on-write branch overlays are
+available; `main` keeps the live view.
 
 ## SQL dialect
 

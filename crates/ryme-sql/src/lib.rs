@@ -1484,6 +1484,7 @@ pub struct Executor<B = TxnManager> {
     database: String,
     branch: String,
     manager: B,
+    read_ts: Option<u64>,
     realtime: Option<Realtime>,
     read_only: bool,
     isolation: Isolation,
@@ -1505,6 +1506,7 @@ impl Executor<TxnManager> {
             database,
             branch: String::from("main"),
             manager: TxnManager::new(),
+            read_ts: None,
             realtime: None,
             read_only: false,
             isolation: Isolation::Serializable,
@@ -1520,6 +1522,7 @@ impl Executor<TxnManager> {
             database,
             branch: String::from("main"),
             manager,
+            read_ts: None,
             realtime: None,
             read_only: false,
             isolation: Isolation::Serializable,
@@ -1540,6 +1543,7 @@ where
             database,
             branch: String::from("main"),
             manager,
+            read_ts: None,
             realtime: None,
             read_only: false,
             isolation: Isolation::Serializable,
@@ -1566,6 +1570,19 @@ where
     pub fn with_branch(mut self, branch: String) -> Self {
         self.branch = branch;
         self
+    }
+
+    pub fn with_read_ts(mut self, read_ts: u64) -> Self {
+        self.read_ts = Some(read_ts);
+        self
+    }
+
+    fn begin_with(&self, isolation: Isolation) -> Transaction {
+        let mut txn = self.manager.begin_with(isolation);
+        if let Some(read_ts) = self.read_ts {
+            txn.restamp(read_ts);
+        }
+        txn
     }
 
     pub fn manager(&self) -> &B {
@@ -1973,7 +1990,7 @@ where
 
     fn scan_all_rows(&self, table: &str) -> Result<Vec<Row>> {
         const PAGE: usize = 10_000;
-        let mut txn = self.manager.begin_with(self.isolation);
+        let mut txn = self.begin_with(self.isolation);
         let mut rows = self.manager.scan(&mut txn, &self.tenant, &self.database, table, PAGE)?;
         loop {
             if rows.len() < PAGE {
@@ -2163,7 +2180,7 @@ where
         let Some(limit) = realtime.query_limit(&self.tenant, &self.database, table) else {
             return;
         };
-        let mut txn = self.manager.begin();
+        let mut txn = self.begin_with(self.isolation);
         let rows = self.filter_rls_rows(
             table,
             self.manager
@@ -2178,7 +2195,7 @@ where
     }
 
     pub fn begin_transaction(&self, isolation: Isolation) -> Transaction {
-        self.manager.begin_with(isolation)
+        self.begin_with(isolation)
     }
 
     pub async fn execute_in_transaction(
@@ -2756,7 +2773,7 @@ where
                 Box::pin(self.execute_returning(statement, fields, isolation)).await
             }
             Statement::InsertRows { table, columns, rows, upsert } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let (result, changes) = self
                     .execute_returning_rows_in_transaction(
                         &mut txn, table, columns, rows, upsert, &fields,
@@ -2778,7 +2795,7 @@ where
                 Ok(returning_result(&fields, pk_for_result, value_for_result))
             }
             Statement::UpdateRow { table, pk, assignments } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let current = self
                     .manager
@@ -2800,7 +2817,7 @@ where
                 Ok(returning_result(&fields, pk_for_result, value_for_result))
             }
             Statement::Delete { table, pk } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let value = self
                     .manager
@@ -2844,7 +2861,7 @@ where
             }
             Statement::InsertRows { table, columns, rows, upsert } => {
                 self.reject_if_read_only()?;
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let changes = self
                     .execute_insert_rows_in_transaction(&mut txn, table, columns, rows, upsert)
                     .await?;
@@ -2854,7 +2871,7 @@ where
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 if before.is_some() {
@@ -2879,7 +2896,7 @@ where
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 let existed = before.is_some();
@@ -2904,7 +2921,7 @@ where
                 Ok(QueryResult::Ok)
             }
             Statement::SelectByKey { table, pk } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 match self.manager.get(&mut txn, &key)? {
                     Some(value) if self.rls_allows(&table, &value) => {
@@ -2915,13 +2932,13 @@ where
                 }
             }
             Statement::SelectColumns { table, columns, limit, offset, order, filter } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 self.select_columns_in_transaction(
                     &mut txn, table, columns, limit, offset, order, filter,
                 )
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
                 let rows = self.scan_rows(&mut txn, &table, &filter, cap)?;
@@ -2942,7 +2959,7 @@ where
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, filter } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let rows = self.filter_rls_rows(
                     &table,
                     self.manager.scan(&mut txn, &self.tenant, &self.database, &table, 10000)?,
@@ -2957,7 +2974,7 @@ where
                 })
             }
             Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let rows = self.filter_rls_rows(
                     table.as_str(),
                     self.manager.scan(
@@ -3037,7 +3054,7 @@ where
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Join { left, right, limit, offset, order, filter } => {
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let left_rows = self.filter_rls_rows(
                     left.as_str(),
                     self.manager.scan(
@@ -3091,7 +3108,7 @@ where
             }
             Statement::UpdateRow { table, pk, assignments } => {
                 self.reject_if_read_only()?;
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let current = self
                     .manager
@@ -3107,7 +3124,7 @@ where
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 if before.is_none() {
@@ -3132,7 +3149,7 @@ where
             }
             Statement::Delete { table, pk } => {
                 self.reject_if_read_only()?;
-                let mut txn = self.manager.begin_with(isolation);
+                let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 if before.is_none() {
@@ -3165,7 +3182,7 @@ where
             return Err(RymeError::InvalidArgument(String::from("batch too large")));
         }
         for chunk in rows.chunks(500) {
-            let mut txn = self.manager.begin_with(self.isolation);
+            let mut txn = self.begin_with(self.isolation);
             let mut staged: Vec<TransactionChange> = Vec::new();
             for (pk, value) in chunk {
                 if pk.is_empty() || pk.len() > 1024 {
