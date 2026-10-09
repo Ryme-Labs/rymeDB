@@ -148,6 +148,9 @@ named projections such as `SELECT payload, count FROM t WHERE id = '...'`,
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:
 `gen_random_uuid()` (v4) and `now()` (unix seconds) evaluate in KEY/VALUE
 positions; quoted literals are never evaluated.
+Scalar PostgreSQL reads without a `FROM` clause such as `SELECT 1`,
+`SELECT $1::text AS value`, `SELECT version()`, and `SELECT now()` use the
+shared SQL executor across simple and extended wire requests.
 Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND key IN ('a', 'b')]
 [AND key NOT IN ('c', 'd')] [AND score BETWEEN 10 AND 20]
 [AND score NOT BETWEEN 30 AND 40] [AND key = 'a' OR key = 'b']

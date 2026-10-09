@@ -190,6 +190,10 @@ pub enum Statement {
         order: Order,
         filter: Vec<Predicate>,
     },
+    SelectValues {
+        columns: Vec<String>,
+        values: Vec<String>,
+    },
     Aggregate {
         table: String,
         func: AggFunc,
@@ -864,6 +868,7 @@ impl Statement {
             Self::Explain { inner, .. } => inner.table(),
             Self::Distinct { statement, .. } => statement.table(),
             Self::Union { left, .. } => left.table(),
+            Self::SelectValues { .. } => "",
         }
     }
 }
@@ -887,7 +892,13 @@ pub fn parse(input: &str) -> Result<Statement> {
                 "ALTER" => parse_alter(&tokens, input),
                 "UPSERT" => parse_upsert(&tokens),
                 "INSERT" => parse_insert(&tokens, input),
-                "SELECT" => parse_select(&tokens, input),
+                "SELECT" => {
+                    if find_sql_keyword(input, "FROM", "SELECT".len()).is_none() {
+                        parse_select_values(input)
+                    } else {
+                        parse_select(&tokens, input)
+                    }
+                }
                 "WITH" => parse_with(input),
                 "UPDATE" => parse_update(&tokens, input),
                 "DELETE" => parse_delete(&tokens, input),
@@ -3124,6 +3135,44 @@ fn parse_aggregate_item(raw: &str) -> Option<Result<(AggFunc, Field, Option<Stri
     Some(field.map(|(field, column)| (func, field, column)))
 }
 
+fn parse_select_values(raw: &str) -> Result<Statement> {
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    let values_sql = trimmed
+        .get("SELECT".len()..)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("select values")))?
+        .trim();
+    if values_sql.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("select values")));
+    }
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for item in split_sql_items(values_sql) {
+        let item = item.trim();
+        if item.is_empty() || item == "*" {
+            return Err(RymeError::InvalidArgument(String::from("select values")));
+        }
+        let (expression, column) = if let Some(position) = find_sql_keyword(item, "AS", 0) {
+            let expression = item[..position].trim();
+            let column = unquote(item[position + "AS".len()..].trim());
+            if expression.is_empty() || column.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from("select alias")));
+            }
+            (expression.to_string(), column)
+        } else {
+            (item.to_string(), item.to_string())
+        };
+        if !select_value_is_supported(&expression) {
+            return Err(RymeError::InvalidArgument(String::from("unsupported select value")));
+        }
+        columns.push(column);
+        values.push(expression);
+    }
+    if values.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("select values")));
+    }
+    Ok(Statement::SelectValues { columns, values })
+}
+
 fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "FROM")?;
     if tokens.iter().any(|t| t.eq_ignore_ascii_case("GROUP")) {
@@ -3852,6 +3901,79 @@ fn eval_operand(raw: &str) -> Result<String> {
     Ok(unquote(trimmed))
 }
 
+fn eval_select_value(raw: &str) -> Result<Vec<u8>> {
+    let expression = raw.trim();
+    let expression =
+        expression.split_once("::").map(|(value, _)| value.trim()).unwrap_or(expression);
+    let lower = expression.to_ascii_lowercase();
+    let quoted = expression.len() >= 2
+        && ((expression.starts_with('\'') && expression.ends_with('\''))
+            || (expression.starts_with('"') && expression.ends_with('"')));
+    let literal = quoted
+        || expression.eq_ignore_ascii_case("NULL")
+        || expression.eq_ignore_ascii_case("TRUE")
+        || expression.eq_ignore_ascii_case("FALSE")
+        || expression.parse::<f64>().is_ok();
+    let parameter = expression.strip_prefix('$').is_some_and(|digits| {
+        !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+    });
+    let builtin = matches!(
+        lower.as_str(),
+        "version()"
+            | "current_database()"
+            | "current_user"
+            | "current_user()"
+            | "current_schema()"
+            | "current_catalog"
+            | "now()"
+            | "now"
+            | "gen_random_uuid()"
+            | "gen_random_uuid"
+    );
+    if !literal && !builtin && !parameter {
+        return Err(RymeError::InvalidArgument(String::from("unsupported select value")));
+    }
+    let value = match lower.as_str() {
+        "version()" => String::from("PostgreSQL 16.0 on rymeDB"),
+        "current_database()" | "current_catalog" => String::from("default"),
+        "current_user" | "current_user()" => String::from("ryme"),
+        "current_schema()" => String::from("public"),
+        _ => eval_operand(expression)?,
+    };
+    Ok(value.into_bytes())
+}
+
+fn select_value_is_supported(raw: &str) -> bool {
+    let expression =
+        raw.trim().split_once("::").map(|(value, _)| value.trim()).unwrap_or(raw.trim());
+    let lower = expression.to_ascii_lowercase();
+    let quoted = expression.len() >= 2
+        && ((expression.starts_with('\'') && expression.ends_with('\''))
+            || (expression.starts_with('"') && expression.ends_with('"')));
+    let literal = quoted
+        || expression.eq_ignore_ascii_case("NULL")
+        || expression.eq_ignore_ascii_case("TRUE")
+        || expression.eq_ignore_ascii_case("FALSE")
+        || expression.parse::<f64>().is_ok();
+    let parameter = expression.strip_prefix('$').is_some_and(|digits| {
+        !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+    });
+    let builtin = matches!(
+        lower.as_str(),
+        "version()"
+            | "current_database()"
+            | "current_user"
+            | "current_user()"
+            | "current_schema()"
+            | "current_catalog"
+            | "now()"
+            | "now"
+            | "gen_random_uuid()"
+            | "gen_random_uuid"
+    );
+    literal || parameter || builtin
+}
+
 fn eval_default(raw: &str) -> Result<Option<Vec<u8>>> {
     if raw.trim().eq_ignore_ascii_case("NULL") {
         return Ok(None);
@@ -4528,6 +4650,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::SelectColumns { table, columns, limit, offset, .. } => {
             format!("project({table}) columns {} limit {limit} offset {offset}", columns.len())
         }
+        Statement::SelectValues { columns, .. } => {
+            format!("values select columns {}", columns.len())
+        }
         Statement::Update { table, .. } => format!("write update({table}) point"),
         Statement::UpdateRow { table, assignments, .. } => {
             format!("write update({table}) columns {}", assignments.len())
@@ -4626,6 +4751,12 @@ fn apply_distinct(result: QueryResult, offset: usize, limit: usize) -> QueryResu
         }
         result => result,
     }
+}
+
+fn select_values_result(columns: Vec<String>, values: Vec<String>) -> Result<QueryResult> {
+    let values =
+        values.into_iter().map(|value| eval_select_value(&value)).collect::<Result<Vec<_>>>()?;
+    Ok(QueryResult::Table { columns, rows: vec![values] })
 }
 
 fn apply_set_operation<T>(
@@ -9676,6 +9807,7 @@ where
                     Some(_) => Ok(QueryResult::Rows { rows: Vec::new() }),
                 }
             }
+            Statement::SelectValues { columns, values } => select_values_result(columns, values),
             Statement::SelectColumns { table, columns, limit, offset, order, filter } => self
                 .select_columns_in_transaction(txn, table, columns, limit, offset, order, filter),
             Statement::SelectScan { table, limit, offset, order, filter } => {
@@ -10395,6 +10527,7 @@ where
                     Some(_) => Ok(QueryResult::Rows { rows: Vec::new() }),
                 }
             }
+            Statement::SelectValues { columns, values } => select_values_result(columns, values),
             Statement::SelectColumns { table, columns, limit, offset, order, filter } => {
                 let mut txn = self.begin_with(isolation);
                 self.select_columns_in_transaction(
@@ -13492,6 +13625,44 @@ mod tests {
         assert_eq!(count, 2);
         let parsed = parse("COPY docs FROM stdin").unwrap();
         assert!(matches!(parsed, Statement::CopyFrom { table, .. } if table == "docs"));
+    }
+
+    #[tokio::test]
+    async fn scalar_select_values_use_the_core_executor() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let statement =
+            parse("SELECT 1, true, NULL, 'hello' AS greeting, version(), current_schema(), now()")
+                .unwrap();
+        assert!(matches!(statement, Statement::SelectValues { ref columns, .. } if columns == &[
+            String::from("1"),
+            String::from("true"),
+            String::from("NULL"),
+            String::from("greeting"),
+            String::from("version()"),
+            String::from("current_schema()"),
+            String::from("now()"),
+        ]));
+        let result = executor.execute(statement).await.unwrap();
+        match result {
+            QueryResult::Table { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], b"1");
+                assert_eq!(rows[0][1], b"true");
+                assert_eq!(rows[0][2], b"NULL");
+                assert_eq!(rows[0][3], b"hello");
+                assert!(String::from_utf8_lossy(&rows[0][4]).contains("rymeDB"));
+                assert_eq!(rows[0][5], b"public");
+                assert!(
+                    String::from_utf8_lossy(&rows[0][6]).parse::<u64>().unwrap() > 1_700_000_000
+                );
+            }
+            _ => panic!("expected scalar table"),
+        }
+        let bound = bind("SELECT $1::text AS echo", &[String::from("hi")]);
+        let result = executor.execute(parse(&bound).unwrap()).await.unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"hi".to_vec()]])
+        );
     }
 
     #[tokio::test]

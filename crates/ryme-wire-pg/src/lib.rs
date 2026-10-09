@@ -1069,6 +1069,9 @@ fn describe_query(query: &str) -> Vec<u8> {
         if let Statement::SelectColumns { columns, .. } = &statement {
             return multi_row_description(columns);
         }
+        if let Statement::SelectValues { columns, .. } = &statement {
+            return multi_row_description(columns);
+        }
         if matches!(
             statement,
             ryme_sql::Statement::SelectByKey { .. } | ryme_sql::Statement::SelectScan { .. }
@@ -2814,6 +2817,8 @@ mod tests {
     #[test]
     fn describe_shapes() {
         assert_eq!(describe_query("SELECT 1")[0], b'T');
+        assert!(parse("SELECT 1, 2 AS n").is_ok());
+        assert_eq!(describe_query("SELECT 1, 2 AS n")[0], b'T');
         assert_eq!(describe_query("INSERT INTO t KEY '1' VALUE 'v'")[0], b'n');
         assert_eq!(describe_query("SELECT nonsense()")[0], b'n');
     }
