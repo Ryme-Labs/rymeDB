@@ -236,10 +236,12 @@ pub struct ColumnDefinition {
     pub unique: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForeignKeyAction {
     Restrict,
     Cascade,
+    SetNull,
+    SetDefault,
 }
 
 impl Default for ForeignKeyAction {
@@ -1459,6 +1461,20 @@ fn parse_references_target(input: &str) -> Result<(String, Vec<String>, ForeignK
             || action.is_empty()
         {
             ForeignKeyAction::Restrict
+        } else if action.eq_ignore_ascii_case("SET") {
+            let set_action = suffix[on_delete + "ON DELETE".len()..]
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default();
+            if set_action.eq_ignore_ascii_case("NULL") {
+                ForeignKeyAction::SetNull
+            } else if set_action.eq_ignore_ascii_case("DEFAULT") {
+                ForeignKeyAction::SetDefault
+            } else {
+                return Err(RymeError::InvalidArgument(format!(
+                    "unsupported foreign key delete action SET {set_action}"
+                )));
+            }
         } else {
             return Err(RymeError::InvalidArgument(format!(
                 "unsupported foreign key delete action {action}"
@@ -3872,34 +3888,74 @@ where
                 if !matches_parent {
                     continue;
                 }
-                if constraint.on_delete == ForeignKeyAction::Restrict {
-                    return Err(RymeError::Conflict(format!(
-                        "foreign key constraint failed: referenced row in {table} is still used"
-                    )));
+                match constraint.on_delete {
+                    ForeignKeyAction::Restrict => {
+                        return Err(RymeError::Conflict(format!(
+                            "foreign key constraint failed: referenced row in {table} is still used"
+                        )));
+                    }
+                    ForeignKeyAction::Cascade => {
+                        let child_identity = (child_table.clone(), child_pk.clone());
+                        if visited.contains(&child_identity) {
+                            continue;
+                        }
+                        self.delete_row_with_references(
+                            txn,
+                            &child_table,
+                            &child_pk,
+                            &child_value,
+                            changes,
+                            visited,
+                        )?;
+                        self.manager.delete(
+                            txn,
+                            RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
+                        );
+                        changes.push(TransactionChange {
+                            table: child_table.clone(),
+                            pk: child_pk,
+                            op: Operation::Delete,
+                            before: Some(child_value),
+                            after: None,
+                        });
+                    }
+                    ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
+                        let assignment = match constraint.on_delete {
+                            ForeignKeyAction::SetNull => InsertValue::Null,
+                            ForeignKeyAction::SetDefault => InsertValue::Default,
+                            ForeignKeyAction::Restrict | ForeignKeyAction::Cascade => {
+                                unreachable!()
+                            }
+                        };
+                        let assignments = constraint
+                            .columns
+                            .iter()
+                            .cloned()
+                            .map(|column| (column, assignment.clone()))
+                            .collect();
+                        let after = self.materialize_update_row(
+                            &child_table,
+                            &child_pk,
+                            assignments,
+                            &child_value,
+                        )?;
+                        self.enforce_checks(&child_table, &child_pk, &after)?;
+                        self.enforce_foreign_keys(txn, &child_table, &child_pk, &after)?;
+                        self.check_unique(&child_table, &child_pk, &after)?;
+                        self.manager.put(
+                            txn,
+                            RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
+                            after.clone(),
+                        );
+                        changes.push(TransactionChange {
+                            table: child_table.clone(),
+                            pk: child_pk,
+                            op: Operation::Update,
+                            before: Some(child_value),
+                            after: Some(after),
+                        });
+                    }
                 }
-                let child_identity = (child_table.clone(), child_pk.clone());
-                if visited.contains(&child_identity) {
-                    continue;
-                }
-                self.delete_row_with_references(
-                    txn,
-                    &child_table,
-                    &child_pk,
-                    &child_value,
-                    changes,
-                    visited,
-                )?;
-                self.manager.delete(
-                    txn,
-                    RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
-                );
-                changes.push(TransactionChange {
-                    table: child_table.clone(),
-                    pk: child_pk,
-                    op: Operation::Delete,
-                    before: Some(child_value),
-                    after: None,
-                });
             }
         }
         Ok(())
@@ -8027,6 +8083,52 @@ mod tests {
             let result = executor.execute(parse(&format!("SELECT * FROM {table}")).unwrap()).await;
             assert!(matches!(result, Ok(QueryResult::Rows { rows }) if rows.is_empty()));
         }
+    }
+
+    #[tokio::test]
+    async fn foreign_key_delete_actions_set_null_and_default() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE profiles (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id) ON DELETE SET NULL)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT DEFAULT 'u2' REFERENCES users (id) ON DELETE SET DEFAULT)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO users (id) VALUES ('u1'), ('u2')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO profiles (id, user_id) VALUES ('p1', 'u1')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO sessions (id, user_id) VALUES ('s1', 'u1')").unwrap())
+            .await
+            .unwrap();
+
+        executor.execute(parse("DELETE FROM users WHERE id = 'u1'").unwrap()).await.unwrap();
+        let profiles = executor.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
+        let sessions = executor.execute(parse("SELECT * FROM sessions").unwrap()).await.unwrap();
+        assert!(
+            matches!(profiles, QueryResult::Rows { rows } if rows[0].1.windows(13).any(|window| window == br#"user_id":null"#))
+        );
+        assert!(
+            matches!(sessions, QueryResult::Rows { rows } if rows[0].1.windows(13).any(|window| window == br#"user_id":"u2""#))
+        );
     }
 
     #[tokio::test]

@@ -7,7 +7,8 @@ use ryme_observe::{
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
-    bind, parse, Executor, Field, QueryResult, ReturningField, Statement, TransactionChange,
+    bind, parse, Executor, Field, ForeignKeyAction, QueryResult, ReturningField, Statement,
+    TransactionChange,
 };
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use std::collections::HashMap;
@@ -1073,6 +1074,10 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("contype"),
                 String::from("conrelid"),
                 String::from("conindid"),
+                String::from("confrelid"),
+                String::from("conkey"),
+                String::from("confkey"),
+                String::from("confdeltype"),
                 String::from("convalidated"),
             ],
             "index" => vec![
@@ -1407,6 +1412,9 @@ where
                         "{{{}}}",
                         primary_ordinals.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
                     ),
+                    0,
+                    String::new(),
+                    String::new(),
                 ));
             }
             for index in executor.catalog_indexes(&table).into_iter().filter(|index| index.unique) {
@@ -1442,6 +1450,9 @@ where
                         "{{{}}}",
                         ordinals.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
                     ),
+                    0,
+                    String::new(),
+                    String::new(),
                 ));
             }
             for (foreign_index, foreign_key) in
@@ -1457,6 +1468,24 @@ where
                             .map(|ordinal| ordinal + 1)
                     })
                     .collect::<Vec<_>>();
+                let referenced_definitions =
+                    executor.catalog_columns(&foreign_key.referenced_table);
+                let confkey = foreign_key
+                    .referenced_columns
+                    .iter()
+                    .filter_map(|column| {
+                        referenced_definitions
+                            .iter()
+                            .position(|definition| definition.name.eq_ignore_ascii_case(column))
+                            .map(|ordinal| ordinal + 1)
+                    })
+                    .collect::<Vec<_>>();
+                let confdeltype = match foreign_key.on_delete {
+                    ForeignKeyAction::Restrict => b"r".to_vec(),
+                    ForeignKeyAction::Cascade => b"c".to_vec(),
+                    ForeignKeyAction::SetNull => b"n".to_vec(),
+                    ForeignKeyAction::SetDefault => b"d".to_vec(),
+                };
                 constraints.push((
                     format!("{table_name}_fkey_{foreign_index}"),
                     String::from("f"),
@@ -1466,29 +1495,49 @@ where
                         "{{{}}}",
                         conkey.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
                     ),
+                    catalog_relation_oid(&foreign_key.referenced_table),
+                    format!(
+                        "{{{}}}",
+                        confkey.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+                    ),
+                    String::from_utf8_lossy(&confdeltype).into_owned(),
                 ));
             }
         }
         let rows: Vec<Vec<Vec<u8>>> = constraints
             .into_iter()
-            .map(|(name, kind, relation_oid, index_oid, conkey)| {
-                columns
-                    .iter()
-                    .map(|column| match column.as_str() {
-                        "oid" => {
-                            catalog_oid(&format!("constraint:{name}")).to_string().into_bytes()
-                        }
-                        "conname" => name.as_bytes().to_vec(),
-                        "connamespace" => b"2200".to_vec(),
-                        "contype" => kind.as_bytes().to_vec(),
-                        "conrelid" => relation_oid.to_string().into_bytes(),
-                        "conindid" => index_oid.to_string().into_bytes(),
-                        "conkey" => conkey.as_bytes().to_vec(),
-                        "convalidated" => b"t".to_vec(),
-                        _ => Vec::new(),
-                    })
-                    .collect()
-            })
+            .map(
+                |(
+                    name,
+                    kind,
+                    relation_oid,
+                    index_oid,
+                    conkey,
+                    referenced_relation_oid,
+                    confkey,
+                    confdeltype,
+                )| {
+                    columns
+                        .iter()
+                        .map(|column| match column.as_str() {
+                            "oid" => {
+                                catalog_oid(&format!("constraint:{name}")).to_string().into_bytes()
+                            }
+                            "conname" => name.as_bytes().to_vec(),
+                            "connamespace" => b"2200".to_vec(),
+                            "contype" => kind.as_bytes().to_vec(),
+                            "conrelid" => relation_oid.to_string().into_bytes(),
+                            "conindid" => index_oid.to_string().into_bytes(),
+                            "confrelid" => referenced_relation_oid.to_string().into_bytes(),
+                            "conkey" => conkey.as_bytes().to_vec(),
+                            "confkey" => confkey.as_bytes().to_vec(),
+                            "confdeltype" => confdeltype.as_bytes().to_vec(),
+                            "convalidated" => b"t".to_vec(),
+                            _ => Vec::new(),
+                        })
+                        .collect()
+                },
+            )
             .collect();
         return Some(encode_catalog_rows(&columns, rows));
     }
