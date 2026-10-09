@@ -16,7 +16,9 @@ filter, so a tag always publishes the tested SDK set. Update the version in
 each manifest before pushing a tag. The workflow uploads npm, Cargo, and
 Maven build artifacts to the GitHub release. Java publishing deploys the
 tested JAR, sources, and Javadoc artifacts rather than rebuilding a separate
-package. Publishing also requires these
+package. Rust publishing downloads and publishes the exact tested Cargo
+package artifact rather than rebuilding from a second checkout. Publishing
+also requires these
 repository configuration values:
 
 - `NPM_TOKEN`: an npm automation token with publish access
