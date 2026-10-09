@@ -85,6 +85,8 @@ rows written directly in the branch overlay.
 and `DEFAULT` values), with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
+declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
+`ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
 `CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields,
 with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
 (`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, and `pg_index`),

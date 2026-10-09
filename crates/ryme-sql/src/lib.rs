@@ -567,6 +567,7 @@ fn split_sql_items(input: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut current = String::new();
     let mut depth = 0usize;
+    let mut bracket_depth = 0usize;
     let mut quote = None;
     for ch in input.chars() {
         if let Some(open) = quote {
@@ -589,7 +590,15 @@ fn split_sql_items(input: &str) -> Vec<String> {
                 depth = depth.saturating_sub(1);
                 current.push(ch);
             }
-            ',' if depth == 0 => {
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 && bracket_depth == 0 => {
                 if !current.trim().is_empty() {
                     items.push(current.trim().to_string());
                 }
@@ -1224,6 +1233,11 @@ fn json_insert_value(value: Option<Vec<u8>>, data_type: &str) -> serde_json::Val
     let Some(value) = value else { return serde_json::Value::Null };
     let text = String::from_utf8_lossy(&value);
     let trimmed = text.trim();
+    if data_type.ends_with("[]") || data_type.eq_ignore_ascii_case("array") {
+        if let Some(parsed) = parse_array_literal(trimmed) {
+            return parsed;
+        }
+    }
     if matches!(data_type, "json" | "jsonb") {
         if let Ok(parsed) = serde_json::from_slice(&value) {
             return parsed;
@@ -1254,10 +1268,47 @@ fn json_update_value(
     let data_type = match previous {
         Some(serde_json::Value::Bool(_)) => "boolean",
         Some(serde_json::Value::Number(_)) => "numeric",
-        Some(serde_json::Value::Array(_) | serde_json::Value::Object(_)) => "jsonb",
+        Some(serde_json::Value::Array(_)) => "array",
+        Some(serde_json::Value::Object(_)) => "jsonb",
         _ => "text",
     };
     json_insert_value(value, data_type)
+}
+
+fn parse_array_literal(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    let inner = if trimmed.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("ARRAY[")) {
+        trimmed.strip_suffix(']')?.get(6..)?
+    } else if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        return None;
+    };
+    if inner.trim().is_empty() {
+        return Some(serde_json::Value::Array(Vec::new()));
+    }
+    let values = split_sql_items(inner)
+        .into_iter()
+        .map(|item| {
+            let item = item.trim();
+            if item.eq_ignore_ascii_case("NULL") {
+                return serde_json::Value::Null;
+            }
+            if let Ok(value) = item.parse::<bool>() {
+                return serde_json::Value::Bool(value);
+            }
+            if let Ok(value) = item.parse::<i64>() {
+                return serde_json::Value::Number(value.into());
+            }
+            if let Ok(value) = item.parse::<f64>() {
+                if let Some(number) = serde_json::Number::from_f64(value) {
+                    return serde_json::Value::Number(number);
+                }
+            }
+            serde_json::Value::String(unquote(item))
+        })
+        .collect();
+    Some(serde_json::Value::Array(values))
 }
 
 fn json_result_bytes(value: &serde_json::Value) -> Vec<u8> {
@@ -3851,6 +3902,37 @@ mod tests {
         isolated.execute(parse("CREATE TABLE branch_only").unwrap()).await.unwrap();
         assert!(!restored.catalog_tables().contains(&String::from("branch_only")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn postgres_array_columns_materialize_array_literals() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE rooms (id TEXT PRIMARY KEY, tags TEXT[], seats INTEGER[])")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO rooms (id, tags, seats) VALUES ('r1', ARRAY['chat','game'], '{2,4,8}')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = executor
+            .execute(parse("SELECT tags, seats FROM rooms WHERE key = 'r1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { rows, .. }
+                if rows == vec![vec![
+                    b"[\"chat\",\"game\"]".to_vec(),
+                    b"[2,4,8]".to_vec()
+                ]]
+        ));
     }
 
     #[test]
