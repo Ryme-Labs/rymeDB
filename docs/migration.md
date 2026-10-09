@@ -84,8 +84,9 @@ rows written directly in the branch overlay.
 
 ## SQL dialect
 
-`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, `NOT NULL`,
-and `DEFAULT` values), with PostgreSQL `information_schema.tables` and
+`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, `UNIQUE`,
+`NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
+with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL

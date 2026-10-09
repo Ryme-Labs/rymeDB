@@ -49,6 +49,8 @@ All notable changes to rymeDB are recorded here. Format follows
   constraints and rejects unsupported composite primary keys explicitly.
 - Inline and single-column table-level `UNIQUE` constraints now create durable
   named indexes and reject duplicate inserts and updates.
+- `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
+  preserves nullability/identity metadata, and persists the updated schema.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
