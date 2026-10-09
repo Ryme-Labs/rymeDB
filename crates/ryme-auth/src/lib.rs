@@ -212,9 +212,16 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[derive(Debug, Clone)]
+pub struct RsaJwk {
+    pub kid: Option<String>,
+    pub modulus: Vec<u8>,
+    pub exponent: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 enum JwtKey {
     Hmac(Vec<u8>),
-    RsaJwk { modulus: Vec<u8>, exponent: Vec<u8> },
+    RsaJwks(Vec<RsaJwk>),
 }
 
 #[derive(Debug, Clone)]
@@ -235,12 +242,11 @@ impl JwtVerifier {
     }
 
     pub fn with_rsa_jwk(modulus: Vec<u8>, exponent: Vec<u8>) -> Self {
-        Self {
-            key: JwtKey::RsaJwk { modulus, exponent },
-            leeway_secs: 60,
-            issuer: None,
-            audience: None,
-        }
+        Self::with_rsa_jwks(vec![RsaJwk { kid: None, modulus, exponent }])
+    }
+
+    pub fn with_rsa_jwks(keys: Vec<RsaJwk>) -> Self {
+        Self { key: JwtKey::RsaJwks(keys), leeway_secs: 60, issuer: None, audience: None }
     }
 
     pub fn with_rsa_jwk_issuer(
@@ -250,6 +256,10 @@ impl JwtVerifier {
         audience: String,
     ) -> Self {
         Self::with_rsa_jwk(modulus, exponent).with_claims(Some(issuer), Some(audience))
+    }
+
+    pub fn with_rsa_jwks_issuer(keys: Vec<RsaJwk>, issuer: String, audience: String) -> Self {
+        Self::with_rsa_jwks(keys).with_claims(Some(issuer), Some(audience))
     }
 
     fn with_claims(mut self, issuer: Option<String>, audience: Option<String>) -> Self {
@@ -287,12 +297,27 @@ impl JwtVerifier {
                     return Err(RymeError::Unauthorized);
                 }
             }
-            JwtKey::RsaJwk { modulus, exponent } => {
+            JwtKey::RsaJwks(keys) => {
                 if algorithm != "RS256" {
                     return Err(RymeError::Unauthorized);
                 }
+                let token_kid = header.get("kid").and_then(|value| value.as_str());
+                let key = if let Some(kid) = token_kid {
+                    keys.iter().find(|key| key.kid.as_deref() == Some(kid))
+                } else if keys.len() == 1 {
+                    keys.first()
+                } else {
+                    let mut unlabelled = keys.iter().filter(|key| key.kid.is_none());
+                    let key = unlabelled.next();
+                    if unlabelled.next().is_some() {
+                        None
+                    } else {
+                        key
+                    }
+                }
+                .ok_or(RymeError::Unauthorized)?;
                 let public_key =
-                    ring::signature::RsaPublicKeyComponents { n: modulus, e: exponent };
+                    ring::signature::RsaPublicKeyComponents { n: &key.modulus, e: &key.exponent };
                 public_key
                     .verify(
                         &ring::signature::RSA_PKCS1_2048_8192_SHA256,
@@ -988,15 +1013,34 @@ mod tests {
             )
             .unwrap();
         let token = format!("{input}.{}", base64_url_encode(&signature));
-        let verifier = JwtVerifier::with_rsa_jwk(
-            base64::engine::general_purpose::STANDARD
-                .decode("ksesa1z6EENheQ7vbs6t9HdN1sQmR1ATKmR7+h8QCxDRLjCiNmK40dHlQLpnnMEYOwE4A12eqt8zTY7zV4arusU9/zXoBdJNBppyyee8KydKjSJzBN79sic1qeP0TyP73uyFmXfsmQA6JDEXhTBPuCvFExedDZhf4NVzqN3aILpeKz+Uha0wuGRWi1tIvwLlVB/uGJFywB1eBimv2qrC8+LNiQc6b5hLbQUh//rJ8+boBxXcIGKOHU/e68pc66xKVoU+y0uqkw3v13Usvs/JY8y9y8X/Vqg1PjYG3/wqo346dKOnwzB8NKEQYax//Ez+dnF9ziT7PsLoiAFrUXo5lw==")
-                .unwrap(),
-            base64_url_decode("AQAB").unwrap(),
-        );
+        let modulus = base64::engine::general_purpose::STANDARD
+            .decode("ksesa1z6EENheQ7vbs6t9HdN1sQmR1ATKmR7+h8QCxDRLjCiNmK40dHlQLpnnMEYOwE4A12eqt8zTY7zV4arusU9/zXoBdJNBppyyee8KydKjSJzBN79sic1qeP0TyP73uyFmXfsmQA6JDEXhTBPuCvFExedDZhf4NVzqN3aILpeKz+Uha0wuGRWi1tIvwLlVB/uGJFywB1eBimv2qrC8+LNiQc6b5hLbQUh//rJ8+boBxXcIGKOHU/e68pc66xKVoU+y0uqkw3v13Usvs/JY8y9y8X/Vqg1PjYG3/wqo346dKOnwzB8NKEQYax//Ez+dnF9ziT7PsLoiAFrUXo5lw==")
+            .unwrap();
+        let exponent = base64_url_decode("AQAB").unwrap();
+        let verifier = JwtVerifier::with_rsa_jwks(vec![
+            RsaJwk {
+                kid: Some(String::from("old")),
+                modulus: modulus.clone(),
+                exponent: exponent.clone(),
+            },
+            RsaJwk { kid: Some(String::from("test")), modulus, exponent },
+        ]);
         let principal = verifier.principal_from_token(&token, 1000).unwrap();
         assert_eq!(principal.id, "ada");
         assert!(principal.roles.contains(&Role::ReadOnly));
+        let unknown_kid = base64_url_encode(br#"{"alg":"RS256","kid":"unknown"}"#);
+        let unknown_input = format!("{unknown_kid}.{payload}");
+        let mut unknown_signature = vec![0; key_pair.public().modulus_len()];
+        key_pair
+            .sign(
+                &ring::signature::RSA_PKCS1_SHA256,
+                &ring::rand::SystemRandom::new(),
+                unknown_input.as_bytes(),
+                &mut unknown_signature,
+            )
+            .unwrap();
+        let unknown_token = format!("{unknown_input}.{}", base64_url_encode(&unknown_signature));
+        assert!(verifier.principal_from_token(&unknown_token, 1000).is_err());
     }
 
     #[test]

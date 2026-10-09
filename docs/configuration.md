@@ -96,6 +96,12 @@ returns the normal compatibility error for `AUTH`.
 Both mechanisms use the protocol’s password exchange; use the TLS listeners
 for non-loopback deployments.
 
+For OIDC/JWT verification, set `RYME_JWT_SECRET` for HS256 or set
+`RYME_JWT_JWKS_FILE` to a JSON JWKS file containing RSA signing keys for
+RS256. The verifier selects a matching `kid` from the token, which permits key
+rotation; `RYME_JWT_JWK_KID` can restrict the mounted set to one key. Set
+`RYME_JWT_ISSUER` and `RYME_JWT_AUDIENCE` together to enforce those claims.
+
 Application-auth state is stored atomically in `data_dir/auth.json`. It contains
 password hashes, OTP/passkey metadata, API-key digests, and refresh-token
 digests; raw API keys, passwords, refresh tokens, and WebAuthn challenges are

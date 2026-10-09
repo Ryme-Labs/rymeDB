@@ -483,7 +483,7 @@ paths:
     post:
       tags: [auth]
       security: []
-      description: Build a provider authorization URL. HS256 providers only in v1; RS256 discovery is future work.
+      description: Build a provider authorization URL. OIDC token verification accepts HS256 secrets or RS256 keys loaded from a configured JWKS file.
       requestBody:
         required: true
         content:

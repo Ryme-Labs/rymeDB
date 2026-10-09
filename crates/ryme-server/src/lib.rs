@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use ryme_archive::{Archiver, BackupManifest};
 use ryme_auth::{
     ApiKeyStore, CredentialStore, JwtVerifier, OidcConfig, PasskeyRegistry, PolicyEngine,
-    Principal, RefreshTokenRecord, RefreshTokenStore, Role,
+    Principal, RefreshTokenRecord, RefreshTokenStore, Role, RsaJwk,
 };
 use ryme_backup::Checkpoint;
 use ryme_config::{Config, OtelConfig};
@@ -6786,7 +6786,7 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
         .and_then(|value| value.as_array())
         .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks keys")))?;
     let requested_kid = std::env::var("RYME_JWT_JWK_KID").ok();
-    let key = keys
+    let selected_keys = keys
         .iter()
         .filter(|key| key.get("kty").and_then(|value| value.as_str()) == Some("RSA"))
         .filter(|key| {
@@ -6795,34 +6795,43 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
                 .map(|algorithm| algorithm == "RS256")
                 .unwrap_or(true)
         })
-        .find(|key| {
+        .filter(|key| {
             requested_kid
                 .as_deref()
                 .map(|kid| key.get("kid").and_then(|value| value.as_str()) == Some(kid))
                 .unwrap_or(true)
         })
-        .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks rsa key")))?;
-    let modulus = key
-        .get("n")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus")))
-        .and_then(|value| {
-            ryme_auth::base64_url_decode(value)
-                .map_err(|_| ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus")))
-        })?;
-    let exponent = key
-        .get("e")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent")))
-        .and_then(|value| {
-            ryme_auth::base64_url_decode(value)
-                .map_err(|_| ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent")))
-        })?;
+        .map(|key| {
+            let kid = key.get("kid").and_then(|value| value.as_str()).map(String::from);
+            let modulus = key
+                .get("n")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus")))
+                .and_then(|value| {
+                    ryme_auth::base64_url_decode(value).map_err(|_| {
+                        ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus"))
+                    })
+                })?;
+            let exponent = key
+                .get("e")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent")))
+                .and_then(|value| {
+                    ryme_auth::base64_url_decode(value).map_err(|_| {
+                        ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent"))
+                    })
+                })?;
+            Ok(RsaJwk { kid, modulus, exponent })
+        })
+        .collect::<ryme_error::Result<Vec<_>>>()?;
+    if selected_keys.is_empty() {
+        return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks rsa key")));
+    }
     let verifier = match (issuer, audience) {
         (Some(issuer), Some(audience)) => {
-            JwtVerifier::with_rsa_jwk_issuer(modulus, exponent, issuer, audience)
+            JwtVerifier::with_rsa_jwks_issuer(selected_keys, issuer, audience)
         }
-        (None, None) => JwtVerifier::with_rsa_jwk(modulus, exponent),
+        (None, None) => JwtVerifier::with_rsa_jwks(selected_keys),
         _ => {
             return Err(ryme_error::RymeError::InvalidArgument(String::from(
                 "jwt issuer and audience must be configured together",
