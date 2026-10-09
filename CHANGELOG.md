@@ -19,6 +19,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and remove every matching row across storage pages.
 - PostgREST REST filters now support compound `or=(...)` and `and=(...)`
   groups with nested filter expressions.
+- REST inserts support `on_conflict=<field>` to update an existing JSON row
+  when a logical conflict field matches.
 
 - PostgREST filtering now advances through ordered storage pages, so matching
   rows beyond the first page are not lost; non-key ordering scans the complete

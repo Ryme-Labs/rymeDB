@@ -153,6 +153,26 @@ async fn compat_rest_graphql_copy_explain() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains(r#""id":"p2""#), "{text}");
     assert!(text.contains(r#""id":"p3""#), "{text}");
+    let (status, _) = http_request(
+        http,
+        "POST /rest/v1/people",
+        br#"{"id":"p4","email":"ada@example.com","name":"Ada"}"#,
+    )
+    .await;
+    assert_eq!(status, 201);
+    let (status, _) = http_request(
+        http,
+        "POST /rest/v1/people?on_conflict=email",
+        br#"{"id":"p5","email":"ada@example.com","name":"Updated Ada"}"#,
+    )
+    .await;
+    assert_eq!(status, 201);
+    let (status, body) =
+        http_request(http, "GET /rest/v1/people?email=eq.ada%40example.com&select=name", b"").await;
+    assert_eq!(status, 200);
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].get("name").and_then(serde_json::Value::as_str), Some("Updated Ada"));
     let (status, body) =
         http_request(http, "PATCH /rest/v1/people?id=eq.p1", br#"{"status":"away"}"#).await;
     assert_eq!(status, 200);

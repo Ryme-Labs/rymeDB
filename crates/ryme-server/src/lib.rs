@@ -2701,6 +2701,27 @@ fn rest_matching_keys(
     Ok(keys)
 }
 
+fn rest_conflict_key(
+    gateway: &Gateway<BranchStorage>,
+    principal: &Principal,
+    table: &str,
+    field: &str,
+    expected: &serde_json::Value,
+) -> ryme_error::Result<Option<Vec<u8>>> {
+    let mut cursor = None;
+    loop {
+        let (page, next) = gateway.scan_page(principal, table, cursor.as_deref(), 256)?;
+        for (key, value) in page {
+            let row = rest_row_to_json(&key, &value);
+            if row.get(field) == Some(expected) {
+                return Ok(Some(key));
+            }
+        }
+        let Some(next_cursor) = next else { return Ok(None) };
+        cursor = Some(next_cursor);
+    }
+}
+
 async fn rest_list(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -3064,6 +3085,7 @@ async fn rest_insert(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Path(table): Path<String>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
     let bodies = match rest_write_bodies(&body) {
@@ -3080,7 +3102,10 @@ async fn rest_insert(
     if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
-    let rows = bodies.iter().flat_map(rest_body_rows).collect::<Vec<_>>();
+    let rows = bodies
+        .iter()
+        .flat_map(|body| rest_body_rows(body).into_iter().map(move |row| (body, row)))
+        .collect::<Vec<_>>();
     if rows.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("rows")));
     }
@@ -3088,8 +3113,29 @@ async fn rest_insert(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
+    let conflict_field =
+        rest_query_value(&raw.unwrap_or_default(), "on_conflict").and_then(|field| {
+            field
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .map(str::to_string)
+        });
     let mut inserted = Vec::new();
-    for (key, value) in rows {
+    for (body, (mut key, value)) in rows {
+        if let Some(field) = conflict_field.as_deref() {
+            if let Some(expected) = body.fields.get(field) {
+                if let Some(existing) =
+                    match rest_conflict_key(&gateway, &principal, &table, field, expected) {
+                        Ok(existing) => existing,
+                        Err(e) => return error_response(e),
+                    }
+                {
+                    key = existing;
+                }
+            }
+        }
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
@@ -3117,8 +3163,16 @@ async fn rest_upsert(
         Ok(body) => body,
         Err(e) => return error_response(e),
     };
+    let raw = raw.unwrap_or_default();
     if body_is_json_array(&body) || parsed.len() != 1 || parsed[0].fields.is_empty() {
-        return rest_insert(State(state), headers, Path(table), body).await;
+        return rest_insert(
+            State(state),
+            headers,
+            Path(table),
+            axum::extract::RawQuery(Some(raw)),
+            body,
+        )
+        .await;
     }
     let parsed = parsed.into_iter().next().expect("single REST object");
 
@@ -3136,7 +3190,6 @@ async fn rest_upsert(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    let raw = raw.unwrap_or_default();
     let keys = match rest_matching_keys(&gateway, &principal, &table, &raw) {
         Ok(keys) => keys,
         Err(e) => return error_response(e),
@@ -3238,6 +3291,13 @@ fn rest_query_has_filter(raw: &str) -> bool {
     raw.split('&').any(|pair| {
         let name = url_decode(pair.split_once('=').map(|(name, _)| name).unwrap_or(pair));
         !name.is_empty() && !matches!(name.as_str(), "select" | "limit" | "offset" | "order")
+    })
+}
+
+fn rest_query_value(raw: &str, wanted: &str) -> Option<String> {
+    raw.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (url_decode(name) == wanted).then(|| url_decode(value))
     })
 }
 

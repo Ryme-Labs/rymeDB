@@ -55,6 +55,7 @@ with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is`, `like`, `ilike`, and
 projection/aliases,
 `POST /rest/v1/:table` with `{key, value}`, `{rows: [...]}`, a JSON object,
 or a JSON array of objects with an `id`/`key` field,
+and `on_conflict=<field>` resolves duplicate JSON rows by that field,
 `PATCH /rest/v1/:table?<field>=eq.<value>` with a JSON object for filtered
 partial updates,
 `DELETE /rest/v1/:table?<field>=eq.<value>` (including the legacy
