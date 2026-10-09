@@ -24,7 +24,7 @@ runs on every boot.
 | `read_only` | bool | false | Follower mode: serve reads, reject mutations with 503. Flag: `--read-only`. |
 | `raft_tls` | bool | false | Mutual-TLS Raft mesh: every inter-node RPC handshakes with CA-chained certs. Requires `raft_listen`, `tls_cert_pem`, `tls_key_pem` and `tls_client_ca_pem`. Flag: `--raft-tls`. |
 | `http_listen` | socket addr | `127.0.0.1:8080` | REST listener. |
-| `data_dir` | path | `/var/lib/rymedb` | WAL, snapshots, Raft state, and durable SQL schema metadata live here. |
+| `data_dir` | path | `/var/lib/rymedb` | WAL, snapshots, Raft state, main SQL schema metadata, and tenant-scoped branch schemas live here. |
 | `durability` | enum | `"local-durable"` | One of `strict`, `regional-fast`, `local-durable`, `memory` (kebab-case). The three durable tiers share one implementation in v1: fsync per commit plus Raft quorum where clustered. Only `memory` relaxes durability (no fsync); never select it for data you cannot lose. Pinned by `only_memory_relaxes_durability`. |
 | `cache_bytes` | u64 | `67108864` (64 MiB) | Must be >= 1 MiB. Raise to 256 MiB–2 GiB on performance nodes. |
 | `max_connections` | u32 | `10000` | Must be non-zero. Excess PG/RESP connections get `53300` / `-ERR overloaded`; excess HTTP/HTTPS TCP connections are closed immediately; gRPC per-connection concurrency is capped at the same value. |

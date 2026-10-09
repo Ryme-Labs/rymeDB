@@ -66,7 +66,9 @@ Branch reads use MVCC snapshots without copying rows. Send
 read and write the selected tenant's branch through a copy-on-write overlay.
 Parent rows are visible at the branch base commit, branch mutations are stored
 under the branch namespace, and branch deletes mask (but do not remove) parent
-rows. `main` keeps the live view.
+rows. Branch table and index definitions are stored under the data directory
+per tenant/branch, so branch DDL survives request/executor recreation without
+changing `main`. `main` keeps the live view.
 Resetting a branch advances its storage epoch, so prior branch-local writes are
 discarded from the new view; deleting a branch removes its selectable metadata.
 `GET /v1/branches/<id>/diff?against=<branch>` keeps the manifest comparison

@@ -846,6 +846,12 @@ pub struct ClusterReplaceRequest {
 }
 
 impl SharedState {
+    fn branch_schema_path(&self, tenant: &str, branch: &str) -> std::path::PathBuf {
+        let tenant = ryme_auth::base64_url_encode(tenant.as_bytes());
+        let branch = ryme_auth::base64_url_encode(branch.as_bytes());
+        self.data_dir.join("branch-schemas").join(tenant).join(format!("{branch}.json"))
+    }
+
     fn persist_auth(&self) -> ryme_error::Result<()> {
         let snapshot = AuthSnapshot {
             api_keys: self.keys.snapshot()?,
@@ -2473,7 +2479,14 @@ fn branch_executor(
                 base_commit_ts,
                 storage_epoch,
             );
-            Ok(executor.with_isolated_schema(manager).with_branch(branch))
+            let schema_path = state.branch_schema_path(tenant, &branch);
+            let mut branch_executor = executor.with_isolated_schema(manager).with_branch(branch);
+            if schema_path.exists() {
+                let snapshot = load_schema_snapshot(&schema_path)?;
+                branch_executor.restore_schema_snapshot(snapshot)?;
+            }
+            branch_executor.set_schema_path(schema_path);
+            Ok(branch_executor)
         }
         None => Ok(executor),
     }
@@ -4851,15 +4864,39 @@ async fn branch_create(
     } else {
         request.base_commit_ts
     };
-    match branches.create_child_for(&principal.tenant, request.id, &request.parent, base_commit_ts)
-    {
-        Ok(()) => match branches.persist(&state.branch_path) {
-            Ok(()) => {
-                control.branches = branches;
-                (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+    let parent_schema = if request.parent == "main" {
+        state.executor.schema_snapshot()
+    } else {
+        let parent_path = state.branch_schema_path(&principal.tenant, &request.parent);
+        if parent_path.exists() {
+            match load_schema_snapshot(&parent_path) {
+                Ok(snapshot) => snapshot,
+                Err(e) => return error_response(e),
             }
-            Err(e) => error_response(e),
-        },
+        } else {
+            state.executor.schema_snapshot()
+        }
+    };
+    let branch_id = request.id.clone();
+    match branches.create_child_for(
+        &principal.tenant,
+        branch_id.clone(),
+        &request.parent,
+        base_commit_ts,
+    ) {
+        Ok(()) => {
+            let schema_path = state.branch_schema_path(&principal.tenant, &branch_id);
+            if let Err(e) = ryme_sql::persist_schema_snapshot(&schema_path, &parent_schema) {
+                return error_response(e);
+            }
+            match branches.persist(&state.branch_path) {
+                Ok(()) => {
+                    control.branches = branches;
+                    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+                }
+                Err(e) => error_response(e),
+            }
+        }
         Err(e) => error_response(e),
     }
 }
@@ -4904,6 +4941,7 @@ async fn branch_delete(
         Ok(garbage) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
+                let _ = std::fs::remove_file(state.branch_schema_path(&principal.tenant, &id));
                 (StatusCode::OK, Json(serde_json::json!({ "garbage": garbage }))).into_response()
             }
             Err(e) => error_response(e),
@@ -4960,6 +4998,12 @@ async fn branch_reset(
         Ok(branch) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
+                if let Err(e) = ryme_sql::persist_schema_snapshot(
+                    &state.branch_schema_path(&principal.tenant, &id),
+                    &state.executor.schema_snapshot(),
+                ) {
+                    return error_response(e);
+                }
                 (StatusCode::OK, Json(branch)).into_response()
             }
             Err(e) => error_response(e),
@@ -6841,6 +6885,66 @@ mod realtime_policy_tests {
         let mode = std::fs::metadata(dir.join("schema.json")).unwrap().permissions();
         #[cfg(unix)]
         assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o077, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn branch_schema_survives_executor_recreation_without_leaking_to_main() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-branch-schema-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("branch-schema");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .executor
+            .execute(ryme_sql::parse("INSERT INTO messages KEY 'm1' VALUE 'hello'").unwrap())
+            .await
+            .unwrap();
+
+        {
+            let mut control = state.control.lock().unwrap();
+            let mut branches = control.branches.clone();
+            branches
+                .create_child_for(
+                    "default",
+                    String::from("preview"),
+                    "main",
+                    state.backend.latest_commit(),
+                )
+                .unwrap();
+            branches.persist(&state.branch_path).unwrap();
+            control.branches = branches;
+        }
+        ryme_sql::persist_schema_snapshot(
+            &state.branch_schema_path("default", "preview"),
+            &state.executor.schema_snapshot(),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ryme-branch", axum::http::HeaderValue::from_static("preview"));
+        let branch = branch_executor(&state, &headers, "default").unwrap();
+        branch
+            .execute(ryme_sql::parse("CREATE TABLE branch_only (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        drop(branch);
+
+        let recreated = branch_executor(&state, &headers, "default").unwrap();
+        assert!(recreated.catalog_tables().contains(&String::from("branch_only")));
+        assert!(!state.executor.catalog_tables().contains(&String::from("branch_only")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

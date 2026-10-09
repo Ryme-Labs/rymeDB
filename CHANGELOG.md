@@ -13,6 +13,10 @@ All notable changes to rymeDB are recorded here. Format follows
   with rebuilt index entries, isolated for branch executors, and included in
   archive backups. Migration applications are serialized per server process
   so concurrent requests cannot execute duplicate or interleaved migrations.
+- Branch schema snapshots now persist tenant-safely under `branch-schemas`,
+  preserving branch-only tables and indexes across executor recreation while
+  keeping branch DDL out of `main`; child branches inherit their parent
+  schema snapshot.
 - SDK distribution is limited to the Java, npm/TypeScript, and Rust clients;
   the release workflow packages and publishes those three artifacts and the
   Pages workflow builds their documentation.

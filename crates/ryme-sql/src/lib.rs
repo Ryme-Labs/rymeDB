@@ -4,7 +4,7 @@ use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -142,6 +142,28 @@ pub struct SchemaSnapshot {
     pub tables: BTreeMap<String, Vec<ColumnDefinition>>,
     #[serde(default)]
     pub indexes: Vec<IndexDefinition>,
+}
+
+pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(snapshot)
+        .map_err(|error| RymeError::Internal(format!("schema snapshot: {error}")))?;
+    let temporary = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(temporary, path)?;
+    Ok(())
 }
 
 impl Statement {
@@ -2281,24 +2303,7 @@ where
         if !self.schema_dirty.load(Ordering::SeqCst) {
             return Ok(());
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec(&self.schema_snapshot())
-            .map_err(|error| RymeError::Internal(format!("schema snapshot: {error}")))?;
-        let temporary = path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_data()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(temporary, path)?;
+        persist_schema_snapshot(&path, &self.schema_snapshot())?;
         self.schema_dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
