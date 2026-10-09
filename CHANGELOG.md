@@ -20,7 +20,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention
-  prunes safely around the newest base, and archive jobs include the artifacts.
+  prunes safely around the newest base, compacts at 64 segments, and archive
+  jobs include the artifacts.
 - SDK distribution is limited to the Java, npm/TypeScript, and Rust clients;
   the release workflow packages and publishes those three artifacts and the
   Pages workflow builds their documentation.

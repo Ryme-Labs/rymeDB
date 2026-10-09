@@ -74,6 +74,20 @@ impl Engine {
         self.inner.keys().cloned().collect()
     }
 
+    pub(crate) fn version_at(
+        &self,
+        key: &RecordKey,
+        read_ts: u64,
+    ) -> Option<(u64, Option<Vec<u8>>, u64)> {
+        self.inner.get(key).and_then(|versions| {
+            versions
+                .iter()
+                .take_while(|version| version.commit_ts <= read_ts)
+                .last()
+                .map(|version| (version.commit_ts, version.value.clone(), version.expires_at))
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }

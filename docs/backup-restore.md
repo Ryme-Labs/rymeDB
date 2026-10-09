@@ -51,6 +51,11 @@ metadata. Startup merges the ordered base-plus-delta set when the snapshot
 pointer is unavailable; WAL replay still covers commits newer than the newest
 segment.
 
+When a shard reaches 64 segment files, the retention loop compacts its current
+MVCC state into one new full base segment and removes superseded files. The
+compaction holds the transaction commit gate while taking its consistent base,
+so it cannot publish a partial state.
+
 Archives include the SQL and control-plane metadata files: `schema.json`,
 `branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema
 snapshots are stored under `branch-schemas/<tenant>/<branch>.json`. Restore

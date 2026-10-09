@@ -1003,6 +1003,8 @@ pub struct DurableManager {
     dir: std::path::PathBuf,
 }
 
+const SEGMENT_COMPACTION_THRESHOLD: usize = 64;
+
 impl DurableManager {
     pub fn open(dir: &Path, segment_bytes: u64, policy: SyncPolicy) -> Result<Self> {
         let wal = Wal::open(dir, segment_bytes)?;
@@ -1160,6 +1162,9 @@ impl DurableManager {
     pub fn retention_sweep(&self, snapshot_keep: usize) -> Result<(usize, usize)> {
         let pruned = self.prune_snapshots(snapshot_keep)?;
         let _segments_pruned = self.segments.prune(snapshot_keep)?;
+        if self.segments.segment_paths()?.len() >= SEGMENT_COMPACTION_THRESHOLD {
+            self.compact_segments()?;
+        }
         let wal_removed = match self.oldest_snapshot()? {
             Some(floor) => self
                 .wal
@@ -1169,6 +1174,33 @@ impl DurableManager {
             None => 0,
         };
         Ok((pruned, wal_removed))
+    }
+
+    pub fn compact_segments(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
+        let _guard = self
+            .inner
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let engine = self
+            .inner
+            .inner
+            .engine
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?
+            .clone();
+        if engine.is_empty() {
+            return Ok(None);
+        }
+        let max = engine.max_commit_ts();
+        let (meta, newest) = self.segments.write(max, &engine)?;
+        for path in self.segments.segment_paths()? {
+            if path != newest {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(Some(meta))
     }
 
     pub fn restore_to(&self, target: u64) -> Result<u64> {
@@ -1770,6 +1802,54 @@ mod tests {
             manager.put(&mut txn, key.clone(), value);
             manager.commit(txn).unwrap();
         }
+        drop(manager);
+
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &first).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reopened.get(&mut probe, &second).unwrap(), Some(b"two".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_publishes_one_recoverable_base() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-compaction-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let first = RecordKey::new("t", "d", "s", b"first");
+        let second = RecordKey::new("t", "d", "s", b"second");
+        for (key, value) in [(&first, b"one".to_vec()), (&second, b"two".to_vec())] {
+            let mut txn = manager.begin();
+            manager.put(&mut txn, key.clone(), value);
+            manager.commit(txn).unwrap();
+        }
+        assert_eq!(
+            ryme_storage::SegmentStore::open(&manager.segment_dir())
+                .unwrap()
+                .segment_paths()
+                .unwrap()
+                .len(),
+            2
+        );
+        manager.compact_segments().unwrap().unwrap();
+        assert_eq!(
+            ryme_storage::SegmentStore::open(&manager.segment_dir())
+                .unwrap()
+                .segment_paths()
+                .unwrap()
+                .len(),
+            1
+        );
         drop(manager);
 
         for entry in std::fs::read_dir(&dir).unwrap() {
