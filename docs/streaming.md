@@ -210,3 +210,8 @@ In cluster mode, appends are accepted only by the current Raft leader and are
 committed through the durable Raft log before the cursor is returned. Every
 gateway applies the same cursor-ordered append and persists its local topic
 snapshot, so reads converge after a gateway receives the committed entry.
+
+Cluster database-change streams follow the same gateway-independent rule:
+committed writes are emitted locally by the leader and reconstructed from the
+Raft write set on followers. A subscriber can therefore attach to any live
+gateway and receive the committed CDC stream.

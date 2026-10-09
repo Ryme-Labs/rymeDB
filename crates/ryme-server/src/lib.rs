@@ -1657,6 +1657,7 @@ pub async fn serve_cluster(
         }
     };
     install_cluster_range_replication(&state, &node)?;
+    install_cluster_data_replication(&state, &node)?;
     install_cluster_realtime_replication(&state, &node)?;
     install_cluster_presence_replication(&state, &node)?;
     install_cluster_topic_replication(&state, &node)?;
@@ -6246,6 +6247,16 @@ fn install_cluster_range_replication(
     node.set_metadata_hook(hook)
 }
 
+fn install_cluster_data_replication(
+    state: &SharedState,
+    node: &std::sync::Arc<Node>,
+) -> ryme_error::Result<()> {
+    let state = state.clone();
+    let hook: ryme_raft::net::MetadataHook =
+        Arc::new(move |payload| apply_replicated_data(&state, payload));
+    node.set_data_hook(hook)
+}
+
 fn install_cluster_realtime_replication(
     state: &SharedState,
     node: &std::sync::Arc<Node>,
@@ -6264,6 +6275,49 @@ fn install_cluster_presence_replication(
     let hook: ryme_raft::net::MetadataHook =
         Arc::new(move |payload| apply_replicated_presence(&state, payload));
     node.set_presence_hook(hook)
+}
+
+fn apply_replicated_data(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
+    let (commit_ts, encoded) = ryme_raft::decode_applied(payload)?;
+    let writes = ryme_txn::decode_writes(&encoded)?;
+    let mut query_tables = BTreeSet::new();
+    for (key, write) in writes {
+        let mut before_txn = state.backend.begin();
+        before_txn.restamp(commit_ts.saturating_sub(1));
+        let before = state.backend.get(&mut before_txn, &key)?;
+        let op = match write.value {
+            None => ryme_realtime::Operation::Delete,
+            Some(_) if before.is_some() => ryme_realtime::Operation::Update,
+            Some(_) => ryme_realtime::Operation::Insert,
+        };
+        let after = write.value;
+        state.realtime.publish(ryme_realtime::NewChange {
+            tenant: key.tenant.clone(),
+            database: key.database.clone(),
+            branch: String::from("main"),
+            table: key.table.clone(),
+            op,
+            pk: key.pk.clone(),
+            before,
+            after,
+            commit_ts,
+            tx_id: commit_ts,
+        })?;
+        query_tables.insert((key.tenant, key.database, key.table));
+    }
+    for (tenant, database, table) in query_tables {
+        let Some(limit) = state.realtime.query_limit_branch(&tenant, &database, "main", &table)
+        else {
+            continue;
+        };
+        let mut txn = state.backend.begin();
+        txn.restamp(commit_ts);
+        let rows = state.backend.scan(&mut txn, &tenant, &database, &table, limit)?;
+        let _ = state
+            .realtime
+            .publish_query_branch(&tenant, &database, "main", &table, commit_ts, rows, limit);
+    }
+    Ok(())
 }
 
 fn install_cluster_topic_replication(

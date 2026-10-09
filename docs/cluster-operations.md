@@ -201,3 +201,8 @@ or leave, and presence is not replayed from the Raft log.
 Durable topic appends use the durable Raft path instead of the ephemeral mesh.
 The leader returns a cursor only after the entry reaches quorum and applies it;
 followers replay the entry and persist their bounded `topics.json` snapshot.
+
+Committed database writes also emit CDC on every live gateway. The leader's
+executor emits its local change after commit, while followers reconstruct the
+same change from the committed Raft write set after applying it, so clients can
+connect to any gateway and receive the database-change stream.

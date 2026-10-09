@@ -447,6 +447,7 @@ pub struct Node {
     mesh_tls: std::sync::Mutex<Option<Arc<MeshTransport>>>,
     metadata: std::sync::Mutex<Option<Vec<u8>>>,
     metadata_hook: MetadataHookSlot,
+    data_hook: MetadataHookSlot,
     realtime_hook: MetadataHookSlot,
     presence_hook: MetadataHookSlot,
     topic_hook: MetadataHookSlot,
@@ -599,6 +600,7 @@ impl Node {
             )),
             metadata: std::sync::Mutex::new(metadata),
             metadata_hook: MetadataHookSlot::default(),
+            data_hook: MetadataHookSlot::default(),
             realtime_hook: MetadataHookSlot::default(),
             presence_hook: MetadataHookSlot::default(),
             topic_hook: MetadataHookSlot::default(),
@@ -1039,8 +1041,12 @@ impl Node {
         for entry in entries {
             match decode_apply(&entry.payload)? {
                 ApplyPayload::Data { commit_ts, writes } => {
+                    let encoded_writes = writes.clone();
                     let writes = decode_writes(&writes)?;
                     self.manager.replay_at(commit_ts, &writes)?;
+                    if self.inner.lock().await.role != Role::Leader {
+                        self.apply_data_hook(crate::encode_applied(commit_ts, &encoded_writes))?;
+                    }
                 }
                 ApplyPayload::Conf { change } => {
                     self.apply_conf(change).await;
@@ -1070,6 +1076,19 @@ impl Node {
                 .map_err(|_| RymeError::Internal(String::from("metadata hook lock")))?
                 .clone()
         };
+        if let Some(hook) = hook {
+            hook(&payload)?;
+        }
+        Ok(())
+    }
+
+    fn apply_data_hook(&self, payload: Vec<u8>) -> Result<()> {
+        let hook = self
+            .data_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("data hook lock")))?
+            .clone();
         if let Some(hook) = hook {
             hook(&payload)?;
         }
@@ -1646,6 +1665,16 @@ impl Node {
         if let Some(payload) = current {
             hook(&payload)?;
         }
+        Ok(())
+    }
+
+    pub fn set_data_hook(&self, hook: MetadataHook) -> Result<()> {
+        let mut registered = self
+            .data_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("data hook lock")))?;
+        *registered = Some(hook);
         Ok(())
     }
 
