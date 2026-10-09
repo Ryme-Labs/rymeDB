@@ -4299,6 +4299,14 @@ fn json_result_bytes(value: &serde_json::Value) -> Vec<u8> {
     }
 }
 
+fn json_result_bytes_or_null(value: &serde_json::Value) -> Vec<u8> {
+    if value.is_null() {
+        SQL_NULL_SENTINEL.to_vec()
+    } else {
+        json_result_bytes(value)
+    }
+}
+
 fn excluded_value_bytes(expression: &[u8], incoming: &[u8]) -> Option<Vec<u8>> {
     let expression = std::str::from_utf8(expression).ok()?.trim();
     let (prefix, column) = expression.split_once('.')?;
@@ -4380,14 +4388,6 @@ fn convert_json_column_value(
         )));
     }
     Ok(converted)
-}
-
-fn json_projection_bytes(
-    expression: &str,
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> Option<Vec<u8>> {
-    let (current, text_result) = json_projection_value(expression, object)?;
-    Some(if text_result { json_result_bytes(current) } else { serde_json::to_vec(current).ok()? })
 }
 
 fn json_column_value<'a>(
@@ -5172,12 +5172,12 @@ fn returning_field_value(field: &ReturningField, pk: &[u8], value: &[u8]) -> Vec
         ReturningField::Value => object
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("value"))
-            .map(|(_, value)| json_result_bytes(value))
+            .map(|(_, value)| json_result_bytes_or_null(value))
             .unwrap_or_else(|| value.to_vec()),
         ReturningField::Column(column) => object
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(column))
-            .map(|(_, value)| json_result_bytes(value))
+            .map(|(_, value)| json_result_bytes_or_null(value))
             .unwrap_or_default(),
     }
 }
@@ -6622,13 +6622,19 @@ where
                 let Some(serde_json::Value::Object(object)) = object.as_ref() else {
                     return value.to_vec();
                 };
-                if let Some(projected) = json_projection_bytes(column, object) {
-                    return projected;
+                if let Some((projected, text_result)) = json_projection_value(column, object) {
+                    return if projected.is_null() {
+                        SQL_NULL_SENTINEL.to_vec()
+                    } else if text_result {
+                        json_result_bytes(projected)
+                    } else {
+                        serde_json::to_vec(projected).unwrap_or_default()
+                    };
                 }
                 object
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                    .map(|(_, value)| json_result_bytes(value))
+                    .map(|(_, value)| json_result_bytes_or_null(value))
                     .unwrap_or_default()
             })
             .collect()
@@ -11397,6 +11403,28 @@ mod tests {
         assert!(matches!(result, QueryResult::Table { ref columns, ref rows }
             if columns == &[String::from("body"), String::from("total")]
                 && rows == &vec![vec![b"hello".to_vec(), b"3".to_vec()]]));
+
+        executor
+            .execute(
+                parse("INSERT INTO events (id, payload, count) VALUES ('e2', NULL, 4)").unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = executor
+            .execute(parse("SELECT payload FROM events WHERE id = 'e2'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Table { ref rows, .. }
+            if rows == &vec![vec![SQL_NULL_SENTINEL.to_vec()]]));
+        let returned = executor
+            .execute(
+                parse("UPDATE events SET payload = NULL WHERE id = 'e2' RETURNING payload")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(returned, QueryResult::Returning { ref rows, .. }
+            if rows == &vec![vec![SQL_NULL_SENTINEL.to_vec()]]));
 
         let returned = executor
             .execute(

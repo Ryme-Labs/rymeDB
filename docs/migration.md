@@ -152,7 +152,8 @@ positions; quoted literals are never evaluated.
 Scalar PostgreSQL reads without a `FROM` clause such as `SELECT 1`,
 `SELECT $1::text AS value`, `SELECT version()`, and `SELECT now()` use the
 shared SQL executor across simple and extended wire requests; `SELECT NULL`
-is emitted as a protocol-level null rather than the text `NULL`.
+is emitted as a protocol-level null rather than the text `NULL`; nullable
+table projections and `RETURNING` cells use the same protocol-level encoding.
 Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND key IN ('a', 'b')]
 [AND key NOT IN ('c', 'd')] [AND score BETWEEN 10 AND 20]
 [AND score NOT BETWEEN 30 AND 40] [AND key = 'a' OR key = 'b']
