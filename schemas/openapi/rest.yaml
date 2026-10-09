@@ -673,6 +673,29 @@ paths:
           description: messages from cursor
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /v1/topics/{partition}/stream:
+    get:
+      tags: [streams]
+      description: "Live durable topic WebSocket. Replays retained messages from the optional cursor, then follows committed appends; a cursor gap outside retention closes the stream."
+      parameters:
+        - name: partition
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: integer
+        - name: api_key
+          in: query
+          schema:
+            type: string
+      responses:
+        '101':
+          description: durable topic WebSocket upgrade
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /v1/vector/upsert:
     post:
       tags: [index]

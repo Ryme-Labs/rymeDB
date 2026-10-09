@@ -728,6 +728,12 @@ pub struct BroadcastStreamQuery {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct DurableStreamQuery {
+    pub from: Option<u64>,
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct QueryStreamQuery {
     pub table: String,
     pub limit: Option<usize>,
@@ -1462,6 +1468,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/broadcast/:channel", get(broadcast_stream))
         .route("/v1/topics/append", post(durable_append))
         .route("/v1/topics/read", get(durable_read))
+        .route("/v1/topics/:partition/stream", get(durable_stream))
         .route("/v1/vector/upsert", post(vector_upsert))
         .route("/v1/vector/search", post(vector_search))
         .route("/v1/vector/ann-search", post(vector_ann_search))
@@ -4328,6 +4335,140 @@ async fn forward_broadcast(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(_) => break,
+                }
+            }
+            next = incoming.next() => {
+                match next {
+                    Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
+                        if !queue_realtime_message(
+                            &outgoing,
+                            axum::extract::ws::Message::Pong(payload),
+                        ) {
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+    }
+}
+
+async fn durable_stream(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(partition): Path<String>,
+    Query(query): Query<DurableStreamQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let principal = match state.principal_with_query(&headers, query.api_key.as_deref()) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
+    if partition.is_empty() || partition.contains('\0') || partition.len() > 256 {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("partition")));
+    }
+    if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
+        return error_response(e);
+    }
+    let connection = match open_realtime_connection(&state, &principal.tenant) {
+        Ok(connection) => connection,
+        Err(e) => return error_response(e),
+    };
+    let realtime = state.realtime.clone();
+    let tenant = principal.tenant.clone();
+    let qos = state.qos.clone();
+    let from = query.from.unwrap_or(0);
+    upgrade.on_upgrade(move |socket| async move {
+        let _connection = connection;
+        forward_durable_topic(socket, realtime, qos, &tenant, &partition, from).await;
+    })
+}
+
+fn durable_message_text(message: &ryme_realtime::DurableMsg) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "partition": message.partition,
+        "cursor": message.cursor,
+        "key": String::from_utf8_lossy(&message.key),
+        "value": String::from_utf8_lossy(&message.value),
+        "commit_ts": message.commit_ts,
+    }))
+    .unwrap_or_else(|_| String::from("{}"))
+}
+
+fn queue_durable_message(
+    outgoing: &RealtimeOutgoing,
+    qos: &Arc<Mutex<QosRegistry>>,
+    tenant: &str,
+    message: &ryme_realtime::DurableMsg,
+) -> bool {
+    let text = durable_message_text(message);
+    stream_realtime_event(qos, tenant, text.len() as u64)
+        && queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+}
+
+async fn forward_durable_topic(
+    socket: axum::extract::ws::WebSocket,
+    realtime: Realtime,
+    qos: Arc<Mutex<QosRegistry>>,
+    tenant: &str,
+    partition: &str,
+    from: u64,
+) {
+    let mut receiver = realtime.durable_subscribe(tenant, partition);
+    let replayed = realtime.durable_read(tenant, partition, from, 1000);
+    let (sender, mut incoming) = socket.split();
+    let outgoing = start_realtime_writer(sender);
+    let mut next_cursor = from;
+    for message in &replayed {
+        next_cursor = next_cursor.max(message.cursor.saturating_add(1));
+        if !queue_durable_message(&outgoing, &qos, tenant, message) {
+            return;
+        }
+    }
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if !queue_realtime_message(
+                    &outgoing,
+                    axum::extract::ws::Message::Ping(Vec::new()),
+                ) {
+                    break;
+                }
+            }
+            message = receiver.recv() => {
+                match message {
+                    Ok(message) => {
+                        if message.cursor < next_cursor {
+                            continue;
+                        }
+                        next_cursor = message.cursor.saturating_add(1);
+                        if !queue_durable_message(&outgoing, &qos, tenant, &message) {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let recovered = realtime.durable_read(tenant, partition, next_cursor, 1000);
+                        if recovered.first().map(|message| message.cursor > next_cursor).unwrap_or(false) {
+                            break;
+                        }
+                        for message in recovered {
+                            if message.cursor < next_cursor {
+                                continue;
+                            }
+                            next_cursor = message.cursor.saturating_add(1);
+                            if !queue_durable_message(&outgoing, &qos, tenant, &message) {
+                                return;
+                            }
+                        }
+                    }
                     Err(_) => break,
                 }
             }

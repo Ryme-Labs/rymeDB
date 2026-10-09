@@ -155,16 +155,19 @@ until the socket closes or you send SIGINT.
 
 - **Java** (`sdks/java`): the dependency-free `RymeClient` covers HTTP and
   Java 17 WebSocket subscriptions through `subscribeTable`, `subscribeQuery`,
-  and `subscribeBroadcast`; callbacks receive complete JSON text frames.
+  `subscribeBroadcast`, and `subscribeDurableTopic`; callbacks receive
+  complete JSON text frames.
 - **JS** (`sdks/js/src/index.ts`): `subscribeTable(base, table, onMessage,
   {apiKey?})`
   and `subscribeQuery(base, table, onMessage, {apiKey?, limit?})`, plus
-  `subscribeBroadcast(base, channel, onMessage, {apiKey?})`, all returning
-  `{ready, close}`. `onMessage` receives parsed `ChangeRecord` /
-  `QueryMessage` / `BroadcastRecord` objects.
+  `subscribeBroadcast(base, channel, onMessage, {apiKey?})` and
+  `subscribeDurableTopic(base, partition, onMessage, {apiKey?, from?})`, all
+  returning `{ready, close}`. `onMessage` receives parsed `ChangeRecord` /
+  `QueryMessage` / `BroadcastRecord` / `DurableTopicMessage` objects.
 - **Rust** (`sdks/rust`): `RymeClient` exposes `subscribe_table`,
-  `subscribe_query`, and `subscribe_broadcast`; `RealtimeSubscription::recv`
-  handles ping/pong while returning complete JSON text frames.
+  `subscribe_query`, `subscribe_broadcast`, and
+  `subscribe_durable_topic`; `RealtimeSubscription::recv` handles ping/pong
+  while returning complete JSON text frames.
 
 ## `GET /v1/broadcast/<channel>` — broadcast subscribe
 
@@ -195,6 +198,13 @@ cursor are atomically persisted in the server data directory (`topics.json`)
 after each append, so retained messages survive a process restart. The file
 is restricted to the server account on Unix; topic retention remains bounded
 to prevent an unbounded restart snapshot.
+
+`GET /v1/topics/<partition>/stream?from=<cursor>` upgrades to a WebSocket.
+It replays retained messages at or after `from`, then follows new committed
+appends. The same cursor is emitted in every frame, and the connection uses
+the standard heartbeat, QoS accounting, bounded outgoing queue, and lag
+recovery behavior; a cursor gap outside retention closes the stream so a
+client cannot silently lose messages.
 
 In cluster mode, appends are accepted only by the current Raft leader and are
 committed through the durable Raft log before the cursor is returned. Every

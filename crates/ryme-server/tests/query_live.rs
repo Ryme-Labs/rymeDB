@@ -301,6 +301,52 @@ async fn live_broadcast_stream_receives_posts() {
 }
 
 #[tokio::test]
+async fn live_durable_topic_stream_replays_and_follows() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root =
+        std::env::temp_dir().join(format!("ryme-topic-stream-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (key, value) in [("k1", "one"), ("k2", "two")] {
+        let body = format!(
+            "{{\"partition\":\"chat\",\"key\":\"{key}\",\"value\":\"{value}\",\"retention\":16}}"
+        );
+        let (status, _) = http_request(http, "POST /v1/topics/append", body.as_bytes()).await;
+        assert_eq!(status, 200);
+    }
+    let url = format!("ws://{http}/v1/topics/chat/stream?from=0&api_key={KEY}");
+    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    assert_eq!(response.status(), 101);
+    let first = next_text(&mut stream).await;
+    let second = next_text(&mut stream).await;
+    assert_eq!(first.get("cursor").and_then(|value| value.as_u64()), Some(0));
+    assert_eq!(second.get("cursor").and_then(|value| value.as_u64()), Some(1));
+    assert_eq!(second.get("value").and_then(|value| value.as_str()), Some("two"));
+    let body = br#"{"partition":"chat","key":"k3","value":"three","retention":16}"#;
+    let (status, _) = http_request(http, "POST /v1/topics/append", body).await;
+    assert_eq!(status, 200);
+    let live = next_text(&mut stream).await;
+    assert_eq!(live.get("cursor").and_then(|value| value.as_u64()), Some(2));
+    assert_eq!(live.get("value").and_then(|value| value.as_str()), Some("three"));
+    stream.close(None).await.unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn live_cdc_stream_resumes_from_commit() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root =

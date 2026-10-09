@@ -57,6 +57,7 @@ pub struct Realtime {
     inner: Arc<Mutex<RealtimeInner>>,
     table_topics: Arc<Vec<Mutex<TableTopicShard>>>,
     broadcast_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>>>,
+    durable_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<DurableMsg>>>>>,
     broadcast_capacity: usize,
     capacity: usize,
     sequence: Arc<AtomicU64>,
@@ -151,6 +152,9 @@ impl Realtime {
             broadcast_topics: Arc::new(
                 (0..BROADCAST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             ),
+            durable_topics: Arc::new(
+                (0..BROADCAST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            ),
             broadcast_capacity: capacity,
             capacity,
             sequence: Arc::new(AtomicU64::new(0)),
@@ -175,6 +179,12 @@ impl Realtime {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         (hasher.finish() as usize) % self.table_topics.len()
+    }
+
+    fn durable_topic_shard(&self, key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.durable_topics.len()
     }
 
     pub fn publish(&self, event: NewChange) -> Result<u64> {
@@ -548,6 +558,19 @@ impl Realtime {
                 }
             }
         }
+        for shard in self.durable_topics.iter() {
+            if let Ok(mut topics) = shard.lock() {
+                let idle_topics: Vec<String> = topics
+                    .iter()
+                    .filter(|(_, sender)| sender.receiver_count() == 0)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in idle_topics {
+                    topics.remove(&key);
+                    removed += 1;
+                }
+            }
+        }
         removed
     }
 
@@ -676,7 +699,7 @@ impl Realtime {
             .map(|topic| topic.next_cursor)
             .unwrap_or(0);
         Self::durable_append_locked(
-            &mut inner, tenant, partition, cursor, key, value, commit_ts, retention,
+            self, &mut inner, tenant, partition, cursor, key, value, commit_ts, retention,
         )
     }
 
@@ -693,11 +716,12 @@ impl Realtime {
         let mut inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
         Self::durable_append_locked(
-            &mut inner, tenant, partition, cursor, key, value, commit_ts, retention,
+            self, &mut inner, tenant, partition, cursor, key, value, commit_ts, retention,
         )
     }
 
     fn durable_append_locked(
+        &self,
         inner: &mut RealtimeInner,
         tenant: &str,
         partition: &str,
@@ -707,12 +731,12 @@ impl Realtime {
         commit_ts: u64,
         retention: usize,
     ) -> Result<u64> {
-        let topic =
-            inner.durable.entry(durable_key(tenant, partition)).or_insert_with(|| DurableTopic {
-                messages: VecDeque::new(),
-                next_cursor: 0,
-                retention: retention.clamp(16, 100000),
-            });
+        let topic_key = durable_key(tenant, partition);
+        let topic = inner.durable.entry(topic_key.clone()).or_insert_with(|| DurableTopic {
+            messages: VecDeque::new(),
+            next_cursor: 0,
+            retention: retention.clamp(16, 100000),
+        });
         if cursor < topic.next_cursor {
             return Ok(cursor);
         }
@@ -721,17 +745,39 @@ impl Realtime {
         }
         topic.retention = retention.clamp(16, 100000);
         topic.next_cursor = topic.next_cursor.saturating_add(1);
-        topic.messages.push_back(DurableMsg {
-            partition: partition.to_string(),
-            cursor,
-            key,
-            value,
-            commit_ts,
-        });
+        let message =
+            DurableMsg { partition: partition.to_string(), cursor, key, value, commit_ts };
+        topic.messages.push_back(message.clone());
         while topic.messages.len() > topic.retention {
             topic.messages.pop_front();
         }
+        let shard = self.durable_topic_shard(&topic_key);
+        if let Some(topics) = self.durable_topics.get(shard) {
+            if let Ok(topics) = topics.lock() {
+                if let Some(sender) = topics.get(&topic_key) {
+                    let _ = sender.send(message);
+                }
+            }
+        }
         Ok(cursor)
+    }
+
+    pub fn durable_subscribe(
+        &self,
+        tenant: &str,
+        partition: &str,
+    ) -> broadcast::Receiver<DurableMsg> {
+        let key = durable_key(tenant, partition);
+        let shard = self.durable_topic_shard(&key);
+        let Some(topics) = self.durable_topics.get(shard) else {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        };
+        let Ok(mut topics) = topics.lock() else {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        };
+        topics.entry(key).or_insert_with(|| broadcast::channel(self.capacity).0).subscribe()
     }
 
     pub fn durable_read(
@@ -1129,6 +1175,7 @@ mod tests {
     #[test]
     fn durable_cursor_resume() {
         let realtime = Realtime::new(64);
+        let mut live = realtime.durable_subscribe("t", "orders");
         let first =
             realtime.durable_append("t", "orders", b"k1".to_vec(), b"v1".to_vec(), 5, 16).unwrap();
         let second =
@@ -1140,6 +1187,8 @@ mod tests {
         assert_eq!(tail[0].key, b"k2".to_vec());
         let all = realtime.durable_read("t", "orders", 0, 10);
         assert_eq!(all.len(), 2);
+        assert_eq!(live.try_recv().unwrap().cursor, first);
+        assert_eq!(live.try_recv().unwrap().cursor, second);
     }
 
     #[test]

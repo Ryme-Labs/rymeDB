@@ -142,6 +142,82 @@ impl ResumableRealtimeSubscription {
     }
 }
 
+/// A durable topic subscription that reconnects from the next cursor after a disconnect.
+pub struct ResumableDurableTopicSubscription {
+    client: RymeClient,
+    partition: String,
+    cursor: Option<u64>,
+    stream: Option<RealtimeSubscription>,
+    reconnect_delay: Duration,
+    closed: bool,
+}
+
+impl ResumableDurableTopicSubscription {
+    const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+    const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+    const MAX_RECONNECT_ATTEMPTS: usize = 8;
+
+    pub async fn recv(&mut self) -> Result<Option<String>, ClientError> {
+        let mut attempts = 0;
+        loop {
+            if self.closed {
+                return Ok(None);
+            }
+            let result = match self.stream.as_mut() {
+                Some(stream) => stream.recv().await,
+                None => Err(ClientError::WebSocket(String::from("subscription is closed"))),
+            };
+            match result {
+                Ok(Some(text)) => {
+                    self.update_cursor(&text);
+                    return Ok(Some(text));
+                }
+                Ok(None) | Err(_) => {}
+            }
+            self.stream.take();
+            attempts += 1;
+            if attempts > Self::MAX_RECONNECT_ATTEMPTS {
+                return Err(ClientError::WebSocket(String::from("topic stream closed")));
+            }
+            tokio::time::sleep(self.reconnect_delay).await;
+            if self.closed {
+                return Ok(None);
+            }
+            match self.client.subscribe_durable_topic(&self.partition, self.cursor).await {
+                Ok(stream) => {
+                    self.stream = Some(stream);
+                    self.reconnect_delay = Self::INITIAL_RECONNECT_DELAY;
+                    attempts = 0;
+                }
+                Err(error) => {
+                    if attempts >= Self::MAX_RECONNECT_ATTEMPTS {
+                        return Err(error);
+                    }
+                    self.reconnect_delay =
+                        (self.reconnect_delay * 2).min(Self::MAX_RECONNECT_DELAY);
+                }
+            }
+        }
+    }
+
+    fn update_cursor(&mut self, text: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return };
+        let Some(cursor) = value.get("cursor").and_then(serde_json::Value::as_u64) else {
+            return;
+        };
+        let next = cursor.saturating_add(1);
+        self.cursor = Some(self.cursor.map_or(next, |current| current.max(next)));
+    }
+
+    pub async fn close(mut self) -> Result<(), ClientError> {
+        self.closed = true;
+        match self.stream.take() {
+            Some(stream) => stream.close().await,
+            None => Ok(()),
+        }
+    }
+}
+
 impl RymeClient {
     pub fn new(base: String, api_key: String) -> Self {
         Self { base, api_key, http: reqwest::Client::new() }
@@ -268,6 +344,41 @@ impl RymeClient {
             Vec::new(),
         )
         .await
+    }
+
+    pub async fn subscribe_durable_topic(
+        &self,
+        partition: &str,
+        from: Option<u64>,
+    ) -> Result<RealtimeSubscription, ClientError> {
+        let mut params = Vec::new();
+        if let Some(from) = from {
+            params.push((String::from("from"), from.to_string()));
+        }
+        self.subscribe(
+            &format!(
+                "/v1/topics/{}/stream",
+                utf8_percent_encode(partition, NON_ALPHANUMERIC)
+            ),
+            params,
+        )
+        .await
+    }
+
+    pub async fn subscribe_durable_topic_resumable(
+        &self,
+        partition: &str,
+        from: Option<u64>,
+    ) -> Result<ResumableDurableTopicSubscription, ClientError> {
+        let stream = self.subscribe_durable_topic(partition, from).await?;
+        Ok(ResumableDurableTopicSubscription {
+            client: self.clone(),
+            partition: partition.to_string(),
+            cursor: from,
+            stream: Some(stream),
+            reconnect_delay: ResumableDurableTopicSubscription::INITIAL_RECONNECT_DELAY,
+            closed: false,
+        })
     }
 
     pub async fn subscribe_query(

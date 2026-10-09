@@ -394,6 +394,14 @@ public final class RymeClient {
         return subscribe("/v1/broadcast/" + segment(channel), List.of(), onMessage);
     }
 
+    /** Subscribe to retained and newly committed durable topic messages. */
+    public CompletableFuture<WebSocket> subscribeDurableTopic(String partition, Long from,
+                                                               Consumer<String> onMessage) {
+        List<String> params = new ArrayList<>();
+        if (from != null) params.add("from=" + from);
+        return subscribe("/v1/topics/" + segment(partition) + "/stream", params, onMessage);
+    }
+
     /** Subscribe to a live query snapshot/update stream. */
     public CompletableFuture<WebSocket> subscribeQuery(String table, String branch, Integer limit,
                                                         Consumer<String> onMessage) {

@@ -652,6 +652,14 @@ export interface BroadcastRecord {
   sequence: number;
 }
 
+export interface DurableTopicMessage {
+  partition: string;
+  cursor: number;
+  key: string;
+  value: string;
+  commit_ts: number;
+}
+
 export interface QueryRow {
   pk: string;
   value: string;
@@ -712,6 +720,27 @@ export function subscribeBroadcast(
   const query = `/v1/broadcast/${encodeURIComponent(channel)}`;
   return openSocket(base, query, options, (data) => {
     onMessage(JSON.parse(data) as BroadcastRecord);
+  });
+}
+
+export function subscribeDurableTopic(
+  base: string,
+  partition: string,
+  onMessage: (message: DurableTopicMessage) => void,
+  options?: SubscribeOptions,
+): Subscription {
+  let cursor = options?.from;
+  const query = () => {
+    let path = `/v1/topics/${encodeURIComponent(partition)}/stream`;
+    if (cursor !== undefined) path += `?from=${cursor}`;
+    return path;
+  };
+  return openSocket(base, query, { ...options, reconnect: options?.reconnect ?? true }, (data) => {
+    const message = JSON.parse(data) as DurableTopicMessage;
+    if (typeof message.cursor === "number" && Number.isSafeInteger(message.cursor)) {
+      cursor = Math.max(cursor ?? 0, message.cursor + 1);
+    }
+    onMessage(message);
   });
 }
 
