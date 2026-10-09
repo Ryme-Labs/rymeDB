@@ -18,6 +18,10 @@ pub enum Statement {
         table: String,
         column: ColumnDefinition,
     },
+    AlterTableDropColumn {
+        table: String,
+        column: String,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -439,6 +443,7 @@ impl Statement {
         match self {
             Self::CreateTable { table, .. }
             | Self::AlterTableAddColumn { table, .. }
+            | Self::AlterTableDropColumn { table, .. }
             | Self::CreateIndex { table, .. }
             | Self::Insert { table, .. }
             | Self::InsertRow { table, .. }
@@ -498,6 +503,19 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(2)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table")))?;
+    if let Some(drop_pos) = tokens.iter().position(|token| token.eq_ignore_ascii_case("DROP")) {
+        let column_pos =
+            if tokens.get(drop_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
+                drop_pos + 2
+            } else {
+                drop_pos + 1
+            };
+        let column = tokens
+            .get(column_pos)
+            .map(|value| unquote(value))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
+        return Ok(Statement::AlterTableDropColumn { table, column });
+    }
     let add_pos = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("ADD"))
@@ -1885,6 +1903,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         }
         Statement::AlterTableAddColumn { table, column } => {
             format!("ddl alter_table({table}) add_column({})", column.name)
+        }
+        Statement::AlterTableDropColumn { table, column } => {
+            format!("ddl alter_table({table}) drop_column({column})")
         }
         Statement::CreateIndex { name, table, field, column, unique } => {
             let field = column.as_deref().unwrap_or(match field {
@@ -3294,6 +3315,83 @@ where
         Ok(())
     }
 
+    async fn alter_table_drop_column(&self, table: String, column: String) -> Result<()> {
+        self.reject_if_read_only()?;
+        let existing = self
+            .catalog
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        let dropped = existing
+            .iter()
+            .find(|definition| definition.name.eq_ignore_ascii_case(&column))
+            .cloned()
+            .ok_or_else(|| RymeError::NotFound(String::from("column")))?;
+        if dropped.primary_key {
+            return Err(RymeError::InvalidArgument(String::from(
+                "dropping a primary key column is not supported",
+            )));
+        }
+
+        let rows = self.scan_all_rows(&table)?;
+        let mut updates = Vec::with_capacity(rows.len());
+        for (pk, before) in rows {
+            let serde_json::Value::Object(mut object) = serde_json::from_slice(&before)
+                .map_err(|_| RymeError::InvalidArgument(String::from("schema row")))?
+            else {
+                return Err(RymeError::InvalidArgument(String::from("schema row")));
+            };
+            if let Some(actual_name) =
+                object.keys().find(|name| name.eq_ignore_ascii_case(&column)).cloned()
+            {
+                object.remove(&actual_name);
+            }
+            let after = serde_json::to_vec(&serde_json::Value::Object(object))
+                .map_err(|error| RymeError::Internal(error.to_string()))?;
+            updates.push((pk, before, after));
+        }
+
+        if !updates.is_empty() {
+            let mut txn = self.begin_with(self.isolation);
+            for (pk, _, after) in &updates {
+                self.manager.put(
+                    &mut txn,
+                    RecordKey::new(&self.tenant, &self.database, &table, pk),
+                    after.clone(),
+                );
+            }
+            self.manager.commit(txn).await?;
+        }
+        {
+            let mut catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
+            let definitions = catalog
+                .get_mut(&table)
+                .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+            definitions.retain(|definition| !definition.name.eq_ignore_ascii_case(&column));
+        }
+        {
+            let mut indexes =
+                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            if let Some(table_indexes) = indexes.get_mut(&table) {
+                let column_prefix = format!("{}->", column.to_ascii_lowercase());
+                table_indexes.retain(|state| {
+                    state.definition.column.as_deref().is_none_or(|indexed| {
+                        let indexed = indexed.to_ascii_lowercase();
+                        indexed != column.to_ascii_lowercase()
+                            && !indexed.starts_with(&column_prefix)
+                    })
+                });
+            }
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn ensure_table(&self, table: &str) {
         self.register_table(table.to_string(), Vec::new());
     }
@@ -3396,6 +3494,7 @@ where
                 self.register_table(table.clone(), columns.clone());
             }
             Statement::AlterTableAddColumn { .. } => {}
+            Statement::AlterTableDropColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
@@ -3417,6 +3516,10 @@ where
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
             Statement::AlterTableAddColumn { table, column } => {
                 self.alter_table_add_column(table, column).await?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterTableDropColumn { table, column } => {
+                self.alter_table_drop_column(table, column).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreateIndex { name, table, field, column, unique } => {
@@ -3973,6 +4076,7 @@ where
                 self.register_table(table.clone(), columns.clone());
             }
             Statement::AlterTableAddColumn { .. } => {}
+            Statement::AlterTableDropColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
@@ -3981,6 +4085,7 @@ where
             &statement,
             Statement::CreateTable { .. }
                 | Statement::AlterTableAddColumn { .. }
+                | Statement::AlterTableDropColumn { .. }
                 | Statement::CreateIndex { .. }
         );
         let result = match statement {
@@ -4095,6 +4200,10 @@ where
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
             Statement::AlterTableAddColumn { table, column } => {
                 self.alter_table_add_column(table, column).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterTableDropColumn { table, column } => {
+                self.alter_table_drop_column(table, column).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreateIndex { name, table, field, column, unique } => {
@@ -5510,6 +5619,61 @@ mod tests {
             .await
             .is_err());
         assert!(executor.catalog_columns("events").iter().all(|column| column.name != "note"));
+    }
+
+    #[tokio::test]
+    async fn alter_table_drop_column_removes_data_and_dependent_indexes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE events (id TEXT PRIMARY KEY, keep TEXT, obsolete TEXT UNIQUE)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO events (id, keep, obsolete) VALUES ('e1', 'hello', 'old')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX events_keep_idx ON events (keep)").unwrap())
+            .await
+            .unwrap();
+
+        executor.execute(parse("ALTER TABLE events DROP COLUMN obsolete").unwrap()).await.unwrap();
+
+        assert!(executor
+            .catalog_columns("events")
+            .iter()
+            .all(|column| !column.name.eq_ignore_ascii_case("obsolete")));
+        let indexes = executor.catalog_indexes("events");
+        assert!(indexes.iter().any(|index| index.name == "events_keep_idx"));
+        assert!(indexes.iter().all(|index| {
+            !index.column.as_deref().is_some_and(|column| column.eq_ignore_ascii_case("obsolete"))
+        }));
+        let result = executor
+            .execute(parse("SELECT keep FROM events WHERE id = 'e1'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"hello".to_vec()]])
+        );
+
+        executor
+            .execute(parse("INSERT INTO events (id, keep) VALUES ('e2', 'world')").unwrap())
+            .await
+            .unwrap();
+        assert!(executor
+            .execute(parse("ALTER TABLE events DROP COLUMN id").unwrap())
+            .await
+            .is_err());
+        assert!(executor
+            .catalog_columns("events")
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case("id")));
     }
 
     #[tokio::test]

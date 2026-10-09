@@ -51,6 +51,8 @@ All notable changes to rymeDB are recorded here. Format follows
   named indexes and reject duplicate inserts and updates.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
   preserves nullability/identity metadata, and persists the updated schema.
+- `ALTER TABLE ... DROP COLUMN` now removes the field from durable JSON rows,
+  cleans dependent named indexes, and persists the updated schema.
 - SQL aggregate parsing now requires function-call parentheses, so columns named
   `count`, `sum`, `avg`, `min`, or `max` remain valid projections.
 - Aggregates, grouping, and key joins now page through all visible rows instead
