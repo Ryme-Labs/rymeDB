@@ -28,6 +28,7 @@ pub struct RespGateway<B = TxnManager> {
     branch: String,
     authenticator: Option<RespAuthenticator>,
     realtime: Option<Realtime>,
+    realtime_replicator: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     qos: Option<Arc<Mutex<QosRegistry>>>,
     metering: Option<Arc<Mutex<MeterRegistry>>>,
     latency: Option<LatencyWindow>,
@@ -74,6 +75,16 @@ struct PubSubMessage {
 struct ClusterPubSubMessage {
     channel: Vec<u8>,
     payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterPubSubBroadcast {
+    tenant: String,
+    channel: String,
+    from: String,
+    payload: serde_json::Value,
+    commit_ts: u64,
+    sequence: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +222,7 @@ impl RespGateway<TxnManager> {
             branch: String::from("main"),
             authenticator: None,
             realtime: None,
+            realtime_replicator: None,
             qos: None,
             metering: None,
             latency: None,
@@ -232,6 +244,7 @@ impl RespGateway<TxnManager> {
             branch: String::from("main"),
             authenticator: None,
             realtime: None,
+            realtime_replicator: None,
             qos: None,
             metering: None,
             latency: None,
@@ -258,6 +271,7 @@ where
             branch: String::from("main"),
             authenticator: None,
             realtime: None,
+            realtime_replicator: None,
             qos: None,
             metering: None,
             latency: None,
@@ -286,6 +300,14 @@ where
 
     pub fn with_realtime(mut self, realtime: Realtime) -> Self {
         self.realtime = Some(realtime);
+        self
+    }
+
+    pub fn with_realtime_replicator<F>(mut self, replicator: F) -> Self
+    where
+        F: Fn(Vec<u8>) + Send + Sync + 'static,
+    {
+        self.realtime_replicator = Some(Arc::new(replicator));
         self
     }
 
@@ -1266,10 +1288,25 @@ where
             &self.tenant,
             &resp_pubsub_topic(&self.database),
             String::new(),
-            message,
+            message.clone(),
             0,
         ) {
-            Ok(_) => encode_integer(delivered as i64),
+            Ok(sequence) => {
+                if let Some(replicator) = &self.realtime_replicator {
+                    let envelope = ClusterPubSubBroadcast {
+                        tenant: self.tenant.clone(),
+                        channel: resp_pubsub_topic(&self.database),
+                        from: String::new(),
+                        payload: message,
+                        commit_ts: 0,
+                        sequence,
+                    };
+                    if let Ok(payload) = serde_json::to_vec(&envelope) {
+                        replicator(payload);
+                    }
+                }
+                encode_integer(delivered as i64)
+            }
             Err(error) => encode_error(error.to_string()),
         }
     }

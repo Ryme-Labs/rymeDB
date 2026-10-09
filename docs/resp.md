@@ -27,9 +27,10 @@ pins every row):
 
 When the gateway has realtime enabled, RESP Pub/Sub is bridged through a
 tenant/database-scoped realtime topic, so subscribers connected through
-different gateways in the same process receive `PUBLISH` messages. Without a
-realtime layer, the gateway retains its low-overhead process-local Pub/Sub
-path.
+different gateways in the same process receive `PUBLISH` messages. In a
+Raft-backed deployment, the leader also forwards the sequence-stamped event
+to peer gateways through the realtime fanout path. Without a realtime layer,
+the gateway retains its low-overhead process-local Pub/Sub path.
 
 Sorted sets order by score with lexicographic member tiebreak. Scores
 accept `inf`/`-inf`; `nan` is rejected. `ZRANGE` supports index ranges

@@ -1372,6 +1372,16 @@ impl Node {
             return Err(RymeError::Unavailable(String::from("not leader")));
         }
         self.apply_realtime(payload.clone())?;
+        self.fanout_realtime_peers(payload).await
+    }
+
+    pub async fn fanout_realtime_peers(self: &Arc<Self>, payload: Vec<u8>) -> Result<()> {
+        if payload.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("realtime")));
+        }
+        if !self.is_leader().await {
+            return Err(RymeError::Unavailable(String::from("not leader")));
+        }
         let peers = self.member_pools().await;
         for (_, pool) in peers {
             let payload = payload.clone();

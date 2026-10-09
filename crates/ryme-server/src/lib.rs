@@ -1832,11 +1832,19 @@ fn spawn_gateways(
         state.database.clone(),
         state.backend.clone(),
     );
+    let resp_node = state.raft_node();
     if let Some(authenticator) = resp_authenticator(&state) {
         resp = resp.with_authenticator(move |user, password| authenticator(user, password));
     }
     let resp = resp
         .with_realtime(state.realtime.clone())
+        .with_realtime_replicator(move |payload| {
+            if let Some(node) = resp_node.clone() {
+                tokio::spawn(async move {
+                    let _ = node.fanout_realtime_peers(payload).await;
+                });
+            }
+        })
         .with_qos(state.qos.clone())
         .with_metering(state.metering.clone())
         .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
@@ -1928,8 +1936,16 @@ fn spawn_gateways(
             gateway =
                 gateway.with_authenticator(move |user, password| authenticator(user, password));
         }
+        let resp_tls_node = resp_tls_state.raft_node();
         let gateway = gateway
             .with_realtime(resp_tls_state.realtime.clone())
+            .with_realtime_replicator(move |payload| {
+                if let Some(node) = resp_tls_node.clone() {
+                    tokio::spawn(async move {
+                        let _ = node.fanout_realtime_peers(payload).await;
+                    });
+                }
+            })
             .with_qos(resp_tls_state.qos.clone())
             .with_metering(resp_tls_state.metering.clone())
             .with_observe(
