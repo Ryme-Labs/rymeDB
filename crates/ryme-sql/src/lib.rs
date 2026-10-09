@@ -844,6 +844,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         "UPSERT" => parse_upsert(&tokens),
         "INSERT" => parse_insert(&tokens, input),
         "SELECT" => parse_select(&tokens, input),
+        "WITH" => parse_with(input),
         "UPDATE" => parse_update(&tokens, input),
         "DELETE" => parse_delete(&tokens, input),
         "COPY" => parse_copy(&tokens),
@@ -853,7 +854,9 @@ pub fn parse(input: &str) -> Result<Statement> {
     if is_distinct {
         statement = prepare_distinct(statement);
     }
-    if tokens.iter().any(|token| token.eq_ignore_ascii_case("RETURNING")) {
+    if tokens.iter().any(|token| token.eq_ignore_ascii_case("RETURNING"))
+        && !matches!(statement, Statement::Returning { .. })
+    {
         let fields = parse_returning_fields(&tokens)?;
         if statement.is_write() && !matches!(statement, Statement::CopyFrom { .. }) {
             return Ok(Statement::Returning { statement: Box::new(statement), fields });
@@ -1458,6 +1461,172 @@ fn parse_named_table_constraints(raw: &str) -> Result<Vec<TableConstraint>> {
         }
     }
     Ok(constraints)
+}
+
+fn parse_with(raw: &str) -> Result<Statement> {
+    let with_offset = find_sql_keyword(raw, "WITH", 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("with clause")))?;
+    let cte_start = with_offset + "WITH".len();
+    if raw[cte_start..]
+        .trim_start()
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RECURSIVE"))
+    {
+        return Err(RymeError::InvalidArgument(String::from("recursive CTEs are not supported")));
+    }
+    let as_offset = find_sql_keyword(raw, "AS", cte_start)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
+    let cte_name = raw[cte_start..as_offset].trim();
+    if cte_name.is_empty() || tokenize(cte_name).len() != 1 {
+        return Err(RymeError::InvalidArgument(String::from("with name")));
+    }
+    let cte_name = unquote(cte_name);
+    let open = raw[as_offset + "AS".len()..]
+        .find('(')
+        .map(|offset| as_offset + "AS".len() + offset)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
+    let close = matching_paren(raw, open)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
+    let query = parse(raw[open + 1..close].trim())?;
+    let body_sql = raw[close + 1..].trim();
+    if body_sql.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("with body")));
+    }
+    let body = parse(body_sql)?;
+    rewrite_simple_cte(query, body, &cte_name)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("unsupported CTE shape")))
+}
+
+fn cte_source(statement: Statement) -> Option<(String, Vec<Predicate>)> {
+    match statement {
+        Statement::SelectScan { table, filter, .. } => Some((table, filter)),
+        Statement::SelectByKey { table, pk } => Some((
+            table,
+            vec![Predicate {
+                field: Field::Key,
+                column: None,
+                op: Cmp::Eq,
+                operand: pk,
+                operands: Vec::new(),
+                alternatives: Vec::new(),
+            }],
+        )),
+        _ => None,
+    }
+}
+
+fn rewrite_simple_cte(query: Statement, body: Statement, cte_name: &str) -> Option<Statement> {
+    let (source_table, source_filter) = cte_source(query)?;
+    match body {
+        Statement::Returning { statement, fields } => rewrite_simple_cte(
+            Statement::SelectScan {
+                table: source_table,
+                limit: 100,
+                offset: 0,
+                order: Order::default(),
+                filter: source_filter,
+            },
+            *statement,
+            cte_name,
+        )
+        .map(|statement| Statement::Returning { statement: Box::new(statement), fields }),
+        Statement::SelectByKey { table, pk } if table.eq_ignore_ascii_case(cte_name) => {
+            let mut filter = source_filter;
+            filter.push(Predicate {
+                field: Field::Key,
+                column: None,
+                op: Cmp::Eq,
+                operand: pk,
+                operands: Vec::new(),
+                alternatives: Vec::new(),
+            });
+            Some(Statement::SelectScan {
+                table: source_table,
+                limit: 100,
+                offset: 0,
+                order: Order::default(),
+                filter,
+            })
+        }
+        Statement::SelectScan { table, limit, offset, order, filter: body_filter }
+            if table.eq_ignore_ascii_case(cte_name) =>
+        {
+            let mut filter = source_filter;
+            filter.extend(body_filter);
+            Some(Statement::SelectScan { table: source_table, limit, offset, order, filter })
+        }
+        Statement::SelectColumns { table, columns, limit, offset, order, filter }
+            if table.eq_ignore_ascii_case(cte_name) =>
+        {
+            let mut combined = source_filter;
+            combined.extend(filter);
+            Some(Statement::SelectColumns {
+                table: source_table,
+                columns,
+                limit,
+                offset,
+                order,
+                filter: combined,
+            })
+        }
+        Statement::Aggregate { table, func, field, column, filter }
+            if table.eq_ignore_ascii_case(cte_name) =>
+        {
+            let mut combined = source_filter;
+            combined.extend(filter);
+            Some(Statement::Aggregate {
+                table: source_table,
+                func,
+                field,
+                column,
+                filter: combined,
+            })
+        }
+        Statement::GroupBy { table, select, group, group_column, filter, limit, offset, order }
+            if table.eq_ignore_ascii_case(cte_name) =>
+        {
+            let mut combined = source_filter;
+            combined.extend(filter);
+            Some(Statement::GroupBy {
+                table: source_table,
+                select,
+                group,
+                group_column,
+                filter: combined,
+                limit,
+                offset,
+                order,
+            })
+        }
+        Statement::InsertSelect {
+            table,
+            columns,
+            source_table: body_source,
+            source_columns,
+            filter,
+            upsert,
+            on_conflict_do_nothing,
+            conflict_target,
+            conflict_update,
+            conflict_filter,
+        } if body_source.eq_ignore_ascii_case(cte_name) => {
+            let mut combined = source_filter;
+            combined.extend(filter);
+            Some(Statement::InsertSelect {
+                table,
+                columns,
+                source_table,
+                source_columns,
+                filter: combined,
+                upsert,
+                on_conflict_do_nothing,
+                conflict_target,
+                conflict_update,
+                conflict_filter,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -10320,6 +10489,55 @@ mod tests {
         assert!(matches!(
             executor.execute(parse("SELECT * FROM archive KEY '2'").unwrap()).await.unwrap(),
             QueryResult::Rows { rows } if rows.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn simple_ctes_feed_selects_and_insert_selects() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE accounts (id TEXT PRIMARY KEY, status TEXT, score INTEGER)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE TABLE archive (id TEXT PRIMARY KEY, score INTEGER)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO accounts (id, status, score) VALUES ('1', 'active', 4), ('2', 'inactive', 9), ('3', 'active', 1)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let selected = executor
+            .execute(
+                parse("WITH active AS (SELECT * FROM accounts WHERE status = 'active') SELECT id, score FROM active WHERE score > 1")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            selected,
+            QueryResult::Table { rows, .. }
+                if rows == vec![vec![b"1".to_vec(), b"4".to_vec()]]
+        ));
+
+        executor
+            .execute(
+                parse("WITH active AS (SELECT * FROM accounts WHERE status = 'active') INSERT INTO archive (id, score) SELECT id, score FROM active WHERE score > 1 RETURNING id, score")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            executor.execute(parse("SELECT id, score FROM archive").unwrap()).await.unwrap(),
+            QueryResult::Table { rows, .. }
+                if rows == vec![vec![b"1".to_vec(), b"4".to_vec()]]
         ));
     }
 
