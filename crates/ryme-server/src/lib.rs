@@ -2494,7 +2494,8 @@ async fn sql_copy(
         .into_iter()
         .map(|row| (row.key.into_bytes(), row.value.into_bytes()))
         .collect();
-    match state.executor.bulk_upsert(request.table.clone(), rows.clone()).await {
+    let executor = state.executor.clone().with_tenant(principal.tenant.clone());
+    match executor.bulk_upsert(request.table.clone(), rows.clone()).await {
         Ok(count) => {
             record_meter(&state, Metric::WriteUnit, count as u64);
             note_range_write(&state, request.table.as_bytes(), count as u64);
@@ -2538,7 +2539,8 @@ async fn sql_explain(
         Some(params) => bind(&request.sql, &params),
         None => request.sql,
     };
-    match state.executor.explain(&sql) {
+    let executor = state.executor.clone().with_tenant(principal.tenant.clone());
+    match executor.explain(&sql) {
         Ok(plan) => (StatusCode::OK, Json(serde_json::json!({ "plan": plan }))).into_response(),
         Err(e) => error_response(e),
     }
@@ -2708,7 +2710,8 @@ async fn migrate_apply(
     if duplicate {
         return error_response(ryme_error::RymeError::Conflict(String::from("migration")));
     }
-    if let Err(e) = state.executor.execute(statement).await {
+    let executor = state.executor.clone().with_tenant(principal.tenant.clone());
+    if let Err(e) = executor.execute(statement).await {
         return error_response(e);
     }
     let mut control = match state.control.lock() {
@@ -4133,7 +4136,8 @@ async fn sql_exec(
     }
     let table_name = statement.table().to_string();
     let write_statement = statement.is_write();
-    let result = match state.executor.execute(statement).await {
+    let executor = state.executor.clone().with_tenant(principal.tenant.clone());
+    let result = match executor.execute(statement).await {
         Ok(QueryResult::Ok) => {
             (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
         }

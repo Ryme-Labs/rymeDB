@@ -1576,6 +1576,17 @@ where
         &self.tenant
     }
 
+    /// Returns an executor using a different tenant namespace while keeping
+    /// the shared backend, catalog, indexes, and policy settings.
+    pub fn with_tenant(mut self, tenant: String) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
+    pub fn set_tenant(&mut self, tenant: String) {
+        self.tenant = tenant;
+    }
+
     pub fn database_name(&self) -> &str {
         &self.database
     }

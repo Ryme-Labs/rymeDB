@@ -119,6 +119,34 @@ async fn tenants_share_no_presence_or_partitions() {
     let (status, body) = bearer_request(http, &beta, "GET /v1/presence/room", b"").await;
     assert_eq!(status, 200);
     assert_eq!(body.as_array().map(Vec::len), Some(0));
+
+    let copy = serde_json::json!({
+        "table": "sql_docs",
+        "rows": [{"key": "shared", "value": "alpha-row"}]
+    })
+    .to_string();
+    let (status, _) = bearer_request(http, &alpha, "POST /v1/sql/copy", copy.as_bytes()).await;
+    assert_eq!(status, 200);
+    let (status, body) = bearer_request(
+        http,
+        &alpha,
+        "POST /v1/sql",
+        br#"{"sql":"SELECT * FROM sql_docs KEY 'shared'"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body.get("pk").and_then(|v| v.as_str()), Some("shared"));
+    assert_eq!(body.get("value").and_then(|v| v.as_str()), Some("alpha-row"));
+    let (status, body) = bearer_request(
+        http,
+        &beta,
+        "POST /v1/sql",
+        br#"{"sql":"SELECT * FROM sql_docs KEY 'shared'"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body.get("pk"), None);
+
     let append = serde_json::json!({"partition": "orders", "key": "k1", "value": "v1"}).to_string();
     let (status, body) =
         bearer_request(http, &alpha, "POST /v1/topics/append", append.as_bytes()).await;
