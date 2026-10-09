@@ -2330,6 +2330,30 @@ fn admit_realtime(state: &SharedState, tenant: &str, messages: u64) -> ryme_erro
     }
 }
 
+struct RealtimeConnectionGuard {
+    qos: Arc<Mutex<QosRegistry>>,
+    tenant: String,
+}
+
+impl Drop for RealtimeConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut qos) = self.qos.lock() {
+            qos.connection_close(&self.tenant);
+        }
+    }
+}
+
+fn open_realtime_connection(
+    state: &SharedState,
+    tenant: &str,
+) -> ryme_error::Result<RealtimeConnectionGuard> {
+    let qos = state.qos.clone();
+    qos.lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("qos lock")))?
+        .connection_open(tenant, qos_now_nanos())?;
+    Ok(RealtimeConnectionGuard { qos, tenant: tenant.to_string() })
+}
+
 fn branch_snapshot(
     state: &SharedState,
     headers: &HeaderMap,
@@ -3930,10 +3954,15 @@ async fn broadcast_stream(
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
     }
+    let connection = match open_realtime_connection(&state, &principal.tenant) {
+        Ok(connection) => connection,
+        Err(e) => return error_response(e),
+    };
     let realtime = state.realtime.clone();
     let tenant = principal.tenant.clone();
     let qos = state.qos.clone();
     upgrade.on_upgrade(move |socket| async move {
+        let _connection = connection;
         forward_broadcast(socket, realtime, qos, &tenant, &channel).await;
     })
 }
@@ -5948,6 +5977,10 @@ async fn stream(
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
     }
+    let connection = match open_realtime_connection(&state, &principal.tenant) {
+        Ok(connection) => connection,
+        Err(e) => return error_response(e),
+    };
     let (branch, _, _) = match branch_snapshot_selected(
         &state,
         &headers,
@@ -5967,6 +6000,7 @@ async fn stream(
     let qos = state.qos.clone();
     let rls_tables = state.rls_tables.clone();
     upgrade.on_upgrade(move |socket| async move {
+        let _connection = connection;
         forward_changes(
             socket,
             realtime,
@@ -6161,6 +6195,10 @@ async fn query_stream(
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
     }
+    let connection = match open_realtime_connection(&state, &principal.tenant) {
+        Ok(connection) => connection,
+        Err(e) => return error_response(e),
+    };
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
     let (branch, branch_commit, storage_epoch) = match branch_snapshot_selected(
         &state,
@@ -6190,6 +6228,7 @@ async fn query_stream(
     let qos = state.qos.clone();
     let rls_tables = state.rls_tables.clone();
     upgrade.on_upgrade(move |socket| async move {
+        let _connection = connection;
         forward_query(
             socket,
             backend,

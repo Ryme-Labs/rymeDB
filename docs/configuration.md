@@ -43,6 +43,11 @@ runs on every boot.
 | `index_partitions` | usize | `4` | Range 1–64. Hash partitions for vector/text index spaces; writes route by id, reads fan out and merge. |
 | `replicated_tables` | string[] | `[]` | Non-empty requires `raft_listen` (selects the Hybrid backend). |
 
+Realtime WebSocket sessions also consume the authenticated tenant's QoS
+`max_connections` quota. The session is released automatically when the
+socket closes, while the node-level `max_connections` limit still protects
+the HTTP listener itself.
+
 ## `cluster`
 
 | Field | Type | Default | Notes |
