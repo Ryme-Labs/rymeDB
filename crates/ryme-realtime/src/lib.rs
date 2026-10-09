@@ -670,15 +670,57 @@ impl Realtime {
     ) -> Result<u64> {
         let mut inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
+        let cursor = inner
+            .durable
+            .get(&durable_key(tenant, partition))
+            .map(|topic| topic.next_cursor)
+            .unwrap_or(0);
+        Self::durable_append_locked(
+            &mut inner, tenant, partition, cursor, key, value, commit_ts, retention,
+        )
+    }
+
+    pub fn durable_append_at(
+        &self,
+        tenant: &str,
+        partition: &str,
+        cursor: u64,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        commit_ts: u64,
+        retention: usize,
+    ) -> Result<u64> {
+        let mut inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
+        Self::durable_append_locked(
+            &mut inner, tenant, partition, cursor, key, value, commit_ts, retention,
+        )
+    }
+
+    fn durable_append_locked(
+        inner: &mut RealtimeInner,
+        tenant: &str,
+        partition: &str,
+        cursor: u64,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        commit_ts: u64,
+        retention: usize,
+    ) -> Result<u64> {
         let topic =
             inner.durable.entry(durable_key(tenant, partition)).or_insert_with(|| DurableTopic {
                 messages: VecDeque::new(),
                 next_cursor: 0,
                 retention: retention.clamp(16, 100000),
             });
+        if cursor < topic.next_cursor {
+            return Ok(cursor);
+        }
+        if cursor > topic.next_cursor {
+            return Err(RymeError::Corrupt(String::from("durable topic cursor")));
+        }
         topic.retention = retention.clamp(16, 100000);
-        let cursor = topic.next_cursor;
-        topic.next_cursor += 1;
+        topic.next_cursor = topic.next_cursor.saturating_add(1);
         topic.messages.push_back(DurableMsg {
             partition: partition.to_string(),
             cursor,

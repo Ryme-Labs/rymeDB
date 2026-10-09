@@ -197,3 +197,7 @@ leader and applied to every live gateway with one shared expiry timestamp.
 Presence is intentionally ephemeral: a gateway that is down during a join or
 leave does not receive that event until the client sends its next heartbeat
 or leave, and presence is not replayed from the Raft log.
+
+Durable topic appends use the durable Raft path instead of the ephemeral mesh.
+The leader returns a cursor only after the entry reaches quorum and applies it;
+followers replay the entry and persist their bounded `topics.json` snapshot.

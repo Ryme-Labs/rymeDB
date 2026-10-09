@@ -444,7 +444,7 @@ pub struct SharedState {
     executor: Executor<BranchStorage>,
     rls_tables: HashMap<String, String>,
     realtime: Realtime,
-    durable_persist_lock: Arc<Mutex<()>>,
+    durable_persist_lock: Arc<tokio::sync::Mutex<()>>,
     migration_lock: Arc<tokio::sync::Mutex<()>>,
     keys: ApiKeyStore,
     jwt: Option<JwtVerifier>,
@@ -1187,7 +1187,7 @@ impl SharedState {
             executor,
             rls_tables: config.rls_tables.clone(),
             realtime,
-            durable_persist_lock: Arc::new(Mutex::new(())),
+            durable_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             migration_lock: Arc::new(tokio::sync::Mutex::new(())),
             keys,
             jwt,
@@ -1652,6 +1652,8 @@ pub async fn serve_cluster(
     install_cluster_range_replication(&state, &node)?;
     install_cluster_realtime_replication(&state, &node)?;
     install_cluster_presence_replication(&state, &node)?;
+    install_cluster_topic_replication(&state, &node)?;
+    node.replay_topics().await?;
     let mut tasks = node.spawn(raft_listener);
     tasks.extend(
         spawn_gateways(
@@ -4009,6 +4011,17 @@ enum ClusterPresence {
     },
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClusterTopicAppend {
+    tenant: String,
+    partition: String,
+    cursor: u64,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    commit_ts: u64,
+    retention: usize,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DurableAppendRequest {
     pub partition: String,
@@ -4368,11 +4381,35 @@ async fn durable_append(
     if let Err(e) = admit_write(&state, &principal.tenant, bytes) {
         return error_response(e);
     }
-    let _durable_persist_guard = match state.durable_persist_lock.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
+    let _durable_persist_guard = state.durable_persist_lock.lock().await;
     let commit = state.backend.latest_commit();
+    if let Some(node) = state.raft_node() {
+        if !node.is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let cursor = state.realtime.durable_cursor(&principal.tenant, &request.partition);
+        let event = ClusterTopicAppend {
+            tenant: principal.tenant.clone(),
+            partition: request.partition.clone(),
+            cursor,
+            key: request.key.into_bytes(),
+            value: request.value.into_bytes(),
+            commit_ts: commit,
+            retention: request.retention.unwrap_or(1024),
+        };
+        let payload = match serde_json::to_vec(&event) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return error_response(ryme_error::RymeError::Internal(error.to_string()))
+            }
+        };
+        return match node.propose_topic(payload).await {
+            Ok(_) => {
+                (StatusCode::OK, Json(serde_json::json!({ "cursor": cursor }))).into_response()
+            }
+            Err(error) => error_response(error),
+        };
+    }
     match state.realtime.durable_append(
         &principal.tenant,
         &request.partition,
@@ -6088,6 +6125,16 @@ fn install_cluster_presence_replication(
     node.set_presence_hook(hook)
 }
 
+fn install_cluster_topic_replication(
+    state: &SharedState,
+    node: &std::sync::Arc<Node>,
+) -> ryme_error::Result<()> {
+    let state = state.clone();
+    let hook: ryme_raft::net::MetadataHook =
+        Arc::new(move |payload| apply_replicated_topic(&state, payload));
+    node.set_topic_hook(hook)
+}
+
 fn apply_replicated_broadcast(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
     let event: ClusterBroadcast = serde_json::from_slice(payload)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("realtime event: {error}")))?;
@@ -6123,6 +6170,23 @@ fn apply_replicated_presence(state: &SharedState, payload: &[u8]) -> ryme_error:
             state.realtime.presence_leave(&tenant, &channel, &member).map(|_| ())
         }
     }
+}
+
+fn apply_replicated_topic(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
+    let event: ClusterTopicAppend = serde_json::from_slice(payload)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("topic event: {error}")))?;
+    state
+        .realtime
+        .durable_append_at(
+            &event.tenant,
+            &event.partition,
+            event.cursor,
+            event.key,
+            event.value,
+            event.commit_ts,
+            event.retention,
+        )
+        .and_then(|_| state.persist_durable_topics())
 }
 
 fn apply_replicated_ranges(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {

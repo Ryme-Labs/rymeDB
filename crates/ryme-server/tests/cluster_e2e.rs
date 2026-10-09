@@ -189,6 +189,31 @@ async fn wait_presence(https: &[std::net::SocketAddr], member: &str, expected: b
     }
 }
 
+async fn wait_topic(https: &[std::net::SocketAddr], cursor: u64, value: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut converged = true;
+        for http in https {
+            let (status, body) =
+                http_request(*http, "GET /v1/topics/read?partition=chat&from=0&limit=10", b"")
+                    .await;
+            let text = String::from_utf8_lossy(&body);
+            if status != 200
+                || !text.contains(&format!("\"cursor\":{cursor}"))
+                || !text.contains(&format!("\"value\":\"{value}\""))
+            {
+                converged = false;
+                break;
+            }
+        }
+        if converged {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "topic did not converge");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn cluster_write_failover_restart() {
     std::env::set_var("RYME_API_KEY", KEY);
@@ -526,6 +551,86 @@ async fn cluster_presence_reaches_every_gateway() {
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&response).contains("true"));
     wait_presence(&http, "ada", false).await;
+    for handle in handles {
+        handle.shutdown();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn cluster_durable_topics_replicate_in_cursor_order() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-cluster-topics-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut bound = Vec::new();
+    for _ in 0..3 {
+        bound.push(bind_node().await);
+    }
+    let mut pg = Vec::new();
+    let mut resp = Vec::new();
+    let mut http = Vec::new();
+    let mut raft = Vec::new();
+    for node in &bound {
+        pg.push(node.0.local_addr().unwrap());
+        resp.push(node.1.local_addr().unwrap());
+        http.push(node.2.local_addr().unwrap());
+        raft.push(node.3.local_addr().unwrap());
+    }
+    let mut handles = Vec::new();
+    for (index, (pg_listener, resp_listener, http_listener, raft_listener)) in
+        bound.drain(..).enumerate()
+    {
+        let config =
+            node_config(&root, index, pg[index], resp[index], http[index], raft[index], &raft);
+        handles.push(
+            ryme_server::serve_cluster(
+                config,
+                pg_listener,
+                resp_listener,
+                http_listener,
+                raft_listener,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let leader = wait_leader(&http, None).await;
+    let first = br#"{"partition":"chat","key":"message-1","value":"hello","retention":16}"#;
+    let (status, body) = http_request(http[leader], "POST /v1/topics/append", first).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains("\"cursor\":0"));
+    wait_topic(&http, 0, "hello").await;
+    let second = br#"{"partition":"chat","key":"message-2","value":"world","retention":16}"#;
+    let (status, body) = http_request(http[leader], "POST /v1/topics/append", second).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains("\"cursor\":1"));
+    wait_topic(&http, 1, "world").await;
+    let restarted = (leader + 1) % 3;
+    handles.remove(restarted).shutdown();
+    let config = node_config(
+        &root,
+        restarted,
+        pg[restarted],
+        resp[restarted],
+        http[restarted],
+        raft[restarted],
+        &raft,
+    );
+    let revived = ryme_server::serve_cluster(
+        config,
+        bind_addr(pg[restarted]).await,
+        bind_addr(resp[restarted]).await,
+        bind_addr(http[restarted]).await,
+        bind_addr(raft[restarted]).await,
+    )
+    .await
+    .unwrap();
+    wait_topic(&[http[restarted]], 1, "world").await;
+    revived.shutdown();
     for handle in handles {
         handle.shutdown();
     }

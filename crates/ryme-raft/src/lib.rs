@@ -178,6 +178,7 @@ pub enum ApplyPayload {
     Data { commit_ts: u64, writes: Vec<u8> },
     Conf { change: ConfChange },
     Metadata { payload: Vec<u8> },
+    Topic { payload: Vec<u8> },
 }
 
 pub fn encode_conf(members: &[crate::net::Member]) -> Result<Vec<u8>> {
@@ -201,6 +202,16 @@ pub fn encode_metadata(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn encode_topic(payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("topic")));
+    }
+    let mut out = Vec::with_capacity(payload.len() + 1);
+    out.push(3u8);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
 pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
     if input.first() == Some(&1u8) {
         let body = &input[1..];
@@ -218,6 +229,12 @@ pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
             return Err(RymeError::Corrupt(String::from("metadata")));
         }
         return Ok(ApplyPayload::Metadata { payload: input[1..].to_vec() });
+    }
+    if input.first() == Some(&3u8) {
+        if input.len() == 1 {
+            return Err(RymeError::Corrupt(String::from("topic")));
+        }
+        return Ok(ApplyPayload::Topic { payload: input[1..].to_vec() });
     }
     let (commit_ts, writes) = decode_applied(input)?;
     Ok(ApplyPayload::Data { commit_ts, writes })
@@ -534,5 +551,11 @@ mod tests {
             ApplyPayload::Metadata { payload: br#"[{"id":"r0"}]"#.to_vec() }
         );
         assert!(matches!(encode_metadata(&[]), Err(RymeError::InvalidArgument(_))));
+        let topic = encode_topic(b"event").unwrap();
+        assert_eq!(
+            decode_apply(&topic).unwrap(),
+            ApplyPayload::Topic { payload: b"event".to_vec() }
+        );
+        assert!(matches!(encode_topic(&[]), Err(RymeError::InvalidArgument(_))));
     }
 }

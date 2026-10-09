@@ -326,6 +326,11 @@ fn validate_apply_payload(input: &[u8]) -> Result<()> {
                 return Err(RymeError::Corrupt(String::from("metadata")));
             }
         }
+        ApplyPayload::Topic { payload } => {
+            if payload.is_empty() {
+                return Err(RymeError::Corrupt(String::from("topic")));
+            }
+        }
     }
     Ok(())
 }
@@ -444,6 +449,7 @@ pub struct Node {
     metadata_hook: MetadataHookSlot,
     realtime_hook: MetadataHookSlot,
     presence_hook: MetadataHookSlot,
+    topic_hook: MetadataHookSlot,
 }
 
 impl Node {
@@ -541,6 +547,7 @@ impl Node {
                 ApplyPayload::Metadata { payload } => {
                     metadata = Some(payload);
                 }
+                ApplyPayload::Topic { .. } => {}
             }
             applied = entry.index;
         }
@@ -594,6 +601,7 @@ impl Node {
             metadata_hook: MetadataHookSlot::default(),
             realtime_hook: MetadataHookSlot::default(),
             presence_hook: MetadataHookSlot::default(),
+            topic_hook: MetadataHookSlot::default(),
         });
         Ok(node)
     }
@@ -1040,6 +1048,9 @@ impl Node {
                 ApplyPayload::Metadata { payload } => {
                     self.apply_metadata(payload)?;
                 }
+                ApplyPayload::Topic { payload } => {
+                    self.apply_topic(payload)?;
+                }
             }
             self.inner.lock().await.applied = entry.index;
         }
@@ -1071,6 +1082,19 @@ impl Node {
             .0
             .lock()
             .map_err(|_| RymeError::Internal(String::from("realtime hook lock")))?
+            .clone();
+        if let Some(hook) = hook {
+            hook(&payload)?;
+        }
+        Ok(())
+    }
+
+    fn apply_topic(&self, payload: Vec<u8>) -> Result<()> {
+        let hook = self
+            .topic_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("topic hook lock")))?
             .clone();
         if let Some(hook) = hook {
             hook(&payload)?;
@@ -1309,6 +1333,13 @@ impl Node {
 
     pub async fn propose_metadata(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
         let encoded = crate::encode_metadata(&payload)?;
+        let index = self.propose_frame(encoded).await?;
+        self.wait_applied(index).await?;
+        Ok(index)
+    }
+
+    pub async fn propose_topic(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
+        let encoded = crate::encode_topic(&payload)?;
         let index = self.propose_frame(encoded).await?;
         self.wait_applied(index).await?;
         Ok(index)
@@ -1635,6 +1666,35 @@ impl Node {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("presence hook lock")))?;
         *registered = Some(hook);
+        Ok(())
+    }
+
+    pub fn set_topic_hook(&self, hook: MetadataHook) -> Result<()> {
+        let mut registered = self
+            .topic_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("topic hook lock")))?;
+        *registered = Some(hook);
+        Ok(())
+    }
+
+    pub async fn replay_topics(&self) -> Result<()> {
+        let payloads = {
+            let inner = self.inner.lock().await;
+            inner
+                .log
+                .iter()
+                .filter(|entry| entry.index <= inner.commit_index)
+                .filter_map(|entry| match decode_apply(&entry.payload) {
+                    Ok(ApplyPayload::Topic { payload }) => Some(payload),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for payload in payloads {
+            self.apply_topic(payload)?;
+        }
         Ok(())
     }
 

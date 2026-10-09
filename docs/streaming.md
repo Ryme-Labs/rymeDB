@@ -195,3 +195,8 @@ cursor are atomically persisted in the server data directory (`topics.json`)
 after each append, so retained messages survive a process restart. The file
 is restricted to the server account on Unix; topic retention remains bounded
 to prevent an unbounded restart snapshot.
+
+In cluster mode, appends are accepted only by the current Raft leader and are
+committed through the durable Raft log before the cursor is returned. Every
+gateway applies the same cursor-ordered append and persists its local topic
+snapshot, so reads converge after a gateway receives the committed entry.
