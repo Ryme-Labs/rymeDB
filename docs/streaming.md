@@ -43,8 +43,8 @@ administrative role). Each frame is a `ChangeRecord`
 - For exact reconnects, use `?from_sequence=<sequence>` from the last
   delivered `ChangeRecord`. This distinguishes multiple writes sharing one
   commit timestamp and uses the same retained ring for recovery. The JS,
-  Python, and Go SDKs expose this cursor as `fromSequence`, `from_sequence`,
-  and `SubscribeTableFromSequence` respectively.
+  The npm/TypeScript SDK exposes this cursor as `fromSequence`; Java and Rust
+  clients can pass `from_sequence` directly to the stream endpoint.
 - Send a Close frame (or just disconnect) to stop; the server breaks the
   forwarding loop on close.
 - Idle stream sessions receive a WebSocket ping every 30 seconds, and client
@@ -133,21 +133,16 @@ until the socket closes or you send SIGINT.
 
 ## SDKs
 
-- **Python** (`sdks/python/src/rymedb/__init__.py`):
-  `client.subscribe_table(table)` / `client.subscribe_query(table, limit)`
-  / `client.subscribe_broadcast(channel)` return an iterable `Subscription`
-  of parsed dicts; call `.close()` when done.
+- **Java** (`sdks/java`): the dependency-free `RymeClient` covers the HTTP
+  endpoints; use a WebSocket client for streaming subscriptions.
 - **JS** (`sdks/js/src/index.ts`): `subscribeTable(base, table, onMessage,
   {apiKey?})`
   and `subscribeQuery(base, table, onMessage, {apiKey?, limit?})`, plus
   `subscribeBroadcast(base, channel, onMessage, {apiKey?})`, all returning
   `{ready, close}`. `onMessage` receives parsed `ChangeRecord` /
   `QueryMessage` / `BroadcastRecord` objects.
-- **Go** (`sdks/go/subscribe.go`): `client.SubscribeTable(table)` /
-  `client.SubscribeQuery(table, limit)` / `client.SubscribeBroadcast(channel)`
-  return a `*Subscription`; decode each frame with `sub.Next(&record)` /
-  `sub.Next(&msg)` into `ChangeRecord` / `QueryMessage` / `BroadcastMessage`,
-  then `sub.Close()`.
+- **Rust** (`sdks/rust`): use the same authenticated stream URLs with a
+  WebSocket client and the crate's HTTP client for request/response APIs.
 
 ## `GET /v1/broadcast/<channel>` — broadcast subscribe
 

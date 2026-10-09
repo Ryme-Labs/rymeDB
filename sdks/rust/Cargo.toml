@@ -3,6 +3,9 @@ name = "rymedb-client"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "Async Rust client for the rymeDB HTTP API"
+repository = "https://github.com/Ryme-Labs/rymeDB"
+readme = "README.md"
 
 [workspace]
 

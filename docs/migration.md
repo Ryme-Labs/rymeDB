@@ -38,8 +38,9 @@ REST: `GET /rest/v1/:table?select=&key=eq.<id>&order=key.desc&limit=&offset=`,
 GraphQL: `POST /graphql` with `{ table(key: "k") }` or `{ table(limit: 100) }`.
 
 Realtime: `GET /v1/stream?table=` for CDC, `GET /v1/query-stream?table=`
-for snapshot plus updates. SDK helpers: JS `subscribeTable`/`subscribeQuery`,
-Python `subscribe_table`/`subscribe_query`, Go `SubscribeTable`/`SubscribeQuery`.
+for snapshot plus updates. The npm/TypeScript SDK exposes
+`subscribeTable`/`subscribeQuery`; Java and Rust clients can use the same
+HTTP/WebSocket endpoints directly.
 
 Auth accepts Supabase-style JWT claims (`sub`, `tenant`, `roles`, `exp`)
 where feasible; use separate issuers for app users versus operators.
@@ -122,8 +123,8 @@ histograms, OTel-style trace spans (`TraceSpan`/`TraceCollector`) and
   `ryme vector ann-search <table> <v,...> [--top-k N] [--ef N]`.
 - Full text: `POST /v1/text/index`, `POST /v1/text/search` (TF-IDF ranked),
   `DELETE /v1/text/:table/:id`. Lowercase alphanumeric tokenizer,
-  100k docs/space. SDKs: JS/Python/Go/Rust `vectorUpsert`/`vectorSearch`/
-  `textIndex`/`textSearch` (+ Swift/Kotlin/Dart/C# equivalents);
+  100k docs/space. The npm/TypeScript, Java, and Rust SDKs expose the vector
+  and text endpoints;
   CLI: `ryme vector ...`, `ryme text ...`.
 
 ## Application auth
