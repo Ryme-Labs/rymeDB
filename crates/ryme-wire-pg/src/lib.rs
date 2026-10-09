@@ -1444,6 +1444,30 @@ where
                     ),
                 ));
             }
+            for (foreign_index, foreign_key) in
+                executor.catalog_foreign_keys(&table).into_iter().enumerate()
+            {
+                let conkey = foreign_key
+                    .columns
+                    .iter()
+                    .filter_map(|column| {
+                        definitions
+                            .iter()
+                            .position(|definition| definition.name.eq_ignore_ascii_case(column))
+                            .map(|ordinal| ordinal + 1)
+                    })
+                    .collect::<Vec<_>>();
+                constraints.push((
+                    format!("{table_name}_fkey_{foreign_index}"),
+                    String::from("f"),
+                    relation_oid,
+                    0,
+                    format!(
+                        "{{{}}}",
+                        conkey.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+                    ),
+                ));
+            }
         }
         let rows: Vec<Vec<Vec<u8>>> = constraints
             .into_iter()

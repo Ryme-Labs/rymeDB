@@ -60,6 +60,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Column-level and table-level `CHECK` constraints now persist with schema
   snapshots and reject false rows across SQL writes, transactions, and bulk
   upserts while preserving PostgreSQL's NULL-as-unknown behavior.
+- Column-level and table-level `FOREIGN KEY ... REFERENCES` constraints now
+  persist with schema snapshots, validate inserts and updates, and protect
+  referenced rows from deletes across transactional write paths.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
   preserves nullability/identity metadata, and persists the updated schema.
 - `ALTER TABLE ... DROP COLUMN` now removes the field from durable JSON rows,

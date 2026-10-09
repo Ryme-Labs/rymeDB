@@ -18,6 +18,8 @@ pub enum Statement {
         #[serde(default)]
         checks: Vec<String>,
         #[serde(default)]
+        foreign_keys: Vec<ForeignKeyConstraint>,
+        #[serde(default)]
         if_not_exists: bool,
     },
     DropTable {
@@ -212,6 +214,14 @@ pub struct ColumnDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKeyConstraint {
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    #[serde(default)]
+    pub referenced_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDefinition {
     pub name: String,
     pub table: String,
@@ -231,6 +241,8 @@ pub struct SchemaSnapshot {
     pub indexes: Vec<IndexDefinition>,
     #[serde(default)]
     pub checks: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub foreign_keys: BTreeMap<String, Vec<ForeignKeyConstraint>>,
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -1076,8 +1088,15 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
     let if_not_exists =
         tokens.get(table_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
-    let (columns, unique_constraints, checks) = parse_table_definition(raw)?;
-    Ok(Statement::CreateTable { table, columns, unique_constraints, checks, if_not_exists })
+    let (columns, unique_constraints, checks, foreign_keys) = parse_table_definition(raw)?;
+    Ok(Statement::CreateTable {
+        table,
+        columns,
+        unique_constraints,
+        checks,
+        foreign_keys,
+        if_not_exists,
+    })
 }
 
 fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -1133,23 +1152,31 @@ fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
 }
 
 fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
-    parse_table_definition(raw).map(|(columns, _, _)| columns)
+    parse_table_definition(raw).map(|(columns, _, _, _)| columns)
 }
 
 fn parse_table_definition(
     raw: &str,
-) -> Result<(Vec<ColumnDefinition>, Vec<Vec<String>>, Vec<String>)> {
-    let Some(open) = raw.find('(') else { return Ok((Vec::new(), Vec::new(), Vec::new())) };
-    let Some(close) = raw.rfind(')') else { return Ok((Vec::new(), Vec::new(), Vec::new())) };
+) -> Result<(Vec<ColumnDefinition>, Vec<Vec<String>>, Vec<String>, Vec<ForeignKeyConstraint>)> {
+    let Some(open) = raw.find('(') else {
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    };
+    let Some(close) = raw.rfind(')') else {
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    };
     if close <= open {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     }
     let items = split_sql_items(&raw[open + 1..close]);
     let mut table_primary = Vec::new();
     let mut table_unique = Vec::new();
     let mut checks = Vec::new();
+    let mut foreign_keys = Vec::new();
     for item in &items {
         checks.extend(check_expressions(item));
+        if let Some(foreign_key) = parse_foreign_key(item)? {
+            foreign_keys.push(foreign_key);
+        }
         let words: Vec<&str> = item.split_whitespace().collect();
         let table_constraint = words.first().is_some_and(|word| {
             word.eq_ignore_ascii_case("PRIMARY")
@@ -1184,6 +1211,7 @@ fn parse_table_definition(
                 || words[0].eq_ignore_ascii_case("PRIMARY")
                 || words[0].eq_ignore_ascii_case("UNIQUE")
                 || words[0].eq_ignore_ascii_case("CHECK")
+                || words[0].eq_ignore_ascii_case("FOREIGN")
             {
                 return None;
             }
@@ -1255,7 +1283,64 @@ fn parse_table_definition(
         };
         column.unique = true;
     }
-    Ok((columns, composite_unique, checks))
+    Ok((columns, composite_unique, checks, foreign_keys))
+}
+
+fn parse_foreign_key(item: &str) -> Result<Option<ForeignKeyConstraint>> {
+    let upper = item.to_ascii_uppercase();
+    let Some(references) = upper.find("REFERENCES") else { return Ok(None) };
+    let before = &item[..references];
+    let before_upper = &upper[..references];
+    let (columns, target_start) = if let Some(foreign_key) = before_upper.find("FOREIGN KEY") {
+        let open = before[foreign_key + "FOREIGN KEY".len()..]
+            .find('(')
+            .map(|offset| foreign_key + "FOREIGN KEY".len() + offset)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("foreign key columns")))?;
+        let close = matching_paren(item, open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("foreign key columns")))?;
+        let columns = split_sql_items(&item[open + 1..close])
+            .into_iter()
+            .map(|column| unquote(column.trim()))
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("foreign key columns")));
+        }
+        (columns, references)
+    } else {
+        let local = item
+            .split_whitespace()
+            .next()
+            .map(unquote)
+            .filter(|column| !column.is_empty())
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("foreign key column")))?;
+        (vec![local], references)
+    };
+    let (referenced_table, referenced_columns) =
+        parse_references_target(&item[target_start + 10..])?;
+    Ok(Some(ForeignKeyConstraint { columns, referenced_table, referenced_columns }))
+}
+
+fn parse_references_target(input: &str) -> Result<(String, Vec<String>)> {
+    let trimmed = input.trim();
+    let tokens = tokenize(trimmed);
+    let referenced_table = tokens
+        .first()
+        .map(|token| unquote(token))
+        .filter(|table| !table.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("referenced table")))?;
+    let referenced_columns = if let Some(open) = trimmed.find('(') {
+        let close = matching_paren(trimmed, open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("referenced columns")))?;
+        split_sql_items(&trimmed[open + 1..close])
+            .into_iter()
+            .map(|column| unquote(column.trim()))
+            .filter(|column| !column.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((referenced_table, referenced_columns))
 }
 
 fn check_expressions(item: &str) -> Vec<String> {
@@ -2484,6 +2569,22 @@ fn decode_key_parts(encoded: &[u8]) -> Option<Vec<Vec<u8>>> {
     (!parts.is_empty()).then_some(parts)
 }
 
+fn referenced_columns_are_primary(
+    referenced_columns: &[String],
+    definitions: &[ColumnDefinition],
+) -> bool {
+    let primary = definitions
+        .iter()
+        .filter(|definition| definition.primary_key)
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    referenced_columns.len() == primary.len()
+        && referenced_columns
+            .iter()
+            .zip(primary)
+            .all(|(referenced, primary)| referenced.eq_ignore_ascii_case(primary))
+}
+
 fn index_value(definition: &IndexDefinition, pk: &[u8], value: &[u8]) -> Option<Vec<u8>> {
     if !definition.columns.is_empty() {
         let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
@@ -2996,6 +3097,7 @@ pub struct Executor<B = TxnManager> {
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
     rls_tables: Arc<HashMap<String, String>>,
     checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    foreign_keys: Arc<Mutex<HashMap<String, Vec<ForeignKeyConstraint>>>>,
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
@@ -3023,6 +3125,7 @@ impl Executor<TxnManager> {
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
             checks: Arc::new(Mutex::new(HashMap::new())),
+            foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -3044,6 +3147,7 @@ impl Executor<TxnManager> {
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
             checks: Arc::new(Mutex::new(HashMap::new())),
+            foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -3070,6 +3174,7 @@ where
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
             checks: Arc::new(Mutex::new(HashMap::new())),
+            foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -3115,6 +3220,7 @@ where
             indexes: self.indexes,
             rls_tables: self.rls_tables,
             checks: self.checks,
+            foreign_keys: self.foreign_keys,
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
@@ -3194,7 +3300,17 @@ where
                     .collect()
             })
             .unwrap_or_default();
-        SchemaSnapshot { tables, indexes, checks }
+        let foreign_keys = self
+            .foreign_keys
+            .lock()
+            .map(|foreign_keys| {
+                foreign_keys
+                    .iter()
+                    .map(|(table, constraints)| (table.clone(), constraints.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        SchemaSnapshot { tables, indexes, checks, foreign_keys }
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
@@ -3209,6 +3325,11 @@ where
             *checks = snapshot.checks.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("check constraint lock")));
+        }
+        if let Ok(mut foreign_keys) = self.foreign_keys.lock() {
+            *foreign_keys = snapshot.foreign_keys.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("foreign key lock")));
         }
         if let Ok(mut indexes) = self.indexes.lock() {
             indexes.clear();
@@ -3229,6 +3350,8 @@ where
         let catalog = self.catalog.lock().map(|catalog| catalog.clone()).unwrap_or_default();
         let indexes = self.indexes.lock().map(|indexes| indexes.clone()).unwrap_or_default();
         let checks = self.checks.lock().map(|checks| checks.clone()).unwrap_or_default();
+        let foreign_keys =
+            self.foreign_keys.lock().map(|foreign_keys| foreign_keys.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -3242,6 +3365,7 @@ where
             indexes: Arc::new(Mutex::new(indexes)),
             rls_tables: self.rls_tables,
             checks: Arc::new(Mutex::new(checks)),
+            foreign_keys: Arc::new(Mutex::new(foreign_keys)),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -3272,6 +3396,16 @@ where
                 })
             })
             .unwrap_or_default()
+    }
+
+    fn canonical_table_name(&self, table: &str) -> Option<String> {
+        self.catalog.lock().ok().and_then(|catalog| {
+            catalog.get_key_value(table).map(|(name, _)| name.clone()).or_else(|| {
+                catalog
+                    .keys()
+                    .find_map(|name| (name.rsplit('.').next() == Some(table)).then(|| name.clone()))
+            })
+        })
     }
 
     fn next_sequence_value(&self, table: &str, definition: &ColumnDefinition) -> Result<Vec<u8>> {
@@ -3335,6 +3469,20 @@ where
             .collect()
     }
 
+    pub fn catalog_foreign_keys(&self, table: &str) -> Vec<ForeignKeyConstraint> {
+        self.foreign_keys
+            .lock()
+            .ok()
+            .and_then(|foreign_keys| {
+                foreign_keys.get(table).cloned().or_else(|| {
+                    foreign_keys.iter().find_map(|(name, constraints)| {
+                        (name.rsplit('.').next() == Some(table)).then(|| constraints.clone())
+                    })
+                })
+            })
+            .unwrap_or_default()
+    }
+
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
         let Some(column) = self.rls_tables.get(table) else { return true };
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
@@ -3378,6 +3526,216 @@ where
             }
             if !valid {
                 return Err(RymeError::Conflict(format!("check constraint failed: {expression}")));
+            }
+        }
+        Ok(())
+    }
+
+    fn row_column_value(
+        &self,
+        table: &str,
+        pk: &[u8],
+        value: &[u8],
+        column: &str,
+    ) -> Option<Vec<u8>> {
+        if let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) {
+            if let Some(selected) = json_column_value(column, &object) {
+                return (!selected.is_null()).then(|| json_result_bytes(selected));
+            }
+        }
+        let primary_keys = self
+            .catalog_columns(table)
+            .into_iter()
+            .filter(|definition| definition.primary_key)
+            .collect::<Vec<_>>();
+        if let Some(index) =
+            primary_keys.iter().position(|definition| definition.name.eq_ignore_ascii_case(column))
+        {
+            if primary_keys.len() == 1 {
+                return Some(pk.to_vec());
+            }
+            return decode_key_parts(pk).and_then(|parts| parts.get(index).cloned());
+        }
+        None
+    }
+
+    fn scan_all_rows_in_transaction(&self, txn: &mut Transaction, table: &str) -> Result<Vec<Row>> {
+        const PAGE: usize = 10_000;
+        let mut rows = self.manager.scan(&mut *txn, &self.tenant, &self.database, table, PAGE)?;
+        loop {
+            if rows.len() < PAGE {
+                break;
+            }
+            let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
+            let next = self.manager.scan_after(
+                &mut *txn,
+                &self.tenant,
+                &self.database,
+                table,
+                &last,
+                PAGE,
+            )?;
+            if next.is_empty() {
+                break;
+            }
+            rows.extend(next);
+        }
+        if !txn.writes().is_empty() {
+            let mut merged = rows.into_iter().collect::<BTreeMap<_, _>>();
+            for (key, write) in txn.writes() {
+                if key.tenant != self.tenant || key.database != self.database || key.table != table
+                {
+                    continue;
+                }
+                match write.value.as_ref() {
+                    Some(value) => {
+                        merged.insert(key.pk.clone(), value.clone());
+                    }
+                    None => {
+                        merged.remove(&key.pk);
+                    }
+                }
+            }
+            return Ok(merged.into_iter().collect());
+        }
+        Ok(rows)
+    }
+
+    fn enforce_foreign_keys(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        pk: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let constraints = self
+            .foreign_keys
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        for constraint in constraints {
+            let Some(local_values) = constraint
+                .columns
+                .iter()
+                .map(|column| self.row_column_value(table, pk, value, column))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let referenced_columns = if constraint.referenced_columns.is_empty() {
+                self.catalog_columns(&constraint.referenced_table)
+                    .into_iter()
+                    .filter(|definition| definition.primary_key)
+                    .map(|definition| definition.name)
+                    .collect::<Vec<_>>()
+            } else {
+                constraint.referenced_columns.clone()
+            };
+            if referenced_columns.len() != local_values.len() || referenced_columns.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from("foreign key column count")));
+            }
+            let parent_columns = self.catalog_columns(&constraint.referenced_table);
+            let parent_primary = parent_columns
+                .iter()
+                .filter(|definition| definition.primary_key)
+                .map(|definition| definition.name.clone())
+                .collect::<Vec<_>>();
+            let references_primary = referenced_columns.len() == parent_primary.len()
+                && referenced_columns
+                    .iter()
+                    .zip(&parent_primary)
+                    .all(|(referenced, primary)| referenced.eq_ignore_ascii_case(primary));
+            let exists = if references_primary {
+                let parent_pk = if local_values.len() == 1 {
+                    local_values[0].clone()
+                } else {
+                    encode_key_parts(&local_values).ok_or_else(|| {
+                        RymeError::InvalidArgument(String::from("foreign key value"))
+                    })?
+                };
+                self.manager
+                    .get(
+                        txn,
+                        &RecordKey::new(
+                            &self.tenant,
+                            &self.database,
+                            &constraint.referenced_table,
+                            &parent_pk,
+                        ),
+                    )?
+                    .is_some()
+            } else {
+                self.scan_all_rows_in_transaction(txn, &constraint.referenced_table)?.iter().any(
+                    |(parent_pk, parent_value)| {
+                        referenced_columns.iter().zip(&local_values).all(|(column, expected)| {
+                            self.row_column_value(
+                                &constraint.referenced_table,
+                                parent_pk,
+                                parent_value,
+                                column,
+                            )
+                            .is_some_and(|actual| actual == *expected)
+                        })
+                    },
+                )
+            };
+            if !exists {
+                return Err(RymeError::Conflict(format!(
+                    "foreign key constraint failed: {} references {}",
+                    constraint.columns.join(", "),
+                    constraint.referenced_table
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_referenced_rows(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        pk: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let constraints = self
+            .foreign_keys
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .iter()
+            .flat_map(|(child_table, constraints)| {
+                constraints.iter().map(move |constraint| (child_table.clone(), constraint.clone()))
+            })
+            .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(table))
+            .collect::<Vec<_>>();
+        for (child_table, constraint) in constraints {
+            let referenced_columns = if constraint.referenced_columns.is_empty() {
+                self.catalog_columns(table)
+                    .into_iter()
+                    .filter(|definition| definition.primary_key)
+                    .map(|definition| definition.name)
+                    .collect::<Vec<_>>()
+            } else {
+                constraint.referenced_columns.clone()
+            };
+            let Some(parent_values) = referenced_columns
+                .iter()
+                .map(|column| self.row_column_value(table, pk, value, column))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let child_rows = self.scan_all_rows_in_transaction(txn, &child_table)?;
+            if child_rows.iter().any(|(child_pk, child_value)| {
+                constraint.columns.iter().zip(&parent_values).all(|(column, expected)| {
+                    self.row_column_value(&child_table, child_pk, child_value, column)
+                        .is_some_and(|actual| actual == *expected)
+                })
+            }) {
+                return Err(RymeError::Conflict(format!(
+                    "foreign key constraint failed: referenced row in {table} is still used"
+                )));
             }
         }
         Ok(())
@@ -4142,6 +4500,7 @@ where
         columns: Vec<ColumnDefinition>,
         unique_constraints: Vec<Vec<String>>,
         checks: Vec<String>,
+        foreign_keys: Vec<ForeignKeyConstraint>,
         if_not_exists: bool,
     ) -> Result<()> {
         let exists = self
@@ -4161,6 +4520,107 @@ where
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("check constraint lock")))?
                 .insert(table.clone(), checks);
+        }
+        if !foreign_keys.is_empty() {
+            let normalized = (|| -> Result<Vec<ForeignKeyConstraint>> {
+                let mut normalized = Vec::with_capacity(foreign_keys.len());
+                for mut constraint in foreign_keys {
+                    if constraint.columns.is_empty()
+                        || constraint.columns.iter().any(|column| {
+                            !self
+                                .catalog_columns(&table)
+                                .iter()
+                                .any(|definition| definition.name.eq_ignore_ascii_case(column))
+                        })
+                    {
+                        return Err(RymeError::InvalidArgument(String::from(
+                            "unknown foreign key column",
+                        )));
+                    }
+                    constraint.referenced_table = self
+                        .canonical_table_name(&constraint.referenced_table)
+                        .ok_or_else(|| {
+                            RymeError::InvalidArgument(format!(
+                                "unknown referenced table {}",
+                                constraint.referenced_table
+                            ))
+                        })?;
+                    let referenced_definitions = self.catalog_columns(&constraint.referenced_table);
+                    if constraint.referenced_columns.is_empty() {
+                        constraint.referenced_columns = referenced_definitions
+                            .iter()
+                            .filter(|definition| definition.primary_key)
+                            .map(|definition| definition.name.clone())
+                            .collect();
+                    }
+                    if constraint.referenced_columns.len() != constraint.columns.len()
+                        || constraint.referenced_columns.iter().any(|column| {
+                            !referenced_definitions
+                                .iter()
+                                .any(|definition| definition.name.eq_ignore_ascii_case(column))
+                        })
+                    {
+                        return Err(RymeError::InvalidArgument(String::from(
+                            "unknown referenced column",
+                        )));
+                    }
+                    let references_primary = referenced_columns_are_primary(
+                        &constraint.referenced_columns,
+                        &referenced_definitions,
+                    );
+                    let references_unique_column = constraint.referenced_columns.len() == 1
+                        && referenced_definitions.iter().any(|definition| {
+                            definition.name.eq_ignore_ascii_case(&constraint.referenced_columns[0])
+                                && definition.unique
+                        });
+                    let references_unique_index =
+                        self.catalog_indexes(&constraint.referenced_table).iter().any(|index| {
+                            if !index.unique {
+                                return false;
+                            }
+                            if constraint.referenced_columns.len() == 1 && index.columns.is_empty()
+                            {
+                                return index.column.as_deref().is_some_and(|indexed| {
+                                    indexed.eq_ignore_ascii_case(&constraint.referenced_columns[0])
+                                });
+                            }
+                            index.columns.len() == constraint.referenced_columns.len()
+                                && index.columns.iter().zip(&constraint.referenced_columns).all(
+                                    |(indexed, referenced)| {
+                                        indexed.eq_ignore_ascii_case(referenced)
+                                    },
+                                )
+                        });
+                    if !references_primary && !references_unique_column && !references_unique_index
+                    {
+                        return Err(RymeError::InvalidArgument(String::from(
+                            "referenced columns are not unique",
+                        )));
+                    }
+                    normalized.push(constraint);
+                }
+                Ok(normalized)
+            })();
+            let normalized = match normalized {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    if let Ok(mut catalog) = self.catalog.lock() {
+                        catalog.remove(&table);
+                    }
+                    if let Ok(mut indexes) = self.indexes.lock() {
+                        indexes.remove(&table);
+                    }
+                    if let Ok(mut checks) = self.checks.lock() {
+                        checks.remove(&table);
+                    }
+                    self.schema_dirty.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
+            };
+            self.foreign_keys
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+                .insert(table.clone(), normalized);
         }
         for columns in unique_constraints {
             if columns.len() < 2 {
@@ -4195,6 +4655,20 @@ where
             }
             return Err(RymeError::NotFound(String::from("table")));
         }
+        if self
+            .foreign_keys
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .iter()
+            .any(|(child_table, constraints)| {
+                child_table != &table
+                    && constraints
+                        .iter()
+                        .any(|constraint| constraint.referenced_table.eq_ignore_ascii_case(&table))
+            })
+        {
+            return Err(RymeError::Conflict(String::from("table is referenced by a foreign key")));
+        }
 
         let rows = self.scan_all_rows(&table)?;
         if !rows.is_empty() {
@@ -4220,6 +4694,9 @@ where
         if let Ok(mut checks) = self.checks.lock() {
             checks.remove(&table);
         }
+        if let Ok(mut foreign_keys) = self.foreign_keys.lock() {
+            foreign_keys.remove(&table);
+        }
         let prefix = format!("{}\0{}\0{}\0", self.tenant, self.database, table);
         if let Ok(mut sequences) = self.sequence_next.lock() {
             sequences.retain(|key, _| !key.starts_with(&prefix));
@@ -4237,6 +4714,20 @@ where
             .contains_key(&table);
         if !present {
             return Err(RymeError::NotFound(String::from("table")));
+        }
+        if self
+            .foreign_keys
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .iter()
+            .any(|(child_table, constraints)| {
+                child_table != &table
+                    && constraints
+                        .iter()
+                        .any(|constraint| constraint.referenced_table.eq_ignore_ascii_case(&table))
+            })
+        {
+            return Err(RymeError::Conflict(String::from("table is referenced by a foreign key")));
         }
 
         let rows = self.scan_all_rows(&table)?;
@@ -4414,6 +4905,27 @@ where
         {
             return Err(RymeError::InvalidArgument(String::from(
                 "dropping a column referenced by a check constraint is not supported",
+            )));
+        }
+        if self
+            .foreign_keys
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .iter()
+            .any(|(child_table, constraints)| {
+                constraints.iter().any(|constraint| {
+                    (child_table.eq_ignore_ascii_case(&table)
+                        && constraint.columns.iter().any(|name| name.eq_ignore_ascii_case(&column)))
+                        || (constraint.referenced_table.eq_ignore_ascii_case(&table)
+                            && constraint
+                                .referenced_columns
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(&column)))
+                })
+            })
+        {
+            return Err(RymeError::InvalidArgument(String::from(
+                "dropping a column referenced by a foreign key is not supported",
             )));
         }
 
@@ -4601,6 +5113,26 @@ where
                 }
             }
         }
+        if let Ok(mut foreign_keys) = self.foreign_keys.lock() {
+            for (child_table, constraints) in foreign_keys.iter_mut() {
+                for constraint in constraints {
+                    if child_table.eq_ignore_ascii_case(&table) {
+                        for name in &mut constraint.columns {
+                            if name.eq_ignore_ascii_case(&from) {
+                                *name = to.clone();
+                            }
+                        }
+                    }
+                    if constraint.referenced_table.eq_ignore_ascii_case(&table) {
+                        for name in &mut constraint.referenced_columns {
+                            if name.eq_ignore_ascii_case(&from) {
+                                *name = to.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -4765,6 +5297,7 @@ where
                 columns,
                 unique_constraints,
                 checks,
+                foreign_keys,
                 if_not_exists,
             } => {
                 self.create_table(
@@ -4772,6 +5305,7 @@ where
                     columns.clone(),
                     unique_constraints.clone(),
                     checks.clone(),
+                    foreign_keys.clone(),
                     *if_not_exists,
                 )?;
             }
@@ -4868,6 +5402,7 @@ where
                     }
                     self.enforce_rls(&table, &value)?;
                     self.enforce_checks(&table, &pk, &value)?;
+                    self.enforce_foreign_keys(txn, &table, &pk, &value)?;
                     let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                     let before = self.manager.get(txn, &key)?;
                     self.check_unique(&table, &pk, &value)?;
@@ -4901,6 +5436,7 @@ where
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
+                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if before.is_some() {
@@ -4923,6 +5459,7 @@ where
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
+                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if let Some(before) = before.as_deref() {
@@ -4963,6 +5500,7 @@ where
                         self.materialize_update_row(&table, &pk, assignments.clone(), &before)?;
                     self.enforce_rls(&table, &after)?;
                     self.enforce_checks(&table, &pk, &after)?;
+                    self.enforce_foreign_keys(txn, &table, &pk, &after)?;
                     self.check_unique(&table, &pk, &after)?;
                     self.manager.put(
                         txn,
@@ -4983,6 +5521,7 @@ where
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
+                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if before.is_none() {
@@ -5010,6 +5549,12 @@ where
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
+                self.enforce_referenced_rows(
+                    txn,
+                    &table,
+                    &pk,
+                    before.as_deref().unwrap_or_default(),
+                )?;
                 self.manager.delete(txn, key);
                 Ok((
                     QueryResult::Ok,
@@ -5028,6 +5573,7 @@ where
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, before) in rows {
                     self.enforce_rls(&table, &before)?;
+                    self.enforce_referenced_rows(txn, &table, &pk, &before)?;
                     self.manager
                         .delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
                     changes.push(TransactionChange {
@@ -5405,6 +5951,7 @@ where
                 columns,
                 unique_constraints,
                 checks,
+                foreign_keys,
                 if_not_exists,
             } => {
                 self.create_table(
@@ -5412,6 +5959,7 @@ where
                     columns.clone(),
                     unique_constraints.clone(),
                     checks.clone(),
+                    foreign_keys.clone(),
                     *if_not_exists,
                 )?;
             }
@@ -5625,6 +6173,7 @@ where
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
+                self.enforce_foreign_keys(&mut txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 if before.is_some() {
@@ -5651,6 +6200,7 @@ where
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
+                self.enforce_foreign_keys(&mut txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 let existed = before.is_some();
@@ -5856,6 +6406,7 @@ where
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
+                self.enforce_foreign_keys(&mut txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 if before.is_none() {
@@ -5887,6 +6438,12 @@ where
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
+                self.enforce_referenced_rows(
+                    &mut txn,
+                    &table,
+                    &pk,
+                    before.as_deref().unwrap_or_default(),
+                )?;
                 self.manager.delete(&mut txn, key);
                 let commit_ts = self.manager.commit(txn).await?;
                 self.apply_index_change(&TransactionChange {
@@ -5934,6 +6491,7 @@ where
                 let key = RecordKey::new(&self.tenant, &self.database, &table, pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 self.enforce_checks(&table, pk, value)?;
+                self.enforce_foreign_keys(&mut txn, &table, pk, value)?;
                 self.check_unique(&table, pk, value)?;
                 self.manager.put(&mut txn, key, value.clone());
                 staged.push(TransactionChange {
@@ -6857,6 +7415,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_column_and_table_foreign_keys() {
+        let Statement::CreateTable { foreign_keys, .. } = parse(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id), room_id TEXT, FOREIGN KEY (room_id) REFERENCES rooms (id))",
+        )
+        .unwrap()
+        else {
+            panic!("expected create table")
+        };
+        assert_eq!(
+            foreign_keys,
+            vec![
+                ForeignKeyConstraint {
+                    columns: vec![String::from("user_id")],
+                    referenced_table: String::from("users"),
+                    referenced_columns: vec![String::from("id")],
+                },
+                ForeignKeyConstraint {
+                    columns: vec![String::from("room_id")],
+                    referenced_table: String::from("rooms"),
+                    referenced_columns: vec![String::from("id")],
+                },
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn index_ddl_enforces_existence_and_can_remove_index_metadata() {
         let executor = Executor::new(String::from("t"), String::from("d"));
@@ -7023,6 +7607,100 @@ mod tests {
             )
             .await;
         assert!(restored_invalid.is_err());
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_enforce_writes_and_restrict_parent_deletes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id))",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor.execute(parse("INSERT INTO users (id) VALUES ('u1')").unwrap()).await.unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (id, user_id) VALUES ('m1', 'u1')").unwrap())
+            .await
+            .unwrap();
+        let missing_parent = executor
+            .execute(parse("INSERT INTO messages (id, user_id) VALUES ('m2', 'missing')").unwrap())
+            .await;
+        assert!(
+            matches!(missing_parent, Err(RymeError::Conflict(message)) if message.contains("foreign key"))
+        );
+        executor
+            .execute(parse("INSERT INTO messages (id, user_id) VALUES ('m3', NULL)").unwrap())
+            .await
+            .unwrap();
+        let invalid_update = executor
+            .execute(parse("UPDATE messages SET user_id = 'missing' WHERE id = 'm1'").unwrap())
+            .await;
+        assert!(invalid_update.is_err());
+        let blocked_delete =
+            executor.execute(parse("DELETE FROM users WHERE id = 'u1'").unwrap()).await;
+        assert!(
+            matches!(blocked_delete, Err(RymeError::Conflict(message)) if message.contains("foreign key"))
+        );
+        executor.execute(parse("DELETE FROM messages WHERE id = 'm1'").unwrap()).await.unwrap();
+        executor.execute(parse("DELETE FROM users WHERE id = 'u1'").unwrap()).await.unwrap();
+
+        let restored = Executor::with_manager(
+            String::from("t"),
+            String::from("d"),
+            executor.manager().clone(),
+        );
+        restored.restore_schema_snapshot(executor.schema_snapshot()).unwrap();
+        assert_eq!(restored.schema_snapshot().foreign_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn composite_foreign_keys_match_composite_primary_keys() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE tenants (tenant_id TEXT, id TEXT, PRIMARY KEY (tenant_id, id))",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE memberships (id TEXT PRIMARY KEY, tenant_id TEXT, tenant_user TEXT, FOREIGN KEY (tenant_id, tenant_user) REFERENCES tenants (tenant_id, id))",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO tenants (tenant_id, id) VALUES ('t1', 'u1')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO memberships (id, tenant_id, tenant_user) VALUES ('m1', 't1', 'u1')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invalid = executor
+            .execute(
+                parse(
+                    "INSERT INTO memberships (id, tenant_id, tenant_user) VALUES ('m2', 't1', 'missing')",
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(invalid.is_err());
     }
 
     #[tokio::test]
