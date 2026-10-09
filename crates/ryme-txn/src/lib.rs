@@ -1471,6 +1471,17 @@ impl DurableManager {
         Ok(applied)
     }
 
+    pub fn replay_at(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
+        if self.mode == StorageMode::Standard {
+            self.segments.write_delta(commit_ts, &segment_entries(commit_ts, writes))?;
+        }
+        self.inner.replay_at(commit_ts, writes)?;
+        if self.mode == StorageMode::Standard {
+            self.inner.clear_engine()?;
+        }
+        Ok(())
+    }
+
     pub fn begin(&self) -> Transaction {
         self.inner.begin()
     }

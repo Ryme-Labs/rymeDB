@@ -185,7 +185,7 @@ impl ShardSet {
                     .manager_for(shard as usize)
                     .ok_or_else(|| RymeError::Corrupt(String::from("cohort")))?;
                 let writes = decode_writes(&payload)?;
-                manager.inner().replay_at(commit_ts, &writes)?;
+                manager.replay_at(commit_ts, &writes)?;
             }
         }
         Ok(())
