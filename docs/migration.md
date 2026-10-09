@@ -84,7 +84,8 @@ rows written directly in the branch overlay.
 
 ## SQL dialect
 
-`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, `UNIQUE`,
+`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, single-column
+and composite `UNIQUE` constraints,
 `NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
 `DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability changes
 (including `IF [NOT] EXISTS` where supported), plus
@@ -99,7 +100,8 @@ chained object and array paths in selected columns,
 `serial`/`bigserial`/`smallserial` and `GENERATED ... AS IDENTITY` columns
 generate integer primary keys when omitted and recover their next value from
 durable rows after executor restart,
-`CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields,
+`CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields or
+multiple declared columns,
 with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
 (`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, and `pg_index`),
 and indexed equality lookup,

@@ -14,6 +14,8 @@ pub enum Statement {
         table: String,
         columns: Vec<ColumnDefinition>,
         #[serde(default)]
+        unique_constraints: Vec<Vec<String>>,
+        #[serde(default)]
         if_not_exists: bool,
     },
     DropTable {
@@ -57,6 +59,8 @@ pub enum Statement {
         field: Field,
         #[serde(default)]
         column: Option<String>,
+        #[serde(default)]
+        columns: Vec<String>,
         unique: bool,
         #[serde(default)]
         if_not_exists: bool,
@@ -212,6 +216,8 @@ pub struct IndexDefinition {
     pub field: Field,
     #[serde(default)]
     pub column: Option<String>,
+    #[serde(default)]
+    pub columns: Vec<String>,
     pub unique: bool,
 }
 
@@ -1009,7 +1015,7 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         || (tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("UNIQUE"))
             && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("INDEX")))
     {
-        return parse_create_index(tokens);
+        return parse_create_index(tokens, raw);
     }
     let table_index = tokens
         .iter()
@@ -1030,10 +1036,11 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
     let if_not_exists =
         tokens.get(table_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
-    Ok(Statement::CreateTable { table, columns: parse_column_definitions(raw)?, if_not_exists })
+    let (columns, unique_constraints) = parse_table_definition(raw)?;
+    Ok(Statement::CreateTable { table, columns, unique_constraints, if_not_exists })
 }
 
-fn parse_create_index(tokens: &[String]) -> Result<Statement> {
+fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
     let unique = tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("UNIQUE"));
     let index_pos = tokens
         .iter()
@@ -1055,24 +1062,45 @@ fn parse_create_index(tokens: &[String]) -> Result<Statement> {
     let if_not_exists =
         tokens.get(index_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
     let table = table_after(tokens, "ON")?;
-    let on_pos = tokens
-        .iter()
-        .position(|token| token.eq_ignore_ascii_case("ON"))
+    let raw_upper = raw.to_ascii_uppercase();
+    let raw_on = raw_upper
+        .find(" ON ")
+        .map(|position| position + 4)
+        .or_else(|| raw_upper.find("ON").map(|position| position + 2))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("index table")))?;
-    let field_token = tokens
-        .get(on_pos + 2)
+    let open = raw[raw_on..]
+        .find('(')
+        .map(|position| raw_on + position)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("index field")))?;
-    let (field, column) = parse_field(field_token)
-        .map(|field| (field, None))
-        .unwrap_or_else(|| (Field::Value, Some(unquote(field_token))));
-    Ok(Statement::CreateIndex { name, table, field, column, unique, if_not_exists })
+    let close = matching_paren(raw, open)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("index field")))?;
+    let fields = split_sql_items(&raw[open + 1..close])
+        .into_iter()
+        .map(|field| unquote(field.trim()))
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("index field")));
+    }
+    let (field, column, columns) = if fields.len() > 1 {
+        (Field::Value, None, fields)
+    } else {
+        let field_token = fields.first().expect("index fields is not empty");
+        parse_field(field_token)
+            .map(|field| (field, None, Vec::new()))
+            .unwrap_or_else(|| (Field::Value, Some(field_token.clone()), Vec::new()))
+    };
+    Ok(Statement::CreateIndex { name, table, field, column, columns, unique, if_not_exists })
 }
 
 fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
-    let Some(open) = raw.find('(') else { return Ok(Vec::new()) };
-    let Some(close) = raw.rfind(')') else { return Ok(Vec::new()) };
+    parse_table_definition(raw).map(|(columns, _)| columns)
+}
+
+fn parse_table_definition(raw: &str) -> Result<(Vec<ColumnDefinition>, Vec<Vec<String>>)> {
+    let Some(open) = raw.find('(') else { return Ok((Vec::new(), Vec::new())) };
+    let Some(close) = raw.rfind(')') else { return Ok((Vec::new(), Vec::new())) };
     if close <= open {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let items = split_sql_items(&raw[open + 1..close]);
     let mut table_primary = Vec::new();
@@ -1100,12 +1128,7 @@ fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
         if upper.contains("PRIMARY KEY") {
             table_primary.extend(columns);
         } else {
-            if columns.len() > 1 {
-                return Err(RymeError::InvalidArgument(String::from(
-                    "composite unique constraints are not supported",
-                )));
-            }
-            table_unique.extend(columns);
+            table_unique.push(columns);
         }
     }
     if table_primary.len() > 1 {
@@ -1179,7 +1202,13 @@ fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
         column.primary_key = true;
         column.nullable = false;
     }
+    let mut composite_unique = Vec::new();
     for unique in table_unique {
+        if unique.len() > 1 {
+            composite_unique.push(unique);
+            continue;
+        }
+        let Some(unique) = unique.first() else { continue };
         let Some(column) =
             columns.iter_mut().find(|column| column.name.eq_ignore_ascii_case(&unique))
         else {
@@ -1187,7 +1216,7 @@ fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
         };
         column.unique = true;
     }
-    Ok(columns)
+    Ok((columns, composite_unique))
 }
 
 fn split_sql_items(input: &str) -> Vec<String> {
@@ -2348,6 +2377,23 @@ fn json_column_value<'a>(
 }
 
 fn index_value(definition: &IndexDefinition, pk: &[u8], value: &[u8]) -> Option<Vec<u8>> {
+    if !definition.columns.is_empty() {
+        let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
+            return None;
+        };
+        let mut encoded = Vec::new();
+        for column in &definition.columns {
+            let selected = json_column_value(column, &object)?;
+            if selected.is_null() {
+                return None;
+            }
+            let bytes = json_result_bytes(selected);
+            let length = u32::try_from(bytes.len()).ok()?;
+            encoded.extend_from_slice(&length.to_be_bytes());
+            encoded.extend_from_slice(&bytes);
+        }
+        return Some(encoded);
+    }
     if let Some(column) = definition.column.as_deref() {
         let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
             return None;
@@ -2362,6 +2408,30 @@ fn index_value(definition: &IndexDefinition, pk: &[u8], value: &[u8]) -> Option<
         Field::Key => pk.to_vec(),
         Field::Value => value.to_vec(),
     })
+}
+
+fn index_filter_value(definition: &IndexDefinition, filter: &[Predicate]) -> Option<Vec<u8>> {
+    if definition.columns.is_empty() {
+        return None;
+    }
+    let mut encoded = Vec::new();
+    for column in &definition.columns {
+        let predicate = filter.iter().find(|predicate| {
+            predicate.op == Cmp::Eq
+                && predicate.field == Field::Value
+                && predicate
+                    .column
+                    .as_deref()
+                    .is_some_and(|indexed| indexed.eq_ignore_ascii_case(column))
+        })?;
+        if is_null_bytes(&predicate.operand) {
+            return None;
+        }
+        let length = u32::try_from(predicate.operand.len()).ok()?;
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(&predicate.operand);
+    }
+    Some(encoded)
 }
 
 fn rename_index_column(indexed: &str, from: &str, to: &str) -> String {
@@ -2474,11 +2544,18 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::AlterTableColumn { table, column, alteration } => {
             format!("ddl alter_table({table}) alter_column({column}, {alteration:?})")
         }
-        Statement::CreateIndex { name, table, field, column, unique, .. } => {
-            let field = column.as_deref().unwrap_or(match field {
-                Field::Key => "key",
-                Field::Value => "value",
-            });
+        Statement::CreateIndex { name, table, field, column, columns, unique, .. } => {
+            let field = if columns.is_empty() {
+                column
+                    .as_deref()
+                    .unwrap_or(match field {
+                        Field::Key => "key",
+                        Field::Value => "value",
+                    })
+                    .to_string()
+            } else {
+                columns.join(", ")
+            };
             format!("ddl {}index({name}) on {table}({field})", if *unique { "unique " } else { "" })
         }
         Statement::Insert { table, .. } => format!("write insert({table}) point"),
@@ -3491,6 +3568,16 @@ where
 
     fn create_index(&self, definition: IndexDefinition, if_not_exists: bool) -> Result<()> {
         self.reject_if_read_only()?;
+        if !definition.columns.is_empty() {
+            let definitions = self.catalog_columns(&definition.table);
+            for column in &definition.columns {
+                if !definitions.iter().any(|entry| entry.name.eq_ignore_ascii_case(column)) {
+                    return Err(RymeError::InvalidArgument(format!(
+                        "unknown index column {column}"
+                    )));
+                }
+            }
+        }
         {
             let indexes =
                 self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
@@ -3542,12 +3629,31 @@ where
     }
 
     fn indexed_candidates(&self, table: &str, filter: &[Predicate]) -> Option<Vec<Vec<u8>>> {
-        let predicate = filter.iter().find(|predicate| predicate.op == Cmp::Eq)?;
         let indexes = self.indexes.lock().ok()?;
         let state = indexes.get(table)?.iter().find(|state| {
-            state.definition.field == predicate.field && state.definition.column == predicate.column
+            if !state.definition.columns.is_empty() {
+                return index_filter_value(&state.definition, filter).is_some();
+            }
+            filter.iter().any(|predicate| {
+                predicate.op == Cmp::Eq
+                    && state.definition.field == predicate.field
+                    && state.definition.column == predicate.column
+            })
         })?;
-        Some(state.entries.get(&predicate.operand)?.iter().cloned().collect())
+        let key = if state.definition.columns.is_empty() {
+            filter
+                .iter()
+                .find(|predicate| {
+                    predicate.op == Cmp::Eq
+                        && state.definition.field == predicate.field
+                        && state.definition.column == predicate.column
+                })?
+                .operand
+                .clone()
+        } else {
+            index_filter_value(&state.definition, filter)?
+        };
+        Some(state.entries.get(&key)?.iter().cloned().collect())
     }
 
     fn check_unique(&self, table: &str, pk: &[u8], value: &[u8]) -> Result<()> {
@@ -3826,6 +3932,7 @@ where
                                     table: table_name.clone(),
                                     field: Field::Value,
                                     column: Some(column),
+                                    columns: Vec::new(),
                                     unique: true,
                                 },
                                 entries: BTreeMap::new(),
@@ -3842,6 +3949,7 @@ where
         &self,
         table: String,
         columns: Vec<ColumnDefinition>,
+        unique_constraints: Vec<Vec<String>>,
         if_not_exists: bool,
     ) -> Result<()> {
         let exists = self
@@ -3855,7 +3963,24 @@ where
             }
             return Err(RymeError::Conflict(String::from("table exists")));
         }
-        self.register_table(table, columns);
+        self.register_table(table.clone(), columns);
+        for columns in unique_constraints {
+            if columns.len() < 2 {
+                continue;
+            }
+            let name = format!("{}_{}_unique", table, columns.join("_"));
+            self.create_index(
+                IndexDefinition {
+                    name,
+                    table: table.clone(),
+                    field: Field::Value,
+                    column: None,
+                    columns,
+                    unique: true,
+                },
+                false,
+            )?;
+        }
         Ok(())
     }
 
@@ -3968,6 +4093,7 @@ where
             table: table.clone(),
             field: Field::Value,
             column: Some(column.name.clone()),
+            columns: Vec::new(),
             unique: true,
         };
         let mut index_entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> =
@@ -4122,11 +4248,16 @@ where
             if let Some(table_indexes) = indexes.get_mut(&table) {
                 let column_prefix = format!("{}->", column.to_ascii_lowercase());
                 table_indexes.retain(|state| {
-                    state.definition.column.as_deref().is_none_or(|indexed| {
-                        let indexed = indexed.to_ascii_lowercase();
-                        indexed != column.to_ascii_lowercase()
-                            && !indexed.starts_with(&column_prefix)
-                    })
+                    let in_composite = state.definition.columns.iter().any(|indexed| {
+                        indexed.eq_ignore_ascii_case(&column)
+                            || indexed.to_ascii_lowercase().starts_with(&column_prefix)
+                    });
+                    !in_composite
+                        && state.definition.column.as_deref().is_none_or(|indexed| {
+                            let indexed = indexed.to_ascii_lowercase();
+                            indexed != column.to_ascii_lowercase()
+                                && !indexed.starts_with(&column_prefix)
+                        })
                 });
             }
         }
@@ -4209,6 +4340,27 @@ where
                 self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
             if let Some(table_indexes) = indexes.get_mut(&table) {
                 for state in table_indexes {
+                    if !state.definition.columns.is_empty() {
+                        let renamed = state
+                            .definition
+                            .columns
+                            .iter()
+                            .map(|indexed| rename_index_column(indexed, &from, &to))
+                            .collect::<Vec<_>>();
+                        if renamed != state.definition.columns {
+                            state.definition.columns = renamed;
+                            let mut entries = BTreeMap::new();
+                            for (pk, _, after) in &updates {
+                                if let Some(value) = index_value(&state.definition, pk, after) {
+                                    entries
+                                        .entry(value)
+                                        .or_insert_with(std::collections::BTreeSet::new)
+                                        .insert(pk.clone());
+                                }
+                            }
+                            state.entries = entries;
+                        }
+                    }
                     if let Some(indexed) = state.definition.column.as_deref() {
                         let renamed = rename_index_column(indexed, &from, &to);
                         if renamed != indexed {
@@ -4387,8 +4539,13 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match &statement {
-            Statement::CreateTable { table, columns, if_not_exists } => {
-                self.create_table(table.clone(), columns.clone(), *if_not_exists)?;
+            Statement::CreateTable { table, columns, unique_constraints, if_not_exists } => {
+                self.create_table(
+                    table.clone(),
+                    columns.clone(),
+                    unique_constraints.clone(),
+                    *if_not_exists,
+                )?;
             }
             Statement::DropTable { .. } => {}
             Statement::DropIndex { .. } => {}
@@ -4449,9 +4606,17 @@ where
                 self.drop_index(name, if_exists)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
-            Statement::CreateIndex { name, table, field, column, unique, if_not_exists } => {
+            Statement::CreateIndex {
+                name,
+                table,
+                field,
+                column,
+                columns,
+                unique,
+                if_not_exists,
+            } => {
                 self.create_index(
-                    IndexDefinition { name, table, field, column, unique },
+                    IndexDefinition { name, table, field, column, columns, unique },
                     if_not_exists,
                 )?;
                 Ok((QueryResult::Ok, Vec::new()))
@@ -5002,8 +5167,13 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match &statement {
-            Statement::CreateTable { table, columns, if_not_exists } => {
-                self.create_table(table.clone(), columns.clone(), *if_not_exists)?;
+            Statement::CreateTable { table, columns, unique_constraints, if_not_exists } => {
+                self.create_table(
+                    table.clone(),
+                    columns.clone(),
+                    unique_constraints.clone(),
+                    *if_not_exists,
+                )?;
             }
             Statement::DropTable { .. } => {}
             Statement::DropIndex { .. } => {}
@@ -5169,9 +5339,17 @@ where
                 self.alter_table_column(table, column, alteration).await?;
                 Ok(QueryResult::Ok)
             }
-            Statement::CreateIndex { name, table, field, column, unique, if_not_exists } => {
+            Statement::CreateIndex {
+                name,
+                table,
+                field,
+                column,
+                columns,
+                unique,
+                if_not_exists,
+            } => {
                 self.create_index(
-                    IndexDefinition { name, table, field, column, unique },
+                    IndexDefinition { name, table, field, column, columns, unique },
                     if_not_exists,
                 )?;
                 Ok(QueryResult::Ok)
@@ -6364,6 +6542,7 @@ mod tests {
                 table: String::from("messages"),
                 field: Field::Value,
                 column: None,
+                columns: Vec::new(),
                 unique: false,
                 if_not_exists: false,
             }
@@ -6380,6 +6559,36 @@ mod tests {
             parse("DROP INDEX IF EXISTS messages_value_idx").unwrap(),
             Statement::DropIndex { name, if_exists: true } if name == "messages_value_idx"
         ));
+    }
+
+    #[test]
+    fn parses_composite_create_index_and_unique_constraint() {
+        assert_eq!(
+            parse(
+                "CREATE UNIQUE INDEX memberships_pair_unique ON memberships (tenant_id, user_id)"
+            )
+            .unwrap(),
+            Statement::CreateIndex {
+                name: String::from("memberships_pair_unique"),
+                table: String::from("memberships"),
+                field: Field::Value,
+                column: None,
+                columns: vec![String::from("tenant_id"), String::from("user_id")],
+                unique: true,
+                if_not_exists: false,
+            }
+        );
+        let Statement::CreateTable { unique_constraints, .. } = parse(
+            "CREATE TABLE memberships (id TEXT PRIMARY KEY, tenant_id TEXT, user_id TEXT, UNIQUE (tenant_id, user_id))",
+        )
+        .unwrap()
+        else {
+            panic!("expected create table")
+        };
+        assert_eq!(
+            unique_constraints,
+            vec![vec![String::from("tenant_id"), String::from("user_id")]]
+        );
     }
 
     #[tokio::test]
@@ -6406,6 +6615,49 @@ mod tests {
         assert!(executor.catalog_indexes("messages").is_empty());
         assert!(executor.execute(parse("DROP INDEX messages_value_idx").unwrap()).await.is_err());
         executor.execute(parse("DROP INDEX IF EXISTS messages_value_idx").unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn composite_unique_constraints_enforce_column_tuples() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse(
+                "CREATE TABLE memberships (id TEXT PRIMARY KEY, tenant_id TEXT, user_id TEXT, UNIQUE (tenant_id, user_id))",
+            )
+            .unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse(
+                "INSERT INTO memberships (id, tenant_id, user_id) VALUES ('1', 'tenant-a', 'user-a')",
+            )
+            .unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse(
+                "INSERT INTO memberships (id, tenant_id, user_id) VALUES ('2', 'tenant-a', 'user-b')",
+            )
+            .unwrap())
+            .await
+            .unwrap();
+        let duplicate = executor
+            .execute(parse(
+                "INSERT INTO memberships (id, tenant_id, user_id) VALUES ('3', 'tenant-a', 'user-a')",
+            )
+            .unwrap())
+            .await;
+        assert!(
+            matches!(duplicate, Err(RymeError::Conflict(message)) if message.contains("tenant_id_user_id"))
+        );
+
+        let null_tuple = executor
+            .execute(parse(
+                "INSERT INTO memberships (id, tenant_id, user_id) VALUES ('4', 'tenant-a', NULL)",
+            )
+            .unwrap())
+            .await;
+        assert!(null_tuple.is_ok());
     }
 
     #[tokio::test]

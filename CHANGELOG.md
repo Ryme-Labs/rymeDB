@@ -53,6 +53,9 @@ All notable changes to rymeDB are recorded here. Format follows
   `DROP INDEX [IF EXISTS]` removes durable index metadata and entries.
 - Inline and single-column table-level `UNIQUE` constraints now create durable
   named indexes and reject duplicate inserts and updates.
+- Composite `UNIQUE` constraints and composite `CREATE [UNIQUE] INDEX`
+  definitions now encode column tuples, enforce uniqueness across writes and
+  transactions, persist with schema snapshots, and track column renames.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
   preserves nullability/identity metadata, and persists the updated schema.
 - `ALTER TABLE ... DROP COLUMN` now removes the field from durable JSON rows,

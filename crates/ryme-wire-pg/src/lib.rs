@@ -1350,9 +1350,13 @@ where
             .into_iter()
             .map(|index| {
                 let (schema, table_name) = catalog_table_parts(&index.table);
-                let field = match index.field {
-                    Field::Key => "id",
-                    Field::Value => "value",
+                let fields = if index.columns.is_empty() {
+                    match index.field {
+                        Field::Key => String::from("id"),
+                        Field::Value => String::from("value"),
+                    }
+                } else {
+                    index.columns.join(", ")
                 };
                 let unique = if index.unique { "UNIQUE " } else { "" };
                 columns
@@ -1363,8 +1367,8 @@ where
                         "indexname" => index.name.as_bytes().to_vec(),
                         "tablespace" => Vec::new(),
                         "indexdef" => format!(
-                            "CREATE {unique}INDEX {} ON {}.{} ({field})",
-                            index.name, schema, table_name
+                            "CREATE {unique}INDEX {} ON {}.{} ({fields})",
+                            index.name, schema, table_name,
                         )
                         .into_bytes(),
                         _ => Vec::new(),
@@ -1387,7 +1391,8 @@ where
                 continue;
             }
             let relation_oid = catalog_relation_oid(&table);
-            for (ordinal, definition) in executor.catalog_columns(&table).into_iter().enumerate() {
+            let definitions = executor.catalog_columns(&table);
+            for (ordinal, definition) in definitions.iter().enumerate() {
                 if definition.primary_key {
                     let name = format!("{}_{}_pkey", table_name, definition.name);
                     constraints.push((
@@ -1395,23 +1400,49 @@ where
                         String::from("p"),
                         relation_oid,
                         catalog_index_oid(&format!("constraint:{table}:{ordinal}")),
-                        ordinal + 1,
+                        format!("{{{}}}", ordinal + 1),
                     ));
                 }
             }
             for index in executor.catalog_indexes(&table).into_iter().filter(|index| index.unique) {
+                let ordinals = if index.columns.is_empty() {
+                    index
+                        .column
+                        .as_deref()
+                        .and_then(|column| {
+                            definitions
+                                .iter()
+                                .position(|definition| definition.name.eq_ignore_ascii_case(column))
+                        })
+                        .map(|ordinal| vec![ordinal + 1])
+                        .unwrap_or_else(|| vec![1])
+                } else {
+                    index
+                        .columns
+                        .iter()
+                        .filter_map(|column| {
+                            definitions
+                                .iter()
+                                .position(|definition| definition.name.eq_ignore_ascii_case(column))
+                                .map(|ordinal| ordinal + 1)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 constraints.push((
                     index.name.clone(),
                     String::from("u"),
                     relation_oid,
                     catalog_index_oid(&index.name),
-                    1,
+                    format!(
+                        "{{{}}}",
+                        ordinals.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+                    ),
                 ));
             }
         }
         let rows: Vec<Vec<Vec<u8>>> = constraints
             .into_iter()
-            .map(|(name, kind, relation_oid, index_oid, ordinal)| {
+            .map(|(name, kind, relation_oid, index_oid, conkey)| {
                 columns
                     .iter()
                     .map(|column| match column.as_str() {
@@ -1423,7 +1454,7 @@ where
                         "contype" => kind.as_bytes().to_vec(),
                         "conrelid" => relation_oid.to_string().into_bytes(),
                         "conindid" => index_oid.to_string().into_bytes(),
-                        "conkey" => format!("{{{ordinal}}}").into_bytes(),
+                        "conkey" => conkey.as_bytes().to_vec(),
                         "convalidated" => b"t".to_vec(),
                         _ => Vec::new(),
                     })
@@ -1451,6 +1482,30 @@ where
                     .catalog_indexes(&table)
                     .into_iter()
                     .map(|index| {
+                        let definitions = executor.catalog_columns(&table);
+                        let ordinals = if index.columns.is_empty() {
+                            index
+                                .column
+                                .as_deref()
+                                .and_then(|column| {
+                                    definitions.iter().position(|definition| {
+                                        definition.name.eq_ignore_ascii_case(column)
+                                    })
+                                })
+                                .map(|ordinal| vec![ordinal + 1])
+                                .unwrap_or_else(|| vec![1])
+                        } else {
+                            index
+                                .columns
+                                .iter()
+                                .filter_map(|column| {
+                                    definitions.iter().position(|definition| {
+                                        definition.name.eq_ignore_ascii_case(column)
+                                    })
+                                })
+                                .map(|ordinal| ordinal + 1)
+                                .collect::<Vec<_>>()
+                        };
                         let index_oid = catalog_index_oid(&index.name);
                         columns
                             .iter()
@@ -1465,8 +1520,15 @@ where
                                     }
                                 }
                                 "indisprimary" => b"f".to_vec(),
-                                "indnatts" | "indnkeyatts" => b"1".to_vec(),
-                                "indkey" => b"1".to_vec(),
+                                "indnatts" | "indnkeyatts" => {
+                                    ordinals.len().to_string().into_bytes()
+                                }
+                                "indkey" => ordinals
+                                    .iter()
+                                    .map(usize::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                                    .into_bytes(),
                                 _ => Vec::new(),
                             })
                             .collect()
