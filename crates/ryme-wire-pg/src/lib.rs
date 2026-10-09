@@ -1392,17 +1392,22 @@ where
             }
             let relation_oid = catalog_relation_oid(&table);
             let definitions = executor.catalog_columns(&table);
-            for (ordinal, definition) in definitions.iter().enumerate() {
-                if definition.primary_key {
-                    let name = format!("{}_{}_pkey", table_name, definition.name);
-                    constraints.push((
-                        name,
-                        String::from("p"),
-                        relation_oid,
-                        catalog_index_oid(&format!("constraint:{table}:{ordinal}")),
-                        format!("{{{}}}", ordinal + 1),
-                    ));
-                }
+            let primary_ordinals = definitions
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, definition)| definition.primary_key.then_some(ordinal + 1))
+                .collect::<Vec<_>>();
+            if !primary_ordinals.is_empty() {
+                constraints.push((
+                    format!("{table_name}_pkey"),
+                    String::from("p"),
+                    relation_oid,
+                    catalog_index_oid(&format!("constraint:{table}")),
+                    format!(
+                        "{{{}}}",
+                        primary_ordinals.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+                    ),
+                ));
             }
             for index in executor.catalog_indexes(&table).into_iter().filter(|index| index.unique) {
                 let ordinals = if index.columns.is_empty() {

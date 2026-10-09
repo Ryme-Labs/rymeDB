@@ -84,8 +84,8 @@ rows written directly in the branch overlay.
 
 ## SQL dialect
 
-`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, single-column
-and composite `UNIQUE` constraints,
+`CREATE TABLE` (including `IF NOT EXISTS`, column types, single-column and composite
+`PRIMARY KEY` constraints, single-column and composite `UNIQUE` constraints,
 `NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
 `DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability changes
 (including `IF [NOT] EXISTS` where supported), plus

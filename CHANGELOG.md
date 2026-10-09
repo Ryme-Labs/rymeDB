@@ -45,8 +45,9 @@ All notable changes to rymeDB are recorded here. Format follows
   `_` patterns.
 - Named and JSON-path indexes now preserve their indexed column metadata and
   enforce unique constraints across inserts, updates, and transactions.
-- `CREATE TABLE` now recognizes single-column table-level `PRIMARY KEY`
-  constraints and rejects unsupported composite primary keys explicitly.
+- `CREATE TABLE` now recognizes column-level and table-level `PRIMARY KEY`
+  constraints, including composite keys encoded as stable length-delimited
+  storage keys.
 - Duplicate `CREATE TABLE` statements now fail, while `CREATE TABLE IF NOT
   EXISTS` remains idempotent without replacing the existing schema.
 - Duplicate `CREATE INDEX` statements now fail unless `IF NOT EXISTS` is used;

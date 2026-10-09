@@ -1131,11 +1131,6 @@ fn parse_table_definition(raw: &str) -> Result<(Vec<ColumnDefinition>, Vec<Vec<S
             table_unique.push(columns);
         }
     }
-    if table_primary.len() > 1 {
-        return Err(RymeError::InvalidArgument(String::from(
-            "composite primary keys are not supported",
-        )));
-    }
     let mut columns: Vec<ColumnDefinition> = items
         .into_iter()
         .filter_map(|definition| {
@@ -1191,9 +1186,9 @@ fn parse_table_definition(raw: &str) -> Result<(Vec<ColumnDefinition>, Vec<Vec<S
             })
         })
         .collect();
-    if let Some(primary) = table_primary.first() {
+    for primary in table_primary {
         let Some(column) =
-            columns.iter_mut().find(|column| column.name.eq_ignore_ascii_case(primary))
+            columns.iter_mut().find(|column| column.name.eq_ignore_ascii_case(&primary))
         else {
             return Err(RymeError::InvalidArgument(format!(
                 "unknown primary key column {primary}"
@@ -2376,6 +2371,33 @@ fn json_column_value<'a>(
     }
 }
 
+fn encode_key_parts(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for part in parts {
+        if part.is_empty() {
+            return None;
+        }
+        let length = u32::try_from(part.len()).ok()?;
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(part);
+    }
+    Some(encoded)
+}
+
+fn decode_key_parts(encoded: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut parts = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < encoded.len() {
+        let length_bytes = encoded.get(cursor..cursor + 4)?;
+        let length = u32::from_be_bytes(length_bytes.try_into().ok()?) as usize;
+        cursor = cursor.checked_add(4)?;
+        let end = cursor.checked_add(length)?;
+        parts.push(encoded.get(cursor..end)?.to_vec());
+        cursor = end;
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
 fn index_value(definition: &IndexDefinition, pk: &[u8], value: &[u8]) -> Option<Vec<u8>> {
     if !definition.columns.is_empty() {
         let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
@@ -3154,11 +3176,18 @@ where
             next
         } else {
             let mut highest = 0u64;
+            let composite_primary = self
+                .catalog_columns(table)
+                .iter()
+                .filter(|definition| definition.primary_key)
+                .count()
+                > 1;
             for (pk, value) in self.scan_all_rows(table)? {
-                let candidate = if definition.primary_key
-                    || definition.name.eq_ignore_ascii_case("id")
-                    || definition.name.eq_ignore_ascii_case("pk")
-                    || definition.name.eq_ignore_ascii_case("key")
+                let candidate = if !composite_primary
+                    && (definition.primary_key
+                        || definition.name.eq_ignore_ascii_case("id")
+                        || definition.name.eq_ignore_ascii_case("pk")
+                        || definition.name.eq_ignore_ascii_case("key"))
                 {
                     std::str::from_utf8(&pk).ok().and_then(|value| value.parse::<u64>().ok())
                 } else {
@@ -3310,25 +3339,47 @@ where
             }
         }
 
-        let primary_key = definitions
+        let primary_keys = definitions
             .iter()
-            .find(|definition| definition.primary_key)
+            .filter(|definition| definition.primary_key)
             .map(|definition| definition.name.to_ascii_lowercase())
-            .or_else(|| {
-                row.iter()
-                    .find(|(name, _, _)| {
-                        name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("pk")
-                    })
-                    .map(|(name, _, _)| name.to_ascii_lowercase())
-            })
-            .or_else(|| row.first().map(|(name, _, _)| name.to_ascii_lowercase()))
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("insert primary key")))?;
-        let pk = row
-            .iter()
-            .find(|(name, _, _)| name.eq_ignore_ascii_case(&primary_key))
-            .and_then(|(_, value, _)| value.clone())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("null value in primary key")))?;
+            .collect::<Vec<_>>();
+        let pk = if primary_keys.len() > 1 {
+            let parts = primary_keys
+                .iter()
+                .map(|primary_key| {
+                    row.iter()
+                        .find(|(name, _, _)| name.eq_ignore_ascii_case(primary_key))
+                        .and_then(|(_, value, _)| value.clone())
+                        .ok_or_else(|| {
+                            RymeError::InvalidArgument(String::from("null value in primary key"))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            encode_key_parts(&parts).ok_or_else(|| {
+                RymeError::InvalidArgument(String::from("null value in primary key"))
+            })?
+        } else {
+            let primary_key = primary_keys
+                .first()
+                .cloned()
+                .or_else(|| {
+                    row.iter()
+                        .find(|(name, _, _)| {
+                            name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("pk")
+                        })
+                        .map(|(name, _, _)| name.to_ascii_lowercase())
+                })
+                .or_else(|| row.first().map(|(name, _, _)| name.to_ascii_lowercase()))
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("insert primary key")))?;
+            row.iter()
+                .find(|(name, _, _)| name.eq_ignore_ascii_case(&primary_key))
+                .and_then(|(_, value, _)| value.clone())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RymeError::InvalidArgument(String::from("null value in primary key"))
+                })?
+        };
 
         let mut object = serde_json::Map::new();
         for (name, value, data_type) in row {
@@ -3404,22 +3455,17 @@ where
             .ok_or_else(|| {
                 RymeError::InvalidArgument(String::from("row is not a schema record"))
             })?;
-        let primary_key = definitions
+        let primary_keys = definitions
             .iter()
-            .find(|definition| definition.primary_key)
-            .map(|definition| definition.name.as_str())
-            .or_else(|| {
-                definitions
-                    .iter()
-                    .find(|definition| definition.name.eq_ignore_ascii_case("id"))
-                    .map(|definition| definition.name.as_str())
-            });
+            .filter(|definition| definition.primary_key)
+            .map(|definition| definition.name.clone())
+            .collect::<Vec<_>>();
         for (column, value) in assignments {
             let definition = definitions
                 .iter()
                 .find(|definition| definition.name.eq_ignore_ascii_case(&column))
                 .ok_or_else(|| RymeError::InvalidArgument(format!("unknown column {column}")))?;
-            if primary_key.is_some_and(|name| name.eq_ignore_ascii_case(&column)) {
+            if primary_keys.iter().any(|name| name.eq_ignore_ascii_case(&column)) {
                 return Err(RymeError::InvalidArgument(String::from(
                     "updating the primary key is not supported",
                 )));
@@ -3442,10 +3488,12 @@ where
                 json_insert_value(resolved, &definition.data_type),
             );
         }
-        object.insert(
-            primary_key.unwrap_or("id").to_string(),
-            serde_json::Value::String(String::from_utf8_lossy(pk).to_string()),
-        );
+        if primary_keys.len() <= 1 {
+            object.insert(
+                primary_keys.first().cloned().unwrap_or_else(|| String::from("id")),
+                serde_json::Value::String(String::from_utf8_lossy(pk).to_string()),
+            );
+        }
         serde_json::to_vec(&serde_json::Value::Object(object))
             .map_err(|error| RymeError::Internal(error.to_string()))
     }
@@ -3458,10 +3506,9 @@ where
         value: &[u8],
     ) -> Vec<Vec<u8>> {
         let definitions = self.catalog_columns(table);
-        let primary_key = definitions
-            .iter()
-            .find(|definition| definition.primary_key)
-            .map(|definition| definition.name.as_str());
+        let primary_keys =
+            definitions.iter().filter(|definition| definition.primary_key).collect::<Vec<_>>();
+        let composite_parts = (primary_keys.len() > 1).then(|| decode_key_parts(pk)).flatten();
         let object = serde_json::from_slice::<serde_json::Value>(value).ok();
         columns
             .iter()
@@ -3469,10 +3516,18 @@ where
                 let schema_column = definitions
                     .iter()
                     .any(|definition| definition.name.eq_ignore_ascii_case(column));
+                if let Some(primary_index) = primary_keys
+                    .iter()
+                    .position(|definition| definition.name.eq_ignore_ascii_case(column))
+                {
+                    if let Some(parts) = composite_parts.as_ref() {
+                        return parts.get(primary_index).cloned().unwrap_or_default();
+                    }
+                    return pk.to_vec();
+                }
                 if column.eq_ignore_ascii_case("key")
                     || column.eq_ignore_ascii_case("pk")
                     || column.eq_ignore_ascii_case("id")
-                    || primary_key.is_some_and(|name| name.eq_ignore_ascii_case(column))
                 {
                     return pk.to_vec();
                 }
@@ -6511,10 +6566,14 @@ mod tests {
         assert!(columns[0].primary_key);
         assert!(!columns[0].nullable);
         assert!(!columns[1].primary_key);
-        assert!(parse(
-            "CREATE TABLE users (left_id BIGINT, right_id BIGINT, PRIMARY KEY (left_id, right_id))"
+        let Statement::CreateTable { columns, .. } = parse(
+            "CREATE TABLE users (left_id BIGINT, right_id BIGINT, PRIMARY KEY (left_id, right_id))",
         )
-        .is_err());
+        .unwrap() else {
+            panic!("expected create table")
+        };
+        assert!(columns.iter().all(|column| column.primary_key));
+        assert!(columns.iter().all(|column| !column.nullable));
     }
 
     #[test]
@@ -6658,6 +6717,47 @@ mod tests {
             .unwrap())
             .await;
         assert!(null_tuple.is_ok());
+    }
+
+    #[tokio::test]
+    async fn composite_primary_keys_encode_and_project_each_component() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse(
+                "CREATE TABLE memberships (tenant_id TEXT, user_id TEXT, role TEXT, PRIMARY KEY (tenant_id, user_id))",
+            )
+            .unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse(
+                "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('tenant-a', 'user-a', 'admin')",
+            )
+            .unwrap())
+            .await
+            .unwrap();
+        let duplicate = executor
+            .execute(parse(
+                "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('tenant-a', 'user-a', 'member')",
+            )
+            .unwrap())
+            .await;
+        assert!(duplicate.is_err());
+
+        let result = executor
+            .execute(parse(
+                "SELECT tenant_id, user_id, role FROM memberships WHERE tenant_id = 'tenant-a' AND user_id = 'user-a'",
+            )
+            .unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { rows, .. }
+                if rows == vec![
+                    vec![b"tenant-a".to_vec(), b"user-a".to_vec(), b"admin".to_vec()]
+                ]
+        ));
     }
 
     #[tokio::test]
