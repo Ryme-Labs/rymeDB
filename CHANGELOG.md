@@ -41,6 +41,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Filtered scans now paginate through storage pages until they collect the
   requested matches, preventing late matches from being hidden behind a full
   first page on large unindexed tables.
+- SQL predicates now support `LIKE` and `ILIKE` wildcard matching with `%` and
+  `_` patterns.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

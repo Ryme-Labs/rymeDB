@@ -230,6 +230,8 @@ pub enum Cmp {
     IsNull,
     IsNotNull,
     Contains,
+    Like,
+    ILike,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,8 +358,42 @@ impl Predicate {
                 let want = String::from_utf8_lossy(&self.operand);
                 text.contains(want.as_ref())
             }
+            Cmp::Like | Cmp::ILike => {
+                let text = String::from_utf8_lossy(target);
+                let pattern = String::from_utf8_lossy(&self.operand);
+                if self.op == Cmp::ILike {
+                    sql_like(&text.to_lowercase(), &pattern.to_lowercase())
+                } else {
+                    sql_like(&text, &pattern)
+                }
+            }
         }
     }
+}
+
+fn sql_like(value: &str, pattern: &str) -> bool {
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut matches = vec![false; value.len() + 1];
+    matches[0] = true;
+    for token in pattern {
+        if token == '%' {
+            for index in 1..=value.len() {
+                matches[index] = matches[index] || matches[index - 1];
+            }
+        } else {
+            let mut next = vec![false; matches.len()];
+            for index in 1..next.len() {
+                if matches[index - 1]
+                    && (token == '_' || value.get(index - 1).is_some_and(|value| *value == token))
+                {
+                    next[index] = true;
+                }
+            }
+            matches = next;
+        }
+    }
+    matches[value.len()]
 }
 
 fn compare_operands(left: &[u8], right: &[u8]) -> Option<std::cmp::Ordering> {
@@ -1280,6 +1316,16 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op: Cmp::Contains,
                 operand: unquote(&parts[2]).into_bytes(),
             });
+        }
+        let op = if parts[1].eq_ignore_ascii_case("LIKE") {
+            Some(Cmp::Like)
+        } else if parts[1].eq_ignore_ascii_case("ILIKE") {
+            Some(Cmp::ILike)
+        } else {
+            None
+        };
+        if let Some(op) = op {
+            return Ok(Predicate { field, column, op, operand: unquote(&parts[2]).into_bytes() });
         }
     }
     if parts.len() == 4 {
@@ -4768,6 +4814,20 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+        let rows = executor
+            .execute(parse("SELECT * FROM docs WHERE value LIKE 'ap%'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(rows, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"a".as_slice(), b"c".as_slice()])
+        );
+        let rows = executor
+            .execute(parse("SELECT * FROM docs WHERE value ILIKE 'AP%'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(rows, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"a".as_slice(), b"c".as_slice()])
+        );
         let rows = executor
             .execute(
                 parse("SELECT * FROM docs WHERE key != 'b' ORDER BY key DESC LIMIT 2").unwrap(),
