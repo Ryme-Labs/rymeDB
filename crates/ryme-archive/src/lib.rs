@@ -1,7 +1,9 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::{Component, Path};
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 
 pub mod local;
 pub mod s3;
@@ -77,6 +79,52 @@ fn safe_relative_name(name: &str) -> bool {
         && Path::new(name).components().all(|component| matches!(component, Component::Normal(_)))
 }
 
+fn valid_backup_id(backup_id: &str) -> bool {
+    !backup_id.is_empty()
+        && backup_id.len() <= 128
+        && !backup_id.contains('/')
+        && !backup_id.contains("..")
+}
+
+fn valid_sha256(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_manifest(manifest_key: &str, manifest: &BackupManifest) -> Result<()> {
+    if !valid_backup_id(&manifest.backup_id) {
+        return Err(RymeError::Corrupt(String::from("manifest backup_id")));
+    }
+    if manifest_key != manifest.manifest_key() {
+        return Err(RymeError::Corrupt(String::from("manifest key")));
+    }
+    let prefix = manifest.prefix();
+    let mut names = HashSet::with_capacity(manifest.files.len());
+    for file in &manifest.files {
+        let name = file
+            .key
+            .strip_prefix(&prefix)
+            .filter(|name| safe_relative_name(name))
+            .ok_or_else(|| RymeError::Corrupt(String::from("manifest filename")))?;
+        if !names.insert(name.to_string()) {
+            return Err(RymeError::Corrupt(String::from("manifest duplicate")));
+        }
+        if !valid_sha256(&file.sha256) {
+            return Err(RymeError::Corrupt(String::from("manifest checksum")));
+        }
+    }
+    Ok(())
+}
+
+fn restore_stage_path(dest_dir: &Path) -> PathBuf {
+    let parent = dest_dir.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest_dir.file_name().and_then(|name| name.to_str()).unwrap_or("restore");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{name}.restore-{}-{nanos}", std::process::id()))
+}
+
 pub struct Archiver<S> {
     store: S,
 }
@@ -127,17 +175,18 @@ impl<S: ObjectStore> Archiver<S> {
     where
         F: Fn(&[u8]) -> Result<(Vec<u8>, Option<FileEncryption>)> + Send + Sync,
     {
-        if backup_id.is_empty() || backup_id.len() > 128 {
-            return Err(RymeError::InvalidArgument(String::from("backup_id")));
-        }
-        if backup_id.contains('/') || backup_id.contains("..") {
+        if !valid_backup_id(backup_id) {
             return Err(RymeError::InvalidArgument(String::from("backup_id")));
         }
         let prefix = format!("backups/{commit_ts:020}-{backup_id}/");
         let mut entries = Vec::new();
+        let mut names = HashSet::with_capacity(files.len());
         for (name, bytes) in files {
             if !safe_relative_name(&name) {
                 return Err(RymeError::InvalidArgument(String::from("filename")));
+            }
+            if !names.insert(name.clone()) {
+                return Err(RymeError::InvalidArgument(String::from("duplicate filename")));
             }
             let key = format!("{prefix}{name}");
             let (stored, encryption) = protect(&bytes)?;
@@ -171,6 +220,7 @@ impl<S: ObjectStore> Archiver<S> {
             let raw = self.store.get(&key).await?;
             let manifest: BackupManifest = serde_json::from_slice(&raw)
                 .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
+            validate_manifest(&key, &manifest)?;
             out.push(manifest);
         }
         out.sort_by_key(|m| m.commit_ts);
@@ -194,25 +244,45 @@ impl<S: ObjectStore> Archiver<S> {
         let raw = self.store.get(manifest_key).await?;
         let manifest: BackupManifest = serde_json::from_slice(&raw)
             .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
-        std::fs::create_dir_all(dest_dir)?;
-        for file in &manifest.files {
-            let bytes = self.store.get(&file.key).await?;
-            if sha256_hex(&bytes) != file.sha256 {
-                return Err(RymeError::Corrupt(String::from("restore verify")));
+        validate_manifest(manifest_key, &manifest)?;
+        if std::fs::symlink_metadata(dest_dir).is_ok() {
+            return Err(RymeError::Conflict(String::from("restore destination exists")));
+        }
+        if let Some(parent) = dest_dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let staging = restore_stage_path(dest_dir);
+        std::fs::create_dir(&staging)?;
+        let restore_result: Result<()> = async {
+            for file in &manifest.files {
+                let bytes = self.store.get(&file.key).await?;
+                if bytes.len() as u64 != file.bytes || sha256_hex(&bytes) != file.sha256 {
+                    return Err(RymeError::Corrupt(String::from("restore verify")));
+                }
+                let plain = open(&file.encryption, &bytes)?;
+                let name =
+                    file.key.strip_prefix(&manifest.prefix()).expect("validated archive manifest");
+                let dest = staging.join(name);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let tmp = dest.with_extension("tmp");
+                let mut output = std::fs::File::create(&tmp)?;
+                output.write_all(&plain)?;
+                output.sync_all()?;
+                drop(output);
+                std::fs::rename(&tmp, &dest)?;
             }
-            let plain = open(&file.encryption, &bytes)?;
-            let name = file
-                .key
-                .strip_prefix(&manifest.prefix())
-                .filter(|name| safe_relative_name(name))
-                .ok_or_else(|| RymeError::Corrupt(String::from("filename")))?;
-            let dest = dest_dir.join(name);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let tmp = dest.with_extension("tmp");
-            std::fs::write(&tmp, &plain)?;
-            std::fs::rename(&tmp, &dest)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = restore_result {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&staging, dest_dir) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error.into());
         }
         Ok(manifest.commit_ts)
     }
@@ -225,10 +295,11 @@ impl<S: ObjectStore> Archiver<S> {
         let raw = self.store.get(manifest_key).await?;
         let manifest: BackupManifest = serde_json::from_slice(&raw)
             .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
+        validate_manifest(manifest_key, &manifest)?;
         let mut verified = 0u64;
         for file in &manifest.files {
             let bytes = self.store.get(&file.key).await?;
-            if sha256_hex(&bytes) != file.sha256 {
+            if bytes.len() as u64 != file.bytes || sha256_hex(&bytes) != file.sha256 {
                 return Err(RymeError::Corrupt(String::from("restore verify")));
             }
             open(&file.encryption, &bytes)?;
@@ -260,10 +331,11 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
     dest: &D,
     manifest: &BackupManifest,
 ) -> Result<u64> {
+    validate_manifest(&manifest.manifest_key(), manifest)?;
     let mut copied = 0u64;
     for file in &manifest.files {
         let bytes = source.get(&file.key).await?;
-        if sha256_hex(&bytes) != file.sha256 {
+        if bytes.len() as u64 != file.bytes || sha256_hex(&bytes) != file.sha256 {
             return Err(RymeError::Corrupt(String::from("copy verify")));
         }
         dest.put(&file.key, bytes).await?;
@@ -276,8 +348,9 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
     }
     let key = manifest.manifest_key();
     let raw = source.get(&key).await?;
-    serde_json::from_slice::<BackupManifest>(&raw)
-        .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
+    let copied_manifest: BackupManifest =
+        serde_json::from_slice(&raw).map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
+    validate_manifest(&key, &copied_manifest)?;
     dest.put(&key, raw).await?;
     Ok(copied)
 }
@@ -365,6 +438,64 @@ mod tests {
         backend.put(&manifest.files[0].key, b"fake".to_vec()).await.unwrap();
         let result = archiver.restore_backup(&manifest.manifest_key(), &root.join("out")).await;
         assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_is_atomic_on_late_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-atomic-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = LocalStore::new(root.clone());
+        let archiver = Archiver::new(store.clone());
+        let manifest = archiver
+            .archive_files(
+                "atomic",
+                8,
+                vec![
+                    (String::from("first"), b"first".to_vec()),
+                    (String::from("second"), b"second".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        store.put(&manifest.files[1].key, b"tampered".to_vec()).await.unwrap();
+
+        let dest = root.join("out");
+        let result = archiver.restore_backup(&manifest.manifest_key(), &dest).await;
+        assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        assert!(!dest.exists());
+        assert!(!root
+            .read_dir()
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".out.restore-")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn archive_rejects_duplicate_filenames() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-duplicates-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let archiver = Archiver::new(LocalStore::new(root.clone()));
+        let result = archiver
+            .archive_files(
+                "duplicates",
+                1,
+                vec![
+                    (String::from("same"), b"one".to_vec()),
+                    (String::from("same"), b"two".to_vec()),
+                ],
+            )
+            .await;
+        assert!(matches!(result, Err(RymeError::InvalidArgument(_))));
         let _ = std::fs::remove_dir_all(&root);
     }
 
