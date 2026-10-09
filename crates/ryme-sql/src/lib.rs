@@ -46,6 +46,11 @@ pub enum Statement {
         from: String,
         to: String,
     },
+    AlterTableColumn {
+        table: String,
+        column: String,
+        alteration: ColumnAlteration,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -166,6 +171,14 @@ pub enum InsertValue {
     Value(Vec<u8>),
     Default,
     Null,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColumnAlteration {
+    SetDefault(String),
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +486,7 @@ impl Statement {
             | Self::AlterTableAddColumn { table, .. }
             | Self::AlterTableDropColumn { table, .. }
             | Self::AlterTableRenameColumn { table, .. }
+            | Self::AlterTableColumn { table, .. }
             | Self::CreateIndex { table, .. }
             | Self::Insert { table, .. }
             | Self::InsertRow { table, .. }
@@ -568,12 +582,14 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(2)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table")))?;
-    if let Some(drop_pos) = tokens
-        .iter()
-        .enumerate()
-        .skip(3)
-        .find_map(|(position, token)| token.eq_ignore_ascii_case("DROP").then_some(position))
-    {
+    if let Some(drop_pos) = tokens.iter().enumerate().skip(3).find_map(|(position, token)| {
+        if !token.eq_ignore_ascii_case("DROP") {
+            return None;
+        }
+        let is_column_alter =
+            tokens.iter().take(position).skip(3).any(|token| token.eq_ignore_ascii_case("ALTER"));
+        (!is_column_alter).then_some(position)
+    }) {
         let initial_column_pos =
             if tokens.get(drop_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
                 drop_pos + 2
@@ -617,6 +633,60 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
             .map(|value| unquote(value))
             .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
         return Ok(Statement::AlterTableRenameColumn { table, from, to });
+    }
+    if let Some(alter_pos) = tokens
+        .iter()
+        .enumerate()
+        .skip(3)
+        .find_map(|(position, token)| token.eq_ignore_ascii_case("ALTER").then_some(position))
+    {
+        let column_pos = if tokens
+            .get(alter_pos + 1)
+            .is_some_and(|token| token.eq_ignore_ascii_case("COLUMN"))
+        {
+            alter_pos + 2
+        } else {
+            alter_pos + 1
+        };
+        let column = tokens
+            .get(column_pos)
+            .map(|value| unquote(value))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
+        let action_pos = column_pos + 1;
+        let alteration = if tokens
+            .get(action_pos)
+            .is_some_and(|token| token.eq_ignore_ascii_case("SET"))
+            && tokens.get(action_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("DEFAULT"))
+        {
+            let default = tokens
+                .get(action_pos + 2..)
+                .unwrap_or_default()
+                .join(" ")
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
+            if default.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from("alter column default")));
+            }
+            ColumnAlteration::SetDefault(default)
+        } else if tokens.get(action_pos).is_some_and(|token| token.eq_ignore_ascii_case("DROP"))
+            && tokens.get(action_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("DEFAULT"))
+        {
+            ColumnAlteration::DropDefault
+        } else if tokens.get(action_pos).is_some_and(|token| token.eq_ignore_ascii_case("SET"))
+            && tokens.get(action_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+            && tokens.get(action_pos + 2).is_some_and(|token| token.eq_ignore_ascii_case("NULL"))
+        {
+            ColumnAlteration::SetNotNull
+        } else if tokens.get(action_pos).is_some_and(|token| token.eq_ignore_ascii_case("DROP"))
+            && tokens.get(action_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+            && tokens.get(action_pos + 2).is_some_and(|token| token.eq_ignore_ascii_case("NULL"))
+        {
+            ColumnAlteration::DropNotNull
+        } else {
+            return Err(RymeError::InvalidArgument(String::from("alter column")));
+        };
+        return Ok(Statement::AlterTableColumn { table, column, alteration });
     }
     let add_pos = tokens
         .iter()
@@ -2046,6 +2116,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         }
         Statement::AlterTableRenameColumn { table, from, to } => {
             format!("ddl alter_table({table}) rename_column({from}, {to})")
+        }
+        Statement::AlterTableColumn { table, column, alteration } => {
+            format!("ddl alter_table({table}) alter_column({column}, {alteration:?})")
         }
         Statement::CreateIndex { name, table, field, column, unique, .. } => {
             let field = column.as_deref().unwrap_or(match field {
@@ -3776,6 +3849,63 @@ where
         Ok(())
     }
 
+    async fn alter_table_column(
+        &self,
+        table: String,
+        column: String,
+        alteration: ColumnAlteration,
+    ) -> Result<()> {
+        self.reject_if_read_only()?;
+        let existing = self
+            .catalog
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        if !existing.iter().any(|definition| definition.name.eq_ignore_ascii_case(&column)) {
+            return Err(RymeError::NotFound(String::from("column")));
+        }
+        if matches!(&alteration, ColumnAlteration::SetNotNull) {
+            for (_, value) in self.scan_all_rows(&table)? {
+                let serde_json::Value::Object(object) = serde_json::from_slice(&value)
+                    .map_err(|_| RymeError::InvalidArgument(String::from("schema row")))?
+                else {
+                    return Err(RymeError::InvalidArgument(String::from("schema row")));
+                };
+                let present = object
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&column))
+                    .map(|(_, value)| !value.is_null())
+                    .unwrap_or(false);
+                if !present {
+                    return Err(RymeError::InvalidArgument(format!(
+                        "column {} contains null values",
+                        column
+                    )));
+                }
+            }
+        }
+        let mut catalog =
+            self.catalog.lock().map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
+        let definition = catalog
+            .get_mut(&table)
+            .and_then(|definitions| {
+                definitions
+                    .iter_mut()
+                    .find(|definition| definition.name.eq_ignore_ascii_case(&column))
+            })
+            .ok_or_else(|| RymeError::NotFound(String::from("column")))?;
+        match alteration {
+            ColumnAlteration::SetDefault(default) => definition.column_default = Some(default),
+            ColumnAlteration::DropDefault => definition.column_default = None,
+            ColumnAlteration::SetNotNull => definition.nullable = false,
+            ColumnAlteration::DropNotNull => definition.nullable = true,
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn ensure_table(&self, table: &str) {
         self.register_table(table.to_string(), Vec::new());
     }
@@ -3883,6 +4013,7 @@ where
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
             Statement::AlterTableRenameColumn { .. } => {}
+            Statement::AlterTableColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
@@ -3920,6 +4051,10 @@ where
             }
             Statement::AlterTableRenameColumn { table, from, to } => {
                 self.alter_table_rename_column(table, from, to).await?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterTableColumn { table, column, alteration } => {
+                self.alter_table_column(table, column, alteration).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::DropIndex { name, if_exists } => {
@@ -4488,6 +4623,7 @@ where
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
             Statement::AlterTableRenameColumn { .. } => {}
+            Statement::AlterTableColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
@@ -4500,6 +4636,7 @@ where
                 | Statement::AlterTableAddColumn { .. }
                 | Statement::AlterTableDropColumn { .. }
                 | Statement::AlterTableRenameColumn { .. }
+                | Statement::AlterTableColumn { .. }
                 | Statement::CreateIndex { .. }
         );
         let result = match statement {
@@ -4634,6 +4771,10 @@ where
             }
             Statement::AlterTableRenameColumn { table, from, to } => {
                 self.alter_table_rename_column(table, from, to).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterTableColumn { table, column, alteration } => {
+                self.alter_table_column(table, column, alteration).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreateIndex { name, table, field, column, unique, if_not_exists } => {
@@ -6215,6 +6356,72 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn alter_table_column_updates_defaults_and_nullability() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE events (id TEXT PRIMARY KEY, state TEXT DEFAULT 'new')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE events ALTER COLUMN state SET DEFAULT 'queued'").unwrap())
+            .await
+            .unwrap();
+        executor.execute(parse("INSERT INTO events (id) VALUES ('e1')").unwrap()).await.unwrap();
+        let result = executor
+            .execute(parse("SELECT state FROM events WHERE id = 'e1'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"queued".to_vec()]])
+        );
+
+        executor
+            .execute(parse("ALTER TABLE events ALTER COLUMN state DROP DEFAULT").unwrap())
+            .await
+            .unwrap();
+        assert!(executor
+            .catalog_columns("events")
+            .iter()
+            .find(|column| column.name == "state")
+            .is_some_and(|column| column.column_default.is_none()));
+
+        executor
+            .execute(parse("CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor.execute(parse("INSERT INTO jobs (id) VALUES ('j1')").unwrap()).await.unwrap();
+        assert!(executor
+            .execute(parse("ALTER TABLE jobs ALTER COLUMN status SET NOT NULL").unwrap())
+            .await
+            .is_err());
+        executor
+            .execute(parse("UPDATE jobs SET status = 'ready' WHERE id = 'j1'").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE jobs ALTER COLUMN status SET NOT NULL").unwrap())
+            .await
+            .unwrap();
+        assert!(executor
+            .catalog_columns("jobs")
+            .iter()
+            .find(|column| column.name == "status")
+            .is_some_and(|column| !column.nullable));
+        executor
+            .execute(parse("ALTER TABLE jobs ALTER COLUMN status DROP NOT NULL").unwrap())
+            .await
+            .unwrap();
+        assert!(executor
+            .catalog_columns("jobs")
+            .iter()
+            .find(|column| column.name == "status")
+            .is_some_and(|column| column.nullable));
     }
 
     #[tokio::test]
