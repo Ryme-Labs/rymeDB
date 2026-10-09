@@ -92,6 +92,13 @@ async fn psql_smoke() {
     assert!(out.contains("created_at|timestamp with time zone|YES|now()"), "{out}");
     let (ok, out) = psql(
         addr,
+        "CREATE TABLE public.events (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payload TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now()); INSERT INTO public.events (payload) VALUES ('hello') RETURNING *;",
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(out.contains("hello"), "{out}");
+    let (ok, out) = psql(
+        addr,
         "CREATE INDEX messages_payload_idx ON public.messages (payload); SELECT indexname, tablename FROM pg_catalog.pg_indexes WHERE tablename = 'messages';",
     )
     .await;

@@ -23,6 +23,12 @@ pub enum Statement {
         pk: Vec<u8>,
         value: Vec<u8>,
     },
+    InsertRow {
+        table: String,
+        columns: Vec<String>,
+        values: Vec<InsertValue>,
+        upsert: bool,
+    },
     Upsert {
         table: String,
         pk: Vec<u8>,
@@ -86,6 +92,13 @@ pub enum Statement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InsertValue {
+    Value(Vec<u8>),
+    Default,
+    Null,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: String,
@@ -107,6 +120,7 @@ impl Statement {
         matches!(
             self,
             Statement::Insert { .. }
+                | Statement::InsertRow { .. }
                 | Statement::Upsert { .. }
                 | Statement::Update { .. }
                 | Statement::Delete { .. }
@@ -251,6 +265,7 @@ impl Statement {
             Self::CreateTable { table, .. }
             | Self::CreateIndex { table, .. }
             | Self::Insert { table, .. }
+            | Self::InsertRow { table, .. }
             | Self::Upsert { table, .. }
             | Self::SelectByKey { table, .. }
             | Self::SelectScan { table, .. }
@@ -524,6 +539,26 @@ fn split_sql_items(input: &str) -> Vec<String> {
 
 fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
+    if let Some((columns, values)) = parse_standard_insert_row(raw)? {
+        let upsert = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
+        if columns.len() == 2 && values.len() == 2 {
+            let values = values
+                .into_iter()
+                .map(|value| match value {
+                    InsertValue::Value(value) => Ok(value),
+                    InsertValue::Default | InsertValue::Null => {
+                        Err(RymeError::InvalidArgument(String::from("default key/value insert")))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return if upsert {
+                Ok(Statement::Upsert { table, pk: values[0].clone(), value: values[1].clone() })
+            } else {
+                Ok(Statement::Insert { table, pk: values[0].clone(), value: values[1].clone() })
+            };
+        }
+        return Ok(Statement::InsertRow { table, columns, values, upsert });
+    }
     let (pk, value) = if let Some(values) =
         tokens.iter().position(|token| token.eq_ignore_ascii_case("VALUES"))
     {
@@ -542,6 +577,83 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
         return Ok(Statement::Upsert { table, pk, value });
     }
     Ok(Statement::Insert { table, pk, value })
+}
+
+fn parse_standard_insert_row(raw: &str) -> Result<Option<(Vec<String>, Vec<InsertValue>)>> {
+    let upper = raw.to_ascii_uppercase();
+    let Some(values_keyword) = upper.find("VALUES") else {
+        return Ok(None);
+    };
+    let before_values = &raw[..values_keyword];
+    let Some(columns_open) = before_values.find('(') else {
+        return Ok(None);
+    };
+    let Some(columns_close) = matching_paren(before_values, columns_open) else {
+        return Err(RymeError::InvalidArgument(String::from("insert columns")));
+    };
+    if columns_close <= columns_open {
+        return Err(RymeError::InvalidArgument(String::from("insert columns")));
+    }
+    let columns = split_sql_items(&before_values[columns_open + 1..columns_close])
+        .into_iter()
+        .map(|column| unquote(column.trim()))
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("insert columns")));
+    }
+
+    let values_clause = &raw[values_keyword + "VALUES".len()..];
+    let Some(values_open) = values_clause.find('(') else {
+        return Err(RymeError::InvalidArgument(String::from("insert values")));
+    };
+    let Some(values_close) = matching_paren(values_clause, values_open) else {
+        return Err(RymeError::InvalidArgument(String::from("insert values")));
+    };
+    if values_close <= values_open {
+        return Err(RymeError::InvalidArgument(String::from("insert values")));
+    }
+    let values = split_sql_items(&values_clause[values_open + 1..values_close])
+        .into_iter()
+        .map(|value| parse_insert_value(value.trim()))
+        .collect::<Result<Vec<_>>>()?;
+    if columns.len() != values.len() {
+        return Err(RymeError::InvalidArgument(String::from("insert column/value count")));
+    }
+    Ok(Some((columns, values)))
+}
+
+fn matching_paren(input: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    for (index, ch) in input.char_indices().skip_while(|(index, _)| *index < open) {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn parse_insert_value(raw: &str) -> Result<InsertValue> {
+    if raw.eq_ignore_ascii_case("DEFAULT") {
+        return Ok(InsertValue::Default);
+    }
+    if raw.eq_ignore_ascii_case("NULL") {
+        return Ok(InsertValue::Null);
+    }
+    Ok(InsertValue::Value(eval_operand(raw)?.into_bytes()))
 }
 
 fn parse_upsert(tokens: &[String]) -> Result<Statement> {
@@ -936,13 +1048,49 @@ fn eval_operand(raw: &str) -> Result<String> {
     if quoted {
         return Ok(unquote(trimmed));
     }
-    if trimmed.eq_ignore_ascii_case("gen_random_uuid") {
+    if trimmed.eq_ignore_ascii_case("gen_random_uuid")
+        || trimmed.eq_ignore_ascii_case("gen_random_uuid()")
+    {
         return new_uuid_v4();
     }
-    if trimmed.eq_ignore_ascii_case("now") {
+    if trimmed.eq_ignore_ascii_case("now") || trimmed.eq_ignore_ascii_case("now()") {
         return Ok(ryme_txn::now_unix().to_string());
     }
     Ok(unquote(trimmed))
+}
+
+fn eval_default(raw: &str) -> Result<Option<Vec<u8>>> {
+    if raw.trim().eq_ignore_ascii_case("NULL") {
+        return Ok(None);
+    }
+    Ok(Some(eval_operand(raw)?.into_bytes()))
+}
+
+fn json_insert_value(value: Option<Vec<u8>>, data_type: &str) -> serde_json::Value {
+    let Some(value) = value else { return serde_json::Value::Null };
+    let text = String::from_utf8_lossy(&value);
+    let trimmed = text.trim();
+    if matches!(data_type, "json" | "jsonb") {
+        if let Ok(parsed) = serde_json::from_slice(&value) {
+            return parsed;
+        }
+    }
+    if matches!(data_type, "bool" | "boolean") {
+        if let Ok(parsed) = trimmed.parse::<bool>() {
+            return serde_json::Value::Bool(parsed);
+        }
+    }
+    if data_type.contains("int") || data_type.contains("numeric") || data_type.contains("decimal") {
+        if let Ok(parsed) = trimmed.parse::<i64>() {
+            return serde_json::Value::Number(parsed.into());
+        }
+        if let Ok(parsed) = trimmed.parse::<f64>() {
+            if let Some(number) = serde_json::Number::from_f64(parsed) {
+                return serde_json::Value::Number(number);
+            }
+        }
+    }
+    serde_json::Value::String(text.into_owned())
 }
 
 fn new_uuid_v4() -> Result<String> {
@@ -996,6 +1144,9 @@ pub fn describe_plan(statement: &Statement) -> String {
             format!("ddl {}index({name}) on {table}({field})", if *unique { "unique " } else { "" })
         }
         Statement::Insert { table, .. } => format!("write insert({table}) point"),
+        Statement::InsertRow { table, upsert, .. } => {
+            format!("write {}({table}) row", if *upsert { "upsert" } else { "insert" })
+        }
         Statement::Upsert { table, .. } => format!("write upsert({table}) point"),
         Statement::SelectByKey { table, .. } => {
             format!("point_lookup({table}) using primary index")
@@ -1281,6 +1432,97 @@ where
             .collect()
     }
 
+    fn materialize_insert_row(
+        &self,
+        table: &str,
+        columns: Vec<String>,
+        values: Vec<InsertValue>,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        if columns.is_empty() || columns.len() != values.len() {
+            return Err(RymeError::InvalidArgument(String::from("insert column/value count")));
+        }
+        let definitions = self.catalog_columns(table);
+        let mut supplied = HashMap::new();
+        for (column, value) in columns.iter().zip(values) {
+            let name = column.to_ascii_lowercase();
+            if supplied.contains_key(&name) {
+                return Err(RymeError::InvalidArgument(format!("duplicate column {column}")));
+            }
+            if !definitions.is_empty()
+                && !definitions.iter().any(|definition| definition.name.eq_ignore_ascii_case(column))
+            {
+                return Err(RymeError::InvalidArgument(format!("unknown column {column}")));
+            }
+            let resolved = match value {
+                InsertValue::Value(value) => Some(value),
+                InsertValue::Null => None,
+                InsertValue::Default => definitions
+                    .iter()
+                    .find(|definition| definition.name.eq_ignore_ascii_case(column))
+                    .and_then(|definition| definition.column_default.as_deref())
+                    .map(eval_default)
+                    .transpose()?
+                    .flatten(),
+            };
+            supplied.insert(name, resolved);
+        }
+
+        let mut row = Vec::new();
+        if definitions.is_empty() {
+            for (column, value) in &supplied {
+                row.push((column.clone(), value.clone(), String::new()));
+            }
+        } else {
+            for definition in &definitions {
+                let value =
+                    if let Some(value) = supplied.remove(&definition.name.to_ascii_lowercase()) {
+                        value
+                    } else if let Some(default) = definition.column_default.as_deref() {
+                        eval_default(default)?
+                    } else if definition.nullable {
+                        None
+                    } else {
+                        return Err(RymeError::InvalidArgument(format!(
+                            "null value in column {} violates not-null constraint",
+                            definition.name
+                        )));
+                    };
+                row.push((definition.name.clone(), value, definition.data_type.clone()));
+            }
+            for (column, value) in supplied {
+                row.push((column, value, String::new()));
+            }
+        }
+
+        let primary_key = definitions
+            .iter()
+            .find(|definition| definition.primary_key)
+            .map(|definition| definition.name.to_ascii_lowercase())
+            .or_else(|| {
+                row.iter()
+                    .find(|(name, _, _)| {
+                        name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("pk")
+                    })
+                    .map(|(name, _, _)| name.to_ascii_lowercase())
+            })
+            .or_else(|| row.first().map(|(name, _, _)| name.to_ascii_lowercase()))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("insert primary key")))?;
+        let pk = row
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(&primary_key))
+            .and_then(|(_, value, _)| value.clone())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("null value in primary key")))?;
+
+        let mut object = serde_json::Map::new();
+        for (name, value, data_type) in row {
+            object.insert(name, json_insert_value(value, &data_type));
+        }
+        let encoded = serde_json::to_vec(&serde_json::Value::Object(object))
+            .map_err(|error| RymeError::Internal(error.to_string()))?;
+        Ok((pk, encoded))
+    }
+
     fn scan_all_rows(&self, table: &str) -> Result<Vec<Row>> {
         const PAGE: usize = 10_000;
         let mut txn = self.manager.begin_with(self.isolation);
@@ -1552,6 +1794,15 @@ where
                 }
                 Ok((QueryResult::Ok, changes))
             }
+            Statement::InsertRow { table, columns, values, upsert } => {
+                let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
+                let statement = if upsert {
+                    Statement::Upsert { table, pk, value }
+                } else {
+                    Statement::Insert { table, pk, value }
+                };
+                Box::pin(self.execute_in_transaction_base(txn, statement)).await
+            }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -1639,6 +1890,15 @@ where
         fields: Vec<Field>,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
+            Statement::InsertRow { table, columns, values, upsert } => {
+                let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
+                let statement = if upsert {
+                    Statement::Upsert { table, pk, value }
+                } else {
+                    Statement::Insert { table, pk, value }
+                };
+                Box::pin(self.execute_returning_in_transaction(txn, statement, fields)).await
+            }
             Statement::Insert { table, pk, value } => {
                 let pk_for_result = pk.clone();
                 let value_for_result = value.clone();
@@ -1921,6 +2181,15 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match statement {
+            Statement::InsertRow { table, columns, values, upsert } => {
+                let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
+                let statement = if upsert {
+                    Statement::Upsert { table, pk, value }
+                } else {
+                    Statement::Insert { table, pk, value }
+                };
+                Box::pin(self.execute_returning(statement, fields, isolation)).await
+            }
             Statement::Insert { table, pk, value } => {
                 let pk_for_result = pk.clone();
                 let value_for_result = value.clone();
@@ -1972,6 +2241,15 @@ where
             }
             Statement::Explain { plan, .. } => {
                 Ok(QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() })
+            }
+            Statement::InsertRow { table, columns, values, upsert } => {
+                let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
+                let statement = if upsert {
+                    Statement::Upsert { table, pk, value }
+                } else {
+                    Statement::Insert { table, pk, value }
+                };
+                Box::pin(self.execute_with_base(statement, isolation)).await
             }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
@@ -2332,6 +2610,52 @@ mod tests {
             QueryResult::Row { value, .. } => assert_eq!(value, b"grace"),
             _ => panic!("expected row"),
         }
+    }
+
+    #[tokio::test]
+    async fn standard_row_insert_applies_defaults_and_enforces_not_null() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE events (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payload TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let returned = executor
+            .execute(parse("INSERT INTO events (payload) VALUES ('hello') RETURNING *").unwrap())
+            .await
+            .unwrap();
+        let (pk, value) = match returned {
+            QueryResult::Returning { ref rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0].len(), 36);
+                (rows[0][0].clone(), rows[0][1].clone())
+            }
+            _ => panic!("expected returning row"),
+        };
+        let object: serde_json::Value = serde_json::from_slice(&value).unwrap();
+        assert_eq!(object["id"], serde_json::Value::String(String::from_utf8(pk).unwrap()));
+        assert_eq!(object["payload"], "hello");
+        assert!(object["created_at"].as_str().is_some_and(|value| !value.is_empty()));
+
+        let explicit_default = executor
+            .execute(
+                parse("INSERT INTO events (id, payload, created_at) VALUES (DEFAULT, 'world', DEFAULT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(explicit_default, QueryResult::Ok));
+
+        let missing =
+            executor.execute(parse("INSERT INTO events (id) VALUES (DEFAULT)").unwrap()).await;
+        assert!(
+            matches!(missing, Err(RymeError::InvalidArgument(message)) if message.contains("not-null"))
+        );
     }
 
     #[tokio::test]
