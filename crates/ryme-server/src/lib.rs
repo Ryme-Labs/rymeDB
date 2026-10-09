@@ -1087,18 +1087,20 @@ impl SharedState {
         } else {
             control.restore_ranges(control_snapshot.ranges)?;
         }
-        if let Backend::Sharded(shards) = &backend {
-            let placements = control
-                .ranges()
-                .into_iter()
-                .map(|range| ryme_shard::RangePlacement {
-                    id: range.id,
-                    start: range.start,
-                    end: range.end,
-                    shard: 0,
-                })
-                .collect();
-            shards.set_range_topology(placements)?;
+        let placements = control
+            .ranges()
+            .into_iter()
+            .map(|range| ryme_shard::RangePlacement {
+                id: range.id,
+                start: range.start,
+                end: range.end,
+                shard: 0,
+            })
+            .collect();
+        match &backend {
+            Backend::Sharded(shards) => shards.set_range_topology(placements)?,
+            Backend::Hybrid(hybrid) => hybrid.local().set_range_topology(placements)?,
+            _ => {}
         }
         if control.branches.list_for(&tenant).is_empty() {
             control.branches.create_root_for(
@@ -6061,6 +6063,7 @@ fn sync_range_topology(state: &SharedState, ranges: &[Range]) -> ryme_error::Res
         .collect();
     match &state.backend {
         Backend::Sharded(shards) => shards.set_range_topology(placements),
+        Backend::Hybrid(hybrid) => hybrid.local().set_range_topology(placements),
         _ => Ok(()),
     }
 }

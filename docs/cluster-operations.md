@@ -176,5 +176,7 @@ range topology is also the data-plane placement map. Point reads/writes route
 by `table\0primary-key`; a split or merge migrates affected rows between local
 shards before the new topology is persisted, and range assignments survive a
 restart. `POST /v1/shards/move` remains available for whole-table placement.
-Cluster and hybrid backends still use range metadata for routing/load control;
-their cross-node range transfer requires the cluster data-movement protocol.
+Pure cluster backends still use range metadata for routing/load control; their
+cross-node range transfer requires the cluster data-movement protocol. Hybrid
+backends apply the same local range placement to their non-replicated tier,
+while replicated tables continue to follow the Raft-backed placement.
