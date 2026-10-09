@@ -1668,6 +1668,8 @@ name = "ryme-branch"
 version = "0.1.0"
 dependencies = [
  "ryme-error",
+ "ryme-storage",
+ "ryme-txn",
  "serde",
  "serde_json",
 ]

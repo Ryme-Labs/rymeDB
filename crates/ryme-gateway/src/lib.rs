@@ -110,6 +110,19 @@ where
         self
     }
 
+    pub fn with_backend_manager<C>(self, manager: C) -> Gateway<C> {
+        Gateway {
+            manager,
+            realtime: self.realtime,
+            policies: self.policies,
+            tenant: self.tenant,
+            database: self.database,
+            branch: self.branch,
+            read_ts: None,
+            read_only: self.read_only,
+        }
+    }
+
     fn begin(&self) -> ryme_txn::Transaction {
         let mut txn = self.manager.begin();
         if let Some(read_ts) = self.read_ts {

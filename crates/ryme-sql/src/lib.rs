@@ -1577,6 +1577,22 @@ where
         self
     }
 
+    pub fn with_backend_manager<C>(self, manager: C) -> Executor<C> {
+        Executor {
+            tenant: self.tenant,
+            database: self.database,
+            branch: self.branch,
+            manager,
+            read_ts: None,
+            realtime: self.realtime,
+            read_only: self.read_only,
+            isolation: self.isolation,
+            catalog: self.catalog,
+            indexes: self.indexes,
+            rls_tables: self.rls_tables,
+        }
+    }
+
     fn begin_with(&self, isolation: Isolation) -> Transaction {
         let mut txn = self.manager.begin_with(isolation);
         if let Some(read_ts) = self.read_ts {

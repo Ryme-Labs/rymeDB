@@ -6,5 +6,7 @@ license.workspace = true
 
 [dependencies]
 ryme-error = { workspace = true }
+ryme-storage = { workspace = true }
+ryme-txn = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

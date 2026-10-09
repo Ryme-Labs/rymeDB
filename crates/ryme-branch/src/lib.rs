@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +77,12 @@ impl BranchManager {
     }
 
     pub fn create_root_for(&mut self, tenant: &str, id: String, manifest: Manifest) -> Result<()> {
-        if id.is_empty() || id.len() > 128 || id.contains('/') || id.contains("..") {
+        if id.is_empty()
+            || id.len() > 128
+            || id.contains('/')
+            || id.contains("..")
+            || id.contains('\0')
+        {
             return Err(RymeError::InvalidArgument(String::from("branch")));
         }
         let key = scoped_key(tenant, &id);
@@ -111,7 +116,12 @@ impl BranchManager {
         parent: &str,
         base_commit_ts: u64,
     ) -> Result<()> {
-        if id.is_empty() || id.len() > 128 || id.contains('/') || id.contains("..") {
+        if id.is_empty()
+            || id.len() > 128
+            || id.contains('/')
+            || id.contains("..")
+            || id.contains('\0')
+        {
             return Err(RymeError::InvalidArgument(String::from("branch")));
         }
         let key = scoped_key(tenant, &id);
@@ -274,9 +284,266 @@ fn scoped_key(tenant: &str, branch: &str) -> String {
     format!("{tenant}\0{branch}")
 }
 
+const BRANCH_VALUE_PREFIX: &[u8] = b"\0RYME_BRANCH\x01";
+
+/// A copy-on-write view over a transactional backend.
+///
+/// Parent data is read at `base_commit_ts`. Mutations are written to a
+/// branch-local database namespace, so branch creation remains metadata-only
+/// and only changed rows consume additional storage. A tombstone in that
+/// namespace hides a parent row without deleting the parent version.
+#[derive(Debug, Clone)]
+pub struct BranchBackend<B> {
+    base: B,
+    branch_database: String,
+    base_commit_ts: u64,
+    overlay: bool,
+}
+
+impl<B> BranchBackend<B>
+where
+    B: ryme_txn::TxnBackend,
+{
+    pub fn passthrough(base: B, _database: String) -> Self {
+        Self { base, branch_database: String::new(), base_commit_ts: 0, overlay: false }
+    }
+
+    pub fn new(base: B, database: String, branch: String, base_commit_ts: u64) -> Self {
+        Self {
+            branch_database: format!("{database}\0branch\0{branch}"),
+            base,
+            base_commit_ts,
+            overlay: true,
+        }
+    }
+
+    fn local_key(&self, key: &ryme_storage::RecordKey) -> ryme_storage::RecordKey {
+        ryme_storage::RecordKey::new(&key.tenant, &self.branch_database, &key.table, &key.pk)
+    }
+
+    fn parent_transaction(&self) -> ryme_txn::Transaction {
+        let mut txn = self.base.begin();
+        txn.restamp(self.base_commit_ts);
+        txn
+    }
+
+    fn encode(value: Option<&[u8]>) -> Vec<u8> {
+        let mut encoded =
+            Vec::with_capacity(BRANCH_VALUE_PREFIX.len() + 1 + value.map_or(0, |v| v.len()));
+        encoded.extend_from_slice(BRANCH_VALUE_PREFIX);
+        match value {
+            Some(value) => {
+                encoded.push(0);
+                encoded.extend_from_slice(value);
+            }
+            None => encoded.push(1),
+        }
+        encoded
+    }
+
+    fn decode(value: &[u8]) -> Option<Option<Vec<u8>>> {
+        if !value.starts_with(BRANCH_VALUE_PREFIX) {
+            return Some(Some(value.to_vec()));
+        }
+        match value.get(BRANCH_VALUE_PREFIX.len()) {
+            Some(0) => Some(Some(value[BRANCH_VALUE_PREFIX.len() + 1..].to_vec())),
+            Some(1) => Some(None),
+            _ => None,
+        }
+    }
+
+    fn overlay_rows(
+        &self,
+        txn: &ryme_txn::Transaction,
+        tenant: &str,
+        table: &str,
+    ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+        let mut rows = BTreeMap::new();
+        let mut local_txn = self.base.begin();
+        let local_rows =
+            self.scan_all(&mut local_txn, tenant, &self.branch_database, table, usize::MAX)?;
+        for (pk, value) in local_rows {
+            if let Some(decoded) = Self::decode(&value) {
+                rows.insert(pk, decoded);
+            }
+        }
+        for (key, write) in txn.writes() {
+            if key.tenant != tenant || key.database != self.branch_database || key.table != table {
+                continue;
+            }
+            let value = write.value.as_deref().and_then(Self::decode).flatten();
+            rows.insert(key.pk.clone(), value);
+        }
+        Ok(rows)
+    }
+
+    fn scan_all(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        const PAGE: usize = 1024;
+        let page_limit = limit.min(PAGE);
+        let mut rows = self.base.scan(txn, tenant, database, table, page_limit)?;
+        while rows.len() < limit && rows.len() >= page_limit && !rows.is_empty() {
+            let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
+            let next_limit = (limit - rows.len()).min(PAGE);
+            let next = self.base.scan_after(txn, tenant, database, table, &last, next_limit)?;
+            if next.is_empty() {
+                break;
+            }
+            rows.extend(next);
+        }
+        Ok(rows)
+    }
+}
+
+impl<B> ryme_txn::TxnBackend for BranchBackend<B>
+where
+    B: ryme_txn::TxnBackend,
+{
+    fn begin(&self) -> ryme_txn::Transaction {
+        self.base.begin()
+    }
+
+    fn get(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        key: &ryme_storage::RecordKey,
+    ) -> Result<Option<Vec<u8>>> {
+        if !self.overlay {
+            return self.base.get(txn, key);
+        }
+        let local = self.local_key(key);
+        if let Some(write) = txn.writes().get(&local) {
+            return Ok(write.value.as_deref().and_then(Self::decode).flatten());
+        }
+        let mut local_txn = self.base.begin();
+        if let Some(value) = self.base.get(&mut local_txn, &local)? {
+            return Ok(Self::decode(&value).flatten());
+        }
+        let mut parent_txn = self.parent_transaction();
+        self.base.get(&mut parent_txn, key)
+    }
+
+    fn put(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey, value: Vec<u8>) {
+        if self.overlay {
+            self.base.put(txn, self.local_key(&key), Self::encode(Some(&value)));
+        } else {
+            self.base.put(txn, key, value);
+        }
+    }
+
+    fn put_with_ttl(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        key: ryme_storage::RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        if self.overlay {
+            self.base.put_with_ttl(
+                txn,
+                self.local_key(&key),
+                Self::encode(Some(&value)),
+                expires_at,
+            );
+        } else {
+            self.base.put_with_ttl(txn, key, value, expires_at);
+        }
+    }
+
+    fn delete(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey) {
+        if self.overlay {
+            self.base.put(txn, self.local_key(&key), Self::encode(None));
+        } else {
+            self.base.delete(txn, key);
+        }
+    }
+
+    fn expires_at(&self, key: &ryme_storage::RecordKey) -> Result<Option<u64>> {
+        if !self.overlay {
+            return self.base.expires_at(key);
+        }
+        let local = self.local_key(key);
+        let mut txn = self.base.begin();
+        if let Some(value) = self.base.get(&mut txn, &local)? {
+            return Ok(if Self::decode(&value).flatten().is_some() {
+                self.base.expires_at(&local)?
+            } else {
+                Some(1)
+            });
+        }
+        self.base.expires_at(key)
+    }
+
+    fn commit(
+        &self,
+        txn: ryme_txn::Transaction,
+    ) -> impl std::future::Future<Output = Result<u64>> + Send {
+        let base = self.base.clone();
+        async move { base.commit(txn).await }
+    }
+
+    fn scan(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.overlay {
+            return self.base.scan(txn, tenant, database, table, limit);
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let overlay = self.overlay_rows(txn, tenant, table)?;
+        let parent_limit = limit.saturating_add(overlay.len());
+        let mut parent_txn = self.parent_transaction();
+        let parent = self.scan_all(&mut parent_txn, tenant, database, table, parent_limit)?;
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = parent.into_iter().collect();
+        for (pk, value) in overlay {
+            match value {
+                Some(value) => {
+                    merged.insert(pk, value);
+                }
+                None => {
+                    merged.remove(&pk);
+                }
+            }
+        }
+        Ok(merged.into_iter().take(limit).collect())
+    }
+
+    fn scan_after(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start_after: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.overlay {
+            return self.base.scan_after(txn, tenant, database, table, start_after, limit);
+        }
+        let rows = self.scan(txn, tenant, database, table, usize::MAX)?;
+        Ok(rows.into_iter().filter(|(pk, _)| pk.as_slice() > start_after).take(limit).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryme_txn::TxnBackend;
 
     fn root_manager() -> BranchManager {
         let mut manager = BranchManager::new();
@@ -376,5 +643,38 @@ mod tests {
         assert!(manager.get_for("beta", "preview").is_err());
         assert_eq!(manager.list_for("alpha").len(), 2);
         assert_eq!(manager.list_for("beta").len(), 0);
+    }
+
+    #[test]
+    fn copy_on_write_overlay_reads_parent_and_masks_deletes() {
+        let base = ryme_txn::TxnManager::new();
+        let parent_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"parent");
+        let mut parent_txn = base.begin();
+        base.put(&mut parent_txn, parent_key.clone(), b"from-parent".to_vec());
+        let parent_commit = base.commit(parent_txn).unwrap();
+
+        let branch = BranchBackend::new(
+            base.clone(),
+            String::from("default"),
+            String::from("preview"),
+            parent_commit,
+        );
+        let mut write_txn = branch.begin();
+        assert_eq!(branch.get(&mut write_txn, &parent_key).unwrap(), Some(b"from-parent".to_vec()));
+        let child_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"child");
+        branch.put(&mut write_txn, child_key.clone(), b"from-child".to_vec());
+        branch.delete(&mut write_txn, parent_key.clone());
+        base.commit(write_txn).unwrap();
+
+        let mut read_txn = branch.begin();
+        assert_eq!(branch.get(&mut read_txn, &parent_key).unwrap(), None);
+        assert_eq!(branch.get(&mut read_txn, &child_key).unwrap(), Some(b"from-child".to_vec()));
+        assert_eq!(
+            branch.scan(&mut read_txn, "tenant", "default", "docs", 10).unwrap(),
+            vec![(b"child".to_vec(), b"from-child".to_vec())]
+        );
+
+        let mut base_read = base.begin();
+        assert_eq!(base.get(&mut base_read, &parent_key).unwrap(), Some(b"from-parent".to_vec()));
     }
 }

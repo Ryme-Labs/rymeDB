@@ -434,12 +434,14 @@ impl Backend {
     }
 }
 
+type BranchStorage = ryme_branch::BranchBackend<Backend>;
+
 #[derive(Debug, Clone)]
 pub struct SharedState {
     backend: Backend,
     durable: DurableManager,
-    gateway: Gateway<Backend>,
-    executor: Executor<Backend>,
+    gateway: Gateway<BranchStorage>,
+    executor: Executor<BranchStorage>,
     rls_tables: HashMap<String, String>,
     realtime: Realtime,
     keys: ApiKeyStore,
@@ -788,18 +790,18 @@ impl SharedState {
         let tenant = String::from("default");
         let database = String::from("default");
         let branch = String::from("main");
+        let storage = ryme_branch::BranchBackend::passthrough(backend.clone(), database.clone());
         let mut gateway = Gateway::with_backend(
             tenant.clone(),
             database.clone(),
             branch.clone(),
             policies,
             realtime.clone(),
-            backend.clone(),
+            storage.clone(),
         );
         gateway.set_read_only(config.read_only);
-        let mut executor =
-            Executor::with_backend(tenant.clone(), database.clone(), backend.clone())
-                .with_realtime(realtime.clone());
+        let mut executor = Executor::with_backend(tenant.clone(), database.clone(), storage)
+            .with_realtime(realtime.clone());
         executor.set_rls_tables(config.rls_tables.clone());
         executor.set_read_only(config.read_only);
         let branch_path = config.data_dir.join("branches.json");
@@ -2154,16 +2156,12 @@ fn branch_snapshot(
     Ok(Some((selected.id, selected.base_commit_ts)))
 }
 
-fn reject_branch_write(
+fn validate_branch_selection(
     state: &SharedState,
     headers: &HeaderMap,
     tenant: &str,
 ) -> ryme_error::Result<()> {
-    if branch_snapshot(state, headers, tenant)?.is_some() {
-        return Err(ryme_error::RymeError::ReadOnly(String::from(
-            "branch snapshots are read-only",
-        )));
-    }
+    let _ = branch_snapshot(state, headers, tenant)?;
     Ok(())
 }
 
@@ -2171,11 +2169,39 @@ fn branch_gateway(
     state: &SharedState,
     headers: &HeaderMap,
     tenant: &str,
-) -> ryme_error::Result<Gateway<Backend>> {
+) -> ryme_error::Result<Gateway<BranchStorage>> {
     let gateway = state.gateway.clone();
     match branch_snapshot(state, headers, tenant)? {
-        Some((branch, read_ts)) => Ok(gateway.with_branch(branch).with_read_ts(read_ts)),
+        Some((branch, base_commit_ts)) => {
+            let manager = ryme_branch::BranchBackend::new(
+                state.backend.clone(),
+                state.database.clone(),
+                branch.clone(),
+                base_commit_ts,
+            );
+            Ok(gateway.with_backend_manager(manager).with_branch(branch))
+        }
         None => Ok(gateway),
+    }
+}
+
+fn branch_executor(
+    state: &SharedState,
+    headers: &HeaderMap,
+    tenant: &str,
+) -> ryme_error::Result<Executor<BranchStorage>> {
+    let executor = state.executor.clone().with_tenant(tenant.to_string());
+    match branch_snapshot(state, headers, tenant)? {
+        Some((branch, base_commit_ts)) => {
+            let manager = ryme_branch::BranchBackend::new(
+                state.backend.clone(),
+                state.database.clone(),
+                branch.clone(),
+                base_commit_ts,
+            );
+            Ok(executor.with_backend_manager(manager).with_branch(branch))
+        }
+        None => Ok(executor),
     }
 }
 
@@ -2358,19 +2384,23 @@ async fn rest_insert(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if let Err(e) = reject_branch_write(&state, &headers, &principal.tenant) {
+    if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
     let rows = rest_body_rows(&body);
     if rows.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("rows")));
     }
+    let gateway = match branch_gateway(&state, &headers, &principal.tenant) {
+        Ok(gateway) => gateway,
+        Err(e) => return error_response(e),
+    };
     let mut inserted = Vec::new();
     for (key, value) in rows {
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
-        match state.gateway.put(&principal, &table, key.clone(), value.clone()).await {
+        match gateway.put(&principal, &table, key.clone(), value.clone()).await {
             Ok(commit) => {
                 record_meter(&state, Metric::WriteUnit, 1);
                 inserted.push(rest_row_to_json(&key, &value));
@@ -2404,7 +2434,7 @@ async fn rest_delete(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if let Err(e) = reject_branch_write(&state, &headers, &principal.tenant) {
+    if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
     let raw = raw.unwrap_or_default();
@@ -2425,7 +2455,11 @@ async fn rest_delete(
     if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {
         return error_response(e);
     }
-    match state.gateway.delete(&principal, &table, key.into_bytes()).await {
+    let gateway = match branch_gateway(&state, &headers, &principal.tenant) {
+        Ok(gateway) => gateway,
+        Err(e) => return error_response(e),
+    };
+    match gateway.delete(&principal, &table, key.into_bytes()).await {
         Ok(commit) => {
             record_meter(&state, Metric::WriteUnit, 1);
             (StatusCode::OK, Json(serde_json::json!({ "commit": commit }))).into_response()
@@ -2484,7 +2518,7 @@ async fn graphql_exec(
 
 async fn execute_graphql(
     state: &SharedState,
-    gateway: &Gateway<Backend>,
+    gateway: &Gateway<BranchStorage>,
     principal: &Principal,
     query: &str,
 ) -> ryme_error::Result<serde_json::Value> {
@@ -2575,7 +2609,7 @@ async fn sql_copy(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if let Err(e) = reject_branch_write(&state, &headers, &principal.tenant) {
+    if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
     if request.table.is_empty() || request.rows.len() > 10000 {
@@ -2590,7 +2624,10 @@ async fn sql_copy(
         .into_iter()
         .map(|row| (row.key.into_bytes(), row.value.into_bytes()))
         .collect();
-    let executor = state.executor.clone().with_tenant(principal.tenant.clone());
+    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     match executor.bulk_upsert(request.table.clone(), rows.clone()).await {
         Ok(count) => {
             record_meter(&state, Metric::WriteUnit, count as u64);
@@ -2635,11 +2672,8 @@ async fn sql_explain(
         Some(params) => bind(&request.sql, &params),
         None => request.sql,
     };
-    let executor = match branch_snapshot(&state, &headers, &principal.tenant) {
-        Ok(Some((_, read_ts))) => {
-            state.executor.clone().with_tenant(principal.tenant.clone()).with_read_ts(read_ts)
-        }
-        Ok(None) => state.executor.clone().with_tenant(principal.tenant.clone()),
+    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+        Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
     match executor.explain(&sql) {
@@ -4138,13 +4172,17 @@ async fn inner_kv_put(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = reject_branch_write(state, headers, &principal.tenant) {
+    if let Err(e) = validate_branch_selection(state, headers, &principal.tenant) {
         return error_response(e);
     }
     if let Err(e) = admit_write(state, &principal.tenant, value.len() as u64) {
         return error_response(e);
     }
-    match state.gateway.put_with_ttl(&principal, table, key, value, expires_at).await {
+    let gateway = match branch_gateway(state, headers, &principal.tenant) {
+        Ok(gateway) => gateway,
+        Err(e) => return error_response(e),
+    };
+    match gateway.put_with_ttl(&principal, table, key, value, expires_at).await {
         Ok(commit) => {
             (StatusCode::OK, Json(serde_json::json!({ "commit": commit }))).into_response()
         }
@@ -4192,14 +4230,18 @@ async fn kv_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = reject_branch_write(&state, &headers, &principal.tenant) {
+    if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
     let key_bytes = key.into_bytes();
     if let Err(e) = admit_write(&state, &principal.tenant, key_bytes.len() as u64) {
         return error_response(e);
     }
-    let result = match state.gateway.delete(&principal, &table, key_bytes.clone()).await {
+    let gateway = match branch_gateway(&state, &headers, &principal.tenant) {
+        Ok(gateway) => gateway,
+        Err(e) => return error_response(e),
+    };
+    let result = match gateway.delete(&principal, &table, key_bytes.clone()).await {
         Ok(commit) => {
             (StatusCode::OK, Json(serde_json::json!({ "commit": commit }))).into_response()
         }
@@ -4252,20 +4294,9 @@ async fn sql_exec(
     }
     let table_name = statement.table().to_string();
     let write_statement = statement.is_write();
-    let branch = match branch_snapshot(&state, &headers, &principal.tenant) {
-        Ok(branch) => branch,
+    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+        Ok(executor) => executor,
         Err(e) => return error_response(e),
-    };
-    if write_statement && branch.is_some() {
-        return error_response(ryme_error::RymeError::ReadOnly(String::from(
-            "branch snapshots are read-only",
-        )));
-    }
-    let executor = match branch.as_ref() {
-        Some((_, read_ts)) => {
-            state.executor.clone().with_tenant(principal.tenant.clone()).with_read_ts(*read_ts)
-        }
-        None => state.executor.clone().with_tenant(principal.tenant.clone()),
     };
     let result = match executor.execute(statement).await {
         Ok(QueryResult::Ok) => {
