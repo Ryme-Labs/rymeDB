@@ -528,6 +528,8 @@ struct ControlSnapshot {
     backups: ryme_backup::BackupLog,
     #[serde(default)]
     migrations: ryme_migrate::Ledger,
+    #[serde(default)]
+    ranges: Vec<Range>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -594,6 +596,7 @@ fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSn
     Ok(ControlSnapshot {
         backups: ryme_backup::BackupLog::from_checkpoints(snapshot.backups.checkpoints().to_vec()),
         migrations: snapshot.migrations,
+        ranges: snapshot.ranges,
     })
 }
 
@@ -908,15 +911,18 @@ impl SharedState {
     }
 
     fn persist_control(&self) -> ryme_error::Result<()> {
-        let snapshot = {
-            let control = self
-                .control
-                .lock()
-                .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
-            ControlSnapshot {
-                backups: control.backups.clone(),
-                migrations: control.migrations.clone(),
-            }
+        let control = self
+            .control
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+        self.persist_control_locked(&control)
+    }
+
+    fn persist_control_locked(&self, control: &ControlPlane) -> ryme_error::Result<()> {
+        let snapshot = ControlSnapshot {
+            backups: control.backups.clone(),
+            migrations: control.migrations.clone(),
+            ranges: control.ranges(),
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
             ryme_error::RymeError::Internal(format!("control snapshot: {error}"))
@@ -1069,13 +1075,17 @@ impl SharedState {
         control.backups = control_snapshot.backups;
         control.migrations = control_snapshot.migrations;
         control.branches = ryme_branch::BranchManager::load(&branch_path)?;
-        control.add_range(Range::new(
-            String::from("range-0"),
-            Vec::new(),
-            Vec::new(),
-            config.node_id.clone(),
-            0,
-        ));
+        if control_snapshot.ranges.is_empty() {
+            control.add_range(Range::new(
+                String::from("range-0"),
+                Vec::new(),
+                Vec::new(),
+                config.node_id.clone(),
+                0,
+            ));
+        } else {
+            control.restore_ranges(control_snapshot.ranges)?;
+        }
         if control.branches.list_for(&tenant).is_empty() {
             control.branches.create_root_for(
                 &tenant,
@@ -2064,6 +2074,9 @@ fn spawn_gateways(
                 Err(_) => Vec::new(),
             };
             if !created.is_empty() {
+                if let Err(error) = autosplit_state.persist_control() {
+                    tracing::error!(%error, "failed to persist auto-split topology");
+                }
                 tracing::info!(ranges = ?created, "auto-split hot ranges");
             }
         }
@@ -5869,6 +5882,9 @@ async fn range_split(
         request.expected_epoch,
     ) {
         Ok(()) => {
+            if let Err(error) = state.persist_control_locked(&control) {
+                return error_response(error);
+            }
             let left = control.router_get(&request.left_id);
             let right = control.router_get(&request.right_id);
             match (left, right) {
@@ -5909,10 +5925,15 @@ async fn range_merge(
         request.expected_left_epoch,
         request.expected_right_epoch,
     ) {
-        Ok(()) => match control.router_get(&request.merged_id) {
-            Ok(merged) => (StatusCode::OK, Json(merged)).into_response(),
-            Err(e) => error_response(e),
-        },
+        Ok(()) => {
+            if let Err(error) = state.persist_control_locked(&control) {
+                return error_response(error);
+            }
+            match control.router_get(&request.merged_id) {
+                Ok(merged) => (StatusCode::OK, Json(merged)).into_response(),
+                Err(e) => error_response(e),
+            }
+        }
         Err(e) => error_response(e),
     }
 }
@@ -5951,6 +5972,11 @@ async fn range_autosplit(
     };
     match control.auto_split_once(threshold) {
         Ok(created) => {
+            if !created.is_empty() {
+                if let Err(error) = state.persist_control_locked(&control) {
+                    return error_response(error);
+                }
+            }
             (StatusCode::OK, Json(serde_json::json!({ "split": created }))).into_response()
         }
         Err(e) => error_response(e),
@@ -7310,6 +7336,43 @@ mod realtime_policy_tests {
             .await
             .is_err());
         assert_eq!(state.control.lock().unwrap().migrations.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn range_topology_survives_control_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-range-snapshot-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        config.archive.interval_secs = 0;
+
+        let state = SharedState::build(&config).unwrap();
+        {
+            let mut control = state.control.lock().unwrap();
+            control
+                .split_range(
+                    "range-0",
+                    b"m".to_vec(),
+                    String::from("left"),
+                    String::from("right"),
+                    0,
+                )
+                .unwrap();
+            state.persist_control_locked(&control).unwrap();
+        }
+        drop(state);
+
+        let reopened = SharedState::build(&config).unwrap();
+        let control = reopened.control.lock().unwrap();
+        assert_eq!(control.ranges().len(), 2);
+        assert_eq!(control.route(b"a").unwrap().id, "left");
+        assert_eq!(control.route(b"z").unwrap().id, "right");
+        drop(control);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

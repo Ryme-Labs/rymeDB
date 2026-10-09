@@ -71,6 +71,36 @@ impl ControlPlane {
         self.router.insert(range);
     }
 
+    pub fn restore_ranges(&mut self, mut ranges: Vec<Range>) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        ranges.sort_by(|left, right| left.start.cmp(&right.start));
+        if !ranges[0].start.is_empty()
+            || ranges.last().map(|range| !range.end.is_empty()).unwrap_or(true)
+        {
+            return Err(RymeError::Corrupt(String::from("range snapshot does not cover keyspace")));
+        }
+        let mut router = Router::new();
+        let mut ids = std::collections::HashSet::new();
+        for (index, range) in ranges.iter().enumerate() {
+            if !ids.insert(range.id.clone()) {
+                return Err(RymeError::Corrupt(String::from("duplicate range id")));
+            }
+            if !range.end.is_empty() && range.start >= range.end {
+                return Err(RymeError::Corrupt(String::from("invalid range bounds")));
+            }
+            if let Some(next) = ranges.get(index + 1) {
+                if range.end.is_empty() || range.end != next.start {
+                    return Err(RymeError::Corrupt(String::from("range snapshot has a gap")));
+                }
+            }
+            router.insert(range.clone());
+        }
+        self.router = router;
+        Ok(())
+    }
+
     pub fn route(&self, key: &[u8]) -> Result<Range> {
         self.router.route(key)
     }
@@ -429,5 +459,18 @@ mod tests {
         let created = plane.auto_split_once(10).unwrap();
         assert_eq!(created.len(), 2);
         assert!(plane.router.get("tiny-a-0").is_err());
+    }
+
+    #[test]
+    fn restore_ranges_preserves_topology_and_rejects_gaps() {
+        let mut plane = ControlPlane::new();
+        plane.restore_ranges(vec![ranged("right", b"m", &[]), ranged("left", &[], b"m")]).unwrap();
+        assert_eq!(plane.route(b"a").unwrap().id, "left");
+        assert_eq!(plane.route(b"z").unwrap().id, "right");
+
+        let error = plane
+            .restore_ranges(vec![ranged("gap", &[], b"m"), ranged("tail", b"z", &[])])
+            .unwrap_err();
+        assert!(matches!(error, RymeError::Corrupt(_)));
     }
 }

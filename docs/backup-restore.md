@@ -32,6 +32,10 @@ the newest 128 markers
 (`BACKUP_LOG_KEEP`); effective PITR depth is additionally bounded by
 snapshot/WAL retention on disk.
 
+The same snapshot stores the contiguous range-shard topology. Split, merge,
+and autosplit operations persist before reporting success, and startup
+validates that restored ranges cover the keyspace without gaps.
+
 ## Snapshots
 
 Snapshots capture backend files with their max commit. Requires write auth:
