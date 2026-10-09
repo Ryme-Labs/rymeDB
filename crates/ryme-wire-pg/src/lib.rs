@@ -1138,6 +1138,8 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
         "types"
     } else if upper.contains("PG_CATALOG.PG_CONSTRAINT") {
         "constraints"
+    } else if upper.contains("PG_CATALOG.PG_DEFAULT_ACL") || upper.contains("PG_DEFAULT_ACL") {
+        "default_acls"
     } else if upper.contains("PG_CATALOG.PG_INDEX") {
         "index"
     } else {
@@ -1158,6 +1160,7 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
         "classes" => vec![String::from("relname")],
         "types" => vec![String::from("typname")],
         "constraints" => vec![String::from("conname")],
+        "default_acls" => vec![String::from("defaclrole")],
         "index" => vec![String::from("indexrelid")],
         "attributes" => vec![String::from("attname")],
         _ => vec![String::from("column_name")],
@@ -1278,6 +1281,13 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("confdeltype"),
                 String::from("confupdtype"),
                 String::from("convalidated"),
+            ],
+            "default_acls" => vec![
+                String::from("oid"),
+                String::from("defaclrole"),
+                String::from("defaclnamespace"),
+                String::from("defaclobjtype"),
+                String::from("defaclacl"),
             ],
             "index" => vec![
                 String::from("indexrelid"),
@@ -1425,12 +1435,82 @@ fn information_schema_type(data_type: &str) -> &str {
     }
 }
 
+fn default_privilege_acl_code(privilege: &str) -> &'static str {
+    match privilege.to_ascii_uppercase().as_str() {
+        "SELECT" => "r",
+        "INSERT" => "a",
+        "UPDATE" => "w",
+        "DELETE" => "d",
+        "TRUNCATE" => "D",
+        "REFERENCES" => "x",
+        "TRIGGER" => "t",
+        "USAGE" => "U",
+        "EXECUTE" => "X",
+        "CREATE" => "C",
+        "CONNECT" => "c",
+        "TEMPORARY" | "TEMP" => "T",
+        _ => "r",
+    }
+}
+
 fn catalog_query<B>(query: &str, executor: &Arc<Executor<B>>) -> Option<Vec<u8>>
 where
     B: TxnBackend,
 {
     let columns = catalog_query_columns(query)?;
     let upper = query.to_ascii_uppercase();
+    if upper.contains("PG_CATALOG.PG_DEFAULT_ACL") || upper.contains("PG_DEFAULT_ACL") {
+        let snapshot = executor.schema_snapshot();
+        let rows = snapshot
+            .default_privileges
+            .into_iter()
+            .map(|default| {
+                let owner = default.owner.as_deref().unwrap_or("postgres");
+                let schema_oid = default.schema.as_deref().map(catalog_namespace_oid).unwrap_or(0);
+                let object_type = match default.object_type.to_ascii_uppercase().as_str() {
+                    "SEQUENCE" => "S",
+                    "FUNCTION" => "f",
+                    "TYPE" => "T",
+                    "SCHEMA" => "n",
+                    _ => "r",
+                };
+                let privilege = default_privilege_acl_code(&default.privilege);
+                let grantor = catalog_oid(&format!("role:{owner}"));
+                let acl = [
+                    String::from("{"),
+                    default.grantee.clone(),
+                    String::from("="),
+                    String::from(privilege),
+                    default.grant_option.then_some("*").unwrap_or("").to_string(),
+                    String::from("/"),
+                    owner.to_string(),
+                    String::from("}"),
+                ]
+                .concat();
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => catalog_oid(&format!(
+                            "default-acl:{}:{}:{}:{}:{}",
+                            owner,
+                            default.schema.as_deref().unwrap_or(""),
+                            default.object_type,
+                            default.grantee,
+                            default.privilege
+                        ))
+                        .to_string()
+                        .into_bytes(),
+                        "defaclrole" => grantor.to_string().into_bytes(),
+                        "defaclnamespace" => schema_oid.to_string().into_bytes(),
+                        "defaclobjtype" => object_type.as_bytes().to_vec(),
+                        "defaclacl" => acl.as_bytes().to_vec(),
+                        _ => Vec::new(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
     if upper.contains("PG_CATALOG.PG_ROLES") || upper.contains("PG_ROLES") {
         let filter = sql_literal_after(query, "ROLNAME");
         let mut roles = vec![
@@ -3191,8 +3271,8 @@ where
 mod tests {
     use super::*;
     use ryme_sql::{
-        FunctionDefinition, PrivilegeGrant, RlsPolicy, RoleDefinition, SchemaSnapshot,
-        SequenceDefinition, TriggerDefinition, ViewDefinition,
+        DefaultPrivilegeGrant, FunctionDefinition, PrivilegeGrant, RlsPolicy, RoleDefinition,
+        SchemaSnapshot, SequenceDefinition, TriggerDefinition, ViewDefinition,
     };
 
     #[test]
@@ -3503,6 +3583,34 @@ mod tests {
         assert!(privileges.windows(b"app_reader".len()).any(|window| window == b"app_reader"));
         assert!(privileges.windows(b"SELECT".len()).any(|window| window == b"SELECT"));
         assert!(privileges.windows(b"YES".len()).any(|window| window == b"YES"));
+    }
+
+    #[test]
+    fn catalog_exposes_default_privileges() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.default_privileges.push(DefaultPrivilegeGrant {
+            object_type: String::from("TABLE"),
+            schema: Some(String::from("public")),
+            owner: Some(String::from("postgres")),
+            privilege: String::from("SELECT"),
+            grantee: String::from("authenticated"),
+            grant_option: true,
+        });
+        executor.restore_schema_snapshot(snapshot).unwrap();
+
+        let response = catalog_query(
+            "SELECT defaclrole, defaclnamespace, defaclobjtype, defaclacl FROM pg_catalog.pg_default_acl WHERE defaclobjtype = 'r'",
+            &executor,
+        )
+        .unwrap();
+        assert!(response
+            .windows(b"authenticated=r*/postgres".len())
+            .any(|window| { window == b"authenticated=r*/postgres" }));
+        assert!(response.windows(b"r".len()).any(|window| window == b"r"));
+        assert!(response
+            .windows(catalog_namespace_oid("public").to_string().len())
+            .any(|window| window == catalog_namespace_oid("public").to_string().as_bytes()));
     }
 
     #[test]

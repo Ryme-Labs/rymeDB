@@ -7743,6 +7743,10 @@ where
         self.privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default()
     }
 
+    pub fn catalog_default_privileges(&self) -> Vec<DefaultPrivilegeGrant> {
+        self.default_privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default()
+    }
+
     pub fn catalog_columns(&self, table: &str) -> Vec<ColumnDefinition> {
         self.catalog
             .lock()

@@ -81,6 +81,8 @@ authenticated gateway/RLS boundary until SQL sessions carry an explicit role.
 `ALTER DEFAULT PRIVILEGES` for tables and sequences is also persisted and
 applied to subsequently created tables, views, and sequences, including
 schema-scoped defaults and `FOR ROLE` owner selectors.
+The declarations are available through `pg_catalog.pg_default_acl` with
+PostgreSQL-style role OIDs, namespace OIDs, object-type codes, and ACL text.
 Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
 persisted in schema snapshots. `BEFORE` row triggers that assign
 `NEW.column = now()` (or the equivalent current-timestamp expressions) are
