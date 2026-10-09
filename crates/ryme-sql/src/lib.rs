@@ -200,6 +200,8 @@ pub enum Statement {
         #[serde(default)]
         group_column: Option<String>,
         filter: Vec<Predicate>,
+        #[serde(default)]
+        having: Vec<Predicate>,
         limit: usize,
         offset: usize,
         order: Order,
@@ -893,22 +895,31 @@ fn prepare_distinct(statement: Statement) -> Statement {
                 offset,
             }
         }
-        Statement::GroupBy { table, select, group, group_column, filter, limit, offset, order } => {
-            Statement::Distinct {
-                statement: Box::new(Statement::GroupBy {
-                    table,
-                    select,
-                    group,
-                    group_column,
-                    filter,
-                    limit: default_distinct_limit(),
-                    offset: 0,
-                    order,
-                }),
-                limit,
-                offset,
-            }
-        }
+        Statement::GroupBy {
+            table,
+            select,
+            group,
+            group_column,
+            filter,
+            having,
+            limit,
+            offset,
+            order,
+        } => Statement::Distinct {
+            statement: Box::new(Statement::GroupBy {
+                table,
+                select,
+                group,
+                group_column,
+                filter,
+                having,
+                limit: default_distinct_limit(),
+                offset: 0,
+                order,
+            }),
+            limit,
+            offset,
+        },
         Statement::Join { left, right, limit, offset, order, filter } => Statement::Distinct {
             statement: Box::new(Statement::Join {
                 left,
@@ -1713,9 +1724,17 @@ fn rewrite_simple_cte(query: Statement, body: Statement, cte_name: &str) -> Opti
                 filter: combined,
             })
         }
-        Statement::GroupBy { table, select, group, group_column, filter, limit, offset, order }
-            if table.eq_ignore_ascii_case(cte_name) =>
-        {
+        Statement::GroupBy {
+            table,
+            select,
+            group,
+            group_column,
+            filter,
+            having,
+            limit,
+            offset,
+            order,
+        } if table.eq_ignore_ascii_case(cte_name) => {
             let mut combined = source_filter;
             combined.extend(filter);
             Some(Statement::GroupBy {
@@ -1724,6 +1743,7 @@ fn rewrite_simple_cte(query: Statement, body: Statement, cte_name: &str) -> Opti
                 group,
                 group_column,
                 filter: combined,
+                having,
                 limit,
                 offset,
                 order,
@@ -3086,16 +3106,65 @@ fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
     }
     let (limit, offset, order) = parse_scan_tail(tokens)?;
     let filter = parse_where_filter(tokens)?;
+    let having = parse_having_filter(tokens)?;
     Ok(Statement::GroupBy {
         table: table.to_string(),
         select,
         group,
         group_column,
         filter,
+        having,
         limit,
         offset,
         order,
     })
+}
+
+fn parse_having_filter(tokens: &[String]) -> Result<Vec<Predicate>> {
+    let Some(start) = tokens.iter().position(|token| token.eq_ignore_ascii_case("HAVING")) else {
+        return Ok(Vec::new());
+    };
+    let mut clause = Vec::new();
+    let mut index = start + 1;
+    while index < tokens.len()
+        && !tokens[index].eq_ignore_ascii_case("ORDER")
+        && !tokens[index].eq_ignore_ascii_case("LIMIT")
+        && !tokens[index].eq_ignore_ascii_case("OFFSET")
+    {
+        if AggFunc::parse(&tokens[index]).is_some()
+            && tokens.get(index + 1).is_some_and(|token| !is_predicate_operator(token))
+        {
+            clause.push(tokens[index].clone());
+            index += 2;
+        } else {
+            clause.push(tokens[index].clone());
+            index += 1;
+        }
+    }
+    if clause.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("having predicate")));
+    }
+    parse_filter(&clause)
+}
+
+fn is_predicate_operator(token: &str) -> bool {
+    matches!(
+        token.to_ascii_uppercase().as_str(),
+        "=" | "!"
+            | "!="
+            | "<>"
+            | ">"
+            | ">="
+            | "<"
+            | "<="
+            | "IN"
+            | "NOT"
+            | "IS"
+            | "LIKE"
+            | "ILIKE"
+            | "CONTAINS"
+            | "BETWEEN"
+    )
 }
 
 fn parse_join(tokens: &[String], left: &str) -> Result<Statement> {
@@ -9280,6 +9349,7 @@ where
                 group,
                 group_column,
                 filter,
+                having,
                 limit,
                 offset,
                 order,
@@ -9348,10 +9418,11 @@ where
                             }
                         }
                     }
-                    out.push((
-                        group_key.clone(),
-                        serde_json::Value::Object(record).to_string().into_bytes(),
-                    ));
+                    let record = serde_json::Value::Object(record);
+                    let encoded = record.to_string().into_bytes();
+                    if having.iter().all(|predicate| predicate.matches(group_key, &encoded)) {
+                        out.push((group_key.clone(), encoded));
+                    }
                 }
                 out.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
@@ -10017,6 +10088,7 @@ where
                 group,
                 group_column,
                 filter,
+                having,
                 limit,
                 offset,
                 order,
@@ -10086,10 +10158,11 @@ where
                             }
                         }
                     }
-                    out.push((
-                        group_key.clone(),
-                        serde_json::Value::Object(record).to_string().into_bytes(),
-                    ));
+                    let record = serde_json::Value::Object(record);
+                    let encoded = record.to_string().into_bytes();
+                    if having.iter().all(|predicate| predicate.matches(group_key, &encoded)) {
+                        out.push((group_key.clone(), encoded));
+                    }
                 }
                 out.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
@@ -13657,6 +13730,22 @@ mod tests {
                 assert_eq!(only["count"], "2");
             }
             _ => panic!("expected rows"),
+        }
+        let statement =
+            parse("SELECT value, COUNT(*) FROM tags GROUP BY value HAVING COUNT(*) > 2").unwrap();
+        let Statement::GroupBy { having, .. } = &statement else {
+            panic!("expected grouped statement")
+        };
+        assert_eq!(having.len(), 1);
+        let rows = executor.execute(statement).await.unwrap();
+        match rows {
+            QueryResult::Rows { rows } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].0, b"red".to_vec());
+                let only: serde_json::Value = serde_json::from_slice(&rows[0].1).unwrap();
+                assert_eq!(only["count"], "3");
+            }
+            _ => panic!("expected having rows"),
         }
         let plan = executor.explain("SELECT key, COUNT(*) FROM tags GROUP BY key").unwrap();
         assert!(plan.contains("group_by(tags)"));

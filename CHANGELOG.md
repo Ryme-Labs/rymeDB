@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Grouped PostgreSQL queries now support `HAVING` predicates over group columns
+  and aggregate aliases such as `COUNT(*)`.
 - PostgreSQL extended-protocol `Describe` now returns parameter metadata for
   prepared statements and correctly distinguishes statement and portal names.
 - The realtime benchmark opens subscriber WebSockets with bounded concurrency,
