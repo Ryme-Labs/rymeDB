@@ -8,6 +8,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL `CREATE ROLE`/`DROP ROLE` and `GRANT`/`REVOKE` declarations now
+  persist role and table/schema/sequence privilege metadata through schema
+  snapshots. `pg_roles` and `information_schema.table_privileges` expose the
+  stored metadata for migration and ORM introspection.
 - PostgreSQL sequences now support persisted `CREATE SEQUENCE`, `ALTER
   SEQUENCE` restart/increment options, `DROP SEQUENCE`, and `nextval`/`currval`/
   `setval` calls, with sequence state exposed through `pg_catalog.pg_sequences`

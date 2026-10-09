@@ -7,8 +7,8 @@ use ryme_observe::{
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
-    bind, parse, Executor, Field, ForeignKeyAction, QueryResult, ReturningField, Statement,
-    TransactionChange, SQL_NULL_SENTINEL,
+    bind, parse, Executor, Field, ForeignKeyAction, QueryResult, ReturningField, RoleDefinition,
+    Statement, TransactionChange, SQL_NULL_SENTINEL,
 };
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use std::collections::HashMap;
@@ -1107,40 +1107,48 @@ fn describe_query(query: &str) -> Vec<u8> {
 
 fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
     let upper = query.to_ascii_uppercase();
-    let kind =
-        if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES") {
-            "tables"
-        } else if upper.contains("INFORMATION_SCHEMA.COLUMNS") {
-            "columns"
-        } else if upper.contains("PG_CATALOG.PG_ATTRIBUTE") {
-            "attributes"
-        } else if upper.contains("PG_CATALOG.PG_INDEXES") {
-            "indexes"
-        } else if upper.contains("PG_CATALOG.PG_POLICIES") || upper.contains("PG_POLICIES") {
-            "policies"
-        } else if upper.contains("PG_CATALOG.PG_PROC") || upper.contains("PG_PROC") {
-            "functions"
-        } else if upper.contains("PG_CATALOG.PG_TRIGGER") || upper.contains("PG_TRIGGER") {
-            "triggers"
-        } else if upper.contains("PG_CATALOG.PG_SEQUENCES") || upper.contains("PG_SEQUENCES") {
-            "sequences"
-        } else if upper.contains("PG_CATALOG.PG_NAMESPACE") {
-            "namespaces"
-        } else if upper.contains("PG_CATALOG.PG_CLASS") {
-            "classes"
-        } else if upper.contains("PG_CATALOG.PG_TYPE") {
-            "types"
-        } else if upper.contains("PG_CATALOG.PG_CONSTRAINT") {
-            "constraints"
-        } else if upper.contains("PG_CATALOG.PG_INDEX") {
-            "index"
-        } else {
-            return None;
-        };
+    let kind = if upper.contains("INFORMATION_SCHEMA.TABLE_PRIVILEGES")
+        || upper.contains("INFORMATION_SCHEMA.ROLE_TABLE_GRANTS")
+    {
+        "privileges"
+    } else if upper.contains("PG_CATALOG.PG_ROLES") || upper.contains("PG_ROLES") {
+        "roles"
+    } else if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES")
+    {
+        "tables"
+    } else if upper.contains("INFORMATION_SCHEMA.COLUMNS") {
+        "columns"
+    } else if upper.contains("PG_CATALOG.PG_ATTRIBUTE") {
+        "attributes"
+    } else if upper.contains("PG_CATALOG.PG_INDEXES") {
+        "indexes"
+    } else if upper.contains("PG_CATALOG.PG_POLICIES") || upper.contains("PG_POLICIES") {
+        "policies"
+    } else if upper.contains("PG_CATALOG.PG_PROC") || upper.contains("PG_PROC") {
+        "functions"
+    } else if upper.contains("PG_CATALOG.PG_TRIGGER") || upper.contains("PG_TRIGGER") {
+        "triggers"
+    } else if upper.contains("PG_CATALOG.PG_SEQUENCES") || upper.contains("PG_SEQUENCES") {
+        "sequences"
+    } else if upper.contains("PG_CATALOG.PG_NAMESPACE") {
+        "namespaces"
+    } else if upper.contains("PG_CATALOG.PG_CLASS") {
+        "classes"
+    } else if upper.contains("PG_CATALOG.PG_TYPE") {
+        "types"
+    } else if upper.contains("PG_CATALOG.PG_CONSTRAINT") {
+        "constraints"
+    } else if upper.contains("PG_CATALOG.PG_INDEX") {
+        "index"
+    } else {
+        return None;
+    };
     let from = upper.find(" FROM ")?;
     let selected = split_select_list(query[6..from].trim());
     let defaults = match kind {
         "tables" => vec![String::from("table_name")],
+        "privileges" => vec![String::from("table_name")],
+        "roles" => vec![String::from("rolname")],
         "indexes" => vec![String::from("indexname")],
         "policies" => vec![String::from("policyname")],
         "functions" => vec![String::from("proname")],
@@ -1156,6 +1164,29 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
     };
     if selected.is_empty() || selected.iter().any(|item| item == "*") {
         return Some(match kind {
+            "privileges" => vec![
+                String::from("grantor"),
+                String::from("grantee"),
+                String::from("table_catalog"),
+                String::from("table_schema"),
+                String::from("table_name"),
+                String::from("privilege_type"),
+                String::from("is_grantable"),
+            ],
+            "roles" => vec![
+                String::from("oid"),
+                String::from("rolname"),
+                String::from("rolsuper"),
+                String::from("rolinherit"),
+                String::from("rolcreaterole"),
+                String::from("rolcreatedb"),
+                String::from("rolcanlogin"),
+                String::from("rolreplication"),
+                String::from("rolbypassrls"),
+                String::from("rolconnlimit"),
+                String::from("rolpassword"),
+                String::from("rolvaliduntil"),
+            ],
             "tables" => vec![
                 String::from("table_schema"),
                 String::from("table_name"),
@@ -1400,6 +1431,152 @@ where
 {
     let columns = catalog_query_columns(query)?;
     let upper = query.to_ascii_uppercase();
+    if upper.contains("PG_CATALOG.PG_ROLES") || upper.contains("PG_ROLES") {
+        let filter = sql_literal_after(query, "ROLNAME");
+        let mut roles = vec![
+            RoleDefinition {
+                name: String::from("postgres"),
+                login: true,
+                superuser: true,
+                createdb: true,
+                createrole: true,
+                inherit: true,
+            },
+            RoleDefinition {
+                name: String::from("anon"),
+                login: false,
+                superuser: false,
+                createdb: false,
+                createrole: false,
+                inherit: true,
+            },
+            RoleDefinition {
+                name: String::from("authenticated"),
+                login: false,
+                superuser: false,
+                createdb: false,
+                createrole: false,
+                inherit: true,
+            },
+            RoleDefinition {
+                name: String::from("service_role"),
+                login: false,
+                superuser: false,
+                createdb: false,
+                createrole: false,
+                inherit: true,
+            },
+        ];
+        for role in executor.catalog_roles() {
+            if let Some(existing) = roles.iter_mut().find(|entry| entry.name == role.name) {
+                *existing = role;
+            } else {
+                roles.push(role);
+            }
+        }
+        let rows: Vec<Vec<Vec<u8>>> = roles
+            .into_iter()
+            .filter(|role| filter.as_ref().is_none_or(|want| want == &role.name))
+            .map(|role| {
+                let oid = catalog_oid(&format!("role:{}", role.name));
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => oid.to_string().into_bytes(),
+                        "rolname" => role.name.as_bytes().to_vec(),
+                        "rolsuper" => {
+                            if role.superuser {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        "rolinherit" => {
+                            if role.inherit {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        "rolcreaterole" => {
+                            if role.createrole {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        "rolcreatedb" => {
+                            if role.createdb {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        "rolcanlogin" => {
+                            if role.login {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        "rolreplication" | "rolbypassrls" => b"f".to_vec(),
+                        "rolconnlimit" => b"-1".to_vec(),
+                        "rolpassword" | "rolvaliduntil" => SQL_NULL_SENTINEL.to_vec(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+    if upper.contains("INFORMATION_SCHEMA.TABLE_PRIVILEGES")
+        || upper.contains("INFORMATION_SCHEMA.ROLE_TABLE_GRANTS")
+    {
+        let table_filter = sql_literal_after(query, "TABLE_NAME");
+        let mut rows = Vec::new();
+        for privilege in executor.catalog_privileges() {
+            if !privilege.object_type.eq_ignore_ascii_case("TABLE") {
+                continue;
+            }
+            let mut tables = vec![privilege.object.clone()];
+            if privilege.object.ends_with(".*") {
+                let schema = privilege.object.trim_end_matches(".*");
+                tables = executor
+                    .catalog_tables()
+                    .into_iter()
+                    .filter(|table| catalog_table_parts(table).0 == schema)
+                    .collect();
+            }
+            for table in tables {
+                let (schema, name) = catalog_table_parts(&table);
+                if table_filter.as_ref().is_some_and(|want| want != &table && want != name) {
+                    continue;
+                }
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|column| match column.as_str() {
+                            "grantor" => b"postgres".to_vec(),
+                            "grantee" => privilege.grantee.as_bytes().to_vec(),
+                            "table_catalog" => b"default".to_vec(),
+                            "table_schema" => schema.as_bytes().to_vec(),
+                            "table_name" => name.as_bytes().to_vec(),
+                            "privilege_type" => privilege.privilege.as_bytes().to_vec(),
+                            "is_grantable" => {
+                                if privilege.grant_option {
+                                    b"YES".to_vec()
+                                } else {
+                                    b"NO".to_vec()
+                                }
+                            }
+                            _ => Vec::new(),
+                        })
+                        .collect(),
+                );
+            }
+        }
+        return Some(encode_catalog_rows(&columns, rows));
+    }
     if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES") {
         let filter = sql_literal_after(query, "TABLE_NAME")
             .or_else(|| sql_literal_after(query, "TABLENAME"));
@@ -3014,8 +3191,8 @@ where
 mod tests {
     use super::*;
     use ryme_sql::{
-        FunctionDefinition, RlsPolicy, SchemaSnapshot, SequenceDefinition, TriggerDefinition,
-        ViewDefinition,
+        FunctionDefinition, PrivilegeGrant, RlsPolicy, RoleDefinition, SchemaSnapshot,
+        SequenceDefinition, TriggerDefinition, ViewDefinition,
     };
 
     #[test]
@@ -3284,6 +3461,48 @@ mod tests {
         .unwrap();
         assert!(relations.windows(b"events_id_seq".len()).any(|window| window == b"events_id_seq"));
         assert!(relations.windows(b"S".len()).any(|window| window == b"S"));
+    }
+
+    #[test]
+    fn catalogs_expose_roles_and_table_privileges() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.roles.insert(
+            String::from("app_reader"),
+            RoleDefinition {
+                name: String::from("app_reader"),
+                login: true,
+                superuser: false,
+                createdb: false,
+                createrole: false,
+                inherit: true,
+            },
+        );
+        snapshot.privileges.push(PrivilegeGrant {
+            object_type: String::from("TABLE"),
+            object: String::from("public.messages"),
+            privilege: String::from("SELECT"),
+            grantee: String::from("app_reader"),
+            grant_option: true,
+        });
+        executor.restore_schema_snapshot(snapshot).unwrap();
+
+        let roles = catalog_query(
+            "SELECT rolname, rolcanlogin FROM pg_catalog.pg_roles WHERE rolname = 'app_reader'",
+            &executor,
+        )
+        .unwrap();
+        assert!(roles.windows(b"app_reader".len()).any(|window| window == b"app_reader"));
+        assert!(roles.windows(b"t".len()).any(|window| window == b"t"));
+
+        let privileges = catalog_query(
+            "SELECT grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges WHERE table_name = 'messages'",
+            &executor,
+        )
+        .unwrap();
+        assert!(privileges.windows(b"app_reader".len()).any(|window| window == b"app_reader"));
+        assert!(privileges.windows(b"SELECT".len()).any(|window| window == b"SELECT"));
+        assert!(privileges.windows(b"YES".len()).any(|window| window == b"YES"));
     }
 
     #[test]

@@ -57,6 +57,39 @@ pub enum SequenceOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivilegeGrant {
+    pub object_type: String,
+    pub object: String,
+    pub privilege: String,
+    pub grantee: String,
+    #[serde(default)]
+    pub grant_option: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDefinition {
+    pub name: String,
+    #[serde(default = "default_role_login")]
+    pub login: bool,
+    #[serde(default)]
+    pub superuser: bool,
+    #[serde(default)]
+    pub createdb: bool,
+    #[serde(default)]
+    pub createrole: bool,
+    #[serde(default = "default_role_inherit")]
+    pub inherit: bool,
+}
+
+const fn default_role_login() -> bool {
+    false
+}
+
+const fn default_role_inherit() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Statement {
     CreateSchema {
         schema: String,
@@ -177,6 +210,34 @@ pub enum Statement {
         restart: Option<i64>,
         #[serde(default)]
         increment: Option<i64>,
+    },
+    CreateRole {
+        name: String,
+        #[serde(default)]
+        login: bool,
+        #[serde(default)]
+        superuser: bool,
+        #[serde(default)]
+        createdb: bool,
+        #[serde(default)]
+        createrole: bool,
+        #[serde(default = "default_role_inherit")]
+        inherit: bool,
+    },
+    DropRole {
+        name: String,
+        #[serde(default)]
+        if_exists: bool,
+    },
+    PrivilegeChange {
+        #[serde(default)]
+        grant: bool,
+        object_type: String,
+        objects: Vec<String>,
+        privileges: Vec<String>,
+        grantees: Vec<String>,
+        #[serde(default)]
+        grant_option: bool,
     },
     TruncateTable {
         table: String,
@@ -615,6 +676,10 @@ pub struct SchemaSnapshot {
     #[serde(default)]
     pub sequences: BTreeMap<String, SequenceDefinition>,
     #[serde(default)]
+    pub roles: BTreeMap<String, RoleDefinition>,
+    #[serde(default)]
+    pub privileges: Vec<PrivilegeGrant>,
+    #[serde(default)]
     pub rls_tables: BTreeMap<String, String>,
     #[serde(default)]
     pub rls_write_tables: BTreeMap<String, String>,
@@ -683,6 +748,9 @@ impl Statement {
                 | Statement::DropView { .. }
                 | Statement::DropSequence { .. }
                 | Statement::AlterSequence { .. }
+                | Statement::CreateRole { .. }
+                | Statement::DropRole { .. }
+                | Statement::PrivilegeChange { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
@@ -1187,6 +1255,8 @@ impl Statement {
             Self::DropTrigger { table, .. } => table,
             Self::DropView { name, .. } => name,
             Self::DropSequence { name, .. } | Self::AlterSequence { name, .. } => name,
+            Self::CreateRole { .. } | Self::PrivilegeChange { .. } => "",
+            Self::DropRole { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
             Self::Distinct { statement, .. } => statement.table(),
@@ -1212,6 +1282,8 @@ pub fn parse(input: &str) -> Result<Statement> {
             match head.as_str() {
                 "CREATE" => parse_create(&tokens, input),
                 "DROP" => parse_drop(&tokens),
+                "GRANT" => parse_privilege_change(&tokens, input, true),
+                "REVOKE" => parse_privilege_change(&tokens, input, false),
                 "TRUNCATE" => parse_truncate(&tokens),
                 "ALTER" => parse_alter(&tokens, input),
                 "UPSERT" => parse_upsert(&tokens),
@@ -1380,6 +1452,9 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
     }
     if kind.eq_ignore_ascii_case("SEQUENCE") {
         return Ok(Statement::DropSequence { name: object, if_exists });
+    }
+    if kind.eq_ignore_ascii_case("ROLE") || kind.eq_ignore_ascii_case("USER") {
+        return Ok(Statement::DropRole { name: object, if_exists });
     }
     if kind.eq_ignore_ascii_case("TABLE") {
         return Ok(Statement::DropTable { table: object, if_exists });
@@ -1977,6 +2052,11 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         1
     };
     if tokens.get(kind_index).is_some_and(|token| {
+        token.eq_ignore_ascii_case("ROLE") || token.eq_ignore_ascii_case("USER")
+    }) {
+        return parse_create_role(tokens, kind_index);
+    }
+    if tokens.get(kind_index).is_some_and(|token| {
         token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE")
     }) {
         return parse_create_function(tokens, raw, kind_index);
@@ -2082,6 +2162,108 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         foreign_keys,
         named_constraints,
         if_not_exists,
+    })
+}
+
+fn parse_create_role(tokens: &[String], kind_index: usize) -> Result<Statement> {
+    let name = tokens
+        .get(kind_index + 1)
+        .map(|value| unquote(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create role")))?;
+    let mut login = false;
+    let mut superuser = false;
+    let mut createdb = false;
+    let mut createrole = false;
+    let mut inherit = true;
+    for token in tokens.iter().skip(kind_index + 2) {
+        match token.to_ascii_uppercase().as_str() {
+            "LOGIN" => login = true,
+            "NOLOGIN" => login = false,
+            "SUPERUSER" => superuser = true,
+            "NOSUPERUSER" => superuser = false,
+            "CREATEDB" => createdb = true,
+            "NOCREATEDB" => createdb = false,
+            "CREATEROLE" => createrole = true,
+            "NOCREATEROLE" => createrole = false,
+            "INHERIT" => inherit = true,
+            "NOINHERIT" => inherit = false,
+            _ => {}
+        }
+    }
+    Ok(Statement::CreateRole { name, login, superuser, createdb, createrole, inherit })
+}
+
+fn parse_privilege_change(tokens: &[String], raw: &str, grant: bool) -> Result<Statement> {
+    let command = if grant { "GRANT" } else { "REVOKE" };
+    let on_pos = find_sql_keyword(raw, "ON", command.len())
+        .ok_or_else(|| RymeError::InvalidArgument(format!("{command} object")))?;
+    let recipient_keyword = if grant { "TO" } else { "FROM" };
+    let recipient_pos = find_sql_keyword(raw, recipient_keyword, on_pos + 2)
+        .ok_or_else(|| RymeError::InvalidArgument(format!("{command} grantee")))?;
+    let mut privilege_text = raw[command.len()..on_pos].trim();
+    if !grant {
+        privilege_text =
+            privilege_text.strip_prefix("GRANT OPTION FOR").unwrap_or(privilege_text).trim();
+    }
+    let privileges = split_sql_items(privilege_text)
+        .into_iter()
+        .map(|privilege| unquote(privilege.trim()).to_ascii_uppercase())
+        .filter(|privilege| !privilege.is_empty())
+        .map(
+            |privilege| if privilege == "ALL PRIVILEGES" { String::from("ALL") } else { privilege },
+        )
+        .collect::<Vec<_>>();
+    let object_text = raw[on_pos + 2..recipient_pos].trim();
+    let object_tokens = tokenize(object_text);
+    let (object_type, objects_text) =
+        if object_tokens.first().is_some_and(|token| token.eq_ignore_ascii_case("ALL")) {
+            let kind = object_tokens
+                .get(1)
+                .map(|token| token.trim_end_matches('S').to_ascii_uppercase())
+                .ok_or_else(|| RymeError::InvalidArgument(format!("{command} object")))?;
+            let schema_pos =
+                object_tokens.iter().position(|token| token.eq_ignore_ascii_case("SCHEMA"));
+            let schema = schema_pos
+                .and_then(|position| object_tokens.get(position + 1))
+                .map(|value| unquote(value))
+                .ok_or_else(|| RymeError::InvalidArgument(format!("{command} schema")))?;
+            (kind, format!("{schema}.*"))
+        } else {
+            let object_type = object_tokens
+                .first()
+                .map(|value| unquote(value).to_ascii_uppercase())
+                .ok_or_else(|| RymeError::InvalidArgument(format!("{command} object")))?;
+            let type_len = object_tokens.first().map_or(0, String::len);
+            (object_type, object_text[type_len..].trim().to_string())
+        };
+    let objects = split_sql_items(&objects_text)
+        .into_iter()
+        .map(|object| unquote(object.trim()))
+        .filter(|object| !object.is_empty())
+        .collect::<Vec<_>>();
+    let mut grantee_text =
+        raw[recipient_pos + recipient_keyword.len()..].trim().trim_end_matches(';').trim();
+    let grant_option = grant && grantee_text.to_ascii_uppercase().ends_with("WITH GRANT OPTION");
+    if grant_option {
+        grantee_text = grantee_text[..grantee_text.len() - "WITH GRANT OPTION".len()].trim();
+    }
+    let grantees = split_sql_items(grantee_text)
+        .into_iter()
+        .map(|grantee| unquote(grantee.trim()))
+        .filter(|grantee| !grantee.is_empty())
+        .collect::<Vec<_>>();
+    if privileges.is_empty() || objects.is_empty() || grantees.is_empty() {
+        return Err(RymeError::InvalidArgument(format!("{command} privilege")));
+    }
+    let _ = tokens;
+    Ok(Statement::PrivilegeChange {
+        grant,
+        object_type,
+        objects,
+        privileges,
+        grantees,
+        grant_option,
     })
 }
 
@@ -5587,6 +5769,20 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::AlterSequence { name, restart, increment } => {
             format!("ddl alter_sequence({name}) restart {restart:?} increment {increment:?}")
         }
+        Statement::CreateRole { name, .. } => format!("ddl create_role({name})"),
+        Statement::DropRole { name, .. } => format!("ddl drop_role({name})"),
+        Statement::PrivilegeChange {
+            grant, object_type, objects, privileges, grantees, ..
+        } => {
+            format!(
+                "ddl {} {} {} on {} to {}",
+                if *grant { "grant" } else { "revoke" },
+                privileges.join(","),
+                object_type,
+                objects.join(","),
+                grantees.join(",")
+            )
+        }
         Statement::TruncateTable { table, restart_identity, cascade } => {
             format!(
                 "write truncate({table}) {} {}",
@@ -6194,6 +6390,8 @@ pub struct Executor<B = TxnManager> {
     triggers: Arc<Mutex<HashMap<String, TriggerDefinition>>>,
     views: Arc<Mutex<HashMap<String, ViewDefinition>>>,
     sequences: Arc<Mutex<HashMap<String, SequenceDefinition>>>,
+    roles: Arc<Mutex<HashMap<String, RoleDefinition>>>,
+    privileges: Arc<Mutex<Vec<PrivilegeGrant>>>,
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
@@ -6231,6 +6429,8 @@ impl Executor<TxnManager> {
             triggers: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
             sequences: Arc::new(Mutex::new(HashMap::new())),
+            roles: Arc::new(Mutex::new(HashMap::new())),
+            privileges: Arc::new(Mutex::new(Vec::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -6262,6 +6462,8 @@ impl Executor<TxnManager> {
             triggers: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
             sequences: Arc::new(Mutex::new(HashMap::new())),
+            roles: Arc::new(Mutex::new(HashMap::new())),
+            privileges: Arc::new(Mutex::new(Vec::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -6298,6 +6500,8 @@ where
             triggers: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
             sequences: Arc::new(Mutex::new(HashMap::new())),
+            roles: Arc::new(Mutex::new(HashMap::new())),
+            privileges: Arc::new(Mutex::new(Vec::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -6657,6 +6861,86 @@ where
         })
     }
 
+    fn install_role(&self, definition: RoleDefinition) -> Result<()> {
+        let mut roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        if roles.contains_key(&definition.name) {
+            return Err(RymeError::Conflict(format!("role {}", definition.name)));
+        }
+        roles.insert(definition.name.clone(), definition);
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn drop_role(&self, name: &str, if_exists: bool) -> Result<()> {
+        let removed = self
+            .roles
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("role lock")))?
+            .remove(name)
+            .is_some();
+        if !removed && !if_exists {
+            return Err(RymeError::NotFound(format!("role {name}")));
+        }
+        if removed {
+            let mut privileges = self
+                .privileges
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("privilege lock")))?;
+            privileges.retain(|grant| !grant.grantee.eq_ignore_ascii_case(name));
+            self.schema_dirty.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn apply_privilege_change(
+        &self,
+        grant: bool,
+        object_type: String,
+        objects: Vec<String>,
+        privileges: Vec<String>,
+        grantees: Vec<String>,
+        grant_option: bool,
+    ) -> Result<()> {
+        let mut stored = self
+            .privileges
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("privilege lock")))?;
+        for object in objects {
+            for privilege in &privileges {
+                for grantee in &grantees {
+                    if grant {
+                        if let Some(existing) = stored.iter_mut().find(|entry| {
+                            entry.object_type.eq_ignore_ascii_case(&object_type)
+                                && entry.object.eq_ignore_ascii_case(&object)
+                                && entry.privilege.eq_ignore_ascii_case(privilege)
+                                && entry.grantee.eq_ignore_ascii_case(grantee)
+                        }) {
+                            existing.grant_option |= grant_option;
+                        } else {
+                            stored.push(PrivilegeGrant {
+                                object_type: object_type.clone(),
+                                object: object.clone(),
+                                privilege: privilege.clone(),
+                                grantee: grantee.clone(),
+                                grant_option,
+                            });
+                        }
+                    } else {
+                        stored.retain(|entry| {
+                            !(entry.object_type.eq_ignore_ascii_case(&object_type)
+                                && entry.object.eq_ignore_ascii_case(&object)
+                                && entry.privilege.eq_ignore_ascii_case(privilege)
+                                && entry.grantee.eq_ignore_ascii_case(grantee))
+                        });
+                    }
+                }
+            }
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn apply_before_triggers(&self, table: &str, event: &str, value: &[u8]) -> Result<Vec<u8>> {
         let triggers = self
             .triggers
@@ -6835,6 +7119,8 @@ where
             triggers: self.triggers,
             views: self.views,
             sequences: self.sequences,
+            roles: self.roles,
+            privileges: self.privileges,
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
@@ -6997,6 +7283,9 @@ where
                     .collect()
             })
             .unwrap_or_default();
+        let roles = self.roles.lock().map(|roles| roles.clone()).unwrap_or_default();
+        let privileges =
+            self.privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
         SchemaSnapshot {
             tables,
             indexes,
@@ -7007,6 +7296,8 @@ where
             triggers,
             views,
             sequences,
+            roles: roles.into_iter().collect(),
+            privileges,
             rls_tables,
             rls_write_tables,
             rls_enabled,
@@ -7020,6 +7311,8 @@ where
         let triggers = snapshot.triggers;
         let views = snapshot.views;
         let sequences = snapshot.sequences;
+        let roles = snapshot.roles;
+        let privileges = snapshot.privileges;
         {
             let mut catalog = self
                 .catalog
@@ -7061,6 +7354,16 @@ where
             *stored = sequences.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("sequence lock")));
+        }
+        if let Ok(mut stored) = self.roles.lock() {
+            *stored = roles.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("role lock")));
+        }
+        if let Ok(mut stored) = self.privileges.lock() {
+            *stored = privileges;
+        } else {
+            return Err(RymeError::Internal(String::from("privilege lock")));
         }
         let legacy_rls_enabled: HashSet<String> = snapshot.rls_tables.keys().cloned().collect();
         let rls_enabled: HashSet<String> = if snapshot.rls_enabled.is_empty() {
@@ -7153,6 +7456,9 @@ where
         let views = self.views.lock().map(|views| views.clone()).unwrap_or_default();
         let sequences =
             self.sequences.lock().map(|sequences| sequences.clone()).unwrap_or_default();
+        let roles = self.roles.lock().map(|roles| roles.clone()).unwrap_or_default();
+        let privileges =
+            self.privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -7176,6 +7482,8 @@ where
             triggers: Arc::new(Mutex::new(triggers)),
             views: Arc::new(Mutex::new(views)),
             sequences: Arc::new(Mutex::new(sequences)),
+            roles: Arc::new(Mutex::new(roles)),
+            privileges: Arc::new(Mutex::new(privileges)),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -7206,6 +7514,17 @@ where
         let mut definitions: Vec<SequenceDefinition> = sequences.values().cloned().collect();
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
         definitions
+    }
+
+    pub fn catalog_roles(&self) -> Vec<RoleDefinition> {
+        let Ok(roles) = self.roles.lock() else { return Vec::new() };
+        let mut definitions: Vec<RoleDefinition> = roles.values().cloned().collect();
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        definitions
+    }
+
+    pub fn catalog_privileges(&self) -> Vec<PrivilegeGrant> {
+        self.privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default()
     }
 
     pub fn catalog_columns(&self, table: &str) -> Vec<ColumnDefinition> {
@@ -10330,6 +10649,9 @@ where
             | Statement::DropView { .. }
             | Statement::DropSequence { .. }
             | Statement::AlterSequence { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::PrivilegeChange { .. }
             | Statement::SequenceValue { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
@@ -10410,6 +10732,39 @@ where
                         last_value: None,
                     },
                     if_not_exists,
+                )?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::CreateRole { name, login, superuser, createdb, createrole, inherit } => {
+                self.install_role(RoleDefinition {
+                    name,
+                    login,
+                    superuser,
+                    createdb,
+                    createrole,
+                    inherit,
+                })?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::DropRole { name, if_exists } => {
+                self.drop_role(&name, if_exists)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::PrivilegeChange {
+                grant,
+                object_type,
+                objects,
+                privileges,
+                grantees,
+                grant_option,
+            } => {
+                self.apply_privilege_change(
+                    grant,
+                    object_type,
+                    objects,
+                    privileges,
+                    grantees,
+                    grant_option,
                 )?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
@@ -11910,6 +12265,9 @@ where
             | Statement::DropView { .. }
             | Statement::DropSequence { .. }
             | Statement::AlterSequence { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::PrivilegeChange { .. }
             | Statement::SequenceValue { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
@@ -11949,6 +12307,7 @@ where
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
                 | Statement::CreateSequence { .. }
+                | Statement::CreateRole { .. }
                 | Statement::CreateFunction { .. }
                 | Statement::CreateView { .. }
                 | Statement::CreateTrigger { .. }
@@ -11958,6 +12317,8 @@ where
                 | Statement::DropView { .. }
                 | Statement::DropSequence { .. }
                 | Statement::AlterSequence { .. }
+                | Statement::DropRole { .. }
+                | Statement::PrivilegeChange { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
@@ -12367,6 +12728,39 @@ where
                         last_value: None,
                     },
                     if_not_exists,
+                )?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::CreateRole { name, login, superuser, createdb, createrole, inherit } => {
+                self.install_role(RoleDefinition {
+                    name,
+                    login,
+                    superuser,
+                    createdb,
+                    createrole,
+                    inherit,
+                })?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::DropRole { name, if_exists } => {
+                self.drop_role(&name, if_exists)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::PrivilegeChange {
+                grant,
+                object_type,
+                objects,
+                privileges,
+                grantees,
+                grant_option,
+            } => {
+                self.apply_privilege_change(
+                    grant,
+                    object_type,
+                    objects,
+                    privileges,
+                    grantees,
+                    grant_option,
                 )?;
                 Ok(QueryResult::Ok)
             }
@@ -13635,6 +14029,46 @@ mod tests {
         assert!(
             matches!(restored, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"7".to_vec()]])
         );
+    }
+
+    #[tokio::test]
+    async fn roles_and_privileges_persist_and_revoke_cleanly() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE ROLE app_reader LOGIN").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT SELECT, INSERT ON TABLE public.messages TO app_reader, authenticated WITH GRANT OPTION").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT USAGE ON SCHEMA public TO authenticated").unwrap())
+            .await
+            .unwrap();
+        let snapshot = executor.schema_snapshot();
+        assert!(snapshot.roles.contains_key("app_reader"));
+        assert!(snapshot.privileges.iter().any(|grant| {
+            grant.object == "public.messages"
+                && grant.privilege == "SELECT"
+                && grant.grantee == "app_reader"
+                && grant.grant_option
+        }));
+        assert!(snapshot.privileges.iter().any(|grant| {
+            grant.object == "public"
+                && grant.object_type == "SCHEMA"
+                && grant.grantee == "authenticated"
+        }));
+
+        executor
+            .execute(parse("REVOKE SELECT ON TABLE public.messages FROM app_reader").unwrap())
+            .await
+            .unwrap();
+        assert!(!executor.schema_snapshot().privileges.iter().any(|grant| {
+            grant.object == "public.messages"
+                && grant.privilege == "SELECT"
+                && grant.grantee == "app_reader"
+        }));
+        executor.execute(parse("DROP ROLE app_reader").unwrap()).await.unwrap();
+        executor.restore_schema_snapshot(snapshot).unwrap();
+        assert!(executor.schema_snapshot().roles.contains_key("app_reader"));
     }
 
     #[tokio::test]

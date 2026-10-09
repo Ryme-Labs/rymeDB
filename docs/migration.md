@@ -73,6 +73,11 @@ PostgreSQL sequences are also persisted and support `CREATE SEQUENCE`,
 `ALTER SEQUENCE ... RESTART/INCREMENT`, `DROP SEQUENCE`, and the common
 `nextval`, `currval`, and `setval` functions; their state survives schema
 snapshot restoration and is available through `pg_catalog.pg_sequences`.
+Common `CREATE ROLE`, `DROP ROLE`, `GRANT`, and `REVOKE` declarations are
+persisted as database privilege metadata. Role rows are available through
+`pg_catalog.pg_roles`, while table grants are exposed through
+`information_schema.table_privileges`; privilege enforcement remains at the
+authenticated gateway/RLS boundary until SQL sessions carry an explicit role.
 Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
 persisted in schema snapshots. `BEFORE` row triggers that assign
 `NEW.column = now()` (or the equivalent current-timestamp expressions) are
@@ -143,6 +148,7 @@ common migration declarations `CREATE SCHEMA IF NOT EXISTS` and
 `DROP VIEW [IF EXISTS]`,
 `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, including
 `nextval`, `currval`, and `setval` sequence calls,
+`CREATE ROLE`, `DROP ROLE`, `GRANT`, and `REVOKE` privilege declarations,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT (columns) DO UPDATE` uses
