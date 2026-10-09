@@ -1323,6 +1323,51 @@ fn json_result_bytes(value: &serde_json::Value) -> Vec<u8> {
     }
 }
 
+fn json_projection_bytes(
+    expression: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<u8>> {
+    let operator = expression.find("->")?;
+    let base = expression[..operator].trim();
+    let mut current = object.get(base)?;
+    let mut tail = &expression[operator + 2..];
+    loop {
+        let text_result = tail.starts_with('>');
+        if text_result {
+            tail = &tail[1..];
+        }
+        let (selector, consumed) = if tail.starts_with('\'') || tail.starts_with('"') {
+            let quote = tail.as_bytes()[0] as char;
+            let end = tail
+                .char_indices()
+                .skip(1)
+                .find_map(|(index, ch)| (ch == quote).then_some(index))?;
+            (&tail[1..end], end + 1)
+        } else {
+            let end = tail.find("->").unwrap_or(tail.len());
+            (&tail[..end], end)
+        };
+        let selector = unquote(selector.trim());
+        current = match current {
+            serde_json::Value::Object(values) => values.get(&selector)?,
+            serde_json::Value::Array(values) => values.get(selector.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+        tail = &tail[consumed..];
+        if tail.is_empty() {
+            return Some(if text_result {
+                json_result_bytes(current)
+            } else {
+                serde_json::to_vec(current).ok()?
+            });
+        }
+        if !tail.starts_with("->") {
+            return None;
+        }
+        tail = &tail[2..];
+    }
+}
+
 fn new_uuid_v4() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| RymeError::Internal(e.to_string()))?;
@@ -2117,6 +2162,9 @@ where
                 let Some(serde_json::Value::Object(object)) = object.as_ref() else {
                     return value.to_vec();
                 };
+                if let Some(projected) = json_projection_bytes(column, object) {
+                    return projected;
+                }
                 object
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case(column))
@@ -3932,6 +3980,36 @@ mod tests {
                     b"[\"chat\",\"game\"]".to_vec(),
                     b"[2,4,8]".to_vec()
                 ]]
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_json_projection_supports_chained_paths() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE docs (id TEXT PRIMARY KEY, payload JSONB)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO docs (id, payload) VALUES ('d1', '{\"name\":\"Ada\",\"meta\":{\"role\":\"admin\"}}')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = executor
+            .execute(
+                parse(
+                    "SELECT payload->>'name', payload->'meta'->>'role' FROM docs WHERE key = 'd1'",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { rows, .. }
+                if rows == vec![vec![b"Ada".to_vec(), b"admin".to_vec()]]
         ));
     }
 

@@ -87,6 +87,8 @@ and `DEFAULT` values), with PostgreSQL `information_schema.tables` and
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
 `ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
+JSONB projections support PostgreSQL `->` and `->>` operators, including
+chained object and array paths in selected columns,
 `CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields,
 with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
 (`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, and `pg_index`),

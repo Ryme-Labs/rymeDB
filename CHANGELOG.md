@@ -39,6 +39,8 @@ All notable changes to rymeDB are recorded here. Format follows
   propagates replay failures instead of silently advancing its applied index.
 - SQL schema rows now materialize declared array columns from `ARRAY[...]` and
   PostgreSQL brace literals as structured JSON arrays instead of opaque text.
+- SQL JSONB projections now support `->` and `->>` object/array paths,
+  including chained expressions.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention
