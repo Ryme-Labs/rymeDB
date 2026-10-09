@@ -114,7 +114,9 @@ subscriber to receive every successful publish. It reports publisher qps,
 fanout deliveries per second, delivery percentage, and errors. A run is only
 valid when `publish_errors=0`, `receive_errors=0`, and `delivery_percent=100`;
 record the CPU, memory, payload, connection count, publish concurrency, and
-server QoS tier beside the result. This is an end-to-end workload gate, not a
+server QoS tier beside the result. Broadcast channels use a dedicated
+32-shard registry and sequence allocation path, separate from CDC/query,
+presence, and durable-topic state. This is an end-to-end workload gate, not a
 claim about all realtime workloads or connection capacity.
 
 ## What we claim

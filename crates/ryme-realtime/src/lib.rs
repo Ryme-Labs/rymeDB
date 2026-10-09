@@ -1,6 +1,8 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -33,6 +35,7 @@ pub struct QueryRow {
 
 pub const PRESENCE_MAX_MEMBERS: usize = 1000;
 pub const PRESENCE_MAX_TTL_SECS: u64 = 86400;
+const BROADCAST_SHARDS: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryUpdate {
@@ -48,6 +51,9 @@ pub struct QueryUpdate {
 #[derive(Debug, Clone)]
 pub struct Realtime {
     inner: Arc<Mutex<RealtimeInner>>,
+    broadcast_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>>>,
+    broadcast_capacity: usize,
+    sequence: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -62,9 +68,7 @@ struct RealtimeInner {
     history: HashMap<String, std::collections::VecDeque<ChangeRecord>>,
     queries: HashMap<String, QueryTopic>,
     presence: HashMap<String, HashMap<String, PresenceMember>>,
-    broadcast: HashMap<String, broadcast::Sender<BroadcastMsg>>,
     durable: HashMap<String, DurableTopic>,
-    sequence: u64,
     capacity: usize,
 }
 
@@ -114,25 +118,38 @@ pub struct NewChange {
 
 impl Realtime {
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.clamp(16, 100000);
         Self {
             inner: Arc::new(Mutex::new(RealtimeInner {
                 topics: HashMap::new(),
                 history: HashMap::new(),
                 queries: HashMap::new(),
                 presence: HashMap::new(),
-                broadcast: HashMap::new(),
                 durable: HashMap::new(),
-                sequence: 0,
-                capacity: capacity.clamp(16, 100000),
+                capacity,
             })),
+            broadcast_topics: Arc::new(
+                (0..BROADCAST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            ),
+            broadcast_capacity: capacity,
+            sequence: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn next_sequence(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn broadcast_shard(&self, key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.broadcast_topics.len()
     }
 
     pub fn publish(&self, event: NewChange) -> Result<u64> {
         let mut inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
-        inner.sequence += 1;
-        let sequence = inner.sequence;
+        let sequence = self.next_sequence();
         let record = ChangeRecord {
             tenant: event.tenant.clone(),
             database: event.database.clone(),
@@ -258,13 +275,12 @@ impl Realtime {
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         limit: usize,
     ) -> Option<u64> {
-        let mut inner = self.inner.lock().ok()?;
+        let inner = self.inner.lock().ok()?;
         let key = topic_key(tenant, database, table);
         if !inner.queries.contains_key(&key) {
             return None;
         }
-        inner.sequence += 1;
-        let sequence = inner.sequence;
+        let sequence = self.next_sequence();
         let topic = inner.queries.get(&key)?;
         let truncated = rows.len() >= limit;
         let rows = rows.into_iter().take(limit).map(|(pk, value)| QueryRow { pk, value }).collect();
@@ -334,15 +350,18 @@ impl Realtime {
             inner.history.remove(&key);
             removed += 1;
         }
-        let idle_broadcast: Vec<String> = inner
-            .broadcast
-            .iter()
-            .filter(|(_, sender)| sender.receiver_count() == 0)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in idle_broadcast {
-            inner.broadcast.remove(&key);
-            removed += 1;
+        for shard in self.broadcast_topics.iter() {
+            if let Ok(mut topics) = shard.lock() {
+                let idle_broadcast: Vec<String> = topics
+                    .iter()
+                    .filter(|(_, sender)| sender.receiver_count() == 0)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in idle_broadcast {
+                    topics.remove(&key);
+                    removed += 1;
+                }
+            }
         }
         let idle_queries: Vec<String> = inner
             .queries
@@ -396,15 +415,17 @@ impl Realtime {
         payload: serde_json::Value,
         commit_ts: u64,
     ) -> Result<u64> {
-        let mut inner =
-            self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
-        inner.sequence += 1;
-        let sequence = inner.sequence;
-        let capacity = inner.capacity;
-        let sender = inner
-            .broadcast
-            .entry(scope_key(tenant, channel))
-            .or_insert_with(|| broadcast::channel(capacity).0);
+        let key = scope_key(tenant, channel);
+        let shard = self.broadcast_shard(&key);
+        let mut topics = self
+            .broadcast_topics
+            .get(shard)
+            .expect("broadcast shard")
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+        let sequence = self.next_sequence();
+        let sender =
+            topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
         let _ = sender.send(BroadcastMsg {
             channel: channel.to_string(),
             from,
@@ -420,15 +441,16 @@ impl Realtime {
         tenant: &str,
         channel: &str,
     ) -> broadcast::Receiver<BroadcastMsg> {
-        let Ok(mut inner) = self.inner.lock() else {
+        let key = scope_key(tenant, channel);
+        let shard = self.broadcast_shard(&key);
+        let Ok(mut topics) = self.broadcast_topics.get(shard).expect("broadcast shard").lock()
+        else {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
         };
-        let capacity = inner.capacity;
-        inner
-            .broadcast
-            .entry(scope_key(tenant, channel))
-            .or_insert_with(|| broadcast::channel(capacity).0)
+        topics
+            .entry(key)
+            .or_insert_with(|| broadcast::channel(self.broadcast_capacity).0)
             .subscribe()
     }
 
@@ -666,6 +688,38 @@ mod tests {
             let msg = receiver.try_recv().unwrap();
             assert_eq!(msg.channel, "lobby");
             assert_eq!(msg.commit_ts, 3);
+        }
+    }
+
+    #[test]
+    fn broadcast_sequences_are_unique_under_concurrent_publishers() {
+        let realtime = Realtime::new(512);
+        let mut receiver = realtime.broadcast_subscribe("t", "lobby");
+        let mut workers = Vec::new();
+        for worker in 0..4u64 {
+            let realtime = realtime.clone();
+            workers.push(std::thread::spawn(move || {
+                (0..100u64)
+                    .map(|message| {
+                        realtime
+                            .broadcast(
+                                "t",
+                                "lobby",
+                                format!("{worker}-{message}"),
+                                serde_json::Value::Null,
+                                message,
+                            )
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut sequences =
+            workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=400).collect::<Vec<_>>());
+        for expected in 1..=400 {
+            assert_eq!(receiver.try_recv().unwrap().sequence, expected);
         }
     }
 
