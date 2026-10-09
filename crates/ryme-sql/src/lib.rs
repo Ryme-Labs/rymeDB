@@ -16,6 +16,8 @@ pub enum Statement {
         #[serde(default)]
         unique_constraints: Vec<Vec<String>>,
         #[serde(default)]
+        checks: Vec<String>,
+        #[serde(default)]
         if_not_exists: bool,
     },
     DropTable {
@@ -227,6 +229,8 @@ pub struct SchemaSnapshot {
     pub tables: BTreeMap<String, Vec<ColumnDefinition>>,
     #[serde(default)]
     pub indexes: Vec<IndexDefinition>,
+    #[serde(default)]
+    pub checks: BTreeMap<String, Vec<String>>,
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -545,6 +549,42 @@ impl Predicate {
 
 fn is_null_bytes(value: &[u8]) -> bool {
     value.is_empty() || value.eq_ignore_ascii_case(b"null")
+}
+
+fn check_predicate_result(predicate: &Predicate, pk: &[u8], value: &[u8]) -> Option<bool> {
+    if predicate.op == Cmp::AnyOf {
+        let mut unknown = false;
+        for branch in &predicate.alternatives {
+            let mut branch_unknown = false;
+            let mut branch_valid = true;
+            for predicate in branch {
+                match check_predicate_result(predicate, pk, value) {
+                    Some(true) => {}
+                    Some(false) => {
+                        branch_valid = false;
+                        break;
+                    }
+                    None => branch_unknown = true,
+                }
+            }
+            if branch_valid && !branch_unknown {
+                return Some(true);
+            }
+            if branch_valid && branch_unknown {
+                unknown = true;
+            }
+        }
+        return if unknown { None } else { Some(false) };
+    }
+    if predicate.matches(pk, value) {
+        return Some(true);
+    }
+    if !matches!(predicate.op, Cmp::IsNull | Cmp::IsNotNull | Cmp::IsDistinct | Cmp::IsNotDistinct)
+        && predicate.target_is_null(pk, value) == Some(true)
+    {
+        return None;
+    }
+    Some(false)
 }
 
 fn sql_like(value: &str, pattern: &str) -> bool {
@@ -1036,8 +1076,8 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
     let if_not_exists =
         tokens.get(table_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
-    let (columns, unique_constraints) = parse_table_definition(raw)?;
-    Ok(Statement::CreateTable { table, columns, unique_constraints, if_not_exists })
+    let (columns, unique_constraints, checks) = parse_table_definition(raw)?;
+    Ok(Statement::CreateTable { table, columns, unique_constraints, checks, if_not_exists })
 }
 
 fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -1093,19 +1133,23 @@ fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
 }
 
 fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
-    parse_table_definition(raw).map(|(columns, _)| columns)
+    parse_table_definition(raw).map(|(columns, _, _)| columns)
 }
 
-fn parse_table_definition(raw: &str) -> Result<(Vec<ColumnDefinition>, Vec<Vec<String>>)> {
-    let Some(open) = raw.find('(') else { return Ok((Vec::new(), Vec::new())) };
-    let Some(close) = raw.rfind(')') else { return Ok((Vec::new(), Vec::new())) };
+fn parse_table_definition(
+    raw: &str,
+) -> Result<(Vec<ColumnDefinition>, Vec<Vec<String>>, Vec<String>)> {
+    let Some(open) = raw.find('(') else { return Ok((Vec::new(), Vec::new(), Vec::new())) };
+    let Some(close) = raw.rfind(')') else { return Ok((Vec::new(), Vec::new(), Vec::new())) };
     if close <= open {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     let items = split_sql_items(&raw[open + 1..close]);
     let mut table_primary = Vec::new();
     let mut table_unique = Vec::new();
+    let mut checks = Vec::new();
     for item in &items {
+        checks.extend(check_expressions(item));
         let words: Vec<&str> = item.split_whitespace().collect();
         let table_constraint = words.first().is_some_and(|word| {
             word.eq_ignore_ascii_case("PRIMARY")
@@ -1211,7 +1255,49 @@ fn parse_table_definition(raw: &str) -> Result<(Vec<ColumnDefinition>, Vec<Vec<S
         };
         column.unique = true;
     }
-    Ok((columns, composite_unique))
+    Ok((columns, composite_unique, checks))
+}
+
+fn check_expressions(item: &str) -> Vec<String> {
+    let upper = item.to_ascii_uppercase();
+    let mut checks = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = upper[cursor..].find("CHECK") {
+        let start = cursor + relative;
+        let after = start + "CHECK".len();
+        let Some(open_relative) = item[after..].find('(') else { break };
+        let open = after + open_relative;
+        let Some(close) = matching_paren(item, open) else { break };
+        let expression = item[open + 1..close].trim();
+        if !expression.is_empty() {
+            checks.push(expression.to_string());
+        }
+        cursor = close + 1;
+    }
+    checks
+}
+
+fn check_references_column(expression: &str, column: &str) -> bool {
+    tokenize(expression).iter().any(|token| {
+        !token.starts_with('\'') && !token.starts_with('"') && token.eq_ignore_ascii_case(column)
+    })
+}
+
+fn rename_check_column(expression: &str, from: &str, to: &str) -> String {
+    tokenize(expression)
+        .into_iter()
+        .map(|token| {
+            if !token.starts_with('\'')
+                && !token.starts_with('"')
+                && token.eq_ignore_ascii_case(from)
+            {
+                to.to_string()
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn split_sql_items(input: &str) -> Vec<String> {
@@ -2909,6 +2995,7 @@ pub struct Executor<B = TxnManager> {
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
     rls_tables: Arc<HashMap<String, String>>,
+    checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
@@ -2935,6 +3022,7 @@ impl Executor<TxnManager> {
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
+            checks: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -2955,6 +3043,7 @@ impl Executor<TxnManager> {
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
+            checks: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -2980,6 +3069,7 @@ where
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
+            checks: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -3024,6 +3114,7 @@ where
             catalog: self.catalog,
             indexes: self.indexes,
             rls_tables: self.rls_tables,
+            checks: self.checks,
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
@@ -3093,7 +3184,17 @@ where
         indexes.sort_by(|left, right| {
             left.table.cmp(&right.table).then_with(|| left.name.cmp(&right.name))
         });
-        SchemaSnapshot { tables, indexes }
+        let checks = self
+            .checks
+            .lock()
+            .map(|checks| {
+                checks
+                    .iter()
+                    .map(|(table, expressions)| (table.clone(), expressions.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        SchemaSnapshot { tables, indexes, checks }
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
@@ -3103,6 +3204,11 @@ where
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
             *catalog = snapshot.tables.into_iter().collect();
+        }
+        if let Ok(mut checks) = self.checks.lock() {
+            *checks = snapshot.checks.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("check constraint lock")));
         }
         if let Ok(mut indexes) = self.indexes.lock() {
             indexes.clear();
@@ -3122,6 +3228,7 @@ where
     {
         let catalog = self.catalog.lock().map(|catalog| catalog.clone()).unwrap_or_default();
         let indexes = self.indexes.lock().map(|indexes| indexes.clone()).unwrap_or_default();
+        let checks = self.checks.lock().map(|checks| checks.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -3134,6 +3241,7 @@ where
             catalog: Arc::new(Mutex::new(catalog)),
             indexes: Arc::new(Mutex::new(indexes)),
             rls_tables: self.rls_tables,
+            checks: Arc::new(Mutex::new(checks)),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -3245,6 +3353,34 @@ where
         } else {
             Err(RymeError::Forbidden)
         }
+    }
+
+    fn enforce_checks(&self, table: &str, pk: &[u8], value: &[u8]) -> Result<()> {
+        let checks = self
+            .checks
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("check constraint lock")))?
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        for expression in checks {
+            let predicates = parse_filter(&tokenize(&expression))?;
+            let mut valid = true;
+            for predicate in predicates {
+                match check_predicate_result(&predicate, pk, value) {
+                    Some(true) => {}
+                    Some(false) => {
+                        valid = false;
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            if !valid {
+                return Err(RymeError::Conflict(format!("check constraint failed: {expression}")));
+            }
+        }
+        Ok(())
     }
 
     fn filter_rls_rows(&self, table: &str, rows: impl IntoIterator<Item = Row>) -> Vec<Row> {
@@ -4005,6 +4141,7 @@ where
         table: String,
         columns: Vec<ColumnDefinition>,
         unique_constraints: Vec<Vec<String>>,
+        checks: Vec<String>,
         if_not_exists: bool,
     ) -> Result<()> {
         let exists = self
@@ -4019,6 +4156,12 @@ where
             return Err(RymeError::Conflict(String::from("table exists")));
         }
         self.register_table(table.clone(), columns);
+        if !checks.is_empty() {
+            self.checks
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("check constraint lock")))?
+                .insert(table.clone(), checks);
+        }
         for columns in unique_constraints {
             if columns.len() < 2 {
                 continue;
@@ -4073,6 +4216,9 @@ where
             let mut indexes =
                 self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
             indexes.remove(&table);
+        }
+        if let Ok(mut checks) = self.checks.lock() {
+            checks.remove(&table);
         }
         let prefix = format!("{}\0{}\0{}\0", self.tenant, self.database, table);
         if let Ok(mut sequences) = self.sequence_next.lock() {
@@ -4257,6 +4403,19 @@ where
                 "dropping a primary key column is not supported",
             )));
         }
+        if self
+            .checks
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("check constraint lock")))?
+            .get(&table)
+            .is_some_and(|checks| {
+                checks.iter().any(|check| check_references_column(check, &column))
+            })
+        {
+            return Err(RymeError::InvalidArgument(String::from(
+                "dropping a column referenced by a check constraint is not supported",
+            )));
+        }
 
         let rows = self.scan_all_rows(&table)?;
         let mut updates = Vec::with_capacity(rows.len());
@@ -4435,6 +4594,13 @@ where
                 }
             }
         }
+        if let Ok(mut checks) = self.checks.lock() {
+            if let Some(expressions) = checks.get_mut(&table) {
+                for expression in expressions {
+                    *expression = rename_check_column(expression, &from, &to);
+                }
+            }
+        }
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -4594,11 +4760,18 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match &statement {
-            Statement::CreateTable { table, columns, unique_constraints, if_not_exists } => {
+            Statement::CreateTable {
+                table,
+                columns,
+                unique_constraints,
+                checks,
+                if_not_exists,
+            } => {
                 self.create_table(
                     table.clone(),
                     columns.clone(),
                     unique_constraints.clone(),
+                    checks.clone(),
                     *if_not_exists,
                 )?;
             }
@@ -4694,6 +4867,7 @@ where
                         return Err(RymeError::Overload(String::from("value")));
                     }
                     self.enforce_rls(&table, &value)?;
+                    self.enforce_checks(&table, &pk, &value)?;
                     let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                     let before = self.manager.get(txn, &key)?;
                     self.check_unique(&table, &pk, &value)?;
@@ -4726,6 +4900,7 @@ where
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
+                self.enforce_checks(&table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if before.is_some() {
@@ -4747,6 +4922,7 @@ where
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
+                self.enforce_checks(&table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if let Some(before) = before.as_deref() {
@@ -4786,6 +4962,7 @@ where
                     let after =
                         self.materialize_update_row(&table, &pk, assignments.clone(), &before)?;
                     self.enforce_rls(&table, &after)?;
+                    self.enforce_checks(&table, &pk, &after)?;
                     self.check_unique(&table, &pk, &after)?;
                     self.manager.put(
                         txn,
@@ -4805,6 +4982,7 @@ where
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
+                self.enforce_checks(&table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if before.is_none() {
@@ -5222,11 +5400,18 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match &statement {
-            Statement::CreateTable { table, columns, unique_constraints, if_not_exists } => {
+            Statement::CreateTable {
+                table,
+                columns,
+                unique_constraints,
+                checks,
+                if_not_exists,
+            } => {
                 self.create_table(
                     table.clone(),
                     columns.clone(),
                     unique_constraints.clone(),
+                    checks.clone(),
                     *if_not_exists,
                 )?;
             }
@@ -5438,6 +5623,7 @@ where
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
+                self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
@@ -5463,6 +5649,7 @@ where
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
+                self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
@@ -5667,6 +5854,7 @@ where
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
+                self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
@@ -5745,6 +5933,7 @@ where
                 }
                 let key = RecordKey::new(&self.tenant, &self.database, &table, pk);
                 let before = self.manager.get(&mut txn, &key)?;
+                self.enforce_checks(&table, pk, value)?;
                 self.check_unique(&table, pk, value)?;
                 self.manager.put(&mut txn, key, value.clone());
                 staged.push(TransactionChange {
@@ -6650,6 +6839,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_column_and_table_check_constraints() {
+        let Statement::CreateTable { checks, .. } = parse(
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY, age INTEGER CHECK (age >= 18), CHECK (status = 'active' OR status = 'pending'))",
+        )
+        .unwrap()
+        else {
+            panic!("expected create table")
+        };
+        assert_eq!(
+            checks,
+            vec![
+                String::from("age >= 18"),
+                String::from("status = 'active' OR status = 'pending'"),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn index_ddl_enforces_existence_and_can_remove_index_metadata() {
         let executor = Executor::new(String::from("t"), String::from("d"));
@@ -6758,6 +6965,64 @@ mod tests {
                     vec![b"tenant-a".to_vec(), b"user-a".to_vec(), b"admin".to_vec()]
                 ]
         ));
+    }
+
+    #[tokio::test]
+    async fn check_constraints_reject_false_rows_and_allow_sql_null() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse(
+                "CREATE TABLE accounts (id TEXT PRIMARY KEY, age INTEGER CHECK (age >= 18), status TEXT, CHECK (status = 'active' OR status = 'pending'))",
+            )
+            .unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO accounts (id, age, status) VALUES ('1', 21, 'active')").unwrap(),
+            )
+            .await
+            .unwrap();
+        let too_young = executor
+            .execute(
+                parse("INSERT INTO accounts (id, age, status) VALUES ('2', 17, 'active')").unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(too_young, Err(RymeError::Conflict(message)) if message.contains("age >= 18"))
+        );
+        let bad_status = executor
+            .execute(
+                parse("INSERT INTO accounts (id, age, status) VALUES ('3', 21, 'disabled')")
+                    .unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(bad_status, Err(RymeError::Conflict(message)) if message.contains("status ="))
+        );
+        executor
+            .execute(
+                parse("INSERT INTO accounts (id, age, status) VALUES ('4', NULL, NULL)").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let invalid_update =
+            executor.execute(parse("UPDATE accounts SET age = 12 WHERE id = '1'").unwrap()).await;
+        assert!(invalid_update.is_err());
+
+        let restored = Executor::with_manager(
+            String::from("t"),
+            String::from("d"),
+            executor.manager().clone(),
+        );
+        restored.restore_schema_snapshot(executor.schema_snapshot()).unwrap();
+        let restored_invalid = restored
+            .execute(
+                parse("INSERT INTO accounts (id, age, status) VALUES ('5', 17, 'active')").unwrap(),
+            )
+            .await;
+        assert!(restored_invalid.is_err());
     }
 
     #[tokio::test]

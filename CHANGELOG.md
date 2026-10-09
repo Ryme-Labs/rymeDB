@@ -57,6 +57,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Composite `UNIQUE` constraints and composite `CREATE [UNIQUE] INDEX`
   definitions now encode column tuples, enforce uniqueness across writes and
   transactions, persist with schema snapshots, and track column renames.
+- Column-level and table-level `CHECK` constraints now persist with schema
+  snapshots and reject false rows across SQL writes, transactions, and bulk
+  upserts while preserving PostgreSQL's NULL-as-unknown behavior.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
   preserves nullability/identity metadata, and persists the updated schema.
 - `ALTER TABLE ... DROP COLUMN` now removes the field from durable JSON rows,
