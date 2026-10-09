@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 
 const KEY: &str = "ryme-query-e2e-key-4b8d2f0a9c13";
@@ -296,6 +296,120 @@ async fn live_broadcast_stream_receives_posts() {
     );
     assert!(message.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0) > 0);
     stream.close(None).await.unwrap();
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn supabase_realtime_protocol_joins_heartbeats_and_broadcasts() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-supabase-realtime-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let url = format!("ws://{http}/realtime/v1/websocket?apikey={KEY}&vsn=1.0.0");
+    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    assert_eq!(response.status(), 101);
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "topic": "realtime:room",
+                "event": "phx_join",
+                "payload": { "config": { "broadcast": { "ack": true, "self": true } } },
+                "ref": "1",
+                "join_ref": "1"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let joined = next_text(&mut stream).await;
+    assert_eq!(joined["event"], "phx_reply");
+    assert_eq!(joined["payload"]["status"], "ok");
+
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "topic": "phoenix",
+                "event": "heartbeat",
+                "payload": {},
+                "ref": "2"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let heartbeat = next_text(&mut stream).await;
+    assert_eq!(heartbeat["topic"], "phoenix");
+    assert_eq!(heartbeat["event"], "phx_reply");
+
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "topic": "realtime:room",
+                "event": "broadcast",
+                "payload": { "event": "chat", "payload": { "text": "hello" } },
+                "ref": "3",
+                "join_ref": "1"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let first = next_text(&mut stream).await;
+    let second = next_text(&mut stream).await;
+    let broadcast = if first["event"] == "broadcast" { first.clone() } else { second.clone() };
+    let ack = if first["event"] == "phx_reply" { first } else { second };
+    assert_eq!(broadcast["event"], "broadcast");
+    assert_eq!(broadcast["payload"]["event"], "chat");
+    assert_eq!(broadcast["payload"]["payload"]["text"], "hello");
+    assert_eq!(ack["event"], "phx_reply");
+    assert_eq!(ack["payload"]["status"], "ok");
+
+    stream.close(None).await.unwrap();
+    let v2_url = format!("ws://{http}/realtime/v1/websocket?apikey={KEY}&vsn=2.0.0");
+    let (mut v2, response) = tokio_tungstenite::connect_async(v2_url).await.unwrap();
+    assert_eq!(response.status(), 101);
+    v2.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!([
+            "7",
+            "8",
+            "realtime:array-room",
+            "phx_join",
+            { "config": { "broadcast": { "ack": false } } }
+        ])
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let v2_joined = next_text(&mut v2).await;
+    assert_eq!(v2_joined[3], "phx_reply");
+    assert_eq!(v2_joined[4]["status"], "ok");
+    v2.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!([null, "9", "phoenix", "heartbeat", {}]).to_string(),
+    ))
+    .await
+    .unwrap();
+    let v2_heartbeat = next_text(&mut v2).await;
+    assert_eq!(v2_heartbeat[3], "phx_reply");
+    v2.close(None).await.unwrap();
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }

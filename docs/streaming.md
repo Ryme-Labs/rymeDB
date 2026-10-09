@@ -118,6 +118,18 @@ If a consumer falls behind the bounded event queue, the server sends a fresh
 room view. The stream has the same heartbeat, QoS, and bounded outgoing queue
 behavior as the other realtime endpoints.
 
+## Supabase Realtime protocol compatibility
+
+`/realtime/v1/websocket?apikey=<key>&vsn=1.0.0` accepts the Phoenix-style
+Supabase Realtime channel protocol for broadcast workloads. Join a topic such
+as `realtime:room` with `phx_join`, send `broadcast` events, leave with
+`phx_leave`, and answer connection heartbeats on the `phoenix` topic. The
+server sends `phx_reply` acknowledgements when requested by the join
+configuration and forwards broadcast frames to every joined tenant-scoped
+channel. `vsn=2.0.0` uses the array frame form; the default `1.0.0` uses JSON
+objects. Database-change and presence events remain available through the
+native endpoints above while this compatibility surface is expanded.
+
 In cluster mode, presence joins and leaves must reach the current Raft leader.
 The leader fans each mutation over the live gateway mesh, and all gateways use
 the leader's expiry timestamp so reads converge without adding ephemeral

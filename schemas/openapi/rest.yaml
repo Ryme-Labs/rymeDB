@@ -592,6 +592,25 @@ paths:
           description: presence WebSocket upgrade
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /realtime/v1/websocket:
+    get:
+      tags: [streams]
+      description: "Supabase Realtime-compatible Phoenix WebSocket for broadcast channels. Supports v1 JSON objects and v2 JSON arrays, phx_join, phx_leave, heartbeat, and broadcast events."
+      parameters:
+        - name: apikey
+          in: query
+          schema:
+            type: string
+        - name: vsn
+          in: query
+          schema:
+            type: string
+            enum: [1.0.0, 2.0.0]
+      responses:
+        '101':
+          description: Supabase Realtime WebSocket upgrade
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /v1/presence/{channel}:
     get:
       tags: [streams]

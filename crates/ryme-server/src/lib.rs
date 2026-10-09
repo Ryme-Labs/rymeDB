@@ -734,6 +734,13 @@ pub struct PresenceStreamQuery {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct SupabaseRealtimeQuery {
+    pub apikey: Option<String>,
+    pub api_key: Option<String>,
+    pub vsn: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct DurableStreamQuery {
     pub from: Option<u64>,
     pub api_key: Option<String>,
@@ -1488,6 +1495,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/presence/:channel", get(presence_list))
         .route("/v1/broadcast", post(broadcast_post))
         .route("/v1/broadcast/:channel", get(broadcast_stream))
+        .route("/realtime/v1/websocket", get(supabase_realtime_stream))
         .route("/v1/topics/append", post(durable_append))
         .route("/v1/topics/read", get(durable_read))
         .route("/v1/topics/:partition/stream", get(durable_stream))
@@ -4847,6 +4855,85 @@ async fn presence_stream(
     })
 }
 
+async fn supabase_realtime_stream(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(query): Query<SupabaseRealtimeQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let api_key = query.apikey.as_deref().or(query.api_key.as_deref());
+    let principal = match state.principal_with_query(&headers, api_key) {
+        Ok(principal) => principal,
+        Err(error) => return error_response(error),
+    };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
+    let array_protocol = match query.vsn.as_deref() {
+        None | Some("1.0.0") => false,
+        Some("2.0.0") => true,
+        Some(_) => {
+            return error_response(ryme_error::RymeError::InvalidArgument(String::from("vsn")))
+        }
+    };
+    if let Err(error) = admit_realtime(&state, &principal.tenant, 1) {
+        return error_response(error);
+    }
+    let connection = match open_realtime_connection(&state, &principal.tenant) {
+        Ok(connection) => connection,
+        Err(error) => return error_response(error),
+    };
+    let realtime = state.realtime.clone();
+    let qos = state.qos.clone();
+    let tenant = principal.tenant.clone();
+    let sender = principal.id.clone();
+    let can_publish = principal.can_publish();
+    upgrade.on_upgrade(move |socket| async move {
+        let _connection = connection;
+        forward_supabase_realtime(
+            socket,
+            state,
+            realtime,
+            qos,
+            tenant,
+            sender,
+            can_publish,
+            array_protocol,
+        )
+        .await;
+    })
+}
+
+async fn publish_broadcast(
+    state: &SharedState,
+    tenant: &str,
+    from: String,
+    channel: String,
+    payload: serde_json::Value,
+) -> ryme_error::Result<u64> {
+    admit_realtime(state, tenant, 1)?;
+    let commit = state.backend.latest_commit();
+    if let Some(node) = state.raft_node() {
+        if !node.is_leader().await {
+            return Err(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let sequence = state.realtime.reserve_sequence();
+        let event = ClusterBroadcast {
+            tenant: tenant.to_string(),
+            channel,
+            from,
+            payload,
+            commit_ts: commit,
+            sequence,
+        };
+        let encoded = serde_json::to_vec(&event)
+            .map_err(|error| ryme_error::RymeError::Internal(error.to_string()))?;
+        node.fanout_realtime(encoded).await?;
+        return Ok(sequence);
+    }
+    state.realtime.broadcast(tenant, &channel, from, payload, commit)
+}
+
 async fn broadcast_post(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -4869,47 +4956,272 @@ async fn broadcast_post(
     if request.channel.len() > 256 {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("channel")));
     }
-    if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
-        return error_response(e);
-    }
-    let commit = state.backend.latest_commit();
-    if let Some(node) = state.raft_node() {
-        if !node.is_leader().await {
-            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
-        }
-        let sequence = state.realtime.reserve_sequence();
-        let event = ClusterBroadcast {
-            tenant: principal.tenant.clone(),
-            channel: request.channel.clone(),
-            from: request.from.unwrap_or_else(|| principal.id.clone()),
-            payload: request.payload,
-            commit_ts: commit,
-            sequence,
-        };
-        let payload = match serde_json::to_vec(&event) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return error_response(ryme_error::RymeError::Internal(error.to_string()))
-            }
-        };
-        return match node.fanout_realtime(payload).await {
-            Ok(_) => {
-                (StatusCode::OK, Json(serde_json::json!({ "sequence": sequence }))).into_response()
-            }
-            Err(error) => error_response(error),
-        };
-    }
-    match state.realtime.broadcast(
+    match publish_broadcast(
+        &state,
         &principal.tenant,
-        &request.channel,
         request.from.unwrap_or_else(|| principal.id.clone()),
+        request.channel,
         request.payload,
-        commit,
-    ) {
+    )
+    .await
+    {
         Ok(sequence) => {
             (StatusCode::OK, Json(serde_json::json!({ "sequence": sequence }))).into_response()
         }
         Err(e) => error_response(e),
+    }
+}
+
+#[derive(Debug)]
+struct SupabaseFrame {
+    join_ref: Option<String>,
+    reference: Option<String>,
+    topic: String,
+    event: String,
+    payload: serde_json::Value,
+}
+
+fn parse_supabase_frame(value: serde_json::Value) -> Option<(SupabaseFrame, bool)> {
+    if let serde_json::Value::Array(values) = value {
+        if values.len() != 5 {
+            return None;
+        }
+        let text =
+            |index: usize| values.get(index).and_then(serde_json::Value::as_str).map(String::from);
+        return Some((
+            SupabaseFrame {
+                join_ref: text(0),
+                reference: text(1),
+                topic: text(2)?,
+                event: text(3)?,
+                payload: values.get(4).cloned().unwrap_or(serde_json::Value::Null),
+            },
+            true,
+        ));
+    }
+    let serde_json::Value::Object(object) = value else { return None };
+    Some((
+        SupabaseFrame {
+            join_ref: object.get("join_ref").and_then(serde_json::Value::as_str).map(String::from),
+            reference: object.get("ref").and_then(serde_json::Value::as_str).map(String::from),
+            topic: object.get("topic").and_then(serde_json::Value::as_str)?.to_string(),
+            event: object.get("event").and_then(serde_json::Value::as_str)?.to_string(),
+            payload: object.get("payload").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        false,
+    ))
+}
+
+fn encode_supabase_frame(frame: &SupabaseFrame, array_protocol: bool) -> String {
+    if array_protocol {
+        serde_json::json!([
+            frame.join_ref,
+            frame.reference,
+            frame.topic,
+            frame.event,
+            frame.payload,
+        ])
+        .to_string()
+    } else {
+        serde_json::json!({
+            "join_ref": frame.join_ref,
+            "ref": frame.reference,
+            "topic": frame.topic,
+            "event": frame.event,
+            "payload": frame.payload,
+        })
+        .to_string()
+    }
+}
+
+fn supabase_reply(
+    frame: &SupabaseFrame,
+    status: &str,
+    response: serde_json::Value,
+    array_protocol: bool,
+) -> String {
+    encode_supabase_frame(
+        &SupabaseFrame {
+            join_ref: frame.join_ref.clone(),
+            reference: frame.reference.clone(),
+            topic: frame.topic.clone(),
+            event: String::from("phx_reply"),
+            payload: serde_json::json!({ "status": status, "response": response }),
+        },
+        array_protocol,
+    )
+}
+
+fn spawn_supabase_broadcast_forwarder(
+    realtime: &Realtime,
+    tenant: &str,
+    topic: &str,
+    events: &tokio::sync::mpsc::Sender<(String, ryme_realtime::BroadcastMsg)>,
+) -> tokio::task::JoinHandle<()> {
+    let channel = topic.strip_prefix("realtime:").unwrap_or(topic).to_string();
+    let mut receiver = realtime.broadcast_subscribe(tenant, &channel);
+    let topic = topic.to_string();
+    let events = events.clone();
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(record) => {
+                    if events.try_send((topic.clone(), record)).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+async fn forward_supabase_realtime(
+    socket: axum::extract::ws::WebSocket,
+    state: SharedState,
+    realtime: Realtime,
+    qos: Arc<Mutex<QosRegistry>>,
+    tenant: String,
+    sender: String,
+    can_publish: bool,
+    array_protocol: bool,
+) {
+    let (sink, mut incoming) = socket.split();
+    let outgoing = start_realtime_writer(sink);
+    let (events, mut event_queue) = tokio::sync::mpsc::channel::<(
+        String,
+        ryme_realtime::BroadcastMsg,
+    )>(REALTIME_OUTGOING_QUEUE_CAPACITY);
+    let mut channels: HashMap<String, (tokio::task::JoinHandle<()>, bool, bool)> = HashMap::new();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(Vec::new())) {
+                    break;
+                }
+            }
+            event = event_queue.recv(), if !channels.is_empty() => {
+                let Some((topic, record)) = event else { break };
+                let Some((_, _, include_self)) = channels.get(&topic) else { continue };
+                if !*include_self && record.from == sender {
+                    continue;
+                }
+                let (event_name, payload) = match record.payload {
+                    serde_json::Value::Object(mut payload) => {
+                        let event_name = payload.remove("event")
+                            .and_then(|value| value.as_str().map(String::from))
+                            .unwrap_or_else(|| String::from("message"));
+                        let payload = payload.remove("payload").unwrap_or(serde_json::Value::Object(payload));
+                        (event_name, payload)
+                    }
+                    payload => (String::from("message"), payload),
+                };
+                let text = encode_supabase_frame(
+                    &SupabaseFrame {
+                        join_ref: None,
+                        reference: None,
+                        topic,
+                        event: String::from("broadcast"),
+                        payload: serde_json::json!({
+                            "event": event_name,
+                            "payload": payload,
+                            "type": "broadcast",
+                        }),
+                    },
+                    array_protocol,
+                );
+                if !stream_realtime_event(&qos, &tenant, text.len() as u64)
+                    || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
+                    break;
+                }
+            }
+            next = incoming.next() => {
+                let Some(Ok(message)) = next else { break };
+                let axum::extract::ws::Message::Text(text) = message else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let Some((frame, frame_array)) = parse_supabase_frame(value) else {
+                    continue;
+                };
+                let array_protocol = frame_array || array_protocol;
+                match frame.event.as_str() {
+                    "heartbeat" if frame.topic == "phoenix" => {
+                        let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) {
+                            break;
+                        }
+                    }
+                    "phx_join" => {
+                        if !frame.topic.starts_with("realtime:") || frame.topic.len() > 256 {
+                            let reply = supabase_reply(&frame, "error", serde_json::json!({"reason":"invalid topic"}), array_protocol);
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                            continue;
+                        }
+                        if let Some((task, _, _)) = channels.remove(&frame.topic) {
+                            task.abort();
+                        }
+                        let ack = frame.payload.pointer("/config/broadcast/ack")
+                            .and_then(serde_json::Value::as_bool).unwrap_or(false);
+                        let include_self = frame.payload.pointer("/config/broadcast/self")
+                            .and_then(serde_json::Value::as_bool).unwrap_or(false);
+                        let task = spawn_supabase_broadcast_forwarder(&realtime, &tenant, &frame.topic, &events);
+                        channels.insert(frame.topic.clone(), (task, ack, include_self));
+                        let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                    }
+                    "phx_leave" => {
+                        if let Some((task, _, _)) = channels.remove(&frame.topic) {
+                            task.abort();
+                        }
+                        let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                    }
+                    "broadcast" => {
+                        if !can_publish || !channels.contains_key(&frame.topic) {
+                            let reply = supabase_reply(&frame, "error", serde_json::json!({"reason":"not joined or not allowed"}), array_protocol);
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                            continue;
+                        }
+                        let channel = frame.topic.strip_prefix("realtime:").unwrap_or(&frame.topic);
+                        let (event_name, payload) = match frame.payload.clone() {
+                            serde_json::Value::Object(mut payload) => {
+                                let event_name = payload.remove("event")
+                                    .and_then(|value| value.as_str().map(String::from))
+                                    .unwrap_or_else(|| String::from("message"));
+                                let payload = payload.remove("payload").unwrap_or(serde_json::Value::Object(payload));
+                                (event_name, payload)
+                            }
+                            payload => (String::from("message"), payload),
+                        };
+                        let published = publish_broadcast(
+                            &state,
+                            &tenant,
+                            sender.clone(),
+                            channel.to_string(),
+                            serde_json::json!({ "event": event_name, "payload": payload }),
+                        ).await;
+                        if channels.get(&frame.topic).is_some_and(|(_, ack, _)| *ack) {
+                            let (status, response) = match published {
+                                Ok(sequence) => ("ok", serde_json::json!({ "sequence": sequence })),
+                                Err(error) => ("error", serde_json::json!({ "reason": error.to_string() })),
+                            };
+                            let reply = supabase_reply(&frame, status, response, array_protocol);
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for (task, _, _) in channels.into_values() {
+        task.abort();
     }
 }
 
