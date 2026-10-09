@@ -143,6 +143,16 @@ async fn compat_rest_graphql_copy_explain() {
             .await;
     assert_eq!(status, 201);
     assert!(String::from_utf8_lossy(&body).contains(r#""name":"Ada""#));
+    let (status, body) = http_request(
+        http,
+        "POST /rest/v1/people",
+        br#"[{"id":"p2","name":"Grace"},{"id":"p3","name":"Linus"}]"#,
+    )
+    .await;
+    assert_eq!(status, 201);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains(r#""id":"p2""#), "{text}");
+    assert!(text.contains(r#""id":"p3""#), "{text}");
     let (status, body) =
         http_request(http, "PATCH /rest/v1/people?id=eq.p1", br#"{"status":"away"}"#).await;
     assert_eq!(status, 200);

@@ -3012,8 +3012,8 @@ async fn rest_insert(
     Path(table): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let body: RestWriteBody = match json_body(&body) {
-        Ok(body) => body,
+    let bodies = match rest_write_bodies(&body) {
+        Ok(bodies) => bodies,
         Err(e) => return error_response(e),
     };
     let principal = match state.principal(&headers) {
@@ -3026,7 +3026,7 @@ async fn rest_insert(
     if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
-    let rows = rest_body_rows(&body);
+    let rows = bodies.iter().flat_map(rest_body_rows).collect::<Vec<_>>();
     if rows.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("rows")));
     }
@@ -3059,13 +3059,14 @@ async fn rest_upsert(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let parsed: RestWriteBody = match json_body(&body) {
+    let parsed = match rest_write_bodies(&body) {
         Ok(body) => body,
         Err(e) => return error_response(e),
     };
-    if parsed.fields.is_empty() {
+    if body_is_json_array(&body) || parsed.len() != 1 || parsed[0].fields.is_empty() {
         return rest_insert(State(state), headers, Path(table), body).await;
     }
+    let parsed = parsed.into_iter().next().expect("single REST object");
 
     let principal = match state.principal(&headers) {
         Ok(principal) => principal,
@@ -3200,6 +3201,26 @@ fn rest_body_rows(body: &RestWriteBody) -> Vec<(Vec<u8>, Vec<u8>)> {
         }
         _ => Vec::new(),
     }
+}
+
+fn rest_write_bodies(body: &[u8]) -> Result<Vec<RestWriteBody>, ryme_error::RymeError> {
+    let value: serde_json::Value = json_body(body)?;
+    match value {
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value(value)
+                    .map_err(|_| ryme_error::RymeError::InvalidArgument(String::from("body")))
+            })
+            .collect(),
+        serde_json::Value::Object(_) => Ok(vec![serde_json::from_value(value)
+            .map_err(|_| ryme_error::RymeError::InvalidArgument(String::from("body")))?]),
+        _ => Err(ryme_error::RymeError::InvalidArgument(String::from("body"))),
+    }
+}
+
+fn body_is_json_array(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).map(|value| value.is_array()).unwrap_or(false)
 }
 
 async fn graphql_exec(

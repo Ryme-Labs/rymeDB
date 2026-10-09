@@ -1023,7 +1023,7 @@ paths:
           $ref: '#/components/responses/Forbidden'
     post:
       tags: [rest]
-      description: Insert one row or a rows array.
+      description: Insert key/value rows, a JSON object with an id/key field, or a JSON array of such objects.
       parameters:
         - $ref: '#/components/parameters/TableParam'
       responses:
