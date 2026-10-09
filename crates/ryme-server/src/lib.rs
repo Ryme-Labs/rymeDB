@@ -1649,6 +1649,7 @@ pub async fn serve_cluster(
             return Err(ryme_error::RymeError::InvalidArgument(String::from("cluster")));
         }
     };
+    install_cluster_range_replication(&state, &node)?;
     let mut tasks = node.spawn(raft_listener);
     tasks.extend(
         spawn_gateways(
@@ -5937,6 +5938,56 @@ async fn range_list(
     }
 }
 
+fn install_cluster_range_replication(
+    state: &SharedState,
+    node: &std::sync::Arc<Node>,
+) -> ryme_error::Result<()> {
+    let state = state.clone();
+    let hook: ryme_raft::net::MetadataHook =
+        Arc::new(move |payload| apply_replicated_ranges(&state, payload));
+    node.set_metadata_hook(hook)
+}
+
+fn apply_replicated_ranges(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
+    let ranges: Vec<Range> = serde_json::from_slice(payload)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("range metadata: {error}")))?;
+    let mut control =
+        state.control.lock().map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+    let previous = control.ranges();
+    control.restore_ranges(ranges.clone())?;
+    if let Err(error) = sync_range_topology(state, &ranges) {
+        let _ = control.restore_ranges(previous.clone());
+        let _ = sync_range_topology(state, &previous);
+        return Err(error);
+    }
+    if let Err(error) = state.persist_control_locked(&control) {
+        let _ = control.restore_ranges(previous.clone());
+        let _ = sync_range_topology(state, &previous);
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn commit_cluster_ranges(
+    state: &SharedState,
+    node: &std::sync::Arc<Node>,
+    previous: Vec<Range>,
+    updated: Vec<Range>,
+) -> ryme_error::Result<()> {
+    let payload = serde_json::to_vec(&updated)
+        .map_err(|error| ryme_error::RymeError::Internal(format!("range metadata: {error}")))?;
+    if let Err(error) = node.propose_metadata(payload).await {
+        let mut control = state
+            .control
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+        let _ = control.restore_ranges(previous.clone());
+        let _ = sync_range_topology(state, &previous);
+        return Err(error);
+    }
+    Ok(())
+}
+
 async fn range_loads(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     if state.principal(&headers).is_err() {
         return error_response(ryme_error::RymeError::Unauthorized);
@@ -5966,37 +6017,61 @@ async fn range_split(
             return error_response(ryme_error::RymeError::InvalidArgument(String::from("body")))
         }
     };
-    let mut control = match state.control.lock() {
+    let raft = state.raft_node();
+    if let Some(node) = raft.as_ref() {
+        if !node.is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+    }
+    let prepared = {
+        let mut control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        let previous = control.ranges();
+        match control.split_range(
+            &request.id,
+            request.mid.into_bytes(),
+            request.left_id.clone(),
+            request.right_id.clone(),
+            request.expected_epoch,
+        ) {
+            Ok(()) => {
+                let updated = control.ranges();
+                if let Err(error) = sync_range_topology(&state, &updated) {
+                    let _ = control.restore_ranges(previous);
+                    return error_response(error);
+                }
+                Ok((previous, updated))
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let (previous, updated) = match prepared {
+        Ok(value) => value,
+        Err(error) => return error_response(error),
+    };
+    let commit_result = if let Some(node) = raft {
+        commit_cluster_ranges(&state, &node, previous.clone(), updated).await
+    } else {
+        state.persist_control()
+    };
+    if let Err(error) = commit_result {
+        if let Ok(mut control) = state.control.lock() {
+            let _ = control.restore_ranges(previous.clone());
+        }
+        let _ = sync_range_topology(&state, &previous);
+        return error_response(error);
+    }
+    let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    let previous = control.ranges();
-    match control.split_range(
-        &request.id,
-        request.mid.into_bytes(),
-        request.left_id.clone(),
-        request.right_id.clone(),
-        request.expected_epoch,
-    ) {
-        Ok(()) => {
-            let updated = control.ranges();
-            if let Err(error) = sync_range_topology(&state, &updated) {
-                let _ = control.restore_ranges(previous.clone());
-                return error_response(error);
-            }
-            if let Err(error) = state.persist_control_locked(&control) {
-                let _ = control.restore_ranges(previous.clone());
-                let _ = sync_range_topology(&state, &previous);
-                return error_response(error);
-            }
-            let left = control.router_get(&request.left_id);
-            let right = control.router_get(&request.right_id);
-            match (left, right) {
-                (Ok(left), Ok(right)) => (StatusCode::OK, Json(vec![left, right])).into_response(),
-                (Err(e), _) | (_, Err(e)) => error_response(e),
-            }
-        }
-        Err(e) => error_response(e),
+    let left = control.router_get(&request.left_id);
+    let right = control.router_get(&request.right_id);
+    match (left, right) {
+        (Ok(left), Ok(right)) => (StatusCode::OK, Json(vec![left, right])).into_response(),
+        (Err(e), _) | (_, Err(e)) => error_response(e),
     }
 }
 
@@ -6018,34 +6093,58 @@ async fn range_merge(
             return error_response(ryme_error::RymeError::InvalidArgument(String::from("body")))
         }
     };
-    let mut control = match state.control.lock() {
+    let raft = state.raft_node();
+    if let Some(node) = raft.as_ref() {
+        if !node.is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+    }
+    let prepared = {
+        let mut control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        let previous = control.ranges();
+        match control.merge_ranges(
+            &request.left_id,
+            &request.right_id,
+            request.merged_id.clone(),
+            request.expected_left_epoch,
+            request.expected_right_epoch,
+        ) {
+            Ok(()) => {
+                let updated = control.ranges();
+                if let Err(error) = sync_range_topology(&state, &updated) {
+                    let _ = control.restore_ranges(previous);
+                    return error_response(error);
+                }
+                Ok((previous, updated))
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let (previous, updated) = match prepared {
+        Ok(value) => value,
+        Err(error) => return error_response(error),
+    };
+    let commit_result = if let Some(node) = raft {
+        commit_cluster_ranges(&state, &node, previous.clone(), updated).await
+    } else {
+        state.persist_control()
+    };
+    if let Err(error) = commit_result {
+        if let Ok(mut control) = state.control.lock() {
+            let _ = control.restore_ranges(previous.clone());
+        }
+        let _ = sync_range_topology(&state, &previous);
+        return error_response(error);
+    }
+    let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    let previous = control.ranges();
-    match control.merge_ranges(
-        &request.left_id,
-        &request.right_id,
-        request.merged_id.clone(),
-        request.expected_left_epoch,
-        request.expected_right_epoch,
-    ) {
-        Ok(()) => {
-            let updated = control.ranges();
-            if let Err(error) = sync_range_topology(&state, &updated) {
-                let _ = control.restore_ranges(previous.clone());
-                return error_response(error);
-            }
-            if let Err(error) = state.persist_control_locked(&control) {
-                let _ = control.restore_ranges(previous.clone());
-                let _ = sync_range_topology(&state, &previous);
-                return error_response(error);
-            }
-            match control.router_get(&request.merged_id) {
-                Ok(merged) => (StatusCode::OK, Json(merged)).into_response(),
-                Err(e) => error_response(e),
-            }
-        }
+    match control.router_get(&request.merged_id) {
+        Ok(merged) => (StatusCode::OK, Json(merged)).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -6089,10 +6188,12 @@ async fn range_autosplit(
     if !principal.can_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    let mut control = match state.control.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
+    let raft = state.raft_node();
+    if let Some(node) = raft.as_ref() {
+        if !node.is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+    }
     let threshold = match query.min_writes {
         Some(min) if min > 0 => min,
         None if state.autosplit_writes > 0 => state.autosplit_writes,
@@ -6100,25 +6201,44 @@ async fn range_autosplit(
             return (StatusCode::OK, Json(serde_json::json!({ "split": [] }))).into_response();
         }
     };
-    let previous = control.ranges();
-    match control.auto_split_once(threshold) {
-        Ok(created) => {
-            if !created.is_empty() {
+    let prepared = {
+        let mut control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        let previous = control.ranges();
+        match control.auto_split_once(threshold) {
+            Ok(created) if created.is_empty() => Ok((previous, created, None)),
+            Ok(created) => {
                 let updated = control.ranges();
                 if let Err(error) = sync_range_topology(&state, &updated) {
-                    let _ = control.restore_ranges(previous.clone());
+                    let _ = control.restore_ranges(previous);
                     return error_response(error);
                 }
-                if let Err(error) = state.persist_control_locked(&control) {
-                    let _ = control.restore_ranges(previous.clone());
-                    let _ = sync_range_topology(&state, &previous);
-                    return error_response(error);
-                }
+                Ok((previous, created, Some(updated)))
             }
-            (StatusCode::OK, Json(serde_json::json!({ "split": created }))).into_response()
+            Err(error) => Err(error),
         }
-        Err(e) => error_response(e),
+    };
+    let (previous, created, updated) = match prepared {
+        Ok(value) => value,
+        Err(error) => return error_response(error),
+    };
+    if let Some(updated) = updated {
+        let commit_result = if let Some(node) = raft {
+            commit_cluster_ranges(&state, &node, previous.clone(), updated).await
+        } else {
+            state.persist_control()
+        };
+        if let Err(error) = commit_result {
+            if let Ok(mut control) = state.control.lock() {
+                let _ = control.restore_ranges(previous.clone());
+            }
+            let _ = sync_range_topology(&state, &previous);
+            return error_response(error);
+        }
     }
+    (StatusCode::OK, Json(serde_json::json!({ "split": created }))).into_response()
 }
 
 async fn cluster_members(State(state): State<SharedState>, headers: HeaderMap) -> Response {

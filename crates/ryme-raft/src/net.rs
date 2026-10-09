@@ -309,6 +309,11 @@ fn validate_apply_payload(input: &[u8]) -> Result<()> {
             decode_writes(&writes)?;
         }
         ApplyPayload::Conf { .. } => {}
+        ApplyPayload::Metadata { payload } => {
+            if payload.is_empty() {
+                return Err(RymeError::Corrupt(String::from("metadata")));
+            }
+        }
     }
     Ok(())
 }
@@ -401,6 +406,17 @@ impl Inner {
     }
 }
 
+pub type MetadataHook = Arc<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
+
+#[derive(Default)]
+struct MetadataHookSlot(std::sync::Mutex<Option<MetadataHook>>);
+
+impl std::fmt::Debug for MetadataHookSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MetadataHookSlot(..)")
+    }
+}
+
 #[derive(Debug)]
 pub struct Node {
     id: usize,
@@ -412,6 +428,8 @@ pub struct Node {
     rng: Arc<Mutex<u64>>,
     isolated: Arc<std::sync::atomic::AtomicBool>,
     mesh_tls: std::sync::Mutex<Option<Arc<MeshTransport>>>,
+    metadata: std::sync::Mutex<Option<Vec<u8>>>,
+    metadata_hook: MetadataHookSlot,
 }
 
 impl Node {
@@ -496,6 +514,7 @@ impl Node {
         let mut applied = 0u64;
         let mut replayed: Option<crate::ConfChange> = None;
         let mut replayed_joint: Option<Vec<Member>> = None;
+        let mut metadata = None;
         for entry in log.iter().filter(|e| e.index <= meta.commit_index) {
             match decode_apply(&entry.payload)? {
                 ApplyPayload::Data { commit_ts, writes } => {
@@ -504,6 +523,9 @@ impl Node {
                 }
                 ApplyPayload::Conf { change } => {
                     replayed = Some(change);
+                }
+                ApplyPayload::Metadata { payload } => {
+                    metadata = Some(payload);
                 }
             }
             applied = entry.index;
@@ -554,6 +576,8 @@ impl Node {
                     .unwrap_or(1)
                     .wrapping_add((id as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15)),
             )),
+            metadata: std::sync::Mutex::new(metadata),
+            metadata_hook: MetadataHookSlot::default(),
         });
         Ok(node)
     }
@@ -997,8 +1021,30 @@ impl Node {
                 ApplyPayload::Conf { change } => {
                     self.apply_conf(change).await;
                 }
+                ApplyPayload::Metadata { payload } => {
+                    self.apply_metadata(payload)?;
+                }
             }
             self.inner.lock().await.applied = entry.index;
+        }
+        Ok(())
+    }
+
+    fn apply_metadata(&self, payload: Vec<u8>) -> Result<()> {
+        let hook = {
+            let mut metadata = self
+                .metadata
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("metadata lock")))?;
+            *metadata = Some(payload.clone());
+            self.metadata_hook
+                .0
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("metadata hook lock")))?
+                .clone()
+        };
+        if let Some(hook) = hook {
+            hook(&payload)?;
         }
         Ok(())
     }
@@ -1201,6 +1247,13 @@ impl Node {
             }
         }
         self.commit_txn(txn).await
+    }
+
+    pub async fn propose_metadata(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
+        let encoded = crate::encode_metadata(&payload)?;
+        let index = self.propose_frame(encoded).await?;
+        self.wait_applied(index).await?;
+        Ok(index)
     }
 
     pub async fn commit_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
@@ -1445,6 +1498,30 @@ impl Node {
 
     pub async fn is_leader(&self) -> bool {
         self.inner.lock().await.role == Role::Leader
+    }
+
+    pub fn metadata_snapshot(&self) -> Option<Vec<u8>> {
+        self.metadata.lock().ok().and_then(|metadata| metadata.clone())
+    }
+
+    pub fn set_metadata_hook(&self, hook: MetadataHook) -> Result<()> {
+        {
+            let mut registered = self
+                .metadata_hook
+                .0
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("metadata hook lock")))?;
+            *registered = Some(hook.clone());
+        }
+        let current = self
+            .metadata
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("metadata lock")))?
+            .clone();
+        if let Some(payload) = current {
+            hook(&payload)?;
+        }
+        Ok(())
     }
 
     pub async fn term(&self) -> u64 {

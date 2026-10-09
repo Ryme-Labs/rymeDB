@@ -148,6 +148,26 @@ async fn wait_value(https: &[std::net::SocketAddr], key: &str, value: &str) {
     }
 }
 
+async fn wait_ranges(https: &[std::net::SocketAddr]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut converged = true;
+        for http in https {
+            let (status, body) = http_request(*http, "GET /v1/ranges", b"").await;
+            let text = String::from_utf8_lossy(&body);
+            if status != 200 || !text.contains("range-left") || !text.contains("range-right") {
+                converged = false;
+                break;
+            }
+        }
+        if converged {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "range metadata did not converge");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn cluster_write_failover_restart() {
     std::env::set_var("RYME_API_KEY", KEY);
@@ -305,6 +325,58 @@ async fn cluster_replication_latency() {
     eprintln!("leader_ack_median_us={ack_median} replica_visible_median_us={visible_median} replica_visible_max_us={visible_max}");
     assert!(visible_max < 2_000_000, "replication stalled: {visible_max}us");
     assert!(visible_median < 100_000, "replica median too slow: {visible_median}us");
+    for handle in handles {
+        handle.shutdown();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn cluster_range_split_replicates_metadata() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-cluster-ranges-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut bound = Vec::new();
+    for _ in 0..3 {
+        bound.push(bind_node().await);
+    }
+    let mut pg = Vec::new();
+    let mut resp = Vec::new();
+    let mut http = Vec::new();
+    let mut raft = Vec::new();
+    for node in &bound {
+        pg.push(node.0.local_addr().unwrap());
+        resp.push(node.1.local_addr().unwrap());
+        http.push(node.2.local_addr().unwrap());
+        raft.push(node.3.local_addr().unwrap());
+    }
+    let mut handles = Vec::new();
+    for (index, (pg_listener, resp_listener, http_listener, raft_listener)) in
+        bound.drain(..).enumerate()
+    {
+        let config =
+            node_config(&root, index, pg[index], resp[index], http[index], raft[index], &raft);
+        handles.push(
+            ryme_server::serve_cluster(
+                config,
+                pg_listener,
+                resp_listener,
+                http_listener,
+                raft_listener,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let leader = wait_leader(&http, None).await;
+    let body = br#"{"id":"range-0","mid":"t","left_id":"range-left","right_id":"range-right","expected_epoch":0}"#;
+    let (status, _) = http_request(http[leader], "POST /v1/ranges/split", body).await;
+    assert_eq!(status, 200);
+    wait_ranges(&http).await;
     for handle in handles {
         handle.shutdown();
     }

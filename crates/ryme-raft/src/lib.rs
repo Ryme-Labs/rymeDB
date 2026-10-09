@@ -177,6 +177,7 @@ pub fn decode_applied(input: &[u8]) -> Result<(u64, Vec<u8>)> {
 pub enum ApplyPayload {
     Data { commit_ts: u64, writes: Vec<u8> },
     Conf { change: ConfChange },
+    Metadata { payload: Vec<u8> },
 }
 
 pub fn encode_conf(members: &[crate::net::Member]) -> Result<Vec<u8>> {
@@ -187,6 +188,16 @@ pub fn encode_conf_change(change: &ConfChange) -> Result<Vec<u8>> {
     let mut out = vec![1u8];
     let raw = serde_json::to_vec(change).map_err(|e| RymeError::Internal(e.to_string()))?;
     out.extend_from_slice(&raw);
+    Ok(out)
+}
+
+pub fn encode_metadata(payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("metadata")));
+    }
+    let mut out = Vec::with_capacity(payload.len() + 1);
+    out.push(2u8);
+    out.extend_from_slice(payload);
     Ok(out)
 }
 
@@ -201,6 +212,12 @@ pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
         let change: ConfChange =
             serde_json::from_slice(body).map_err(|_| RymeError::Corrupt(String::from("conf")))?;
         return Ok(ApplyPayload::Conf { change });
+    }
+    if input.first() == Some(&2u8) {
+        if input.len() == 1 {
+            return Err(RymeError::Corrupt(String::from("metadata")));
+        }
+        return Ok(ApplyPayload::Metadata { payload: input[1..].to_vec() });
     }
     let (commit_ts, writes) = decode_applied(input)?;
     Ok(ApplyPayload::Data { commit_ts, writes })
@@ -507,5 +524,15 @@ mod tests {
         let result = cluster.replicate_from(0);
         assert!(matches!(result, Err(RymeError::Corrupt(_))));
         assert_eq!(cluster.nodes[0].applied, 0);
+    }
+
+    #[test]
+    fn metadata_payload_round_trips() {
+        let encoded = encode_metadata(br#"[{"id":"r0"}]"#).unwrap();
+        assert_eq!(
+            decode_apply(&encoded).unwrap(),
+            ApplyPayload::Metadata { payload: br#"[{"id":"r0"}]"#.to_vec() }
+        );
+        assert!(matches!(encode_metadata(&[]), Err(RymeError::InvalidArgument(_))));
     }
 }
