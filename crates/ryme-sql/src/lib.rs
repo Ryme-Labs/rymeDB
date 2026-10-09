@@ -19,6 +19,9 @@ pub enum Statement {
         #[serde(default)]
         if_exists: bool,
     },
+    TruncateTable {
+        table: String,
+    },
     AlterTableAddColumn {
         table: String,
         column: ColumnDefinition,
@@ -457,6 +460,7 @@ impl Statement {
         match self {
             Self::CreateTable { table, .. }
             | Self::DropTable { table, .. }
+            | Self::TruncateTable { table, .. }
             | Self::AlterTableAddColumn { table, .. }
             | Self::AlterTableDropColumn { table, .. }
             | Self::AlterTableRenameColumn { table, .. }
@@ -492,6 +496,7 @@ pub fn parse(input: &str) -> Result<Statement> {
     let statement = match head.as_str() {
         "CREATE" => parse_create(&tokens, input),
         "DROP" => parse_drop(&tokens),
+        "TRUNCATE" => parse_truncate(&tokens),
         "ALTER" => parse_alter(&tokens, input),
         "UPSERT" => parse_upsert(&tokens),
         "INSERT" => parse_insert(&tokens, input),
@@ -528,6 +533,16 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("drop table")))?;
     Ok(Statement::DropTable { table, if_exists })
+}
+
+fn parse_truncate(tokens: &[String]) -> Result<Statement> {
+    let table_pos =
+        if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("TABLE")) { 2 } else { 1 };
+    let table = tokens
+        .get(table_pos)
+        .map(|value| unquote(value))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("truncate table")))?;
+    Ok(Statement::TruncateTable { table })
 }
 
 fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -2002,6 +2017,7 @@ pub fn describe_plan(statement: &Statement) -> String {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
         Statement::DropTable { table, .. } => format!("ddl drop_table({table})"),
+        Statement::TruncateTable { table } => format!("write truncate({table})"),
         Statement::AlterTableAddColumn { table, column, .. } => {
             format!("ddl alter_table({table}) add_column({})", column.name)
         }
@@ -3360,6 +3376,40 @@ where
         Ok(())
     }
 
+    async fn truncate_table(&self, table: String) -> Result<()> {
+        self.reject_if_read_only()?;
+        let present = self
+            .catalog
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
+            .contains_key(&table);
+        if !present {
+            return Err(RymeError::NotFound(String::from("table")));
+        }
+
+        let rows = self.scan_all_rows(&table)?;
+        if !rows.is_empty() {
+            let mut txn = self.begin_with(self.isolation);
+            for (pk, _) in &rows {
+                self.manager
+                    .delete(&mut txn, RecordKey::new(&self.tenant, &self.database, &table, pk));
+            }
+            self.manager.commit(txn).await?;
+        }
+        if let Ok(mut indexes) = self.indexes.lock() {
+            if let Some(table_indexes) = indexes.get_mut(&table) {
+                for state in table_indexes {
+                    state.entries.clear();
+                }
+            }
+        }
+        let prefix = format!("{}\0{}\0{}\0", self.tenant, self.database, table);
+        if let Ok(mut sequences) = self.sequence_next.lock() {
+            sequences.retain(|key, _| !key.starts_with(&prefix));
+        }
+        Ok(())
+    }
+
     async fn alter_table_add_column(
         &self,
         table: String,
@@ -3758,6 +3808,7 @@ where
                 self.register_table(table.clone(), columns.clone());
             }
             Statement::DropTable { .. } => {}
+            Statement::TruncateTable { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
             Statement::AlterTableRenameColumn { .. } => {}
@@ -3782,6 +3833,10 @@ where
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
             Statement::DropTable { table, if_exists } => {
                 self.drop_table(table, if_exists).await?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::TruncateTable { table } => {
+                self.truncate_table(table).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
@@ -4350,6 +4405,7 @@ where
                 self.register_table(table.clone(), columns.clone());
             }
             Statement::DropTable { .. } => {}
+            Statement::TruncateTable { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
             Statement::AlterTableRenameColumn { .. } => {}
@@ -4478,6 +4534,10 @@ where
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
             Statement::DropTable { table, if_exists } => {
                 self.drop_table(table, if_exists).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::TruncateTable { table } => {
+                self.truncate_table(table).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
@@ -6062,6 +6122,42 @@ mod tests {
         assert!(
             matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"world".to_vec()]])
         );
+    }
+
+    #[tokio::test]
+    async fn truncate_table_clears_rows_but_preserves_schema_and_indexes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE events (id TEXT PRIMARY KEY, name TEXT UNIQUE)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO events (id, name) VALUES ('e1', 'hello')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX events_name_idx ON events (name)").unwrap())
+            .await
+            .unwrap();
+
+        executor.execute(parse("TRUNCATE TABLE events").unwrap()).await.unwrap();
+        assert_eq!(executor.catalog_tables(), vec![String::from("events")]);
+        assert!(executor.catalog_columns("events").iter().any(|column| column.name == "name"));
+        assert!(executor
+            .catalog_indexes("events")
+            .iter()
+            .any(|index| index.name == "events_name_idx"));
+        let result = executor.execute(parse("SELECT name FROM events").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Table { rows, .. } if rows.is_empty()));
+
+        executor
+            .execute(parse("INSERT INTO events (id, name) VALUES ('e2', 'world')").unwrap())
+            .await
+            .unwrap();
+        assert!(executor
+            .execute(parse("INSERT INTO events (id, name) VALUES ('e3', 'world')").unwrap())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
