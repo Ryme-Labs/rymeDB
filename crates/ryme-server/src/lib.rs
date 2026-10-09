@@ -25,6 +25,7 @@ use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
 use ryme_sql::{bind, parse, Executor, QueryResult, Statement};
 use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2718,7 +2719,12 @@ async fn rest_list(
     }
     let items: Vec<serde_json::Value> = paged
         .iter()
-        .map(|(pk, value)| rest_row_to_json(pk, &gateway.masked(&table, value.clone())))
+        .map(|(pk, value)| {
+            rest_project_row(
+                rest_row_to_json(pk, &gateway.masked(&table, value.clone())),
+                query.select.as_deref(),
+            )
+        })
         .collect();
     record_meter(&state, Metric::ReadUnit, items.len() as u64);
     let micros = elapsed_micros(start);
@@ -2729,30 +2735,181 @@ async fn rest_list(
 }
 
 fn filter_rows_by_query(rows: Vec<(Vec<u8>, Vec<u8>)>, raw: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut key_eq: Option<String> = None;
-    for pair in raw.split('&') {
-        let mut split = pair.splitn(2, '=');
-        let name = split.next().unwrap_or("");
-        let value = split.next().unwrap_or("");
-        if name == "key" {
-            if let Some(rest) = value.strip_prefix("eq.") {
-                key_eq = Some(url_decode(rest));
+    let filters: Vec<(String, String)> = raw
+        .split('&')
+        .filter_map(|pair| {
+            let mut split = pair.splitn(2, '=');
+            let name = url_decode(split.next().unwrap_or(""));
+            let value = url_decode(split.next().unwrap_or(""));
+            if name.is_empty() || matches!(name.as_str(), "select" | "limit" | "offset" | "order") {
+                None
+            } else {
+                Some((name, value))
+            }
+        })
+        .collect();
+    if filters.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|(pk, value)| {
+            let row = rest_row_to_json(pk, value);
+            filters.iter().all(|(name, expression)| rest_filter_matches(&row, name, expression))
+        })
+        .collect()
+}
+
+fn rest_filter_matches(row: &serde_json::Value, field: &str, expression: &str) -> bool {
+    let Some(actual) = row.get(field) else { return false };
+    let (operator, expected) = expression.split_once('.').unwrap_or(("eq", expression));
+    if actual.is_null() && !operator.eq_ignore_ascii_case("is") {
+        return false;
+    }
+    if operator.eq_ignore_ascii_case("not") {
+        let Some((nested_operator, nested_expected)) = expected.split_once('.') else {
+            return false;
+        };
+        return !rest_filter_matches(row, field, &format!("{nested_operator}.{nested_expected}"));
+    }
+    let actual_text = rest_scalar_text(actual);
+    let expected = expected.trim();
+    match operator.to_ascii_lowercase().as_str() {
+        "eq" => actual_text.as_deref() == Some(expected),
+        "neq" => actual_text.as_deref() != Some(expected),
+        "gt" => rest_compare(actual_text.as_deref(), Some(expected)) == Ordering::Greater,
+        "gte" => matches!(
+            rest_compare(actual_text.as_deref(), Some(expected)),
+            Ordering::Greater | Ordering::Equal
+        ),
+        "lt" => rest_compare(actual_text.as_deref(), Some(expected)) == Ordering::Less,
+        "lte" => matches!(
+            rest_compare(actual_text.as_deref(), Some(expected)),
+            Ordering::Less | Ordering::Equal
+        ),
+        "like" | "ilike" => rest_like(
+            actual_text.as_deref().unwrap_or_default(),
+            expected,
+            operator.eq_ignore_ascii_case("ilike"),
+        ),
+        "in" => expected
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+            .map(|values| values.split(',').any(|value| actual_text.as_deref() == Some(value)))
+            .unwrap_or(false),
+        "is" => match expected.to_ascii_lowercase().as_str() {
+            "null" => actual.is_null(),
+            "true" => actual.as_bool() == Some(true),
+            "false" => actual.as_bool() == Some(false),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn rest_scalar_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => Some(value.to_string()),
+    }
+}
+
+fn rest_compare(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => match (left.parse::<f64>(), right.parse::<f64>()) {
+            (Ok(left), Ok(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+            _ => left.cmp(right),
+        },
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+    }
+}
+
+fn rest_like(value: &str, pattern: &str, insensitive: bool) -> bool {
+    let value = if insensitive { value.to_ascii_lowercase() } else { value.to_string() };
+    let pattern = if insensitive { pattern.to_ascii_lowercase() } else { pattern.to_string() };
+    let value = value.chars().collect::<Vec<_>>();
+    let pattern = pattern
+        .chars()
+        .map(|character| match character {
+            '%' => '*',
+            '_' => '?',
+            character => character,
+        })
+        .collect::<Vec<_>>();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for character in pattern {
+        let mut next = vec![false; value.len() + 1];
+        if character == '*' {
+            next[0] = matched[0];
+            for index in 1..=value.len() {
+                next[index] = matched[index] || next[index - 1];
+            }
+        } else {
+            for index in 1..=value.len() {
+                next[index] =
+                    matched[index - 1] && (character == '?' || character == value[index - 1]);
             }
         }
-        if name.is_empty()
-            || name == "select"
-            || name == "limit"
-            || name == "offset"
-            || name == "order"
-        {
-            continue;
+        matched = next;
+    }
+    matched[value.len()]
+}
+
+fn rest_project_row(row: serde_json::Value, select: Option<&str>) -> serde_json::Value {
+    let Some(select) = select.map(str::trim).filter(|select| !select.is_empty() && *select != "*")
+    else {
+        return row;
+    };
+    let Some(object) = row.as_object() else { return row };
+    let mut projected = serde_json::Map::new();
+    for item in select.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let (alias, field) = item.split_once(':').unwrap_or((item, item));
+        if let Some(value) = object.get(field.trim()) {
+            projected.insert(alias.trim().to_string(), value.clone());
         }
     }
-    match key_eq {
-        Some(want) => {
-            rows.into_iter().filter(|(pk, _)| String::from_utf8_lossy(pk) == want).collect()
-        }
-        None => rows,
+    serde_json::Value::Object(projected)
+}
+
+#[cfg(test)]
+mod rest_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn postgrest_filters_and_projection_are_applied() {
+        let rows = vec![
+            (b"one".to_vec(), br#"{"status":"ready","score":12,"owner":"a"}"#.to_vec()),
+            (b"two".to_vec(), br#"{"status":"queued","score":4,"owner":"b"}"#.to_vec()),
+        ];
+        let filtered = filter_rows_by_query(rows, "status=eq.ready&score=gte.10");
+        assert_eq!(filtered.len(), 1);
+        let row =
+            rest_project_row(rest_row_to_json(&filtered[0].0, &filtered[0].1), Some("key,status"));
+        assert_eq!(row, serde_json::json!({"key":"one","status":"ready"}));
+        let ordered = order_rows(
+            vec![
+                (b"one".to_vec(), br#"{"score":12}"#.to_vec()),
+                (b"two".to_vec(), br#"{"score":4}"#.to_vec()),
+            ],
+            Some("score.desc"),
+        );
+        assert_eq!(ordered[0].0, b"one");
+    }
+
+    #[test]
+    fn postgrest_like_and_null_filters_have_expected_semantics() {
+        let rows = vec![
+            (b"one".to_vec(), br#"{"name":"Alice","deleted":null}"#.to_vec()),
+            (b"two".to_vec(), br#"{"name":"Bob","deleted":false}"#.to_vec()),
+        ];
+        assert_eq!(filter_rows_by_query(rows.clone(), "name=ilike.*ali*&deleted=is.null").len(), 1);
+        assert_eq!(filter_rows_by_query(rows.clone(), "name=like.Ali%&deleted=is.null").len(), 1);
+        assert_eq!(filter_rows_by_query(rows, "name=not.ilike.*ali*").len(), 1);
     }
 }
 
@@ -2790,14 +2947,22 @@ fn hex_val(byte: u8) -> Option<u8> {
 
 fn order_rows(rows: Vec<(Vec<u8>, Vec<u8>)>, order: Option<&str>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rows = rows;
-    match order {
-        Some(spec) if spec.starts_with("key.desc") => {
-            rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let spec = order.and_then(|value| value.split(',').next()).unwrap_or("key.asc");
+    let mut parts = spec.split('.');
+    let field = parts.next().unwrap_or("key").trim();
+    let descending = parts.next().is_some_and(|direction| direction.eq_ignore_ascii_case("desc"));
+    rows.sort_by(|left, right| {
+        let left_row = rest_row_to_json(&left.0, &left.1);
+        let right_row = rest_row_to_json(&right.0, &right.1);
+        let left_value = left_row.get(field).and_then(rest_scalar_text);
+        let right_value = right_row.get(field).and_then(rest_scalar_text);
+        let ordering = rest_compare(left_value.as_deref(), right_value.as_deref());
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
         }
-        _ => {
-            rows.sort_by(|a, b| a.0.cmp(&b.0));
-        }
-    }
+    });
     rows
 }
 

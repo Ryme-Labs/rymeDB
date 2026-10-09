@@ -991,6 +991,29 @@ paths:
       description: Supabase-style list with select, key=eq.<id>, order, limit, offset.
       parameters:
         - $ref: '#/components/parameters/TableParam'
+        - name: select
+          in: query
+          description: comma-separated fields to project; aliases use alias:field
+          schema:
+            type: string
+        - name: key
+          in: query
+          description: PostgREST filter, for example eq.k1
+          schema:
+            type: string
+        - name: order
+          in: query
+          description: field.asc or field.desc (key is the default field)
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
       responses:
         '200':
           description: rows as JSON objects

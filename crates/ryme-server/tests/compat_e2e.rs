@@ -93,6 +93,25 @@ async fn compat_rest_graphql_copy_explain() {
     let text = String::from_utf8_lossy(&body).into_owned();
     assert!(text.contains("k2"), "{text}");
     assert!(!text.contains("k1"), "{text}");
+    let (status, _) = http_request(
+        http,
+        "POST /v1/sql/copy",
+        br#"{"table":"profiles","rows":[{"key":"p1","value":"{\"status\":\"ready\",\"score\":12,\"owner\":\"a\"}"},{"key":"p2","value":"{\"status\":\"queued\",\"score\":4,\"owner\":\"b\"}"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, body) = http_request(
+        http,
+        "GET /rest/v1/profiles?select=key,status&status=eq.ready&score=gte.10",
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains(r#""key":"p1""#), "{text}");
+    assert!(text.contains(r#""status":"ready""#), "{text}");
+    assert!(!text.contains("owner"), "{text}");
+    assert!(!text.contains("p2"), "{text}");
     let (status, _) =
         http_request(http, "POST /rest/v1/docs", b"{\"key\":\"k3\",\"value\":\"v3\"}").await;
     assert_eq!(status, 201);
