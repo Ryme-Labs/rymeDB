@@ -52,6 +52,8 @@ All notable changes to rymeDB are recorded here. Format follows
   records for single and composite keys, and rebuilds secondary indexes.
 - `ALTER TABLE ... ALTER COLUMN ... TYPE` now converts existing scalar, boolean,
   array, and JSON values, validates constraints, and rebuilds affected indexes.
+- SQL updates can now relocate single and composite primary keys, refresh
+  secondary indexes, and apply foreign-key `ON UPDATE` actions atomically.
 - Duplicate `CREATE TABLE` statements now fail, while `CREATE TABLE IF NOT
   EXISTS` remains idempotent without replacing the existing schema.
 - Duplicate `CREATE INDEX` statements now fail unless `IF NOT EXISTS` is used;

@@ -359,6 +359,7 @@ pub type Row = (Vec<u8>, Vec<u8>);
 pub struct TransactionChange {
     pub table: String,
     pub pk: Vec<u8>,
+    pub previous_pk: Option<Vec<u8>>,
     pub op: Operation,
     pub before: Option<Vec<u8>>,
     pub after: Option<Vec<u8>>,
@@ -4050,6 +4051,7 @@ where
                         changes.push(TransactionChange {
                             table: child_table.clone(),
                             pk: child_pk,
+                            previous_pk: None,
                             op: Operation::Delete,
                             before: Some(child_value),
                             after: None,
@@ -4086,6 +4088,7 @@ where
                         changes.push(TransactionChange {
                             table: child_table.clone(),
                             pk: child_pk,
+                            previous_pk: None,
                             op: Operation::Update,
                             before: Some(child_value),
                             after: Some(after),
@@ -4207,6 +4210,7 @@ where
                 changes.push(TransactionChange {
                     table: child_table.clone(),
                     pk: child_pk,
+                    previous_pk: None,
                     op: Operation::Update,
                     before: Some(child_value),
                     after: Some(child_after),
@@ -4372,21 +4376,7 @@ where
             if let Ok(serde_json::Value::Object(mut object)) =
                 serde_json::from_slice::<serde_json::Value>(current)
             {
-                let primary_key = object
-                    .keys()
-                    .find(|name| {
-                        name.eq_ignore_ascii_case("id")
-                            || name.eq_ignore_ascii_case("pk")
-                            || name.eq_ignore_ascii_case("key")
-                    })
-                    .cloned();
                 for (column, value) in assignments {
-                    if primary_key.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(&column))
-                    {
-                        return Err(RymeError::InvalidArgument(String::from(
-                            "updating the primary key is not supported",
-                        )));
-                    }
                     let previous = object.get(&column);
                     let resolved = match value {
                         InsertValue::Value(value) => json_update_value(Some(value), previous),
@@ -4435,11 +4425,6 @@ where
                 .iter()
                 .find(|definition| definition.name.eq_ignore_ascii_case(&column))
                 .ok_or_else(|| RymeError::InvalidArgument(format!("unknown column {column}")))?;
-            if primary_keys.iter().any(|name| name.eq_ignore_ascii_case(&column)) {
-                return Err(RymeError::InvalidArgument(String::from(
-                    "updating the primary key is not supported",
-                )));
-            }
             let resolved = match value {
                 InsertValue::Value(value) => Some(value),
                 InsertValue::Null => None,
@@ -4458,14 +4443,58 @@ where
                 json_insert_value(resolved, &definition.data_type),
             );
         }
-        if primary_keys.len() <= 1 {
+        if primary_keys.is_empty() {
             object.insert(
-                primary_keys.first().cloned().unwrap_or_else(|| String::from("id")),
+                String::from("id"),
                 serde_json::Value::String(String::from_utf8_lossy(pk).to_string()),
             );
         }
         serde_json::to_vec(&serde_json::Value::Object(object))
             .map_err(|error| RymeError::Internal(error.to_string()))
+    }
+
+    fn primary_key_for_row(&self, table: &str, fallback: &[u8], value: &[u8]) -> Result<Vec<u8>> {
+        let definitions = self.catalog_columns(table);
+        let primary_keys =
+            definitions.iter().filter(|definition| definition.primary_key).collect::<Vec<_>>();
+        if primary_keys.is_empty() {
+            return Ok(fallback.to_vec());
+        }
+        let serde_json::Value::Object(object) = serde_json::from_slice(value)
+            .map_err(|_| RymeError::InvalidArgument(String::from("row is not a schema record")))?
+        else {
+            return Err(RymeError::InvalidArgument(String::from("row is not a schema record")));
+        };
+        let parts = primary_keys
+            .iter()
+            .map(|definition| {
+                let selected = object
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&definition.name))
+                    .map(|(_, selected)| selected)
+                    .filter(|selected| !selected.is_null())
+                    .ok_or_else(|| {
+                        RymeError::InvalidArgument(format!(
+                            "null value in column {} violates not-null constraint",
+                            definition.name
+                        ))
+                    })?;
+                let bytes = json_result_bytes(selected);
+                if bytes.is_empty() {
+                    return Err(RymeError::InvalidArgument(String::from(
+                        "null value in primary key",
+                    )));
+                }
+                Ok(bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if parts.len() == 1 {
+            Ok(parts.into_iter().next().unwrap_or_default())
+        } else {
+            encode_key_parts(&parts).ok_or_else(|| {
+                RymeError::InvalidArgument(String::from("null value in primary key"))
+            })
+        }
     }
 
     fn project_row(
@@ -4682,16 +4711,27 @@ where
     }
 
     fn check_unique(&self, table: &str, pk: &[u8], value: &[u8]) -> Result<()> {
+        self.check_unique_excluding(table, pk, value, None)
+    }
+
+    fn check_unique_excluding(
+        &self,
+        table: &str,
+        pk: &[u8],
+        value: &[u8],
+        excluded_pk: Option<&[u8]>,
+    ) -> Result<()> {
         let indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
-            if state
-                .entries
-                .get(&indexed)
-                .is_some_and(|pks| pks.iter().any(|existing| existing.as_slice() != pk))
-            {
+            if state.entries.get(&indexed).is_some_and(|pks| {
+                pks.iter().any(|existing| {
+                    existing.as_slice() != pk
+                        && excluded_pk.is_none_or(|excluded| existing.as_slice() != excluded)
+                })
+            }) {
                 return Err(RymeError::Conflict(format!("unique index {}", state.definition.name)));
             }
         }
@@ -4702,14 +4742,14 @@ where
         let Ok(mut indexes) = self.indexes.lock() else { return };
         let Some(table_indexes) = indexes.get_mut(&change.table) else { return };
         for state in table_indexes {
+            let previous_pk = change.previous_pk.as_deref().unwrap_or(&change.pk);
             if let Some(before) = change.before.as_ref() {
-                let Some(indexed) = index_value(&state.definition, &change.pk, before) else {
-                    continue;
-                };
-                if let Some(pks) = state.entries.get_mut(&indexed) {
-                    pks.remove(&change.pk);
-                    if pks.is_empty() {
-                        state.entries.remove(&indexed);
+                if let Some(indexed) = index_value(&state.definition, previous_pk, before) {
+                    if let Some(pks) = state.entries.get_mut(&indexed) {
+                        pks.remove(previous_pk);
+                        if pks.is_empty() {
+                            state.entries.remove(&indexed);
+                        }
                     }
                 }
             }
@@ -6287,6 +6327,7 @@ where
                     vec![TransactionChange {
                         table,
                         pk,
+                        previous_pk: None,
                         op: Operation::Insert,
                         before,
                         after: Some(value),
@@ -6314,6 +6355,7 @@ where
                     vec![TransactionChange {
                         table,
                         pk,
+                        previous_pk: None,
                         op: Operation::Insert,
                         before: None,
                         after: Some(value),
@@ -6347,6 +6389,7 @@ where
                 changes.push(TransactionChange {
                     table,
                     pk,
+                    previous_pk: None,
                     op: if before.is_some() { Operation::Update } else { Operation::Insert },
                     before,
                     after: Some(value),
@@ -6373,13 +6416,29 @@ where
                     self.enforce_rls(&table, &before)?;
                     let after =
                         self.materialize_update_row(&table, &pk, assignments.clone(), &before)?;
+                    let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
                     self.enforce_rls(&table, &after)?;
-                    self.enforce_checks(&table, &pk, &after)?;
-                    self.enforce_foreign_keys(txn, &table, &pk, &after)?;
-                    self.check_unique(&table, &pk, &after)?;
+                    self.enforce_checks(&table, &new_pk, &after)?;
+                    self.enforce_foreign_keys(txn, &table, &new_pk, &after)?;
+                    self.check_unique_excluding(&table, &new_pk, &after, Some(&pk))?;
+                    if new_pk != pk
+                        && self
+                            .manager
+                            .get(
+                                txn,
+                                &RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
+                            )?
+                            .is_some()
+                    {
+                        return Err(RymeError::Conflict(String::from("primary key exists")));
+                    }
+                    if new_pk != pk {
+                        self.manager
+                            .delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
+                    }
                     self.manager.put(
                         txn,
-                        RecordKey::new(&self.tenant, &self.database, &table, &pk),
+                        RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
                         after.clone(),
                     );
                     self.update_referencing_rows(
@@ -6393,7 +6452,8 @@ where
                     )?;
                     changes.push(TransactionChange {
                         table: table.clone(),
-                        pk,
+                        previous_pk: (new_pk != pk).then_some(pk),
+                        pk: new_pk,
                         op: Operation::Update,
                         before: Some(before),
                         after: Some(after),
@@ -6403,17 +6463,34 @@ where
             }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
+                let before_key = pk.clone();
+                let new_pk = self.primary_key_for_row(&table, &pk, &value)?;
                 self.enforce_rls(&table, &value)?;
-                self.enforce_checks(&table, &pk, &value)?;
-                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
+                self.enforce_checks(&table, &new_pk, &value)?;
+                self.enforce_foreign_keys(txn, &table, &new_pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
-                self.check_unique(&table, &pk, &value)?;
-                self.manager.put(txn, key, value.clone());
+                self.check_unique_excluding(&table, &new_pk, &value, Some(&pk))?;
+                if new_pk != pk
+                    && self
+                        .manager
+                        .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &new_pk))?
+                        .is_some()
+                {
+                    return Err(RymeError::Conflict(String::from("primary key exists")));
+                }
+                if new_pk != pk {
+                    self.manager.delete(txn, key);
+                }
+                self.manager.put(
+                    txn,
+                    RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
+                    value.clone(),
+                );
                 let mut changes = Vec::new();
                 if let Some(before_value) = before.as_deref() {
                     self.update_referencing_rows(
@@ -6428,7 +6505,8 @@ where
                 }
                 changes.push(TransactionChange {
                     table,
-                    pk,
+                    previous_pk: (new_pk != before_key).then_some(before_key),
+                    pk: new_pk,
                     op: Operation::Update,
                     before,
                     after: Some(value),
@@ -6456,6 +6534,7 @@ where
                 changes.push(TransactionChange {
                     table,
                     pk,
+                    previous_pk: None,
                     op: Operation::Delete,
                     before,
                     after: None,
@@ -6481,6 +6560,7 @@ where
                     changes.push(TransactionChange {
                         table: table.clone(),
                         pk,
+                        previous_pk: None,
                         op: Operation::Delete,
                         before: Some(before),
                         after: None,
@@ -6625,7 +6705,7 @@ where
                     .get(txn, &key)?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
                 let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
-                let pk_for_result = pk.clone();
+                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
                 let value_for_result = value.clone();
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Update { table, pk, value })
@@ -6633,7 +6713,7 @@ where
                 Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
             }
             Statement::Update { table, pk, value } => {
-                let pk_for_result = pk.clone();
+                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
                 let value_for_result = value.clone();
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Update { table, pk, value })
@@ -6690,8 +6770,12 @@ where
                 continue;
             }
             for state in table_indexes.iter().filter(|state| state.definition.unique) {
-                let touched: std::collections::BTreeSet<Vec<u8>> =
-                    table_changes.iter().map(|change| change.pk.clone()).collect();
+                let touched: std::collections::BTreeSet<Vec<u8>> = table_changes
+                    .iter()
+                    .flat_map(|change| {
+                        std::iter::once(change.pk.clone()).chain(change.previous_pk.iter().cloned())
+                    })
+                    .collect();
                 let mut occupied: HashMap<Vec<u8>, Vec<u8>> = state
                     .entries
                     .iter()
@@ -7008,7 +7092,7 @@ where
                     .get(&mut txn, &key)?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
                 let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
-                let pk_for_result = pk.clone();
+                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
                 let value_for_result = value.clone();
                 let (_result, changes) = self
                     .execute_in_transaction_base(&mut txn, Statement::Update { table, pk, value })
@@ -7017,7 +7101,7 @@ where
                 Ok(returning_result(&fields, pk_for_result, value_for_result))
             }
             Statement::Update { table, pk, value } => {
-                let pk_for_result = pk.clone();
+                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
                 let value_for_result = value.clone();
                 self.execute_with_base(Statement::Update { table, pk, value }, isolation).await?;
                 Ok(returning_result(&fields, pk_for_result, value_for_result))
@@ -7181,6 +7265,7 @@ where
                 self.apply_index_change(&TransactionChange {
                     table: table.clone(),
                     pk: pk.clone(),
+                    previous_pk: None,
                     op: Operation::Insert,
                     before: before.clone(),
                     after: Some(value.clone()),
@@ -7405,6 +7490,7 @@ where
                 changes.push(TransactionChange {
                     table,
                     pk,
+                    previous_pk: None,
                     op: Operation::Delete,
                     before,
                     after: None,
@@ -8877,6 +8963,50 @@ mod tests {
             matches!(cascaded, QueryResult::Rows { ref rows } if rows[0].1.windows(new_user.len()).any(|window| window == new_user)),
             "{cascaded:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn updating_primary_keys_rekeys_rows_and_cascades_foreign_keys() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY, code TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users (id) ON UPDATE CASCADE)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO users (id, code) VALUES ('u1', 'room')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (id, user_id) VALUES ('m1', 'u1')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX users_code_idx ON users (code)").unwrap())
+            .await
+            .unwrap();
+
+        let returned = executor
+            .execute(parse("UPDATE users SET id = 'u2' WHERE id = 'u1' RETURNING id").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(returned, QueryResult::Returning { rows, .. }
+            if rows == vec![vec![b"u2".to_vec()]]));
+        let old =
+            executor.execute(parse("SELECT * FROM users WHERE id = 'u1'").unwrap()).await.unwrap();
+        assert!(matches!(old, QueryResult::Rows { rows } if rows.is_empty()));
+        let indexed = executor
+            .execute(parse("SELECT * FROM users WHERE code = 'room'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(indexed, QueryResult::Rows { rows }
+            if rows.len() == 1 && rows[0].0 == b"u2"));
+        let child = executor.execute(parse("SELECT user_id FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(child, QueryResult::Table { rows, .. }
+            if rows == vec![vec![b"u2".to_vec()]]));
     }
 
     #[tokio::test]

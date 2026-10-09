@@ -88,7 +88,7 @@ rows written directly in the branch overlay.
 `PRIMARY KEY` constraints, single-column and composite `UNIQUE` constraints,
 `CHECK`, `FOREIGN KEY ... REFERENCES`, `NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
 `ALTER TABLE ... ADD PRIMARY KEY` and `ADD CONSTRAINT` for `UNIQUE`, `CHECK`, and `FOREIGN KEY ... REFERENCES`,
-`DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability changes
+`DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability/type changes
 (including `ALTER COLUMN ... TYPE` for supported scalar, boolean, array, and JSON values)
 (including `IF [NOT] EXISTS` where supported), plus
 foreign-key actions `ON DELETE`/`ON UPDATE RESTRICT`, `CASCADE`, `SET NULL`,
