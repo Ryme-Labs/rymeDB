@@ -65,6 +65,8 @@ enum Command {
         payload_bytes: usize,
         #[arg(long, default_value_t = 32)]
         publish_concurrency: usize,
+        #[arg(long, default_value_t = 256)]
+        connection_concurrency: usize,
         #[arg(long, default_value_t = 100)]
         warmup_ms: u64,
         #[arg(long)]
@@ -111,6 +113,7 @@ async fn main() {
             messages,
             payload_bytes,
             publish_concurrency,
+            connection_concurrency,
             warmup_ms,
             json,
         }) => {
@@ -122,6 +125,7 @@ async fn main() {
                 messages,
                 payload_bytes,
                 publish_concurrency,
+                connection_concurrency,
                 warmup_ms,
                 json,
             })
@@ -141,6 +145,7 @@ struct RealtimeBench {
     messages: usize,
     payload_bytes: usize,
     publish_concurrency: usize,
+    connection_concurrency: usize,
     warmup_ms: u64,
     json: bool,
 }
@@ -164,14 +169,23 @@ async fn realtime_bench(config: RealtimeBench) {
     let benchmark_start = Instant::now();
     let ws_url =
         format!("ws://{}/v1/broadcast/{}?api_key={}", config.addr, config.channel, config.api_key);
+    let connection_results = futures_util::stream::iter(0..config.connections)
+        .map(|_| {
+            let ws_url = ws_url.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    tokio_tungstenite::connect_async(ws_url),
+                )
+                .await
+            }
+        })
+        .buffer_unordered(config.connection_concurrency.max(1))
+        .collect::<Vec<_>>()
+        .await;
     let mut streams = Vec::with_capacity(config.connections);
-    for _ in 0..config.connections {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            tokio_tungstenite::connect_async(&ws_url),
-        )
-        .await
-        {
+    for result in connection_results {
+        match result {
             Ok(Ok((stream, _))) => streams.push(stream),
             Ok(Err(error)) => {
                 eprintln!(

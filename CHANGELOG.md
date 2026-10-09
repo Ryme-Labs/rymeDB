@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- The realtime benchmark opens subscriber WebSockets with bounded concurrency,
+  making high-connection capacity runs practical without unbounded client fanout.
 - PostgreSQL `ALTER COLUMN TYPE ... USING column::type` casts are accepted
   for safe self-column migration syntax.
 - The realtime benchmark now reports sampled publisher-to-client fanout

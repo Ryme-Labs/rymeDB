@@ -105,12 +105,15 @@ The WebSocket path can be measured against a running server with:
 
 ```text
 ryme-bench realtime --addr 127.0.0.1:3000 --api-key ryme-dev-key \
-  --connections 100 --messages 10000 --payload-bytes 128 --json
+  --connections 100 --connection-concurrency 256 --messages 10000 \
+  --payload-bytes 128 --json
 ```
 
 The command opens all subscribers before publishing, sends authenticated
 `POST /v1/broadcast` requests with bounded concurrency, and waits for every
-subscriber to receive every successful publish. It reports publisher qps,
+subscriber to receive every successful publish. Connections are established
+with bounded concurrency (`--connection-concurrency`) so high-connection runs
+do not serialize setup. It reports publisher qps,
 fanout deliveries per second, sampled publisher-to-client latency percentiles,
 delivery percentage, and errors. The benchmark carries a monotonic timestamp
 from the publisher process in each payload, so the latency fields are valid
