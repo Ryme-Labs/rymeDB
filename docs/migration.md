@@ -52,7 +52,8 @@ protocol connections: `SELECT pg_catalog.version()`,
 REST: `GET /rest/v1/:table?select=&key=eq.<id>&order=key.desc&limit=&offset=`,
 with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is`, `like`, `ilike`, and
 `not.<operator>`, `or=(...)`, and `and=(...)` filters plus field
-projection/aliases,
+projection/aliases. `order` accepts comma-separated fields with `asc`/`desc`
+and `nullsfirst`/`nullslast` modifiers,
 `POST /rest/v1/:table` with `{key, value}`, `{rows: [...]}`, a JSON object,
 or a JSON array of objects with an `id`/`key` field,
 and `on_conflict=<field>` resolves duplicate JSON rows by that field,

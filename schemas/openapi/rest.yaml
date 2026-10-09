@@ -1003,7 +1003,7 @@ paths:
             type: string
         - name: order
           in: query
-          description: field.asc or field.desc (key is the default field)
+          description: comma-separated field.asc/field.desc clauses with optional nullsfirst/nullslast (key is the default field)
           schema:
             type: string
         - name: limit

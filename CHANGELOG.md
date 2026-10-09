@@ -21,6 +21,8 @@ All notable changes to rymeDB are recorded here. Format follows
   groups with nested filter expressions.
 - REST inserts support `on_conflict=<field>` to update an existing JSON row
   when a logical conflict field matches.
+- REST ordering now supports multiple fields and PostgREST
+  `nullsfirst`/`nullslast` modifiers.
 
 - PostgREST filtering now advances through ordered storage pages, so matching
   rows beyond the first page are not lost; non-key ordering scans the complete
