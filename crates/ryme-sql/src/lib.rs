@@ -5567,8 +5567,10 @@ where
     ) -> Result<()> {
         let expressions = using.into_iter().chain(check);
         let mut tenant_column = None;
+        let mut allow_all = false;
         for expression in expressions {
             if expression.trim().eq_ignore_ascii_case("true") {
+                allow_all = true;
                 continue;
             }
             let Some(column) = policy_tenant_column(expression) else {
@@ -5583,8 +5585,11 @@ where
             }
             tenant_column = Some(column);
         }
-        if let Some(column) = tenant_column {
-            let command = command.to_ascii_uppercase();
+        let command = command.to_ascii_uppercase();
+        if !matches!(command.as_str(), "ALL" | "SELECT" | "INSERT" | "UPDATE" | "DELETE") {
+            return Err(RymeError::InvalidArgument(String::from("unsupported RLS command")));
+        }
+        if let Some(column) = tenant_column.or_else(|| allow_all.then(String::new)) {
             let applies_read = matches!(command.as_str(), "ALL" | "SELECT" | "UPDATE" | "DELETE");
             let applies_write = matches!(command.as_str(), "ALL" | "INSERT" | "UPDATE" | "DELETE");
             if applies_read {
@@ -5984,8 +5989,11 @@ where
         }
         let Some(column) = self.rls_tables.read().ok().and_then(|rls| rls.get(table).cloned())
         else {
-            return true;
+            return false;
         };
+        if column.is_empty() {
+            return true;
+        }
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return false;
         };
@@ -6007,8 +6015,11 @@ where
         let Some(column) =
             self.rls_write_tables.read().ok().and_then(|rls| rls.get(table).cloned())
         else {
-            return Ok(());
+            return Err(RymeError::Forbidden);
         };
+        if column.is_empty() {
+            return Ok(());
+        }
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return Err(RymeError::Forbidden);
         };
@@ -7272,14 +7283,7 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
-        let rls_enabled = self.rls_enabled.read().ok().is_some_and(|tables| {
-            tables.contains(table)
-                && self
-                    .rls_tables
-                    .read()
-                    .ok()
-                    .is_some_and(|rls_tables| rls_tables.contains_key(table))
-        });
+        let rls_enabled = self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table));
         if rls_enabled {
             if limit == 0 {
                 return Ok(Vec::new());
@@ -12021,6 +12025,55 @@ mod tests {
         executor.restore_schema_snapshot(snapshot).unwrap();
         let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn sql_rls_defaults_to_deny_without_matching_policy_command() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE private_rows (id TEXT PRIMARY KEY, tenant_id TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO private_rows (id, tenant_id) VALUES ('one', 'tenant-a')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE private_rows ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+
+        let result = executor.execute(parse("SELECT * FROM private_rows").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { ref rows } if rows.is_empty()));
+        let rejected = executor
+            .execute(
+                parse("INSERT INTO private_rows (id, tenant_id) VALUES ('two', 'tenant-a')")
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(rejected, Err(RymeError::Forbidden)));
+
+        executor
+            .execute(
+                parse("CREATE POLICY read_private ON private_rows FOR SELECT USING (auth.uid() = tenant_id)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = executor.execute(parse("SELECT * FROM private_rows").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+        let rejected = executor
+            .execute(
+                parse("INSERT INTO private_rows (id, tenant_id) VALUES ('three', 'tenant-a')")
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(rejected, Err(RymeError::Forbidden)));
     }
 
     #[tokio::test]

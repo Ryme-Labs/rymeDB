@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Enabled RLS tables now default-deny reads and writes when no applicable
+  policy command exists, including `FOR SELECT` policies that must not grant
+  insert/update/delete access implicitly.
 - Realtime CDC replay, live updates, and query snapshots now use the same
   persisted SQL RLS state as PostgreSQL reads, so migration-created policies
   protect WebSocket data as well as direct queries.
