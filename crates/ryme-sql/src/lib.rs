@@ -3604,10 +3604,7 @@ where
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, filter } => {
-                let rows = self.filter_rls_rows(
-                    &table,
-                    self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?,
-                );
+                let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
@@ -3618,10 +3615,7 @@ where
                 })
             }
             Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
-                let rows = self.filter_rls_rows(
-                    &table,
-                    self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?,
-                );
+                let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
                     if !filter.iter().all(|p| p.matches(&pk, &value)) {
@@ -3691,14 +3685,8 @@ where
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Join { left, right, limit, offset, order, filter } => {
-                let left_rows = self.filter_rls_rows(
-                    &left,
-                    self.manager.scan(txn, &self.tenant, &self.database, &left, 10000)?,
-                );
-                let right_rows = self.filter_rls_rows(
-                    &right,
-                    self.manager.scan(txn, &self.tenant, &self.database, &right, 10000)?,
-                );
+                let left_rows = self.scan_rows(txn, &left, &[], usize::MAX)?;
+                let right_rows = self.scan_rows(txn, &right, &[], usize::MAX)?;
                 let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
                 for (pk, value) in right_rows {
                     index.entry(pk).or_insert(value);
@@ -3976,10 +3964,7 @@ where
             }
             Statement::Aggregate { table, func, field, filter } => {
                 let mut txn = self.begin_with(isolation);
-                let rows = self.filter_rls_rows(
-                    &table,
-                    self.manager.scan(&mut txn, &self.tenant, &self.database, &table, 10000)?,
-                );
+                let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
@@ -3991,16 +3976,7 @@ where
             }
             Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
                 let mut txn = self.begin_with(isolation);
-                let rows = self.filter_rls_rows(
-                    table.as_str(),
-                    self.manager.scan(
-                        &mut txn,
-                        &self.tenant,
-                        &self.database,
-                        table.as_str(),
-                        10000,
-                    )?,
-                );
+                let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
                     if !filter.iter().all(|p| p.matches(&pk, &value)) {
@@ -4071,26 +4047,8 @@ where
             }
             Statement::Join { left, right, limit, offset, order, filter } => {
                 let mut txn = self.begin_with(isolation);
-                let left_rows = self.filter_rls_rows(
-                    left.as_str(),
-                    self.manager.scan(
-                        &mut txn,
-                        &self.tenant,
-                        &self.database,
-                        left.as_str(),
-                        10000,
-                    )?,
-                );
-                let right_rows = self.filter_rls_rows(
-                    right.as_str(),
-                    self.manager.scan(
-                        &mut txn,
-                        &self.tenant,
-                        &self.database,
-                        right.as_str(),
-                        10000,
-                    )?,
-                );
+                let left_rows = self.scan_rows(&mut txn, &left, &[], usize::MAX)?;
+                let right_rows = self.scan_rows(&mut txn, &right, &[], usize::MAX)?;
                 let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
                 for (pk, value) in right_rows {
                     index.entry(pk).or_insert(value);
@@ -5461,6 +5419,43 @@ mod tests {
                 "{column}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn large_aggregates_groups_and_joins_read_past_first_page() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE metrics (id TEXT PRIMARY KEY, amount INTEGER)").unwrap())
+            .await
+            .unwrap();
+        let values =
+            (0..10_001).map(|index| format!("('m{index}', 1)")).collect::<Vec<_>>().join(", ");
+        executor
+            .execute(parse(&format!("INSERT INTO metrics (id, amount) VALUES {values}")).unwrap())
+            .await
+            .unwrap();
+
+        let aggregate =
+            executor.execute(parse("SELECT COUNT(*) FROM metrics").unwrap()).await.unwrap();
+        assert!(matches!(aggregate, QueryResult::Scalar { value, .. } if value == b"10001"));
+
+        let groups = executor
+            .execute(
+                parse("SELECT key, COUNT(*) FROM metrics GROUP BY key OFFSET 10000 LIMIT 1")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(groups, QueryResult::Rows { rows } if rows.len() == 1));
+
+        let joined = executor
+            .execute(
+                parse("SELECT * FROM metrics JOIN metrics ON KEY = KEY OFFSET 10000 LIMIT 1")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(joined, QueryResult::Rows { rows } if rows.len() == 1));
     }
 
     #[tokio::test]

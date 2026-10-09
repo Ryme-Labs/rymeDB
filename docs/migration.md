@@ -109,10 +109,11 @@ positions; quoted literals are never evaluated.
 Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND value CONTAINS 'x'
 AND value != 'y'] [ORDER BY key|value ASC|DESC] [LIMIT n] [OFFSET n]`.
 Predicates evaluate on stored bytes as text; plain scans stream the ordered
-range while filtered/ordered/paged scans evaluate the head 10k rows in key
-order unless an equality predicate can use a maintained secondary index.
+range while filtered/ordered/paged scans page through storage until the
+requested window is satisfied, with a 10k result cap unless an equality
+predicate can use a maintained secondary index.
 Aggregates: `SELECT COUNT(*) | COUNT(field) | SUM(field) | AVG(field) | MIN(field) | MAX(field)
-FROM t [WHERE ...]` compute over the head 10k filtered rows; numerics parse
+FROM t [WHERE ...]` compute over all visible filtered rows; numerics parse
 as f64 with non-numeric values skipped (`SUM` over none yields `0`,
 `AVG`/`MIN`/`MAX` over none yield `null`). Aggregate names without parentheses
 are treated as ordinary projected columns.
