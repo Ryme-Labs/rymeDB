@@ -855,6 +855,8 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
             || upper.contains("PG_CATALOG.PG_ATTRIBUTE")
         {
             "columns"
+        } else if upper.contains("PG_CATALOG.PG_INDEXES") {
+            "indexes"
         } else {
             return None;
         };
@@ -862,6 +864,7 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
     let selected = split_select_list(query[6..from].trim());
     let defaults = match kind {
         "tables" => vec![String::from("table_name")],
+        "indexes" => vec![String::from("indexname")],
         _ => vec![String::from("column_name")],
     };
     if selected.is_empty() || selected.iter().any(|item| item == "*") {
@@ -870,6 +873,13 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("table_schema"),
                 String::from("table_name"),
                 String::from("table_type"),
+            ],
+            "indexes" => vec![
+                String::from("schemaname"),
+                String::from("tablename"),
+                String::from("indexname"),
+                String::from("tablespace"),
+                String::from("indexdef"),
             ],
             _ => vec![
                 String::from("column_name"),
@@ -944,6 +954,39 @@ where
                         "table_schema" | "schemaname" => schema.as_bytes().to_vec(),
                         "table_name" | "tablename" => table_name.as_bytes().to_vec(),
                         "table_type" => b"BASE TABLE".to_vec(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_INDEXES") {
+        let table = sql_literal_after(query, "TABLENAME");
+        let indexes =
+            table.as_deref().map(|name| executor.catalog_indexes(name)).unwrap_or_default();
+        let rows: Vec<Vec<Vec<u8>>> = indexes
+            .into_iter()
+            .map(|index| {
+                let (schema, table_name) = catalog_table_parts(&index.table);
+                let field = match index.field {
+                    Field::Key => "id",
+                    Field::Value => "value",
+                };
+                let unique = if index.unique { "UNIQUE " } else { "" };
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "schemaname" => schema.as_bytes().to_vec(),
+                        "tablename" => table_name.as_bytes().to_vec(),
+                        "indexname" => index.name.as_bytes().to_vec(),
+                        "tablespace" => Vec::new(),
+                        "indexdef" => format!(
+                            "CREATE {unique}INDEX {} ON {}.{} ({field})",
+                            index.name, schema, table_name
+                        )
+                        .into_bytes(),
                         _ => Vec::new(),
                     })
                     .collect()

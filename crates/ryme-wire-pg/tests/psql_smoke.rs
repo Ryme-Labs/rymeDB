@@ -90,6 +90,13 @@ async fn psql_smoke() {
     assert!(out.contains("payload|jsonb|NO"), "{out}");
     let (ok, out) = psql(
         addr,
+        "CREATE INDEX messages_payload_idx ON public.messages (payload); SELECT indexname, tablename FROM pg_catalog.pg_indexes WHERE tablename = 'messages';",
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(out.contains("messages_payload_idx|messages"), "{out}");
+    let (ok, out) = psql(
+        addr,
         "BEGIN; INSERT INTO docs (id, value) VALUES ('tx', 'inside'); SELECT * FROM docs KEY 'tx'; COMMIT;",
     )
     .await;

@@ -62,6 +62,8 @@ at the logical level; internal page formats are never imported.
 `NOT NULL` metadata), with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
+`CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields,
+with `pg_catalog.pg_indexes` introspection and indexed equality lookup,
 `SELECT * FROM t KEY 'k'`, `SELECT * FROM t LIMIT n`, `UPDATE`, `DELETE`,
 `COPY t FROM stdin` (bulk path), `EXPLAIN <sql>` (planned access path),
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:
@@ -71,7 +73,7 @@ Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND value CONTAINS 'x'
 AND value != 'y'] [ORDER BY key|value ASC|DESC] [LIMIT n] [OFFSET n]`.
 Predicates evaluate on stored bytes as text; plain scans stream the ordered
 range while filtered/ordered/paged scans evaluate the head 10k rows in key
-order — correct within that stated bound, not a full-table engine.
+order unless an equality predicate can use a maintained secondary index.
 Aggregates: `SELECT COUNT(*) | COUNT(field) | SUM | AVG | MIN | MAX (field)
 FROM t [WHERE ...]` compute over the head 10k filtered rows; numerics parse
 as f64 with non-numeric values skipped (`SUM` over none yields `0`,

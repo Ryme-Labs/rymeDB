@@ -12,6 +12,12 @@ pub enum Statement {
         table: String,
         columns: Vec<ColumnDefinition>,
     },
+    CreateIndex {
+        name: String,
+        table: String,
+        field: Field,
+        unique: bool,
+    },
     Insert {
         table: String,
         pk: Vec<u8>,
@@ -87,6 +93,14 @@ pub struct ColumnDefinition {
     pub primary_key: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDefinition {
+    pub name: String,
+    pub table: String,
+    pub field: Field,
+    pub unique: bool,
+}
+
 impl Statement {
     pub fn is_write(&self) -> bool {
         matches!(
@@ -117,6 +131,7 @@ pub struct TransactionChange {
     pub table: String,
     pub pk: Vec<u8>,
     pub op: Operation,
+    pub before: Option<Vec<u8>>,
     pub after: Option<Vec<u8>>,
 }
 
@@ -233,6 +248,7 @@ impl Statement {
     pub fn table(&self) -> &str {
         match self {
             Self::CreateTable { table, .. }
+            | Self::CreateIndex { table, .. }
             | Self::Insert { table, .. }
             | Self::Upsert { table, .. }
             | Self::SelectByKey { table, .. }
@@ -353,6 +369,12 @@ fn unquote(value: &str) -> String {
 }
 
 fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
+    if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("INDEX"))
+        || (tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("UNIQUE"))
+            && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("INDEX")))
+    {
+        return parse_create_index(tokens);
+    }
     let table_index = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("TABLE"))
@@ -371,6 +393,37 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
     Ok(Statement::CreateTable { table, columns: parse_column_definitions(raw) })
+}
+
+fn parse_create_index(tokens: &[String]) -> Result<Statement> {
+    let unique = tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("UNIQUE"));
+    let index_pos = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("INDEX"))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create index")))?;
+    let mut name_pos = index_pos + 1;
+    if tokens.get(name_pos).is_some_and(|token| token.eq_ignore_ascii_case("IF")) {
+        if !tokens.get(name_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+            || !tokens.get(name_pos + 2).is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+        {
+            return Err(RymeError::InvalidArgument(String::from("index name")));
+        }
+        name_pos += 3;
+    }
+    let name = tokens
+        .get(name_pos)
+        .map(|token| unquote(token))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("index name")))?;
+    let table = table_after(tokens, "ON")?;
+    let on_pos = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("ON"))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("index table")))?;
+    let field_token = tokens
+        .get(on_pos + 2)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("index field")))?;
+    let field = parse_field(field_token).unwrap_or(Field::Value);
+    Ok(Statement::CreateIndex { name, table, field, unique })
 }
 
 fn parse_column_definitions(raw: &str) -> Vec<ColumnDefinition> {
@@ -909,6 +962,13 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::CreateTable { table, columns } => {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
+        Statement::CreateIndex { name, table, field, unique } => {
+            let field = match field {
+                Field::Key => "key",
+                Field::Value => "value",
+            };
+            format!("ddl {}index({name}) on {table}({field})", if *unique { "unique " } else { "" })
+        }
         Statement::Insert { table, .. } => format!("write insert({table}) point"),
         Statement::Upsert { table, .. } => format!("write upsert({table}) point"),
         Statement::SelectByKey { table, .. } => {
@@ -1070,6 +1130,13 @@ pub struct Executor<B = TxnManager> {
     read_only: bool,
     isolation: Isolation,
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
+    indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexState {
+    definition: IndexDefinition,
+    entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>>,
 }
 
 impl Executor<TxnManager> {
@@ -1083,6 +1150,7 @@ impl Executor<TxnManager> {
             read_only: false,
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
+            indexes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1096,6 +1164,7 @@ impl Executor<TxnManager> {
             read_only: false,
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
+            indexes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1114,6 +1183,7 @@ where
             read_only: false,
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
+            indexes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1166,6 +1236,170 @@ where
                 })
             })
             .unwrap_or_default()
+    }
+
+    pub fn catalog_indexes(&self, table: &str) -> Vec<IndexDefinition> {
+        self.indexes
+            .lock()
+            .ok()
+            .and_then(|indexes| {
+                indexes.get(table).cloned().or_else(|| {
+                    indexes.iter().find_map(|(name, definitions)| {
+                        (name.rsplit('.').next() == Some(table)).then(|| definitions.clone())
+                    })
+                })
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|state| state.definition)
+            .collect()
+    }
+
+    fn scan_all_rows(&self, table: &str) -> Result<Vec<Row>> {
+        const PAGE: usize = 10_000;
+        let mut txn = self.manager.begin_with(self.isolation);
+        let mut rows = self.manager.scan(&mut txn, &self.tenant, &self.database, table, PAGE)?;
+        loop {
+            if rows.len() < PAGE {
+                break;
+            }
+            let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
+            let next = self.manager.scan_after(
+                &mut txn,
+                &self.tenant,
+                &self.database,
+                table,
+                &last,
+                PAGE,
+            )?;
+            if next.is_empty() {
+                break;
+            }
+            rows.extend(next);
+        }
+        Ok(rows)
+    }
+
+    fn create_index(&self, definition: IndexDefinition) -> Result<()> {
+        self.reject_if_read_only()?;
+        let rows = self.scan_all_rows(&definition.table)?;
+        let mut entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = BTreeMap::new();
+        for (pk, value) in rows {
+            let indexed = match definition.field {
+                Field::Key => pk.clone(),
+                Field::Value => value,
+            };
+            let pks = entries.entry(indexed).or_default();
+            if definition.unique && !pks.is_empty() && !pks.contains(&pk) {
+                return Err(RymeError::Conflict(format!("unique index {}", definition.name)));
+            }
+            pks.insert(pk);
+        }
+        let mut indexes =
+            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+        let table_indexes = indexes.entry(definition.table.clone()).or_default();
+        if table_indexes.iter().any(|state| state.definition.name == definition.name) {
+            return Ok(());
+        }
+        table_indexes.push(IndexState { definition, entries });
+        Ok(())
+    }
+
+    fn indexed_candidates(&self, table: &str, filter: &[Predicate]) -> Option<Vec<Vec<u8>>> {
+        let predicate = filter
+            .iter()
+            .find(|predicate| predicate.field == Field::Value && predicate.op == Cmp::Eq)?;
+        let indexes = self.indexes.lock().ok()?;
+        let state =
+            indexes.get(table)?.iter().find(|state| state.definition.field == predicate.field)?;
+        Some(state.entries.get(&predicate.operand)?.iter().cloned().collect())
+    }
+
+    fn check_unique(&self, table: &str, pk: &[u8], value: &[u8]) -> Result<()> {
+        let indexes =
+            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+        let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
+        for state in table_indexes.iter().filter(|state| state.definition.unique) {
+            let indexed = match state.definition.field {
+                Field::Key => pk,
+                Field::Value => value,
+            };
+            if state
+                .entries
+                .get(indexed)
+                .is_some_and(|pks| pks.iter().any(|existing| existing.as_slice() != pk))
+            {
+                return Err(RymeError::Conflict(format!("unique index {}", state.definition.name)));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_index_change(&self, change: &TransactionChange) {
+        let Ok(mut indexes) = self.indexes.lock() else { return };
+        let Some(table_indexes) = indexes.get_mut(&change.table) else { return };
+        for state in table_indexes {
+            if let Some(before) = change.before.as_ref() {
+                let indexed = match state.definition.field {
+                    Field::Key => change.pk.clone(),
+                    Field::Value => before.clone(),
+                };
+                if let Some(pks) = state.entries.get_mut(&indexed) {
+                    pks.remove(&change.pk);
+                    if pks.is_empty() {
+                        state.entries.remove(&indexed);
+                    }
+                }
+            }
+            if let Some(after) = change.after.as_ref() {
+                let indexed = match state.definition.field {
+                    Field::Key => change.pk.clone(),
+                    Field::Value => after.clone(),
+                };
+                state.entries.entry(indexed).or_default().insert(change.pk.clone());
+            }
+        }
+    }
+
+    fn scan_rows(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        filter: &[Predicate],
+        limit: usize,
+    ) -> Result<Vec<Row>> {
+        if txn.writes().is_empty() {
+            if let Some(candidates) = self.indexed_candidates(table, filter) {
+                let mut rows = Vec::with_capacity(candidates.len());
+                for pk in candidates {
+                    let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
+                    if let Some(value) = self.manager.get(txn, &key)? {
+                        rows.push((pk, value));
+                    }
+                }
+                return Ok(rows);
+            }
+        }
+        let mut rows = self.manager.scan(txn, &self.tenant, &self.database, table, limit)?;
+        if !txn.writes().is_empty() {
+            let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = rows.drain(..).collect();
+            for (key, write) in txn.writes() {
+                if key.tenant != self.tenant || key.database != self.database || key.table != table
+                {
+                    continue;
+                }
+                match write.value.as_ref() {
+                    Some(value) => {
+                        merged.insert(key.pk.clone(), value.clone());
+                    }
+                    None => {
+                        merged.remove(&key.pk);
+                    }
+                }
+            }
+            rows = merged.into_iter().take(limit).collect();
+        }
+        Ok(rows)
     }
 
     fn register_table(&self, table: String, columns: Vec<ColumnDefinition>) {
@@ -1238,6 +1472,7 @@ where
             Statement::CreateTable { table, columns } => {
                 self.register_table(table.clone(), columns.clone());
             }
+            Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
         }
@@ -1256,6 +1491,10 @@ where
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
+            Statement::CreateIndex { name, table, field, unique } => {
+                self.create_index(IndexDefinition { name, table, field, unique })?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
             Statement::Explain { plan, .. } => Ok((
                 QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() },
                 Vec::new(),
@@ -1274,12 +1513,14 @@ where
                         return Err(RymeError::Overload(String::from("value")));
                     }
                     let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                    let existed = self.manager.get(txn, &key)?.is_some();
+                    let before = self.manager.get(txn, &key)?;
+                    self.check_unique(&table, &pk, &value)?;
                     self.manager.put(txn, key, value.clone());
                     changes.push(TransactionChange {
                         table: table.clone(),
                         pk,
-                        op: if existed { Operation::Update } else { Operation::Insert },
+                        op: if before.is_some() { Operation::Update } else { Operation::Insert },
+                        before,
                         after: Some(value),
                     });
                 }
@@ -1288,9 +1529,11 @@ where
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                if self.manager.get(txn, &key)?.is_some() {
+                let before = self.manager.get(txn, &key)?;
+                if before.is_some() {
                     return Err(RymeError::Conflict(String::from("exists")));
                 }
+                self.check_unique(&table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
                 Ok((
                     QueryResult::Ok,
@@ -1298,6 +1541,7 @@ where
                         table,
                         pk,
                         op: Operation::Insert,
+                        before,
                         after: Some(value),
                     }],
                 ))
@@ -1305,14 +1549,16 @@ where
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let existed = self.manager.get(txn, &key)?.is_some();
+                let before = self.manager.get(txn, &key)?;
+                self.check_unique(&table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
                 Ok((
                     QueryResult::Ok,
                     vec![TransactionChange {
                         table,
                         pk,
-                        op: if existed { Operation::Update } else { Operation::Insert },
+                        op: if before.is_some() { Operation::Update } else { Operation::Insert },
+                        before,
                         after: Some(value),
                     }],
                 ))
@@ -1320,9 +1566,11 @@ where
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                if self.manager.get(txn, &key)?.is_none() {
+                let before = self.manager.get(txn, &key)?;
+                if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
+                self.check_unique(&table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
                 Ok((
                     QueryResult::Ok,
@@ -1330,6 +1578,7 @@ where
                         table,
                         pk,
                         op: Operation::Update,
+                        before,
                         after: Some(value),
                     }],
                 ))
@@ -1337,13 +1586,20 @@ where
             Statement::Delete { table, pk } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                if self.manager.get(txn, &key)?.is_none() {
+                let before = self.manager.get(txn, &key)?;
+                if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.manager.delete(txn, key);
                 Ok((
                     QueryResult::Ok,
-                    vec![TransactionChange { table, pk, op: Operation::Delete, after: None }],
+                    vec![TransactionChange {
+                        table,
+                        pk,
+                        op: Operation::Delete,
+                        before,
+                        after: None,
+                    }],
                 ))
             }
             statement => Ok((self.execute_read_in_transaction(txn, statement)?, Vec::new())),
@@ -1401,11 +1657,58 @@ where
         txn: Transaction,
         changes: Vec<TransactionChange>,
     ) -> Result<u64> {
+        self.check_transaction_uniqueness(&changes)?;
         let commit_ts = self.manager.commit(txn).await?;
         for change in changes {
+            self.apply_index_change(&change);
             self.emit(&change.table, change.pk, change.op, change.after, commit_ts)?;
         }
         Ok(commit_ts)
+    }
+
+    fn check_transaction_uniqueness(&self, changes: &[TransactionChange]) -> Result<()> {
+        let indexes =
+            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+        for (table, table_indexes) in indexes.iter() {
+            let table_changes: Vec<&TransactionChange> =
+                changes.iter().filter(|change| &change.table == table).collect();
+            if table_changes.is_empty() {
+                continue;
+            }
+            for state in table_indexes.iter().filter(|state| state.definition.unique) {
+                let touched: std::collections::BTreeSet<Vec<u8>> =
+                    table_changes.iter().map(|change| change.pk.clone()).collect();
+                let mut occupied: HashMap<Vec<u8>, Vec<u8>> = state
+                    .entries
+                    .iter()
+                    .filter_map(|(indexed, pks)| {
+                        pks.iter()
+                            .find(|pk| !touched.contains(*pk))
+                            .map(|pk| (indexed.clone(), pk.clone()))
+                    })
+                    .collect();
+                let mut assigned: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+                for change in table_changes.iter() {
+                    if let Some(previous) = assigned.remove(&change.pk) {
+                        occupied.remove(&previous);
+                    }
+                    let Some(after) = change.after.as_ref() else { continue };
+                    let indexed = match state.definition.field {
+                        Field::Key => change.pk.clone(),
+                        Field::Value => after.clone(),
+                    };
+                    if occupied.get(&indexed).is_some_and(|existing| existing != &change.pk) {
+                        return Err(RymeError::Conflict(format!(
+                            "unique index {}",
+                            state.definition.name
+                        )));
+                    }
+                    occupied.insert(indexed.clone(), change.pk.clone());
+                    assigned.insert(change.pk.clone(), indexed);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn execute_read_in_transaction(
@@ -1424,7 +1727,7 @@ where
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
-                let rows = self.manager.scan(txn, &self.tenant, &self.database, &table, cap)?;
+                let rows = self.scan_rows(txn, &table, &filter, cap)?;
                 let mut rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
@@ -1573,6 +1876,7 @@ where
             Statement::CreateTable { table, columns } => {
                 self.register_table(table.clone(), columns.clone());
             }
+            Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
         }
@@ -1631,6 +1935,10 @@ where
     ) -> Result<QueryResult> {
         match statement {
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
+            Statement::CreateIndex { name, table, field, unique } => {
+                self.create_index(IndexDefinition { name, table, field, unique })?;
+                Ok(QueryResult::Ok)
+            }
             Statement::CopyFrom { table, rows } => {
                 self.reject_if_read_only()?;
                 self.bulk_upsert(table, rows).await?;
@@ -1643,12 +1951,21 @@ where
                 self.reject_if_read_only()?;
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                if self.manager.get(&mut txn, &key)?.is_some() {
+                let before = self.manager.get(&mut txn, &key)?;
+                if before.is_some() {
                     return Err(RymeError::Conflict(String::from("exists")));
                 }
+                self.check_unique(&table, &pk, &value)?;
                 let after = self.realtime.as_ref().map(|_| value.clone());
-                self.manager.put(&mut txn, key, value);
+                self.manager.put(&mut txn, key, value.clone());
                 let commit_ts = self.manager.commit(txn).await?;
+                self.apply_index_change(&TransactionChange {
+                    table: table.clone(),
+                    pk: pk.clone(),
+                    op: Operation::Insert,
+                    before,
+                    after: Some(value.clone()),
+                });
                 if let Some(after) = after {
                     self.emit(&table, pk, Operation::Insert, Some(after), commit_ts)?;
                 }
@@ -1658,10 +1975,19 @@ where
                 self.reject_if_read_only()?;
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let existed = self.manager.get(&mut txn, &key)?.is_some();
+                let before = self.manager.get(&mut txn, &key)?;
+                let existed = before.is_some();
+                self.check_unique(&table, &pk, &value)?;
                 let after = self.realtime.as_ref().map(|_| value.clone());
-                self.manager.put(&mut txn, key, value);
+                self.manager.put(&mut txn, key, value.clone());
                 let commit_ts = self.manager.commit(txn).await?;
+                self.apply_index_change(&TransactionChange {
+                    table: table.clone(),
+                    pk: pk.clone(),
+                    op: if existed { Operation::Update } else { Operation::Insert },
+                    before,
+                    after: Some(value.clone()),
+                });
                 if let Some(after) = after {
                     let op = if existed { Operation::Update } else { Operation::Insert };
                     self.emit(&table, pk, op, Some(after), commit_ts)?;
@@ -1680,8 +2006,7 @@ where
                 let mut txn = self.manager.begin_with(isolation);
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
-                let rows =
-                    self.manager.scan(&mut txn, &self.tenant, &self.database, &table, cap)?;
+                let rows = self.scan_rows(&mut txn, &table, &filter, cap)?;
                 let mut rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
@@ -1839,12 +2164,21 @@ where
                 self.reject_if_read_only()?;
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                if self.manager.get(&mut txn, &key)?.is_none() {
+                let before = self.manager.get(&mut txn, &key)?;
+                if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
+                self.check_unique(&table, &pk, &value)?;
                 let after = self.realtime.as_ref().map(|_| value.clone());
-                self.manager.put(&mut txn, key, value);
+                self.manager.put(&mut txn, key, value.clone());
                 let commit_ts = self.manager.commit(txn).await?;
+                self.apply_index_change(&TransactionChange {
+                    table: table.clone(),
+                    pk: pk.clone(),
+                    op: Operation::Update,
+                    before,
+                    after: Some(value.clone()),
+                });
                 if let Some(after) = after {
                     self.emit(&table, pk, Operation::Update, Some(after), commit_ts)?;
                 }
@@ -1854,11 +2188,19 @@ where
                 self.reject_if_read_only()?;
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                if self.manager.get(&mut txn, &key)?.is_none() {
+                let before = self.manager.get(&mut txn, &key)?;
+                if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.manager.delete(&mut txn, key);
                 let commit_ts = self.manager.commit(txn).await?;
+                self.apply_index_change(&TransactionChange {
+                    table: table.clone(),
+                    pk: pk.clone(),
+                    op: Operation::Delete,
+                    before,
+                    after: None,
+                });
                 if self.realtime.is_some() {
                     self.emit(&table, pk, Operation::Delete, None, commit_ts)?;
                 }
@@ -1877,7 +2219,7 @@ where
         }
         for chunk in rows.chunks(500) {
             let mut txn = self.manager.begin_with(self.isolation);
-            let mut staged: Vec<(Vec<u8>, Operation, Option<Vec<u8>>)> = Vec::new();
+            let mut staged: Vec<TransactionChange> = Vec::new();
             for (pk, value) in chunk {
                 if pk.is_empty() || pk.len() > 1024 {
                     return Err(RymeError::InvalidArgument(String::from("key")));
@@ -1886,16 +2228,24 @@ where
                     return Err(RymeError::Overload(String::from("value")));
                 }
                 let key = RecordKey::new(&self.tenant, &self.database, &table, pk);
-                let existed = self.manager.get(&mut txn, &key)?.is_some();
-                if self.realtime.is_some() {
-                    let op = if existed { Operation::Update } else { Operation::Insert };
-                    staged.push((pk.clone(), op, Some(value.clone())));
-                }
+                let before = self.manager.get(&mut txn, &key)?;
+                self.check_unique(&table, pk, value)?;
                 self.manager.put(&mut txn, key, value.clone());
+                staged.push(TransactionChange {
+                    table: table.clone(),
+                    pk: pk.clone(),
+                    op: if before.is_some() { Operation::Update } else { Operation::Insert },
+                    before,
+                    after: Some(value.clone()),
+                });
             }
+            self.check_transaction_uniqueness(&staged)?;
             let commit_ts = self.manager.commit(txn).await?;
-            for (pk, op, after) in staged {
-                self.emit(&table, pk, op, after, commit_ts)?;
+            for change in staged {
+                self.apply_index_change(&change);
+                if self.realtime.is_some() {
+                    self.emit(&change.table, change.pk, change.op, change.after, commit_ts)?;
+                }
             }
         }
         Ok(rows.len())
@@ -2045,6 +2395,104 @@ mod tests {
         executor.execute(statement).await.unwrap();
         assert_eq!(executor.catalog_tables(), vec![String::from("public.messages")]);
         assert_eq!(executor.catalog_columns("public.messages"), columns);
+    }
+
+    #[test]
+    fn parses_standard_create_index() {
+        assert_eq!(
+            parse("CREATE INDEX messages_value_idx ON messages (value)").unwrap(),
+            Statement::CreateIndex {
+                name: String::from("messages_value_idx"),
+                table: String::from("messages"),
+                field: Field::Value,
+                unique: false,
+            }
+        );
+        assert!(matches!(
+            parse("CREATE UNIQUE INDEX messages_value_unique ON messages (value)").unwrap(),
+            Statement::CreateIndex { unique: true, .. }
+        ));
+        assert!(matches!(
+            parse("CREATE INDEX IF NOT EXISTS messages_value_idx ON messages (value)").unwrap(),
+            Statement::CreateIndex { name, .. } if name == "messages_value_idx"
+        ));
+    }
+
+    #[tokio::test]
+    async fn secondary_index_tracks_mutations_and_transaction_writes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE messages").unwrap()).await.unwrap();
+        executor.execute(parse("INSERT INTO messages KEY '1' VALUE 'one'").unwrap()).await.unwrap();
+        executor.execute(parse("INSERT INTO messages KEY '2' VALUE 'two'").unwrap()).await.unwrap();
+        executor
+            .execute(parse("CREATE INDEX messages_value_idx ON messages (value)").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(executor.catalog_indexes("messages").len(), 1);
+
+        let result = executor
+            .execute(parse("SELECT * FROM messages WHERE value = 'two'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows == vec![(b"2".to_vec(), b"two".to_vec())])
+        );
+
+        executor
+            .execute(parse("UPSERT INTO messages KEY '2' VALUE 'changed'").unwrap())
+            .await
+            .unwrap();
+        let old = executor
+            .execute(parse("SELECT * FROM messages WHERE value = 'two'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(old, QueryResult::Rows { rows } if rows.is_empty()));
+        let new = executor
+            .execute(parse("SELECT * FROM messages WHERE value = 'changed'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(new, QueryResult::Rows { rows } if rows == vec![(b"2".to_vec(), b"changed".to_vec())])
+        );
+
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let (_, changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO messages KEY '3' VALUE 'three'").unwrap(),
+            )
+            .await
+            .unwrap();
+        let in_transaction = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("SELECT * FROM messages WHERE value = 'three'").unwrap(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            matches!(in_transaction, QueryResult::Rows { rows } if rows == vec![(b"3".to_vec(), b"three".to_vec())])
+        );
+        executor.commit_transaction(txn, changes).await.unwrap();
+        let after_commit = executor
+            .execute(parse("SELECT * FROM messages WHERE value = 'three'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(after_commit, QueryResult::Rows { rows } if rows == vec![(b"3".to_vec(), b"three".to_vec())])
+        );
+
+        executor
+            .execute(
+                parse("CREATE UNIQUE INDEX messages_value_unique ON messages (value)").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(executor
+            .execute(parse("INSERT INTO messages KEY '4' VALUE 'three'").unwrap())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
