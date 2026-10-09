@@ -315,6 +315,7 @@ pub enum Cmp {
     NotIn,
     Between,
     NotBetween,
+    AnyOf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +327,8 @@ pub struct Predicate {
     pub operand: Vec<u8>,
     #[serde(default)]
     pub operands: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub alternatives: Vec<Vec<Predicate>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +408,12 @@ impl Default for Order {
 
 impl Predicate {
     pub fn matches(&self, pk: &[u8], value: &[u8]) -> bool {
+        if !self.alternatives.is_empty() {
+            return self
+                .alternatives
+                .iter()
+                .any(|branch| branch.iter().all(|predicate| predicate.matches(pk, value)));
+        }
         if matches!(self.op, Cmp::IsNull | Cmp::IsNotNull) {
             let is_null = if let Some(column) = self.column.as_deref() {
                 let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
@@ -470,6 +479,7 @@ impl Predicate {
                     !is_between
                 }
             }
+            Cmp::AnyOf => false,
         }
     }
 }
@@ -1826,28 +1836,54 @@ fn parse_field(token: &str) -> Option<Field> {
 }
 
 fn parse_filter(clause: &[String]) -> Result<Vec<Predicate>> {
-    let mut out = Vec::new();
+    let mut alternatives = Vec::new();
+    let mut conjunction = Vec::new();
     let mut current: Vec<String> = Vec::new();
+    let mut pending_or = false;
     for token in clause.iter().chain(std::iter::once(&String::from("AND"))) {
-        if token.eq_ignore_ascii_case("AND") {
-            let between_value_separator = (current.len() == 3
-                && current[1].eq_ignore_ascii_case("BETWEEN"))
+        let between_value_separator = token.eq_ignore_ascii_case("AND")
+            && ((current.len() == 3 && current[1].eq_ignore_ascii_case("BETWEEN"))
                 || (current.len() == 4
                     && current[1].eq_ignore_ascii_case("NOT")
-                    && current[2].eq_ignore_ascii_case("BETWEEN"));
-            if between_value_separator {
-                current.push(token.clone());
-                continue;
-            }
+                    && current[2].eq_ignore_ascii_case("BETWEEN")));
+        if between_value_separator {
+            current.push(token.clone());
+            continue;
+        }
+        if token.eq_ignore_ascii_case("AND") || token.eq_ignore_ascii_case("OR") {
             if !current.is_empty() {
-                out.push(parse_predicate(&current)?);
+                conjunction.push(parse_predicate(&current)?);
                 current.clear();
+            }
+            if token.eq_ignore_ascii_case("OR") {
+                if conjunction.is_empty() {
+                    return Err(RymeError::InvalidArgument(String::from("where predicate")));
+                }
+                alternatives.push(std::mem::take(&mut conjunction));
+                pending_or = true;
             }
             continue;
         }
+        pending_or = false;
         current.push(token.clone());
     }
-    Ok(out)
+    if pending_or {
+        return Err(RymeError::InvalidArgument(String::from("where predicate")));
+    }
+    if !conjunction.is_empty() {
+        alternatives.push(conjunction);
+    }
+    if alternatives.len() <= 1 {
+        return Ok(alternatives.pop().unwrap_or_default());
+    }
+    Ok(vec![Predicate {
+        field: Field::Value,
+        column: None,
+        op: Cmp::AnyOf,
+        operand: Vec::new(),
+        operands: Vec::new(),
+        alternatives,
+    }])
 }
 
 fn parse_predicate_field(raw: &str) -> (Field, Option<String>) {
@@ -1865,12 +1901,20 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
             op: Cmp::Eq,
             operand: unquote(&parts[1]).into_bytes(),
             operands: Vec::new(),
+            alternatives: Vec::new(),
         });
     }
     if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("IN") {
         let (field, column) = parse_predicate_field(&parts[0]);
         let operands = parts[2..].iter().map(|part| unquote(part).into_bytes()).collect();
-        return Ok(Predicate { field, column, op: Cmp::In, operand: Vec::new(), operands });
+        return Ok(Predicate {
+            field,
+            column,
+            op: Cmp::In,
+            operand: Vec::new(),
+            operands,
+            alternatives: Vec::new(),
+        });
     }
     if parts.len() == 3 {
         let (field, column) = parse_predicate_field(&parts[0]);
@@ -1880,7 +1924,14 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
             } else {
                 return Err(RymeError::InvalidArgument(String::from("where predicate")));
             };
-            return Ok(Predicate { field, column, op, operand: Vec::new(), operands: Vec::new() });
+            return Ok(Predicate {
+                field,
+                column,
+                op,
+                operand: Vec::new(),
+                operands: Vec::new(),
+                alternatives: Vec::new(),
+            });
         }
         if parts[1] == "=" {
             return Ok(Predicate {
@@ -1889,6 +1940,7 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op: Cmp::Eq,
                 operand: unquote(&parts[2]).into_bytes(),
                 operands: Vec::new(),
+                alternatives: Vec::new(),
             });
         }
         if parts[1] == "!" || parts[1] == "!=" || parts[1] == "<>" {
@@ -1898,6 +1950,7 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op: Cmp::NotEq,
                 operand: unquote(&parts[2]).into_bytes(),
                 operands: Vec::new(),
+                alternatives: Vec::new(),
             });
         }
         let op = match parts[1].as_str() {
@@ -1914,6 +1967,7 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op,
                 operand: unquote(&parts[2]).into_bytes(),
                 operands: Vec::new(),
+                alternatives: Vec::new(),
             });
         }
         if parts[1].eq_ignore_ascii_case("CONTAINS") {
@@ -1923,6 +1977,7 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op: Cmp::Contains,
                 operand: unquote(&parts[2]).into_bytes(),
                 operands: Vec::new(),
+                alternatives: Vec::new(),
             });
         }
         let op = if parts[1].eq_ignore_ascii_case("LIKE") {
@@ -1939,6 +1994,7 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op,
                 operand: unquote(&parts[2]).into_bytes(),
                 operands: Vec::new(),
+                alternatives: Vec::new(),
             });
         }
     }
@@ -1948,7 +2004,14 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
     {
         let (field, column) = parse_predicate_field(&parts[0]);
         let operands = parts[3..].iter().map(|part| unquote(part).into_bytes()).collect();
-        return Ok(Predicate { field, column, op: Cmp::NotIn, operand: Vec::new(), operands });
+        return Ok(Predicate {
+            field,
+            column,
+            op: Cmp::NotIn,
+            operand: Vec::new(),
+            operands,
+            alternatives: Vec::new(),
+        });
     }
     if parts.len() == 5
         && parts[1].eq_ignore_ascii_case("BETWEEN")
@@ -1956,7 +2019,14 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
     {
         let (field, column) = parse_predicate_field(&parts[0]);
         let operands = vec![unquote(&parts[2]).into_bytes(), unquote(&parts[4]).into_bytes()];
-        return Ok(Predicate { field, column, op: Cmp::Between, operand: Vec::new(), operands });
+        return Ok(Predicate {
+            field,
+            column,
+            op: Cmp::Between,
+            operand: Vec::new(),
+            operands,
+            alternatives: Vec::new(),
+        });
     }
     if parts.len() == 6
         && parts[1].eq_ignore_ascii_case("NOT")
@@ -1965,7 +2035,14 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
     {
         let (field, column) = parse_predicate_field(&parts[0]);
         let operands = vec![unquote(&parts[3]).into_bytes(), unquote(&parts[5]).into_bytes()];
-        return Ok(Predicate { field, column, op: Cmp::NotBetween, operand: Vec::new(), operands });
+        return Ok(Predicate {
+            field,
+            column,
+            op: Cmp::NotBetween,
+            operand: Vec::new(),
+            operands,
+            alternatives: Vec::new(),
+        });
     }
     if parts.len() == 4 {
         let (field, column) = parse_predicate_field(&parts[0]);
@@ -1979,6 +2056,7 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op: Cmp::IsNotNull,
                 operand: Vec::new(),
                 operands: Vec::new(),
+                alternatives: Vec::new(),
             });
         }
     }
@@ -6976,6 +7054,44 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn where_or_preserves_and_precedence() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        for (id, room, state) in [
+            ("m1", "lobby", "unread"),
+            ("m2", "game", "unread"),
+            ("m3", "game", "read"),
+            ("m4", "support", "read"),
+        ] {
+            executor
+                .execute(
+                    parse(&format!(
+                        "INSERT INTO messages KEY '{id}' VALUE '{{\"room\":\"{room}\",\"state\":\"{state}\"}}'"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let statement = parse(
+            "SELECT * FROM messages WHERE room = 'lobby' OR room = 'game' AND state = 'unread'",
+        )
+        .unwrap();
+        let Statement::SelectScan { filter, .. } = &statement else {
+            panic!("expected select scan")
+        };
+        assert_eq!(filter.len(), 1);
+        assert_eq!(filter[0].op, Cmp::AnyOf);
+        assert_eq!(filter[0].alternatives.len(), 2);
+        assert_eq!(filter[0].alternatives[1].len(), 2);
+        let result = executor.execute(statement).await.unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"m1".as_slice(), b"m2".as_slice()])
+        );
+        assert!(parse("SELECT * FROM messages WHERE room = 'lobby' OR").is_err());
     }
 
     #[test]

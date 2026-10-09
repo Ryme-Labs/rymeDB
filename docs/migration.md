@@ -114,7 +114,8 @@ named projections such as `SELECT payload, count FROM t WHERE id = '...'`,
 positions; quoted literals are never evaluated.
 Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND key IN ('a', 'b')]
 [AND key NOT IN ('c', 'd')] [AND score BETWEEN 10 AND 20]
-[AND score NOT BETWEEN 30 AND 40] [AND value CONTAINS 'x'
+[AND score NOT BETWEEN 30 AND 40] [AND key = 'a' OR key = 'b']
+[AND value CONTAINS 'x'
 AND value != 'y'] [ORDER BY key|value|column|json_path ASC|DESC] [LIMIT n] [OFFSET n]`.
 Predicates evaluate on stored bytes as text; plain scans stream the ordered
 range while filtered/ordered/paged scans page through storage until the
