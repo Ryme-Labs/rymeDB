@@ -91,6 +91,8 @@ compatibility; index publication remains atomic.
 UPDATE target SET ... FROM source WHERE target.id = source.id supports
 qualified join columns, source predicates, source-backed assignments, and
 RETURNING.
+DELETE FROM target USING source WHERE target.id = source.id supports qualified
+join columns, source predicates, and RETURNING.
 
 `CREATE TABLE` (including `IF NOT EXISTS`, column types, single-column and composite
 `PRIMARY KEY` constraints, single-column and composite `UNIQUE` constraints,

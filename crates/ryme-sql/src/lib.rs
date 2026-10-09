@@ -225,6 +225,15 @@ pub enum Statement {
         table: String,
         filter: Vec<Predicate>,
     },
+    DeleteUsing {
+        table: String,
+        source_table: String,
+        target_column: String,
+        source_column: String,
+        filter: Vec<Predicate>,
+        #[serde(default)]
+        source_filter: Vec<Predicate>,
+    },
     CopyFrom {
         table: String,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
@@ -394,6 +403,7 @@ impl Statement {
                 | Statement::UpdateFrom { .. }
                 | Statement::Delete { .. }
                 | Statement::DeleteWhere { .. }
+                | Statement::DeleteUsing { .. }
                 | Statement::CopyFrom { .. }
                 | Statement::Returning { .. }
         )
@@ -779,6 +789,7 @@ impl Statement {
             | Self::UpdateFrom { table, .. }
             | Self::Delete { table, .. }
             | Self::DeleteWhere { table, .. }
+            | Self::DeleteUsing { table, .. }
             | Self::CopyFrom { table, .. } => table,
             Self::DropIndex { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
@@ -805,7 +816,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         "INSERT" => parse_insert(&tokens, input),
         "SELECT" => parse_select(&tokens, input),
         "UPDATE" => parse_update(&tokens, input),
-        "DELETE" => parse_delete(&tokens),
+        "DELETE" => parse_delete(&tokens, input),
         "COPY" => parse_copy(&tokens),
         "EXPLAIN" => parse_explain(input),
         _ => Err(RymeError::InvalidArgument(String::from("unknown statement"))),
@@ -2260,53 +2271,13 @@ fn parse_update_from(
 
     let where_end = returning_offset.unwrap_or(raw.len());
     let where_tokens = tokenize(&raw[where_offset + "WHERE".len()..where_end]);
-    let mut target_column = None;
-    let mut source_column = None;
-    let mut target_filter_tokens = Vec::new();
-    let mut source_filter_tokens = Vec::new();
-    for condition in split_and_conditions(&where_tokens) {
-        if condition.len() == 2 {
-            if let (Some((left_prefix, left_column)), Some((right_prefix, right_column))) =
-                (qualified_reference(&condition[0]), qualified_reference(&condition[1]))
-            {
-                let left_target = left_prefix.eq_ignore_ascii_case(&target_alias)
-                    || left_prefix.eq_ignore_ascii_case(&table);
-                let right_target = right_prefix.eq_ignore_ascii_case(&target_alias)
-                    || right_prefix.eq_ignore_ascii_case(&table);
-                let left_source = left_prefix.eq_ignore_ascii_case(&source_alias)
-                    || left_prefix.eq_ignore_ascii_case(&source_table);
-                let right_source = right_prefix.eq_ignore_ascii_case(&source_alias)
-                    || right_prefix.eq_ignore_ascii_case(&source_table);
-                if left_target && right_source {
-                    target_column = Some(normalize_column_reference(&left_column));
-                    source_column = Some(normalize_column_reference(&right_column));
-                    continue;
-                }
-                if right_target && left_source {
-                    target_column = Some(normalize_column_reference(&right_column));
-                    source_column = Some(normalize_column_reference(&left_column));
-                    continue;
-                }
-            }
-        }
-        let has_source_prefix = condition.iter().any(|token| {
-            qualified_reference(token).is_some_and(|(prefix, _)| {
-                prefix.eq_ignore_ascii_case(&source_alias)
-                    || prefix.eq_ignore_ascii_case(&source_table)
-            })
-        });
-        if has_source_prefix {
-            append_condition_tokens(&mut source_filter_tokens, condition);
-        } else {
-            append_condition_tokens(&mut target_filter_tokens, condition);
-        }
-    }
-    let target_column =
-        target_column.ok_or_else(|| RymeError::InvalidArgument(String::from("update join")))?;
-    let source_column =
-        source_column.ok_or_else(|| RymeError::InvalidArgument(String::from("update join")))?;
-    let filter = parse_filter(&target_filter_tokens)?;
-    let source_filter = parse_filter(&source_filter_tokens)?;
+    let (target_column, source_column, filter, source_filter) = parse_relation_conditions(
+        &where_tokens,
+        &target_alias,
+        &table,
+        &source_alias,
+        &source_table,
+    )?;
     Ok(Statement::UpdateFrom {
         table,
         assignments,
@@ -2372,8 +2343,117 @@ fn append_condition_tokens(target: &mut Vec<String>, condition: Vec<String>) {
     target.extend(condition);
 }
 
-fn parse_delete(tokens: &[String]) -> Result<Statement> {
+fn parse_relation_conditions(
+    where_tokens: &[String],
+    target_alias: &str,
+    target_table: &str,
+    source_alias: &str,
+    source_table: &str,
+) -> Result<(String, String, Vec<Predicate>, Vec<Predicate>)> {
+    let mut target_column = None;
+    let mut source_column = None;
+    let mut target_filter_tokens = Vec::new();
+    let mut source_filter_tokens = Vec::new();
+    for condition in split_and_conditions(where_tokens) {
+        if condition.len() == 2 {
+            if let (Some((left_prefix, left_column)), Some((right_prefix, right_column))) =
+                (qualified_reference(&condition[0]), qualified_reference(&condition[1]))
+            {
+                let left_target = left_prefix.eq_ignore_ascii_case(target_alias)
+                    || left_prefix.eq_ignore_ascii_case(target_table);
+                let right_target = right_prefix.eq_ignore_ascii_case(target_alias)
+                    || right_prefix.eq_ignore_ascii_case(target_table);
+                let left_source = left_prefix.eq_ignore_ascii_case(source_alias)
+                    || left_prefix.eq_ignore_ascii_case(source_table);
+                let right_source = right_prefix.eq_ignore_ascii_case(source_alias)
+                    || right_prefix.eq_ignore_ascii_case(source_table);
+                if left_target && right_source {
+                    target_column = Some(normalize_column_reference(&left_column));
+                    source_column = Some(normalize_column_reference(&right_column));
+                    continue;
+                }
+                if right_target && left_source {
+                    target_column = Some(normalize_column_reference(&right_column));
+                    source_column = Some(normalize_column_reference(&left_column));
+                    continue;
+                }
+            }
+        }
+        let has_source_prefix = condition.iter().any(|token| {
+            qualified_reference(token).is_some_and(|(prefix, _)| {
+                prefix.eq_ignore_ascii_case(source_alias)
+                    || prefix.eq_ignore_ascii_case(source_table)
+            })
+        });
+        if has_source_prefix {
+            append_condition_tokens(&mut source_filter_tokens, condition);
+        } else {
+            append_condition_tokens(&mut target_filter_tokens, condition);
+        }
+    }
+    let target_column =
+        target_column.ok_or_else(|| RymeError::InvalidArgument(String::from("update join")))?;
+    let source_column =
+        source_column.ok_or_else(|| RymeError::InvalidArgument(String::from("update join")))?;
+    let filter = parse_filter(&target_filter_tokens)?;
+    let source_filter = parse_filter(&source_filter_tokens)?;
+    Ok((target_column, source_column, filter, source_filter))
+}
+
+fn parse_delete(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "FROM")?;
+    if let Some(from_pos) = tokens.iter().position(|token| token.eq_ignore_ascii_case("FROM")) {
+        if let Some(using_pos) =
+            tokens.iter().enumerate().skip(from_pos + 1).find_map(|(position, token)| {
+                token.eq_ignore_ascii_case("USING").then_some(position)
+            })
+        {
+            let _where_pos = tokens
+                .iter()
+                .enumerate()
+                .skip(using_pos + 1)
+                .find_map(|(position, token)| {
+                    token.eq_ignore_ascii_case("WHERE").then_some(position)
+                })
+                .ok_or_else(|| {
+                    RymeError::InvalidArgument(String::from("delete using predicate"))
+                })?;
+            let using_offset = find_sql_keyword(raw, "USING", 0)
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("delete using source")))?;
+            let where_offset = find_sql_keyword(raw, "WHERE", using_offset + "USING".len())
+                .ok_or_else(|| {
+                    RymeError::InvalidArgument(String::from("delete using predicate"))
+                })?;
+            let returning_offset = find_sql_keyword(raw, "RETURNING", where_offset + "WHERE".len());
+            let source_spec = raw[using_offset + "USING".len()..where_offset].trim();
+            let source_tokens = tokenize(source_spec);
+            let source_table = source_tokens
+                .first()
+                .map(|token| unquote(token))
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("delete using source")))?;
+            let source_alias = relation_alias(&source_tokens, &source_table);
+            let target_alias =
+                relation_alias(&tokens.get(from_pos + 1..using_pos).unwrap_or_default(), &table);
+            let where_end = returning_offset.unwrap_or(raw.len());
+            let where_tokens = tokenize(&raw[where_offset + "WHERE".len()..where_end]);
+            let (target_column, source_column, filter, source_filter) = parse_relation_conditions(
+                &where_tokens,
+                &target_alias,
+                &table,
+                &source_alias,
+                &source_table,
+            )
+            .map_err(|_| RymeError::InvalidArgument(String::from("delete using join")))?;
+            return Ok(Statement::DeleteUsing {
+                table,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            });
+        }
+    }
     if tokens.iter().any(|token| token.eq_ignore_ascii_case("WHERE")) {
         let filter = parse_where_filter(tokens)?;
         if filter.is_empty() {
@@ -3825,6 +3905,13 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::Delete { table, .. } => format!("write delete({table}) point"),
         Statement::DeleteWhere { table, filter } => {
             format!("write delete({table}) filters {}", filter.len())
+        }
+        Statement::DeleteUsing { table, source_table, filter, source_filter, .. } => {
+            format!(
+                "write delete({table}) using {source_table} filters {}+{}",
+                filter.len(),
+                source_filter.len()
+            )
         }
         Statement::CopyFrom { table, .. } => format!("bulk ingest({table}) batched put"),
         Statement::Returning { statement, fields } => {
@@ -5374,6 +5461,56 @@ where
                 op: Operation::Update,
                 before: Some(before),
                 after: Some(after),
+            });
+        }
+        Ok(changes)
+    }
+
+    async fn execute_delete_using_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        table: String,
+        source_table: String,
+        target_column: String,
+        source_column: String,
+        filter: Vec<Predicate>,
+        source_filter: Vec<Predicate>,
+    ) -> Result<Vec<TransactionChange>> {
+        self.reject_if_read_only()?;
+        let targets = self.scan_rows(txn, &table, &filter, usize::MAX)?;
+        let sources = self.scan_rows(txn, &source_table, &source_filter, usize::MAX)?;
+        let mut changes = Vec::new();
+        for (pk, value) in targets {
+            self.enforce_rls(&table, &value)?;
+            let matched = sources.iter().any(|(source_pk, source_value)| {
+                self.row_column_value(&table, &pk, &value, &target_column)
+                    .zip(self.row_column_value(
+                        &source_table,
+                        source_pk,
+                        source_value,
+                        &source_column,
+                    ))
+                    .is_some_and(|(target, source)| target == source)
+            });
+            if !matched {
+                continue;
+            }
+            self.delete_row_with_references(
+                txn,
+                &table,
+                &pk,
+                &value,
+                &mut changes,
+                &mut BTreeSet::new(),
+            )?;
+            self.manager.delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
+            changes.push(TransactionChange {
+                table: table.clone(),
+                pk,
+                previous_pk: None,
+                op: Operation::Delete,
+                before: Some(value),
+                after: None,
             });
         }
         Ok(changes)
@@ -7606,6 +7743,27 @@ where
                 }
                 Ok((QueryResult::Ok, changes))
             }
+            Statement::DeleteUsing {
+                table,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                let changes = self
+                    .execute_delete_using_in_transaction(
+                        txn,
+                        table,
+                        source_table,
+                        target_column,
+                        source_column,
+                        filter,
+                        source_filter,
+                    )
+                    .await?;
+                Ok((QueryResult::Ok, changes))
+            }
             statement => Ok((self.execute_read_in_transaction(txn, statement)?, Vec::new())),
         }
     }
@@ -8268,6 +8426,25 @@ where
                 let (_, changes) = self.execute_in_transaction_base(txn, statement).await?;
                 Ok((returning_changes(&fields, &changes), changes))
             }
+            Statement::DeleteUsing {
+                table,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                let statement = Statement::DeleteUsing {
+                    table,
+                    source_table,
+                    target_column,
+                    source_column,
+                    filter,
+                    source_filter,
+                };
+                let (_, changes) = self.execute_in_transaction_base(txn, statement).await?;
+                Ok((returning_changes(&fields, &changes), changes))
+            }
             _ => Err(RymeError::InvalidArgument(String::from("RETURNING requires a row mutation"))),
         }
     }
@@ -8799,6 +8976,28 @@ where
                 self.commit_transaction(txn, changes).await?;
                 Ok(result)
             }
+            Statement::DeleteUsing {
+                table,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                let mut txn = self.begin_with(isolation);
+                let statement = Statement::DeleteUsing {
+                    table,
+                    source_table,
+                    target_column,
+                    source_column,
+                    filter,
+                    source_filter,
+                };
+                let (_, changes) = self.execute_in_transaction_base(&mut txn, statement).await?;
+                let result = returning_changes(&fields, &changes);
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
+            }
             _ => Err(RymeError::InvalidArgument(String::from("RETURNING requires a row mutation"))),
         }
     }
@@ -9286,6 +9485,28 @@ where
                 let (_, changes) = self
                     .execute_in_transaction_base(&mut txn, Statement::DeleteWhere { table, filter })
                     .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::DeleteUsing {
+                table,
+                source_table,
+                target_column,
+                source_column,
+                filter,
+                source_filter,
+            } => {
+                self.reject_if_read_only()?;
+                let mut txn = self.begin_with(isolation);
+                let statement = Statement::DeleteUsing {
+                    table,
+                    source_table,
+                    target_column,
+                    source_column,
+                    filter,
+                    source_filter,
+                };
+                let (_, changes) = self.execute_in_transaction_base(&mut txn, statement).await?;
                 self.commit_transaction(txn, changes).await?;
                 Ok(QueryResult::Ok)
             }
@@ -10053,6 +10274,59 @@ mod tests {
                 if rows == vec![
                     vec![b"1".to_vec(), b"ready".to_vec(), b"13".to_vec()],
                     vec![b"2".to_vec(), b"old".to_vec(), b"20".to_vec()],
+                ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_using_applies_source_values_and_filters_atomically() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE accounts (id TEXT PRIMARY KEY, status TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("CREATE TABLE tombstones (id TEXT PRIMARY KEY, active BOOLEAN)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO accounts (id, status) VALUES ('1', 'expired'), ('2', 'open'), ('3', 'open')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO tombstones (id, active) VALUES ('1', true), ('2', false)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(
+                parse("DELETE FROM accounts AS a USING tombstones AS t WHERE a.id = t.id AND t.active = true RETURNING a.id, a.status")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Returning { ref rows, .. }
+                if rows == &vec![vec![b"1".to_vec(), b"expired".to_vec()]]
+        ));
+        assert!(matches!(
+            executor
+                .execute(parse("SELECT id, status FROM accounts ORDER BY id").unwrap())
+                .await
+                .unwrap(),
+            QueryResult::Table { rows, .. }
+                if rows == vec![
+                    vec![b"2".to_vec(), b"open".to_vec()],
+                    vec![b"3".to_vec(), b"open".to_vec()],
                 ]
         ));
     }

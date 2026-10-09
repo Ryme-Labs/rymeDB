@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL DELETE ... USING now joins target and source rows by qualified
+  columns, supports source-filtered deletes and RETURNING, and preserves
+  transaction, foreign-key, RLS, and CDC handling.
 - PostgreSQL UPDATE ... FROM now joins source rows by qualified columns,
   supports source-filtered updates and source-backed assignments, preserves
   transaction/constraint/RLS checks, and returns affected rows.
