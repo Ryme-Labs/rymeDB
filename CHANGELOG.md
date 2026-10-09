@@ -125,6 +125,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - PostgreSQL `INSERT INTO table DEFAULT VALUES` now materializes identity and
   column defaults through the normal constraint, transaction, and `RETURNING`
   paths.
+- PostgreSQL `INSERT INTO target (...) SELECT ... FROM source` now copies
+  projected, filtered rows atomically and supports `RETURNING` and the existing
+  conflict-handling paths.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

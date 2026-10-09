@@ -105,6 +105,8 @@ such as `count = count + 1`, `count + EXCLUDED.count`, concatenation,
 `COALESCE`, `GREATEST`, and `LEAST`,
 and `INSERT INTO table DEFAULT VALUES` materializes identity/serial and column
 defaults with normal constraints and `RETURNING`,
+`INSERT INTO target (...) SELECT ... FROM source [WHERE ...]` copies projected
+and filtered rows atomically,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
 `ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
 JSONB projections support PostgreSQL `->` and `->>` operators, including

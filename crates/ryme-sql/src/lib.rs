@@ -106,6 +106,23 @@ pub enum Statement {
         #[serde(default)]
         conflict_filter: Vec<Predicate>,
     },
+    InsertSelect {
+        table: String,
+        columns: Vec<String>,
+        source_table: String,
+        source_columns: Vec<String>,
+        filter: Vec<Predicate>,
+        #[serde(default)]
+        upsert: bool,
+        #[serde(default)]
+        on_conflict_do_nothing: bool,
+        #[serde(default)]
+        conflict_target: Vec<String>,
+        #[serde(default)]
+        conflict_update: Vec<(String, InsertValue)>,
+        #[serde(default)]
+        conflict_filter: Vec<Predicate>,
+    },
     Upsert {
         table: String,
         pk: Vec<u8>,
@@ -357,6 +374,7 @@ impl Statement {
             Statement::Insert { .. }
                 | Statement::InsertRow { .. }
                 | Statement::InsertRows { .. }
+                | Statement::InsertSelect { .. }
                 | Statement::Upsert { .. }
                 | Statement::InsertIgnore { .. }
                 | Statement::InsertConflict { .. }
@@ -734,6 +752,7 @@ impl Statement {
             | Self::Insert { table, .. }
             | Self::InsertRow { table, .. }
             | Self::InsertRows { table, .. }
+            | Self::InsertSelect { table, .. }
             | Self::Upsert { table, .. }
             | Self::InsertIgnore { table, .. }
             | Self::InsertConflict { table, .. }
@@ -1729,6 +1748,9 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
             conflict_filter: Vec::new(),
         });
     }
+    if let Some(statement) = parse_insert_select(tokens, raw, table.clone())? {
+        return Ok(statement);
+    }
     if let Some((columns, rows)) = parse_standard_insert_rows(raw)? {
         let conflict = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
         let (conflict_target, conflict_update, on_conflict_do_nothing, conflict_filter) =
@@ -1785,6 +1807,74 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
         return Ok(Statement::Upsert { table, pk, value });
     }
     Ok(Statement::Insert { table, pk, value })
+}
+
+fn parse_insert_select(tokens: &[String], raw: &str, table: String) -> Result<Option<Statement>> {
+    let Some(select_start) = find_sql_keyword(raw, "SELECT", 6) else {
+        return Ok(None);
+    };
+    let before_select = &raw[..select_start];
+    let columns = if let Some(open) = before_select.find('(') {
+        let close = matching_paren(before_select, open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("insert columns")))?;
+        if !before_select[close + 1..].trim().is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("insert columns")));
+        }
+        split_sql_items(&before_select[open + 1..close])
+            .into_iter()
+            .map(|column| unquote(column.trim()))
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let select_end = [
+        find_sql_keyword(raw, "ON CONFLICT", select_start + "SELECT".len()),
+        find_sql_keyword(raw, "RETURNING", select_start + "SELECT".len()),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(raw.len());
+    let select_sql = raw[select_start..select_end].trim();
+    let select_tokens = tokenize(select_sql);
+    if select_tokens.iter().any(|token| {
+        token.eq_ignore_ascii_case("LIMIT")
+            || token.eq_ignore_ascii_case("OFFSET")
+            || token.eq_ignore_ascii_case("ORDER")
+    }) {
+        return Err(RymeError::InvalidArgument(String::from(
+            "INSERT SELECT does not support source windows",
+        )));
+    }
+    let select = parse_select(&select_tokens, select_sql)?;
+    let (source_table, source_columns, filter) = match select {
+        Statement::SelectColumns { table, columns, filter, .. } => (table, columns, filter),
+        Statement::SelectScan { table, filter, .. } => (table, Vec::new(), filter),
+        _ => {
+            return Err(RymeError::InvalidArgument(String::from(
+                "INSERT SELECT requires a plain source SELECT",
+            )))
+        }
+    };
+    let conflict = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
+    let (conflict_target, conflict_update, on_conflict_do_nothing, conflict_filter) = if conflict {
+        parse_conflict_clause(raw)?
+    } else {
+        (Vec::new(), Vec::new(), false, Vec::new())
+    };
+    Ok(Some(Statement::InsertSelect {
+        table,
+        columns,
+        source_table,
+        source_columns,
+        filter,
+        upsert: conflict && !on_conflict_do_nothing,
+        on_conflict_do_nothing,
+        conflict_target,
+        conflict_update,
+        conflict_filter,
+    }))
 }
 
 fn parse_conflict_clause(
@@ -3466,6 +3556,10 @@ pub fn describe_plan(statement: &Statement) -> String {
                 rows.len()
             )
         }
+        Statement::InsertSelect { table, source_table, upsert, .. } => format!(
+            "write {}({table}) from select({source_table})",
+            if *upsert { "upsert" } else { "insert" }
+        ),
         Statement::Upsert { table, .. } => format!("write upsert({table}) point"),
         Statement::InsertIgnore { table, .. } => format!("write insert({table}) ignore conflicts"),
         Statement::InsertConflict { table, do_nothing, .. } => format!(
@@ -6788,6 +6882,43 @@ where
                 };
                 Box::pin(self.execute_in_transaction_base(txn, statement)).await
             }
+            Statement::InsertSelect {
+                table,
+                columns,
+                source_table,
+                source_columns,
+                filter,
+                upsert,
+                on_conflict_do_nothing,
+                conflict_target,
+                conflict_update,
+                conflict_filter,
+            } => {
+                let (columns, rows) = self
+                    .materialize_insert_select_rows(
+                        txn,
+                        table.clone(),
+                        columns,
+                        source_table,
+                        source_columns,
+                        filter,
+                    )
+                    .await?;
+                let changes = self
+                    .execute_insert_rows_in_transaction(
+                        txn,
+                        table,
+                        columns,
+                        rows,
+                        upsert,
+                        on_conflict_do_nothing,
+                        conflict_target,
+                        conflict_update,
+                        conflict_filter,
+                    )
+                    .await?;
+                Ok((QueryResult::Ok, changes))
+            }
             Statement::InsertRows {
                 table,
                 columns,
@@ -7328,6 +7459,109 @@ where
         Box::pin(self.execute_in_transaction_base(txn, statement)).await
     }
 
+    fn insert_select_value(
+        &self,
+        source_table: &str,
+        column: &str,
+        pk: &[u8],
+        value: &[u8],
+    ) -> InsertValue {
+        let definitions = self.catalog_columns(source_table);
+        let primary_keys =
+            definitions.iter().filter(|definition| definition.primary_key).collect::<Vec<_>>();
+        if let Some(index) =
+            primary_keys.iter().position(|definition| definition.name.eq_ignore_ascii_case(column))
+        {
+            if primary_keys.len() == 1 {
+                return InsertValue::Value(pk.to_vec());
+            }
+            if let Some(parts) = decode_key_parts(pk) {
+                return parts
+                    .get(index)
+                    .cloned()
+                    .map(InsertValue::Value)
+                    .unwrap_or(InsertValue::Null);
+            }
+        }
+        let schema_column =
+            definitions.iter().any(|definition| definition.name.eq_ignore_ascii_case(column));
+        if !schema_column
+            && (column.eq_ignore_ascii_case("id")
+                || column.eq_ignore_ascii_case("pk")
+                || column.eq_ignore_ascii_case("key"))
+        {
+            return InsertValue::Value(pk.to_vec());
+        }
+        if !schema_column
+            && (column.eq_ignore_ascii_case("value")
+                || column.eq_ignore_ascii_case("val")
+                || column.eq_ignore_ascii_case("data"))
+        {
+            return InsertValue::Value(value.to_vec());
+        }
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
+            return InsertValue::Value(value.to_vec());
+        };
+        json_column_value(column, &object)
+            .map(|selected| {
+                if selected.is_null() {
+                    InsertValue::Null
+                } else {
+                    InsertValue::Value(json_result_bytes(selected))
+                }
+            })
+            .unwrap_or(InsertValue::Null)
+    }
+
+    async fn materialize_insert_select_rows(
+        &self,
+        txn: &mut Transaction,
+        table: String,
+        columns: Vec<String>,
+        source_table: String,
+        source_columns: Vec<String>,
+        filter: Vec<Predicate>,
+    ) -> Result<(Vec<String>, Vec<Vec<InsertValue>>)> {
+        let target_columns = if columns.is_empty() {
+            self.catalog_columns(&table)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>()
+        } else {
+            columns
+        };
+        if target_columns.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from(
+                "INSERT SELECT requires target columns",
+            )));
+        }
+        let source_columns = if source_columns.is_empty() {
+            let definitions = self.catalog_columns(&source_table);
+            if definitions.is_empty() {
+                vec![String::from("id"), String::from("value")]
+            } else {
+                definitions.into_iter().map(|definition| definition.name).collect()
+            }
+        } else {
+            source_columns
+        };
+        if source_columns.len() != target_columns.len() {
+            return Err(RymeError::InvalidArgument(String::from("INSERT SELECT column count")));
+        }
+        let rows = self.scan_rows(txn, &source_table, &filter, usize::MAX)?;
+        let values = rows
+            .into_iter()
+            .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
+            .map(|(pk, value)| {
+                source_columns
+                    .iter()
+                    .map(|column| self.insert_select_value(&source_table, column, &pk, &value))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Ok((target_columns, values))
+    }
+
     async fn execute_insert_rows_in_transaction(
         &self,
         txn: &mut Transaction,
@@ -7461,6 +7695,42 @@ where
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_returning_in_transaction(txn, statement, fields)).await
+            }
+            Statement::InsertSelect {
+                table,
+                columns,
+                source_table,
+                source_columns,
+                filter,
+                upsert,
+                on_conflict_do_nothing,
+                conflict_target,
+                conflict_update,
+                conflict_filter,
+            } => {
+                let (columns, rows) = self
+                    .materialize_insert_select_rows(
+                        txn,
+                        table.clone(),
+                        columns,
+                        source_table,
+                        source_columns,
+                        filter,
+                    )
+                    .await?;
+                self.execute_returning_rows_in_transaction(
+                    txn,
+                    table,
+                    columns,
+                    rows,
+                    upsert,
+                    on_conflict_do_nothing,
+                    conflict_target,
+                    conflict_update,
+                    conflict_filter,
+                    &fields,
+                )
+                .await
             }
             Statement::InsertRows {
                 table,
@@ -7910,6 +8180,46 @@ where
                 };
                 Box::pin(self.execute_returning(statement, fields, isolation)).await
             }
+            Statement::InsertSelect {
+                table,
+                columns,
+                source_table,
+                source_columns,
+                filter,
+                upsert,
+                on_conflict_do_nothing,
+                conflict_target,
+                conflict_update,
+                conflict_filter,
+            } => {
+                let mut txn = self.begin_with(isolation);
+                let (columns, rows) = self
+                    .materialize_insert_select_rows(
+                        &mut txn,
+                        table.clone(),
+                        columns,
+                        source_table,
+                        source_columns,
+                        filter,
+                    )
+                    .await?;
+                let (result, changes) = self
+                    .execute_returning_rows_in_transaction(
+                        &mut txn,
+                        table,
+                        columns,
+                        rows,
+                        upsert,
+                        on_conflict_do_nothing,
+                        conflict_target,
+                        conflict_update,
+                        conflict_filter,
+                        &fields,
+                    )
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
+            }
             Statement::InsertRows {
                 table,
                 columns,
@@ -8160,6 +8470,46 @@ where
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_with_base(statement, isolation)).await
+            }
+            Statement::InsertSelect {
+                table,
+                columns,
+                source_table,
+                source_columns,
+                filter,
+                upsert,
+                on_conflict_do_nothing,
+                conflict_target,
+                conflict_update,
+                conflict_filter,
+            } => {
+                self.reject_if_read_only()?;
+                let mut txn = self.begin_with(isolation);
+                let (columns, rows) = self
+                    .materialize_insert_select_rows(
+                        &mut txn,
+                        table.clone(),
+                        columns,
+                        source_table,
+                        source_columns,
+                        filter,
+                    )
+                    .await?;
+                let changes = self
+                    .execute_insert_rows_in_transaction(
+                        &mut txn,
+                        table,
+                        columns,
+                        rows,
+                        upsert,
+                        on_conflict_do_nothing,
+                        conflict_target,
+                        conflict_update,
+                        conflict_filter,
+                    )
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(QueryResult::Ok)
             }
             Statement::InsertRows {
                 table,
@@ -8827,6 +9177,46 @@ mod tests {
         assert!(matches!(
             executor.execute(parse("SELECT * FROM events KEY '2'").unwrap()).await.unwrap(),
             QueryResult::Row { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn insert_select_copies_projected_rows_transactionally() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE source (id TEXT PRIMARY KEY, payload TEXT, active BOOLEAN)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE TABLE archive (id TEXT PRIMARY KEY, payload TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO source (id, payload, active) VALUES ('1', 'keep', true), ('2', 'skip', false)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(
+                parse("INSERT INTO archive (id, payload) SELECT id, payload FROM source WHERE active = true RETURNING id, payload")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Returning { ref rows, .. }
+                if rows == &vec![vec![b"1".to_vec(), b"keep".to_vec()]]
+        ));
+        assert!(matches!(
+            executor.execute(parse("SELECT * FROM archive KEY '2'").unwrap()).await.unwrap(),
+            QueryResult::Rows { rows } if rows.is_empty()
         ));
     }
 
