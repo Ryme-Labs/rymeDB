@@ -514,6 +514,18 @@ where
                     .map(|(pk, value)| masked_row(&self.gateway, &table, pk, value))
                     .collect(),
             },
+            Ok(ryme_sql::QueryResult::Returning { rows, .. }) => proto::SqlReply {
+                ok: true,
+                error: String::new(),
+                rows: rows
+                    .into_iter()
+                    .map(|row| {
+                        let pk = row.first().cloned().unwrap_or_default();
+                        let value = row.get(1).cloned().unwrap_or_else(|| pk.clone());
+                        masked_row(&self.gateway, &table, pk, value)
+                    })
+                    .collect(),
+            },
             Err(e) => proto::SqlReply { ok: false, error: e.to_string(), rows: Vec::new() },
         };
         self.observe(&principal, write);

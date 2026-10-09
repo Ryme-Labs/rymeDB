@@ -4121,15 +4121,7 @@ async fn sql_exec(
         Ok(statement) => statement,
         Err(e) => return error_response(e),
     };
-    if matches!(
-        statement,
-        ryme_sql::Statement::Insert { .. }
-            | ryme_sql::Statement::Upsert { .. }
-            | ryme_sql::Statement::Update { .. }
-            | ryme_sql::Statement::Delete { .. }
-            | ryme_sql::Statement::CopyFrom { .. }
-    ) && !principal.can_write()
-    {
+    if statement.is_write() && !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if statement.is_write() {
@@ -4189,6 +4181,28 @@ async fn sql_exec(
                 })
                 .collect();
             (StatusCode::OK, Json(serde_json::json!({ "rows": items }))).into_response()
+        }
+        Ok(QueryResult::Returning { columns, rows }) => {
+            let egress: u64 = columns.iter().map(String::len).sum::<usize>() as u64
+                + rows.iter().flatten().map(Vec::len).sum::<usize>() as u64;
+            if let Err(e) = admit_egress(&state, &principal.tenant, egress) {
+                return error_response(e);
+            }
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|row| {
+                    let values: Vec<String> = row
+                        .into_iter()
+                        .map(|value| {
+                            String::from_utf8_lossy(&state.gateway.masked(&table_name, value))
+                                .to_string()
+                        })
+                        .collect();
+                    serde_json::json!(values)
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({ "columns": columns, "rows": items })))
+                .into_response()
         }
         Err(e) => error_response(e),
     };

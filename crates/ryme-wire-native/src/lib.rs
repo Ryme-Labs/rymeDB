@@ -607,6 +607,23 @@ where
                 );
                 response
             }
+            Ok(ryme_sql::QueryResult::Returning { rows, .. }) => {
+                let mut response = Response::ok();
+                response.rows = Some(
+                    rows.into_iter()
+                        .map(|row| {
+                            let pk = row.first().cloned().unwrap_or_default();
+                            let value = row.get(1).cloned().unwrap_or_else(|| pk.clone());
+                            let masked = self.gateway.masked(&table, value);
+                            Row {
+                                pk: String::from_utf8_lossy(&pk).to_string(),
+                                value: String::from_utf8_lossy(&masked).to_string(),
+                            }
+                        })
+                        .collect(),
+                );
+                response
+            }
             Err(e) => Response::err(e.to_string()),
         };
         self.observe(principal, write);

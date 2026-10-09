@@ -67,6 +67,10 @@ pub enum Statement {
         table: String,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    Returning {
+        statement: Box<Statement>,
+        fields: Vec<Field>,
+    },
     Explain {
         plan: String,
         inner: Box<Statement>,
@@ -82,6 +86,7 @@ impl Statement {
                 | Statement::Update { .. }
                 | Statement::Delete { .. }
                 | Statement::CopyFrom { .. }
+                | Statement::Returning { .. }
         )
     }
 }
@@ -92,6 +97,7 @@ pub enum QueryResult {
     Row { pk: Vec<u8>, value: Vec<u8> },
     Rows { rows: Vec<(Vec<u8>, Vec<u8>)> },
     Scalar { label: String, value: Vec<u8> },
+    Returning { columns: Vec<String>, rows: Vec<Vec<Vec<u8>>> },
 }
 
 pub type Row = (Vec<u8>, Vec<u8>);
@@ -227,6 +233,7 @@ impl Statement {
             | Self::Update { table, .. }
             | Self::Delete { table, .. }
             | Self::CopyFrom { table, .. } => table,
+            Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
         }
     }
@@ -238,7 +245,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         return Err(RymeError::InvalidArgument(String::from("empty statement")));
     }
     let head = tokens[0].to_ascii_uppercase();
-    match head.as_str() {
+    let statement = match head.as_str() {
         "CREATE" => parse_create(&tokens),
         "UPSERT" => parse_upsert(&tokens),
         "INSERT" => parse_insert(&tokens, input),
@@ -248,7 +255,36 @@ pub fn parse(input: &str) -> Result<Statement> {
         "COPY" => parse_copy(&tokens),
         "EXPLAIN" => parse_explain(input),
         _ => Err(RymeError::InvalidArgument(String::from("unknown statement"))),
+    }?;
+    if tokens.iter().any(|token| token.eq_ignore_ascii_case("RETURNING")) {
+        let fields = parse_returning_fields(&tokens)?;
+        if statement.is_write() && !matches!(statement, Statement::CopyFrom { .. }) {
+            return Ok(Statement::Returning { statement: Box::new(statement), fields });
+        }
+        return Err(RymeError::InvalidArgument(String::from("returning statement")));
     }
+    Ok(statement)
+}
+
+fn parse_returning_fields(tokens: &[String]) -> Result<Vec<Field>> {
+    let start = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("RETURNING"))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("returning fields")))?;
+    let mut fields = Vec::new();
+    for token in &tokens[start + 1..] {
+        if token == "*" {
+            fields.extend([Field::Key, Field::Value]);
+        } else if let Some(field) = parse_field(token) {
+            fields.push(field);
+        } else {
+            return Err(RymeError::InvalidArgument(String::from("returning field")));
+        }
+    }
+    if fields.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("returning fields")));
+    }
+    Ok(fields)
 }
 
 pub fn bind(sql: &str, params: &[String]) -> String {
@@ -814,6 +850,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::Update { table, .. } => format!("write update({table}) point"),
         Statement::Delete { table, .. } => format!("write delete({table}) point"),
         Statement::CopyFrom { table, .. } => format!("bulk ingest({table}) batched put"),
+        Statement::Returning { statement, fields } => {
+            format!("{} returning {} fields", describe_plan(statement), fields.len())
+        }
         Statement::Aggregate { table, func, filter, .. } => {
             format!("aggregate({table}) {} filters {}", func.label(), filter.len())
         }
@@ -920,6 +959,24 @@ fn format_number(value: f64) -> String {
         }
         text
     }
+}
+
+fn returning_result(fields: &[Field], pk: Vec<u8>, value: Vec<u8>) -> QueryResult {
+    let columns = fields
+        .iter()
+        .map(|field| match field {
+            Field::Key => String::from("id"),
+            Field::Value => String::from("value"),
+        })
+        .collect();
+    let row = fields
+        .iter()
+        .map(|field| match field {
+            Field::Key => pk.clone(),
+            Field::Value => value.clone(),
+        })
+        .collect();
+    QueryResult::Returning { columns, rows: vec![row] }
 }
 
 #[derive(Debug, Clone)]
@@ -1062,6 +1119,19 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
+            Statement::Returning { statement, fields } => {
+                self.execute_returning_in_transaction(txn, *statement, fields).await
+            }
+            statement => self.execute_in_transaction_base(txn, statement).await,
+        }
+    }
+
+    async fn execute_in_transaction_base(
+        &self,
+        txn: &mut Transaction,
+        statement: Statement,
+    ) -> Result<(QueryResult, Vec<TransactionChange>)> {
+        match statement {
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
             Statement::Explain { plan, .. } => Ok((
                 QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() },
@@ -1154,6 +1224,52 @@ where
                 ))
             }
             statement => Ok((self.execute_read_in_transaction(txn, statement)?, Vec::new())),
+        }
+    }
+
+    async fn execute_returning_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        statement: Statement,
+        fields: Vec<Field>,
+    ) -> Result<(QueryResult, Vec<TransactionChange>)> {
+        match statement {
+            Statement::Insert { table, pk, value } => {
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                let (_, changes) = self
+                    .execute_in_transaction_base(txn, Statement::Insert { table, pk, value })
+                    .await?;
+                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+            }
+            Statement::Upsert { table, pk, value } => {
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                let (_, changes) = self
+                    .execute_in_transaction_base(txn, Statement::Upsert { table, pk, value })
+                    .await?;
+                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+            }
+            Statement::Update { table, pk, value } => {
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                let (_, changes) = self
+                    .execute_in_transaction_base(txn, Statement::Update { table, pk, value })
+                    .await?;
+                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+            }
+            Statement::Delete { table, pk } => {
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let value = self
+                    .manager
+                    .get(txn, &key)?
+                    .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
+                let (_, changes) = self
+                    .execute_in_transaction_base(txn, Statement::Delete { table, pk: pk.clone() })
+                    .await?;
+                Ok((returning_result(&fields, pk, value), changes))
+            }
+            _ => Err(RymeError::InvalidArgument(String::from("RETURNING requires a row mutation"))),
         }
     }
 
@@ -1326,6 +1442,59 @@ where
     }
 
     pub async fn execute_with(
+        &self,
+        statement: Statement,
+        isolation: Isolation,
+    ) -> Result<QueryResult> {
+        match statement {
+            Statement::Returning { statement, fields } => {
+                self.execute_returning(*statement, fields, isolation).await
+            }
+            statement => self.execute_with_base(statement, isolation).await,
+        }
+    }
+
+    async fn execute_returning(
+        &self,
+        statement: Statement,
+        fields: Vec<Field>,
+        isolation: Isolation,
+    ) -> Result<QueryResult> {
+        match statement {
+            Statement::Insert { table, pk, value } => {
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                self.execute_with_base(Statement::Insert { table, pk, value }, isolation).await?;
+                Ok(returning_result(&fields, pk_for_result, value_for_result))
+            }
+            Statement::Upsert { table, pk, value } => {
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                self.execute_with_base(Statement::Upsert { table, pk, value }, isolation).await?;
+                Ok(returning_result(&fields, pk_for_result, value_for_result))
+            }
+            Statement::Update { table, pk, value } => {
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                self.execute_with_base(Statement::Update { table, pk, value }, isolation).await?;
+                Ok(returning_result(&fields, pk_for_result, value_for_result))
+            }
+            Statement::Delete { table, pk } => {
+                let mut txn = self.manager.begin_with(isolation);
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let value = self
+                    .manager
+                    .get(&mut txn, &key)?
+                    .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
+                self.execute_with_base(Statement::Delete { table, pk: pk.clone() }, isolation)
+                    .await?;
+                Ok(returning_result(&fields, pk, value))
+            }
+            _ => Err(RymeError::InvalidArgument(String::from("RETURNING requires a row mutation"))),
+        }
+    }
+
+    async fn execute_with_base(
         &self,
         statement: Statement,
         isolation: Isolation,
@@ -1565,6 +1734,9 @@ where
                 }
                 Ok(QueryResult::Ok)
             }
+            Statement::Returning { .. } => {
+                Err(RymeError::InvalidArgument(String::from("nested RETURNING statement")))
+            }
         }
     }
 
@@ -1676,6 +1848,48 @@ mod tests {
         executor.execute(parse("DELETE FROM users WHERE id = '1'").unwrap()).await.unwrap();
         let gone = executor.execute(parse("SELECT * FROM users WHERE id = '1'").unwrap()).await;
         assert!(matches!(gone, Ok(QueryResult::Rows { rows }) if rows.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn postgres_returning_reports_mutated_rows_and_stages_in_transactions() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let inserted = executor
+            .execute(
+                parse("INSERT INTO users (id, value) VALUES ('1', 'ada') RETURNING id, value")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(inserted, QueryResult::Returning { ref columns, ref rows }
+            if columns == &["id", "value"] && rows == &vec![vec![b"1".to_vec(), b"ada".to_vec()]]));
+
+        let updated = executor
+            .execute(parse("UPDATE users SET value = 'grace' WHERE id = '1' RETURNING *").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(updated, QueryResult::Returning { ref rows, .. }
+            if rows == &vec![vec![b"1".to_vec(), b"grace".to_vec()]]));
+
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let (returned, changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO users (id, value) VALUES ('2', 'inside') RETURNING value")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(returned, QueryResult::Returning { ref columns, ref rows }
+            if columns == &["value"] && rows == &vec![vec![b"inside".to_vec()]]));
+        assert_eq!(changes.len(), 1);
+        executor.commit_transaction(txn, changes).await.unwrap();
+
+        let deleted = executor
+            .execute(parse("DELETE FROM users WHERE id = '1' RETURNING id, value").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(deleted, QueryResult::Returning { ref rows, .. }
+            if rows == &vec![vec![b"1".to_vec(), b"grace".to_vec()]]));
     }
 
     #[tokio::test]

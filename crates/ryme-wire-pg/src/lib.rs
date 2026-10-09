@@ -6,7 +6,7 @@ use ryme_observe::{
 };
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
-use ryme_sql::{bind, parse, Executor, QueryResult, Statement, TransactionChange};
+use ryme_sql::{bind, parse, Executor, Field, QueryResult, Statement, TransactionChange};
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -821,6 +821,9 @@ where
 fn describe_query(query: &str) -> Vec<u8> {
     let trimmed = query.trim_matches(|c| c == '\0' || c == ';' || c == ' ');
     if let Ok(statement) = parse(trimmed) {
+        if let Statement::Returning { fields, .. } = &statement {
+            return returning_description(fields);
+        }
         if matches!(
             statement,
             ryme_sql::Statement::SelectByKey { .. } | ryme_sql::Statement::SelectScan { .. }
@@ -1393,6 +1396,17 @@ fn multi_row_description(names: &[String]) -> Vec<u8> {
     frame(b'T', &body)
 }
 
+fn returning_description(fields: &[Field]) -> Vec<u8> {
+    let names: Vec<String> = fields
+        .iter()
+        .map(|field| match field {
+            Field::Key => String::from("id"),
+            Field::Value => String::from("value"),
+        })
+        .collect();
+    multi_row_description(&names)
+}
+
 fn session_data_row(values: &[String]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&(values.len() as u16).to_be_bytes());
@@ -1496,6 +1510,14 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
             for (_, value) in rows {
                 let text = String::from_utf8_lossy(&value).into_owned();
                 out.extend(data_row(text));
+            }
+            out.extend(command_complete("SELECT"));
+            out
+        }
+        QueryResult::Returning { columns, rows } => {
+            let mut out = multi_row_description(&columns);
+            for row in rows {
+                out.extend(data_row_values(&row));
             }
             out.extend(command_complete("SELECT"));
             out
@@ -1609,10 +1631,16 @@ fn row_description() -> Vec<u8> {
 }
 
 fn data_row(text: String) -> Vec<u8> {
+    data_row_values(&[text.into_bytes()])
+}
+
+fn data_row_values(values: &[Vec<u8>]) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&1u16.to_be_bytes());
-    body.extend_from_slice(&(text.len() as u32).to_be_bytes());
-    body.extend_from_slice(text.as_bytes());
+    body.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for value in values {
+        body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        body.extend_from_slice(value);
+    }
     frame(b'D', &body)
 }
 

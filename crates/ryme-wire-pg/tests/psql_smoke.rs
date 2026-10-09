@@ -74,6 +74,14 @@ async fn psql_smoke() {
     assert!(out.contains("after"), "{out}");
     let (ok, out) = psql(
         addr,
+        "INSERT INTO docs (id, value) VALUES ('returning', 'one') RETURNING id, value; UPDATE docs SET value = 'two' WHERE id = 'returning' RETURNING *; DELETE FROM docs WHERE id = 'returning' RETURNING id, value;",
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(out.contains("returning|one"), "{out}");
+    assert!(out.contains("returning|two"), "{out}");
+    let (ok, out) = psql(
+        addr,
         "BEGIN; INSERT INTO docs (id, value) VALUES ('tx', 'inside'); SELECT * FROM docs KEY 'tx'; COMMIT;",
     )
     .await;
