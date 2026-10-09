@@ -1379,21 +1379,32 @@ where
     if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES") {
         let filter = sql_literal_after(query, "TABLE_NAME")
             .or_else(|| sql_literal_after(query, "TABLENAME"));
-        let rows: Vec<Vec<Vec<u8>>> = executor
-            .catalog_tables()
+        let include_views = upper.contains("INFORMATION_SCHEMA.TABLES");
+        let mut relations: Vec<(String, bool)> =
+            executor.catalog_tables().into_iter().map(|table| (table, false)).collect();
+        if include_views {
+            relations.extend(executor.catalog_views().into_iter().map(|view| (view, true)));
+        }
+        let rows: Vec<Vec<Vec<u8>>> = relations
             .into_iter()
             .filter(|table| {
-                let (_, table_name) = catalog_table_parts(table);
-                filter.as_ref().is_none_or(|want| want == table || want == table_name)
+                let (_, table_name) = catalog_table_parts(&table.0);
+                filter.as_ref().is_none_or(|want| want == &table.0 || want == table_name)
             })
-            .map(|table| {
+            .map(|(table, is_view)| {
                 let (schema, table_name) = catalog_table_parts(&table);
                 columns
                     .iter()
                     .map(|column| match column.as_str() {
                         "table_schema" | "schemaname" => schema.as_bytes().to_vec(),
                         "table_name" | "tablename" => table_name.as_bytes().to_vec(),
-                        "table_type" => b"BASE TABLE".to_vec(),
+                        "table_type" => {
+                            if is_view {
+                                b"VIEW".to_vec()
+                            } else {
+                                b"BASE TABLE".to_vec()
+                            }
+                        }
                         _ => Vec::new(),
                     })
                     .collect()
@@ -1425,14 +1436,16 @@ where
 
     if upper.contains("PG_CATALOG.PG_CLASS") {
         let filter = sql_literal_after(query, "RELNAME");
-        let rows: Vec<Vec<Vec<u8>>> = executor
-            .catalog_tables()
+        let mut relations: Vec<(String, bool)> =
+            executor.catalog_tables().into_iter().map(|table| (table, false)).collect();
+        relations.extend(executor.catalog_views().into_iter().map(|view| (view, true)));
+        let rows: Vec<Vec<Vec<u8>>> = relations
             .into_iter()
             .filter(|table| {
-                let (_, table_name) = catalog_table_parts(table);
-                filter.as_ref().is_none_or(|want| want == table || want == table_name)
+                let (_, table_name) = catalog_table_parts(&table.0);
+                filter.as_ref().is_none_or(|want| want == &table.0 || want == table_name)
             })
-            .map(|table| {
+            .map(|(table, is_view)| {
                 let (schema, table_name) = catalog_table_parts(&table);
                 let oid = catalog_relation_oid(&table);
                 let has_index = !executor.catalog_indexes(&table).is_empty();
@@ -1442,7 +1455,13 @@ where
                         "oid" => oid.to_string().into_bytes(),
                         "relname" => table_name.as_bytes().to_vec(),
                         "relnamespace" => catalog_namespace_oid(schema).to_string().into_bytes(),
-                        "relkind" => b"r".to_vec(),
+                        "relkind" => {
+                            if is_view {
+                                b"v".to_vec()
+                            } else {
+                                b"r".to_vec()
+                            }
+                        }
                         "relpersistence" => b"p".to_vec(),
                         "relhasindex" => {
                             if has_index {
@@ -2932,7 +2951,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ryme_sql::{FunctionDefinition, RlsPolicy, SchemaSnapshot, TriggerDefinition};
+    use ryme_sql::{
+        FunctionDefinition, RlsPolicy, SchemaSnapshot, TriggerDefinition, ViewDefinition,
+    };
 
     #[test]
     fn split_statements_respects_quotes() {
@@ -3128,6 +3149,40 @@ mod tests {
             .windows(b"set_updated_at".len())
             .any(|window| window == b"set_updated_at"));
         assert!(triggers.windows(b"19".len()).any(|window| window == b"19"));
+    }
+
+    #[test]
+    fn catalogs_expose_views_as_relations() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.views.insert(
+            String::from("active_messages"),
+            ViewDefinition {
+                name: String::from("active_messages"),
+                query: parse("SELECT * FROM messages").unwrap(),
+            },
+        );
+        executor.restore_schema_snapshot(snapshot).unwrap();
+
+        let tables = catalog_query(
+            "SELECT table_name, table_type FROM information_schema.tables WHERE table_name = 'active_messages'",
+            &executor,
+        )
+        .unwrap();
+        assert!(tables
+            .windows(b"active_messages".len())
+            .any(|window| window == b"active_messages"));
+        assert!(tables.windows(b"VIEW".len()).any(|window| window == b"VIEW"));
+
+        let relations = catalog_query(
+            "SELECT relname, relkind FROM pg_catalog.pg_class WHERE relname = 'active_messages'",
+            &executor,
+        )
+        .unwrap();
+        assert!(relations
+            .windows(b"active_messages".len())
+            .any(|window| window == b"active_messages"));
+        assert!(relations.windows(b"v".len()).any(|window| window == b"v"));
     }
 
     #[test]

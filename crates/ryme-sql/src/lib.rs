@@ -42,6 +42,12 @@ pub enum Statement {
         #[serde(default)]
         replace: bool,
     },
+    CreateView {
+        name: String,
+        query: Box<Statement>,
+        #[serde(default)]
+        replace: bool,
+    },
     CreateTrigger {
         name: String,
         table: String,
@@ -98,6 +104,11 @@ pub enum Statement {
     DropTrigger {
         name: String,
         table: String,
+        #[serde(default)]
+        if_exists: bool,
+    },
+    DropView {
+        name: String,
         #[serde(default)]
         if_exists: bool,
     },
@@ -432,6 +443,12 @@ pub struct TriggerDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewDefinition {
+    pub name: String,
+    pub query: Statement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: String,
@@ -499,6 +516,8 @@ pub struct SchemaSnapshot {
     #[serde(default)]
     pub triggers: BTreeMap<String, TriggerDefinition>,
     #[serde(default)]
+    pub views: BTreeMap<String, ViewDefinition>,
+    #[serde(default)]
     pub rls_tables: BTreeMap<String, String>,
     #[serde(default)]
     pub rls_write_tables: BTreeMap<String, String>,
@@ -558,10 +577,12 @@ impl Statement {
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
                 | Statement::CreateFunction { .. }
+                | Statement::CreateView { .. }
                 | Statement::CreateTrigger { .. }
                 | Statement::CreatePolicy { .. }
                 | Statement::DropPolicy { .. }
                 | Statement::DropTrigger { .. }
+                | Statement::DropView { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
@@ -610,6 +631,59 @@ fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, colum
 }
 
 pub type Row = (Vec<u8>, Vec<u8>);
+
+fn query_cell_value(cell: &[u8]) -> serde_json::Value {
+    if cell == SQL_NULL_SENTINEL {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_slice(cell).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(cell).to_string())
+    })
+}
+
+fn query_result_rows(result: QueryResult) -> Vec<Row> {
+    match result {
+        QueryResult::Row { pk, value } => vec![(pk, value)],
+        QueryResult::Rows { rows } => rows,
+        QueryResult::Table { columns, rows } => rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut object = serde_json::Map::new();
+                for (column, cell) in columns.iter().zip(row) {
+                    let value = query_cell_value(&cell);
+                    object.insert(column.clone(), value);
+                }
+                (
+                    index.to_string().into_bytes(),
+                    serde_json::Value::Object(object).to_string().into_bytes(),
+                )
+            })
+            .collect(),
+        QueryResult::Scalar { label, value } => {
+            let mut object = serde_json::Map::new();
+            let parsed = query_cell_value(&value);
+            object.insert(label, parsed);
+            vec![(b"0".to_vec(), serde_json::Value::Object(object).to_string().into_bytes())]
+        }
+        QueryResult::Returning { columns, rows } => rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mut object = serde_json::Map::new();
+                for (column, cell) in columns.iter().zip(row) {
+                    let value = query_cell_value(&cell);
+                    object.insert(column.clone(), value);
+                }
+                (
+                    index.to_string().into_bytes(),
+                    serde_json::Value::Object(object).to_string().into_bytes(),
+                )
+            })
+            .collect(),
+        QueryResult::Ok => Vec::new(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionChange {
@@ -998,12 +1072,14 @@ impl Statement {
             | Self::CopyFrom { table, .. } => table,
             Self::CreateSchema { .. }
             | Self::CreateExtension { .. }
-            | Self::CreateFunction { .. } => "",
+            | Self::CreateFunction { .. }
+            | Self::CreateView { .. } => "",
             Self::CreateTrigger { table, .. } => table,
             Self::CreatePolicy { table, .. } => table,
             Self::DropPolicy { table, .. } => table,
             Self::DropIndex { name, .. } => name,
             Self::DropTrigger { table, .. } => table,
+            Self::DropView { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
             Self::Distinct { statement, .. } => statement.table(),
@@ -1190,6 +1266,9 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| RymeError::InvalidArgument(String::from("drop trigger table")))?;
         return Ok(Statement::DropTrigger { name: object, table, if_exists });
+    }
+    if kind.eq_ignore_ascii_case("VIEW") {
+        return Ok(Statement::DropView { name: object, if_exists });
     }
     if kind.eq_ignore_ascii_case("TABLE") {
         return Ok(Statement::DropTable { table: object, if_exists });
@@ -1791,6 +1870,16 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
     if tokens.get(kind_index).is_some_and(|token| token.eq_ignore_ascii_case("TRIGGER")) {
         return parse_create_trigger(tokens);
     }
+    if tokens.get(kind_index).is_some_and(|token| token.eq_ignore_ascii_case("VIEW")) {
+        return parse_create_view(tokens, raw, kind_index);
+    }
+    if tokens.get(kind_index).is_some_and(|token| token.eq_ignore_ascii_case("MATERIALIZED"))
+        && tokens.get(kind_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("VIEW"))
+    {
+        return Err(RymeError::InvalidArgument(String::from(
+            "materialized views are not supported; use CREATE VIEW",
+        )));
+    }
     if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("POLICY")) {
         return parse_create_policy(tokens, raw);
     }
@@ -1907,6 +1996,31 @@ fn parse_create_function(tokens: &[String], raw: &str, kind_index: usize) -> Res
         .map(|value| unquote(value))
         .unwrap_or_default();
     Ok(Statement::CreateFunction { name, body, language, replace: kind_index == 3 })
+}
+
+fn parse_create_view(tokens: &[String], raw: &str, kind_index: usize) -> Result<Statement> {
+    let keyword = tokens
+        .get(kind_index)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create view")))?;
+    let keyword_pos = find_sql_keyword(raw, keyword, 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create view")))?;
+    let rest = raw[keyword_pos + keyword.len()..].trim_start();
+    let as_pos = find_sql_keyword(rest, "AS", 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("view query")))?;
+    let name = unqualified_name(rest[..as_pos].trim());
+    let query_sql = rest[as_pos + 2..].trim().trim_end_matches(';').trim();
+    if name.is_empty() || query_sql.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("create view")));
+    }
+    let query = parse(query_sql)?;
+    if query.is_write() {
+        return Err(RymeError::InvalidArgument(String::from("view query must be readable")));
+    }
+    Ok(Statement::CreateView {
+        name,
+        query: Box::new(query),
+        replace: tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("OR")),
+    })
 }
 
 fn extract_function_body(raw: &str) -> Option<String> {
@@ -5100,6 +5214,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::CreateFunction { name, language, .. } => {
             format!("ddl create_function({name}) language {language}")
         }
+        Statement::CreateView { name, replace, .. } => {
+            format!("ddl {}view({name})", if *replace { "replace_" } else { "create_" })
+        }
         Statement::CreateTrigger { name, table, timing, events, function } => format!(
             "ddl create_trigger({name} on {table} {timing} {} -> {function})",
             events.join("/")
@@ -5121,6 +5238,7 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::DropTrigger { name, table, .. } => {
             format!("ddl drop_trigger({name}) on {table}")
         }
+        Statement::DropView { name, .. } => format!("ddl drop_view({name})"),
         Statement::TruncateTable { table, restart_identity, cascade } => {
             format!(
                 "write truncate({table}) {} {}",
@@ -5723,6 +5841,7 @@ pub struct Executor<B = TxnManager> {
     constraints: Arc<Mutex<HashMap<String, Vec<ConstraintMetadata>>>>,
     functions: Arc<Mutex<HashMap<String, FunctionDefinition>>>,
     triggers: Arc<Mutex<HashMap<String, TriggerDefinition>>>,
+    views: Arc<Mutex<HashMap<String, ViewDefinition>>>,
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
@@ -5758,6 +5877,7 @@ impl Executor<TxnManager> {
             constraints: Arc::new(Mutex::new(HashMap::new())),
             functions: Arc::new(Mutex::new(HashMap::new())),
             triggers: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5787,6 +5907,7 @@ impl Executor<TxnManager> {
             constraints: Arc::new(Mutex::new(HashMap::new())),
             functions: Arc::new(Mutex::new(HashMap::new())),
             triggers: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5821,6 +5942,7 @@ where
             constraints: Arc::new(Mutex::new(HashMap::new())),
             functions: Arc::new(Mutex::new(HashMap::new())),
             triggers: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5968,6 +6090,50 @@ where
             self.schema_dirty.store(true, Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    fn install_view(&self, definition: ViewDefinition, replace: bool) -> Result<()> {
+        let mut views =
+            self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
+        if !replace && views.contains_key(&definition.name) {
+            return Err(RymeError::Conflict(format!("view {}", definition.name)));
+        }
+        if definition.name.eq_ignore_ascii_case(definition.query.table()) {
+            return Err(RymeError::InvalidArgument(String::from("recursive view")));
+        }
+        views.insert(definition.name.clone(), definition);
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn drop_view(&self, name: &str, if_exists: bool) -> Result<()> {
+        let removed = self
+            .views
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("view lock")))?
+            .remove(name)
+            .is_some();
+        if !removed && !if_exists {
+            return Err(RymeError::NotFound(format!("view {name}")));
+        }
+        if removed {
+            self.schema_dirty.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn view_definition(&self, name: &str) -> Result<Option<ViewDefinition>> {
+        let views =
+            self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
+        Ok(views.get(name).cloned().or_else(|| {
+            views.iter().find_map(|(view_name, definition)| {
+                view_name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|short| short.eq_ignore_ascii_case(name))
+                    .then(|| definition.clone())
+            })
+        }))
     }
 
     fn apply_before_triggers(&self, table: &str, event: &str, value: &[u8]) -> Result<Vec<u8>> {
@@ -6146,6 +6312,7 @@ where
             constraints: self.constraints,
             functions: self.functions,
             triggers: self.triggers,
+            views: self.views,
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
@@ -6291,6 +6458,13 @@ where
             .lock()
             .map(|triggers| triggers.iter().map(|key| (key.0.clone(), key.1.clone())).collect())
             .unwrap_or_default();
+        let views = self
+            .views
+            .lock()
+            .map(|views| {
+                views.iter().map(|(name, definition)| (name.clone(), definition.clone())).collect()
+            })
+            .unwrap_or_default();
         SchemaSnapshot {
             tables,
             indexes,
@@ -6299,6 +6473,7 @@ where
             constraints,
             functions,
             triggers,
+            views,
             rls_tables,
             rls_write_tables,
             rls_enabled,
@@ -6310,6 +6485,7 @@ where
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
         let functions = snapshot.functions;
         let triggers = snapshot.triggers;
+        let views = snapshot.views;
         {
             let mut catalog = self
                 .catalog
@@ -6341,6 +6517,11 @@ where
             *stored = triggers.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("trigger lock")));
+        }
+        if let Ok(mut stored) = self.views.lock() {
+            *stored = views.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("view lock")));
         }
         let legacy_rls_enabled: HashSet<String> = snapshot.rls_tables.keys().cloned().collect();
         let rls_enabled: HashSet<String> = if snapshot.rls_enabled.is_empty() {
@@ -6430,6 +6611,7 @@ where
         let functions =
             self.functions.lock().map(|functions| functions.clone()).unwrap_or_default();
         let triggers = self.triggers.lock().map(|triggers| triggers.clone()).unwrap_or_default();
+        let views = self.views.lock().map(|views| views.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -6451,6 +6633,7 @@ where
             constraints: Arc::new(Mutex::new(constraints)),
             functions: Arc::new(Mutex::new(functions)),
             triggers: Arc::new(Mutex::new(triggers)),
+            views: Arc::new(Mutex::new(views)),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -6467,6 +6650,13 @@ where
         let mut tables: Vec<String> = catalog.keys().cloned().collect();
         tables.sort();
         tables
+    }
+
+    pub fn catalog_views(&self) -> Vec<String> {
+        let Ok(views) = self.views.lock() else { return Vec::new() };
+        let mut names: Vec<String> = views.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     pub fn catalog_columns(&self, table: &str) -> Vec<ColumnDefinition> {
@@ -7651,7 +7841,7 @@ where
             && filter[0].column.is_none()
             && filter[0].field == Field::Key
             && filter[0].op == Cmp::Eq;
-        let rows = if exact_key {
+        let rows = if exact_key && self.view_definition(&table)?.is_none() {
             let pk = filter[0].operand.clone();
             self.manager
                 .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &pk))?
@@ -7869,6 +8059,12 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
+        if let Some(view) = self.view_definition(table)? {
+            let mut rows = query_result_rows(self.execute_read_in_transaction(txn, view.query)?);
+            rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
+            rows.truncate(limit);
+            return Ok(rows);
+        }
         let rls_enabled = self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table));
         if rls_enabled {
             if limit == 0 {
@@ -9543,10 +9739,12 @@ where
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
             | Statement::CreateFunction { .. }
+            | Statement::CreateView { .. }
             | Statement::CreateTrigger { .. }
             | Statement::CreatePolicy { .. }
             | Statement::DropPolicy { .. }
             | Statement::DropTrigger { .. }
+            | Statement::DropView { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -9606,12 +9804,20 @@ where
                 self.install_function(FunctionDefinition { name, body, language }, replace)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
+            Statement::CreateView { name, query, replace } => {
+                self.install_view(ViewDefinition { name, query: *query }, replace)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
             Statement::CreateTrigger { name, table, timing, events, function } => {
                 self.install_trigger(TriggerDefinition { name, table, timing, events, function })?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::DropTrigger { name, table, if_exists } => {
                 self.drop_trigger(&name, &table, if_exists)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::DropView { name, if_exists } => {
+                self.drop_view(&name, if_exists)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreatePolicy { name, table, command, using, check } => {
@@ -11071,10 +11277,12 @@ where
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
             | Statement::CreateFunction { .. }
+            | Statement::CreateView { .. }
             | Statement::CreateTrigger { .. }
             | Statement::CreatePolicy { .. }
             | Statement::DropPolicy { .. }
             | Statement::DropTrigger { .. }
+            | Statement::DropView { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -11113,10 +11321,12 @@ where
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
                 | Statement::CreateFunction { .. }
+                | Statement::CreateView { .. }
                 | Statement::CreateTrigger { .. }
                 | Statement::CreatePolicy { .. }
                 | Statement::DropPolicy { .. }
                 | Statement::DropTrigger { .. }
+                | Statement::DropView { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
@@ -11499,12 +11709,20 @@ where
                 self.install_function(FunctionDefinition { name, body, language }, replace)?;
                 Ok(QueryResult::Ok)
             }
+            Statement::CreateView { name, query, replace } => {
+                self.install_view(ViewDefinition { name, query: *query }, replace)?;
+                Ok(QueryResult::Ok)
+            }
             Statement::CreateTrigger { name, table, timing, events, function } => {
                 self.install_trigger(TriggerDefinition { name, table, timing, events, function })?;
                 Ok(QueryResult::Ok)
             }
             Statement::DropTrigger { name, table, if_exists } => {
                 self.drop_trigger(&name, &table, if_exists)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::DropView { name, if_exists } => {
+                self.drop_view(&name, if_exists)?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreatePolicy { name, table, command, using, check } => {
@@ -12624,6 +12842,50 @@ mod tests {
         assert!(matches!(returned, QueryResult::Returning { ref columns, ref rows }
             if columns == &[String::from("id"), String::from("payload"), String::from("count")]
                 && rows == &vec![vec![b"e1".to_vec(), b"changed".to_vec(), b"4".to_vec()]]));
+    }
+
+    #[tokio::test]
+    async fn views_are_readable_and_persist_in_schema_snapshots() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT, active BOOLEAN)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (id, body, active) VALUES ('1', 'hello', true), ('2', 'hidden', false)").unwrap())
+            .await
+            .unwrap();
+
+        let create =
+            parse("CREATE VIEW active_messages AS SELECT * FROM messages WHERE active = true")
+                .unwrap();
+        assert!(
+            matches!(create, Statement::CreateView { ref name, .. } if name == "active_messages")
+        );
+        executor.execute(create).await.unwrap();
+
+        let rows = executor.execute(parse("SELECT * FROM active_messages").unwrap()).await.unwrap();
+        assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.len() == 1));
+        let projected = executor
+            .execute(parse("SELECT body FROM active_messages WHERE id = '1'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(projected, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"hello".to_vec()]])
+        );
+
+        let snapshot = executor.schema_snapshot();
+        assert!(snapshot.views.contains_key("active_messages"));
+        executor.execute(parse("DROP VIEW active_messages").unwrap()).await.unwrap();
+        executor.restore_schema_snapshot(snapshot).unwrap();
+        let restored =
+            executor.execute(parse("SELECT body FROM active_messages").unwrap()).await.unwrap();
+        assert!(
+            matches!(restored, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"hello".to_vec()]])
+        );
     }
 
     #[tokio::test]

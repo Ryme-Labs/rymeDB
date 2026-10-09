@@ -8,6 +8,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL `CREATE VIEW`, `CREATE OR REPLACE VIEW`, and `DROP VIEW` now
+  persist readable view definitions, execute common table/projection queries,
+  restore through schema snapshots, and appear as `VIEW` relations in
+  `information_schema.tables` and `pg_catalog.pg_class`.
 - PostgreSQL `pg_catalog.pg_proc` and `pg_catalog.pg_trigger` now expose
   persisted function and trigger metadata for ORM and migration introspection.
 - Common PostgreSQL `CREATE OR REPLACE FUNCTION` and `CREATE TRIGGER` schema

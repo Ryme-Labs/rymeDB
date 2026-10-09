@@ -65,6 +65,10 @@ policy name, command, `USING`, and `WITH CHECK` expressions used by migration
 verification and ORM introspection.
 Persisted function and trigger metadata is also available through
 `pg_catalog.pg_proc` and `pg_catalog.pg_trigger`.
+Common `CREATE VIEW` and `CREATE OR REPLACE VIEW` definitions over supported
+read queries are persisted in schema snapshots and can be removed with
+`DROP VIEW [IF EXISTS]`. Views are exposed as `VIEW` rows through
+`information_schema.tables` and as `relkind = 'v'` in `pg_catalog.pg_class`.
 Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
 persisted in schema snapshots. `BEFORE` row triggers that assign
 `NEW.column = now()` (or the equivalent current-timestamp expressions) are
@@ -131,6 +135,8 @@ including `TRUNCATE ... RESTART IDENTITY`, `CONTINUE IDENTITY`, and
 foreign-key `CASCADE`/`RESTRICT`,
 common migration declarations `CREATE SCHEMA IF NOT EXISTS` and
 `CREATE EXTENSION IF NOT EXISTS ... [WITH SCHEMA ...]`,
+`CREATE VIEW`/`CREATE OR REPLACE VIEW` over supported read queries and
+`DROP VIEW [IF EXISTS]`,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT (columns) DO UPDATE` uses
