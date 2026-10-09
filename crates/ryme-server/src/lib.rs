@@ -4063,17 +4063,17 @@ async fn forward_broadcast(
     channel: &str,
 ) {
     let mut receiver = realtime.broadcast_subscribe(tenant, channel);
-    let (mut sender, mut incoming) = socket.split();
+    let (sender, mut incoming) = socket.split();
+    let outgoing = start_realtime_writer(sender);
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
     heartbeat.tick().await;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if !send_realtime_message(
-                    &mut sender,
+                if !queue_realtime_message(
+                    &outgoing,
                     axum::extract::ws::Message::Ping(Vec::new()),
-                )
-                .await {
+                ) {
                     break;
                 }
             }
@@ -4084,15 +4084,14 @@ async fn forward_broadcast(
                         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
-                        if !send_realtime_message(
-                            &mut sender,
+                        if !queue_realtime_message(
+                            &outgoing,
                             axum::extract::ws::Message::Text(text),
-                        )
-                        .await {
+                        ) {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
                     Err(_) => break,
                 }
             }
@@ -4100,11 +4099,10 @@ async fn forward_broadcast(
                 match next {
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
                     Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
-                        if !send_realtime_message(
-                            &mut sender,
+                        if !queue_realtime_message(
+                            &outgoing,
                             axum::extract::ws::Message::Pong(payload),
-                        )
-                        .await {
+                        ) {
                             break;
                         }
                     }
@@ -6166,12 +6164,35 @@ fn stream_realtime_event(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64
 }
 
 const REALTIME_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const REALTIME_OUTGOING_QUEUE_CAPACITY: usize = 256;
 
-async fn send_realtime_message(
-    sender: &mut futures_util::stream::SplitSink<
-        axum::extract::ws::WebSocket,
-        axum::extract::ws::Message,
-    >,
+type RealtimeSink =
+    futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
+
+type RealtimeOutgoing = tokio::sync::mpsc::Sender<axum::extract::ws::Message>;
+
+fn start_realtime_writer(sender: RealtimeSink) -> RealtimeOutgoing {
+    let (outgoing, mut queue) = tokio::sync::mpsc::channel(REALTIME_OUTGOING_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        let mut sender = sender;
+        while let Some(message) = queue.recv().await {
+            if !send_realtime_message_with_sink(&mut sender, message).await {
+                break;
+            }
+        }
+    });
+    outgoing
+}
+
+fn queue_realtime_message(
+    outgoing: &RealtimeOutgoing,
+    message: axum::extract::ws::Message,
+) -> bool {
+    outgoing.try_send(message).is_ok()
+}
+
+async fn send_realtime_message_with_sink(
+    sender: &mut RealtimeSink,
     message: axum::extract::ws::Message,
 ) -> bool {
     tokio::time::timeout(REALTIME_SEND_TIMEOUT, sender.send(message))
@@ -6212,7 +6233,8 @@ async fn forward_changes(
         ),
     };
     let mut seen_sequence = from_sequence.unwrap_or(0);
-    let (mut sender, mut incoming) = socket.split();
+    let (sender, mut incoming) = socket.split();
+    let outgoing = start_realtime_writer(sender);
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
         if !realtime_change_allowed_by_executor(&rls_executor, tenant, branch, record) {
@@ -6222,7 +6244,7 @@ async fn forward_changes(
         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
             return;
         }
-        if !send_realtime_message(&mut sender, axum::extract::ws::Message::Text(text)).await {
+        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
             return;
         }
     }
@@ -6231,11 +6253,10 @@ async fn forward_changes(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if !send_realtime_message(
-                    &mut sender,
+                if !queue_realtime_message(
+                    &outgoing,
                     axum::extract::ws::Message::Ping(Vec::new()),
-                )
-                .await {
+                ) {
                     break;
                 }
             }
@@ -6258,11 +6279,10 @@ async fn forward_changes(
                         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
-                        if !send_realtime_message(
-                            &mut sender,
+                        if !queue_realtime_message(
+                            &outgoing,
                             axum::extract::ws::Message::Text(text),
-                        )
-                        .await {
+                        ) {
                             break;
                         }
                     }
@@ -6299,11 +6319,10 @@ async fn forward_changes(
                             if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                                 return;
                             }
-                            if !send_realtime_message(
-                                &mut sender,
+                            if !queue_realtime_message(
+                                &outgoing,
                                 axum::extract::ws::Message::Text(text),
-                            )
-                            .await {
+                            ) {
                                 return;
                             }
                         }
@@ -6315,11 +6334,10 @@ async fn forward_changes(
                 match next {
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
                     Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
-                        if !send_realtime_message(
-                            &mut sender,
+                        if !queue_realtime_message(
+                            &outgoing,
                             axum::extract::ws::Message::Pong(payload),
-                        )
-                        .await {
+                        ) {
                             break;
                         }
                     }
@@ -6413,11 +6431,12 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
     initial_commit: u64,
 ) {
     let mut receiver = realtime.query_subscribe_branch(tenant, database, branch, table, limit);
-    let (mut sender, mut incoming) = socket.split();
+    let (sender, mut incoming) = socket.split();
+    let outgoing = start_realtime_writer(sender);
     let current_commit =
         initial_commit.max(realtime.query_latest_commit_branch(tenant, database, branch, table));
-    let mut snapshot_commit = send_query_snapshot(
-        &mut sender,
+    let (mut snapshot_commit, snapshot_queued) = send_query_snapshot(
+        &outgoing,
         &backend,
         &qos,
         &rls_executor,
@@ -6427,18 +6446,19 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
         branch,
         limit,
         current_commit,
-    )
-    .await;
+    );
+    if !snapshot_queued {
+        return;
+    }
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
     heartbeat.tick().await;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if !send_realtime_message(
-                    &mut sender,
+                if !queue_realtime_message(
+                    &outgoing,
                     axum::extract::ws::Message::Ping(Vec::new()),
-                )
-                .await {
+                ) {
                     break;
                 }
             }
@@ -6465,11 +6485,10 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
-                        if !send_realtime_message(
-                            &mut sender,
+                        if !queue_realtime_message(
+                            &outgoing,
                             axum::extract::ws::Message::Text(text),
-                        )
-                        .await {
+                        ) {
                             break;
                         }
                     }
@@ -6477,8 +6496,8 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                         let current_commit = initial_commit.max(realtime.query_latest_commit_branch(
                             tenant, database, branch, table,
                         ));
-                        snapshot_commit = send_query_snapshot(
-                            &mut sender,
+                        let (commit, queued) = send_query_snapshot(
+                            &outgoing,
                             &backend,
                             &qos,
                             &rls_executor,
@@ -6488,8 +6507,11 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             branch,
                             limit,
                             current_commit,
-                        )
-                        .await;
+                        );
+                        if !queued {
+                            break;
+                        }
+                        snapshot_commit = commit;
                     }
                     Err(_) => break,
                 }
@@ -6498,11 +6520,10 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                 match next {
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
                     Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
-                        if !send_realtime_message(
-                            &mut sender,
+                        if !queue_realtime_message(
+                            &outgoing,
                             axum::extract::ws::Message::Pong(payload),
-                        )
-                        .await {
+                        ) {
                             break;
                         }
                     }
@@ -6643,11 +6664,8 @@ fn scan_realtime_rows_with_executor<B: TxnBackend>(
     visible
 }
 
-async fn send_query_snapshot<B: TxnBackend>(
-    sender: &mut futures_util::stream::SplitSink<
-        axum::extract::ws::WebSocket,
-        axum::extract::ws::Message,
-    >,
+fn send_query_snapshot<B: TxnBackend>(
+    outgoing: &RealtimeOutgoing,
     backend: &B,
     qos: &Arc<Mutex<QosRegistry>>,
     rls_executor: &Executor<BranchStorage>,
@@ -6657,7 +6675,7 @@ async fn send_query_snapshot<B: TxnBackend>(
     branch: &str,
     limit: usize,
     commit: u64,
-) -> u64 {
+) -> (u64, bool) {
     let rows =
         scan_realtime_rows_with_executor(backend, rls_executor, tenant, database, table, limit);
     let snapshot = serde_json::json!({
@@ -6674,10 +6692,9 @@ async fn send_query_snapshot<B: TxnBackend>(
     });
     let text = snapshot.to_string();
     if !stream_realtime_event(qos, tenant, text.len() as u64) {
-        return commit;
+        return (commit, false);
     }
-    let _ = send_realtime_message(sender, axum::extract::ws::Message::Text(text)).await;
-    commit
+    (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text)))
 }
 
 fn json_body<T>(body: &[u8]) -> Result<T, ryme_error::RymeError>
@@ -7002,6 +7019,17 @@ fn archive_target(
 #[cfg(test)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn realtime_outgoing_queue_rejects_slow_consumers() {
+        let (outgoing, mut queued) = tokio::sync::mpsc::channel(2);
+
+        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
+        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
+        assert!(!queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
+
+        assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));
+    }
 
     #[test]
     fn archive_metadata_includes_branch_schema_tree() {
