@@ -87,6 +87,8 @@ pub enum Statement {
         table: String,
         select: Vec<SelectItem>,
         group: Field,
+        #[serde(default)]
+        group_column: Option<String>,
         filter: Vec<Predicate>,
         limit: usize,
         offset: usize,
@@ -301,6 +303,7 @@ impl AggFunc {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectItem {
     Field(Field),
+    Column(String),
     Agg(AggFunc, Field, Option<String>),
 }
 
@@ -309,6 +312,7 @@ impl SelectItem {
         match self {
             Self::Field(Field::Key) => String::from("key"),
             Self::Field(Field::Value) => String::from("value"),
+            Self::Column(column) => column.clone(),
             Self::Agg(func, _, _) => func.label().to_string(),
         }
     }
@@ -1219,6 +1223,8 @@ fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
                 select.push(SelectItem::Field(field));
                 continue;
             }
+            select.push(SelectItem::Column(unquote(&item_tokens[0])));
+            continue;
         }
         return Err(RymeError::InvalidArgument(String::from("select item")));
     }
@@ -1235,20 +1241,40 @@ fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
     if !tokens.get(group_pos + 1).is_some_and(|t| t.eq_ignore_ascii_case("BY")) {
         return Err(RymeError::InvalidArgument(String::from("group field")));
     }
-    let group = tokens
+    let group_token = tokens
         .get(group_pos + 2)
-        .and_then(|t| parse_field(t))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("group field")))?;
+    let (group, group_column) = parse_field(group_token)
+        .map(|field| (field, None))
+        .unwrap_or((Field::Value, Some(unquote(group_token))));
     for item in &select {
-        if let SelectItem::Field(field) = item {
-            if *field != group {
-                return Err(RymeError::InvalidArgument(String::from("group field")));
+        match item {
+            SelectItem::Field(field) => {
+                if group_column.is_some() || *field != group {
+                    return Err(RymeError::InvalidArgument(String::from("group field")));
+                }
             }
+            SelectItem::Column(column) => {
+                if !group_column.as_deref().is_some_and(|group| group.eq_ignore_ascii_case(column))
+                {
+                    return Err(RymeError::InvalidArgument(String::from("group field")));
+                }
+            }
+            SelectItem::Agg(_, _, _) => {}
         }
     }
     let (limit, offset, order) = parse_scan_tail(tokens)?;
     let filter = parse_where_filter(tokens)?;
-    Ok(Statement::GroupBy { table: table.to_string(), select, group, filter, limit, offset, order })
+    Ok(Statement::GroupBy {
+        table: table.to_string(),
+        select,
+        group,
+        group_column,
+        filter,
+        limit,
+        offset,
+        order,
+    })
 }
 
 fn parse_join(tokens: &[String], left: &str) -> Result<Statement> {
@@ -1977,6 +2003,22 @@ fn aggregate_target_rows(
         || aggregate_rows(rows, func, field),
         |column| aggregate_column_rows(rows, func, column),
     )
+}
+
+fn group_value(pk: &[u8], raw: &[u8], field: Field, column: Option<&str>) -> Vec<u8> {
+    if let Some(column) = column {
+        let Some(serde_json::Value::Object(object)) = serde_json::from_slice(raw).ok() else {
+            return vec![0];
+        };
+        return json_column_value(column, &object)
+            .filter(|value| !value.is_null())
+            .map(json_result_bytes)
+            .unwrap_or_else(|| vec![0]);
+    }
+    match field {
+        Field::Key => pk.to_vec(),
+        Field::Value => raw.to_vec(),
+    }
 }
 
 fn parse_number(raw: &[u8]) -> Option<f64> {
@@ -3675,17 +3717,23 @@ where
                     value: aggregate_target_rows(&rows, func, field, column.as_deref()),
                 })
             }
-            Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
+            Statement::GroupBy {
+                table,
+                select,
+                group,
+                group_column,
+                filter,
+                limit,
+                offset,
+                order,
+            } => {
                 let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
                     if !filter.iter().all(|p| p.matches(&pk, &value)) {
                         continue;
                     }
-                    let key = match group {
-                        Field::Key => pk.clone(),
-                        Field::Value => value.clone(),
-                    };
+                    let key = group_value(&pk, &value, group, group_column.as_deref());
                     groups.entry(key).or_default().push((pk, value));
                 }
                 let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -3713,6 +3761,18 @@ where
                                         )
                                         .to_string(),
                                     ),
+                                );
+                            }
+                            SelectItem::Column(column) => {
+                                record.insert(
+                                    column.clone(),
+                                    if group_key == &[0] {
+                                        serde_json::Value::Null
+                                    } else {
+                                        serde_json::Value::String(
+                                            String::from_utf8_lossy(group_key).to_string(),
+                                        )
+                                    },
                                 );
                             }
                             SelectItem::Agg(func, field, column) => {
@@ -4038,7 +4098,16 @@ where
                     value: aggregate_target_rows(&rows, func, field, column.as_deref()),
                 })
             }
-            Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
+            Statement::GroupBy {
+                table,
+                select,
+                group,
+                group_column,
+                filter,
+                limit,
+                offset,
+                order,
+            } => {
                 let mut txn = self.begin_with(isolation);
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
@@ -4046,10 +4115,7 @@ where
                     if !filter.iter().all(|p| p.matches(&pk, &value)) {
                         continue;
                     }
-                    let key = match group {
-                        Field::Key => pk.clone(),
-                        Field::Value => value.clone(),
-                    };
+                    let key = group_value(&pk, &value, group, group_column.as_deref());
                     groups.entry(key).or_default().push((pk, value));
                 }
                 let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -4077,6 +4143,18 @@ where
                                         )
                                         .to_string(),
                                     ),
+                                );
+                            }
+                            SelectItem::Column(column) => {
+                                record.insert(
+                                    column.clone(),
+                                    if group_key == &[0] {
+                                        serde_json::Value::Null
+                                    } else {
+                                        serde_json::Value::String(
+                                            String::from_utf8_lossy(group_key).to_string(),
+                                        )
+                                    },
                                 );
                             }
                             SelectItem::Agg(func, field, column) => {
@@ -5498,6 +5576,47 @@ mod tests {
         let count =
             executor.execute(parse("SELECT COUNT(count) FROM metrics").unwrap()).await.unwrap();
         assert!(matches!(count, QueryResult::Scalar { value, .. } if value == b"1"));
+
+        let groups = executor
+            .execute(parse("SELECT sum, COUNT(*) FROM metrics GROUP BY sum").unwrap())
+            .await
+            .unwrap();
+        match groups {
+            QueryResult::Rows { rows } => {
+                assert_eq!(rows.len(), 2);
+                let null_group: serde_json::Value = serde_json::from_slice(&rows[0].1).unwrap();
+                assert!(null_group["sum"].is_null());
+                assert_eq!(null_group["count"], "1");
+                let value_group: serde_json::Value = serde_json::from_slice(&rows[1].1).unwrap();
+                assert_eq!(value_group["sum"], "2");
+                assert_eq!(value_group["count"], "1");
+            }
+            _ => panic!("expected grouped rows"),
+        }
+
+        executor
+            .execute(parse("CREATE TABLE teams (id TEXT PRIMARY KEY, payload JSONB)").unwrap())
+            .await
+            .unwrap();
+        for (id, team) in [("t1", "red"), ("t2", "red"), ("t3", "blue")] {
+            executor
+                .execute(
+                    parse(&format!(
+                        "INSERT INTO teams (id, payload) VALUES ('{id}', '{{\"team\":\"{team}\"}}')"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let json_groups = executor
+            .execute(
+                parse("SELECT payload->>'team', COUNT(*) FROM teams GROUP BY payload->>'team'")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(json_groups, QueryResult::Rows { rows } if rows.len() == 2));
     }
 
     #[tokio::test]

@@ -123,10 +123,11 @@ Key-equality joins: `SELECT * FROM a JOIN b ON KEY = KEY [WHERE ...]
 returns rows shaped `{"left": ..., "right": ...}` (lossy UTF-8). Only
 inner key-equality joins; other `ON` shapes are rejected, never
 misexecuted.
-Grouping: `SELECT <field|agg>, ... FROM t [WHERE ...] GROUP BY <field>
+Grouping: `SELECT <key|value|column|agg>, ... FROM t [WHERE ...] GROUP BY <key|value|column>
 [ORDER BY ...] [LIMIT n] [OFFSET n]` groups exact key/value bytes and
-returns one `{"label": result}` row per group. Bare select items must name
-the group field; aggregates reuse the scalar rules above.
+structured column values (including JSON paths), and returns one row per group.
+Bare select items must name the group field; aggregates reuse the scalar rules
+above, and null values share one group.
 
 ## Observability
 
