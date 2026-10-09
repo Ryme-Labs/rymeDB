@@ -110,11 +110,12 @@ async fn psql_smoke() {
     assert!(out.contains("messages_id_pkey|p"), "{out}");
     let (ok, out) = psql(
         addr,
-        "CREATE TABLE public.projection (id TEXT PRIMARY KEY, payload TEXT, count INTEGER); INSERT INTO public.projection (id, payload, count) VALUES ('p1', 'hello', 3); SELECT payload, count FROM public.projection WHERE id = 'p1';",
+        "CREATE TABLE public.projection (id TEXT PRIMARY KEY, payload TEXT, count INTEGER); INSERT INTO public.projection (id, payload, count) VALUES ('p1', 'hello', 3); SELECT payload, count FROM public.projection WHERE id = 'p1'; UPDATE public.projection SET payload = 'changed', count = 4 WHERE id = 'p1' RETURNING id, payload, count;",
     )
     .await;
     assert!(ok, "{out}");
     assert!(out.contains("hello|3"), "{out}");
+    assert!(out.contains("p1|changed|4"), "{out}");
     let (ok, out) = psql(
         addr,
         "CREATE INDEX messages_payload_idx ON public.messages (payload); SELECT indexname, tablename FROM pg_catalog.pg_indexes WHERE tablename = 'messages';",

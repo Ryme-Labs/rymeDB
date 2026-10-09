@@ -102,7 +102,7 @@ pub enum Statement {
     },
     Returning {
         statement: Box<Statement>,
-        fields: Vec<Field>,
+        fields: Vec<ReturningField>,
     },
     Explain {
         plan: String,
@@ -176,6 +176,13 @@ pub struct TransactionChange {
 pub enum Field {
     Key,
     Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReturningField {
+    Key,
+    Value,
+    Column(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,7 +340,7 @@ pub fn parse(input: &str) -> Result<Statement> {
     Ok(statement)
 }
 
-fn parse_returning_fields(tokens: &[String]) -> Result<Vec<Field>> {
+fn parse_returning_fields(tokens: &[String]) -> Result<Vec<ReturningField>> {
     let start = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("RETURNING"))
@@ -341,11 +348,14 @@ fn parse_returning_fields(tokens: &[String]) -> Result<Vec<Field>> {
     let mut fields = Vec::new();
     for token in &tokens[start + 1..] {
         if token == "*" {
-            fields.extend([Field::Key, Field::Value]);
+            fields.extend([ReturningField::Key, ReturningField::Value]);
         } else if let Some(field) = parse_field(token) {
-            fields.push(field);
+            fields.push(match field {
+                Field::Key => ReturningField::Key,
+                Field::Value => ReturningField::Value,
+            });
         } else {
-            return Err(RymeError::InvalidArgument(String::from("returning field")));
+            fields.push(ReturningField::Column(unquote(token)));
         }
     }
     if fields.is_empty() {
@@ -1429,22 +1439,43 @@ fn format_number(value: f64) -> String {
     }
 }
 
-fn returning_result(fields: &[Field], pk: Vec<u8>, value: Vec<u8>) -> QueryResult {
-    let columns = fields
-        .iter()
-        .map(|field| match field {
-            Field::Key => String::from("id"),
-            Field::Value => String::from("value"),
-        })
-        .collect();
-    let row = fields
-        .iter()
-        .map(|field| match field {
-            Field::Key => pk.clone(),
-            Field::Value => value.clone(),
-        })
-        .collect();
+fn returning_result(fields: &[ReturningField], pk: Vec<u8>, value: Vec<u8>) -> QueryResult {
+    let columns = returning_columns(fields);
+    let row = fields.iter().map(|field| returning_field_value(field, &pk, &value)).collect();
     QueryResult::Returning { columns, rows: vec![row] }
+}
+
+fn returning_columns(fields: &[ReturningField]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| match field {
+            ReturningField::Key => String::from("id"),
+            ReturningField::Value => String::from("value"),
+            ReturningField::Column(column) => column.clone(),
+        })
+        .collect()
+}
+
+fn returning_field_value(field: &ReturningField, pk: &[u8], value: &[u8]) -> Vec<u8> {
+    let Some(serde_json::Value::Object(object)) = serde_json::from_slice(value).ok() else {
+        return match field {
+            ReturningField::Key => pk.to_vec(),
+            ReturningField::Value | ReturningField::Column(_) => value.to_vec(),
+        };
+    };
+    match field {
+        ReturningField::Key => pk.to_vec(),
+        ReturningField::Value => object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("value"))
+            .map(|(_, value)| json_result_bytes(value))
+            .unwrap_or_else(|| value.to_vec()),
+        ReturningField::Column(column) => object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .map(|(_, value)| json_result_bytes(value))
+            .unwrap_or_default(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2299,15 +2330,9 @@ where
         columns: Vec<String>,
         rows: Vec<Vec<InsertValue>>,
         upsert: bool,
-        fields: &[Field],
+        fields: &[ReturningField],
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
-        let result_columns = fields
-            .iter()
-            .map(|field| match field {
-                Field::Key => String::from("id"),
-                Field::Value => String::from("value"),
-            })
-            .collect();
+        let result_columns = returning_columns(fields);
         let mut result_rows = Vec::new();
         let mut changes = Vec::new();
         for values in rows {
@@ -2332,7 +2357,7 @@ where
         &self,
         txn: &mut Transaction,
         statement: Statement,
-        fields: Vec<Field>,
+        fields: Vec<ReturningField>,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
             Statement::InsertRow { table, columns, values, upsert } => {
@@ -2644,7 +2669,7 @@ where
     async fn execute_returning(
         &self,
         statement: Statement,
-        fields: Vec<Field>,
+        fields: Vec<ReturningField>,
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match statement {
@@ -3216,6 +3241,19 @@ mod tests {
             .unwrap();
         assert!(matches!(result, QueryResult::Table { ref rows, .. }
             if rows == &vec![vec![b"e1".to_vec(), b"hello".to_vec()]]));
+
+        let returned = executor
+            .execute(
+                parse(
+                    "UPDATE events SET payload = 'changed', count = 4 WHERE id = 'e1' RETURNING id, payload, count",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(returned, QueryResult::Returning { ref columns, ref rows }
+            if columns == &[String::from("id"), String::from("payload"), String::from("count")]
+                && rows == &vec![vec![b"e1".to_vec(), b"changed".to_vec(), b"4".to_vec()]]));
     }
 
     #[tokio::test]

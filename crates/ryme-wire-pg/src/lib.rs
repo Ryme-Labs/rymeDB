@@ -6,7 +6,9 @@ use ryme_observe::{
 };
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
-use ryme_sql::{bind, parse, Executor, Field, QueryResult, Statement, TransactionChange};
+use ryme_sql::{
+    bind, parse, Executor, Field, QueryResult, ReturningField, Statement, TransactionChange,
+};
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1949,12 +1951,13 @@ fn multi_row_description(names: &[String]) -> Vec<u8> {
     frame(b'T', &body)
 }
 
-fn returning_description(fields: &[Field]) -> Vec<u8> {
+fn returning_description(fields: &[ReturningField]) -> Vec<u8> {
     let names: Vec<String> = fields
         .iter()
         .map(|field| match field {
-            Field::Key => String::from("id"),
-            Field::Value => String::from("value"),
+            ReturningField::Key => String::from("id"),
+            ReturningField::Value => String::from("value"),
+            ReturningField::Column(column) => column.clone(),
         })
         .collect();
     multi_row_description(&names)
