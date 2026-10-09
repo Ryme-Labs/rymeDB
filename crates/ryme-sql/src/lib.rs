@@ -22,6 +22,11 @@ pub enum Statement {
         table: String,
         column: String,
     },
+    AlterTableRenameColumn {
+        table: String,
+        from: String,
+        to: String,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -444,6 +449,7 @@ impl Statement {
             Self::CreateTable { table, .. }
             | Self::AlterTableAddColumn { table, .. }
             | Self::AlterTableDropColumn { table, .. }
+            | Self::AlterTableRenameColumn { table, .. }
             | Self::CreateIndex { table, .. }
             | Self::Insert { table, .. }
             | Self::InsertRow { table, .. }
@@ -503,7 +509,12 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(2)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table")))?;
-    if let Some(drop_pos) = tokens.iter().position(|token| token.eq_ignore_ascii_case("DROP")) {
+    if let Some(drop_pos) = tokens
+        .iter()
+        .enumerate()
+        .skip(3)
+        .find_map(|(position, token)| token.eq_ignore_ascii_case("DROP").then_some(position))
+    {
         let column_pos =
             if tokens.get(drop_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
                 drop_pos + 2
@@ -516,9 +527,37 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
             .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
         return Ok(Statement::AlterTableDropColumn { table, column });
     }
+    if let Some(rename_pos) = tokens
+        .iter()
+        .enumerate()
+        .skip(3)
+        .find_map(|(position, token)| token.eq_ignore_ascii_case("RENAME").then_some(position))
+    {
+        let old_pos =
+            if tokens.get(rename_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN"))
+            {
+                rename_pos + 2
+            } else {
+                rename_pos + 1
+            };
+        let from = tokens
+            .get(old_pos)
+            .map(|value| unquote(value))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
+        if !tokens.get(old_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("TO")) {
+            return Err(RymeError::InvalidArgument(String::from("alter column rename")));
+        }
+        let to = tokens
+            .get(old_pos + 2)
+            .map(|value| unquote(value))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
+        return Ok(Statement::AlterTableRenameColumn { table, from, to });
+    }
     let add_pos = tokens
         .iter()
-        .position(|token| token.eq_ignore_ascii_case("ADD"))
+        .enumerate()
+        .skip(3)
+        .find_map(|(position, token)| token.eq_ignore_ascii_case("ADD").then_some(position))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table add")))?;
     let column_pos =
         if tokens.get(add_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
@@ -1817,6 +1856,17 @@ fn index_value(definition: &IndexDefinition, pk: &[u8], value: &[u8]) -> Option<
     })
 }
 
+fn rename_index_column(indexed: &str, from: &str, to: &str) -> String {
+    if indexed.eq_ignore_ascii_case(from) {
+        return to.to_string();
+    }
+    let prefix = format!("{from}->");
+    if indexed.len() >= prefix.len() && indexed[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+        return format!("{to}{}", &indexed[prefix.len()..]);
+    }
+    indexed.to_string()
+}
+
 fn json_projection_value<'a>(
     expression: &str,
     object: &'a serde_json::Map<String, serde_json::Value>,
@@ -1906,6 +1956,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         }
         Statement::AlterTableDropColumn { table, column } => {
             format!("ddl alter_table({table}) drop_column({column})")
+        }
+        Statement::AlterTableRenameColumn { table, from, to } => {
+            format!("ddl alter_table({table}) rename_column({from}, {to})")
         }
         Statement::CreateIndex { name, table, field, column, unique } => {
             let field = column.as_deref().unwrap_or(match field {
@@ -3392,6 +3445,104 @@ where
         Ok(())
     }
 
+    async fn alter_table_rename_column(
+        &self,
+        table: String,
+        from: String,
+        to: String,
+    ) -> Result<()> {
+        self.reject_if_read_only()?;
+        if from.eq_ignore_ascii_case(&to) {
+            return Err(RymeError::InvalidArgument(String::from("column rename")));
+        }
+        let existing = self
+            .catalog
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        if !existing.iter().any(|definition| definition.name.eq_ignore_ascii_case(&from)) {
+            return Err(RymeError::NotFound(String::from("column")));
+        }
+        if existing.iter().any(|definition| definition.name.eq_ignore_ascii_case(&to)) {
+            return Err(RymeError::Conflict(String::from("column")));
+        }
+
+        let rows = self.scan_all_rows(&table)?;
+        let mut updates = Vec::with_capacity(rows.len());
+        for (pk, before) in rows {
+            let serde_json::Value::Object(mut object) = serde_json::from_slice(&before)
+                .map_err(|_| RymeError::InvalidArgument(String::from("schema row")))?
+            else {
+                return Err(RymeError::InvalidArgument(String::from("schema row")));
+            };
+            if let Some(actual_name) =
+                object.keys().find(|name| name.eq_ignore_ascii_case(&from)).cloned()
+            {
+                if let Some(value) = object.remove(&actual_name) {
+                    object.insert(to.clone(), value);
+                }
+            }
+            let after = serde_json::to_vec(&serde_json::Value::Object(object))
+                .map_err(|error| RymeError::Internal(error.to_string()))?;
+            updates.push((pk, before, after));
+        }
+
+        if !updates.is_empty() {
+            let mut txn = self.begin_with(self.isolation);
+            for (pk, _, after) in &updates {
+                self.manager.put(
+                    &mut txn,
+                    RecordKey::new(&self.tenant, &self.database, &table, pk),
+                    after.clone(),
+                );
+            }
+            self.manager.commit(txn).await?;
+        }
+        {
+            let mut catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
+            let definitions = catalog
+                .get_mut(&table)
+                .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+            if let Some(definition) = definitions
+                .iter_mut()
+                .find(|definition| definition.name.eq_ignore_ascii_case(&from))
+            {
+                definition.name = to.clone();
+            }
+        }
+        {
+            let mut indexes =
+                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            if let Some(table_indexes) = indexes.get_mut(&table) {
+                for state in table_indexes {
+                    if let Some(indexed) = state.definition.column.as_deref() {
+                        let renamed = rename_index_column(indexed, &from, &to);
+                        if renamed != indexed {
+                            state.definition.column = Some(renamed);
+                            let mut entries = BTreeMap::new();
+                            for (pk, _, after) in &updates {
+                                if let Some(value) = index_value(&state.definition, pk, after) {
+                                    entries
+                                        .entry(value)
+                                        .or_insert_with(std::collections::BTreeSet::new)
+                                        .insert(pk.clone());
+                                }
+                            }
+                            state.entries = entries;
+                        }
+                    }
+                }
+            }
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn ensure_table(&self, table: &str) {
         self.register_table(table.to_string(), Vec::new());
     }
@@ -3495,6 +3646,7 @@ where
             }
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
+            Statement::AlterTableRenameColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
@@ -3520,6 +3672,10 @@ where
             }
             Statement::AlterTableDropColumn { table, column } => {
                 self.alter_table_drop_column(table, column).await?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterTableRenameColumn { table, from, to } => {
+                self.alter_table_rename_column(table, from, to).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreateIndex { name, table, field, column, unique } => {
@@ -4077,6 +4233,7 @@ where
             }
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
+            Statement::AlterTableRenameColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
@@ -4086,6 +4243,7 @@ where
             Statement::CreateTable { .. }
                 | Statement::AlterTableAddColumn { .. }
                 | Statement::AlterTableDropColumn { .. }
+                | Statement::AlterTableRenameColumn { .. }
                 | Statement::CreateIndex { .. }
         );
         let result = match statement {
@@ -4204,6 +4362,10 @@ where
             }
             Statement::AlterTableDropColumn { table, column } => {
                 self.alter_table_drop_column(table, column).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterTableRenameColumn { table, from, to } => {
+                self.alter_table_rename_column(table, from, to).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreateIndex { name, table, field, column, unique } => {
@@ -5674,6 +5836,60 @@ mod tests {
             .catalog_columns("events")
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case("id")));
+    }
+
+    #[tokio::test]
+    async fn alter_table_rename_column_migrates_rows_and_indexes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT UNIQUE)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO users (id, email) VALUES ('u1', 'a@example.com')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX users_email_idx ON users (email)").unwrap())
+            .await
+            .unwrap();
+
+        executor
+            .execute(parse("ALTER TABLE users RENAME COLUMN email TO address").unwrap())
+            .await
+            .unwrap();
+
+        let columns = executor.catalog_columns("users");
+        assert!(columns.iter().any(|column| column.name == "address"));
+        assert!(columns.iter().all(|column| column.name != "email"));
+        let indexes = executor.catalog_indexes("users");
+        assert!(indexes.iter().all(|index| {
+            !index.column.as_deref().is_some_and(|column| column.eq_ignore_ascii_case("email"))
+        }));
+        assert!(indexes.iter().any(|index| {
+            index.name == "users_email_idx"
+                && index.column.as_deref().is_some_and(|column| column == "address")
+        }));
+        let result = executor
+            .execute(parse("SELECT address FROM users WHERE id = 'u1'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"a@example.com".to_vec()]])
+        );
+
+        assert!(executor
+            .execute(
+                parse("INSERT INTO users (id, address) VALUES ('u2', 'a@example.com')").unwrap()
+            )
+            .await
+            .is_err());
+        executor
+            .execute(
+                parse("INSERT INTO users (id, address) VALUES ('u2', 'b@example.com')").unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

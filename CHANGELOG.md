@@ -53,6 +53,8 @@ All notable changes to rymeDB are recorded here. Format follows
   preserves nullability/identity metadata, and persists the updated schema.
 - `ALTER TABLE ... DROP COLUMN` now removes the field from durable JSON rows,
   cleans dependent named indexes, and persists the updated schema.
+- `ALTER TABLE ... RENAME COLUMN` now migrates stored JSON fields and keeps
+  schema-column indexes and uniqueness checks aligned with the new name.
 - SQL aggregate parsing now requires function-call parentheses, so columns named
   `count`, `sum`, `avg`, `min`, or `max` remain valid projections.
 - Aggregates, grouping, and key joins now page through all visible rows instead
