@@ -1104,14 +1104,7 @@ impl SharedState {
         let mut roles = HashSet::new();
         roles.insert(Role::Owner);
         keys.insert(api_key, Principal { id: String::from("dev"), tenant: tenant.clone(), roles });
-        let jwt = std::env::var("RYME_JWT_SECRET").ok().map(|s| {
-            match (std::env::var("RYME_JWT_ISSUER").ok(), std::env::var("RYME_JWT_AUDIENCE").ok()) {
-                (Some(issuer), Some(audience)) => {
-                    JwtVerifier::with_issuer(s.into_bytes(), issuer, audience)
-                }
-                _ => JwtVerifier::new(s.into_bytes()),
-            }
-        });
+        let jwt = load_jwt_verifier()?;
         let archive = archive_target(&config.archive)?;
         let archive_replica = match config.archive_replica.clone() {
             Some(replica) => archive_target(&replica)?,
@@ -6763,6 +6756,80 @@ fn error_response(error: ryme_error::RymeError) -> Response {
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
+    let issuer = std::env::var("RYME_JWT_ISSUER").ok();
+    let audience = std::env::var("RYME_JWT_AUDIENCE").ok();
+    if let Ok(secret) = std::env::var("RYME_JWT_SECRET") {
+        return Ok(Some(match (issuer, audience) {
+            (Some(issuer), Some(audience)) => {
+                JwtVerifier::with_issuer(secret.into_bytes(), issuer, audience)
+            }
+            _ => JwtVerifier::new(secret.into_bytes()),
+        }));
+    }
+
+    let Some(path) = std::env::var_os("RYME_JWT_JWKS_FILE") else {
+        return Ok(None);
+    };
+    let raw = std::fs::read(&path).map_err(|error| {
+        ryme_error::RymeError::InvalidArgument(format!(
+            "jwt jwks file {}: {error}",
+            std::path::Path::new(&path).display()
+        ))
+    })?;
+    let document: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks: {error}")))?;
+    let keys = document
+        .get("keys")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks keys")))?;
+    let requested_kid = std::env::var("RYME_JWT_JWK_KID").ok();
+    let key = keys
+        .iter()
+        .filter(|key| key.get("kty").and_then(|value| value.as_str()) == Some("RSA"))
+        .filter(|key| {
+            key.get("alg")
+                .and_then(|value| value.as_str())
+                .map(|algorithm| algorithm == "RS256")
+                .unwrap_or(true)
+        })
+        .find(|key| {
+            requested_kid
+                .as_deref()
+                .map(|kid| key.get("kid").and_then(|value| value.as_str()) == Some(kid))
+                .unwrap_or(true)
+        })
+        .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks rsa key")))?;
+    let modulus = key
+        .get("n")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus")))
+        .and_then(|value| {
+            ryme_auth::base64_url_decode(value)
+                .map_err(|_| ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus")))
+        })?;
+    let exponent = key
+        .get("e")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent")))
+        .and_then(|value| {
+            ryme_auth::base64_url_decode(value)
+                .map_err(|_| ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent")))
+        })?;
+    let verifier = match (issuer, audience) {
+        (Some(issuer), Some(audience)) => {
+            JwtVerifier::with_rsa_jwk_issuer(modulus, exponent, issuer, audience)
+        }
+        (None, None) => JwtVerifier::with_rsa_jwk(modulus, exponent),
+        _ => {
+            return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                "jwt issuer and audience must be configured together",
+            )))
+        }
+    };
+    Ok(Some(verifier))
 }
 
 fn wire_tenant(

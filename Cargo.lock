@@ -1634,6 +1634,7 @@ dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
  "p256",
+ "ring",
  "ryme-error",
  "serde",
  "serde_json",

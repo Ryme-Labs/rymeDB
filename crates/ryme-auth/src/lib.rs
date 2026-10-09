@@ -212,8 +212,14 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[derive(Debug, Clone)]
+enum JwtKey {
+    Hmac(Vec<u8>),
+    RsaJwk { modulus: Vec<u8>, exponent: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
 pub struct JwtVerifier {
-    secret: Vec<u8>,
+    key: JwtKey,
     leeway_secs: u64,
     issuer: Option<String>,
     audience: Option<String>,
@@ -221,11 +227,35 @@ pub struct JwtVerifier {
 
 impl JwtVerifier {
     pub fn new(secret: Vec<u8>) -> Self {
-        Self { secret, leeway_secs: 60, issuer: None, audience: None }
+        Self { key: JwtKey::Hmac(secret), leeway_secs: 60, issuer: None, audience: None }
     }
 
     pub fn with_issuer(secret: Vec<u8>, issuer: String, audience: String) -> Self {
-        Self { secret, leeway_secs: 60, issuer: Some(issuer), audience: Some(audience) }
+        Self::new(secret).with_claims(Some(issuer), Some(audience))
+    }
+
+    pub fn with_rsa_jwk(modulus: Vec<u8>, exponent: Vec<u8>) -> Self {
+        Self {
+            key: JwtKey::RsaJwk { modulus, exponent },
+            leeway_secs: 60,
+            issuer: None,
+            audience: None,
+        }
+    }
+
+    pub fn with_rsa_jwk_issuer(
+        modulus: Vec<u8>,
+        exponent: Vec<u8>,
+        issuer: String,
+        audience: String,
+    ) -> Self {
+        Self::with_rsa_jwk(modulus, exponent).with_claims(Some(issuer), Some(audience))
+    }
+
+    fn with_claims(mut self, issuer: Option<String>, audience: Option<String>) -> Self {
+        self.issuer = issuer;
+        self.audience = audience;
+        self
     }
 
     pub fn principal_from_token(&self, token: &str, now_secs: u64) -> Result<Principal> {
@@ -239,19 +269,44 @@ impl JwtVerifier {
             return Err(RymeError::Unauthorized);
         }
         let signing_input = format!("{header_b64}.{payload_b64}");
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.secret).map_err(|_| RymeError::Unauthorized)?;
-        mac.update(signing_input.as_bytes());
-        let expected = mac.finalize().into_bytes();
+        let header_raw = base64_url_decode(header_b64).map_err(|_| RymeError::Unauthorized)?;
+        let header: serde_json::Value =
+            serde_json::from_slice(&header_raw).map_err(|_| RymeError::Unauthorized)?;
+        let algorithm = header.get("alg").and_then(|value| value.as_str()).unwrap_or("");
         let presented = base64_url_decode(sig_b64).map_err(|_| RymeError::Unauthorized)?;
-        if !constant_time_equal(&expected, &presented) {
-            return Err(RymeError::Unauthorized);
+        match &self.key {
+            JwtKey::Hmac(secret) => {
+                if algorithm != "HS256" {
+                    return Err(RymeError::Unauthorized);
+                }
+                let mut mac =
+                    Hmac::<Sha256>::new_from_slice(secret).map_err(|_| RymeError::Unauthorized)?;
+                mac.update(signing_input.as_bytes());
+                let expected = mac.finalize().into_bytes();
+                if !constant_time_equal(&expected, &presented) {
+                    return Err(RymeError::Unauthorized);
+                }
+            }
+            JwtKey::RsaJwk { modulus, exponent } => {
+                if algorithm != "RS256" {
+                    return Err(RymeError::Unauthorized);
+                }
+                let public_key =
+                    ring::signature::RsaPublicKeyComponents { n: modulus, e: exponent };
+                public_key
+                    .verify(
+                        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                        signing_input.as_bytes(),
+                        &presented,
+                    )
+                    .map_err(|_| RymeError::Unauthorized)?;
+            }
         }
         let payload_raw = base64_url_decode(payload_b64).map_err(|_| RymeError::Unauthorized)?;
         let claims: serde_json::Value =
             serde_json::from_slice(&payload_raw).map_err(|_| RymeError::Unauthorized)?;
         let exp = claims.get("exp").and_then(|v| v.as_u64()).unwrap_or(0);
-        if exp + self.leeway_secs < now_secs {
+        if exp.saturating_add(self.leeway_secs) < now_secs {
             return Err(RymeError::Unauthorized);
         }
         if let Some(issuer) = self.issuer.as_ref() {
@@ -886,6 +941,62 @@ mod tests {
     fn jwt_reject_bad_signature() {
         let verifier = JwtVerifier::new(b"test-secret".to_vec());
         assert!(verifier.principal_from_token("a.b.c", 1000).is_err());
+    }
+
+    #[test]
+    fn jwt_rejects_algorithm_confusion() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let payload = base64_url_encode(
+            serde_json::to_string(&serde_json::json!({ "sub": "ada", "exp": 2000000000u64 }))
+                .unwrap()
+                .as_bytes(),
+        );
+        let header = base64_url_encode(br#"{"alg":"RS256"}"#);
+        let input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        mac.update(input.as_bytes());
+        let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
+        assert!(JwtVerifier::new(b"secret".to_vec()).principal_from_token(&token, 1000).is_err());
+    }
+
+    #[test]
+    fn jwt_verifies_rs256_jwk() {
+        use base64::Engine;
+        const PRIVATE_KEY: &str = "MIIEpAIBAAKCAQEAksesa1z6EENheQ7vbs6t9HdN1sQmR1ATKmR7+h8QCxDRLjCiNmK40dHlQLpnnMEYOwE4A12eqt8zTY7zV4arusU9/zXoBdJNBppyyee8KydKjSJzBN79sic1qeP0TyP73uyFmXfsmQA6JDEXhTBPuCvFExedDZhf4NVzqN3aILpeKz+Uha0wuGRWi1tIvwLlVB/uGJFywB1eBimv2qrC8+LNiQc6b5hLbQUh//rJ8+boBxXcIGKOHU/e68pc66xKVoU+y0uqkw3v13Usvs/JY8y9y8X/Vqg1PjYG3/wqo346dKOnwzB8NKEQYax//Ez+dnF9ziT7PsLoiAFrUXo5lwIDAQABAoIBADMYaz8cqLhMnHvl5RevvwKhHWmr8p9UkrdpL3dMpOsVOZxYtb808p2n8aRsv3DkDylLLVKOnpNhC5zuLGvFp7Zmv0Q+YbzVDpdD4L3Ee86R6PPkkCGb9rizyYyQnBWIsz9RGtjn1GcWmybKKCPnQ3kbU4ln6PY4mvfLlm2sfShy8R+E/w9bBQ2q5LDPAMRexEkCwoQQ87ukbHDAh28hWZSv4m5zOBAyJXlOpXzCnV5XMiUxogYvDoFMipgTM/9dUnpRx3sU326pkMeURGy2ZcD0dL6s0dPKLLPqVedKfj5kfxdA3Dl26jOq9NLLyL/36cZCyTtRAYi+HfClM9OLsqECgYEAxv3Nk+2Q/5kHvWFwbCn0u1Fbgv3uuDT/2vlpW1Yax/ytnrA3whMg+RFhKArMLKf5NgeAuC7Pz7y03HuPTgbtPH+HIEHeYCEUUBZz+kFDbPvMNXYQAjuBeinh1y7B2F1yZ93XiRDw7GDGROmWFWVRtw4guzUNCFKptlHzfkTnCb8CgYEAvNSjumP5wr5G0z93LRFNLMYSRrc401AoTkZOGLC4XlzJsajgof+TJ2jQFtNFQeDOBhAlxIsRG95FXuTdrLlq8R4cD0QwMmonaaetjfRZUmG9AcH6TC+kIha9sJr7pSSwQ3oYF9kEEiTQTwdri5rySE2gDgDRyNh82uEeo+as1ikCgYBs7AY4X8SLtBdBeXGRM1ILqpfd1uNxn0khcn5SCYq1R0E96JVMvS3CR9oXkfl6xCMsiOTTbIRB4LhbK6Mggbgf8mpjpMp1cgXtZKztIgYnRJjd9pcCsdHIrd457BUdOuFhq1PMaiKGMN62X+nQIlqdSbVu47YThTPyYV9YEZ0pfwKBgQC7n5TneLsMMz/wWpkx4IUMPeqe9SKzZGwICndCtSUcLZoCusgobudqOwy4AUhJgvNytsywE3X2eM340fMo0jteRQqgaKJzFWL/6inaaLXv00mX24O1+4hcjrgAKJ5topy5DzGtUGZpGMcaH0dOubCPAwJLp6jKpcC5QwHM3UFSsQKBgQCBDeN3Ht8rq/gzca1R4U3QJmFCl9Ba9AJLH6PgeBTkBD+ZeZPFJjnahCmcunMUqvkaqffgUi+/YRIasgGtASHoZff3wx0wmEjB2L729ZH3OyADhzBiqB26DXtLfXbmPE1fRoUTvG1PgNonAFXsxJTd6fHl5tgcA2o77nFrlr7i/w==";
+        let private_key = base64::engine::general_purpose::STANDARD.decode(PRIVATE_KEY).unwrap();
+        let key_pair = ring::signature::RsaKeyPair::from_der(&private_key).unwrap();
+        let header = base64_url_encode(br#"{"alg":"RS256","kid":"test"}"#);
+        let payload = base64_url_encode(
+            serde_json::to_string(&serde_json::json!({
+                "sub": "ada",
+                "tenant": "t",
+                "roles": ["readonly"],
+                "exp": 2000000000u64,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        let input = format!("{header}.{payload}");
+        let mut signature = vec![0; key_pair.public().modulus_len()];
+        key_pair
+            .sign(
+                &ring::signature::RSA_PKCS1_SHA256,
+                &ring::rand::SystemRandom::new(),
+                input.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+        let token = format!("{input}.{}", base64_url_encode(&signature));
+        let verifier = JwtVerifier::with_rsa_jwk(
+            base64::engine::general_purpose::STANDARD
+                .decode("ksesa1z6EENheQ7vbs6t9HdN1sQmR1ATKmR7+h8QCxDRLjCiNmK40dHlQLpnnMEYOwE4A12eqt8zTY7zV4arusU9/zXoBdJNBppyyee8KydKjSJzBN79sic1qeP0TyP73uyFmXfsmQA6JDEXhTBPuCvFExedDZhf4NVzqN3aILpeKz+Uha0wuGRWi1tIvwLlVB/uGJFywB1eBimv2qrC8+LNiQc6b5hLbQUh//rJ8+boBxXcIGKOHU/e68pc66xKVoU+y0uqkw3v13Usvs/JY8y9y8X/Vqg1PjYG3/wqo346dKOnwzB8NKEQYax//Ez+dnF9ziT7PsLoiAFrUXo5lw==")
+                .unwrap(),
+            base64_url_decode("AQAB").unwrap(),
+        );
+        let principal = verifier.principal_from_token(&token, 1000).unwrap();
+        assert_eq!(principal.id, "ada");
+        assert!(principal.roles.contains(&Role::ReadOnly));
     }
 
     #[test]

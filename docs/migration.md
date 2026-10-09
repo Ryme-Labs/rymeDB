@@ -292,7 +292,11 @@ Password register/verify, TOTP setup/verify, WebAuthn challenge, column
 masking, and OIDC: `POST /v1/auth/oidc/login` builds the provider
 authorization URL from `RYME_OIDC_*` env; `POST /v1/auth/oidc/token`
 verifies an HS256 ID token (`iss`/`aud`/`exp`) and returns a principal
-receipt. RS256/JWKS discovery is future work; configure one HMAC provider
+receipt. It can also verify RS256 tokens from a mounted JWKS JSON file. Set
+`RYME_JWT_JWKS_FILE` to the file path and optionally set
+`RYME_JWT_JWK_KID` when the file contains more than one RSA signing key.
+For either mode, set `RYME_JWT_ISSUER` and `RYME_JWT_AUDIENCE` together to
+enforce the expected issuer and audience. Configure one HMAC provider
 per node. `POST /v1/auth/token` returns the existing API key plus an opaque
 30-day refresh token. Send `{"grant_type":"refresh_token",
 "refresh_token":"..."}` to rotate it; each refresh token is single-use,
