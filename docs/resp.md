@@ -10,7 +10,7 @@ pins every row):
 
 | Group | Commands |
 | --- | --- |
-| Connection | `PING` |
+| Connection | `PING`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` (atomic, see below) |
 | Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`GET`), `GETDEL`, `MGET`, `MSET`, `APPEND`, `STRLEN` |
 | Counters | `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT` (clean float formatting, saturating integers) |
@@ -94,9 +94,10 @@ arity, `value is not an integer or out of range`) surface as error elements in t
 while the remaining commands still apply, matching Redis. Nested
 `MULTI` and bare `EXEC`/`DISCARD` are rejected.
 
-Not yet covered: Lua scripting and pub/sub over RESP (use the WebSocket
-realtime API instead). `KEYS` is supported for compatibility, but it scans
-the complete keyspace synchronously; use `SCAN` for production traffic.
+Not yet covered: Lua scripting. RESP pub/sub is in-memory and best-effort;
+durable replay and query subscriptions remain available through the WebSocket
+realtime API. `KEYS` is supported for compatibility, but it scans the complete
+keyspace synchronously; use `SCAN` for production traffic.
 These return `unknown command` rather than a wrong answer.
 
 ## Connection management

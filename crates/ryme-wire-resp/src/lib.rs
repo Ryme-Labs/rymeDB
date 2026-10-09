@@ -11,6 +11,7 @@ use ryme_txn::{Transaction, TxnBackend, TxnManager};
 use std::sync::{atomic::AtomicU64, Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 
 const KV_TABLE: &str = "_kv";
 
@@ -31,6 +32,7 @@ pub struct RespGateway<B = TxnManager> {
     slow_log: Option<SlowLog>,
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
+    pubsub: PubSubBus,
     next_client_id: Arc<AtomicU64>,
     read_only: bool,
 }
@@ -54,6 +56,67 @@ struct ClientState {
     name: Option<Vec<u8>>,
     id: u64,
     authenticated: bool,
+    subscriptions: std::collections::BTreeSet<Vec<u8>>,
+    pubsub: Option<PubSubBus>,
+}
+
+#[derive(Debug, Clone)]
+struct PubSubMessage {
+    channel: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PubSubBus {
+    sender: broadcast::Sender<PubSubMessage>,
+    counts: Arc<Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
+}
+
+fn new_pubsub() -> PubSubBus {
+    PubSubBus {
+        sender: broadcast::channel(4096).0,
+        counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+    }
+}
+
+impl PubSubBus {
+    fn subscribe(&self) -> broadcast::Receiver<PubSubMessage> {
+        self.sender.subscribe()
+    }
+
+    fn add(&self, channel: &[u8]) {
+        if let Ok(mut counts) = self.counts.lock() {
+            *counts.entry(channel.to_vec()).or_default() += 1;
+        }
+    }
+
+    fn remove(&self, channel: &[u8]) {
+        if let Ok(mut counts) = self.counts.lock() {
+            if let Some(count) = counts.get_mut(channel) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(channel);
+                }
+            }
+        }
+    }
+
+    fn publish(&self, channel: Vec<u8>, payload: Vec<u8>) -> usize {
+        let delivered =
+            self.counts.lock().ok().and_then(|counts| counts.get(&channel).copied()).unwrap_or(0);
+        let _ = self.sender.send(PubSubMessage { channel, payload });
+        delivered
+    }
+}
+
+impl Drop for ClientState {
+    fn drop(&mut self) {
+        if let Some(pubsub) = &self.pubsub {
+            for channel in &self.subscriptions {
+                pubsub.remove(channel);
+            }
+        }
+    }
 }
 
 impl RespGateway<TxnManager> {
@@ -72,6 +135,7 @@ impl RespGateway<TxnManager> {
             slow_log: None,
             traces: None,
             range_hook: RangeLoadHook::default(),
+            pubsub: new_pubsub(),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
         }
@@ -92,6 +156,7 @@ impl RespGateway<TxnManager> {
             slow_log: None,
             traces: None,
             range_hook: RangeLoadHook::default(),
+            pubsub: new_pubsub(),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
         }
@@ -117,6 +182,7 @@ where
             slow_log: None,
             traces: None,
             range_hook: RangeLoadHook::default(),
+            pubsub: new_pubsub(),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
         }
@@ -266,6 +332,8 @@ where
             name: None,
             id: self.next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             authenticated: self.authenticator.is_none(),
+            subscriptions: std::collections::BTreeSet::new(),
+            pubsub: Some(self.pubsub.clone()),
         }
     }
 
@@ -402,6 +470,51 @@ where
         }
     }
 
+    fn subscribe(&self, channels: &[Vec<u8>], client: &mut ClientState) -> Vec<u8> {
+        if channels.is_empty() {
+            return encode_error(String::from("wrong args"));
+        }
+        let mut replies = Vec::with_capacity(channels.len());
+        for channel in channels {
+            if client.subscriptions.insert(channel.clone()) {
+                self.pubsub.add(channel);
+            }
+            replies.push(encode_raw_array(vec![
+                encode_bulk(b"subscribe"),
+                encode_bulk(channel),
+                encode_integer(client.subscriptions.len() as i64),
+            ]));
+        }
+        replies.into_iter().flatten().collect()
+    }
+
+    fn unsubscribe(&self, channels: &[Vec<u8>], client: &mut ClientState) -> Vec<u8> {
+        let channels: Vec<Vec<u8>> = if channels.is_empty() {
+            client.subscriptions.iter().cloned().collect()
+        } else {
+            channels.to_vec()
+        };
+        if channels.is_empty() {
+            return encode_raw_array(vec![
+                encode_bulk(b"unsubscribe"),
+                encode_null(),
+                encode_integer(0),
+            ]);
+        }
+        let mut replies = Vec::with_capacity(channels.len());
+        for channel in channels {
+            if client.subscriptions.remove(&channel) {
+                self.pubsub.remove(&channel);
+            }
+            replies.push(encode_raw_array(vec![
+                encode_bulk(b"unsubscribe"),
+                encode_bulk(&channel),
+                encode_integer(client.subscriptions.len() as i64),
+            ]));
+        }
+        replies.into_iter().flatten().collect()
+    }
+
     fn cdc_pending(
         &self,
         txn: &Transaction,
@@ -508,7 +621,7 @@ where
         }
     }
 
-    async fn handle<S>(&self, mut socket: S) -> Result<()>
+    async fn handle<S>(&self, socket: S) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -517,13 +630,33 @@ where
         // turns a single read into a syscall storm, while an unbounded reply
         // buffer would let a client consume arbitrary memory.
         const WRITE_BATCH_BYTES: usize = 64 * 1024;
+        let (mut reader, mut writer) = tokio::io::split(socket);
         let mut service = self.clone();
         let mut buffer = vec![0u8; 65536];
         let mut pending: Vec<u8> = Vec::new();
         let mut multi: Option<Multi> = None;
         let mut client = service.fresh_client();
+        let mut pubsub = service.pubsub.subscribe();
         loop {
-            let read = socket.read(&mut buffer).await.map_err(|e| RymeError::Io(e.to_string()))?;
+            let read = tokio::select! {
+                read = reader.read(&mut buffer) => {
+                    Some(read.map_err(|e| RymeError::Io(e.to_string()))?)
+                }
+                message = pubsub.recv(), if !client.subscriptions.is_empty() => {
+                    if let Ok(message) = message {
+                        if client.subscriptions.contains(&message.channel) {
+                            let reply = encode_raw_array(vec![
+                                encode_bulk(b"message"),
+                                encode_bulk(&message.channel),
+                                encode_bulk(&message.payload),
+                            ]);
+                            writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                        }
+                    }
+                    None
+                }
+            };
+            let Some(read) = read else { continue };
             if read == 0 {
                 return Ok(());
             }
@@ -533,7 +666,7 @@ where
             while let Some((command, command_bytes)) = decode_command(&pending[consumed..])? {
                 consumed += command_bytes;
                 if !replies.is_empty() && Self::may_block(&command, &multi) {
-                    socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    writer.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     replies.clear();
                 }
                 let reply = service.dispatch_conn(command, &mut multi, &mut client).await;
@@ -543,7 +676,7 @@ where
                 };
                 replies.extend_from_slice(&reply);
                 if replies.len() >= WRITE_BATCH_BYTES {
-                    socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    writer.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     replies.clear();
                 }
             }
@@ -553,7 +686,7 @@ where
                 pending.drain(..consumed);
             }
             if !replies.is_empty() {
-                socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                writer.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             if pending.len() > 1024 * 1024 {
                 return Err(RymeError::Overload(String::from("request")));
@@ -608,6 +741,8 @@ where
                 self.record_timing("CLIENT", start.elapsed().as_micros() as u64);
                 reply
             }
+            "SUBSCRIBE" => self.subscribe(&command.args, client),
+            "UNSUBSCRIBE" => self.unsubscribe(&command.args, client),
             "MULTI" => {
                 if multi.is_some() {
                     return encode_error(String::from("MULTI calls can not be nested"));
@@ -923,6 +1058,14 @@ where
     fn dispatch_in(&self, txn: &mut Transaction, command: RespCommand) -> Vec<u8> {
         match command.name.as_str() {
             "PING" => encode_simple("PONG"),
+            "PUBLISH" => {
+                if command.args.len() != 2 {
+                    return encode_error(String::from("wrong args"));
+                }
+                let delivered =
+                    self.pubsub.publish(command.args[0].clone(), command.args[1].clone());
+                encode_integer(delivered as i64)
+            }
             "ECHO" => match command.args.first() {
                 Some(message) => encode_bulk(message),
                 None => encode_error(String::from("wrong args")),
@@ -4318,6 +4461,7 @@ fn is_known(name: &str) -> bool {
         name,
         "PING"
             | "ECHO"
+            | "PUBLISH"
             | "AUTH"
             | "GET"
             | "SET"

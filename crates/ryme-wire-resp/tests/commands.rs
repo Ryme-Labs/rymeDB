@@ -27,6 +27,24 @@ async fn command(addr: std::net::SocketAddr, parts: &[&str]) -> String {
     String::from_utf8(raw).unwrap().trim().to_string()
 }
 
+async fn read_reply(socket: &mut tokio::net::TcpStream) -> String {
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 4096];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before reply");
+            raw.extend_from_slice(&chunk[..read]);
+            if raw.ends_with(b"\r\n") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    String::from_utf8(raw).unwrap()
+}
+
 async fn serve() -> std::net::SocketAddr {
     let gateway = ryme_wire_resp::RespGateway::new(String::from("t"), String::from("d"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -35,6 +53,26 @@ async fn serve() -> std::net::SocketAddr {
         let _ = gateway.serve(listener).await;
     });
     addr
+}
+
+#[tokio::test]
+async fn pubsub_delivers_messages_to_subscribed_connections() {
+    let addr = serve().await;
+    let mut subscriber = tokio::net::TcpStream::connect(addr).await.unwrap();
+    subscriber.write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nchat\r\n").await.unwrap();
+    assert_eq!(read_reply(&mut subscriber).await, "*3\r\n$9\r\nsubscribe\r\n$4\r\nchat\r\n:1\r\n");
+
+    assert_eq!(command(addr, &["PUBLISH", "chat", "hello"]).await, ":1");
+    assert_eq!(
+        read_reply(&mut subscriber).await,
+        "*3\r\n$7\r\nmessage\r\n$4\r\nchat\r\n$5\r\nhello\r\n"
+    );
+
+    subscriber.write_all(b"*1\r\n$11\r\nUNSUBSCRIBE\r\n").await.unwrap();
+    assert_eq!(
+        read_reply(&mut subscriber).await,
+        "*3\r\n$11\r\nunsubscribe\r\n$4\r\nchat\r\n:0\r\n"
+    );
 }
 
 #[tokio::test]
