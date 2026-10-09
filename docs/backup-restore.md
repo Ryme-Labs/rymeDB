@@ -44,12 +44,19 @@ Response shape: `{ "commit": <u64>, "files": [<names>] }`. Snapshots are the
 unit that gets shipped to the archive and the unit you copy back for
 single-node disaster recovery.
 
+Durable managers also write an immutable checksummed `.sst` segment under
+`<wal-dir>/segments` for each snapshot. The segment is sorted by logical
+record key and carries a sparse key index plus Bloom filter metadata. It is a
+recovery fallback when the snapshot pointer is unavailable; WAL replay still
+covers commits newer than the segment.
+
 Archives include the SQL and control-plane metadata files: `schema.json`,
 `branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema
 snapshots are stored under `branch-schemas/<tenant>/<branch>.json`. Restore
 preserves those relative paths, so branch definitions and branch-only tables
 survive a disaster-recovery restore alongside the committed rows. The server
-rebuilds secondary-index entries from the committed rows.
+also archives immutable `.sst` segment artifacts, and rebuilds
+secondary-index entries from the committed rows.
 
 ## Archive
 

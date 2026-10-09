@@ -1245,6 +1245,14 @@ impl SharedState {
                     .to_string();
                 files.push((format!("{prefix}{name}"), std::fs::read(&path)?));
             }
+            for path in immutable_segment_files(&log_dir)? {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| ryme_error::RymeError::Internal(String::from("segment name")))?
+                    .to_string();
+                files.push((format!("{prefix}sst-{name}"), std::fs::read(&path)?));
+            }
         }
         let id = backup_id.unwrap_or_else(|| format!("auto-{commit}"));
         let manifest = match self.active_dek() {
@@ -6710,6 +6718,29 @@ fn wal_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std::path:
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with("seg-") && name.ends_with(".wal") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn immutable_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let segments = dir.join("segments");
+    let entries = match std::fs::read_dir(&segments) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if name.starts_with("segment-") && name.ends_with(".sst") {
             out.push(path);
         }
     }

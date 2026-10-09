@@ -2,6 +2,9 @@ use ryme_error::{Result, RymeError};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
+mod segment;
+pub use segment::{ImmutableSegment, SegmentMeta, SegmentStore};
+
 #[derive(Debug, Clone)]
 pub struct TableVersion {
     pub commit_ts: u64,
@@ -48,7 +51,7 @@ struct Version {
     expires_at: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Engine {
     inner: BTreeMap<RecordKey, Vec<Version>>,
     bytes_held: u64,
@@ -65,6 +68,10 @@ impl Engine {
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub(crate) fn record_keys(&self) -> Vec<RecordKey> {
+        self.inner.keys().cloned().collect()
     }
 
     pub fn is_empty(&self) -> bool {

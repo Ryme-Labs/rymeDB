@@ -1,5 +1,5 @@
 use ryme_error::{Result, RymeError};
-use ryme_storage::{Engine, RecordKey};
+use ryme_storage::{Engine, RecordKey, SegmentStore};
 use ryme_wal::Wal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -990,6 +990,7 @@ fn take_bytes<'a>(cursor: &mut &'a [u8]) -> Result<&'a [u8]> {
 pub struct DurableManager {
     inner: TxnManager,
     wal: Arc<Mutex<Wal>>,
+    segments: Arc<SegmentStore>,
     policy: SyncPolicy,
     dir: std::path::PathBuf,
 }
@@ -997,13 +998,18 @@ pub struct DurableManager {
 impl DurableManager {
     pub fn open(dir: &Path, segment_bytes: u64, policy: SyncPolicy) -> Result<Self> {
         let wal = Wal::open(dir, segment_bytes)?;
+        let segments = Arc::new(SegmentStore::open(&dir.join("segments"))?);
         let manager = Self {
             inner: TxnManager::new(),
             wal: Arc::new(Mutex::new(wal)),
+            segments,
             policy,
             dir: dir.to_path_buf(),
         };
-        let floor = manager.load_latest_snapshot()?.unwrap_or(0);
+        let floor = match manager.load_latest_snapshot()? {
+            Some(floor) => floor,
+            None => manager.load_latest_segment()?.unwrap_or(0),
+        };
         manager.recover_from(floor)?;
         Ok(manager)
     }
@@ -1016,10 +1022,15 @@ impl DurableManager {
         self.dir.join("snapshots")
     }
 
+    pub fn segment_dir(&self) -> std::path::PathBuf {
+        self.segments.dir().to_path_buf()
+    }
+
     pub fn write_snapshot(&self) -> Result<(u64, std::path::PathBuf)> {
         let raw = self.inner.encode_snapshot()?;
         let snapshot = Engine::decode_snapshot(&raw)?;
         let max = snapshot.max_commit_ts();
+        self.segments.write(max, &snapshot)?;
         let dir = self.snapshot_dir();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("snap-{max:020}.rsnap"));
@@ -1049,6 +1060,15 @@ impl DurableManager {
         let path = self.snapshot_dir().join(name.trim());
         let raw = std::fs::read(&path)?;
         Ok(Some(self.inner.restore_snapshot(&raw)?))
+    }
+
+    pub fn load_latest_segment(&self) -> Result<Option<u64>> {
+        let Some(segment) = self.segments.latest()? else {
+            return Ok(None);
+        };
+        let max = segment.meta().max_commit_ts;
+        self.inner.restore_snapshot(&segment.into_engine().encode_snapshot()?)?;
+        Ok(Some(max))
     }
 
     pub fn gc_oldest(&self) -> Result<u64> {
@@ -1132,6 +1152,7 @@ impl DurableManager {
 
     pub fn retention_sweep(&self, snapshot_keep: usize) -> Result<(usize, usize)> {
         let pruned = self.prune_snapshots(snapshot_keep)?;
+        let _segments_pruned = self.segments.prune(snapshot_keep)?;
         let wal_removed = match self.oldest_snapshot()? {
             Some(floor) => self
                 .wal
@@ -1678,6 +1699,36 @@ mod tests {
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"1".to_vec()));
         assert_eq!(reopened.get(&mut probe, &after).unwrap(), Some(b"2".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_fallback_recovers_without_snapshot_or_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-fallback-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let key = RecordKey::new("t", "d", "s", b"segment-only");
+        let mut txn = manager.begin();
+        manager.put(&mut txn, key.clone(), b"durable".to_vec());
+        manager.commit(txn).unwrap();
+        manager.write_snapshot().unwrap();
+        drop(manager);
+
+        std::fs::remove_dir_all(dir.join("snapshots")).unwrap();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+
+        let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"durable".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
