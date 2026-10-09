@@ -492,23 +492,57 @@ where
                                 denied
                             } else {
                                 let start = std::time::Instant::now();
-                                match executor.bulk_upsert(table.clone(), rows).await {
-                                    Ok(count) => {
-                                        observe_statement(&limits, true);
-                                        limits.range_hook.note(table.as_bytes(), count as u64);
-                                        let fingerprint = limits.slow_log.as_ref().map(|_| {
-                                            query_fingerprint(&format!("COPY {table} FROM STDIN"))
-                                        });
-                                        record_timing(
-                                            &limits,
-                                            fingerprint,
-                                            table,
-                                            start.elapsed().as_micros() as u64,
-                                        );
-                                        copy_complete(count)
+                                if let Some(transaction) = active_transaction.as_mut() {
+                                    match executor
+                                        .execute_in_transaction(&mut transaction.txn, statement)
+                                        .await
+                                    {
+                                        Ok((_result, changes)) => {
+                                            let count = rows.len();
+                                            transaction.changes.extend(changes);
+                                            observe_statement(&limits, true);
+                                            limits
+                                                .range_hook
+                                                .note(table.as_bytes(), count.max(1) as u64);
+                                            let fingerprint = limits.slow_log.as_ref().map(|_| {
+                                                query_fingerprint(&format!(
+                                                    "COPY {table} FROM STDIN"
+                                                ))
+                                            });
+                                            record_timing(
+                                                &limits,
+                                                fingerprint,
+                                                table,
+                                                start.elapsed().as_micros() as u64,
+                                            );
+                                            copy_complete(count)
+                                        }
+                                        Err(error) => {
+                                            transaction.failed = true;
+                                            encode_error_code(error_code(&error), error.to_string())
+                                        }
                                     }
-                                    Err(error) => {
-                                        encode_error_code(error_code(&error), error.to_string())
+                                } else {
+                                    match executor.bulk_upsert(table.clone(), rows).await {
+                                        Ok(count) => {
+                                            observe_statement(&limits, true);
+                                            limits.range_hook.note(table.as_bytes(), count as u64);
+                                            let fingerprint = limits.slow_log.as_ref().map(|_| {
+                                                query_fingerprint(&format!(
+                                                    "COPY {table} FROM STDIN"
+                                                ))
+                                            });
+                                            record_timing(
+                                                &limits,
+                                                fingerprint,
+                                                table,
+                                                start.elapsed().as_micros() as u64,
+                                            );
+                                            copy_complete(count)
+                                        }
+                                        Err(error) => {
+                                            encode_error_code(error_code(&error), error.to_string())
+                                        }
                                     }
                                 }
                             }

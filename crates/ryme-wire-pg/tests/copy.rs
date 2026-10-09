@@ -44,6 +44,11 @@ async fn read_until_ready(socket: &mut tokio::net::TcpStream) -> Vec<(u8, Vec<u8
     }
 }
 
+async fn simple(socket: &mut tokio::net::TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+    socket.write_all(&frame(b'Q', format!("{sql}\0").as_bytes())).await.unwrap();
+    read_until_ready(socket).await
+}
+
 #[tokio::test]
 async fn copy_text_protocol_ingests_rows_and_completes() {
     let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
@@ -71,4 +76,47 @@ async fn copy_text_protocol_ingests_rows_and_completes() {
     assert!(frames
         .iter()
         .any(|(tag, body)| { *tag == b'D' && String::from_utf8_lossy(body).contains("v\t2") }));
+}
+
+#[tokio::test]
+async fn copy_inside_transaction_stages_until_commit_and_rolls_back() {
+    let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    let mut socket = startup(addr).await;
+    let _ = simple(&mut socket, "BEGIN").await;
+    socket.write_all(&frame(b'Q', b"COPY tx_docs FROM STDIN\0")).await.unwrap();
+    let (tag, _) = read_frame(&mut socket).await;
+    assert_eq!(tag, b'G');
+    socket.write_all(&frame(b'd', b"k1\tv1\nk2\tv2\n")).await.unwrap();
+    socket.write_all(&frame(b'c', &[])).await.unwrap();
+    let copied = read_until_ready(&mut socket).await;
+    assert!(copied
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("COPY 2") }));
+
+    let staged = simple(&mut socket, "SELECT * FROM tx_docs KEY 'k1'").await;
+    assert!(staged
+        .iter()
+        .any(|(tag, body)| { *tag == b'D' && String::from_utf8_lossy(body).contains("v1") }));
+    let _ = simple(&mut socket, "ROLLBACK").await;
+    let rolled_back = simple(&mut socket, "SELECT * FROM tx_docs KEY 'k1'").await;
+    assert!(!rolled_back.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("v1")));
+
+    let _ = simple(&mut socket, "BEGIN").await;
+    socket.write_all(&frame(b'Q', b"COPY tx_docs FROM STDIN\0")).await.unwrap();
+    let (tag, _) = read_frame(&mut socket).await;
+    assert_eq!(tag, b'G');
+    socket.write_all(&frame(b'd', b"k1\tcommitted\n")).await.unwrap();
+    socket.write_all(&frame(b'c', &[])).await.unwrap();
+    let _ = read_until_ready(&mut socket).await;
+    let _ = simple(&mut socket, "COMMIT").await;
+    let committed = simple(&mut socket, "SELECT * FROM tx_docs KEY 'k1'").await;
+    assert!(committed.iter().any(|(tag, body)| {
+        *tag == b'D' && String::from_utf8_lossy(body).contains("committed")
+    }));
 }
