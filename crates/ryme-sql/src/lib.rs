@@ -452,7 +452,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         "ALTER" => parse_alter(&tokens, input),
         "UPSERT" => parse_upsert(&tokens),
         "INSERT" => parse_insert(&tokens, input),
-        "SELECT" => parse_select(&tokens),
+        "SELECT" => parse_select(&tokens, input),
         "UPDATE" => parse_update(&tokens, input),
         "DELETE" => parse_delete(&tokens),
         "COPY" => parse_copy(&tokens),
@@ -1060,39 +1060,95 @@ fn parse_delete(tokens: &[String]) -> Result<Statement> {
     Ok(Statement::Delete { table, pk: pk.into_bytes() })
 }
 
-fn parse_select(tokens: &[String]) -> Result<Statement> {
+fn select_items(raw: &str) -> Option<Vec<String>> {
+    let statement = raw.trim().trim_end_matches(';').trim();
+    if !statement.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("SELECT")) {
+        return None;
+    }
+    let from = find_sql_keyword(statement, "FROM", 6)?;
+    Some(split_sql_items(statement[6..from].trim()))
+}
+
+fn find_sql_keyword(input: &str, keyword: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (index, ch) in input.char_indices() {
+        if index < start {
+            continue;
+        }
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                continue;
+            }
+            '(' => {
+                depth += 1;
+                continue;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            _ => {}
+        }
+        if depth != 0
+            || !input[index..]
+                .get(..keyword.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+        {
+            continue;
+        }
+        let previous_is_word = input[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|previous| previous.is_ascii_alphanumeric() || previous == '_');
+        let next_is_word = input[index + keyword.len()..]
+            .chars()
+            .next()
+            .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_');
+        if !previous_is_word && !next_is_word {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn parse_aggregate_item(raw: &str) -> Option<Result<(AggFunc, Field)>> {
+    let item = raw.trim();
+    let name_end = item.find(|character: char| character.is_whitespace() || character == '(')?;
+    let func = AggFunc::parse(&item[..name_end])?;
+    if !item[name_end..].trim_start().starts_with('(') {
+        return None;
+    }
+    let tokens = tokenize(item);
+    let field = match tokens.get(1).map(String::as_str) {
+        Some("*") if func == AggFunc::Count => Ok(Field::Value),
+        Some("*") => Err(RymeError::InvalidArgument(String::from("aggregate field"))),
+        Some(name) => parse_field(name)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("aggregate field"))),
+        None => Err(RymeError::InvalidArgument(String::from("aggregate field"))),
+    };
+    Some(field.map(|field| (func, field)))
+}
+
+fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "FROM")?;
     if tokens.iter().any(|t| t.eq_ignore_ascii_case("GROUP")) {
-        return parse_group(tokens, &table);
+        return parse_group(tokens, &table, raw);
     }
-    if tokens.len() > 2 {
-        let func = if tokens[1].eq_ignore_ascii_case("COUNT") {
-            Some(AggFunc::Count)
-        } else if tokens[1].eq_ignore_ascii_case("SUM") {
-            Some(AggFunc::Sum)
-        } else if tokens[1].eq_ignore_ascii_case("AVG") {
-            Some(AggFunc::Avg)
-        } else if tokens[1].eq_ignore_ascii_case("MIN") {
-            Some(AggFunc::Min)
-        } else if tokens[1].eq_ignore_ascii_case("MAX") {
-            Some(AggFunc::Max)
-        } else {
-            None
-        };
-        if let Some(func) = func {
-            let field = match tokens.get(2).map(|s| s.as_str()) {
-                Some("*") if func == AggFunc::Count => Field::Value,
-                Some("*") => {
-                    return Err(RymeError::InvalidArgument(String::from("aggregate field")));
-                }
-                Some(name) => parse_field(name)
-                    .ok_or_else(|| RymeError::InvalidArgument(String::from("aggregate field")))?,
-                None => {
-                    return Err(RymeError::InvalidArgument(String::from("aggregate field")));
-                }
-            };
-            let filter = parse_where_filter(tokens)?;
-            return Ok(Statement::Aggregate { table, func, field, filter });
+    if let Some(items) = select_items(raw) {
+        if items.len() == 1 {
+            if let Some(aggregate) = parse_aggregate_item(&items[0]) {
+                let (func, field) = aggregate?;
+                let filter = parse_where_filter(tokens)?;
+                return Ok(Statement::Aggregate { table, func, field, filter });
+            }
         }
     }
     let has_where = tokens.iter().any(|t| t.eq_ignore_ascii_case("WHERE"));
@@ -1142,35 +1198,26 @@ fn parse_projection(tokens: &[String]) -> Result<Option<Vec<String>>> {
     Ok(Some(columns))
 }
 
-fn parse_group(tokens: &[String], table: &str) -> Result<Statement> {
+fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
     let from_pos = tokens
         .iter()
         .position(|t| t.eq_ignore_ascii_case("FROM"))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("missing table")))?;
     let mut select = Vec::new();
-    let mut index = 1usize;
-    while index < from_pos {
-        let token = &tokens[index];
-        if let Some(func) = AggFunc::parse(token) {
-            let field = match tokens.get(index + 1).map(|s| s.as_str()) {
-                Some("*") if func == AggFunc::Count => Field::Value,
-                Some("*") => {
-                    return Err(RymeError::InvalidArgument(String::from("aggregate field")));
-                }
-                Some(name) => parse_field(name)
-                    .ok_or_else(|| RymeError::InvalidArgument(String::from("aggregate field")))?,
-                None => {
-                    return Err(RymeError::InvalidArgument(String::from("aggregate field")));
-                }
-            };
+    let items =
+        select_items(raw).ok_or_else(|| RymeError::InvalidArgument(String::from("select item")))?;
+    for item in items {
+        if let Some(aggregate) = parse_aggregate_item(&item) {
+            let (func, field) = aggregate?;
             select.push(SelectItem::Agg(func, field));
-            index += 2;
             continue;
         }
-        if let Some(field) = parse_field(token) {
-            select.push(SelectItem::Field(field));
-            index += 1;
-            continue;
+        let item_tokens = tokenize(&item);
+        if item_tokens.len() == 1 {
+            if let Some(field) = parse_field(&item_tokens[0]) {
+                select.push(SelectItem::Field(field));
+                continue;
+            }
         }
         return Err(RymeError::InvalidArgument(String::from("select item")));
     }
@@ -5380,6 +5427,40 @@ mod tests {
         assert!(plan.contains("aggregate"));
         assert!(plan.contains("filters 1"));
         assert!(parse("SELECT SUM(*) FROM nums").is_err());
+    }
+
+    #[tokio::test]
+    async fn aggregate_names_are_valid_projection_columns_without_parentheses() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE metrics (id TEXT PRIMARY KEY, count INTEGER, sum INTEGER, avg INTEGER, min INTEGER, max INTEGER)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO metrics (id, count, sum, avg, min, max) VALUES ('m1', 1, 2, 3, 4, 5)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        for (column, expected) in
+            [("count", b"1"), ("sum", b"2"), ("avg", b"3"), ("min", b"4"), ("max", b"5")]
+        {
+            let statement =
+                parse(&format!("SELECT {column} FROM metrics WHERE id = 'm1'")).unwrap();
+            assert!(matches!(statement, Statement::SelectColumns { .. }), "{column}");
+            let result = executor.execute(statement).await.unwrap();
+            assert!(
+                matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![expected.to_vec()]]),
+                "{column}"
+            );
+        }
     }
 
     #[tokio::test]

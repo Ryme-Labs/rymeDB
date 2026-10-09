@@ -111,10 +111,11 @@ AND value != 'y'] [ORDER BY key|value ASC|DESC] [LIMIT n] [OFFSET n]`.
 Predicates evaluate on stored bytes as text; plain scans stream the ordered
 range while filtered/ordered/paged scans evaluate the head 10k rows in key
 order unless an equality predicate can use a maintained secondary index.
-Aggregates: `SELECT COUNT(*) | COUNT(field) | SUM | AVG | MIN | MAX (field)
+Aggregates: `SELECT COUNT(*) | COUNT(field) | SUM(field) | AVG(field) | MIN(field) | MAX(field)
 FROM t [WHERE ...]` compute over the head 10k filtered rows; numerics parse
 as f64 with non-numeric values skipped (`SUM` over none yields `0`,
-`AVG`/`MIN`/`MAX` over none yield `null`). No `GROUP BY` in v1.
+`AVG`/`MIN`/`MAX` over none yield `null`). Aggregate names without parentheses
+are treated as ordinary projected columns.
 Key-equality joins: `SELECT * FROM a JOIN b ON KEY = KEY [WHERE ...]
 [ORDER BY ...] [LIMIT n] [OFFSET n]` hash-joins on primary-key bytes and
 returns rows shaped `{"left": ..., "right": ...}` (lossy UTF-8). Only
