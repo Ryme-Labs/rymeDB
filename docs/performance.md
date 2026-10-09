@@ -111,8 +111,14 @@ ryme-bench realtime --addr 127.0.0.1:3000 --api-key ryme-dev-key \
 The command opens all subscribers before publishing, sends authenticated
 `POST /v1/broadcast` requests with bounded concurrency, and waits for every
 subscriber to receive every successful publish. It reports publisher qps,
-fanout deliveries per second, delivery percentage, and errors. A run is only
-valid when `publish_errors=0`, `receive_errors=0`, and `delivery_percent=100`;
+fanout deliveries per second, sampled publisher-to-client latency percentiles,
+delivery percentage, and errors. The benchmark carries a monotonic timestamp
+from the publisher process in each payload, so the latency fields are valid
+for same-process or same-host comparisons; cross-host runs require synchronized
+clocks or should treat those fields as advisory. A run is only valid when
+`publish_errors=0`, `receive_errors=0`, and `delivery_percent=100`;
+the initial intra-region realtime target is
+`publish_to_client_p50_us <= 10000` and `publish_to_client_p99_us <= 50000`.
 record the CPU, memory, payload, connection count, publish concurrency, and
 server QoS tier beside the result. Broadcast channels use a dedicated
 32-shard registry and sequence allocation path, separate from CDC/query,

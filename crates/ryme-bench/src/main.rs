@@ -161,6 +161,7 @@ async fn realtime_bench(config: RealtimeBench) {
         eprintln!("connections and messages must be greater than zero");
         return;
     }
+    let benchmark_start = Instant::now();
     let ws_url =
         format!("ws://{}/v1/broadcast/{}?api_key={}", config.addr, config.channel, config.api_key);
     let mut streams = Vec::with_capacity(config.connections);
@@ -189,11 +190,14 @@ async fn realtime_bench(config: RealtimeBench) {
 
     let published_target = Arc::new(AtomicUsize::new(usize::MAX));
     let mut readers = Vec::with_capacity(streams.len());
+    let latency_sample_limit = (1_000_000 / config.connections.max(1)).max(1);
     for mut stream in streams {
         let published_target = published_target.clone();
+        let benchmark_start = benchmark_start;
         readers.push(tokio::spawn(async move {
             let mut received = 0usize;
             let mut errors = 0usize;
+            let mut latency_micros = Vec::with_capacity(latency_sample_limit);
             loop {
                 let target = published_target.load(Ordering::Acquire);
                 if target == usize::MAX {
@@ -205,7 +209,27 @@ async fn realtime_bench(config: RealtimeBench) {
                 }
                 match tokio::time::timeout(std::time::Duration::from_secs(60), stream.next()).await
                 {
-                    Ok(Some(Ok(Message::Text(_)))) => received += 1,
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        received += 1;
+                        if latency_micros.len() < latency_sample_limit {
+                            if let Ok(event) =
+                                serde_json::from_str::<serde_json::Value>(text.as_ref())
+                            {
+                                if let Some(sent_ns) = event
+                                    .get("payload")
+                                    .and_then(|payload| payload.get("sent_ns"))
+                                    .and_then(serde_json::Value::as_u64)
+                                {
+                                    let now_ns =
+                                        benchmark_start.elapsed().as_nanos().min(u64::MAX as u128)
+                                            as u64;
+                                    if now_ns >= sent_ns {
+                                        latency_micros.push((now_ns - sent_ns) / 1_000);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Ok(Some(Ok(Message::Ping(payload)))) => {
                         if stream.send(Message::Pong(payload)).await.is_err() {
                             errors += 1;
@@ -220,7 +244,7 @@ async fn realtime_bench(config: RealtimeBench) {
                 }
             }
             let _ = stream.close(None).await;
-            (received, errors)
+            (received, errors, latency_micros)
         }));
     }
 
@@ -241,7 +265,11 @@ async fn realtime_bench(config: RealtimeBench) {
                     .bearer_auth(api_key)
                     .json(&serde_json::json!({
                         "channel": channel,
-                        "payload": {"index": index, "data": payload["data"]}
+                        "payload": {
+                            "index": index,
+                            "sent_ns": benchmark_start.elapsed().as_nanos().min(u64::MAX as u128),
+                            "data": payload["data"]
+                        }
                     }))
                     .send()
                     .await
@@ -260,17 +288,32 @@ async fn realtime_bench(config: RealtimeBench) {
     let receive_start = Instant::now();
     let mut received = 0usize;
     let mut receive_errors = 0usize;
+    let mut latency_micros = Vec::new();
     for reader in readers {
         match reader.await {
-            Ok((count, errors)) => {
+            Ok((count, errors, mut samples)) => {
                 received += count;
                 receive_errors += errors;
+                latency_micros.append(&mut samples);
             }
             Err(_) => receive_errors += 1,
         }
     }
     let total_seconds = publish_start.elapsed().as_secs_f64().max(0.000001);
     let receive_seconds = receive_start.elapsed().as_secs_f64().max(0.000001);
+    latency_micros.sort_unstable();
+    let latency_percentile = |percentile: f64| -> u64 {
+        if latency_micros.is_empty() {
+            return 0;
+        }
+        let index = ((percentile / 100.0) * latency_micros.len() as f64).floor() as usize;
+        latency_micros[index.min(latency_micros.len() - 1)]
+    };
+    let latency_samples = latency_micros.len();
+    let latency_p50 = latency_percentile(50.0);
+    let latency_p95 = latency_percentile(95.0);
+    let latency_p99 = latency_percentile(99.0);
+    let latency_max = latency_micros.last().copied().unwrap_or(0);
     let result = RealtimeResult {
         published,
         publish_errors,
@@ -297,13 +340,18 @@ async fn realtime_bench(config: RealtimeBench) {
         "publish_qps": (result.published as f64 / result.publish_seconds).round() as u64,
         "fanout_deliveries_per_second":
             (result.received as f64 / receive_seconds).round() as u64,
+        "latency_samples": latency_samples,
+        "publish_to_client_p50_us": latency_p50,
+        "publish_to_client_p95_us": latency_p95,
+        "publish_to_client_p99_us": latency_p99,
+        "publish_to_client_max_us": latency_max,
         "total_seconds": (result.total_seconds * 1000.0).round() / 1000.0,
     });
     if config.json {
         println!("{output}");
     } else {
         println!(
-            "target={} connections={} messages={} published={} publish_errors={} received={} receive_errors={} delivery={delivery_percent:.2}% publish_qps={} fanout_deliveries_per_second={} total_seconds={:.3}",
+            "target={} connections={} messages={} published={} publish_errors={} received={} receive_errors={} delivery={delivery_percent:.2}% publish_qps={} fanout_deliveries_per_second={} latency_samples={} publish_to_client_p50={}us publish_to_client_p95={}us publish_to_client_p99={}us publish_to_client_max={}us total_seconds={:.3}",
             config.addr,
             result.connections,
             result.messages,
@@ -313,6 +361,11 @@ async fn realtime_bench(config: RealtimeBench) {
             result.receive_errors,
             (result.published as f64 / result.publish_seconds).round() as u64,
             (result.received as f64 / receive_seconds).round() as u64,
+            latency_samples,
+            latency_p50,
+            latency_p95,
+            latency_p99,
+            latency_max,
             result.total_seconds,
         );
     }

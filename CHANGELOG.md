@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- The realtime benchmark now reports sampled publisher-to-client fanout
+  latency (`p50`, `p95`, `p99`, and `max`) alongside delivery and throughput.
 - PostgreSQL prepared parameters now bind only real placeholders outside SQL
   literals and comments, handle multi-digit references, preserve scalar
   `NULL`/boolean/numeric values, and escape text safely.
