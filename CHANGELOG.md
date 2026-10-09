@@ -8,9 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
-- Basic PostgreSQL CTEs now rewrite simple `WITH name AS (SELECT * FROM table
-  [WHERE ...])` sources for outer selects, aggregates, grouping, and
-  `INSERT ... SELECT` statements.
+- Basic PostgreSQL CTEs now rewrite one or more simple `WITH name AS (SELECT *
+  FROM table [WHERE ...])` sources for outer selects, aggregates, grouping,
+  and `INSERT ... SELECT` statements.
 - PostgreSQL `ALTER TABLE ... DROP CONSTRAINT [IF EXISTS]` now removes named
   unique, check, foreign-key, and single-column primary-key constraints and
   persists their metadata across schema snapshots.

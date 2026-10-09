@@ -1474,27 +1474,47 @@ fn parse_with(raw: &str) -> Result<Statement> {
     {
         return Err(RymeError::InvalidArgument(String::from("recursive CTEs are not supported")));
     }
-    let as_offset = find_sql_keyword(raw, "AS", cte_start)
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
-    let cte_name = raw[cte_start..as_offset].trim();
-    if cte_name.is_empty() || tokenize(cte_name).len() != 1 {
-        return Err(RymeError::InvalidArgument(String::from("with name")));
+    let mut cursor = cte_start;
+    let mut ctes = Vec::new();
+    loop {
+        while raw.as_bytes().get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let as_offset = find_sql_keyword(raw, "AS", cursor)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
+        let cte_name = raw[cursor..as_offset].trim();
+        if cte_name.is_empty() || tokenize(cte_name).len() != 1 {
+            return Err(RymeError::InvalidArgument(String::from("with name")));
+        }
+        let cte_name = unquote(cte_name);
+        let open = raw[as_offset + "AS".len()..]
+            .find('(')
+            .map(|offset| as_offset + "AS".len() + offset)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
+        let close = matching_paren(raw, open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
+        let query = parse(raw[open + 1..close].trim())?;
+        ctes.push((cte_name, query));
+        cursor = close + 1;
+        while raw.as_bytes().get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if raw.as_bytes().get(cursor) == Some(&b',') {
+            cursor += 1;
+            continue;
+        }
+        break;
     }
-    let cte_name = unquote(cte_name);
-    let open = raw[as_offset + "AS".len()..]
-        .find('(')
-        .map(|offset| as_offset + "AS".len() + offset)
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
-    let close = matching_paren(raw, open)
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("with query")))?;
-    let query = parse(raw[open + 1..close].trim())?;
-    let body_sql = raw[close + 1..].trim();
+    let body_sql = raw[cursor..].trim();
     if body_sql.is_empty() {
         return Err(RymeError::InvalidArgument(String::from("with body")));
     }
-    let body = parse(body_sql)?;
-    rewrite_simple_cte(query, body, &cte_name)
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("unsupported CTE shape")))
+    let mut body = parse(body_sql)?;
+    for (cte_name, query) in ctes.into_iter().rev() {
+        body = rewrite_simple_cte(query, body, &cte_name)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("unsupported CTE shape")))?;
+    }
+    Ok(body)
 }
 
 fn cte_source(statement: Statement) -> Option<(String, Vec<Predicate>)> {
@@ -10538,6 +10558,38 @@ mod tests {
             executor.execute(parse("SELECT id, score FROM archive").unwrap()).await.unwrap(),
             QueryResult::Table { rows, .. }
                 if rows == vec![vec![b"1".to_vec(), b"4".to_vec()]]
+        ));
+    }
+
+    #[tokio::test]
+    async fn multiple_simple_ctes_resolve_in_dependency_order() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE events (id TEXT PRIMARY KEY, state TEXT, score INTEGER)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO events (id, state, score) VALUES ('1', 'ready', 8), ('2', 'ready', 3), ('3', 'done', 9)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let selected = executor
+            .execute(
+                parse("WITH ready AS (SELECT * FROM events WHERE state = 'ready'), ranked AS (SELECT * FROM ready WHERE score > 5) SELECT id, score FROM ranked")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            selected,
+            QueryResult::Table { rows, .. }
+                if rows == vec![vec![b"1".to_vec(), b"8".to_vec()]]
         ));
     }
 
