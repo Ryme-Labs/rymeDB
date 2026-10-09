@@ -38,6 +38,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - SQL WHERE clauses now accept standard equality and range operators (`=`, `<>`,
   `!=`, `>`, `>=`, `<`, and `<=`) with numeric-aware comparisons, schema-column
   filters, JSON projection predicates, and `IS NULL`/`IS NOT NULL` checks.
+- Filtered scans now paginate through storage pages until they collect the
+  requested matches, preventing late matches from being hidden behind a full
+  first page on large unindexed tables.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

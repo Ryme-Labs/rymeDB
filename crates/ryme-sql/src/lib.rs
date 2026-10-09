@@ -2643,6 +2643,88 @@ where
                 }
                 return Ok(self.filter_rls_rows(table, rows));
             }
+
+            if !filter.is_empty() {
+                const PAGE: usize = 1024;
+                let mut matched = Vec::new();
+                let mut after = None;
+                loop {
+                    let page = match after.as_deref() {
+                        Some(after) => self.manager.scan_after(
+                            txn,
+                            &self.tenant,
+                            &self.database,
+                            table,
+                            after,
+                            PAGE,
+                        )?,
+                        None => {
+                            self.manager.scan(txn, &self.tenant, &self.database, table, PAGE)?
+                        }
+                    };
+                    if page.is_empty() {
+                        break;
+                    }
+                    let page_len = page.len();
+                    let last = page.last().map(|(pk, _)| pk.clone());
+                    matched.extend(page.into_iter().filter(|(pk, value)| {
+                        filter.iter().all(|predicate| predicate.matches(pk, value))
+                    }));
+                    if matched.len() >= limit || page_len < PAGE {
+                        break;
+                    }
+                    after = last;
+                }
+                matched.truncate(limit);
+                return Ok(matched);
+            }
+        }
+        if !txn.writes().is_empty() && !filter.is_empty() {
+            const PAGE: usize = 1024;
+            let mut merged = BTreeMap::new();
+            let mut after = None;
+            loop {
+                let page = match after.as_deref() {
+                    Some(after) => self.manager.scan_after(
+                        txn,
+                        &self.tenant,
+                        &self.database,
+                        table,
+                        after,
+                        PAGE,
+                    )?,
+                    None => self.manager.scan(txn, &self.tenant, &self.database, table, PAGE)?,
+                };
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                let last = page.last().map(|(pk, _)| pk.clone());
+                merged.extend(page);
+                if page_len < PAGE {
+                    break;
+                }
+                after = last;
+            }
+            for (key, write) in txn.writes() {
+                if key.tenant != self.tenant || key.database != self.database || key.table != table
+                {
+                    continue;
+                }
+                match write.value.as_ref() {
+                    Some(value) => {
+                        merged.insert(key.pk.clone(), value.clone());
+                    }
+                    None => {
+                        merged.remove(&key.pk);
+                    }
+                }
+            }
+            return Ok(merged
+                .into_iter()
+                .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
+                .take(limit)
+                .collect());
         }
         let mut rows = self.manager.scan(txn, &self.tenant, &self.database, table, limit)?;
         if !txn.writes().is_empty() {
@@ -4380,6 +4462,35 @@ mod tests {
             .unwrap();
         assert!(
             matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"e2".to_vec()]])
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_scans_page_past_non_matching_rows() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE events (id TEXT PRIMARY KEY, note TEXT)").unwrap())
+            .await
+            .unwrap();
+        let rows = (0..10_000)
+            .map(|index| {
+                let id = format!("row{index:05}");
+                let value = format!("{{\"id\":\"{id}\",\"note\":\"other\"}}");
+                (id.into_bytes(), value.into_bytes())
+            })
+            .collect();
+        executor.bulk_upsert(String::from("events"), rows).await.unwrap();
+        executor
+            .execute(parse("INSERT INTO events (id, note) VALUES ('zz-match', 'late')").unwrap())
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(parse("SELECT id FROM events WHERE note = 'late' LIMIT 1").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"zz-match".to_vec()]])
         );
     }
 
