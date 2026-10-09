@@ -55,6 +55,7 @@ enum DecodedCopy {
 struct SessionTransaction {
     txn: Transaction,
     changes: Vec<TransactionChange>,
+    notifications: Vec<PgNotification>,
     failed: bool,
     savepoints: Vec<Savepoint>,
 }
@@ -103,6 +104,7 @@ struct Savepoint {
     name: String,
     checkpoint: TransactionCheckpoint,
     changes_len: usize,
+    notifications_len: usize,
 }
 
 enum TransactionControl {
@@ -133,6 +135,16 @@ fn notification_sender(tenant: &str, database: &str) -> broadcast::Sender<PgNoti
     let key = (tenant.to_string(), database.to_string());
     let mut channels = PG_NOTIFICATIONS.lock().unwrap_or_else(|error| error.into_inner());
     channels.entry(key).or_insert_with(|| broadcast::channel(1024).0).clone()
+}
+
+fn publish_notifications(tenant: &str, database: &str, notifications: &mut Vec<PgNotification>) {
+    if notifications.is_empty() {
+        return;
+    }
+    let sender = notification_sender(tenant, database);
+    for notification in notifications.drain(..) {
+        let _ = sender.send(notification);
+    }
 }
 
 fn register_backend() -> (u32, u32, Arc<AtomicBool>) {
@@ -878,6 +890,7 @@ where
             b'Q' => {
                 let query = String::from_utf8_lossy(&payload);
                 let mut out = Vec::new();
+                let mut committed_notifications = Vec::new();
                 let mut failed = false;
                 let mut awaiting_copy = false;
                 for statement in split_statements(&query) {
@@ -894,18 +907,24 @@ where
                         &limits.database,
                         pid,
                         &mut listening,
+                        &mut active_transaction,
                     ) {
                         out.extend_from_slice(&response);
                     } else if let Some(response) = catalog_query(trimmed, &executor) {
                         out.extend_from_slice(&response);
                     } else if let Some(control) = transaction_control(trimmed, &session) {
-                        out.extend_from_slice(
-                            &handle_transaction_control(
-                                control,
-                                &executor,
-                                &mut active_transaction,
-                            )
-                            .await,
+                        let response = handle_transaction_control_with_notifications(
+                            control,
+                            &executor,
+                            &mut active_transaction,
+                            &mut committed_notifications,
+                        )
+                        .await;
+                        out.extend_from_slice(&response);
+                        publish_notifications(
+                            &limits.tenant,
+                            &limits.database,
+                            &mut committed_notifications,
                         );
                     } else if let Some(response) = session_command(trimmed, &mut session) {
                         out.extend_from_slice(&response);
@@ -917,10 +936,16 @@ where
                         &session,
                         &limits,
                         &mut active_transaction,
+                        &mut committed_notifications,
                     )
                     .await
                     {
                         out.extend_from_slice(&response);
+                        publish_notifications(
+                            &limits.tenant,
+                            &limits.database,
+                            &mut committed_notifications,
+                        );
                     } else {
                         match parse(trimmed) {
                             Ok(Statement::CopyFrom { table, columns, rows }) if rows.is_empty() => {
@@ -1091,6 +1116,7 @@ where
             }
             b'E' => {
                 let portal = read_cstring(&payload, &mut 0).unwrap_or_default();
+                let mut committed_notifications = Vec::new();
                 let response = match portals.get_mut(&portal) {
                     Some(entry) => match statements.get(&entry.statement) {
                         Some(query) => {
@@ -1118,15 +1144,17 @@ where
                                 &limits.database,
                                 pid,
                                 &mut listening,
+                                &mut active_transaction,
                             ) {
                                 response
                             } else if let Some(response) = catalog_query(trimmed, &executor) {
                                 response
                             } else if let Some(control) = transaction_control(trimmed, &session) {
-                                handle_transaction_control(
+                                handle_transaction_control_with_notifications(
                                     control,
                                     &executor,
                                     &mut active_transaction,
+                                    &mut committed_notifications,
                                 )
                                 .await
                             } else {
@@ -1168,6 +1196,11 @@ where
                 } else {
                     response
                 };
+                publish_notifications(
+                    &limits.tenant,
+                    &limits.database,
+                    &mut committed_notifications,
+                );
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             b'C' => {
@@ -2700,10 +2733,30 @@ fn normalize_savepoint_name(value: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 async fn handle_transaction_control<B>(
     control: TransactionControl,
     executor: &Arc<Executor<B>>,
     active: &mut Option<SessionTransaction>,
+) -> Vec<u8>
+where
+    B: TxnBackend,
+{
+    let mut committed_notifications = Vec::new();
+    handle_transaction_control_with_notifications(
+        control,
+        executor,
+        active,
+        &mut committed_notifications,
+    )
+    .await
+}
+
+async fn handle_transaction_control_with_notifications<B>(
+    control: TransactionControl,
+    executor: &Arc<Executor<B>>,
+    active: &mut Option<SessionTransaction>,
+    committed_notifications: &mut Vec<PgNotification>,
 ) -> Vec<u8>
 where
     B: TxnBackend,
@@ -2716,6 +2769,7 @@ where
                 *active = Some(SessionTransaction {
                     txn: executor.begin_transaction(isolation),
                     changes: Vec::new(),
+                    notifications: Vec::new(),
                     failed: false,
                     savepoints: Vec::new(),
                 });
@@ -2733,7 +2787,10 @@ where
                 );
             }
             match executor.commit_transaction(state.txn, state.changes).await {
-                Ok(_) => command_complete("COMMIT"),
+                Ok(_) => {
+                    committed_notifications.extend(state.notifications);
+                    command_complete("COMMIT")
+                }
                 Err(error) => encode_error_code(error_code(&error), error.to_string()),
             }
         }
@@ -2765,6 +2822,7 @@ where
                 name,
                 checkpoint: state.txn.checkpoint(),
                 changes_len: state.changes.len(),
+                notifications_len: state.notifications.len(),
             });
             command_complete("SAVEPOINT")
         }
@@ -2806,6 +2864,7 @@ where
             let savepoint = &state.savepoints[position];
             state.txn.restore_checkpoint(&savepoint.checkpoint);
             state.changes.truncate(savepoint.changes_len);
+            state.notifications.truncate(savepoint.notifications_len);
             state.savepoints.truncate(position + 1);
             state.failed = false;
             command_complete("ROLLBACK")
@@ -2916,12 +2975,21 @@ async fn prepared_command<B>(
     session: &HashMap<String, String>,
     limits: &ConnLimits,
     active: &mut Option<SessionTransaction>,
+    committed_notifications: &mut Vec<PgNotification>,
 ) -> Option<Vec<u8>>
 where
     B: TxnBackend,
 {
     if let Some(control) = transaction_control(query, session) {
-        return Some(handle_transaction_control(control, executor, active).await);
+        return Some(
+            handle_transaction_control_with_notifications(
+                control,
+                executor,
+                active,
+                committed_notifications,
+            )
+            .await,
+        );
     }
     let head = query.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
     match head.as_str() {
@@ -3177,9 +3245,27 @@ fn notification_command(
     database: &str,
     pid: u32,
     listening: &mut HashSet<String>,
+    active: &mut Option<SessionTransaction>,
 ) -> Option<Vec<u8>> {
     let normalized = query.trim().trim_end_matches(';').trim();
     let upper = normalized.to_ascii_uppercase();
+    let is_notification = upper == "LISTEN"
+        || upper.starts_with("LISTEN ")
+        || upper == "UNLISTEN"
+        || upper.starts_with("UNLISTEN ")
+        || upper == "NOTIFY"
+        || upper.starts_with("NOTIFY ");
+    if !is_notification {
+        return None;
+    }
+    if active.as_ref().is_some_and(|transaction| transaction.failed) {
+        return Some(encode_error_code(
+            "25P02",
+            String::from(
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ),
+        ));
+    }
     if upper == "LISTEN" || upper.starts_with("LISTEN ") {
         let channel = normalize_notification_name(normalized.get(6..)?.trim())?;
         if channel.is_empty() {
@@ -3206,8 +3292,12 @@ fn notification_command(
             return None;
         }
         let payload = unquote_literal(payload.trim()).replace("''", "'");
-        let _ =
-            notification_sender(tenant, database).send(PgNotification { channel, payload, pid });
+        let notification = PgNotification { channel, payload, pid };
+        if let Some(transaction) = active.as_mut() {
+            transaction.notifications.push(notification);
+        } else {
+            let _ = notification_sender(tenant, database).send(notification);
+        }
         return Some(command_complete("NOTIFY"));
     }
     None
@@ -3221,7 +3311,7 @@ fn normalize_notification_name(value: &str) -> Option<String> {
     if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
         return Some(value[1..value.len() - 1].replace("\"\"", "\""));
     }
-    (!value.chars().any(char::is_whitespace)).then(|| value.to_string())
+    (!value.chars().any(char::is_whitespace)).then(|| value.to_ascii_lowercase())
 }
 
 fn unquote_literal(value: &str) -> String {
@@ -3988,6 +4078,7 @@ mod tests {
         let mut active = Some(SessionTransaction {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
+            notifications: Vec::new(),
             failed: false,
             savepoints: Vec::new(),
         });

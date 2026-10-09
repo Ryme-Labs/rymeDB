@@ -71,12 +71,25 @@ async fn listen_notify_delivers_async_notification_response() {
     let mut listener_socket = startup(addr).await;
     let mut sender_socket = startup(addr).await;
 
-    let listen_frames = simple(&mut listener_socket, "LISTEN chat").await;
+    let listen_frames = simple(&mut listener_socket, "LISTEN Chat").await;
     assert!(listen_frames
         .iter()
         .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("LISTEN") }));
 
-    let notify_frames = simple(&mut sender_socket, "NOTIFY chat, 'hello, world'").await;
+    let rolled_back =
+        simple(&mut sender_socket, "BEGIN; NOTIFY chat, 'rolled back'; ROLLBACK").await;
+    assert!(rolled_back
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("ROLLBACK") }));
+    assert!(tokio::time::timeout(Duration::from_millis(100), read_frame(&mut listener_socket))
+        .await
+        .is_err());
+
+    let notify_frames = simple(
+        &mut sender_socket,
+        "BEGIN; NOTIFY chat, 'hello, world'; SAVEPOINT keep; NOTIFY chat, 'discarded'; ROLLBACK TO SAVEPOINT keep; COMMIT",
+    )
+    .await;
     assert!(notify_frames
         .iter()
         .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("NOTIFY") }));
@@ -87,6 +100,9 @@ async fn listen_notify_delivers_async_notification_response() {
     assert!(pid > 0);
     assert_eq!(channel, "chat");
     assert_eq!(payload, "hello, world");
+    assert!(tokio::time::timeout(Duration::from_millis(100), read_frame(&mut listener_socket))
+        .await
+        .is_err());
 
     let unlisten_frames = simple(&mut listener_socket, "UNLISTEN chat").await;
     assert!(unlisten_frames
