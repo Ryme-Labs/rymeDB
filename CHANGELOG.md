@@ -8,6 +8,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL sequences now support persisted `CREATE SEQUENCE`, `ALTER
+  SEQUENCE` restart/increment options, `DROP SEQUENCE`, and `nextval`/`currval`/
+  `setval` calls, with sequence state exposed through `pg_catalog.pg_sequences`
+  and schema snapshots.
 - PostgreSQL `CREATE VIEW`, `CREATE OR REPLACE VIEW`, and `DROP VIEW` now
   persist readable view definitions, execute common table/projection queries,
   restore through schema snapshots, and appear as `VIEW` relations in

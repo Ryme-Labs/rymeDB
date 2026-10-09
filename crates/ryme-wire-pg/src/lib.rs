@@ -1082,6 +1082,14 @@ fn describe_query(query: &str) -> Vec<u8> {
         if let Statement::SelectValues { columns, .. } = &statement {
             return multi_row_description(columns);
         }
+        if let Statement::SequenceValue { operation, .. } = &statement {
+            let name = match operation {
+                ryme_sql::SequenceOperation::Nextval => "nextval",
+                ryme_sql::SequenceOperation::Currval => "currval",
+                ryme_sql::SequenceOperation::Setval => "setval",
+            };
+            return multi_row_description(&[String::from(name)]);
+        }
         if matches!(
             statement,
             ryme_sql::Statement::SelectByKey { .. } | ryme_sql::Statement::SelectScan { .. }
@@ -1114,6 +1122,8 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
             "functions"
         } else if upper.contains("PG_CATALOG.PG_TRIGGER") || upper.contains("PG_TRIGGER") {
             "triggers"
+        } else if upper.contains("PG_CATALOG.PG_SEQUENCES") || upper.contains("PG_SEQUENCES") {
+            "sequences"
         } else if upper.contains("PG_CATALOG.PG_NAMESPACE") {
             "namespaces"
         } else if upper.contains("PG_CATALOG.PG_CLASS") {
@@ -1135,6 +1145,7 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
         "policies" => vec![String::from("policyname")],
         "functions" => vec![String::from("proname")],
         "triggers" => vec![String::from("tgname")],
+        "sequences" => vec![String::from("sequencename")],
         "namespaces" => vec![String::from("nspname")],
         "classes" => vec![String::from("relname")],
         "types" => vec![String::from("typname")],
@@ -1187,6 +1198,19 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("tgtype"),
                 String::from("tgenabled"),
                 String::from("tgisinternal"),
+            ],
+            "sequences" => vec![
+                String::from("schemaname"),
+                String::from("sequencename"),
+                String::from("sequenceowner"),
+                String::from("data_type"),
+                String::from("start_value"),
+                String::from("min_value"),
+                String::from("max_value"),
+                String::from("increment_by"),
+                String::from("cycle"),
+                String::from("cache_size"),
+                String::from("last_value"),
             ],
             "namespaces" => vec![
                 String::from("oid"),
@@ -1436,16 +1460,18 @@ where
 
     if upper.contains("PG_CATALOG.PG_CLASS") {
         let filter = sql_literal_after(query, "RELNAME");
-        let mut relations: Vec<(String, bool)> =
-            executor.catalog_tables().into_iter().map(|table| (table, false)).collect();
-        relations.extend(executor.catalog_views().into_iter().map(|view| (view, true)));
+        let mut relations: Vec<(String, u8)> =
+            executor.catalog_tables().into_iter().map(|table| (table, b'r')).collect();
+        relations.extend(executor.catalog_views().into_iter().map(|view| (view, b'v')));
+        relations
+            .extend(executor.catalog_sequences().into_iter().map(|sequence| (sequence.name, b'S')));
         let rows: Vec<Vec<Vec<u8>>> = relations
             .into_iter()
             .filter(|table| {
                 let (_, table_name) = catalog_table_parts(&table.0);
                 filter.as_ref().is_none_or(|want| want == &table.0 || want == table_name)
             })
-            .map(|(table, is_view)| {
+            .map(|(table, relkind)| {
                 let (schema, table_name) = catalog_table_parts(&table);
                 let oid = catalog_relation_oid(&table);
                 let has_index = !executor.catalog_indexes(&table).is_empty();
@@ -1455,13 +1481,7 @@ where
                         "oid" => oid.to_string().into_bytes(),
                         "relname" => table_name.as_bytes().to_vec(),
                         "relnamespace" => catalog_namespace_oid(schema).to_string().into_bytes(),
-                        "relkind" => {
-                            if is_view {
-                                b"v".to_vec()
-                            } else {
-                                b"r".to_vec()
-                            }
-                        }
+                        "relkind" => vec![relkind],
                         "relpersistence" => b"p".to_vec(),
                         "relhasindex" => {
                             if has_index {
@@ -1539,6 +1559,48 @@ where
                             index.name, schema, table_name,
                         )
                         .into_bytes(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_SEQUENCES") || upper.contains("PG_SEQUENCES") {
+        let filter = sql_literal_after(query, "SEQUENCENAME");
+        let rows: Vec<Vec<Vec<u8>>> = executor
+            .catalog_sequences()
+            .into_iter()
+            .filter(|sequence| {
+                let (_, name) = catalog_table_parts(&sequence.name);
+                filter.as_ref().is_none_or(|want| want == &sequence.name || want == name)
+            })
+            .map(|sequence| {
+                let (schema, name) = catalog_table_parts(&sequence.name);
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "schemaname" => schema.as_bytes().to_vec(),
+                        "sequencename" => name.as_bytes().to_vec(),
+                        "sequenceowner" => b"ryme".to_vec(),
+                        "data_type" => sequence.data_type.as_bytes().to_vec(),
+                        "start_value" => sequence.start.to_string().into_bytes(),
+                        "min_value" => sequence.min_value.to_string().into_bytes(),
+                        "max_value" => sequence.max_value.to_string().into_bytes(),
+                        "increment_by" => sequence.increment.to_string().into_bytes(),
+                        "cycle" => {
+                            if sequence.cycle {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        "cache_size" => sequence.cache.to_string().into_bytes(),
+                        "last_value" => sequence.last_value.map_or_else(
+                            || SQL_NULL_SENTINEL.to_vec(),
+                            |value| value.to_string().into_bytes(),
+                        ),
                         _ => Vec::new(),
                     })
                     .collect()
@@ -2952,7 +3014,8 @@ where
 mod tests {
     use super::*;
     use ryme_sql::{
-        FunctionDefinition, RlsPolicy, SchemaSnapshot, TriggerDefinition, ViewDefinition,
+        FunctionDefinition, RlsPolicy, SchemaSnapshot, SequenceDefinition, TriggerDefinition,
+        ViewDefinition,
     };
 
     #[test]
@@ -3183,6 +3246,44 @@ mod tests {
             .windows(b"active_messages".len())
             .any(|window| window == b"active_messages"));
         assert!(relations.windows(b"v".len()).any(|window| window == b"v"));
+    }
+
+    #[test]
+    fn catalogs_expose_sequences() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.sequences.insert(
+            String::from("public.events_id_seq"),
+            SequenceDefinition {
+                name: String::from("public.events_id_seq"),
+                data_type: String::from("bigint"),
+                start: 10,
+                increment: 2,
+                min_value: 1,
+                max_value: i64::MAX,
+                cache: 1,
+                cycle: false,
+                last_value: Some(10),
+            },
+        );
+        executor.restore_schema_snapshot(snapshot).unwrap();
+
+        let response = catalog_query(
+            "SELECT sequencename, increment_by, last_value FROM pg_catalog.pg_sequences WHERE sequencename = 'events_id_seq'",
+            &executor,
+        )
+        .unwrap();
+        assert!(response.windows(b"events_id_seq".len()).any(|window| window == b"events_id_seq"));
+        assert!(response.windows(b"2".len()).any(|window| window == b"2"));
+        assert!(response.windows(b"10".len()).any(|window| window == b"10"));
+
+        let relations = catalog_query(
+            "SELECT relname, relkind FROM pg_catalog.pg_class WHERE relname = 'events_id_seq'",
+            &executor,
+        )
+        .unwrap();
+        assert!(relations.windows(b"events_id_seq".len()).any(|window| window == b"events_id_seq"));
+        assert!(relations.windows(b"S".len()).any(|window| window == b"S"));
     }
 
     #[test]

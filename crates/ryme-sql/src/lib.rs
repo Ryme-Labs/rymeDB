@@ -21,6 +21,41 @@ impl Default for SetOperation {
     }
 }
 
+fn default_sequence_data_type() -> String {
+    String::from("bigint")
+}
+
+const fn default_sequence_start() -> i64 {
+    1
+}
+
+const fn default_sequence_increment() -> i64 {
+    1
+}
+
+const fn default_sequence_min() -> i64 {
+    1
+}
+
+const fn default_sequence_max() -> i64 {
+    i64::MAX
+}
+
+const fn default_sequence_cache() -> i64 {
+    1
+}
+
+const fn default_sequence_called() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SequenceOperation {
+    Nextval,
+    Currval,
+    Setval,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Statement {
     CreateSchema {
@@ -34,6 +69,25 @@ pub enum Statement {
         schema: Option<String>,
         #[serde(default)]
         if_not_exists: bool,
+    },
+    CreateSequence {
+        name: String,
+        #[serde(default)]
+        if_not_exists: bool,
+        #[serde(default = "default_sequence_data_type")]
+        data_type: String,
+        #[serde(default = "default_sequence_start")]
+        start: i64,
+        #[serde(default = "default_sequence_increment")]
+        increment: i64,
+        #[serde(default = "default_sequence_min")]
+        min_value: i64,
+        #[serde(default = "default_sequence_max")]
+        max_value: i64,
+        #[serde(default = "default_sequence_cache")]
+        cache: i64,
+        #[serde(default)]
+        cycle: bool,
     },
     CreateFunction {
         name: String,
@@ -111,6 +165,18 @@ pub enum Statement {
         name: String,
         #[serde(default)]
         if_exists: bool,
+    },
+    DropSequence {
+        name: String,
+        #[serde(default)]
+        if_exists: bool,
+    },
+    AlterSequence {
+        name: String,
+        #[serde(default)]
+        restart: Option<i64>,
+        #[serde(default)]
+        increment: Option<i64>,
     },
     TruncateTable {
         table: String,
@@ -260,6 +326,14 @@ pub enum Statement {
     SelectValues {
         columns: Vec<String>,
         values: Vec<String>,
+    },
+    SequenceValue {
+        operation: SequenceOperation,
+        name: String,
+        #[serde(default)]
+        value: Option<i64>,
+        #[serde(default = "default_sequence_called")]
+        is_called: bool,
     },
     Aggregate {
         table: String,
@@ -449,6 +523,27 @@ pub struct ViewDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceDefinition {
+    pub name: String,
+    #[serde(default = "default_sequence_data_type")]
+    pub data_type: String,
+    #[serde(default = "default_sequence_start")]
+    pub start: i64,
+    #[serde(default = "default_sequence_increment")]
+    pub increment: i64,
+    #[serde(default = "default_sequence_min")]
+    pub min_value: i64,
+    #[serde(default = "default_sequence_max")]
+    pub max_value: i64,
+    #[serde(default = "default_sequence_cache")]
+    pub cache: i64,
+    #[serde(default)]
+    pub cycle: bool,
+    #[serde(default)]
+    pub last_value: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: String,
@@ -518,6 +613,8 @@ pub struct SchemaSnapshot {
     #[serde(default)]
     pub views: BTreeMap<String, ViewDefinition>,
     #[serde(default)]
+    pub sequences: BTreeMap<String, SequenceDefinition>,
+    #[serde(default)]
     pub rls_tables: BTreeMap<String, String>,
     #[serde(default)]
     pub rls_write_tables: BTreeMap<String, String>,
@@ -576,6 +673,7 @@ impl Statement {
             self,
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
+                | Statement::CreateSequence { .. }
                 | Statement::CreateFunction { .. }
                 | Statement::CreateView { .. }
                 | Statement::CreateTrigger { .. }
@@ -583,6 +681,8 @@ impl Statement {
                 | Statement::DropPolicy { .. }
                 | Statement::DropTrigger { .. }
                 | Statement::DropView { .. }
+                | Statement::DropSequence { .. }
+                | Statement::AlterSequence { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
@@ -600,6 +700,12 @@ impl Statement {
                 | Statement::DeleteUsing { .. }
                 | Statement::CopyFrom { .. }
                 | Statement::Returning { .. }
+        ) || matches!(
+            self,
+            Statement::SequenceValue {
+                operation: SequenceOperation::Nextval | SequenceOperation::Setval,
+                ..
+            }
         )
     }
 }
@@ -636,9 +742,8 @@ fn query_cell_value(cell: &[u8]) -> serde_json::Value {
     if cell == SQL_NULL_SENTINEL {
         return serde_json::Value::Null;
     }
-    serde_json::from_slice(cell).unwrap_or_else(|_| {
-        serde_json::Value::String(String::from_utf8_lossy(cell).to_string())
-    })
+    serde_json::from_slice(cell)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(cell).to_string()))
 }
 
 fn query_result_rows(result: QueryResult) -> Vec<Row> {
@@ -1072,6 +1177,7 @@ impl Statement {
             | Self::CopyFrom { table, .. } => table,
             Self::CreateSchema { .. }
             | Self::CreateExtension { .. }
+            | Self::CreateSequence { .. }
             | Self::CreateFunction { .. }
             | Self::CreateView { .. } => "",
             Self::CreateTrigger { table, .. } => table,
@@ -1080,11 +1186,13 @@ impl Statement {
             Self::DropIndex { name, .. } => name,
             Self::DropTrigger { table, .. } => table,
             Self::DropView { name, .. } => name,
+            Self::DropSequence { name, .. } | Self::AlterSequence { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
             Self::Distinct { statement, .. } => statement.table(),
             Self::Union { left, .. } => left.table(),
             Self::SelectValues { .. } => "",
+            Self::SequenceValue { .. } => "",
         }
     }
 }
@@ -1270,6 +1378,9 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
     if kind.eq_ignore_ascii_case("VIEW") {
         return Ok(Statement::DropView { name: object, if_exists });
     }
+    if kind.eq_ignore_ascii_case("SEQUENCE") {
+        return Ok(Statement::DropSequence { name: object, if_exists });
+    }
     if kind.eq_ignore_ascii_case("TABLE") {
         return Ok(Statement::DropTable { table: object, if_exists });
     }
@@ -1327,6 +1438,9 @@ fn parse_truncate(tokens: &[String]) -> Result<Statement> {
 }
 
 fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
+    if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("SEQUENCE")) {
+        return parse_alter_sequence(tokens);
+    }
     if !tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("TABLE")) {
         return Err(RymeError::InvalidArgument(String::from("alter table")));
     }
@@ -1930,6 +2044,9 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
             .map(|value| unquote(value));
         return Ok(Statement::CreateExtension { name, schema, if_not_exists });
     }
+    if tokens.get(kind_index).is_some_and(|token| token.eq_ignore_ascii_case("SEQUENCE")) {
+        return parse_create_sequence(tokens, kind_index);
+    }
     if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("INDEX"))
         || (tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("UNIQUE"))
             && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("INDEX")))
@@ -1966,6 +2083,177 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         named_constraints,
         if_not_exists,
     })
+}
+
+fn parse_create_sequence(tokens: &[String], kind_index: usize) -> Result<Statement> {
+    let mut name_index = kind_index + 1;
+    let if_not_exists =
+        tokens.get(name_index).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+    if if_not_exists {
+        if !tokens.get(name_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+            || !tokens.get(name_index + 2).is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+        {
+            return Err(RymeError::InvalidArgument(String::from("create sequence")));
+        }
+        name_index += 3;
+    }
+    let name = tokens
+        .get(name_index)
+        .map(|value| unquote(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create sequence")))?;
+    let mut data_type = default_sequence_data_type();
+    let mut increment = default_sequence_increment();
+    let mut min_value = default_sequence_min();
+    let mut max_value = default_sequence_max();
+    let mut start = default_sequence_start();
+    let mut cache = default_sequence_cache();
+    let mut cycle = false;
+    let mut position = name_index + 1;
+    while position < tokens.len() {
+        let token = tokens[position].to_ascii_uppercase();
+        match token.as_str() {
+            "AS" => {
+                data_type =
+                    tokens.get(position + 1).map(|value| value.to_ascii_lowercase()).ok_or_else(
+                        || RymeError::InvalidArgument(String::from("sequence data type")),
+                    )?;
+                position += 2;
+            }
+            "INCREMENT" => {
+                let value_pos = if tokens
+                    .get(position + 1)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("BY"))
+                {
+                    position + 2
+                } else {
+                    position + 1
+                };
+                increment = parse_sequence_number(tokens.get(value_pos), "sequence increment")?;
+                position = value_pos + 1;
+            }
+            "START" => {
+                let value_pos = if tokens
+                    .get(position + 1)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("WITH"))
+                {
+                    position + 2
+                } else {
+                    position + 1
+                };
+                start = parse_sequence_number(tokens.get(value_pos), "sequence start")?;
+                position = value_pos + 1;
+            }
+            "MINVALUE" => {
+                min_value = parse_sequence_number(tokens.get(position + 1), "sequence minimum")?;
+                position += 2;
+            }
+            "MAXVALUE" => {
+                max_value = parse_sequence_number(tokens.get(position + 1), "sequence maximum")?;
+                position += 2;
+            }
+            "NO" if tokens
+                .get(position + 1)
+                .is_some_and(|value| value.eq_ignore_ascii_case("MINVALUE")) =>
+            {
+                min_value = if increment < 0 { i64::MIN } else { 1 };
+                position += 2;
+            }
+            "NO" if tokens
+                .get(position + 1)
+                .is_some_and(|value| value.eq_ignore_ascii_case("MAXVALUE")) =>
+            {
+                max_value = if increment < 0 { -1 } else { i64::MAX };
+                position += 2;
+            }
+            "CACHE" => {
+                cache = parse_sequence_number(tokens.get(position + 1), "sequence cache")?;
+                position += 2;
+            }
+            "CYCLE" => {
+                cycle = true;
+                position += 1;
+            }
+            "NO" if tokens
+                .get(position + 1)
+                .is_some_and(|value| value.eq_ignore_ascii_case("CYCLE")) =>
+            {
+                cycle = false;
+                position += 2;
+            }
+            _ => position += 1,
+        }
+    }
+    if increment == 0
+        || cache <= 0
+        || min_value > max_value
+        || start < min_value
+        || start > max_value
+    {
+        return Err(RymeError::InvalidArgument(String::from("invalid sequence definition")));
+    }
+    Ok(Statement::CreateSequence {
+        name,
+        if_not_exists,
+        data_type,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cache,
+        cycle,
+    })
+}
+
+fn parse_sequence_number(value: Option<&String>, message: &str) -> Result<i64> {
+    value
+        .and_then(|value| value.trim_end_matches(';').parse::<i64>().ok())
+        .ok_or_else(|| RymeError::InvalidArgument(message.to_string()))
+}
+
+fn parse_alter_sequence(tokens: &[String]) -> Result<Statement> {
+    let name = tokens
+        .get(2)
+        .map(|value| unquote(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("alter sequence")))?;
+    let mut restart = None;
+    let mut increment = None;
+    let mut position = 3;
+    while position < tokens.len() {
+        match tokens[position].to_ascii_uppercase().as_str() {
+            "RESTART" => {
+                let value_pos = if tokens
+                    .get(position + 1)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("WITH"))
+                {
+                    position + 2
+                } else {
+                    position + 1
+                };
+                restart = Some(parse_sequence_number(tokens.get(value_pos), "sequence restart")?);
+                position = value_pos + 1;
+            }
+            "INCREMENT" => {
+                let value_pos = if tokens
+                    .get(position + 1)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("BY"))
+                {
+                    position + 2
+                } else {
+                    position + 1
+                };
+                increment =
+                    Some(parse_sequence_number(tokens.get(value_pos), "sequence increment")?);
+                position = value_pos + 1;
+            }
+            _ => position += 1,
+        }
+    }
+    if increment == Some(0) {
+        return Err(RymeError::InvalidArgument(String::from("sequence increment")));
+    }
+    Ok(Statement::AlterSequence { name, restart, increment })
 }
 
 fn unqualified_name(value: &str) -> String {
@@ -3759,6 +4047,13 @@ fn parse_select_values(raw: &str) -> Result<Statement> {
     if values_sql.is_empty() {
         return Err(RymeError::InvalidArgument(String::from("select values")));
     }
+    if let Some(item) = split_sql_items(values_sql).first() {
+        if split_sql_items(values_sql).len() == 1 {
+            if let Some(statement) = parse_sequence_value(item.trim())? {
+                return Ok(statement);
+            }
+        }
+    }
     let mut columns = Vec::new();
     let mut values = Vec::new();
     for item in split_sql_items(values_sql) {
@@ -3786,6 +4081,54 @@ fn parse_select_values(raw: &str) -> Result<Statement> {
         return Err(RymeError::InvalidArgument(String::from("select values")));
     }
     Ok(Statement::SelectValues { columns, values })
+}
+
+fn parse_sequence_value(expression: &str) -> Result<Option<Statement>> {
+    let Some(open) = expression.find('(') else { return Ok(None) };
+    if !expression.ends_with(')') {
+        return Ok(None);
+    }
+    let function = expression[..open].trim().to_ascii_lowercase();
+    let operation = match function.as_str() {
+        "nextval" => SequenceOperation::Nextval,
+        "currval" => SequenceOperation::Currval,
+        "setval" => SequenceOperation::Setval,
+        _ => return Ok(None),
+    };
+    let arguments = split_sql_items(&expression[open + 1..expression.len() - 1]);
+    if arguments.is_empty() || (operation != SequenceOperation::Setval && arguments.len() != 1) {
+        return Err(RymeError::InvalidArgument(String::from("sequence function arguments")));
+    }
+    let name = sequence_name_argument(&arguments[0])?;
+    let (value, is_called) = if operation == SequenceOperation::Setval {
+        let value = arguments
+            .get(1)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("setval value")))?;
+        let is_called =
+            arguments.get(2).map(|value| value.trim().eq_ignore_ascii_case("true")).unwrap_or(true);
+        (Some(value), is_called)
+    } else {
+        (None, true)
+    };
+    Ok(Some(Statement::SequenceValue { operation, name, value, is_called }))
+}
+
+fn sequence_name_argument(argument: &str) -> Result<String> {
+    let name = argument.split_once("::").map(|(name, _)| name).unwrap_or(argument).trim();
+    let name = unquote(name);
+    if name.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("sequence name")));
+    }
+    Ok(name)
+}
+
+fn sequence_name_from_default(default: &str) -> Option<String> {
+    let open = default.to_ascii_lowercase().find("nextval")?;
+    let open = default[open..].find('(')? + open;
+    let close = default[open + 1..].rfind(')')? + open + 1;
+    let argument = default[open + 1..close].trim();
+    sequence_name_argument(argument).ok()
 }
 
 fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -5211,6 +5554,7 @@ pub fn describe_plan(statement: &Statement) -> String {
                 schema.as_deref().map_or(String::new(), |schema| format!(" in {schema}"))
             )
         }
+        Statement::CreateSequence { name, .. } => format!("ddl create_sequence({name})"),
         Statement::CreateFunction { name, language, .. } => {
             format!("ddl create_function({name}) language {language}")
         }
@@ -5239,6 +5583,10 @@ pub fn describe_plan(statement: &Statement) -> String {
             format!("ddl drop_trigger({name}) on {table}")
         }
         Statement::DropView { name, .. } => format!("ddl drop_view({name})"),
+        Statement::DropSequence { name, .. } => format!("ddl drop_sequence({name})"),
+        Statement::AlterSequence { name, restart, increment } => {
+            format!("ddl alter_sequence({name}) restart {restart:?} increment {increment:?}")
+        }
         Statement::TruncateTable { table, restart_identity, cascade } => {
             format!(
                 "write truncate({table}) {} {}",
@@ -5392,6 +5740,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::Explain { plan, .. } => format!("explain({plan})"),
         Statement::Distinct { statement, limit, offset } => {
             format!("distinct({}) limit {limit} offset {offset}", describe_plan(statement))
+        }
+        Statement::SequenceValue { operation, name, .. } => {
+            format!("sequence {operation:?}({name})")
         }
     }
 }
@@ -5842,6 +6193,7 @@ pub struct Executor<B = TxnManager> {
     functions: Arc<Mutex<HashMap<String, FunctionDefinition>>>,
     triggers: Arc<Mutex<HashMap<String, TriggerDefinition>>>,
     views: Arc<Mutex<HashMap<String, ViewDefinition>>>,
+    sequences: Arc<Mutex<HashMap<String, SequenceDefinition>>>,
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
@@ -5878,6 +6230,7 @@ impl Executor<TxnManager> {
             functions: Arc::new(Mutex::new(HashMap::new())),
             triggers: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
+            sequences: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5908,6 +6261,7 @@ impl Executor<TxnManager> {
             functions: Arc::new(Mutex::new(HashMap::new())),
             triggers: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
+            sequences: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5943,6 +6297,7 @@ where
             functions: Arc::new(Mutex::new(HashMap::new())),
             triggers: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
+            sequences: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -6136,6 +6491,172 @@ where
         }))
     }
 
+    fn install_sequence(&self, definition: SequenceDefinition, if_not_exists: bool) -> Result<()> {
+        let mut sequences = self
+            .sequences
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("sequence lock")))?;
+        if sequences.contains_key(&definition.name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(RymeError::Conflict(format!("sequence {}", definition.name)));
+        }
+        sequences.insert(definition.name.clone(), definition);
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn drop_sequence(&self, name: &str, if_exists: bool) -> Result<()> {
+        let removed = self
+            .sequences
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("sequence lock")))?
+            .remove(name)
+            .is_some();
+        if !removed && !if_exists {
+            return Err(RymeError::NotFound(format!("sequence {name}")));
+        }
+        if removed {
+            self.schema_dirty.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn alter_sequence(
+        &self,
+        name: &str,
+        restart: Option<i64>,
+        increment: Option<i64>,
+    ) -> Result<()> {
+        let mut sequences = self
+            .sequences
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("sequence lock")))?;
+        let key = sequences
+            .contains_key(name)
+            .then(|| name.to_string())
+            .or_else(|| {
+                sequences
+                    .keys()
+                    .find(|key| {
+                        key.rsplit('.').next().is_some_and(|short| short.eq_ignore_ascii_case(name))
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| RymeError::NotFound(format!("sequence {name}")))?;
+        let sequence = sequences.get_mut(&key).expect("sequence key selected above");
+        if let Some(increment) = increment {
+            sequence.increment = increment;
+        }
+        if let Some(restart) = restart {
+            if restart < sequence.min_value || restart > sequence.max_value {
+                return Err(RymeError::InvalidArgument(String::from("sequence restart")));
+            }
+            sequence.start = restart;
+            sequence.last_value = None;
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn sequence_mutation(
+        &self,
+        operation: SequenceOperation,
+        name: &str,
+        value: Option<i64>,
+        is_called: bool,
+    ) -> Result<i64> {
+        let mut sequences = self
+            .sequences
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("sequence lock")))?;
+        let key = sequences
+            .contains_key(name)
+            .then(|| name.to_string())
+            .or_else(|| {
+                sequences
+                    .keys()
+                    .find(|key| {
+                        key.rsplit('.').next().is_some_and(|short| short.eq_ignore_ascii_case(name))
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| RymeError::NotFound(format!("sequence {name}")))?;
+        let sequence = sequences.get_mut(&key).expect("sequence key selected above");
+        match operation {
+            SequenceOperation::Nextval => {
+                let next = sequence.last_value.map_or(sequence.start, |last| {
+                    last.checked_add(sequence.increment).unwrap_or_else(|| {
+                        if sequence.increment < 0 {
+                            sequence.min_value
+                        } else {
+                            sequence.max_value
+                        }
+                    })
+                });
+                let next = if next < sequence.min_value || next > sequence.max_value {
+                    if sequence.cycle {
+                        if sequence.increment < 0 {
+                            sequence.max_value
+                        } else {
+                            sequence.min_value
+                        }
+                    } else {
+                        return Err(RymeError::Conflict(format!(
+                            "sequence {} exhausted",
+                            sequence.name
+                        )));
+                    }
+                } else {
+                    next
+                };
+                sequence.last_value = Some(next);
+                self.schema_dirty.store(true, Ordering::SeqCst);
+                Ok(next)
+            }
+            SequenceOperation::Currval => sequence.last_value.ok_or_else(|| {
+                RymeError::InvalidArgument(format!(
+                    "currval of sequence {} is not yet defined",
+                    sequence.name
+                ))
+            }),
+            SequenceOperation::Setval => {
+                let value = value
+                    .ok_or_else(|| RymeError::InvalidArgument(String::from("setval value")))?;
+                if value < sequence.min_value || value > sequence.max_value {
+                    return Err(RymeError::InvalidArgument(String::from("setval value")));
+                }
+                sequence.last_value = if is_called {
+                    Some(value)
+                } else {
+                    Some(value.checked_sub(sequence.increment).unwrap_or(value))
+                };
+                self.schema_dirty.store(true, Ordering::SeqCst);
+                Ok(value)
+            }
+        }
+    }
+
+    fn execute_sequence_value(
+        &self,
+        operation: SequenceOperation,
+        name: String,
+        value: Option<i64>,
+        is_called: bool,
+    ) -> Result<QueryResult> {
+        let result = self.sequence_mutation(operation, &name, value, is_called)?;
+        let label = match operation {
+            SequenceOperation::Nextval => "nextval",
+            SequenceOperation::Currval => "currval",
+            SequenceOperation::Setval => "setval",
+        };
+        Ok(QueryResult::Table {
+            columns: vec![label.to_string()],
+            rows: vec![vec![result.to_string().into_bytes()]],
+        })
+    }
+
     fn apply_before_triggers(&self, table: &str, event: &str, value: &[u8]) -> Result<Vec<u8>> {
         let triggers = self
             .triggers
@@ -6313,6 +6834,7 @@ where
             functions: self.functions,
             triggers: self.triggers,
             views: self.views,
+            sequences: self.sequences,
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
@@ -6465,6 +6987,16 @@ where
                 views.iter().map(|(name, definition)| (name.clone(), definition.clone())).collect()
             })
             .unwrap_or_default();
+        let sequences = self
+            .sequences
+            .lock()
+            .map(|sequences| {
+                sequences
+                    .iter()
+                    .map(|(name, definition)| (name.clone(), definition.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         SchemaSnapshot {
             tables,
             indexes,
@@ -6474,6 +7006,7 @@ where
             functions,
             triggers,
             views,
+            sequences,
             rls_tables,
             rls_write_tables,
             rls_enabled,
@@ -6486,6 +7019,7 @@ where
         let functions = snapshot.functions;
         let triggers = snapshot.triggers;
         let views = snapshot.views;
+        let sequences = snapshot.sequences;
         {
             let mut catalog = self
                 .catalog
@@ -6522,6 +7056,11 @@ where
             *stored = views.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("view lock")));
+        }
+        if let Ok(mut stored) = self.sequences.lock() {
+            *stored = sequences.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("sequence lock")));
         }
         let legacy_rls_enabled: HashSet<String> = snapshot.rls_tables.keys().cloned().collect();
         let rls_enabled: HashSet<String> = if snapshot.rls_enabled.is_empty() {
@@ -6612,6 +7151,8 @@ where
             self.functions.lock().map(|functions| functions.clone()).unwrap_or_default();
         let triggers = self.triggers.lock().map(|triggers| triggers.clone()).unwrap_or_default();
         let views = self.views.lock().map(|views| views.clone()).unwrap_or_default();
+        let sequences =
+            self.sequences.lock().map(|sequences| sequences.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -6634,6 +7175,7 @@ where
             functions: Arc::new(Mutex::new(functions)),
             triggers: Arc::new(Mutex::new(triggers)),
             views: Arc::new(Mutex::new(views)),
+            sequences: Arc::new(Mutex::new(sequences)),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -6657,6 +7199,13 @@ where
         let mut names: Vec<String> = views.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    pub fn catalog_sequences(&self) -> Vec<SequenceDefinition> {
+        let Ok(sequences) = self.sequences.lock() else { return Vec::new() };
+        let mut definitions: Vec<SequenceDefinition> = sequences.values().cloned().collect();
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        definitions
     }
 
     pub fn catalog_columns(&self, table: &str) -> Vec<ColumnDefinition> {
@@ -7316,7 +7865,24 @@ where
                 InsertValue::Default => {
                     if let Some(definition) = definition {
                         if definition.auto_increment {
-                            Some(self.next_sequence_value(table, definition)?)
+                            if let Some(sequence) = definition
+                                .column_default
+                                .as_deref()
+                                .and_then(sequence_name_from_default)
+                            {
+                                Some(
+                                    self.sequence_mutation(
+                                        SequenceOperation::Nextval,
+                                        &sequence,
+                                        None,
+                                        true,
+                                    )?
+                                    .to_string()
+                                    .into_bytes(),
+                                )
+                            } else {
+                                Some(self.next_sequence_value(table, definition)?)
+                            }
                         } else {
                             definition
                                 .column_default
@@ -7355,21 +7921,37 @@ where
             }
         } else {
             for definition in &definitions {
-                let value =
-                    if let Some(value) = supplied.remove(&definition.name.to_ascii_lowercase()) {
-                        value
-                    } else if definition.auto_increment {
-                        Some(self.next_sequence_value(table, definition)?)
-                    } else if let Some(default) = definition.column_default.as_deref() {
-                        eval_default(default)?
-                    } else if definition.nullable {
-                        None
+                let value = if let Some(value) =
+                    supplied.remove(&definition.name.to_ascii_lowercase())
+                {
+                    value
+                } else if definition.auto_increment {
+                    if let Some(sequence) =
+                        definition.column_default.as_deref().and_then(sequence_name_from_default)
+                    {
+                        Some(
+                            self.sequence_mutation(
+                                SequenceOperation::Nextval,
+                                &sequence,
+                                None,
+                                true,
+                            )?
+                            .to_string()
+                            .into_bytes(),
+                        )
                     } else {
-                        return Err(RymeError::InvalidArgument(format!(
-                            "null value in column {} violates not-null constraint",
-                            definition.name
-                        )));
-                    };
+                        Some(self.next_sequence_value(table, definition)?)
+                    }
+                } else if let Some(default) = definition.column_default.as_deref() {
+                    eval_default(default)?
+                } else if definition.nullable {
+                    None
+                } else {
+                    return Err(RymeError::InvalidArgument(format!(
+                        "null value in column {} violates not-null constraint",
+                        definition.name
+                    )));
+                };
                 row.push((definition.name.clone(), value, definition.data_type.clone()));
             }
             for (column, value) in supplied {
@@ -9738,6 +10320,7 @@ where
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
+            | Statement::CreateSequence { .. }
             | Statement::CreateFunction { .. }
             | Statement::CreateView { .. }
             | Statement::CreateTrigger { .. }
@@ -9745,6 +10328,9 @@ where
             | Statement::DropPolicy { .. }
             | Statement::DropTrigger { .. }
             | Statement::DropView { .. }
+            | Statement::DropSequence { .. }
+            | Statement::AlterSequence { .. }
+            | Statement::SequenceValue { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -9800,6 +10386,33 @@ where
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
                 Ok((QueryResult::Ok, Vec::new()))
             }
+            Statement::CreateSequence {
+                name,
+                if_not_exists,
+                data_type,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cache,
+                cycle,
+            } => {
+                self.install_sequence(
+                    SequenceDefinition {
+                        name,
+                        data_type,
+                        start,
+                        increment,
+                        min_value,
+                        max_value,
+                        cache,
+                        cycle,
+                        last_value: None,
+                    },
+                    if_not_exists,
+                )?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
             Statement::CreateFunction { name, body, language, replace } => {
                 self.install_function(FunctionDefinition { name, body, language }, replace)?;
                 Ok((QueryResult::Ok, Vec::new()))
@@ -9819,6 +10432,17 @@ where
             Statement::DropView { name, if_exists } => {
                 self.drop_view(&name, if_exists)?;
                 Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::DropSequence { name, if_exists } => {
+                self.drop_sequence(&name, if_exists)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterSequence { name, restart, increment } => {
+                self.alter_sequence(&name, restart, increment)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::SequenceValue { operation, name, value, is_called } => {
+                Ok((self.execute_sequence_value(operation, name, value, is_called)?, Vec::new()))
             }
             Statement::CreatePolicy { name, table, command, using, check } => {
                 self.install_policy(&name, &table, &command, using.as_deref(), check.as_deref())?;
@@ -11276,6 +11900,7 @@ where
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
+            | Statement::CreateSequence { .. }
             | Statement::CreateFunction { .. }
             | Statement::CreateView { .. }
             | Statement::CreateTrigger { .. }
@@ -11283,6 +11908,9 @@ where
             | Statement::DropPolicy { .. }
             | Statement::DropTrigger { .. }
             | Statement::DropView { .. }
+            | Statement::DropSequence { .. }
+            | Statement::AlterSequence { .. }
+            | Statement::SequenceValue { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -11320,6 +11948,7 @@ where
             &statement,
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
+                | Statement::CreateSequence { .. }
                 | Statement::CreateFunction { .. }
                 | Statement::CreateView { .. }
                 | Statement::CreateTrigger { .. }
@@ -11327,6 +11956,8 @@ where
                 | Statement::DropPolicy { .. }
                 | Statement::DropTrigger { .. }
                 | Statement::DropView { .. }
+                | Statement::DropSequence { .. }
+                | Statement::AlterSequence { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
@@ -11339,13 +11970,20 @@ where
                 | Statement::AlterTableColumn { .. }
                 | Statement::CreateIndex { .. }
         );
+        let sequence_state_statement = matches!(
+            &statement,
+            Statement::SequenceValue {
+                operation: SequenceOperation::Nextval | SequenceOperation::Setval,
+                ..
+            }
+        );
         let result = match statement {
             Statement::Returning { statement, fields } => {
                 self.execute_returning(*statement, fields, isolation).await
             }
             statement => self.execute_with_base(statement, isolation).await,
         };
-        if result.is_ok() && schema_statement {
+        if result.is_ok() && (schema_statement || sequence_state_statement) {
             self.persist_schema_if_configured()?;
         }
         result
@@ -11705,6 +12343,33 @@ where
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
                 Ok(QueryResult::Ok)
             }
+            Statement::CreateSequence {
+                name,
+                if_not_exists,
+                data_type,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cache,
+                cycle,
+            } => {
+                self.install_sequence(
+                    SequenceDefinition {
+                        name,
+                        data_type,
+                        start,
+                        increment,
+                        min_value,
+                        max_value,
+                        cache,
+                        cycle,
+                        last_value: None,
+                    },
+                    if_not_exists,
+                )?;
+                Ok(QueryResult::Ok)
+            }
             Statement::CreateFunction { name, body, language, replace } => {
                 self.install_function(FunctionDefinition { name, body, language }, replace)?;
                 Ok(QueryResult::Ok)
@@ -11724,6 +12389,17 @@ where
             Statement::DropView { name, if_exists } => {
                 self.drop_view(&name, if_exists)?;
                 Ok(QueryResult::Ok)
+            }
+            Statement::DropSequence { name, if_exists } => {
+                self.drop_sequence(&name, if_exists)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterSequence { name, restart, increment } => {
+                self.alter_sequence(&name, restart, increment)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::SequenceValue { operation, name, value, is_called } => {
+                self.execute_sequence_value(operation, name, value, is_called)
             }
             Statement::CreatePolicy { name, table, command, using, check } => {
                 self.install_policy(&name, &table, &command, using.as_deref(), check.as_deref())?;
@@ -12885,6 +13561,79 @@ mod tests {
             executor.execute(parse("SELECT body FROM active_messages").unwrap()).await.unwrap();
         assert!(
             matches!(restored, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"hello".to_vec()]])
+        );
+    }
+
+    #[tokio::test]
+    async fn sequences_support_nextval_currval_setval_and_restore() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE SEQUENCE public.events_id_seq AS bigint START WITH 10 INCREMENT BY 2 CACHE 1").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE SEQUENCE public.default_id_seq START WITH 100").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE TABLE events (id BIGINT PRIMARY KEY DEFAULT nextval('public.default_id_seq'::regclass), body TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO events (body) VALUES ('hello')").unwrap())
+            .await
+            .unwrap();
+        let generated =
+            executor.execute(parse("SELECT id FROM events WHERE id = 100").unwrap()).await.unwrap();
+        assert!(
+            matches!(generated, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"100".to_vec()]])
+        );
+        let next = executor
+            .execute(parse("SELECT nextval('public.events_id_seq'::regclass)").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(next, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"10".to_vec()]])
+        );
+        let current = executor
+            .execute(parse("SELECT currval('public.events_id_seq')").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(current, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"10".to_vec()]])
+        );
+
+        let set = executor
+            .execute(parse("SELECT setval('public.events_id_seq', 50, false)").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(set, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"50".to_vec()]])
+        );
+        let next =
+            executor.execute(parse("SELECT nextval('events_id_seq')").unwrap()).await.unwrap();
+        assert!(
+            matches!(next, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"50".to_vec()]])
+        );
+
+        executor
+            .execute(parse("ALTER SEQUENCE public.events_id_seq RESTART WITH 7").unwrap())
+            .await
+            .unwrap();
+        let restarted =
+            executor.execute(parse("SELECT nextval('events_id_seq')").unwrap()).await.unwrap();
+        assert!(
+            matches!(restarted, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"7".to_vec()]])
+        );
+
+        let snapshot = executor.schema_snapshot();
+        assert_eq!(snapshot.sequences["public.events_id_seq"].last_value, Some(7));
+        executor.execute(parse("DROP SEQUENCE public.events_id_seq").unwrap()).await.unwrap();
+        executor.restore_schema_snapshot(snapshot).unwrap();
+        let restored =
+            executor.execute(parse("SELECT currval('events_id_seq')").unwrap()).await.unwrap();
+        assert!(
+            matches!(restored, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"7".to_vec()]])
         );
     }
 
