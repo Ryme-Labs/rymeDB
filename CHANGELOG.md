@@ -17,10 +17,10 @@ All notable changes to rymeDB are recorded here. Format follows
   preserving branch-only tables and indexes across executor recreation while
   keeping branch DDL out of `main`; child branches inherit their parent
   schema snapshot, and archives preserve the nested branch metadata paths.
-- Durable snapshots now also produce checksummed immutable `.sst` segments
-  with sparse indexes and Bloom filters; startup can recover from the newest
-  segment when the snapshot directory is unavailable, retention prunes old
-  segment files, and archive jobs include the segment artifacts.
+- Durable commits now append checksummed immutable `.sst` delta segments, while
+  snapshots produce full sorted bases with sparse indexes and Bloom filters;
+  startup merges the segment set when snapshots are unavailable, retention
+  prunes safely around the newest base, and archive jobs include the artifacts.
 - SDK distribution is limited to the Java, npm/TypeScript, and Rust clients;
   the release workflow packages and publishes those three artifacts and the
   Pages workflow builds their documentation.

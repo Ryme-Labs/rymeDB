@@ -8,6 +8,20 @@ const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentKind {
+    Snapshot = 0,
+    Delta = 1,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentEntry {
+    pub key: RecordKey,
+    pub commit_ts: u64,
+    pub value: Option<Vec<u8>>,
+    pub expires_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMeta {
     pub id: u64,
@@ -19,6 +33,7 @@ pub struct SegmentMeta {
 #[derive(Debug, Clone)]
 pub struct ImmutableSegment {
     meta: SegmentMeta,
+    kind: SegmentKind,
     engine: Engine,
     keys: Vec<RecordKey>,
     sparse_index: Vec<(RecordKey, usize)>,
@@ -41,11 +56,36 @@ impl ImmutableSegment {
             entries: keys.len() as u64,
             bytes: engine.bytes_held(),
         };
-        Self { meta, engine: engine.clone(), keys, sparse_index, bloom }
+        Self {
+            meta,
+            kind: SegmentKind::Snapshot,
+            engine: engine.clone(),
+            keys,
+            sparse_index,
+            bloom,
+        }
+    }
+
+    pub fn from_entries(id: u64, entries: &[SegmentEntry]) -> Result<Self> {
+        let mut engine = Engine::new();
+        let mut ordered = entries.to_vec();
+        ordered.sort_by(|left, right| {
+            left.key.cmp(&right.key).then(left.commit_ts.cmp(&right.commit_ts))
+        });
+        for entry in ordered {
+            engine.apply_with_expiry(entry.key, entry.commit_ts, entry.value, entry.expires_at)?;
+        }
+        let mut segment = Self::from_engine(id, &engine);
+        segment.kind = SegmentKind::Delta;
+        Ok(segment)
     }
 
     pub fn meta(&self) -> &SegmentMeta {
         &self.meta
+    }
+
+    pub fn is_snapshot(&self) -> bool {
+        self.kind == SegmentKind::Snapshot
     }
 
     pub fn key_count(&self) -> usize {
@@ -83,12 +123,26 @@ impl ImmutableSegment {
         self.engine
     }
 
+    pub fn merge_into(&self, target: &mut Engine) -> Result<()> {
+        for (key, versions) in &self.engine.inner {
+            for version in versions {
+                target.apply_with_expiry(
+                    key.clone(),
+                    version.commit_ts,
+                    version.value.clone(),
+                    version.expires_at,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let payload = self.engine.encode_snapshot()?;
         let mut out = Vec::with_capacity(4 + 2 + 2 + 8 + 4 + payload.len() + 4);
         out.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
         out.extend_from_slice(&SEGMENT_VERSION.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(self.kind as u16).to_be_bytes());
         out.extend_from_slice(&self.meta.id.to_be_bytes());
         out.extend_from_slice(
             &(u32::try_from(payload.len())
@@ -128,7 +182,11 @@ impl ImmutableSegment {
         let mut cursor = &input[..];
         let magic = take_u32(&mut cursor)?;
         let version = take_u16(&mut cursor)?;
-        let _reserved = take_u16(&mut cursor)?;
+        let kind = match take_u16(&mut cursor)? {
+            0 => SegmentKind::Snapshot,
+            1 => SegmentKind::Delta,
+            _ => return Err(RymeError::Corrupt(String::from("segment kind"))),
+        };
         let id = take_u64(&mut cursor)?;
         let payload_len = take_u32(&mut cursor)? as usize;
         if magic != SEGMENT_MAGIC || version != SEGMENT_VERSION {
@@ -140,7 +198,8 @@ impl ImmutableSegment {
         let payload = &cursor[..payload_len];
         cursor = &cursor[payload_len..];
         let engine = Engine::decode_snapshot(payload)?;
-        let segment = Self::from_engine(id, &engine);
+        let mut segment = Self::from_engine(id, &engine);
+        segment.kind = kind;
         if segment.meta.max_commit_ts != engine.max_commit_ts() {
             return Err(RymeError::Corrupt(String::from("segment commit")));
         }
@@ -160,7 +219,11 @@ impl ImmutableSegment {
             let ordinal = take_u32(&mut cursor)? as usize;
             sparse_index.push((key, ordinal));
         }
-        if cursor.len() != 4 || bloom != segment.bloom || sparse_index != segment.sparse_index {
+        if cursor.len() != 4
+            || bloom != segment.bloom
+            || sparse_index != segment.sparse_index
+            || kind != segment.kind
+        {
             return Err(RymeError::Corrupt(String::from("segment metadata")));
         }
         Ok(segment)
@@ -184,6 +247,20 @@ impl SegmentStore {
 
     pub fn write(&self, id: u64, engine: &Engine) -> Result<(SegmentMeta, PathBuf)> {
         let segment = ImmutableSegment::from_engine(id, engine);
+        self.write_segment(segment)
+    }
+
+    pub fn write_delta(&self, id: u64, entries: &[SegmentEntry]) -> Result<SegmentMeta> {
+        if entries.is_empty() {
+            return Ok(SegmentMeta { id, max_commit_ts: 0, entries: 0, bytes: 0 });
+        }
+        let segment = ImmutableSegment::from_entries(id, entries)?;
+        let (meta, _) = self.write_segment(segment)?;
+        Ok(meta)
+    }
+
+    fn write_segment(&self, segment: ImmutableSegment) -> Result<(SegmentMeta, PathBuf)> {
+        let id = segment.meta.id;
         let path = self.dir.join(segment_name(id));
         let temporary =
             self.dir.join(format!("{segment_name}.tmp", segment_name = segment_name(id)));
@@ -208,6 +285,27 @@ impl SegmentStore {
         };
         let bytes = std::fs::read(path)?;
         Ok(Some(ImmutableSegment::decode(&bytes)?))
+    }
+
+    pub fn load_all(&self) -> Result<Option<(Engine, u64)>> {
+        let mut paths = self.segment_paths()?;
+        paths.sort_by_key(|path| {
+            parse_segment_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        });
+        let mut engine = Engine::new();
+        let mut found = false;
+        let mut max_commit_ts = 0;
+        for path in paths {
+            let segment = ImmutableSegment::decode(&std::fs::read(path)?)?;
+            if segment.is_snapshot() {
+                engine = segment.into_engine();
+            } else {
+                segment.merge_into(&mut engine)?;
+            }
+            max_commit_ts = max_commit_ts.max(engine.max_commit_ts());
+            found = true;
+        }
+        Ok(found.then_some((engine, max_commit_ts)))
     }
 
     pub fn latest_path(&self) -> Result<Option<PathBuf>> {
@@ -250,13 +348,39 @@ impl SegmentStore {
     }
 
     pub fn prune(&self, keep: usize) -> Result<usize> {
-        let mut paths = self.segment_paths()?;
-        paths.sort_by_key(|path| {
-            parse_segment_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
-        });
-        let excess = paths.len().saturating_sub(keep.max(1));
+        let mut segments = Vec::new();
+        for path in self.segment_paths()? {
+            let segment = ImmutableSegment::decode(&std::fs::read(&path)?)?;
+            segments.push((segment.meta.id, path, segment.is_snapshot()));
+        }
+        segments.sort_by_key(|(id, _, _)| *id);
+        let full_ids: Vec<u64> =
+            segments.iter().filter_map(|(id, _, is_snapshot)| is_snapshot.then_some(*id)).collect();
+        let mut keep_paths = Vec::new();
+        if let Some(latest_full) = full_ids.last().copied() {
+            keep_paths.extend(
+                full_ids
+                    .iter()
+                    .rev()
+                    .take(keep.max(1))
+                    .filter_map(|id| segments.iter().find(|(segment_id, _, _)| segment_id == id))
+                    .map(|(_, path, _)| path.clone()),
+            );
+            keep_paths.extend(
+                segments
+                    .iter()
+                    .filter(|(id, _, is_snapshot)| *id > latest_full && !is_snapshot)
+                    .map(|(_, path, _)| path.clone()),
+            );
+        } else {
+            keep_paths
+                .extend(segments.iter().rev().take(keep.max(1)).map(|(_, path, _)| path.clone()));
+        }
         let mut removed = 0;
-        for path in paths.into_iter().take(excess) {
+        for (_, path, _) in segments {
+            if keep_paths.contains(&path) {
+                continue;
+            }
             if std::fs::remove_file(path).is_ok() {
                 removed += 1;
             }
@@ -415,6 +539,29 @@ mod tests {
     }
 
     #[test]
+    fn delta_segments_merge_after_snapshot_base() {
+        let mut base = Engine::new();
+        let first = RecordKey::new("tenant", "db", "items", b"a");
+        base.apply(first.clone(), 10, Some(b"one".to_vec())).unwrap();
+        let snapshot = ImmutableSegment::from_engine(10, &base);
+        let second = RecordKey::new("tenant", "db", "items", b"b");
+        let delta = ImmutableSegment::from_entries(
+            11,
+            &[SegmentEntry {
+                key: second.clone(),
+                commit_ts: 11,
+                value: Some(b"two".to_vec()),
+                expires_at: 0,
+            }],
+        )
+        .unwrap();
+        let mut restored = snapshot.into_engine();
+        delta.merge_into(&mut restored).unwrap();
+        assert_eq!(restored.read(&first, 11, 0).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(restored.read(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
+    }
+
+    #[test]
     fn segment_store_reopens_latest_segment() {
         let dir = std::env::temp_dir().join(format!(
             "ryme-segments-{}-{}",
@@ -432,6 +579,40 @@ mod tests {
         let segment = reopened.latest().unwrap().unwrap();
         assert_eq!(segment.meta().max_commit_ts, 42);
         assert_eq!(segment.get(&key, 42, 0).unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_store_prunes_superseded_deltas_but_keeps_recovery_chain() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-prune-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let mut engine = Engine::new();
+        let first = RecordKey::new("tenant", "db", "items", b"a");
+        engine.apply(first.clone(), 10, Some(b"one".to_vec())).unwrap();
+        store.write(10, &engine).unwrap();
+        let second = RecordKey::new("tenant", "db", "items", b"b");
+        store
+            .write_delta(
+                11,
+                &[SegmentEntry {
+                    key: second.clone(),
+                    commit_ts: 11,
+                    value: Some(b"two".to_vec()),
+                    expires_at: 0,
+                }],
+            )
+            .unwrap();
+        assert_eq!(store.prune(1).unwrap(), 0);
+        assert_eq!(store.segment_paths().unwrap().len(), 2);
+        let (recovered, max) = store.load_all().unwrap().unwrap();
+        assert_eq!(max, 11);
+        assert_eq!(recovered.read(&first, 11, 0).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(recovered.read(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

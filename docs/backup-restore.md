@@ -44,11 +44,12 @@ Response shape: `{ "commit": <u64>, "files": [<names>] }`. Snapshots are the
 unit that gets shipped to the archive and the unit you copy back for
 single-node disaster recovery.
 
-Durable managers also write an immutable checksummed `.sst` segment under
-`<wal-dir>/segments` for each snapshot. The segment is sorted by logical
-record key and carries a sparse key index plus Bloom filter metadata. It is a
-recovery fallback when the snapshot pointer is unavailable; WAL replay still
-covers commits newer than the segment.
+Durable managers append an immutable checksummed delta `.sst` segment under
+`<wal-dir>/segments` for each committed write, and write a full sorted base
+segment for each snapshot. Segments carry a sparse key index plus Bloom filter
+metadata. Startup merges the ordered base-plus-delta set when the snapshot
+pointer is unavailable; WAL replay still covers commits newer than the newest
+segment.
 
 Archives include the SQL and control-plane metadata files: `schema.json`,
 `branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema

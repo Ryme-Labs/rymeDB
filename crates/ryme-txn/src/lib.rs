@@ -1,5 +1,5 @@
 use ryme_error::{Result, RymeError};
-use ryme_storage::{Engine, RecordKey, SegmentStore};
+use ryme_storage::{Engine, RecordKey, SegmentEntry, SegmentStore};
 use ryme_wal::Wal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -594,6 +594,14 @@ impl TxnManager {
         txn: Transaction,
         persist: impl FnOnce(u64, &[u8]) -> Result<()>,
     ) -> Result<u64> {
+        self.commit_durable_with(txn, |commit_ts, payload, _| persist(commit_ts, payload))
+    }
+
+    pub fn commit_durable_with(
+        &self,
+        txn: Transaction,
+        persist: impl FnOnce(u64, &[u8], &BTreeMap<RecordKey, WriteOp>) -> Result<()>,
+    ) -> Result<u64> {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
@@ -604,7 +612,7 @@ impl TxnManager {
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         let commit_ts = self.reserve_locked(&txn)?;
         let payload = encode_writes(&txn.writes)?;
-        persist(commit_ts, &payload)?;
+        persist(commit_ts, &payload, &txn.writes)?;
         self.apply_locked(commit_ts, &txn.writes)?;
         Ok(commit_ts)
     }
@@ -1008,7 +1016,7 @@ impl DurableManager {
         };
         let floor = match manager.load_latest_snapshot()? {
             Some(floor) => floor,
-            None => manager.load_latest_segment()?.unwrap_or(0),
+            None => manager.load_all_segments()?.unwrap_or(0),
         };
         manager.recover_from(floor)?;
         Ok(manager)
@@ -1062,12 +1070,11 @@ impl DurableManager {
         Ok(Some(self.inner.restore_snapshot(&raw)?))
     }
 
-    pub fn load_latest_segment(&self) -> Result<Option<u64>> {
-        let Some(segment) = self.segments.latest()? else {
+    pub fn load_all_segments(&self) -> Result<Option<u64>> {
+        let Some((engine, max)) = self.segments.load_all()? else {
             return Ok(None);
         };
-        let max = segment.meta().max_commit_ts;
-        self.inner.restore_snapshot(&segment.into_engine().encode_snapshot()?)?;
+        self.inner.restore_snapshot(&engine.encode_snapshot()?)?;
         Ok(Some(max))
     }
 
@@ -1280,13 +1287,15 @@ impl DurableManager {
             return Ok(txn.read_ts);
         }
         let policy = self.policy;
-        self.inner.commit_durable(txn, |commit_ts, payload| {
+        let writes = txn.writes().clone();
+        self.inner.commit_durable_with(txn, |commit_ts, payload, _| {
             let mut wal =
                 self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
             wal.append(commit_ts, payload)?;
             if policy == SyncPolicy::Always {
                 wal.sync()?;
             }
+            self.segments.write_delta(commit_ts, &segment_entries(commit_ts, &writes))?;
             Ok(())
         })
     }
@@ -1315,8 +1324,21 @@ impl DurableManager {
                 wal.sync()?;
             }
         }
+        self.segments.write_delta(commit_ts, &segment_entries(commit_ts, &writes))?;
         self.inner.commit_filtered_at(txn, commit_ts, keep)
     }
+}
+
+fn segment_entries(commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Vec<SegmentEntry> {
+    writes
+        .iter()
+        .map(|(key, op)| SegmentEntry {
+            key: key.clone(),
+            commit_ts,
+            value: op.value.clone(),
+            expires_at: op.expires_at,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1729,6 +1751,37 @@ mod tests {
         let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"durable".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delta_segments_recover_multiple_commits_without_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-delta-recover-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let first = RecordKey::new("t", "d", "s", b"first");
+        let second = RecordKey::new("t", "d", "s", b"second");
+        for (key, value) in [(&first, b"one".to_vec()), (&second, b"two".to_vec())] {
+            let mut txn = manager.begin();
+            manager.put(&mut txn, key.clone(), value);
+            manager.commit(txn).unwrap();
+        }
+        drop(manager);
+
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &first).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reopened.get(&mut probe, &second).unwrap(), Some(b"two".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
