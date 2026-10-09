@@ -165,3 +165,12 @@ frames exactly like `/v1/stream`.
 
 All three pass the key as `?api_key=` and default the base-URL scheme
 (`http`→`ws`, `https`→`wss`).
+
+## Durable topics
+
+`POST /v1/topics/append` and `GET /v1/topics/read` provide tenant-scoped,
+ordered partitions with resumable cursors. Topic messages and their next
+cursor are atomically persisted in the server data directory (`topics.json`)
+after each append, so retained messages survive a process restart. The file
+is restricted to the server account on Unix; topic retention remains bounded
+to prevent an unbounded restart snapshot.

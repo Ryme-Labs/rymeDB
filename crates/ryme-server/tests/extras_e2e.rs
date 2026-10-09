@@ -343,6 +343,94 @@ async fn extras_auth_presence_topics_mask() {
 }
 
 #[tokio::test]
+async fn extras_durable_topics_survive_restart() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-extras-topics-restart-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = Config::default();
+    config.node_id = String::from("extras-topics-restart");
+    config.data_dir = root.clone();
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    config.archive.interval_secs = 0;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let (status, body) = http_request(
+        http,
+        "POST /v1/topics/append",
+        b"{\"partition\":\"orders\",\"key\":\"k1\",\"value\":\"v1\",\"retention\":16}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains("\"cursor\":0"));
+    server.abort();
+    let _ = server.await;
+
+    let topics_path = root.join("topics.json");
+    assert!(topics_path.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&topics_path).unwrap().permissions().mode() & 0o077, 0);
+    }
+
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = Config::default();
+    config.node_id = String::from("extras-topics-restart");
+    config.data_dir = root.clone();
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    config.archive.interval_secs = 0;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let (status, body) =
+        http_request(http, "GET /v1/topics/read?partition=orders&from=0&limit=10", b"").await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"cursor\":0"), "{text}");
+    assert!(text.contains("\"key\":\"k1\""), "{text}");
+    let (status, body) = http_request(
+        http,
+        "POST /v1/topics/append",
+        b"{\"partition\":\"orders\",\"key\":\"k2\",\"value\":\"v2\"}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains("\"cursor\":1"));
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn extras_branch_lifecycle_and_billing() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root = std::env::temp_dir().join(format!(

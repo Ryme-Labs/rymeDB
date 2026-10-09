@@ -444,6 +444,7 @@ pub struct SharedState {
     executor: Executor<BranchStorage>,
     rls_tables: HashMap<String, String>,
     realtime: Realtime,
+    durable_persist_lock: Arc<Mutex<()>>,
     keys: ApiKeyStore,
     jwt: Option<JwtVerifier>,
     oidc: Option<OidcConfig>,
@@ -485,6 +486,7 @@ pub struct SharedState {
     branch_path: std::path::PathBuf,
     auth_path: std::path::PathBuf,
     control_path: std::path::PathBuf,
+    durable_path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -525,6 +527,33 @@ struct ControlSnapshot {
     backups: ryme_backup::BackupLog,
     #[serde(default)]
     migrations: ryme_migrate::Ledger,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct DurableSnapshot {
+    #[serde(default)]
+    topics: Vec<ryme_realtime::DurableTopicSnapshot>,
+}
+
+fn load_durable_snapshot(
+    path: &std::path::Path,
+) -> ryme_error::Result<Vec<ryme_realtime::DurableTopicSnapshot>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let snapshot: DurableSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("durable snapshot: {error}")))?;
+    Ok(snapshot.topics)
 }
 
 fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSnapshot> {
@@ -863,6 +892,30 @@ impl SharedState {
         Ok(())
     }
 
+    fn persist_durable_topics(&self) -> ryme_error::Result<()> {
+        let snapshot = DurableSnapshot { topics: self.realtime.durable_snapshot()? };
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
+            ryme_error::RymeError::Internal(format!("durable snapshot: {error}"))
+        })?;
+        if let Some(parent) = self.durable_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self.durable_path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(temporary, &self.durable_path)?;
+        Ok(())
+    }
+
     pub fn build(config: &Config) -> ryme_error::Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
         let wal_dir = config.data_dir.join("wal");
@@ -917,6 +970,9 @@ impl SharedState {
             None => Backend::Single(durable.clone()),
         };
         let realtime = Realtime::new(4096);
+        let durable_path = config.data_dir.join("topics.json");
+        let durable_snapshot = load_durable_snapshot(&durable_path)?;
+        realtime.restore_durable_snapshot(durable_snapshot)?;
         let mut policies = PolicyEngine::new();
         for (table, tenant_column) in &config.rls_tables {
             policies.allow_table(table.clone(), tenant_column.clone());
@@ -1007,6 +1063,7 @@ impl SharedState {
             executor,
             rls_tables: config.rls_tables.clone(),
             realtime,
+            durable_persist_lock: Arc::new(Mutex::new(())),
             keys,
             jwt,
             oidc,
@@ -1061,6 +1118,7 @@ impl SharedState {
             branch_path,
             auth_path,
             control_path,
+            durable_path,
         })
     }
 
@@ -3956,7 +4014,7 @@ async fn durable_append(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if request.partition.is_empty() {
+    if request.partition.is_empty() || request.partition.contains('\0') {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("partition")));
     }
     if request.partition.len() > 256 {
@@ -3972,6 +4030,10 @@ async fn durable_append(
     if let Err(e) = admit_write(&state, &principal.tenant, bytes) {
         return error_response(e);
     }
+    let _durable_persist_guard = match state.durable_persist_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+    };
     let commit = state.backend.latest_commit();
     match state.realtime.durable_append(
         &principal.tenant,
@@ -3981,9 +4043,12 @@ async fn durable_append(
         commit,
         request.retention.unwrap_or(1024),
     ) {
-        Ok(cursor) => {
-            (StatusCode::OK, Json(serde_json::json!({ "cursor": cursor }))).into_response()
-        }
+        Ok(cursor) => match state.persist_durable_topics() {
+            Ok(()) => {
+                (StatusCode::OK, Json(serde_json::json!({ "cursor": cursor }))).into_response()
+            }
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }

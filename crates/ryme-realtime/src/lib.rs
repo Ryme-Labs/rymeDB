@@ -98,6 +98,15 @@ pub struct DurableMsg {
     pub commit_ts: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableTopicSnapshot {
+    pub tenant: String,
+    pub partition: String,
+    pub messages: Vec<DurableMsg>,
+    pub next_cursor: u64,
+    pub retention: usize,
+}
+
 #[derive(Debug)]
 struct DurableTopic {
     messages: VecDeque<DurableMsg>,
@@ -546,7 +555,7 @@ impl Realtime {
         let mut inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
         let topic =
-            inner.durable.entry(scope_key(tenant, partition)).or_insert_with(|| DurableTopic {
+            inner.durable.entry(durable_key(tenant, partition)).or_insert_with(|| DurableTopic {
                 messages: VecDeque::new(),
                 next_cursor: 0,
                 retention: retention.clamp(16, 100000),
@@ -578,7 +587,7 @@ impl Realtime {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
-        let Some(topic) = inner.durable.get(&scope_key(tenant, partition)) else {
+        let Some(topic) = inner.durable.get(&durable_key(tenant, partition)) else {
             return Vec::new();
         };
         topic.messages.iter().filter(|msg| msg.cursor >= from_cursor).take(limit).cloned().collect()
@@ -589,9 +598,66 @@ impl Realtime {
             .lock()
             .ok()
             .and_then(|inner| {
-                inner.durable.get(&scope_key(tenant, partition)).map(|t| t.next_cursor)
+                inner.durable.get(&durable_key(tenant, partition)).map(|t| t.next_cursor)
             })
             .unwrap_or(0)
+    }
+
+    pub fn durable_snapshot(&self) -> Result<Vec<DurableTopicSnapshot>> {
+        let inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
+        let mut snapshots = Vec::with_capacity(inner.durable.len());
+        for (scope, topic) in &inner.durable {
+            let Some((tenant, partition)) = scope.split_once('\0') else {
+                return Err(RymeError::Corrupt(String::from("durable topic scope")));
+            };
+            snapshots.push(DurableTopicSnapshot {
+                tenant: tenant.to_string(),
+                partition: partition.to_string(),
+                messages: topic.messages.iter().cloned().collect(),
+                next_cursor: topic.next_cursor,
+                retention: topic.retention,
+            });
+        }
+        snapshots.sort_by(|left, right| {
+            left.tenant.cmp(&right.tenant).then(left.partition.cmp(&right.partition))
+        });
+        Ok(snapshots)
+    }
+
+    pub fn restore_durable_snapshot(&self, snapshots: Vec<DurableTopicSnapshot>) -> Result<()> {
+        let mut inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
+        for snapshot in snapshots {
+            if snapshot.tenant.is_empty()
+                || snapshot.partition.is_empty()
+                || snapshot.tenant.contains('\0')
+                || snapshot.partition.contains('\0')
+            {
+                return Err(RymeError::Corrupt(String::from("durable topic identity")));
+            }
+            if snapshot.messages.iter().any(|message| message.partition != snapshot.partition) {
+                return Err(RymeError::Corrupt(String::from("durable topic partition")));
+            }
+            let retention = snapshot.retention.clamp(16, 100000);
+            let mut messages = snapshot.messages;
+            messages.sort_by_key(|message| message.cursor);
+            while messages.len() > retention {
+                messages.remove(0);
+            }
+            let next_cursor = snapshot
+                .next_cursor
+                .max(messages.last().map(|message| message.cursor.saturating_add(1)).unwrap_or(0));
+            let key = durable_key(&snapshot.tenant, &snapshot.partition);
+            if inner.durable.contains_key(&key) {
+                return Err(RymeError::Corrupt(String::from("duplicate durable topic")));
+            }
+            inner.durable.insert(
+                key,
+                DurableTopic { messages: messages.into_iter().collect(), next_cursor, retention },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -607,6 +673,10 @@ fn branch_topic_key(tenant: &str, database: &str, branch: &str, table: &str) -> 
 
 fn scope_key(tenant: &str, name: &str) -> String {
     format!("{tenant}/{name}")
+}
+
+fn durable_key(tenant: &str, partition: &str) -> String {
+    format!("{tenant}\0{partition}")
 }
 
 #[cfg(test)]
@@ -868,6 +938,19 @@ mod tests {
         assert_eq!(tail[0].key, b"k2".to_vec());
         let all = realtime.durable_read("t", "orders", 0, 10);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn durable_topics_round_trip_through_snapshot() {
+        let realtime = Realtime::new(64);
+        realtime.durable_append("tenant", "orders", b"k".to_vec(), b"v".to_vec(), 5, 16).unwrap();
+        let snapshots = realtime.durable_snapshot().unwrap();
+        let restored = Realtime::new(64);
+        restored.restore_durable_snapshot(snapshots).unwrap();
+        assert_eq!(restored.durable_cursor("tenant", "orders"), 1);
+        let messages = restored.durable_read("tenant", "orders", 0, 10);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].key, b"k");
     }
 
     #[test]
