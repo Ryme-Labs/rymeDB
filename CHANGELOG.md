@@ -57,6 +57,8 @@ All notable changes to rymeDB are recorded here. Format follows
   schema-column indexes and uniqueness checks aligned with the new name.
 - `ALTER TABLE ... ADD/DROP COLUMN IF [NOT] EXISTS` now supports idempotent
   migration scripts.
+- `DROP TABLE [IF EXISTS]` now removes durable rows, schema metadata, indexes,
+  and table-local sequences.
 - SQL aggregate parsing now requires function-call parentheses, so columns named
   `count`, `sum`, `avg`, `min`, or `max` remain valid projections.
 - Aggregates, grouping, and key joins now page through all visible rows instead
