@@ -164,6 +164,17 @@ pub enum Statement {
         plan: String,
         inner: Box<Statement>,
     },
+    Distinct {
+        statement: Box<Statement>,
+        #[serde(default = "default_distinct_limit")]
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+    },
+}
+
+fn default_distinct_limit() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,6 +518,7 @@ impl Statement {
             Self::DropIndex { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
+            Self::Distinct { statement, .. } => statement.table(),
         }
     }
 }
@@ -517,7 +529,9 @@ pub fn parse(input: &str) -> Result<Statement> {
         return Err(RymeError::InvalidArgument(String::from("empty statement")));
     }
     let head = tokens[0].to_ascii_uppercase();
-    let statement = match head.as_str() {
+    let is_distinct = head == "SELECT"
+        && tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("DISTINCT"));
+    let mut statement = match head.as_str() {
         "CREATE" => parse_create(&tokens, input),
         "DROP" => parse_drop(&tokens),
         "TRUNCATE" => parse_truncate(&tokens),
@@ -531,6 +545,9 @@ pub fn parse(input: &str) -> Result<Statement> {
         "EXPLAIN" => parse_explain(input),
         _ => Err(RymeError::InvalidArgument(String::from("unknown statement"))),
     }?;
+    if is_distinct {
+        statement = prepare_distinct(statement);
+    }
     if tokens.iter().any(|token| token.eq_ignore_ascii_case("RETURNING")) {
         let fields = parse_returning_fields(&tokens)?;
         if statement.is_write() && !matches!(statement, Statement::CopyFrom { .. }) {
@@ -539,6 +556,69 @@ pub fn parse(input: &str) -> Result<Statement> {
         return Err(RymeError::InvalidArgument(String::from("returning statement")));
     }
     Ok(statement)
+}
+
+fn prepare_distinct(statement: Statement) -> Statement {
+    match statement {
+        Statement::SelectScan { table, limit, offset, order, filter } => Statement::Distinct {
+            statement: Box::new(Statement::SelectScan {
+                table,
+                limit: default_distinct_limit(),
+                offset: 0,
+                order,
+                filter,
+            }),
+            limit,
+            offset,
+        },
+        Statement::SelectColumns { table, columns, limit, offset, order, filter } => {
+            Statement::Distinct {
+                statement: Box::new(Statement::SelectColumns {
+                    table,
+                    columns,
+                    limit: default_distinct_limit(),
+                    offset: 0,
+                    order,
+                    filter,
+                }),
+                limit,
+                offset,
+            }
+        }
+        Statement::GroupBy { table, select, group, group_column, filter, limit, offset, order } => {
+            Statement::Distinct {
+                statement: Box::new(Statement::GroupBy {
+                    table,
+                    select,
+                    group,
+                    group_column,
+                    filter,
+                    limit: default_distinct_limit(),
+                    offset: 0,
+                    order,
+                }),
+                limit,
+                offset,
+            }
+        }
+        Statement::Join { left, right, limit, offset, order, filter } => Statement::Distinct {
+            statement: Box::new(Statement::Join {
+                left,
+                right,
+                limit: default_distinct_limit(),
+                offset: 0,
+                order,
+                filter,
+            }),
+            limit,
+            offset,
+        },
+        statement => Statement::Distinct {
+            statement: Box::new(statement),
+            limit: default_distinct_limit(),
+            offset: 0,
+        },
+    }
 }
 
 fn parse_drop(tokens: &[String]) -> Result<Statement> {
@@ -1324,7 +1404,14 @@ fn select_items(raw: &str) -> Option<Vec<String>> {
         return None;
     }
     let from = find_sql_keyword(statement, "FROM", 6)?;
-    Some(split_sql_items(statement[6..from].trim()))
+    let projection = statement[6..from].trim();
+    let projection =
+        if projection.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("DISTINCT")) {
+            projection[8..].trim_start()
+        } else {
+            projection
+        };
+    Some(split_sql_items(projection))
 }
 
 fn find_sql_keyword(input: &str, keyword: &str, start: usize) -> Option<usize> {
@@ -1438,7 +1525,12 @@ fn parse_projection(tokens: &[String]) -> Result<Option<Vec<String>>> {
         .iter()
         .position(|token| token.eq_ignore_ascii_case("FROM"))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("missing table")))?;
-    let selected = &tokens[1..from];
+    let start = if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("DISTINCT")) {
+        2
+    } else {
+        1
+    };
+    let selected = &tokens[start..from];
     if selected.is_empty() || (selected.len() == 1 && selected[0] == "*") {
         return Ok(None);
     }
@@ -2191,6 +2283,35 @@ pub fn describe_plan(statement: &Statement) -> String {
             )
         }
         Statement::Explain { plan, .. } => format!("explain({plan})"),
+        Statement::Distinct { statement, limit, offset } => {
+            format!("distinct({}) limit {limit} offset {offset}", describe_plan(statement))
+        }
+    }
+}
+
+fn apply_distinct(result: QueryResult, offset: usize, limit: usize) -> QueryResult {
+    match result {
+        QueryResult::Rows { rows } => {
+            let mut seen = std::collections::HashSet::new();
+            let rows = rows
+                .into_iter()
+                .filter(|row| seen.insert(row.clone()))
+                .skip(offset)
+                .take(limit)
+                .collect();
+            QueryResult::Rows { rows }
+        }
+        QueryResult::Table { columns, rows } => {
+            let mut seen = std::collections::HashSet::new();
+            let rows = rows
+                .into_iter()
+                .filter(|row| seen.insert(row.clone()))
+                .skip(offset)
+                .take(limit)
+                .collect();
+            QueryResult::Table { columns, rows }
+        }
+        result => result,
     }
 }
 
@@ -4032,6 +4153,11 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
+            Statement::Distinct { statement, limit, offset } => {
+                let (result, changes) =
+                    Box::pin(self.execute_in_transaction_base(txn, *statement)).await?;
+                Ok((apply_distinct(result, offset, limit), changes))
+            }
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
             Statement::DropTable { table, if_exists } => {
                 self.drop_table(table, if_exists).await?;
@@ -4748,6 +4874,10 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match statement {
+            Statement::Distinct { statement, limit, offset } => {
+                let result = Box::pin(self.execute_with_base(*statement, isolation)).await?;
+                Ok(apply_distinct(result, offset, limit))
+            }
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
             Statement::DropTable { table, if_exists } => {
                 self.drop_table(table, if_exists).await?;
@@ -6669,6 +6799,38 @@ mod tests {
         assert!(plan.contains("filters 1"));
         assert!(plan.contains("desc"));
         assert!(parse("SELECT * FROM docs WHERE key BETWEEN 'a' AND 'b'").is_err());
+    }
+
+    #[tokio::test]
+    async fn select_distinct_deduplicates_before_limit_and_offset() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, room TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, room) VALUES ('m1', 'a'), ('m2', 'a'), ('m3', 'b')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(
+                parse("SELECT DISTINCT room FROM messages ORDER BY room ASC LIMIT 1 OFFSET 1")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"b".to_vec()]])
+        );
+        let plan =
+            executor.explain("SELECT DISTINCT room FROM messages ORDER BY room ASC").unwrap();
+        assert!(plan.contains("distinct"));
     }
 
     #[test]

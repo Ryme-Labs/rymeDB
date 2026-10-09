@@ -68,6 +68,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - `TRUNCATE TABLE` now clears durable rows while preserving schema and indexes.
 - SQL aggregate parsing now requires function-call parentheses, so columns named
   `count`, `sum`, `avg`, `min`, or `max` remain valid projections.
+- `SELECT DISTINCT` now deduplicates projected rows before applying
+  `LIMIT`/`OFFSET`.
 - Aggregates, grouping, and key joins now page through all visible rows instead
   of truncating results at the first 10,000-row storage page.
 - Scalar and grouped aggregates now resolve declared schema columns and JSON
