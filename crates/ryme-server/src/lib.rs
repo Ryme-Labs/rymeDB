@@ -1650,6 +1650,7 @@ pub async fn serve_cluster(
         }
     };
     install_cluster_range_replication(&state, &node)?;
+    install_cluster_realtime_replication(&state, &node)?;
     let mut tasks = node.spawn(raft_listener);
     tasks.extend(
         spawn_gateways(
@@ -3979,6 +3980,16 @@ pub struct BroadcastRequest {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClusterBroadcast {
+    tenant: String,
+    channel: String,
+    from: String,
+    payload: serde_json::Value,
+    commit_ts: u64,
+    sequence: u64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DurableAppendRequest {
     pub partition: String,
@@ -4111,6 +4122,32 @@ async fn broadcast_post(
         return error_response(e);
     }
     let commit = state.backend.latest_commit();
+    if let Some(node) = state.raft_node() {
+        if !node.is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let sequence = state.realtime.reserve_sequence();
+        let event = ClusterBroadcast {
+            tenant: principal.tenant.clone(),
+            channel: request.channel.clone(),
+            from: request.from.unwrap_or_else(|| principal.id.clone()),
+            payload: request.payload,
+            commit_ts: commit,
+            sequence,
+        };
+        let payload = match serde_json::to_vec(&event) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return error_response(ryme_error::RymeError::Internal(error.to_string()))
+            }
+        };
+        return match node.fanout_realtime(payload).await {
+            Ok(_) => {
+                (StatusCode::OK, Json(serde_json::json!({ "sequence": sequence }))).into_response()
+            }
+            Err(error) => error_response(error),
+        };
+    }
     match state.realtime.broadcast(
         &principal.tenant,
         &request.channel,
@@ -5946,6 +5983,32 @@ fn install_cluster_range_replication(
     let hook: ryme_raft::net::MetadataHook =
         Arc::new(move |payload| apply_replicated_ranges(&state, payload));
     node.set_metadata_hook(hook)
+}
+
+fn install_cluster_realtime_replication(
+    state: &SharedState,
+    node: &std::sync::Arc<Node>,
+) -> ryme_error::Result<()> {
+    let state = state.clone();
+    let hook: ryme_raft::net::MetadataHook =
+        Arc::new(move |payload| apply_replicated_broadcast(&state, payload));
+    node.set_realtime_hook(hook)
+}
+
+fn apply_replicated_broadcast(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
+    let event: ClusterBroadcast = serde_json::from_slice(payload)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("realtime event: {error}")))?;
+    state
+        .realtime
+        .broadcast_with_sequence(
+            &event.tenant,
+            &event.channel,
+            event.from,
+            event.payload,
+            event.commit_ts,
+            event.sequence,
+        )
+        .map(|_| ())
 }
 
 fn apply_replicated_ranges(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {

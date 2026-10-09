@@ -161,6 +161,10 @@ impl Realtime {
         self.sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    pub fn reserve_sequence(&self) -> u64 {
+        self.next_sequence()
+    }
+
     fn broadcast_shard(&self, key: &str) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
@@ -182,7 +186,7 @@ impl Realtime {
             .ok_or_else(|| RymeError::Internal(String::from("realtime topic shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("realtime topic lock")))?;
-        let sequence = self.next_sequence();
+        let sequence = self.reserve_sequence();
         let record = ChangeRecord {
             tenant: event.tenant,
             database: event.database,
@@ -579,6 +583,36 @@ impl Realtime {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
         let sequence = self.next_sequence();
+        let sender =
+            topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
+        let _ = sender.send(BroadcastMsg {
+            channel: channel.to_string(),
+            from,
+            payload,
+            commit_ts,
+            sequence,
+        });
+        Ok(sequence)
+    }
+
+    pub fn broadcast_with_sequence(
+        &self,
+        tenant: &str,
+        channel: &str,
+        from: String,
+        payload: serde_json::Value,
+        commit_ts: u64,
+        sequence: u64,
+    ) -> Result<u64> {
+        let key = scope_key(tenant, channel);
+        let shard = self.broadcast_shard(&key);
+        let mut topics = self
+            .broadcast_topics
+            .get(shard)
+            .expect("broadcast shard")
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+        self.sequence.fetch_max(sequence, Ordering::Relaxed);
         let sender =
             topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
         let _ = sender.send(BroadcastMsg {

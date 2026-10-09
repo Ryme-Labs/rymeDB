@@ -171,6 +171,14 @@ receive one `BroadcastMsg` JSON frame (`channel`, `from`, `payload`,
 replayed — broadcast stays ephemeral — and slow consumers skip lagged
 frames exactly like `/v1/stream`.
 
+In cluster mode, broadcast requests must reach the current Raft leader. The
+leader assigns the sequence and fans the event over the cluster mesh to
+every currently connected member gateway, so subscribers on different nodes
+receive the same event. Broadcast fanout is intentionally not written to the
+Raft/WAL path: it remains ephemeral and does not replay old chat messages when
+a node joins or restarts. A disconnected member can miss an event; use durable
+topics when replay and recovery are required.
+
 All three pass the key as `?api_key=` and default the base-URL scheme
 (`http`→`ws`, `https`→`wss`).
 

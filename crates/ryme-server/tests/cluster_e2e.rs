@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use ryme_config::{Config, RaftPeer};
 use std::time::Duration;
 
@@ -377,6 +378,77 @@ async fn cluster_range_split_replicates_metadata() {
     let (status, _) = http_request(http[leader], "POST /v1/ranges/split", body).await;
     assert_eq!(status, 200);
     wait_ranges(&http).await;
+    for handle in handles {
+        handle.shutdown();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn cluster_broadcast_reaches_every_gateway() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-cluster-broadcast-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut bound = Vec::new();
+    for _ in 0..3 {
+        bound.push(bind_node().await);
+    }
+    let mut pg = Vec::new();
+    let mut resp = Vec::new();
+    let mut http = Vec::new();
+    let mut raft = Vec::new();
+    for node in &bound {
+        pg.push(node.0.local_addr().unwrap());
+        resp.push(node.1.local_addr().unwrap());
+        http.push(node.2.local_addr().unwrap());
+        raft.push(node.3.local_addr().unwrap());
+    }
+    let mut handles = Vec::new();
+    for (index, (pg_listener, resp_listener, http_listener, raft_listener)) in
+        bound.drain(..).enumerate()
+    {
+        let config =
+            node_config(&root, index, pg[index], resp[index], http[index], raft[index], &raft);
+        handles.push(
+            ryme_server::serve_cluster(
+                config,
+                pg_listener,
+                resp_listener,
+                http_listener,
+                raft_listener,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let leader = wait_leader(&http, None).await;
+    let mut sockets = Vec::new();
+    for address in &http {
+        let url = format!("ws://{address}/v1/broadcast/cluster-chat?api_key={KEY}");
+        let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        sockets.push(socket);
+    }
+    let body = br#"{"channel":"cluster-chat","from":"cluster-test","payload":{"message":"hello"}}"#;
+    let (status, response) = http_request(http[leader], "POST /v1/broadcast", body).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&response).contains("sequence"));
+    for mut socket in sockets {
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match message {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                assert!(text.contains("hello"), "unexpected broadcast: {text}");
+            }
+            other => panic!("unexpected websocket message: {other:?}"),
+        }
+    }
     for handle in handles {
         handle.shutdown();
     }

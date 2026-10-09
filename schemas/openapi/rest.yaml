@@ -590,6 +590,7 @@ paths:
   /v1/broadcast:
     post:
       tags: [streams]
+      description: "Publish an ephemeral tenant-scoped broadcast. In cluster mode the current leader fans it over the cluster mesh; broadcasts are not replayed after restart."
       requestBody:
         required: true
         content:

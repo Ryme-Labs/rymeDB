@@ -42,6 +42,12 @@ pub(crate) enum Rpc {
         term: u64,
         accepted: bool,
     },
+    Realtime {
+        payload: Vec<u8>,
+    },
+    RealtimeResponse {
+        ok: bool,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -430,6 +436,7 @@ pub struct Node {
     mesh_tls: std::sync::Mutex<Option<Arc<MeshTransport>>>,
     metadata: std::sync::Mutex<Option<Vec<u8>>>,
     metadata_hook: MetadataHookSlot,
+    realtime_hook: MetadataHookSlot,
 }
 
 impl Node {
@@ -578,6 +585,7 @@ impl Node {
             )),
             metadata: std::sync::Mutex::new(metadata),
             metadata_hook: MetadataHookSlot::default(),
+            realtime_hook: MetadataHookSlot::default(),
         });
         Ok(node)
     }
@@ -1049,6 +1057,19 @@ impl Node {
         Ok(())
     }
 
+    fn apply_realtime(&self, payload: Vec<u8>) -> Result<()> {
+        let hook = self
+            .realtime_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("realtime hook lock")))?
+            .clone();
+        if let Some(hook) = hook {
+            hook(&payload)?;
+        }
+        Ok(())
+    }
+
     async fn apply_conf(&self, change: crate::ConfChange) {
         let members = {
             let mut inner = self.inner.lock().await;
@@ -1160,6 +1181,13 @@ impl Node {
                 inner.campaign_now = true;
                 Ok(Rpc::TransferResponse { term: inner.term, accepted: true })
             }
+            Rpc::Realtime { payload } => {
+                if payload.is_empty() {
+                    return Err(RymeError::InvalidArgument(String::from("realtime")));
+                }
+                self.apply_realtime(payload)?;
+                Ok(Rpc::RealtimeResponse { ok: true })
+            }
             Rpc::AppendRequest {
                 term,
                 leader: _,
@@ -1229,7 +1257,8 @@ impl Node {
             Rpc::VoteResponse { .. }
             | Rpc::AppendResponse { .. }
             | Rpc::PreVoteResponse { .. }
-            | Rpc::TransferResponse { .. } => {
+            | Rpc::TransferResponse { .. }
+            | Rpc::RealtimeResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
         }
@@ -1254,6 +1283,24 @@ impl Node {
         let index = self.propose_frame(encoded).await?;
         self.wait_applied(index).await?;
         Ok(index)
+    }
+
+    pub async fn fanout_realtime(self: &Arc<Self>, payload: Vec<u8>) -> Result<()> {
+        if payload.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("realtime")));
+        }
+        if !self.is_leader().await {
+            return Err(RymeError::Unavailable(String::from("not leader")));
+        }
+        self.apply_realtime(payload.clone())?;
+        let peers = self.member_pools().await;
+        for (_, pool) in peers {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let _ = pool.roundtrip(&Rpc::Realtime { payload }).await;
+            });
+        }
+        Ok(())
     }
 
     pub async fn commit_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
@@ -1521,6 +1568,16 @@ impl Node {
         if let Some(payload) = current {
             hook(&payload)?;
         }
+        Ok(())
+    }
+
+    pub fn set_realtime_hook(&self, hook: MetadataHook) -> Result<()> {
+        let mut registered = self
+            .realtime_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("realtime hook lock")))?;
+        *registered = Some(hook);
         Ok(())
     }
 

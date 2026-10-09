@@ -184,3 +184,9 @@ consistent across nodes, but it does not yet move range-owned data between
 nodes. Hybrid backends apply the same local range placement to their
 non-replicated tier, while replicated tables continue to follow the Raft-backed
 placement.
+
+Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
+must reach the current leader, which fans the event over the cluster mesh to
+the other live gateways. It is intentionally ephemeral and is not
+replayed after a member joins or restarts; use durable topics for resumable
+messages.
