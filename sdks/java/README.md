@@ -36,7 +36,9 @@ subscription.sendClose(WebSocket.NORMAL_CLOSURE, "done");
 `subscribeTable` accepts `from` and `fromSequence` replay cursors. The same
 client also exposes `subscribeQuery`, `subscribeBroadcast`, and
 `subscribePresence`; presence subscriptions begin with a snapshot and then
-deliver join/leave frames. Callbacks receive complete JSON text frames.
+deliver join/leave frames. `presenceJoin` also accepts raw JSON state and an
+optional TTL for presence refreshes. Callbacks receive complete JSON text
+frames.
 
 For a table subscription that reconnects automatically and advances its
 sequence cursor, use `subscribeTableResumable`. The returned

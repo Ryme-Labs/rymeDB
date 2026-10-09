@@ -32,8 +32,9 @@ For automatic reconnects with exact sequence-based replay, use
 backoff until the subscription is closed or the retry limit is reached.
 
 `subscribe_query`, `subscribe_broadcast`, and `subscribe_presence` are also
-available. Presence streams begin with a state snapshot followed by live
-join/leave events. HTTP and
+available. `presence_join_with_state` accepts JSON state and an optional TTL;
+`presence_leave` and `presence_list` complete the presence controls. Presence
+streams begin with a state snapshot followed by live join/leave events. HTTP and
 WebSocket URLs automatically switch from `http`/`https` to `ws`/`wss`.
 
 Supabase-style REST CRUD is available through `rest_insert`, `rest_upsert`,

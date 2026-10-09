@@ -365,7 +365,16 @@ public final class RymeClient {
     }
 
     public String presenceJoin(String channel, String member) {
-        return request("POST", "/v1/presence/join", "{\"channel\":" + json(channel) + ",\"member\":" + json(member) + "}");
+        return presenceJoin(channel, member, null, null);
+    }
+
+    /** Join or refresh a presence member with optional JSON state and TTL seconds. */
+    public String presenceJoin(String channel, String member, String stateJson, Long ttlSecs) {
+        String state = stateJson == null ? "null" : stateJson;
+        String ttl = ttlSecs == null ? "null" : Long.toString(ttlSecs);
+        return request("POST", "/v1/presence/join", "{\"channel\":" + json(channel)
+                + ",\"member\":" + json(member) + ",\"state\":" + state
+                + ",\"ttl_secs\":" + ttl + "}");
     }
 
     public String presenceLeave(String channel, String member) {

@@ -766,15 +766,46 @@ impl RymeClient {
         channel: &str,
         member: &str,
     ) -> Result<serde_json::Value, ClientError> {
+        self.presence_join_with_state(channel, member, serde_json::Value::Null, None).await
+    }
+
+    pub async fn presence_join_with_state(
+        &self,
+        channel: &str,
+        member: &str,
+        state: serde_json::Value,
+        ttl_secs: Option<u64>,
+    ) -> Result<serde_json::Value, ClientError> {
         self.post_json(
             "/v1/presence/join",
+            serde_json::json!({
+                "channel": channel,
+                "member": member,
+                "state": state,
+                "ttl_secs": ttl_secs,
+            }),
+        )
+        .await
+    }
+
+    pub async fn presence_leave(
+        &self,
+        channel: &str,
+        member: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/presence/leave",
             serde_json::json!({ "channel": channel, "member": member }),
         )
         .await
     }
 
     pub async fn presence_list(&self, channel: &str) -> Result<serde_json::Value, ClientError> {
-        self.get_path(&format!("/v1/presence/{channel}")).await
+        self.get_path(&format!(
+            "/v1/presence/{}",
+            utf8_percent_encode(channel, NON_ALPHANUMERIC)
+        ))
+        .await
     }
 
     pub async fn broadcast(
@@ -1273,6 +1304,31 @@ mod tests {
         client.rest_delete_where("people", "id=eq.p1").await.unwrap();
         let got = seen(&state);
         assert_eq!((got.method.as_str(), got.path.as_str()), ("DELETE", "/rest/v1/people?id=eq.p1"));
+    }
+
+    #[tokio::test]
+    async fn presence_controls_send_state_ttl_and_encoded_channels() {
+        let (base, state) = stub().await;
+        let client = RymeClient::new(base, String::from("k"));
+        client
+            .presence_join_with_state(
+                "room/one",
+                "ada",
+                serde_json::json!({ "typing": true }),
+                Some(30),
+            )
+            .await
+            .unwrap();
+        let got = seen(&state);
+        assert_eq!(got.path, "/v1/presence/join");
+        assert_eq!(
+            got.body,
+            r#"{"channel":"room/one","member":"ada","state":{"typing":true},"ttl_secs":30}"#
+        );
+        client.presence_leave("room/one", "ada").await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/presence/leave");
+        client.presence_list("room/one").await.unwrap();
+        assert_eq!(seen(&state).path, "/v1/presence/room%2Fone");
     }
 
     #[tokio::test]
