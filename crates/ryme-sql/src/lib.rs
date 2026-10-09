@@ -126,6 +126,8 @@ pub struct ColumnDefinition {
     pub nullable: bool,
     pub primary_key: bool,
     pub column_default: Option<String>,
+    #[serde(default)]
+    pub auto_increment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,12 +554,20 @@ fn parse_column_definitions(raw: &str) -> Vec<ColumnDefinition> {
                     }
                     (!expression.is_empty()).then(|| expression.join(" "))
                 });
+            let auto_increment = matches!(
+                words[1].to_ascii_lowercase().as_str(),
+                "serial" | "bigserial" | "smallserial"
+            ) || upper.contains("IDENTITY")
+                || column_default
+                    .as_deref()
+                    .is_some_and(|default| default.to_ascii_uppercase().contains("NEXTVAL("));
             Some(ColumnDefinition {
                 name: unquote(words[0]),
                 data_type: words[1].to_ascii_lowercase(),
                 nullable: !upper.contains("NOT NULL") && !upper.contains("PRIMARY KEY"),
                 primary_key: upper.contains("PRIMARY KEY"),
                 column_default,
+                auto_increment,
             })
         })
         .collect()
@@ -1248,7 +1258,11 @@ fn json_insert_value(value: Option<Vec<u8>>, data_type: &str) -> serde_json::Val
             return serde_json::Value::Bool(parsed);
         }
     }
-    if data_type.contains("int") || data_type.contains("numeric") || data_type.contains("decimal") {
+    if data_type.contains("int")
+        || data_type.contains("serial")
+        || data_type.contains("numeric")
+        || data_type.contains("decimal")
+    {
         if let Ok(parsed) = trimmed.parse::<i64>() {
             return serde_json::Value::Number(parsed.into());
         }
@@ -1622,6 +1636,7 @@ pub struct Executor<B = TxnManager> {
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
+    sequence_next: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1647,6 +1662,7 @@ impl Executor<TxnManager> {
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1666,6 +1682,7 @@ impl Executor<TxnManager> {
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -1690,6 +1707,7 @@ where
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1733,6 +1751,7 @@ where
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
+            sequence_next: self.sequence_next,
         }
     }
 
@@ -1842,6 +1861,7 @@ where
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1868,6 +1888,43 @@ where
                 })
             })
             .unwrap_or_default()
+    }
+
+    fn next_sequence_value(&self, table: &str, definition: &ColumnDefinition) -> Result<Vec<u8>> {
+        let key = format!("{}\0{}\0{}\0{}", self.tenant, self.database, table, definition.name);
+        let mut sequences = self
+            .sequence_next
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("sequence lock")))?;
+        let next = if let Some(next) = sequences.get(&key).copied() {
+            next
+        } else {
+            let mut highest = 0u64;
+            for (pk, value) in self.scan_all_rows(table)? {
+                let candidate = if definition.primary_key
+                    || definition.name.eq_ignore_ascii_case("id")
+                    || definition.name.eq_ignore_ascii_case("pk")
+                    || definition.name.eq_ignore_ascii_case("key")
+                {
+                    std::str::from_utf8(&pk).ok().and_then(|value| value.parse::<u64>().ok())
+                } else {
+                    serde_json::from_slice::<serde_json::Value>(&value)
+                        .ok()
+                        .and_then(|row| row.get(&definition.name).cloned())
+                        .and_then(|value| match value {
+                            serde_json::Value::Number(value) => value.as_u64(),
+                            serde_json::Value::String(value) => value.parse::<u64>().ok(),
+                            _ => None,
+                        })
+                };
+                if let Some(candidate) = candidate {
+                    highest = highest.max(candidate);
+                }
+            }
+            highest.saturating_add(1)
+        };
+        sequences.insert(key, next.saturating_add(1));
+        Ok(next.to_string().into_bytes())
     }
 
     pub fn catalog_indexes(&self, table: &str) -> Vec<IndexDefinition> {
@@ -1945,16 +2002,27 @@ where
             {
                 return Err(RymeError::InvalidArgument(format!("unknown column {column}")));
             }
+            let definition =
+                definitions.iter().find(|definition| definition.name.eq_ignore_ascii_case(column));
             let resolved = match value {
                 InsertValue::Value(value) => Some(value),
                 InsertValue::Null => None,
-                InsertValue::Default => definitions
-                    .iter()
-                    .find(|definition| definition.name.eq_ignore_ascii_case(column))
-                    .and_then(|definition| definition.column_default.as_deref())
-                    .map(eval_default)
-                    .transpose()?
-                    .flatten(),
+                InsertValue::Default => {
+                    if let Some(definition) = definition {
+                        if definition.auto_increment {
+                            Some(self.next_sequence_value(table, definition)?)
+                        } else {
+                            definition
+                                .column_default
+                                .as_deref()
+                                .map(eval_default)
+                                .transpose()?
+                                .flatten()
+                        }
+                    } else {
+                        None
+                    }
+                }
             };
             supplied.insert(name, resolved);
         }
@@ -1969,6 +2037,8 @@ where
                 let value =
                     if let Some(value) = supplied.remove(&definition.name.to_ascii_lowercase()) {
                         value
+                    } else if definition.auto_increment {
+                        Some(self.next_sequence_value(table, definition)?)
                     } else if let Some(default) = definition.column_default.as_deref() {
                         eval_default(default)?
                     } else if definition.nullable {
@@ -4010,6 +4080,43 @@ mod tests {
             result,
             QueryResult::Table { rows, .. }
                 if rows == vec![vec![b"Ada".to_vec(), b"admin".to_vec()]]
+        ));
+    }
+
+    #[tokio::test]
+    async fn serial_columns_generate_and_recover_next_ids() {
+        let manager = TxnManager::new();
+        let executor =
+            Executor::with_manager(String::from("t"), String::from("d"), manager.clone());
+        executor
+            .execute(parse("CREATE TABLE events (id SERIAL PRIMARY KEY, name TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO events (name) VALUES ('first'), ('second')").unwrap())
+            .await
+            .unwrap();
+        let snapshot = executor.schema_snapshot();
+        assert!(snapshot.tables["events"][0].auto_increment);
+
+        let restored = Executor::with_manager(String::from("t"), String::from("d"), manager);
+        restored.restore_schema_snapshot(snapshot).unwrap();
+        restored
+            .execute(parse("INSERT INTO events (name) VALUES ('third')").unwrap())
+            .await
+            .unwrap();
+        let result = restored
+            .execute(parse("SELECT id, name FROM events ORDER BY id ASC").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { rows, .. }
+                if rows == vec![
+                    vec![b"1".to_vec(), b"first".to_vec()],
+                    vec![b"2".to_vec(), b"second".to_vec()],
+                    vec![b"3".to_vec(), b"third".to_vec()]
+                ]
         ));
     }
 

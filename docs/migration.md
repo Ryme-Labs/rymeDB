@@ -89,6 +89,9 @@ declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
 `ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
 JSONB projections support PostgreSQL `->` and `->>` operators, including
 chained object and array paths in selected columns,
+`serial`/`bigserial`/`smallserial` and `GENERATED ... AS IDENTITY` columns
+generate integer primary keys when omitted and recover their next value from
+durable rows after executor restart,
 `CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields,
 with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
 (`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, and `pg_index`),

@@ -41,6 +41,8 @@ All notable changes to rymeDB are recorded here. Format follows
   PostgreSQL brace literals as structured JSON arrays instead of opaque text.
 - SQL JSONB projections now support `->` and `->>` object/array paths,
   including chained expressions.
+- SQL `serial` and identity columns now generate omitted integer IDs and
+  reinitialize their next value from durable rows after executor restart.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention
