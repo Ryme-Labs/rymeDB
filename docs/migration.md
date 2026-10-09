@@ -58,7 +58,9 @@ at the logical level; internal page formats are never imported.
 
 ## SQL dialect
 
-`CREATE TABLE`, custom key/value `INSERT`, and PostgreSQL-style
+`CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, and
+`NOT NULL` metadata), with PostgreSQL `information_schema.tables` and
+`information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
 `SELECT * FROM t KEY 'k'`, `SELECT * FROM t LIMIT n`, `UPDATE`, `DELETE`,
 `COPY t FROM stdin` (bulk path), `EXPLAIN <sql>` (planned access path),

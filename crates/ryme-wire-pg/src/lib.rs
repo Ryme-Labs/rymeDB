@@ -600,7 +600,9 @@ where
                     if failed {
                         break;
                     }
-                    if let Some(control) = transaction_control(trimmed, &session) {
+                    if let Some(response) = catalog_query(trimmed, &executor) {
+                        out.extend_from_slice(&response);
+                    } else if let Some(control) = transaction_control(trimmed, &session) {
                         out.extend_from_slice(
                             &handle_transaction_control(
                                 control,
@@ -745,7 +747,9 @@ where
                                     Err(e) => Err(e),
                                 },
                             };
-                            if let Some(control) = transaction_control(trimmed, &session) {
+                            if let Some(response) = catalog_query(trimmed, &executor) {
+                                response
+                            } else if let Some(control) = transaction_control(trimmed, &session) {
                                 handle_transaction_control(
                                     control,
                                     &executor,
@@ -820,6 +824,9 @@ where
 
 fn describe_query(query: &str) -> Vec<u8> {
     let trimmed = query.trim_matches(|c| c == '\0' || c == ';' || c == ' ');
+    if let Some(columns) = catalog_query_columns(trimmed) {
+        return multi_row_description(&columns);
+    }
     if let Ok(statement) = parse(trimmed) {
         if let Statement::Returning { fields, .. } = &statement {
             return returning_description(fields);
@@ -837,6 +844,149 @@ fn describe_query(query: &str) -> Vec<u8> {
         return multi_row_description(&names);
     }
     frame(b'n', b"")
+}
+
+fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
+    let upper = query.to_ascii_uppercase();
+    let kind =
+        if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES") {
+            "tables"
+        } else if upper.contains("INFORMATION_SCHEMA.COLUMNS")
+            || upper.contains("PG_CATALOG.PG_ATTRIBUTE")
+        {
+            "columns"
+        } else {
+            return None;
+        };
+    let from = upper.find(" FROM ")?;
+    let selected = split_select_list(query[6..from].trim());
+    let defaults = match kind {
+        "tables" => vec![String::from("table_name")],
+        _ => vec![String::from("column_name")],
+    };
+    if selected.is_empty() || selected.iter().any(|item| item == "*") {
+        return Some(match kind {
+            "tables" => vec![
+                String::from("table_schema"),
+                String::from("table_name"),
+                String::from("table_type"),
+            ],
+            _ => vec![
+                String::from("column_name"),
+                String::from("data_type"),
+                String::from("is_nullable"),
+                String::from("ordinal_position"),
+            ],
+        });
+    }
+    let fields: Vec<String> = selected
+        .into_iter()
+        .map(|item| {
+            let item = item.trim();
+            let item = item.split_ascii_whitespace().next().unwrap_or(item);
+            item.rsplit('.').next().unwrap_or(item).trim_matches('"').to_ascii_lowercase()
+        })
+        .collect();
+    if fields.is_empty() {
+        Some(defaults)
+    } else {
+        Some(fields)
+    }
+}
+
+fn sql_literal_after(query: &str, keyword: &str) -> Option<String> {
+    let upper = query.to_ascii_uppercase();
+    let start = upper.find(keyword)? + keyword.len();
+    let rest = &query[start..];
+    let open = rest.find('\'')? + 1;
+    let end = rest[open..].find('\'')? + open;
+    Some(rest[open..end].replace("''", "'"))
+}
+
+fn catalog_table_parts(table: &str) -> (&str, &str) {
+    table.rsplit_once('.').map_or(("public", table), |(schema, name)| (schema, name))
+}
+
+fn information_schema_type(data_type: &str) -> &str {
+    match data_type {
+        "timestamptz" => "timestamp with time zone",
+        "timestamp" => "timestamp without time zone",
+        "varchar" => "character varying",
+        "int2" => "smallint",
+        "int4" | "integer" => "integer",
+        "int8" | "bigint" => "bigint",
+        "bool" => "boolean",
+        other => other,
+    }
+}
+
+fn catalog_query<B>(query: &str, executor: &Arc<Executor<B>>) -> Option<Vec<u8>>
+where
+    B: TxnBackend,
+{
+    let columns = catalog_query_columns(query)?;
+    let upper = query.to_ascii_uppercase();
+    if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES") {
+        let filter = sql_literal_after(query, "TABLE_NAME")
+            .or_else(|| sql_literal_after(query, "TABLENAME"));
+        let rows: Vec<Vec<Vec<u8>>> = executor
+            .catalog_tables()
+            .into_iter()
+            .filter(|table| {
+                let (_, table_name) = catalog_table_parts(table);
+                filter.as_ref().is_none_or(|want| want == table || want == table_name)
+            })
+            .map(|table| {
+                let (schema, table_name) = catalog_table_parts(&table);
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "table_schema" | "schemaname" => schema.as_bytes().to_vec(),
+                        "table_name" | "tablename" => table_name.as_bytes().to_vec(),
+                        "table_type" => b"BASE TABLE".to_vec(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    let table =
+        sql_literal_after(query, "TABLE_NAME").or_else(|| sql_literal_after(query, "RELNAME"))?;
+    let definitions = executor.catalog_columns(&table);
+    let rows: Vec<Vec<Vec<u8>>> = definitions
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            columns
+                .iter()
+                .map(|field| match field.as_str() {
+                    "column_name" | "attname" => column.name.as_bytes().to_vec(),
+                    "data_type" => information_schema_type(&column.data_type).as_bytes().to_vec(),
+                    "is_nullable" => {
+                        if column.nullable {
+                            b"YES".to_vec()
+                        } else {
+                            b"NO".to_vec()
+                        }
+                    }
+                    "ordinal_position" | "attnum" => (index + 1).to_string().into_bytes(),
+                    _ => Vec::new(),
+                })
+                .collect()
+        })
+        .collect();
+    Some(encode_catalog_rows(&columns, rows))
+}
+
+fn encode_catalog_rows(columns: &[String], rows: Vec<Vec<Vec<u8>>>) -> Vec<u8> {
+    let mut out = multi_row_description(columns);
+    for row in rows {
+        out.extend(data_row_values(&row));
+    }
+    out.extend(command_complete("SELECT"));
+    out
 }
 
 fn split_statements(query: &str) -> Vec<&str> {

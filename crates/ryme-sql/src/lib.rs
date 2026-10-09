@@ -4,11 +4,13 @@ use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Statement {
     CreateTable {
         table: String,
+        columns: Vec<ColumnDefinition>,
     },
     Insert {
         table: String,
@@ -75,6 +77,14 @@ pub enum Statement {
         plan: String,
         inner: Box<Statement>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnDefinition {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub primary_key: bool,
 }
 
 impl Statement {
@@ -222,7 +232,7 @@ impl Predicate {
 impl Statement {
     pub fn table(&self) -> &str {
         match self {
-            Self::CreateTable { table }
+            Self::CreateTable { table, .. }
             | Self::Insert { table, .. }
             | Self::Upsert { table, .. }
             | Self::SelectByKey { table, .. }
@@ -246,7 +256,7 @@ pub fn parse(input: &str) -> Result<Statement> {
     }
     let head = tokens[0].to_ascii_uppercase();
     let statement = match head.as_str() {
-        "CREATE" => parse_create(&tokens),
+        "CREATE" => parse_create(&tokens, input),
         "UPSERT" => parse_upsert(&tokens),
         "INSERT" => parse_insert(&tokens, input),
         "SELECT" => parse_select(&tokens),
@@ -342,26 +352,95 @@ fn unquote(value: &str) -> String {
     trimmed.to_string()
 }
 
-fn parse_create(tokens: &[String]) -> Result<Statement> {
-    let mut table = None;
-    for (index, token) in tokens.iter().enumerate() {
-        if token.eq_ignore_ascii_case("TABLE") {
-            if let Some(next) = tokens.get(index + 1) {
-                let cleaned = next.trim_matches(|c| c == '"' || c == '\'' || c == ';');
-                if !cleaned.eq_ignore_ascii_case("IF") {
-                    table = Some(cleaned.to_string());
-                    break;
+fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
+    let table_index = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("TABLE"))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
+    let mut name_index = table_index + 1;
+    if tokens.get(name_index).is_some_and(|token| token.eq_ignore_ascii_case("IF")) {
+        if !tokens.get(name_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+            || !tokens.get(name_index + 2).is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+        {
+            return Err(RymeError::InvalidArgument(String::from("create table")));
+        }
+        name_index += 3;
+    }
+    let table = tokens
+        .get(name_index)
+        .map(|value| unquote(value))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
+    Ok(Statement::CreateTable { table, columns: parse_column_definitions(raw) })
+}
+
+fn parse_column_definitions(raw: &str) -> Vec<ColumnDefinition> {
+    let Some(open) = raw.find('(') else { return Vec::new() };
+    let Some(close) = raw.rfind(')') else { return Vec::new() };
+    if close <= open {
+        return Vec::new();
+    }
+    split_sql_items(&raw[open + 1..close])
+        .into_iter()
+        .filter_map(|definition| {
+            let words: Vec<&str> = definition.split_whitespace().collect();
+            if words.len() < 2
+                || words[0].eq_ignore_ascii_case("CONSTRAINT")
+                || words[0].eq_ignore_ascii_case("PRIMARY")
+                || words[0].eq_ignore_ascii_case("UNIQUE")
+                || words[0].eq_ignore_ascii_case("CHECK")
+            {
+                return None;
+            }
+            let upper = definition.to_ascii_uppercase();
+            Some(ColumnDefinition {
+                name: unquote(words[0]),
+                data_type: words[1].to_ascii_lowercase(),
+                nullable: !upper.contains("NOT NULL") && !upper.contains("PRIMARY KEY"),
+                primary_key: upper.contains("PRIMARY KEY"),
+            })
+        })
+        .collect()
+}
+
+fn split_sql_items(input: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut quote = None;
+    for ch in input.chars() {
+        if let Some(open) = quote {
+            current.push(ch);
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    items.push(current.trim().to_string());
                 }
+                current.clear();
             }
-            if let Some(next) = tokens.get(index + 3) {
-                table = Some(next.clone());
-                break;
-            }
+            _ => current.push(ch),
         }
     }
-    table
-        .map(|table| Statement::CreateTable { table })
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+    items
 }
 
 fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -827,7 +906,9 @@ fn parse_explain(input: &str) -> Result<Statement> {
 
 pub fn describe_plan(statement: &Statement) -> String {
     match statement {
-        Statement::CreateTable { table } => format!("ddl create_table({table})"),
+        Statement::CreateTable { table, columns } => {
+            format!("ddl create_table({table}) columns {}", columns.len())
+        }
         Statement::Insert { table, .. } => format!("write insert({table}) point"),
         Statement::Upsert { table, .. } => format!("write upsert({table}) point"),
         Statement::SelectByKey { table, .. } => {
@@ -988,6 +1069,7 @@ pub struct Executor<B = TxnManager> {
     realtime: Option<Realtime>,
     read_only: bool,
     isolation: Isolation,
+    catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
 }
 
 impl Executor<TxnManager> {
@@ -1000,6 +1082,7 @@ impl Executor<TxnManager> {
             realtime: None,
             read_only: false,
             isolation: Isolation::Serializable,
+            catalog: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1012,6 +1095,7 @@ impl Executor<TxnManager> {
             realtime: None,
             read_only: false,
             isolation: Isolation::Serializable,
+            catalog: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1029,6 +1113,7 @@ where
             realtime: None,
             read_only: false,
             isolation: Isolation::Serializable,
+            catalog: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1060,6 +1145,37 @@ where
 
     pub fn set_isolation(&mut self, isolation: Isolation) {
         self.isolation = isolation;
+    }
+
+    pub fn catalog_tables(&self) -> Vec<String> {
+        let Ok(catalog) = self.catalog.lock() else { return Vec::new() };
+        let mut tables: Vec<String> = catalog.keys().cloned().collect();
+        tables.sort();
+        tables
+    }
+
+    pub fn catalog_columns(&self, table: &str) -> Vec<ColumnDefinition> {
+        self.catalog
+            .lock()
+            .ok()
+            .and_then(|catalog| {
+                catalog.get(table).cloned().or_else(|| {
+                    catalog.iter().find_map(|(name, columns)| {
+                        (name.rsplit('.').next() == Some(table)).then(|| columns.clone())
+                    })
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    fn register_table(&self, table: String, columns: Vec<ColumnDefinition>) {
+        if let Ok(mut catalog) = self.catalog.lock() {
+            catalog.entry(table).or_insert(columns);
+        }
+    }
+
+    fn ensure_table(&self, table: &str) {
+        self.register_table(table.to_string(), Vec::new());
     }
 
     fn reject_if_read_only(&self) -> Result<()> {
@@ -1118,6 +1234,13 @@ where
         txn: &mut Transaction,
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
+        match &statement {
+            Statement::CreateTable { table, columns } => {
+                self.register_table(table.clone(), columns.clone());
+            }
+            statement if statement.is_write() => self.ensure_table(statement.table()),
+            _ => {}
+        }
         match statement {
             Statement::Returning { statement, fields } => {
                 self.execute_returning_in_transaction(txn, *statement, fields).await
@@ -1446,6 +1569,13 @@ where
         statement: Statement,
         isolation: Isolation,
     ) -> Result<QueryResult> {
+        match &statement {
+            Statement::CreateTable { table, columns } => {
+                self.register_table(table.clone(), columns.clone());
+            }
+            statement if statement.is_write() => self.ensure_table(statement.table()),
+            _ => {}
+        }
         match statement {
             Statement::Returning { statement, fields } => {
                 self.execute_returning(*statement, fields, isolation).await
@@ -1890,6 +2020,31 @@ mod tests {
             .unwrap();
         assert!(matches!(deleted, QueryResult::Returning { ref rows, .. }
             if rows == &vec![vec![b"1".to_vec(), b"grace".to_vec()]]));
+    }
+
+    #[tokio::test]
+    async fn create_table_keeps_column_metadata_for_introspection() {
+        let statement = parse(
+            "CREATE TABLE IF NOT EXISTS public.messages (id UUID PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ)",
+        )
+        .unwrap();
+        let (table, columns) = match &statement {
+            Statement::CreateTable { table, columns } => (table.clone(), columns.clone()),
+            _ => panic!("expected create table"),
+        };
+        assert_eq!(table, "public.messages");
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].data_type, "uuid");
+        assert!(columns[0].primary_key);
+        assert!(!columns[0].nullable);
+        assert_eq!(columns[1].data_type, "jsonb");
+        assert!(!columns[1].nullable);
+
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(statement).await.unwrap();
+        assert_eq!(executor.catalog_tables(), vec![String::from("public.messages")]);
+        assert_eq!(executor.catalog_columns("public.messages"), columns);
     }
 
     #[tokio::test]
