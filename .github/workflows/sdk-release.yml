@@ -84,7 +84,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sdk-cargo
-          path: target/package/*.crate
+          path: sdks/rust/target/package/*.crate
           if-no-files-found: error
 
   java:
