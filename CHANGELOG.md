@@ -59,6 +59,8 @@ All notable changes to rymeDB are recorded here. Format follows
   paths, excluding SQL `NULL` values from `COUNT(column)`.
 - `GROUP BY` now accepts declared columns and JSON paths, preserving `NULL` as
   a shared group and projecting the grouped column in the result.
+- `ORDER BY` now sorts schema columns and JSON paths in projections, scans, and
+  grouped results alongside the existing key/value fields.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

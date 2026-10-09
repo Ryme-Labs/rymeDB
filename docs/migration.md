@@ -107,7 +107,7 @@ named projections such as `SELECT payload, count FROM t WHERE id = '...'`,
 `gen_random_uuid()` (v4) and `now()` (unix seconds) evaluate in KEY/VALUE
 positions; quoted literals are never evaluated.
 Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND value CONTAINS 'x'
-AND value != 'y'] [ORDER BY key|value ASC|DESC] [LIMIT n] [OFFSET n]`.
+AND value != 'y'] [ORDER BY key|value|column|json_path ASC|DESC] [LIMIT n] [OFFSET n]`.
 Predicates evaluate on stored bytes as text; plain scans stream the ordered
 range while filtered/ordered/paged scans page through storage until the
 requested window is satisfied, with a 10k result cap unless an equality

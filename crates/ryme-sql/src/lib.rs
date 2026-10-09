@@ -318,15 +318,17 @@ impl SelectItem {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Order {
     pub field: Field,
+    #[serde(default)]
+    pub column: Option<String>,
     pub direction: Direction,
 }
 
 impl Default for Order {
     fn default() -> Self {
-        Self { field: Field::Key, direction: Direction::Asc }
+        Self { field: Field::Key, column: None, direction: Direction::Asc }
     }
 }
 
@@ -1354,6 +1356,10 @@ fn parse_scan_tail(tokens: &[String]) -> Result<(usize, usize, Order)> {
             if let Some(field) = tokens.get(index + 2) {
                 if let Some(parsed) = parse_field(field) {
                     order.field = parsed;
+                    order.column = None;
+                } else {
+                    order.field = Field::Value;
+                    order.column = Some(unquote(field));
                 }
             }
             if let Some(direction) = tokens.get(index + 3) {
@@ -1367,6 +1373,35 @@ fn parse_scan_tail(tokens: &[String]) -> Result<(usize, usize, Order)> {
         }
     }
     Ok((limit, offset, order))
+}
+
+fn order_value(order: &Order, pk: &[u8], raw: &[u8]) -> Vec<u8> {
+    if let Some(column) = order.column.as_deref() {
+        let Some(serde_json::Value::Object(object)) = serde_json::from_slice(raw).ok() else {
+            return Vec::new();
+        };
+        return object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .map(|(_, value)| value)
+            .or_else(|| json_column_value(column, &object))
+            .filter(|value| !value.is_null())
+            .map(json_result_bytes)
+            .unwrap_or_default();
+    }
+    match order.field {
+        Field::Key => pk.to_vec(),
+        Field::Value => raw.to_vec(),
+    }
+}
+
+fn compare_order(order: &Order, left: &Row, right: &Row) -> std::cmp::Ordering {
+    let comparison =
+        order_value(order, &left.0, &left.1).cmp(&order_value(order, &right.0, &right.1));
+    match order.direction {
+        Direction::Asc => comparison,
+        Direction::Desc => comparison.reverse(),
+    }
 }
 
 fn point_lookup_key(tokens: &[String]) -> Option<String> {
@@ -1838,10 +1873,10 @@ pub fn describe_plan(statement: &Statement) -> String {
                 Direction::Asc => "asc",
                 Direction::Desc => "desc",
             };
-            let field = match order.field {
+            let field = order.column.as_deref().unwrap_or(match order.field {
                 Field::Key => "key",
                 Field::Value => "value",
-            };
+            });
             format!(
                 "scan({table}) limit {limit} offset {offset} order {field} {direction} filters {} using ordered range",
                 filter.len()
@@ -2739,16 +2774,7 @@ where
             .into_iter()
             .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
             .collect();
-        rows.sort_by(|left, right| {
-            let (first, second) = match order.field {
-                Field::Key => (&left.0, &right.0),
-                Field::Value => (&left.1, &right.1),
-            };
-            match order.direction {
-                Direction::Asc => first.cmp(second),
-                Direction::Desc => second.cmp(first),
-            }
-        });
+        rows.sort_by(|left, right| compare_order(&order, left, right));
         let rows = rows
             .into_iter()
             .skip(offset)
@@ -3694,16 +3720,7 @@ where
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
                     .collect();
-                rows.sort_by(|a, b| {
-                    let (left, right) = match order.field {
-                        Field::Key => (&a.0, &b.0),
-                        Field::Value => (&a.1, &b.1),
-                    };
-                    match order.direction {
-                        Direction::Asc => left.cmp(right),
-                        Direction::Desc => right.cmp(left),
-                    }
-                });
+                rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
@@ -3796,16 +3813,7 @@ where
                         serde_json::Value::Object(record).to_string().into_bytes(),
                     ));
                 }
-                out.sort_by(|a, b| {
-                    let (first, second) = match order.field {
-                        Field::Key => (&a.0, &b.0),
-                        Field::Value => (&a.1, &b.1),
-                    };
-                    match order.direction {
-                        Direction::Asc => first.cmp(second),
-                        Direction::Desc => second.cmp(first),
-                    }
-                });
+                out.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Join { left, right, limit, offset, order, filter } => {
@@ -3830,16 +3838,7 @@ where
                     })
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
                     .collect();
-                rows.sort_by(|a, b| {
-                    let (first, second) = match order.field {
-                        Field::Key => (&a.0, &b.0),
-                        Field::Value => (&a.1, &b.1),
-                    };
-                    match order.direction {
-                        Direction::Asc => first.cmp(second),
-                        Direction::Desc => second.cmp(first),
-                    }
-                });
+                rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             _ => Err(RymeError::InvalidArgument(String::from(
@@ -4074,16 +4073,7 @@ where
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
                     .collect();
-                rows.sort_by(|a, b| {
-                    let (left, right) = match order.field {
-                        Field::Key => (&a.0, &b.0),
-                        Field::Value => (&a.1, &b.1),
-                    };
-                    match order.direction {
-                        Direction::Asc => left.cmp(right),
-                        Direction::Desc => right.cmp(left),
-                    }
-                });
+                rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
@@ -4178,16 +4168,7 @@ where
                         serde_json::Value::Object(record).to_string().into_bytes(),
                     ));
                 }
-                out.sort_by(|a, b| {
-                    let (first, second) = match order.field {
-                        Field::Key => (&a.0, &b.0),
-                        Field::Value => (&a.1, &b.1),
-                    };
-                    match order.direction {
-                        Direction::Asc => first.cmp(second),
-                        Direction::Desc => second.cmp(first),
-                    }
-                });
+                out.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Join { left, right, limit, offset, order, filter } => {
@@ -4213,16 +4194,7 @@ where
                     })
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
                     .collect();
-                rows.sort_by(|a, b| {
-                    let (first, second) = match order.field {
-                        Field::Key => (&a.0, &b.0),
-                        Field::Value => (&a.1, &b.1),
-                    };
-                    match order.direction {
-                        Direction::Asc => first.cmp(second),
-                        Direction::Desc => second.cmp(first),
-                    }
-                });
+                rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::UpdateRow { table, pk, assignments } => {
@@ -4924,6 +4896,35 @@ mod tests {
         assert!(
             matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"e2".to_vec()]])
         );
+
+        let result = executor
+            .execute(parse("SELECT id, count FROM events ORDER BY count DESC").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { rows, .. }
+                if rows == vec![
+                    vec![b"e2".to_vec(), b"4".to_vec()],
+                    vec![b"e1".to_vec(), b"2".to_vec()]
+                ]
+        ));
+
+        let result = executor
+            .execute(
+                parse("SELECT id, payload->>'name' FROM events ORDER BY payload->>'name' ASC")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { rows, .. }
+                if rows == vec![
+                    vec![b"e1".to_vec(), b"Ada".to_vec()],
+                    vec![b"e2".to_vec(), b"Grace".to_vec()]
+                ]
+        ));
     }
 
     #[tokio::test]
@@ -5611,12 +5612,22 @@ mod tests {
         }
         let json_groups = executor
             .execute(
-                parse("SELECT payload->>'team', COUNT(*) FROM teams GROUP BY payload->>'team'")
-                    .unwrap(),
+                parse(
+                    "SELECT payload->>'team', COUNT(*) FROM teams GROUP BY payload->>'team' ORDER BY payload->>'team' DESC LIMIT 1",
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
-        assert!(matches!(json_groups, QueryResult::Rows { rows } if rows.len() == 2));
+        match json_groups {
+            QueryResult::Rows { rows } => {
+                assert_eq!(rows.len(), 1);
+                let row: serde_json::Value = serde_json::from_slice(&rows[0].1).unwrap();
+                assert_eq!(row["payload->>'team'"], "red");
+                assert_eq!(row["count"], "2");
+            }
+            _ => panic!("expected ordered grouped rows"),
+        }
     }
 
     #[tokio::test]
