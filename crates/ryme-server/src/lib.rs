@@ -24,7 +24,7 @@ use ryme_realtime::Realtime;
 use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
 use ryme_sql::{bind, parse, Executor, QueryResult};
-use ryme_txn::{DurableManager, SyncPolicy, TxnManager};
+use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -4611,6 +4611,71 @@ async fn branch_reset(
     }
 }
 
+async fn promote_branch_data(
+    state: &SharedState,
+    tenant: &str,
+    id: &str,
+) -> ryme_error::Result<u64> {
+    let child = {
+        let control = state
+            .control
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+        control.branches.get_for(tenant, id)?
+    };
+    if child.parent_id.as_deref() != Some("main") {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "only main branch promotion is supported",
+        )));
+    }
+    let branch = ryme_branch::BranchBackend::new(
+        state.backend.clone(),
+        state.database.clone(),
+        child.id.clone(),
+        child.base_commit_ts,
+    );
+    let local_database = branch
+        .local_database()
+        .ok_or_else(|| ryme_error::RymeError::Internal(String::from("branch storage")))?;
+    let mut tables = HashSet::new();
+    for (row_tenant, database, table) in state.backend.spaces()? {
+        if row_tenant == tenant && database == local_database {
+            tables.insert(table);
+        }
+    }
+    let mut changes = Vec::new();
+    for table in tables {
+        for (pk, value) in branch.changes(tenant, &table)? {
+            changes.push((table.clone(), pk, value));
+        }
+    }
+
+    let mut base_txn = state.backend.begin();
+    base_txn.restamp(child.base_commit_ts);
+    let mut current_txn = state.backend.begin();
+    for (table, pk, _value) in &changes {
+        let key = ryme_storage::RecordKey::new(tenant, &state.database, table, pk);
+        let base = state.backend.get(&mut base_txn, &key)?;
+        let current = state.backend.get(&mut current_txn, &key)?;
+        if base != current {
+            return Err(ryme_error::RymeError::Conflict(format!(
+                "branch conflict on {table}/{}",
+                String::from_utf8_lossy(pk)
+            )));
+        }
+    }
+
+    let mut write_txn = state.backend.begin();
+    for (table, pk, value) in changes {
+        let key = ryme_storage::RecordKey::new(tenant, &state.database, &table, &pk);
+        match value {
+            Some(value) => state.backend.put(&mut write_txn, key, value),
+            None => state.backend.delete(&mut write_txn, key),
+        }
+    }
+    state.backend.commit(write_txn).await
+}
+
 async fn branch_promote(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -4622,6 +4687,9 @@ async fn branch_promote(
     };
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
+    }
+    if let Err(e) = promote_branch_data(&state, &principal.tenant, &id).await {
+        return error_response(e);
     }
     let mut control = match state.control.lock() {
         Ok(guard) => guard,

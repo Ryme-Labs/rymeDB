@@ -317,6 +317,18 @@ where
         }
     }
 
+    pub fn local_database(&self) -> Option<&str> {
+        self.overlay.then_some(self.branch_database.as_str())
+    }
+
+    pub fn changes(&self, tenant: &str, table: &str) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        if !self.overlay {
+            return Ok(Vec::new());
+        }
+        let txn = self.base.begin();
+        Ok(self.overlay_rows(&txn, tenant, table)?.into_iter().collect())
+    }
+
     fn local_key(&self, key: &ryme_storage::RecordKey) -> ryme_storage::RecordKey {
         ryme_storage::RecordKey::new(&key.tenant, &self.branch_database, &key.table, &key.pk)
     }
