@@ -462,6 +462,26 @@ impl Realtime {
         ttl_secs: u64,
         now_unix: u64,
     ) -> Result<usize> {
+        let ttl = ttl_secs.clamp(1, PRESENCE_MAX_TTL_SECS);
+        self.presence_join_at(
+            tenant,
+            channel,
+            member,
+            state,
+            now_unix.saturating_add(ttl),
+            now_unix,
+        )
+    }
+
+    pub fn presence_join_at(
+        &self,
+        tenant: &str,
+        channel: &str,
+        member: String,
+        state: serde_json::Value,
+        expires_unix: u64,
+        now_unix: u64,
+    ) -> Result<usize> {
         let mut inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
         let key = scope_key(tenant, channel);
@@ -470,11 +490,7 @@ impl Realtime {
         if !members.contains_key(&member) && members.len() >= PRESENCE_MAX_MEMBERS {
             return Err(RymeError::Overload(String::from("presence room full")));
         }
-        let ttl = ttl_secs.clamp(1, PRESENCE_MAX_TTL_SECS);
-        members.insert(
-            member.clone(),
-            PresenceMember { member, state, expires_unix: now_unix.saturating_add(ttl) },
-        );
+        members.insert(member.clone(), PresenceMember { member, state, expires_unix });
         Ok(inner.presence.get(&scope_key(tenant, channel)).map(|m| m.len()).unwrap_or(0))
     }
 

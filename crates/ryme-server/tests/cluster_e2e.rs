@@ -169,6 +169,26 @@ async fn wait_ranges(https: &[std::net::SocketAddr]) {
     }
 }
 
+async fn wait_presence(https: &[std::net::SocketAddr], member: &str, expected: bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut converged = true;
+        for http in https {
+            let (status, body) = http_request(*http, "GET /v1/presence/room", b"").await;
+            let present = status == 200 && String::from_utf8_lossy(&body).contains(member);
+            if present != expected {
+                converged = false;
+                break;
+            }
+        }
+        if converged {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "presence did not converge");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn cluster_write_failover_restart() {
     std::env::set_var("RYME_API_KEY", KEY);
@@ -449,6 +469,63 @@ async fn cluster_broadcast_reaches_every_gateway() {
             other => panic!("unexpected websocket message: {other:?}"),
         }
     }
+    for handle in handles {
+        handle.shutdown();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn cluster_presence_reaches_every_gateway() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-cluster-presence-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut bound = Vec::new();
+    for _ in 0..3 {
+        bound.push(bind_node().await);
+    }
+    let mut pg = Vec::new();
+    let mut resp = Vec::new();
+    let mut http = Vec::new();
+    let mut raft = Vec::new();
+    for node in &bound {
+        pg.push(node.0.local_addr().unwrap());
+        resp.push(node.1.local_addr().unwrap());
+        http.push(node.2.local_addr().unwrap());
+        raft.push(node.3.local_addr().unwrap());
+    }
+    let mut handles = Vec::new();
+    for (index, (pg_listener, resp_listener, http_listener, raft_listener)) in
+        bound.drain(..).enumerate()
+    {
+        let config =
+            node_config(&root, index, pg[index], resp[index], http[index], raft[index], &raft);
+        handles.push(
+            ryme_server::serve_cluster(
+                config,
+                pg_listener,
+                resp_listener,
+                http_listener,
+                raft_listener,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let leader = wait_leader(&http, None).await;
+    let join = br#"{"channel":"room","member":"ada","state":{"typing":true},"ttl_secs":60}"#;
+    let (status, _) = http_request(http[leader], "POST /v1/presence/join", join).await;
+    assert_eq!(status, 200);
+    wait_presence(&http, "ada", true).await;
+    let leave = br#"{"channel":"room","member":"ada"}"#;
+    let (status, response) = http_request(http[leader], "POST /v1/presence/leave", leave).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&response).contains("true"));
+    wait_presence(&http, "ada", false).await;
     for handle in handles {
         handle.shutdown();
     }

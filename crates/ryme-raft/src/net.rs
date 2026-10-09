@@ -48,6 +48,12 @@ pub(crate) enum Rpc {
     RealtimeResponse {
         ok: bool,
     },
+    Presence {
+        payload: Vec<u8>,
+    },
+    PresenceResponse {
+        ok: bool,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -437,6 +443,7 @@ pub struct Node {
     metadata: std::sync::Mutex<Option<Vec<u8>>>,
     metadata_hook: MetadataHookSlot,
     realtime_hook: MetadataHookSlot,
+    presence_hook: MetadataHookSlot,
 }
 
 impl Node {
@@ -586,6 +593,7 @@ impl Node {
             metadata: std::sync::Mutex::new(metadata),
             metadata_hook: MetadataHookSlot::default(),
             realtime_hook: MetadataHookSlot::default(),
+            presence_hook: MetadataHookSlot::default(),
         });
         Ok(node)
     }
@@ -1070,6 +1078,19 @@ impl Node {
         Ok(())
     }
 
+    fn apply_presence(&self, payload: Vec<u8>) -> Result<()> {
+        let hook = self
+            .presence_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("presence hook lock")))?
+            .clone();
+        if let Some(hook) = hook {
+            hook(&payload)?;
+        }
+        Ok(())
+    }
+
     async fn apply_conf(&self, change: crate::ConfChange) {
         let members = {
             let mut inner = self.inner.lock().await;
@@ -1188,6 +1209,13 @@ impl Node {
                 self.apply_realtime(payload)?;
                 Ok(Rpc::RealtimeResponse { ok: true })
             }
+            Rpc::Presence { payload } => {
+                if payload.is_empty() {
+                    return Err(RymeError::InvalidArgument(String::from("presence")));
+                }
+                self.apply_presence(payload)?;
+                Ok(Rpc::PresenceResponse { ok: true })
+            }
             Rpc::AppendRequest {
                 term,
                 leader: _,
@@ -1258,7 +1286,8 @@ impl Node {
             | Rpc::AppendResponse { .. }
             | Rpc::PreVoteResponse { .. }
             | Rpc::TransferResponse { .. }
-            | Rpc::RealtimeResponse { .. } => {
+            | Rpc::RealtimeResponse { .. }
+            | Rpc::PresenceResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
         }
@@ -1298,6 +1327,24 @@ impl Node {
             let payload = payload.clone();
             tokio::spawn(async move {
                 let _ = pool.roundtrip(&Rpc::Realtime { payload }).await;
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn fanout_presence(self: &Arc<Self>, payload: Vec<u8>) -> Result<()> {
+        if payload.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("presence")));
+        }
+        if !self.is_leader().await {
+            return Err(RymeError::Unavailable(String::from("not leader")));
+        }
+        self.apply_presence(payload.clone())?;
+        let peers = self.member_pools().await;
+        for (_, pool) in peers {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let _ = pool.roundtrip(&Rpc::Presence { payload }).await;
             });
         }
         Ok(())
@@ -1577,6 +1624,16 @@ impl Node {
             .0
             .lock()
             .map_err(|_| RymeError::Internal(String::from("realtime hook lock")))?;
+        *registered = Some(hook);
+        Ok(())
+    }
+
+    pub fn set_presence_hook(&self, hook: MetadataHook) -> Result<()> {
+        let mut registered = self
+            .presence_hook
+            .0
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("presence hook lock")))?;
         *registered = Some(hook);
         Ok(())
     }

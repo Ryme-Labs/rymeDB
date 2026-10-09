@@ -1651,6 +1651,7 @@ pub async fn serve_cluster(
     };
     install_cluster_range_replication(&state, &node)?;
     install_cluster_realtime_replication(&state, &node)?;
+    install_cluster_presence_replication(&state, &node)?;
     let mut tasks = node.spawn(raft_listener);
     tasks.extend(
         spawn_gateways(
@@ -3990,6 +3991,24 @@ struct ClusterBroadcast {
     sequence: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum ClusterPresence {
+    Join {
+        tenant: String,
+        channel: String,
+        member: String,
+        state: serde_json::Value,
+        expires_unix: u64,
+        now_unix: u64,
+    },
+    Leave {
+        tenant: String,
+        channel: String,
+        member: String,
+    },
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DurableAppendRequest {
     pub partition: String,
@@ -4040,12 +4059,42 @@ async fn presence_join(
         return error_response(e);
     }
     let now = ryme_txn::now_unix();
+    let member = request.member;
+    let state_value = request.state.unwrap_or(serde_json::Value::Null);
+    let ttl = request.ttl_secs.unwrap_or(60).clamp(1, ryme_realtime::PRESENCE_MAX_TTL_SECS);
+    if let Some(node) = state.raft_node() {
+        if !node.is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let event = ClusterPresence::Join {
+            tenant: principal.tenant.clone(),
+            channel: request.channel.clone(),
+            member,
+            state: state_value,
+            expires_unix: now.saturating_add(ttl),
+            now_unix: now,
+        };
+        let payload = match serde_json::to_vec(&event) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return error_response(ryme_error::RymeError::Internal(error.to_string()))
+            }
+        };
+        return match node.fanout_presence(payload).await {
+            Ok(()) => {
+                let count =
+                    state.realtime.presence_list(&principal.tenant, &request.channel, now).len();
+                (StatusCode::OK, Json(serde_json::json!({ "members": count }))).into_response()
+            }
+            Err(error) => error_response(error),
+        };
+    }
     match state.realtime.presence_join(
         &principal.tenant,
         &request.channel,
-        request.member,
-        request.state.unwrap_or(serde_json::Value::Null),
-        request.ttl_secs.unwrap_or(60),
+        member,
+        state_value,
+        ttl,
         now,
     ) {
         Ok(count) => {
@@ -4070,6 +4119,40 @@ async fn presence_leave(
     };
     if !principal.can_publish() {
         return error_response(ryme_error::RymeError::Forbidden);
+    }
+    if request.channel.is_empty() || request.member.is_empty() {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
+    }
+    if request.channel.len() > 256 || request.member.len() > 256 {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
+    }
+    if let Some(node) = state.raft_node() {
+        if !node.is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let now = ryme_txn::now_unix();
+        let removed = state
+            .realtime
+            .presence_list(&principal.tenant, &request.channel, now)
+            .iter()
+            .any(|member| member.member == request.member);
+        let event = ClusterPresence::Leave {
+            tenant: principal.tenant.clone(),
+            channel: request.channel.clone(),
+            member: request.member.clone(),
+        };
+        let payload = match serde_json::to_vec(&event) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return error_response(ryme_error::RymeError::Internal(error.to_string()))
+            }
+        };
+        return match node.fanout_presence(payload).await {
+            Ok(()) => {
+                (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
+            }
+            Err(error) => error_response(error),
+        };
     }
     match state.realtime.presence_leave(&principal.tenant, &request.channel, &request.member) {
         Ok(removed) => {
@@ -5995,6 +6078,16 @@ fn install_cluster_realtime_replication(
     node.set_realtime_hook(hook)
 }
 
+fn install_cluster_presence_replication(
+    state: &SharedState,
+    node: &std::sync::Arc<Node>,
+) -> ryme_error::Result<()> {
+    let state = state.clone();
+    let hook: ryme_raft::net::MetadataHook =
+        Arc::new(move |payload| apply_replicated_presence(&state, payload));
+    node.set_presence_hook(hook)
+}
+
 fn apply_replicated_broadcast(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
     let event: ClusterBroadcast = serde_json::from_slice(payload)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("realtime event: {error}")))?;
@@ -6009,6 +6102,27 @@ fn apply_replicated_broadcast(state: &SharedState, payload: &[u8]) -> ryme_error
             event.sequence,
         )
         .map(|_| ())
+}
+
+fn apply_replicated_presence(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
+    let event: ClusterPresence = serde_json::from_slice(payload)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("presence event: {error}")))?;
+    match event {
+        ClusterPresence::Join {
+            tenant,
+            channel,
+            member,
+            state: member_state,
+            expires_unix,
+            now_unix,
+        } => state
+            .realtime
+            .presence_join_at(&tenant, &channel, member, member_state, expires_unix, now_unix)
+            .map(|_| ()),
+        ClusterPresence::Leave { tenant, channel, member } => {
+            state.realtime.presence_leave(&tenant, &channel, &member).map(|_| ())
+        }
+    }
 }
 
 fn apply_replicated_ranges(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {

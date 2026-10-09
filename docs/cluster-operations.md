@@ -190,3 +190,10 @@ must reach the current leader, which fans the event over the cluster mesh to
 the other live gateways. It is intentionally ephemeral and is not
 replayed after a member joins or restarts; use durable topics for resumable
 messages.
+
+Presence mutations follow the same leader-routed mesh path. `POST
+/v1/presence/join` and `POST /v1/presence/leave` are accepted by the current
+leader and applied to every live gateway with one shared expiry timestamp.
+Presence is intentionally ephemeral: a gateway that is down during a join or
+leave does not receive that event until the client sends its next heartbeat
+or leave, and presence is not replayed from the Raft log.

@@ -105,6 +105,11 @@ abandoned presence state cannot accumulate. Each room holds at most 1000
 members; joins beyond the cap get `429`, and re-joining an existing member
 always succeeds.
 
+In cluster mode, presence joins and leaves must reach the current Raft leader.
+The leader fans each mutation over the live gateway mesh, and all gateways use
+the leader's expiry timestamp so reads converge without adding ephemeral
+presence traffic to the durable Raft log.
+
 Channel, partition, and member names are capped at 256 bytes and presence
 state payloads at 4 KiB (`400` beyond), so rooms stay small enough for the
 1000-member cap to mean something.
