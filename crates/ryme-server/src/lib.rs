@@ -5259,7 +5259,7 @@ async fn stream(
         return error_response(e);
     }
     let realtime = state.realtime.clone();
-    let tenant = state.tenant.clone();
+    let tenant = principal.tenant.clone();
     let database = state.database.clone();
     let table = query.table.clone();
     let from = query.from.unwrap_or(u64::MAX);
@@ -5432,7 +5432,7 @@ async fn query_stream(
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
     let backend = state.backend.clone();
     let realtime = state.realtime.clone();
-    let tenant = state.tenant.clone();
+    let tenant = principal.tenant.clone();
     let database = state.database.clone();
     let table = query.table.clone();
     let qos = state.qos.clone();
