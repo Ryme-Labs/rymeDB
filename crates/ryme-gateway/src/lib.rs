@@ -103,11 +103,27 @@ where
         Ok(())
     }
 
+    fn check_tenant(&self, principal: &Principal) -> Result<()> {
+        if principal.tenant == self.tenant {
+            Ok(())
+        } else {
+            Err(RymeError::Forbidden)
+        }
+    }
+
     pub fn get(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_tenant(principal)?;
         self.policies.predicate(principal, table)?;
         let key = RecordKey::new(&self.tenant, &self.database, table, pk);
         let mut txn = self.manager.begin();
-        self.manager.get(&mut txn, &key)
+        let Some(value) = self.manager.get(&mut txn, &key)? else {
+            return Ok(None);
+        };
+        if self.policies.row_allowed(principal, table, &value)? {
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn put(
@@ -129,6 +145,7 @@ where
         expires_at: Option<u64>,
     ) -> Result<u64> {
         self.reject_if_read_only()?;
+        self.check_tenant(principal)?;
         if table.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("table")));
         }
@@ -138,7 +155,7 @@ where
         if value.len() > MAX_VALUE_BYTES {
             return Err(RymeError::Overload(String::from("value")));
         }
-        self.policies.check_write(principal, table)?;
+        self.policies.check_write_row(principal, table, &value)?;
         let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
         let mut txn = self.manager.begin();
         let existed = self.manager.get(&mut txn, &key)?.is_some();
@@ -170,12 +187,16 @@ where
         expires_at: Option<u64>,
     ) -> Result<bool> {
         self.reject_if_read_only()?;
+        self.check_tenant(principal)?;
         self.policies.check_write(principal, table)?;
         let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
         let mut txn = self.manager.begin();
         let Some(current) = self.manager.get(&mut txn, &key)? else {
             return Ok(false);
         };
+        if !self.policies.row_allowed(principal, table, &current)? {
+            return Ok(false);
+        }
         match expires_at {
             Some(ts) => self.manager.put_with_ttl(&mut txn, key, current.clone(), ts),
             None => self.manager.put(&mut txn, key, current.clone()),
@@ -196,6 +217,7 @@ where
     }
 
     pub fn ttl_of(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Ttl> {
+        self.check_tenant(principal)?;
         self.policies.predicate(principal, table)?;
         let key = RecordKey::new(&self.tenant, &self.database, table, pk);
         match self.manager.expires_at(&key)? {
@@ -214,10 +236,14 @@ where
 
     pub async fn delete(&self, principal: &Principal, table: &str, pk: Vec<u8>) -> Result<u64> {
         self.reject_if_read_only()?;
+        self.check_tenant(principal)?;
         self.policies.check_write(principal, table)?;
         let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
         let mut txn = self.manager.begin();
-        if self.manager.get(&mut txn, &key)?.is_none() {
+        let Some(current) = self.manager.get(&mut txn, &key)? else {
+            return Err(RymeError::NotFound(String::from("row")));
+        };
+        if !self.policies.row_allowed(principal, table, &current)? {
             return Err(RymeError::NotFound(String::from("row")));
         }
         self.manager.delete(&mut txn, key);
@@ -250,9 +276,47 @@ where
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_tenant(principal)?;
         self.policies.predicate(principal, table)?;
         let mut txn = self.manager.begin();
-        self.manager.scan(&mut txn, &self.tenant, &self.database, table, limit)
+        if !self.policies.has_table_policy(table) {
+            return self.manager.scan(&mut txn, &self.tenant, &self.database, table, limit);
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut visible = Vec::with_capacity(limit);
+        let mut start_after = None;
+        loop {
+            let page = match start_after.as_deref() {
+                Some(start_after) => self.manager.scan_after(
+                    &mut txn,
+                    &self.tenant,
+                    &self.database,
+                    table,
+                    start_after,
+                    limit,
+                )?,
+                None => self.manager.scan(&mut txn, &self.tenant, &self.database, table, limit)?,
+            };
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            start_after = page.last().map(|(pk, _)| pk.clone());
+            for (pk, value) in page {
+                if self.policies.row_allowed(principal, table, &value)? {
+                    visible.push((pk, value));
+                    if visible.len() == limit {
+                        return Ok(visible);
+                    }
+                }
+            }
+            if page_len < limit {
+                break;
+            }
+        }
+        Ok(visible)
     }
 
     pub fn manager_clone(&self) -> B
@@ -330,6 +394,68 @@ mod tests {
             .put(&principal, "docs", b"k".to_vec(), vec![b'v'; MAX_VALUE_BYTES + 1])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn tenant_policy_filters_reads_and_writes() {
+        let mut policies = PolicyEngine::new();
+        policies.allow_table(String::from("messages"), String::from("tenant_id"));
+        let gateway = Gateway::new(
+            String::from("tenant-a"),
+            String::from("d"),
+            String::from("main"),
+            policies,
+            Realtime::new(16),
+        );
+        let principal = Principal {
+            id: String::from("ada"),
+            tenant: String::from("tenant-a"),
+            roles: [ryme_auth::Role::ReadWrite].into_iter().collect(),
+        };
+        gateway
+            .put(
+                &principal,
+                "messages",
+                b"visible".to_vec(),
+                br#"{"tenant_id":"tenant-a","body":"hello"}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(gateway.get(&principal, "messages", b"visible").unwrap().is_some());
+        assert!(gateway
+            .put(
+                &principal,
+                "messages",
+                b"hidden".to_vec(),
+                br#"{"tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
+            )
+            .await
+            .is_err());
+
+        let manager = gateway.manager_clone();
+        let mut txn = manager.begin();
+        manager.put(
+            &mut txn,
+            RecordKey::new("tenant-a", "d", "messages", b"hidden"),
+            br#"{"tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
+        );
+        manager.commit(txn).unwrap();
+        assert!(gateway.get(&principal, "messages", b"hidden").unwrap().is_none());
+        let rows = gateway.scan(&principal, "messages", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, b"visible");
+        assert!(matches!(
+            gateway.get(
+                &Principal {
+                    id: String::from("mallory"),
+                    tenant: String::from("tenant-b"),
+                    roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
+                },
+                "messages",
+                b"visible"
+            ),
+            Err(RymeError::Forbidden)
+        ));
     }
 
     #[tokio::test]

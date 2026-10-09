@@ -7,7 +7,8 @@ use axum::Json;
 use futures_util::{SinkExt, StreamExt};
 use ryme_archive::{Archiver, BackupManifest};
 use ryme_auth::{
-    ApiKeyStore, CredentialStore, JwtVerifier, OidcConfig, PasskeyRegistry, Principal, Role,
+    ApiKeyStore, CredentialStore, JwtVerifier, OidcConfig, PasskeyRegistry, PolicyEngine,
+    Principal, Role,
 };
 use ryme_backup::Checkpoint;
 use ryme_config::{Config, OtelConfig};
@@ -23,7 +24,7 @@ use ryme_realtime::Realtime;
 use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
 use ryme_sql::{bind, parse, Executor, QueryResult};
-use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
+use ryme_txn::{DurableManager, SyncPolicy, TxnManager};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -778,7 +779,10 @@ impl SharedState {
             None => Backend::Single(durable.clone()),
         };
         let realtime = Realtime::new(4096);
-        let policies = ryme_auth::PolicyEngine::new();
+        let mut policies = PolicyEngine::new();
+        for (table, tenant_column) in &config.rls_tables {
+            policies.allow_table(table.clone(), tenant_column.clone());
+        }
         let tenant = String::from("default");
         let database = String::from("default");
         let branch = String::from("main");
@@ -2155,14 +2159,7 @@ async fn rest_list(
     }
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
     let offset = query.offset.unwrap_or(0).min(10_000);
-    let mut txn = state.backend.begin();
-    let rows = match state.backend.scan(
-        &mut txn,
-        &state.tenant,
-        &state.database,
-        &table,
-        limit.saturating_add(offset),
-    ) {
+    let rows = match state.gateway.scan(&principal, &table, limit.saturating_add(offset)) {
         Ok(rows) => rows,
         Err(e) => return error_response(e),
     };
@@ -2408,8 +2405,7 @@ async fn execute_graphql(
         }
     } else {
         let limit = parse_graphql_limit(query).unwrap_or(100).min(1000);
-        let mut txn = state.backend.begin();
-        let rows = state.backend.scan(&mut txn, &state.tenant, &state.database, &table, limit)?;
+        let rows = state.gateway.scan(principal, &table, limit)?;
         let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
         admit_egress(state, &principal.tenant, egress)?;
         let items: Vec<serde_json::Value> = rows
@@ -4269,8 +4265,7 @@ async fn scan(
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
-    let mut txn = state.backend.begin();
-    match state.backend.scan(&mut txn, &state.tenant, &state.database, &table, limit) {
+    match state.gateway.scan(&principal, &table, limit) {
         Ok(rows) => {
             let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
             if let Err(e) = admit_egress(&state, &principal.tenant, egress) {

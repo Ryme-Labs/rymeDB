@@ -61,6 +61,10 @@ impl PolicyEngine {
         self.table_policies.insert(table, tenant_column);
     }
 
+    pub fn has_table_policy(&self, table: &str) -> bool {
+        self.table_policies.contains_key(table)
+    }
+
     pub fn mask_fields(&self, table: String, fields: Vec<String>) {
         if let Ok(mut guard) = self.masked_fields.write() {
             guard.insert(table, fields);
@@ -94,8 +98,37 @@ impl PolicyEngine {
             return Err(RymeError::Forbidden);
         }
         match self.table_policies.get(table) {
-            Some(column) => Ok(format!("{column} = '{}'", principal.tenant)),
+            Some(column) => {
+                let tenant = principal.tenant.replace('\'', "''");
+                Ok(format!("{column} = '{tenant}'"))
+            }
             None => Ok(String::from("true")),
+        }
+    }
+
+    pub fn row_allowed(&self, principal: &Principal, table: &str, value: &[u8]) -> Result<bool> {
+        self.predicate(principal, table)?;
+        let Some(column) = self.table_policies.get(table) else {
+            return Ok(true);
+        };
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
+            return Ok(false);
+        };
+        Ok(object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .and_then(|(_, value)| value.as_str())
+            .is_some_and(|tenant| tenant == principal.tenant))
+    }
+
+    pub fn check_write_row(&self, principal: &Principal, table: &str, value: &[u8]) -> Result<()> {
+        if !principal.can_write() {
+            return Err(RymeError::Forbidden);
+        }
+        if self.row_allowed(principal, table, value)? {
+            Ok(())
+        } else {
+            Err(RymeError::Forbidden)
         }
     }
 
@@ -830,6 +863,40 @@ mod tests {
         assert!(!text.contains("123"));
         let plain = engine.masked_value("other", b"{\"ssn\":\"123\"}");
         assert_eq!(plain, b"{\"ssn\":\"123\"}".to_vec());
+    }
+
+    #[test]
+    fn tenant_policy_matches_rows_before_returning_them() {
+        let mut engine = PolicyEngine::new();
+        engine.allow_table(String::from("messages"), String::from("tenant_id"));
+        let principal = Principal {
+            id: String::from("ada"),
+            tenant: String::from("tenant-a"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        assert!(engine
+            .row_allowed(&principal, "messages", br#"{"tenant_id":"tenant-a","body":"hi"}"#)
+            .unwrap());
+        assert!(!engine
+            .row_allowed(&principal, "messages", br#"{"tenant_id":"tenant-b","body":"secret"}"#)
+            .unwrap());
+        assert!(!engine.row_allowed(&principal, "messages", br#"{"body":"missing"}"#).unwrap());
+        assert!(engine
+            .check_write_row(&principal, "messages", br#"{"tenant_id":"tenant-a"}"#)
+            .is_ok());
+        assert!(matches!(
+            engine.check_write_row(&principal, "messages", br#"{"tenant_id":"tenant-b"}"#),
+            Err(RymeError::Forbidden)
+        ));
+        assert_eq!(
+            engine
+                .predicate(
+                    &Principal { tenant: String::from("a'b"), ..principal.clone() },
+                    "messages"
+                )
+                .unwrap(),
+            "tenant_id = 'a''b'"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ runs on every boot.
 | `otel` | object | `{}` | OTLP trace export: `endpoint` (e.g. `http://collector:4318`), `service` (default `"rymedb"`), `interval_secs` (default `30`). Unset `endpoint` disables export. Config file only. |
 | `passkey_rp_id` | string | `""` | Relying-party id WebAuthn assertions are verified against (SHA-256 compared to the authenticator-data rpId hash). Empty disables passkey login. Config file only. |
 | `passkey_origins` | string[] | `[]` | Exact-match allow-list for the client-data `origin` during assertion verification. Config file only. |
+| `rls_tables` | object | `{}` | Tenant-column policies as `{ "table": "tenant_column" }`. Gateway reads, scans, and writes only allow JSON rows whose configured tenant column matches the authenticated tenant. Config file only. |
 | `shards` | usize | `1` | Range 1–256. Cannot exceed 1 when `raft_listen` is set. |
 | `index_partitions` | usize | `4` | Range 1–64. Hash partitions for vector/text index spaces; writes route by id, reads fan out and merge. |
 | `replicated_tables` | string[] | `[]` | Non-empty requires `raft_listen` (selects the Hybrid backend). |

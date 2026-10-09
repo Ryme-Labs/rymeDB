@@ -1,5 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
@@ -66,6 +67,8 @@ pub struct Config {
     pub passkey_rp_id: String,
     #[serde(default)]
     pub passkey_origins: Vec<String>,
+    #[serde(default)]
+    pub rls_tables: HashMap<String, String>,
 }
 
 fn default_autosplit_interval() -> u64 {
@@ -244,6 +247,7 @@ impl Default for Config {
             autosplit_interval_secs: default_autosplit_interval(),
             passkey_rp_id: String::new(),
             passkey_origins: Vec::new(),
+            rls_tables: HashMap::new(),
         }
     }
 }
@@ -369,6 +373,10 @@ mod tests {
         let nested = dir.join("ryme-config-nested-typo.json");
         std::fs::write(&nested, "{\"node_id\":\"n\",\"otel\":{\"endpoin\":\"x\"}}").unwrap();
         assert!(Config::from_file(&nested).is_err());
+        let rls = dir.join("ryme-config-rls.json");
+        std::fs::write(&rls, r#"{"node_id":"n","rls_tables":{"messages":"tenant_id"}}"#).unwrap();
+        let parsed = Config::from_file(&rls).unwrap();
+        assert_eq!(parsed.rls_tables.get("messages"), Some(&String::from("tenant_id")));
         let valid = dir.join("ryme-config-valid.json");
         let config = Config {
             autosplit_writes: 7,
