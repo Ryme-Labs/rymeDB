@@ -119,7 +119,9 @@ KEK-wrapped instead of plaintext; without it the log warns and volume
 encryption remains the outer layer. Manifests record per-file
 `dek_id`/`nonce`/`tag` plus sha256 of the sealed bytes.
 
-Drill restores without touching live data:
+Scheduled drills restore the latest backup into a unique temporary directory
+next to the live data directory, verify checksums and decrypt every file, then
+remove the restored copy without touching live data:
 
 ```sh
 ryme backup verify <backup-id>

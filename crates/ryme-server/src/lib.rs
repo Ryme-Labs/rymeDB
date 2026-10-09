@@ -658,6 +658,27 @@ impl ArchiveTarget {
         }
     }
 
+    async fn restore_backup<F>(
+        &self,
+        manifest_key: &str,
+        dest_dir: &std::path::Path,
+        open: &F,
+    ) -> ryme_error::Result<u64>
+    where
+        F: Fn(&Option<ryme_archive::FileEncryption>, &[u8]) -> ryme_error::Result<Vec<u8>>
+            + Send
+            + Sync,
+    {
+        match self {
+            Self::Local(store) => {
+                Archiver::new(store.clone()).restore_backup_with(manifest_key, dest_dir, open).await
+            }
+            Self::S3(store) => {
+                Archiver::new(store.clone()).restore_backup_with(manifest_key, dest_dir, open).await
+            }
+        }
+    }
+
     async fn list_backups(&self) -> ryme_error::Result<Vec<BackupManifest>> {
         match self {
             Self::Local(store) => Archiver::new(store.clone()).list_backups().await,
@@ -5542,17 +5563,34 @@ async fn drill_once(state: &SharedState) -> DrillReport {
         }
     };
     let backup_id = manifest.backup_id.clone();
-    match target
-        .verify_backup(&manifest.manifest_key(), &|encryption, bytes| {
+    let parent = state.data_dir.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let restore_dir = parent.join(format!(".rymedb-restore-drill-{}-{nanos}", std::process::id()));
+    let result = target
+        .restore_backup(&manifest.manifest_key(), &restore_dir, &|encryption, bytes| {
             open_archive_bytes(state, encryption, bytes)
         })
-        .await
-    {
-        Ok(verified) => {
-            tracing::info!(backup = %backup_id, files = verified, "restore drill ok");
+        .await;
+    let cleanup = std::fs::remove_dir_all(&restore_dir);
+    match (result, cleanup) {
+        (Ok(commit), Ok(())) => {
+            let verified = manifest.files.len() as u64;
+            tracing::info!(backup = %backup_id, commit, files = verified, "restore drill ok");
             DrillReport { backup_id, verified_files: verified, at_unix: now_secs(), error: None }
         }
-        Err(e) => {
+        (Ok(_), Err(e)) => {
+            tracing::warn!(backup = %backup_id, error = %e, "restore drill cleanup failed");
+            DrillReport {
+                backup_id,
+                verified_files: 0,
+                at_unix: now_secs(),
+                error: Some(format!("cleanup: {e}")),
+            }
+        }
+        (Err(e), _) => {
             tracing::warn!(backup = %backup_id, error = %e, "restore drill failed");
             DrillReport {
                 backup_id,

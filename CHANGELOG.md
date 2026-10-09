@@ -29,6 +29,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Backup manifests now validate their identity, paths, checksums, and duplicate
   entries; restores verify stored lengths and publish through an atomic staged
   directory, preventing partial destinations after a failed restore.
+- Scheduled backup drills now materialize and clean up a temporary restore
+  directory, exercising the real checksum, decryption, and atomic publish path
+  instead of only reading and verifying archive objects.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention
