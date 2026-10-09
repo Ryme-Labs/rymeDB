@@ -47,17 +47,23 @@ async fn cdc_emits_crud_ops() {
     for _ in 0..6 {
         let record =
             tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
-        events.push((record.op, record.pk.clone(), record.after.clone()));
+        assert_eq!(record.tx_id, record.commit_ts);
+        events.push((record.op, record.pk.clone(), record.before.clone(), record.after.clone()));
     }
     assert_eq!(
         events,
         vec![
-            (ryme_realtime::Operation::Insert, b"a".to_vec(), Some(b"1".to_vec())),
-            (ryme_realtime::Operation::Update, b"a".to_vec(), Some(b"2".to_vec())),
-            (ryme_realtime::Operation::Insert, b"b".to_vec(), Some(b"3".to_vec())),
-            (ryme_realtime::Operation::Insert, b"c".to_vec(), Some(b"4".to_vec())),
-            (ryme_realtime::Operation::Insert, b"n".to_vec(), Some(b"1".to_vec())),
-            (ryme_realtime::Operation::Delete, b"a".to_vec(), None),
+            (ryme_realtime::Operation::Insert, b"a".to_vec(), None, Some(b"1".to_vec())),
+            (
+                ryme_realtime::Operation::Update,
+                b"a".to_vec(),
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+            ),
+            (ryme_realtime::Operation::Insert, b"b".to_vec(), None, Some(b"3".to_vec())),
+            (ryme_realtime::Operation::Insert, b"c".to_vec(), None, Some(b"4".to_vec())),
+            (ryme_realtime::Operation::Insert, b"n".to_vec(), None, Some(b"1".to_vec())),
+            (ryme_realtime::Operation::Delete, b"a".to_vec(), Some(b"2".to_vec()), None),
         ]
     );
 }

@@ -15,14 +15,17 @@ administrative role). Each frame is a `ChangeRecord`
 {
   "tenant": "default", "database": "default", "branch": "main",
   "table": "docs", "op": "INSERT",
-  "pk": [107, 49], "after": [111, 110, 101],
-  "commit_ts": 2, "sequence": 1
+  "pk": [107, 49], "before": null, "after": [111, 110, 101],
+  "commit_ts": 2, "tx_id": 2, "sequence": 1
 }
 ```
 
 - `op` is `INSERT`, `UPDATE`, or `DELETE` (uppercase).
-- `pk` and `after` are **byte arrays** (JSON number arrays), not strings:
-  `[107, 49]` decodes to `"k1"`. `after` is `null` on deletes.
+- `pk`, `before`, and `after` are **byte arrays** (JSON number arrays), not
+  strings: `[107, 49]` decodes to `"k1"`. `before` is `null` on inserts and
+  `after` is `null` on deletes.
+- `tx_id` identifies the committed transaction. It currently matches
+  `commit_ts`, while `sequence` remains the per-topic delivery cursor.
 - If a slow consumer lags behind the broadcast channel, the server replays
   the missing changes from the retained topic ring. If retention is no longer
   sufficient, the socket closes instead of silently presenting an incomplete

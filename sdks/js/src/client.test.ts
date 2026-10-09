@@ -246,7 +246,7 @@ describe("RymeHttpClient", () => {
 
   it("streams table changes over websocket", async () => {
     const frames = [
-      `{"tenant":"t","database":"d","branch":"main","table":"docs","op":"INSERT","pk":[49],"after":[50],"commit_ts":7,"sequence":1}`,
+      `{"tenant":"t","database":"d","branch":"main","table":"docs","op":"INSERT","pk":[49],"before":null,"after":[50],"commit_ts":7,"tx_id":7,"sequence":1}`,
     ];
     const { server, requests, close } = wsStub(frames);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

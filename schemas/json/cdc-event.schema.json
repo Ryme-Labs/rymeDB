@@ -2,14 +2,18 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ChangeRecord",
   "type": "object",
-  "required": ["tenant", "database", "branch", "table", "op", "commit_ts", "sequence"],
+  "required": ["tenant", "database", "branch", "table", "op", "pk", "before", "after", "commit_ts", "tx_id", "sequence"],
   "properties": {
     "tenant": {"type": "string"},
     "database": {"type": "string"},
     "branch": {"type": "string"},
     "table": {"type": "string"},
     "op": {"type": "string", "enum": ["INSERT", "UPDATE", "DELETE"]},
+    "pk": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+    "before": {"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+    "after": {"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}},
     "commit_ts": {"type": "integer"},
+    "tx_id": {"type": "integer"},
     "sequence": {"type": "integer"}
   }
 }

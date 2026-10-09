@@ -402,13 +402,19 @@ where
         }
     }
 
-    fn cdc_pending(&self, txn: &Transaction) -> Vec<(RecordKey, Operation, Option<Vec<u8>>)> {
+    fn cdc_pending(
+        &self,
+        txn: &Transaction,
+    ) -> Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)> {
         let Some(realtime) = self.realtime.as_ref() else { return Vec::new() };
         let mut out = Vec::new();
         for (key, staged) in txn.writes() {
             if !realtime.has_subscribers(&key.tenant, &key.database, &key.table) {
                 continue;
             }
+            let mut before_txn = self.manager.begin();
+            before_txn.restamp(txn.read_ts);
+            let before = self.manager.get(&mut before_txn, key).ok().flatten();
             let op = match &staged.value {
                 None => Operation::Delete,
                 Some(_) => match txn.observed_existed(key) {
@@ -417,14 +423,18 @@ where
                     None => Operation::Update,
                 },
             };
-            out.push((key.clone(), op, staged.value.clone()));
+            out.push((key.clone(), op, before, staged.value.clone()));
         }
         out
     }
 
-    fn cdc_emit(&self, pending: Vec<(RecordKey, Operation, Option<Vec<u8>>)>, commit_ts: u64) {
+    fn cdc_emit(
+        &self,
+        pending: Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>,
+        commit_ts: u64,
+    ) {
         let Some(realtime) = self.realtime.as_ref() else { return };
-        for (key, op, after) in pending {
+        for (key, op, before, after) in pending {
             let _ = realtime.publish(NewChange {
                 tenant: key.tenant.clone(),
                 database: key.database.clone(),
@@ -432,8 +442,10 @@ where
                 table: key.table.clone(),
                 op,
                 pk: key.pk.clone(),
+                before,
                 after,
                 commit_ts,
+                tx_id: commit_ts,
             });
         }
     }

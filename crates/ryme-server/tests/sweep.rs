@@ -63,6 +63,7 @@ async fn sweep_emits_cdc_delete() {
     let record = rx.try_recv().unwrap();
     assert_eq!(record.op, ryme_realtime::Operation::Delete);
     assert_eq!(record.pk, b"gone".to_vec());
+    assert_eq!(record.before, None);
     assert_eq!(record.after, None);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -14,8 +14,10 @@ pub struct ChangeRecord {
     pub table: String,
     pub op: Operation,
     pub pk: Vec<u8>,
+    pub before: Option<Vec<u8>>,
     pub after: Option<Vec<u8>>,
     pub commit_ts: u64,
+    pub tx_id: u64,
     pub sequence: u64,
 }
 
@@ -122,8 +124,10 @@ pub struct NewChange {
     pub table: String,
     pub op: Operation,
     pub pk: Vec<u8>,
+    pub before: Option<Vec<u8>>,
     pub after: Option<Vec<u8>>,
     pub commit_ts: u64,
+    pub tx_id: u64,
 }
 
 impl Realtime {
@@ -167,8 +171,10 @@ impl Realtime {
             table: event.table.clone(),
             op: event.op,
             pk: event.pk.clone(),
+            before: event.before.clone(),
             after: event.after.clone(),
             commit_ts: event.commit_ts,
+            tx_id: event.tx_id,
             sequence,
         };
         let key = branch_topic_key(&event.tenant, &event.database, &event.branch, &event.table);
@@ -695,8 +701,10 @@ mod tests {
                     table: String::from("docs"),
                     op: crate::Operation::Insert,
                     pk: commit.to_be_bytes().to_vec(),
+                    before: None,
                     after: None,
                     commit_ts: commit,
+                    tx_id: commit,
                 })
                 .unwrap();
         }
@@ -765,8 +773,10 @@ mod tests {
                 table: String::from("docs"),
                 op: Operation::Insert,
                 pk: b"main".to_vec(),
+                before: None,
                 after: Some(b"one".to_vec()),
                 commit_ts: 1,
+                tx_id: 1,
             })
             .unwrap();
         realtime
@@ -777,8 +787,10 @@ mod tests {
                 table: String::from("docs"),
                 op: Operation::Insert,
                 pk: b"preview".to_vec(),
+                before: None,
                 after: Some(b"two".to_vec()),
                 commit_ts: 2,
+                tx_id: 2,
             })
             .unwrap();
         assert_eq!(main_changes.try_recv().unwrap().branch, "main");

@@ -637,8 +637,10 @@ export interface ChangeRecord {
   table: string;
   op: "INSERT" | "UPDATE" | "DELETE";
   pk: number[];
+  before: number[] | null;
   after: number[] | null;
   commit_ts: number;
+  tx_id: number;
   sequence: number;
 }
 

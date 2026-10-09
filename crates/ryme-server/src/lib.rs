@@ -427,8 +427,10 @@ impl Backend {
                 table: table.to_string(),
                 op: ryme_realtime::Operation::Delete,
                 pk: pk.clone(),
+                before: None,
                 after: None,
                 commit_ts,
+                tx_id: commit_ts,
             });
         }
     }
@@ -6387,6 +6389,7 @@ fn realtime_change_allowed(
         && record
             .after
             .as_deref()
+            .or(record.before.as_deref())
             .is_none_or(|value| rls_row_allowed(rls_tables, tenant, &record.table, value))
 }
 
@@ -6752,5 +6755,24 @@ mod realtime_policy_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, b"b-visible");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn realtime_delete_filter_checks_before_image() {
+        let policies = HashMap::from([(String::from("messages"), String::from("tenant_id"))]);
+        let record = ryme_realtime::ChangeRecord {
+            tenant: String::from("tenant-a"),
+            database: String::from("default"),
+            branch: String::from("main"),
+            table: String::from("messages"),
+            op: ryme_realtime::Operation::Delete,
+            pk: b"hidden".to_vec(),
+            before: Some(br#"{"tenant_id":"tenant-b"}"#.to_vec()),
+            after: None,
+            commit_ts: 2,
+            tx_id: 2,
+            sequence: 1,
+        };
+        assert!(!realtime_change_allowed(&policies, "tenant-a", "main", &record));
     }
 }

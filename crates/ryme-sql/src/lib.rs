@@ -2173,6 +2173,7 @@ where
         table: &str,
         pk: Vec<u8>,
         op: Operation,
+        before: Option<Vec<u8>>,
         after: Option<Vec<u8>>,
         commit_ts: u64,
     ) -> Result<()> {
@@ -2184,8 +2185,10 @@ where
             table: table.to_string(),
             op,
             pk,
+            before,
             after,
             commit_ts,
+            tx_id: commit_ts,
         })?;
         self.refresh_table(table, commit_ts);
         Ok(())
@@ -2540,7 +2543,7 @@ where
         let commit_ts = self.manager.commit(txn).await?;
         for change in changes {
             self.apply_index_change(&change);
-            self.emit(&change.table, change.pk, change.op, change.after, commit_ts)?;
+            self.emit(&change.table, change.pk, change.op, change.before, change.after, commit_ts)?;
         }
         Ok(commit_ts)
     }
@@ -2911,11 +2914,11 @@ where
                     table: table.clone(),
                     pk: pk.clone(),
                     op: Operation::Insert,
-                    before,
+                    before: before.clone(),
                     after: Some(value.clone()),
                 });
                 if let Some(after) = after {
-                    self.emit(&table, pk, Operation::Insert, Some(after), commit_ts)?;
+                    self.emit(&table, pk, Operation::Insert, None, Some(after), commit_ts)?;
                 }
                 Ok(QueryResult::Ok)
             }
@@ -2937,12 +2940,12 @@ where
                     table: table.clone(),
                     pk: pk.clone(),
                     op: if existed { Operation::Update } else { Operation::Insert },
-                    before,
+                    before: before.clone(),
                     after: Some(value.clone()),
                 });
                 if let Some(after) = after {
                     let op = if existed { Operation::Update } else { Operation::Insert };
-                    self.emit(&table, pk, op, Some(after), commit_ts)?;
+                    self.emit(&table, pk, op, before, Some(after), commit_ts)?;
                 }
                 Ok(QueryResult::Ok)
             }
@@ -3165,11 +3168,11 @@ where
                     table: table.clone(),
                     pk: pk.clone(),
                     op: Operation::Update,
-                    before,
+                    before: before.clone(),
                     after: Some(value.clone()),
                 });
                 if let Some(after) = after {
-                    self.emit(&table, pk, Operation::Update, Some(after), commit_ts)?;
+                    self.emit(&table, pk, Operation::Update, before, Some(after), commit_ts)?;
                 }
                 Ok(QueryResult::Ok)
             }
@@ -3188,11 +3191,11 @@ where
                     table: table.clone(),
                     pk: pk.clone(),
                     op: Operation::Delete,
-                    before,
+                    before: before.clone(),
                     after: None,
                 });
                 if self.realtime.is_some() {
-                    self.emit(&table, pk, Operation::Delete, None, commit_ts)?;
+                    self.emit(&table, pk, Operation::Delete, before, None, commit_ts)?;
                 }
                 Ok(QueryResult::Ok)
             }
@@ -3234,7 +3237,14 @@ where
             for change in staged {
                 self.apply_index_change(&change);
                 if self.realtime.is_some() {
-                    self.emit(&change.table, change.pk, change.op, change.after, commit_ts)?;
+                    self.emit(
+                        &change.table,
+                        change.pk,
+                        change.op,
+                        change.before,
+                        change.after,
+                        commit_ts,
+                    )?;
                 }
             }
         }

@@ -183,13 +183,13 @@ where
         self.policies.check_write_row(principal, table, &value)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.begin();
-        let existed = self.manager.get(&mut txn, &key)?.is_some();
+        let before = self.manager.get(&mut txn, &key)?;
         match expires_at {
             Some(ts) => self.manager.put_with_ttl(&mut txn, key, value.clone(), ts),
             None => self.manager.put(&mut txn, key, value.clone()),
         }
         let commit_ts = self.manager.commit(txn).await?;
-        let op = if existed { Operation::Update } else { Operation::Insert };
+        let op = if before.is_some() { Operation::Update } else { Operation::Insert };
         self.realtime.publish(NewChange {
             tenant: principal.tenant.clone(),
             database: self.database.clone(),
@@ -197,8 +197,10 @@ where
             table: table.to_string(),
             op,
             pk,
+            before,
             after: Some(value),
             commit_ts,
+            tx_id: commit_ts,
         })?;
         self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
@@ -233,8 +235,10 @@ where
             table: table.to_string(),
             op: Operation::Update,
             pk,
+            before: Some(current.clone()),
             after: Some(current),
             commit_ts,
+            tx_id: commit_ts,
         })?;
         self.refresh_table(principal, table, commit_ts);
         Ok(true)
@@ -277,8 +281,10 @@ where
             table: table.to_string(),
             op: Operation::Delete,
             pk,
+            before: Some(current),
             after: None,
             commit_ts,
+            tx_id: commit_ts,
         })?;
         self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
