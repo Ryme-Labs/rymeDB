@@ -11,11 +11,12 @@ use ryme_sql::{
     RoleDefinition, Statement, TransactionChange, SQL_NULL_SENTINEL,
 };
 use ryme_txn::{Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 
 pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
 
@@ -116,6 +117,23 @@ enum TransactionControl {
 static NEXT_BACKEND_PID: AtomicU32 = AtomicU32::new(1);
 static BACKEND_CANCELLATIONS: LazyLock<Mutex<HashMap<(u32, u32), Weak<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone)]
+struct PgNotification {
+    channel: String,
+    payload: String,
+    pid: u32,
+}
+
+static PG_NOTIFICATIONS: LazyLock<
+    Mutex<HashMap<(String, String), broadcast::Sender<PgNotification>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn notification_sender(tenant: &str, database: &str) -> broadcast::Sender<PgNotification> {
+    let key = (tenant.to_string(), database.to_string());
+    let mut channels = PG_NOTIFICATIONS.lock().unwrap_or_else(|error| error.into_inner());
+    channels.entry(key).or_insert_with(|| broadcast::channel(1024).0).clone()
+}
 
 fn register_backend() -> (u32, u32, Arc<AtomicBool>) {
     let pid = NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed).max(1);
@@ -443,7 +461,8 @@ where
         send_greeting(&mut socket).await?;
         send_backend_key_data(&mut socket, pid, secret).await?;
         send_ready(&mut socket).await?;
-        serve_loop(socket, executor, limits, cancellation).await
+        let notifications = notification_sender(&limits.tenant, &limits.database).subscribe();
+        serve_loop(socket, executor, limits, cancellation, pid, notifications).await
     }
     .await;
     unregister_backend(pid, secret);
@@ -636,6 +655,8 @@ async fn serve_loop<B, S>(
     executor: Arc<Executor<B>>,
     limits: ConnLimits,
     cancellation: Arc<AtomicBool>,
+    pid: u32,
+    mut notifications: broadcast::Receiver<PgNotification>,
 ) -> std::result::Result<(), RymeError>
 where
     B: TxnBackend,
@@ -645,19 +666,41 @@ where
     let mut portals: HashMap<String, Portal> = HashMap::new();
     let mut prepared_cache: HashMap<String, (String, Statement)> = HashMap::new();
     let mut session: HashMap<String, String> = HashMap::new();
+    let mut listening = HashSet::new();
     let mut copy_in: Option<CopyInState> = None;
     let mut active_transaction: Option<SessionTransaction> = None;
     loop {
-        let tag = match socket.read_u8().await {
-            Ok(tag) => tag,
-            Err(_) => return Ok(()),
+        let (tag, payload) = if listening.is_empty() {
+            match read_client_message(&mut socket).await {
+                Ok(message) => message,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            loop {
+                tokio::select! {
+                    message = read_client_message(&mut socket) => {
+                        break match message {
+                            Ok(message) => message,
+                            Err(_) => return Ok(()),
+                        };
+                    }
+                    notification = notifications.recv() => {
+                        if let Ok(notification) = notification {
+                            if listening.contains(&notification.channel) {
+                                socket
+                                    .write_all(&notification_response(
+                                        notification.pid,
+                                        &notification.channel,
+                                        &notification.payload,
+                                    ))
+                                    .await
+                                    .map_err(|e| RymeError::Io(e.to_string()))?;
+                            }
+                        }
+                    }
+                }
+            }
         };
-        let length = socket.read_u32().await.map_err(|e| RymeError::Io(e.to_string()))? as usize;
-        if length < 4 {
-            return Err(RymeError::InvalidArgument(String::from("frame")));
-        }
-        let mut payload = vec![0u8; length - 4];
-        socket.read_exact(&mut payload).await.map_err(|e| RymeError::Io(e.to_string()))?;
 
         if cancellation.swap(false, Ordering::Acquire) && copy_in.is_none() {
             let response =
@@ -845,7 +888,15 @@ where
                     if failed {
                         break;
                     }
-                    if let Some(response) = catalog_query(trimmed, &executor) {
+                    if let Some(response) = notification_command(
+                        trimmed,
+                        &limits.tenant,
+                        &limits.database,
+                        pid,
+                        &mut listening,
+                    ) {
+                        out.extend_from_slice(&response);
+                    } else if let Some(response) = catalog_query(trimmed, &executor) {
                         out.extend_from_slice(&response);
                     } else if let Some(control) = transaction_control(trimmed, &session) {
                         out.extend_from_slice(
@@ -1061,7 +1112,15 @@ where
                                     Err(e) => Err(e),
                                 },
                             };
-                            if let Some(response) = catalog_query(trimmed, &executor) {
+                            if let Some(response) = notification_command(
+                                trimmed,
+                                &limits.tenant,
+                                &limits.database,
+                                pid,
+                                &mut listening,
+                            ) {
+                                response
+                            } else if let Some(response) = catalog_query(trimmed, &executor) {
                                 response
                             } else if let Some(control) = transaction_control(trimmed, &session) {
                                 handle_transaction_control(
@@ -3112,6 +3171,59 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
     }
 }
 
+fn notification_command(
+    query: &str,
+    tenant: &str,
+    database: &str,
+    pid: u32,
+    listening: &mut HashSet<String>,
+) -> Option<Vec<u8>> {
+    let normalized = query.trim().trim_end_matches(';').trim();
+    let upper = normalized.to_ascii_uppercase();
+    if upper == "LISTEN" || upper.starts_with("LISTEN ") {
+        let channel = normalize_notification_name(normalized.get(6..)?.trim())?;
+        if channel.is_empty() {
+            return None;
+        }
+        listening.insert(channel);
+        return Some(command_complete("LISTEN"));
+    }
+    if upper == "UNLISTEN" || upper.starts_with("UNLISTEN ") {
+        let channel = normalized.get(8..)?.trim();
+        if channel == "*" {
+            listening.clear();
+        } else {
+            let channel = normalize_notification_name(channel)?;
+            listening.remove(&channel);
+        }
+        return Some(command_complete("UNLISTEN"));
+    }
+    if upper == "NOTIFY" || upper.starts_with("NOTIFY ") {
+        let rest = normalized.get(6..)?.trim();
+        let (channel, payload) = rest.split_once(',').unwrap_or((rest, ""));
+        let channel = normalize_notification_name(channel.trim())?;
+        if channel.is_empty() {
+            return None;
+        }
+        let payload = unquote_literal(payload.trim()).replace("''", "'");
+        let _ =
+            notification_sender(tenant, database).send(PgNotification { channel, payload, pid });
+        return Some(command_complete("NOTIFY"));
+    }
+    None
+}
+
+fn normalize_notification_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        return Some(value[1..value.len() - 1].replace("\"\"", "\""));
+    }
+    (!value.chars().any(char::is_whitespace)).then(|| value.to_string())
+}
+
 fn unquote_literal(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.len() >= 2
@@ -3615,6 +3727,16 @@ fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
     out.extend_from_slice(body);
     out
+}
+
+fn notification_response(pid: u32, channel: &str, payload: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + channel.len() + payload.len());
+    body.extend_from_slice(&pid.to_be_bytes());
+    body.extend_from_slice(channel.as_bytes());
+    body.push(0);
+    body.extend_from_slice(payload.as_bytes());
+    body.push(0);
+    frame(b'A', &body)
 }
 
 fn row_description() -> Vec<u8> {

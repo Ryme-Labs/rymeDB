@@ -1,5 +1,9 @@
 # Changelog
 
+- PostgreSQL wire connections now support ephemeral `LISTEN`, `UNLISTEN`, and
+  `NOTIFY` delivery with standard asynchronous `NotificationResponse` frames,
+  scoped by tenant and database.
+
 All notable changes to rymeDB are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
 [SemVer](https://semver.org/) once 1.0.0 ships.
