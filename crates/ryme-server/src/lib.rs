@@ -1392,14 +1392,42 @@ fn spawn_gateways(
     } else {
         ryme_router::RangeLoadHook::default()
     };
-    let pg = match state.tls.clone() {
+    let mut pg = match state.tls.clone() {
         Some(acceptor) => ryme_wire_pg::PgGateway::with_backend_tls(pg_executor, acceptor),
         None => ryme_wire_pg::PgGateway::with_backend_executor(pg_executor),
+    };
+    if let Ok(expected_password) = std::env::var("RYME_PG_PASSWORD") {
+        let keys = state.keys.clone();
+        let jwt = state.jwt.clone();
+        let default_tenant = state.tenant.clone();
+        pg = pg.with_authenticator(move |_user, password| {
+            let expected = expected_password.as_bytes();
+            let presented = password.as_bytes();
+            let password_matches = expected.len() == presented.len()
+                && expected
+                    .iter()
+                    .zip(presented)
+                    .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+                    == 0;
+            if password_matches {
+                return Ok(default_tenant.clone());
+            }
+            if let Ok(principal) = keys.authenticate(password) {
+                return Ok(principal.tenant);
+            }
+            if let Some(verifier) = jwt.as_ref() {
+                if let Ok(principal) = verifier.principal_from_token(password, now_secs()) {
+                    return Ok(principal.tenant);
+                }
+            }
+            Err(ryme_error::RymeError::Unauthorized)
+        });
     }
-    .with_qos(state.qos.clone())
-    .with_metering(state.metering.clone())
-    .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
-    .with_range_hook(range_hook.clone());
+    let pg = pg
+        .with_qos(state.qos.clone())
+        .with_metering(state.metering.clone())
+        .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
+        .with_range_hook(range_hook.clone());
     let resp = ryme_wire_resp::RespGateway::with_backend(
         state.tenant.clone(),
         state.database.clone(),

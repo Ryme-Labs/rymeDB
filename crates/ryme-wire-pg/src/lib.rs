@@ -16,9 +16,12 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
+
 pub struct PgGateway<B = TxnManager> {
     executor: Arc<Executor<B>>,
     tls: Option<ryme_wire_native::TlsAcceptor>,
+    authenticator: Option<PgAuthenticator>,
     tenant: String,
     database: String,
     qos: Option<Arc<Mutex<QosRegistry>>>,
@@ -96,6 +99,18 @@ struct ConnLimits {
     slow_log: Option<SlowLog>,
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
+}
+
+impl ConnLimits {
+    fn with_tenant(mut self, tenant: String) -> Self {
+        self.tenant = tenant;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StartupParams {
+    user: String,
 }
 
 fn qos_now_nanos() -> u64 {
@@ -178,6 +193,7 @@ impl PgGateway<TxnManager> {
         Self {
             executor: Arc::new(Executor::new(tenant.clone(), database.clone())),
             tls: None,
+            authenticator: None,
             tenant,
             database,
             qos: None,
@@ -196,6 +212,7 @@ impl PgGateway<TxnManager> {
             database: executor.database_name().to_string(),
             executor: Arc::new(executor),
             tls: None,
+            authenticator: None,
             qos: None,
             metering: None,
             latency: None,
@@ -222,6 +239,7 @@ where
             database: executor.database_name().to_string(),
             executor: Arc::new(executor),
             tls: None,
+            authenticator: None,
             qos: None,
             metering: None,
             latency: None,
@@ -241,6 +259,7 @@ where
             database: executor.database_name().to_string(),
             executor: Arc::new(executor),
             tls: Some(acceptor),
+            authenticator: None,
             qos: None,
             metering: None,
             latency: None,
@@ -253,6 +272,14 @@ where
 
     pub fn with_qos(mut self, qos: Arc<Mutex<QosRegistry>>) -> Self {
         self.qos = Some(qos);
+        self
+    }
+
+    pub fn with_authenticator<F>(mut self, authenticator: F) -> Self
+    where
+        F: Fn(&str, &str) -> Result<String> + Send + Sync + 'static,
+    {
+        self.authenticator = Some(Arc::new(authenticator));
         self
     }
 
@@ -307,8 +334,9 @@ where
             let executor = self.executor.clone();
             let tls = self.tls.clone();
             let limits = self.limits();
+            let authenticator = self.authenticator.clone();
             tokio::spawn(async move {
-                let _ = handle_connection(socket, executor, tls, limits).await;
+                let _ = handle_connection(socket, executor, tls, limits, authenticator).await;
             });
         }
     }
@@ -330,9 +358,10 @@ where
             let executor = self.executor.clone();
             let tls = self.tls.clone();
             let limits = self.limits();
+            let authenticator = self.authenticator.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_connection(socket, executor, tls, limits).await;
+                let _ = handle_connection(socket, executor, tls, limits, authenticator).await;
             });
         }
     }
@@ -342,11 +371,16 @@ async fn serve_authenticated<B, S>(
     mut socket: S,
     executor: Arc<Executor<B>>,
     limits: ConnLimits,
+    startup: StartupParams,
+    authenticator: Option<PgAuthenticator>,
 ) -> std::result::Result<(), RymeError>
 where
     B: TxnBackend,
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let (executor, limits) =
+        authenticate_startup(&mut socket, executor, limits, &startup, authenticator.as_ref())
+            .await?;
     let (pid, secret, cancellation) = register_backend();
     let result = async {
         send_auth_ok(&mut socket).await?;
@@ -365,6 +399,7 @@ async fn handle_connection<B>(
     executor: Arc<Executor<B>>,
     tls: Option<ryme_wire_native::TlsAcceptor>,
     limits: ConnLimits,
+    authenticator: Option<PgAuthenticator>,
 ) -> std::result::Result<(), RymeError>
 where
     B: TxnBackend,
@@ -396,7 +431,9 @@ where
                 }
                 let mut rest = vec![0u8; startup_len - 4];
                 tls_stream.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                return serve_authenticated(tls_stream, executor, limits).await;
+                let startup = parse_startup(&rest)?;
+                return serve_authenticated(tls_stream, executor, limits, startup, authenticator)
+                    .await;
             }
             socket.write_all(b"N").await.map_err(|e| RymeError::Io(e.to_string()))?;
             socket
@@ -409,7 +446,8 @@ where
             }
             let mut rest = vec![0u8; retry - 4];
             socket.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
-            return serve_authenticated(socket, executor, limits).await;
+            let startup = parse_startup(&rest)?;
+            return serve_authenticated(socket, executor, limits, startup, authenticator).await;
         }
         return Err(RymeError::InvalidArgument(String::from("startup")));
     }
@@ -430,7 +468,111 @@ where
         cancel_backend(pid, secret);
         return Ok(());
     }
-    serve_authenticated(socket, executor, limits).await
+    let startup = parse_startup(&rest)?;
+    serve_authenticated(socket, executor, limits, startup, authenticator).await
+}
+
+fn parse_startup(payload: &[u8]) -> Result<StartupParams> {
+    if payload.len() < 5 {
+        return Err(RymeError::InvalidArgument(String::from("startup")));
+    }
+    let version = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if version != 196608 {
+        return Err(RymeError::InvalidArgument(String::from("unsupported protocol")));
+    }
+    let mut values = HashMap::new();
+    let mut offset = 4;
+    while offset < payload.len() {
+        let Some(end) = payload[offset..].iter().position(|byte| *byte == 0) else {
+            return Err(RymeError::InvalidArgument(String::from("startup parameters")));
+        };
+        if end == 0 {
+            break;
+        }
+        let key = String::from_utf8(payload[offset..offset + end].to_vec())
+            .map_err(|_| RymeError::InvalidArgument(String::from("startup parameters")))?;
+        offset += end + 1;
+        let Some(value_end) = payload[offset..].iter().position(|byte| *byte == 0) else {
+            return Err(RymeError::InvalidArgument(String::from("startup parameters")));
+        };
+        let value = String::from_utf8(payload[offset..offset + value_end].to_vec())
+            .map_err(|_| RymeError::InvalidArgument(String::from("startup parameters")))?;
+        offset += value_end + 1;
+        values.insert(key, value);
+    }
+    let user = values
+        .remove("user")
+        .filter(|user| !user.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("startup user")))?;
+    Ok(StartupParams { user })
+}
+
+async fn authenticate_startup<B, S>(
+    socket: &mut S,
+    executor: Arc<Executor<B>>,
+    limits: ConnLimits,
+    startup: &StartupParams,
+    authenticator: Option<&PgAuthenticator>,
+) -> Result<(Arc<Executor<B>>, ConnLimits)>
+where
+    B: TxnBackend,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(authenticator) = authenticator else {
+        return Ok((executor, limits));
+    };
+    send_auth_cleartext_password(socket).await?;
+    let (tag, payload) = read_client_message(socket).await?;
+    if tag != b'p' {
+        let error = RymeError::Unauthorized;
+        socket
+            .write_all(&encode_error_code("28P01", String::from("password required")))
+            .await
+            .map_err(|e| RymeError::Io(e.to_string()))?;
+        return Err(error);
+    }
+    let password = payload
+        .split(|byte| *byte == 0)
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or(RymeError::Unauthorized)
+        .and_then(|value| String::from_utf8(value.to_vec()).map_err(|_| RymeError::Unauthorized));
+    let password = match password {
+        Ok(password) => password,
+        Err(error) => {
+            socket
+                .write_all(&encode_error_code("28P01", String::from("invalid password")))
+                .await
+                .map_err(|e| RymeError::Io(e.to_string()))?;
+            return Err(error);
+        }
+    };
+    let tenant = match authenticator(&startup.user, &password) {
+        Ok(tenant) if !tenant.is_empty() => tenant,
+        Ok(_) | Err(_) => {
+            socket
+                .write_all(&encode_error_code("28P01", String::from("authentication failed")))
+                .await
+                .map_err(|e| RymeError::Io(e.to_string()))?;
+            return Err(RymeError::Unauthorized);
+        }
+    };
+    let executor = Arc::new((*executor).clone().with_tenant(tenant.clone()));
+    Ok((executor, limits.with_tenant(tenant)))
+}
+
+async fn read_client_message<S>(socket: &mut S) -> Result<(u8, Vec<u8>)>
+where
+    S: AsyncRead + Unpin,
+{
+    let tag = socket.read_u8().await.map_err(|e| RymeError::Io(e.to_string()))?;
+    let length = socket.read_u32().await.map_err(|e| RymeError::Io(e.to_string()))? as usize;
+    if !(4..=64 * 1024).contains(&length) {
+        return Err(RymeError::InvalidArgument(String::from("message")));
+    }
+    let mut payload = vec![0u8; length - 4];
+    socket.read_exact(&mut payload).await.map_err(|e| RymeError::Io(e.to_string()))?;
+    Ok((tag, payload))
 }
 
 async fn serve_loop<B, S>(
@@ -2286,6 +2428,15 @@ where
     let mut body = Vec::new();
     body.extend_from_slice(&0u32.to_be_bytes());
     let packet = frame(b'R', &body);
+    socket.write_all(&packet).await.map_err(|e| RymeError::Io(e.to_string()))?;
+    Ok(())
+}
+
+async fn send_auth_cleartext_password<S>(socket: &mut S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let packet = frame(b'R', &3u32.to_be_bytes());
     socket.write_all(&packet).await.map_err(|e| RymeError::Io(e.to_string()))?;
     Ok(())
 }

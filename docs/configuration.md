@@ -74,3 +74,9 @@ The server seeds one API key from `RYME_API_KEY`, defaulting to
 `x-api-key` header (streams also accept `?api_key=`). JWT verification applies
 when configured; otherwise an unknown Bearer token is `401`. Mutating
 endpoints additionally require a write-capable principal (`403` without it).
+
+Set `RYME_PG_PASSWORD` to enable PostgreSQL wire authentication. Clients use
+the normal PostgreSQL `user` and `password` startup fields; the configured
+password selects the default tenant, while an API key or JWT supplied as the
+password selects its authenticated tenant. When unset, the embedded wire
+gateway retains trust-mode behavior for local development.
