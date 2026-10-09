@@ -2010,6 +2010,7 @@ dependencies = [
  "ryme-storage",
  "ryme-txn",
  "ryme-wire-native",
+ "serde",
  "serde_json",
  "tokio",
 ]

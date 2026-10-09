@@ -25,6 +25,12 @@ pins every row):
 | HyperLogLog | `PFADD`, `PFCOUNT`, `PFMERGE` (p=14, ~0.81% std error) |
 | Geospatial | `GEOADD`, `GEODIST` (`m`/`km`/`mi`/`ft`), `GEOPOS`, `GEOHASH`, `GEOSEARCH` (`FROMMEMBER`/`FROMLONLAT`, `BYRADIUS`/`BYBOX`, `ASC`/`DESC`, `COUNT`, `WITHDIST`/`WITHCOORD`), `GEORADIUS`, `GEORADIUSBYMEMBER` (`WITHDIST`/`WITHHASH`/`WITHCOORD`, `STORE`/`STOREDIST`) |
 
+When the gateway has realtime enabled, RESP Pub/Sub is bridged through a
+tenant/database-scoped realtime topic, so subscribers connected through
+different gateways in the same process receive `PUBLISH` messages. Without a
+realtime layer, the gateway retains its low-overhead process-local Pub/Sub
+path.
+
 Sorted sets order by score with lexicographic member tiebreak. Scores
 accept `inf`/`-inf`; `nan` is rejected. `ZRANGE` supports index ranges
 only (no `BYSCORE`/`BYLEX`).

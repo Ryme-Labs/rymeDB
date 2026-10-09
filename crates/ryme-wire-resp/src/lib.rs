@@ -8,7 +8,10 @@ use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_router::RangeLoadHook;
 use ryme_storage::RecordKey;
 use ryme_txn::{Transaction, TxnBackend, TxnManager};
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -67,11 +70,18 @@ struct PubSubMessage {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClusterPubSubMessage {
+    channel: Vec<u8>,
+    payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 struct PubSubBus {
     sender: broadcast::Sender<PubSubMessage>,
     counts: Arc<Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
     pattern_counts: Arc<Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
+    cluster_started: Arc<AtomicBool>,
 }
 
 fn new_pubsub() -> PubSubBus {
@@ -79,6 +89,7 @@ fn new_pubsub() -> PubSubBus {
         sender: broadcast::channel(4096).0,
         counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
         pattern_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        cluster_started: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -122,8 +133,14 @@ impl PubSubBus {
     }
 
     fn publish(&self, channel: Vec<u8>, payload: Vec<u8>) -> usize {
+        let delivered = self.delivered_count(&channel);
+        let _ = self.sender.send(PubSubMessage { channel, payload });
+        delivered
+    }
+
+    fn delivered_count(&self, channel: &[u8]) -> usize {
         let exact =
-            self.counts.lock().ok().and_then(|counts| counts.get(&channel).copied()).unwrap_or(0);
+            self.counts.lock().ok().and_then(|counts| counts.get(channel).copied()).unwrap_or(0);
         let patterned = self
             .pattern_counts
             .lock()
@@ -131,14 +148,45 @@ impl PubSubBus {
             .map(|counts| {
                 counts
                     .iter()
-                    .filter(|(pattern, _)| glob_match(pattern, &channel))
+                    .filter(|(pattern, _)| glob_match(pattern, channel))
                     .map(|(_, count)| *count)
                     .sum::<usize>()
             })
             .unwrap_or(0);
-        let _ = self.sender.send(PubSubMessage { channel, payload });
         exact.saturating_add(patterned)
     }
+
+    fn start_cluster_bridge(&self, realtime: Realtime, tenant: String, database: String) {
+        if self.cluster_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let topic = resp_pubsub_topic(&database);
+        let mut receiver = realtime.broadcast_subscribe(&tenant, &topic);
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(message) => {
+                        let Ok(message) =
+                            serde_json::from_value::<ClusterPubSubMessage>(message.payload)
+                        else {
+                            continue;
+                        };
+                        let _ = sender.send(PubSubMessage {
+                            channel: message.channel,
+                            payload: message.payload,
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+}
+
+fn resp_pubsub_topic(database: &str) -> String {
+    format!("__ryme_resp_pubsub__:{database}")
 }
 
 impl Drop for ClientState {
@@ -239,6 +287,12 @@ where
     pub fn with_realtime(mut self, realtime: Realtime) -> Self {
         self.realtime = Some(realtime);
         self
+    }
+
+    fn start_realtime_pubsub(&self) {
+        if let Some(realtime) = self.realtime.clone() {
+            self.pubsub.start_cluster_bridge(realtime, self.tenant.clone(), self.database.clone());
+        }
     }
 
     pub fn with_branch(mut self, branch: String) -> Self {
@@ -688,6 +742,7 @@ where
     }
 
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {
+        self.start_realtime_pubsub();
         loop {
             let (socket, _) = listener.accept().await.map_err(|e| RymeError::Io(e.to_string()))?;
             socket.set_nodelay(true).map_err(|e| RymeError::Io(e.to_string()))?;
@@ -699,6 +754,7 @@ where
     }
 
     pub async fn serve_limited(&self, listener: TcpListener, max_connections: usize) -> Result<()> {
+        self.start_realtime_pubsub();
         let limit = Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
         loop {
             let (socket, _) = listener.accept().await.map_err(|e| RymeError::Io(e.to_string()))?;
@@ -725,6 +781,7 @@ where
     where
         B: Send + Sync + 'static,
     {
+        self.start_realtime_pubsub();
         let limit = Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
         let acceptor = acceptor.acceptor();
         loop {
@@ -1195,6 +1252,28 @@ where
         }
     }
 
+    fn publish_pubsub(&self, channel: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
+        let delivered = self.pubsub.delivered_count(&channel);
+        let Some(realtime) = self.realtime.clone() else {
+            return encode_integer(self.pubsub.publish(channel, payload) as i64);
+        };
+        self.start_realtime_pubsub();
+        let message = match serde_json::to_value(ClusterPubSubMessage { channel, payload }) {
+            Ok(message) => message,
+            Err(error) => return encode_error(error.to_string()),
+        };
+        match realtime.broadcast(
+            &self.tenant,
+            &resp_pubsub_topic(&self.database),
+            String::new(),
+            message,
+            0,
+        ) {
+            Ok(_) => encode_integer(delivered as i64),
+            Err(error) => encode_error(error.to_string()),
+        }
+    }
+
     fn dispatch_in(&self, txn: &mut Transaction, command: RespCommand) -> Vec<u8> {
         match command.name.as_str() {
             "PING" => encode_simple("PONG"),
@@ -1202,9 +1281,7 @@ where
                 if command.args.len() != 2 {
                     return encode_error(String::from("wrong args"));
                 }
-                let delivered =
-                    self.pubsub.publish(command.args[0].clone(), command.args[1].clone());
-                encode_integer(delivered as i64)
+                self.publish_pubsub(command.args[0].clone(), command.args[1].clone())
             }
             "ECHO" => match command.args.first() {
                 Some(message) => encode_bulk(message),

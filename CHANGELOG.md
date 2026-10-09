@@ -1,5 +1,8 @@
 # Changelog
 
+- RESP Pub/Sub now uses the realtime broadcast bus when configured, allowing
+  subscribers on separate gateways to receive `PUBLISH` messages while keeping
+  the process-local fast path for standalone gateways.
 - PostgreSQL wire connections now support ephemeral `LISTEN`, `UNLISTEN`, and
   `NOTIFY` delivery with standard asynchronous `NotificationResponse` frames,
   scoped by tenant and database; notification delivery and listener changes

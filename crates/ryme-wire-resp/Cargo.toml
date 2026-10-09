@@ -14,6 +14,7 @@ ryme-qos = { workspace = true }
 ryme-metering = { workspace = true }
 ryme-observe = { workspace = true }
 ryme-wire-native = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
