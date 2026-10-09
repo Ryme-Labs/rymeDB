@@ -66,6 +66,14 @@ async fn psql_smoke() {
     assert!(out.contains("v3"), "{out}");
     let (ok, out) = psql(
         addr,
+        "INSERT INTO docs (id, payload) VALUES ('std', 'before'); SELECT * FROM docs WHERE id = 'std'; UPDATE docs SET payload = 'after' WHERE id = 'std'; SELECT * FROM docs WHERE id = 'std'; DELETE FROM docs WHERE id = 'std'; SELECT * FROM docs WHERE id = 'std';",
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(out.contains("before"), "{out}");
+    assert!(out.contains("after"), "{out}");
+    let (ok, out) = psql(
+        addr,
         "BEGIN; INSERT INTO docs (id, value) VALUES ('tx', 'inside'); SELECT * FROM docs KEY 'tx'; COMMIT;",
     )
     .await;

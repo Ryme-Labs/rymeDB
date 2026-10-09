@@ -368,7 +368,17 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(1)
         .cloned()
         .ok_or_else(|| RymeError::InvalidArgument(String::from("update table")))?;
-    let (pk, value) = key_value_from(tokens)?;
+    let (pk, value) = key_value_from(tokens).or_else(|_| {
+        let pk = value_after(tokens, &["KEY", "PK", "ID"])?;
+        let set = tokens
+            .iter()
+            .position(|token| token.eq_ignore_ascii_case("SET"))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("update values")))?;
+        let value = tokens
+            .get(set + 2)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("update value")))?;
+        Ok::<(Vec<u8>, Vec<u8>), RymeError>((pk.into_bytes(), eval_operand(value)?.into_bytes()))
+    })?;
     let _ = raw;
     Ok(Statement::Update { table, pk, value })
 }
@@ -416,16 +426,22 @@ fn parse_select(tokens: &[String]) -> Result<Statement> {
     }
     let has_where = tokens.iter().any(|t| t.eq_ignore_ascii_case("WHERE"));
     let has_join = tokens.iter().any(|t| t.eq_ignore_ascii_case("JOIN"));
-    if !has_where && !has_join {
+    let filter = parse_where_filter(tokens)?;
+    if !has_join {
         if let Some(pk) = point_lookup_key(tokens) {
-            return Ok(Statement::SelectByKey { table, pk: pk.into_bytes() });
+            let exact_where = filter.len() == 1
+                && filter[0].field == Field::Key
+                && filter[0].op == Cmp::Eq
+                && filter[0].operand == pk.as_bytes();
+            if !has_where || exact_where {
+                return Ok(Statement::SelectByKey { table, pk: pk.into_bytes() });
+            }
         }
     }
     if has_join {
         return parse_join(tokens, &table);
     }
     let (limit, offset, order) = parse_scan_tail(tokens)?;
-    let filter = parse_where_filter(tokens)?;
     Ok(Statement::SelectScan { table, limit, offset, order, filter })
 }
 
@@ -583,7 +599,13 @@ fn parse_scan_tail(tokens: &[String]) -> Result<(usize, usize, Order)> {
 }
 
 fn point_lookup_key(tokens: &[String]) -> Option<String> {
-    for (index, window) in tokens.windows(2).enumerate() {
+    let start = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("FROM"))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    for (relative, window) in tokens[start..].windows(2).enumerate() {
+        let index = start + relative;
         let is_key = window[0].eq_ignore_ascii_case("KEY")
             || window[0].eq_ignore_ascii_case("PK")
             || window[0].eq_ignore_ascii_case("ID");
@@ -1632,6 +1654,28 @@ mod tests {
             QueryResult::Row { value, .. } => assert_eq!(value, b"grace"),
             _ => panic!("expected row"),
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_primary_key_where_uses_point_path_and_standard_dml() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let select = parse("SELECT * FROM users WHERE id = '1'").unwrap();
+        assert!(matches!(select, Statement::SelectByKey { ref table, ref pk }
+            if table == "users" && pk == b"1"));
+
+        executor
+            .execute(parse("INSERT INTO users (id, payload) VALUES ('1', 'ada')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("UPDATE users SET payload = 'grace' WHERE id = '1'").unwrap())
+            .await
+            .unwrap();
+        let row = executor.execute(select).await.unwrap();
+        assert!(matches!(row, QueryResult::Row { value, .. } if value == b"grace"));
+        executor.execute(parse("DELETE FROM users WHERE id = '1'").unwrap()).await.unwrap();
+        let gone = executor.execute(parse("SELECT * FROM users WHERE id = '1'").unwrap()).await;
+        assert!(matches!(gone, Ok(QueryResult::Rows { rows }) if rows.is_empty()));
     }
 
     #[tokio::test]
