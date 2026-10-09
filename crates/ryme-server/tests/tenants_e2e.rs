@@ -147,6 +147,18 @@ async fn tenants_share_no_presence_or_partitions() {
     assert_eq!(status, 200);
     assert_eq!(body.get("pk"), None);
 
+    let (status, _) = bearer_request(http, KEY, "PUT /v1/kv/docs/default", b"default").await;
+    assert_eq!(status, 200);
+    let (status, _) = bearer_request(http, &alpha, "PUT /v1/kv/docs/alpha", br#""alpha""#).await;
+    assert_eq!(status, 200);
+    let (status, body) = bearer_request(http, &alpha, "GET /v1/kv/docs/alpha", b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::Value::String(String::from("alpha")));
+    let (status, _) = bearer_request(http, &beta, "GET /v1/kv/docs/alpha", b"").await;
+    assert_eq!(status, 404);
+    let (status, _body) = bearer_request(http, &beta, "GET /v1/kv/docs/default", b"").await;
+    assert_eq!(status, 404);
+
     let append = serde_json::json!({"partition": "orders", "key": "k1", "value": "v1"}).to_string();
     let (status, body) =
         bearer_request(http, &alpha, "POST /v1/topics/append", append.as_bytes()).await;

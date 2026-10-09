@@ -103,18 +103,9 @@ where
         Ok(())
     }
 
-    fn check_tenant(&self, principal: &Principal) -> Result<()> {
-        if principal.tenant == self.tenant {
-            Ok(())
-        } else {
-            Err(RymeError::Forbidden)
-        }
-    }
-
     pub fn get(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.check_tenant(principal)?;
         self.policies.predicate(principal, table)?;
-        let key = RecordKey::new(&self.tenant, &self.database, table, pk);
+        let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
         let mut txn = self.manager.begin();
         let Some(value) = self.manager.get(&mut txn, &key)? else {
             return Ok(None);
@@ -145,7 +136,6 @@ where
         expires_at: Option<u64>,
     ) -> Result<u64> {
         self.reject_if_read_only()?;
-        self.check_tenant(principal)?;
         if table.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("table")));
         }
@@ -156,7 +146,7 @@ where
             return Err(RymeError::Overload(String::from("value")));
         }
         self.policies.check_write_row(principal, table, &value)?;
-        let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
+        let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.manager.begin();
         let existed = self.manager.get(&mut txn, &key)?.is_some();
         match expires_at {
@@ -166,7 +156,7 @@ where
         let commit_ts = self.manager.commit(txn).await?;
         let op = if existed { Operation::Update } else { Operation::Insert };
         self.realtime.publish(NewChange {
-            tenant: self.tenant.clone(),
+            tenant: principal.tenant.clone(),
             database: self.database.clone(),
             branch: self.branch.clone(),
             table: table.to_string(),
@@ -175,7 +165,7 @@ where
             after: Some(value),
             commit_ts,
         })?;
-        self.refresh_table(table, commit_ts);
+        self.refresh_table(&principal.tenant, table, commit_ts);
         Ok(commit_ts)
     }
 
@@ -187,9 +177,8 @@ where
         expires_at: Option<u64>,
     ) -> Result<bool> {
         self.reject_if_read_only()?;
-        self.check_tenant(principal)?;
         self.policies.check_write(principal, table)?;
-        let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
+        let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.manager.begin();
         let Some(current) = self.manager.get(&mut txn, &key)? else {
             return Ok(false);
@@ -203,7 +192,7 @@ where
         }
         let commit_ts = self.manager.commit(txn).await?;
         self.realtime.publish(NewChange {
-            tenant: self.tenant.clone(),
+            tenant: principal.tenant.clone(),
             database: self.database.clone(),
             branch: self.branch.clone(),
             table: table.to_string(),
@@ -212,14 +201,13 @@ where
             after: Some(current),
             commit_ts,
         })?;
-        self.refresh_table(table, commit_ts);
+        self.refresh_table(&principal.tenant, table, commit_ts);
         Ok(true)
     }
 
     pub fn ttl_of(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Ttl> {
-        self.check_tenant(principal)?;
         self.policies.predicate(principal, table)?;
-        let key = RecordKey::new(&self.tenant, &self.database, table, pk);
+        let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
         match self.manager.expires_at(&key)? {
             None => Ok(Ttl::Missing),
             Some(0) => Ok(Ttl::Persistent),
@@ -236,9 +224,8 @@ where
 
     pub async fn delete(&self, principal: &Principal, table: &str, pk: Vec<u8>) -> Result<u64> {
         self.reject_if_read_only()?;
-        self.check_tenant(principal)?;
         self.policies.check_write(principal, table)?;
-        let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
+        let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.manager.begin();
         let Some(current) = self.manager.get(&mut txn, &key)? else {
             return Err(RymeError::NotFound(String::from("row")));
@@ -249,7 +236,7 @@ where
         self.manager.delete(&mut txn, key);
         let commit_ts = self.manager.commit(txn).await?;
         self.realtime.publish(NewChange {
-            tenant: self.tenant.clone(),
+            tenant: principal.tenant.clone(),
             database: self.database.clone(),
             branch: self.branch.clone(),
             table: table.to_string(),
@@ -258,7 +245,7 @@ where
             after: None,
             commit_ts,
         })?;
-        self.refresh_table(table, commit_ts);
+        self.refresh_table(&principal.tenant, table, commit_ts);
         Ok(commit_ts)
     }
 
@@ -276,11 +263,10 @@ where
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.check_tenant(principal)?;
         self.policies.predicate(principal, table)?;
         let mut txn = self.manager.begin();
         if !self.policies.has_table_policy(table) {
-            return self.manager.scan(&mut txn, &self.tenant, &self.database, table, limit);
+            return self.manager.scan(&mut txn, &principal.tenant, &self.database, table, limit);
         }
         if limit == 0 {
             return Ok(Vec::new());
@@ -291,13 +277,15 @@ where
             let page = match start_after.as_deref() {
                 Some(start_after) => self.manager.scan_after(
                     &mut txn,
-                    &self.tenant,
+                    &principal.tenant,
                     &self.database,
                     table,
                     start_after,
                     limit,
                 )?,
-                None => self.manager.scan(&mut txn, &self.tenant, &self.database, table, limit)?,
+                None => {
+                    self.manager.scan(&mut txn, &principal.tenant, &self.database, table, limit)?
+                }
             };
             if page.is_empty() {
                 break;
@@ -338,23 +326,14 @@ where
         &self.database
     }
 
-    fn refresh_table(&self, table: &str, commit_ts: u64) {
-        let Some(limit) = self.realtime.query_limit(&self.tenant, &self.database, table) else {
+    fn refresh_table(&self, tenant: &str, table: &str, commit_ts: u64) {
+        let Some(limit) = self.realtime.query_limit(tenant, &self.database, table) else {
             return;
         };
         let mut txn = self.manager.begin();
-        let rows = self
-            .manager
-            .scan(&mut txn, &self.tenant, &self.database, table, limit)
-            .unwrap_or_default();
-        let _ = self.realtime.publish_query(
-            &self.tenant,
-            &self.database,
-            table,
-            commit_ts,
-            rows,
-            limit,
-        );
+        let rows =
+            self.manager.scan(&mut txn, tenant, &self.database, table, limit).unwrap_or_default();
+        let _ = self.realtime.publish_query(tenant, &self.database, table, commit_ts, rows, limit);
     }
 }
 
@@ -444,18 +423,12 @@ mod tests {
         let rows = gateway.scan(&principal, "messages", 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, b"visible");
-        assert!(matches!(
-            gateway.get(
-                &Principal {
-                    id: String::from("mallory"),
-                    tenant: String::from("tenant-b"),
-                    roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
-                },
-                "messages",
-                b"visible"
-            ),
-            Err(RymeError::Forbidden)
-        ));
+        let other_tenant = Principal {
+            id: String::from("mallory"),
+            tenant: String::from("tenant-b"),
+            roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
+        };
+        assert!(gateway.get(&other_tenant, "messages", b"visible").unwrap().is_none());
     }
 
     #[tokio::test]
