@@ -112,7 +112,8 @@ named projections such as `SELECT payload, count FROM t WHERE id = '...'`,
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:
 `gen_random_uuid()` (v4) and `now()` (unix seconds) evaluate in KEY/VALUE
 positions; quoted literals are never evaluated.
-Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND value CONTAINS 'x'
+Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND key IN ('a', 'b')]
+[AND key NOT IN ('c', 'd')] [AND value CONTAINS 'x'
 AND value != 'y'] [ORDER BY key|value|column|json_path ASC|DESC] [LIMIT n] [OFFSET n]`.
 Predicates evaluate on stored bytes as text; plain scans stream the ordered
 range while filtered/ordered/paged scans page through storage until the
