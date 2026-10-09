@@ -37,8 +37,24 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    name: Verify supported SDK set
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Allow only Java, npm, and Rust SDKs
+        run: |
+          actual="$(find sdks -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)"
+          test "$actual" = "java,js,rust" || {
+            echo "unexpected SDK directories: $actual"
+            exit 1
+          }
+
   npm:
     name: Build npm SDK
+    needs: scope
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -86,6 +102,7 @@ jobs:
 
   rust:
     name: Build Rust SDK
+    needs: scope
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -119,6 +136,7 @@ jobs:
 
   java:
     name: Build Java SDK
+    needs: scope
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -148,7 +166,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sdk-maven
-          path: sdks/java/target/*.jar
+          path: |
+            sdks/java/pom.xml
+            sdks/java/target/*.jar
           if-no-files-found: error
 
   publish-npm:
@@ -208,9 +228,6 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -221,11 +238,28 @@ jobs:
           server-password: GITHUB_TOKEN
           cache: maven
 
-      - name: Publish Maven package to GitHub Packages
+      - name: Download tested Maven artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-maven
+          path: ${{ runner.temp }}/maven
+
+      - name: Publish tested Maven package to GitHub Packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
-        run: mvn --batch-mode -f sdks/java/pom.xml deploy -DskipTests
+        run: |
+          jar="$(find "$RUNNER_TEMP/maven/target" -maxdepth 1 -type f -name 'rymedb-client-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)"
+          sources="$(find "$RUNNER_TEMP/maven/target" -maxdepth 1 -type f -name 'rymedb-client-*-sources.jar' -print -quit)"
+          javadoc="$(find "$RUNNER_TEMP/maven/target" -maxdepth 1 -type f -name 'rymedb-client-*-javadoc.jar' -print -quit)"
+          test -n "$jar" -a -n "$sources" -a -n "$javadoc"
+          mvn --batch-mode org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy-file \
+            -Dfile="$jar" \
+            -DpomFile="$RUNNER_TEMP/maven/pom.xml" \
+            -Dsources="$sources" \
+            -Djavadoc="$javadoc" \
+            -DrepositoryId=github \
+            -Durl=https://maven.pkg.github.com/Ryme-Labs/rymeDB
 
   release:
     name: Upload SDK release artifacts

@@ -13,6 +13,7 @@ README = ROOT / "README.md"
 IMAGES = ROOT / "images"
 REPO = "https://github.com/Ryme-Labs/rymeDB"
 SDK_DIRS = (("java", "Java SDK"), ("js", "npm SDK"), ("rust", "Rust SDK"))
+SUPPORTED_SDK_DIRS = {slug for slug, _ in SDK_DIRS}
 
 CSS = """
 :root { color-scheme: light dark; }
@@ -70,7 +71,21 @@ def page(title, body, nav, root_prefix="."):
     )
 
 
+def verify_sdk_scope():
+    sdk_root = ROOT / "sdks"
+    actual = {path.name for path in sdk_root.iterdir() if path.is_dir()}
+    if actual != SUPPORTED_SDK_DIRS:
+        unexpected = ", ".join(sorted(actual - SUPPORTED_SDK_DIRS)) or "none"
+        missing = ", ".join(sorted(SUPPORTED_SDK_DIRS - actual)) or "none"
+        raise RuntimeError(f"unsupported SDK scope: unexpected={unexpected}; missing={missing}")
+    for slug, _ in SDK_DIRS:
+        readme = sdk_root / slug / "README.md"
+        if not readme.is_file():
+            raise RuntimeError(f"missing SDK README: {readme}")
+
+
 def build(out):
+    verify_sdk_scope()
     if out.exists():
         shutil.rmtree(out)
     docs_out = out / "docs"
@@ -89,8 +104,7 @@ def build(out):
     sdk_entries = []
     for slug, title in SDK_DIRS:
         readme = ROOT / "sdks" / slug / "README.md"
-        if readme.exists():
-            sdk_entries.append((slug, title, readme))
+        sdk_entries.append((slug, title, readme))
 
     def nav(active="", base=".."):
         items = ["<li><a href=\"" + base + "/index.html\"" + (" class=\"active\"" if active == "home" else "") + ">Home</a></li>"]
