@@ -74,6 +74,7 @@ All notable changes to rymeDB are recorded here. Format follows
 - SQL predicates now support inclusive `BETWEEN` and `NOT BETWEEN` ranges.
 - SQL filters now support `OR` with normal SQL `AND` precedence.
 - SQL predicates now support null-safe `IS DISTINCT FROM` comparisons.
+- SQL predicates now support `NOT LIKE` and `NOT ILIKE` patterns.
 - Aggregates, grouping, and key joins now page through all visible rows instead
   of truncating results at the first 10,000-row storage page.
 - Scalar and grouped aggregates now resolve declared schema columns and JSON

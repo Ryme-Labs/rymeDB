@@ -318,6 +318,8 @@ pub enum Cmp {
     AnyOf,
     IsDistinct,
     IsNotDistinct,
+    NotLike,
+    NotILike,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,6 +491,16 @@ impl Predicate {
                 } else {
                     sql_like(&text, &pattern)
                 }
+            }
+            Cmp::NotLike | Cmp::NotILike => {
+                let text = String::from_utf8_lossy(target);
+                let pattern = String::from_utf8_lossy(&self.operand);
+                let matched = if self.op == Cmp::NotILike {
+                    sql_like(&text.to_lowercase(), &pattern.to_lowercase())
+                } else {
+                    sql_like(&text, &pattern)
+                };
+                !matched
             }
             Cmp::In => self.operands.iter().any(|operand| target == operand),
             Cmp::NotIn => self.operands.iter().all(|operand| target != operand),
@@ -2042,6 +2054,21 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 alternatives: Vec::new(),
             });
         }
+    }
+    if parts.len() == 4
+        && parts[1].eq_ignore_ascii_case("NOT")
+        && (parts[2].eq_ignore_ascii_case("LIKE") || parts[2].eq_ignore_ascii_case("ILIKE"))
+    {
+        let (field, column) = parse_predicate_field(&parts[0]);
+        let op = if parts[2].eq_ignore_ascii_case("ILIKE") { Cmp::NotILike } else { Cmp::NotLike };
+        return Ok(Predicate {
+            field,
+            column,
+            op,
+            operand: unquote(&parts[3]).into_bytes(),
+            operands: Vec::new(),
+            alternatives: Vec::new(),
+        });
     }
     if parts.len() >= 4
         && parts[1].eq_ignore_ascii_case("NOT")
@@ -7207,6 +7234,37 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 2));
+    }
+
+    #[tokio::test]
+    async fn where_not_like_and_not_ilike_negate_patterns() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        for (id, value) in [("m1", "Hello world"), ("m2", "HELLO agent"), ("m3", "bye")] {
+            executor
+                .execute(
+                    parse(&format!("INSERT INTO messages KEY '{id}' VALUE '{value}'")).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let statement = parse("SELECT * FROM messages WHERE value NOT LIKE 'Hello%'").unwrap();
+        let Statement::SelectScan { filter, .. } = &statement else {
+            panic!("expected select scan")
+        };
+        assert_eq!(filter[0].op, Cmp::NotLike);
+        let result = executor.execute(statement).await.unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"m2".as_slice(), b"m3".as_slice()])
+        );
+
+        let result = executor
+            .execute(parse("SELECT * FROM messages WHERE value NOT ILIKE 'hello%'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"m3".as_slice()])
+        );
     }
 
     #[test]
