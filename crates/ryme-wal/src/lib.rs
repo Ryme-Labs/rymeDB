@@ -115,6 +115,60 @@ impl Wal {
         Ok(removed)
     }
 
+    pub fn truncate_above(&mut self, ceiling_commit_ts: u64) -> Result<usize> {
+        let records = Self::read_all(&self.dir)?;
+        let kept: Vec<WalRecord> = records
+            .iter()
+            .filter(|record| record.commit_ts <= ceiling_commit_ts)
+            .cloned()
+            .collect();
+        let removed = records.len().saturating_sub(kept.len());
+        if removed == 0 {
+            return Ok(0);
+        }
+        self.rewrite(&kept)?;
+        Ok(removed)
+    }
+
+    fn rewrite(&mut self, records: &[WalRecord]) -> Result<()> {
+        let temporary = self.dir.join(".rewrite");
+        if temporary.exists() {
+            std::fs::remove_dir_all(&temporary)?;
+        }
+        std::fs::create_dir_all(&temporary)?;
+        let mut id = 0u64;
+        let mut path = temporary.join(segment_name(id));
+        let mut file = File::create(&path)?;
+        for record in records {
+            let frame = encode_frame(record.lsn, record.commit_ts, &record.payload);
+            let current_len = file.metadata()?.len();
+            if current_len > 0 && current_len + frame.len() as u64 > self.segment_size_bytes {
+                file.sync_data()?;
+                id += 1;
+                path = temporary.join(segment_name(id));
+                file = File::create(&path)?;
+            }
+            file.write_all(&frame)?;
+        }
+        file.sync_data()?;
+        drop(file);
+
+        for id in segment_ids(&self.dir)? {
+            std::fs::remove_file(self.dir.join(segment_name(id)))?;
+        }
+        for entry in std::fs::read_dir(&temporary)? {
+            let entry = entry?;
+            std::fs::rename(entry.path(), self.dir.join(entry.file_name()))?;
+        }
+        std::fs::remove_dir(&temporary)?;
+
+        self.active_id = latest_segment_id(&self.dir)?;
+        let active_path = self.dir.join(segment_name(self.active_id));
+        self.active = OpenOptions::new().create(true).read(true).append(true).open(active_path)?;
+        self.next_lsn = records.last().map(|record| record.lsn + 1).unwrap_or(0);
+        Ok(())
+    }
+
     fn rotate(&mut self) -> Result<()> {
         self.active.sync_data()?;
         self.active_id += 1;
@@ -286,6 +340,27 @@ mod tests {
         assert!(!records.is_empty());
         assert!(records.iter().all(|r| r.commit_ts >= 5));
         assert!(records.iter().any(|r| r.commit_ts == 8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_above_floor_rewrites_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-trunc-above-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 64).unwrap();
+        for ts in 1..=8u64 {
+            wal.append(ts, b"x").unwrap();
+        }
+        wal.sync().unwrap();
+        assert_eq!(wal.truncate_above(4).unwrap(), 4);
+        let records = Wal::read_all(&dir).unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|record| record.commit_ts <= 4));
+        assert_eq!(wal.next_lsn(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

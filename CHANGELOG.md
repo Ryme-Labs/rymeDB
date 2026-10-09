@@ -28,6 +28,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Added `storage_mode = "standard"`: durable managers can recover without
   materializing the full segment history, resolve point reads and scans from
   immutable segments, and evict committed rows from the resident engine.
+- PITR restore now publishes the restored immutable base and truncates future
+  snapshots and WAL records, so the restored state survives process restart.
 - SDK distribution is limited to the Java, npm/TypeScript, and Rust clients;
   the release workflow packages and publishes those three artifacts and the
   Pages workflow builds their documentation.

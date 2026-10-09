@@ -446,6 +446,25 @@ async fn e2e_pitr_restore_roundtrip() {
     let (status, body) = http_request(http, "GET /v1/kv/docs/after", b"").await;
     assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
     server.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let pg_listener = bind_listener().await;
+    let resp_listener = bind_listener().await;
+    let http_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp = resp_listener.local_addr().unwrap();
+    let http = http_listener.local_addr().unwrap();
+    let config = test_config(&root, pg, resp, http);
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, body) = http_request(http, "GET /v1/kv/docs/before", b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"v-before");
+    let (status, body) = http_request(http, "GET /v1/kv/docs/after", b"").await;
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }
 

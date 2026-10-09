@@ -900,6 +900,42 @@ impl TxnManager {
         self.inner.applied.fetch_max(max + 1, Ordering::SeqCst);
         Ok(max)
     }
+
+    pub fn restore_with_replay(
+        &self,
+        mut snapshot: Engine,
+        replay: &[(u64, BTreeMap<RecordKey, WriteOp>)],
+    ) -> Result<u64> {
+        for (commit_ts, writes) in replay {
+            for (key, op) in writes {
+                snapshot.apply_with_expiry(
+                    key.clone(),
+                    *commit_ts,
+                    op.value.clone(),
+                    op.expires_at,
+                )?;
+            }
+        }
+        let max = snapshot.max_commit_ts();
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        self.inner
+            .engine
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?
+            .replace_from(snapshot);
+        self.inner
+            .committed
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?
+            .clear();
+        self.inner.clock.store(max + 1, Ordering::SeqCst);
+        self.inner.applied.store(max + 1, Ordering::SeqCst);
+        Ok(max)
+    }
 }
 
 impl Default for TxnManager {
@@ -1083,6 +1119,7 @@ pub struct DurableManager {
     inner: TxnManager,
     wal: Arc<Mutex<Wal>>,
     segments: Arc<SegmentStore>,
+    gate: Arc<Mutex<()>>,
     policy: SyncPolicy,
     mode: StorageMode,
     dir: std::path::PathBuf,
@@ -1118,6 +1155,7 @@ impl DurableManager {
             inner: TxnManager::new(),
             wal: Arc::new(Mutex::new(wal)),
             segments,
+            gate: Arc::new(Mutex::new(())),
             policy,
             mode,
             dir: dir.to_path_buf(),
@@ -1231,6 +1269,8 @@ impl DurableManager {
     }
 
     pub fn write_snapshot(&self) -> Result<(u64, std::path::PathBuf)> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let snapshot = match self.mode {
             StorageMode::Hot => Engine::decode_snapshot(&self.inner.encode_snapshot()?)?,
             StorageMode::Standard => {
@@ -1359,10 +1399,12 @@ impl DurableManager {
     }
 
     pub fn retention_sweep(&self, snapshot_keep: usize) -> Result<(usize, usize)> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let pruned = self.prune_snapshots(snapshot_keep)?;
         let _segments_pruned = self.segments.prune(snapshot_keep)?;
         if self.segments.segment_paths()?.len() >= SEGMENT_COMPACTION_THRESHOLD {
-            self.compact_segments()?;
+            self.compact_segments_locked()?;
         }
         let wal_removed = match self.oldest_snapshot()? {
             Some(floor) => self
@@ -1376,6 +1418,12 @@ impl DurableManager {
     }
 
     pub fn compact_segments(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
+        self.compact_segments_locked()
+    }
+
+    fn compact_segments_locked(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
         if self.mode == StorageMode::Standard {
             return self.segments.compact();
         }
@@ -1406,22 +1454,76 @@ impl DurableManager {
     }
 
     pub fn restore_to(&self, target: u64) -> Result<u64> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let path = self
             .newest_snapshot_at_or_below(target)?
             .ok_or_else(|| RymeError::NotFound(String::from("snapshot")))?;
         let raw = std::fs::read(&path)?;
-        let base = self.inner.restore_snapshot(&raw)?;
+        let snapshot = Engine::decode_snapshot(&raw)?;
+        let base = snapshot.max_commit_ts();
         let records = Wal::read_all(&self.dir)?;
-        let mut applied = 0u64;
+        let mut replay = Vec::new();
         for record in records {
             if record.commit_ts <= base || record.commit_ts > target {
                 continue;
             }
             let writes = decode_writes(&record.payload)?;
-            self.inner.apply_at(record.commit_ts, &writes)?;
-            applied += 1;
+            replay.push((record.commit_ts, writes));
         }
-        Ok(applied)
+        let replayed = replay.len() as u64;
+        self.inner.restore_with_replay(snapshot, &replay)?;
+        let restored_raw = self.inner.encode_snapshot()?;
+        let restored = Engine::decode_snapshot(&restored_raw)?;
+        let restored_max = restored.max_commit_ts();
+        let (_, newest) = self.segments.write(restored_max, &restored)?;
+        for segment in self.segments.segment_paths()? {
+            if segment != newest {
+                std::fs::remove_file(segment)?;
+            }
+        }
+        self.publish_restored_snapshot(restored_max, target, &restored_raw)?;
+        {
+            let mut wal =
+                self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+            wal.truncate_above(target)?;
+            if self.policy == SyncPolicy::Always {
+                wal.sync()?;
+            }
+        }
+        if self.mode == StorageMode::Standard {
+            self.inner.clear_engine()?;
+        }
+        Ok(replayed)
+    }
+
+    fn publish_restored_snapshot(&self, commit_ts: u64, target: u64, raw: &[u8]) -> Result<()> {
+        let dir = self.snapshot_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("snap-{commit_ts:020}.rsnap"));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(raw)?;
+            file.sync_data()?;
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let candidate = entry.path();
+            let name = candidate.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let Some(rest) = name.strip_prefix("snap-").and_then(|n| n.strip_suffix(".rsnap"))
+            else {
+                continue;
+            };
+            let Ok(snapshot_ts) = rest.parse::<u64>() else {
+                continue;
+            };
+            if snapshot_ts > target && candidate != path {
+                std::fs::remove_file(candidate)?;
+            }
+        }
+        std::fs::write(dir.join("latest"), path.file_name().unwrap().to_string_lossy().as_bytes())?;
+        Ok(())
     }
 
     fn newest_snapshot_at_or_below(&self, target: u64) -> Result<Option<std::path::PathBuf>> {
@@ -1472,6 +1574,8 @@ impl DurableManager {
     }
 
     pub fn replay_at(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         if self.mode == StorageMode::Standard {
             self.segments.write_delta(commit_ts, &segment_entries(commit_ts, writes))?;
         }
@@ -1567,6 +1671,8 @@ impl DurableManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let policy = self.policy;
         let writes = txn.writes().clone();
         let result = self.inner.commit_durable_with(txn, |commit_ts, payload, _| {
@@ -1591,6 +1697,8 @@ impl DurableManager {
         commit_ts: u64,
         keep: impl Fn(&RecordKey) -> bool,
     ) -> Result<()> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let writes: BTreeMap<RecordKey, WriteOp> = txn
             .writes
             .iter()
@@ -2058,6 +2166,75 @@ mod tests {
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"1".to_vec()));
         assert_eq!(reopened.get(&mut probe, &after).unwrap(), Some(b"2".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_persists_after_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("ryme-restore-{}-{}", std::process::id(), now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let before = RecordKey::new("t", "d", "s", b"before");
+        let mut first = manager.begin();
+        manager.put(&mut first, before.clone(), b"one".to_vec());
+        let checkpoint = manager.commit(first).unwrap();
+        manager.write_snapshot().unwrap();
+        let after = RecordKey::new("t", "d", "s", b"after");
+        let mut second = manager.begin();
+        manager.put(&mut second, after.clone(), b"two".to_vec());
+        manager.commit(second).unwrap();
+        assert_eq!(manager.restore_to(checkpoint).unwrap(), 0);
+        drop(manager);
+
+        let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reopened.get(&mut probe, &after).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_restore_persists_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-restore-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let before = RecordKey::new("t", "d", "s", b"before");
+        let mut first = manager.begin();
+        manager.put(&mut first, before.clone(), b"one".to_vec());
+        let checkpoint = manager.commit(first).unwrap();
+        manager.write_snapshot().unwrap();
+        let after = RecordKey::new("t", "d", "s", b"after");
+        let mut second = manager.begin();
+        manager.put(&mut second, after.clone(), b"two".to_vec());
+        manager.commit(second).unwrap();
+        manager.restore_to(checkpoint).unwrap();
+        assert_eq!(manager.resident_bytes().unwrap(), 0);
+        drop(manager);
+
+        let reopened = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reopened.get(&mut probe, &after).unwrap(), None);
+        assert_eq!(reopened.resident_bytes().unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

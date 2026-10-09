@@ -63,6 +63,11 @@ rewritten, compacted, or pruned. Set `storage_mode` to `standard` to avoid
 materializing the full segment history at startup; point reads and bounded
 scans resolve versions directly from the immutable segment chain.
 
+PITR restore publishes a new immutable base at the selected commit, removes
+future segment/snapshot state, truncates future WAL records, and updates the
+latest snapshot pointer. A restart therefore keeps the restored state instead
+of replaying writes that occurred after the restore target.
+
 Archives include the SQL and control-plane metadata files: `schema.json`,
 `branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema
 snapshots are stored under `branch-schemas/<tenant>/<branch>.json`. Restore
