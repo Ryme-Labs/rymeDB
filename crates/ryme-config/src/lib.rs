@@ -367,14 +367,26 @@ mod tests {
     fn unknown_fields_rejected() {
         let dir = std::env::temp_dir();
         let typo = dir.join("ryme-config-typo.json");
-        std::fs::write(&typo, "{\"node_id\":\"n\",\"autosplit_write\":5}").unwrap();
+        std::fs::write(
+            &typo,
+            r#"{"node_id":"n","pg_listen":"127.0.0.1:5433","resp_listen":"127.0.0.1:6380","http_listen":"127.0.0.1:8080","data_dir":"/tmp/ryme-config","durability":"local-durable","cache_bytes":1048576,"max_connections":1,"autosplit_write":5}"#,
+        )
+        .unwrap();
         let err = Config::from_file(&typo).unwrap_err().to_string();
         assert!(err.contains("autosplit_write"), "{err}");
         let nested = dir.join("ryme-config-nested-typo.json");
-        std::fs::write(&nested, "{\"node_id\":\"n\",\"otel\":{\"endpoin\":\"x\"}}").unwrap();
+        std::fs::write(
+            &nested,
+            r#"{"node_id":"n","pg_listen":"127.0.0.1:5433","resp_listen":"127.0.0.1:6380","http_listen":"127.0.0.1:8080","data_dir":"/tmp/ryme-config","durability":"local-durable","cache_bytes":1048576,"max_connections":1,"otel":{"endpoin":"x"}}"#,
+        )
+        .unwrap();
         assert!(Config::from_file(&nested).is_err());
         let rls = dir.join("ryme-config-rls.json");
-        std::fs::write(&rls, r#"{"node_id":"n","rls_tables":{"messages":"tenant_id"}}"#).unwrap();
+        std::fs::write(
+            &rls,
+            r#"{"node_id":"n","pg_listen":"127.0.0.1:5433","resp_listen":"127.0.0.1:6380","http_listen":"127.0.0.1:8080","data_dir":"/tmp/ryme-config","durability":"local-durable","cache_bytes":1048576,"max_connections":1,"rls_tables":{"messages":"tenant_id"}}"#,
+        )
+        .unwrap();
         let parsed = Config::from_file(&rls).unwrap();
         assert_eq!(parsed.rls_tables.get("messages"), Some(&String::from("tenant_id")));
         let valid = dir.join("ryme-config-valid.json");
