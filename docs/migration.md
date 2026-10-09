@@ -56,8 +56,8 @@ The SQL executor also accepts common policies such as
 tenant_id) WITH CHECK (auth.uid() = tenant_id)` together with
 `ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY`. The detected tenant
 column and RLS activation state are persisted with the schema and applied to
-SQL reads and writes; more complex policy expressions still require manual
-review.
+SQL reads, writes, and realtime snapshots/updates; more complex policy
+expressions still require manual review.
 
 Dump analysis: `POST /v1/migrate/supabase` with `{dump}` returns tables and
 `CREATE POLICY` entries with detected tenant columns (`auth.uid() = <col>`

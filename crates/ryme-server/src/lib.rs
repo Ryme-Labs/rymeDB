@@ -6134,14 +6134,15 @@ async fn stream(
     let from = query.from.unwrap_or(u64::MAX);
     let from_sequence = query.from_sequence;
     let qos = state.qos.clone();
-    let rls_tables = state.rls_tables.clone();
+    let rls_executor =
+        state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
     upgrade.on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_changes(
             socket,
             realtime,
             qos,
-            &rls_tables,
+            rls_executor,
             &tenant,
             &database,
             &branch,
@@ -6183,7 +6184,7 @@ async fn forward_changes(
     socket: axum::extract::ws::WebSocket,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
-    rls_tables: &HashMap<String, String>,
+    rls_executor: Executor<BranchStorage>,
     tenant: &str,
     database: &str,
     branch: &str,
@@ -6214,7 +6215,7 @@ async fn forward_changes(
     let (mut sender, mut incoming) = socket.split();
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
-        if !realtime_change_allowed(rls_tables, tenant, branch, record) {
+        if !realtime_change_allowed_by_executor(&rls_executor, tenant, branch, record) {
             continue;
         }
         let text = serde_json::to_string(record).unwrap_or_else(|_| String::from("{}"));
@@ -6245,7 +6246,12 @@ async fn forward_changes(
                             continue;
                         }
                         seen_sequence = seen_sequence.max(record.sequence);
-                        if !realtime_change_allowed(rls_tables, tenant, branch, &record) {
+                        if !realtime_change_allowed_by_executor(
+                            &rls_executor,
+                            tenant,
+                            branch,
+                            &record,
+                        ) {
                             continue;
                         }
                         let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
@@ -6280,7 +6286,12 @@ async fn forward_changes(
                                 continue;
                             }
                             seen_sequence = record.sequence;
-                            if !realtime_change_allowed(rls_tables, tenant, branch, &record) {
+                            if !realtime_change_allowed_by_executor(
+                                &rls_executor,
+                                tenant,
+                                branch,
+                                &record,
+                            ) {
                                 continue;
                             }
                             let text = serde_json::to_string(&record)
@@ -6366,7 +6377,8 @@ async fn query_stream(
     let database = state.database.clone();
     let table = query.table.clone();
     let qos = state.qos.clone();
-    let rls_tables = state.rls_tables.clone();
+    let rls_executor =
+        state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
     upgrade.on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_query(
@@ -6374,7 +6386,7 @@ async fn query_stream(
             backend,
             realtime,
             qos,
-            &rls_tables,
+            rls_executor,
             &tenant,
             &database,
             &table,
@@ -6392,7 +6404,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
     backend: B,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
-    rls_tables: &HashMap<String, String>,
+    rls_executor: Executor<BranchStorage>,
     tenant: &str,
     database: &str,
     table: &str,
@@ -6408,7 +6420,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
         &mut sender,
         &backend,
         &qos,
-        rls_tables,
+        &rls_executor,
         tenant,
         database,
         table,
@@ -6441,12 +6453,9 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             "type": "update",
                             "commit": update.commit_ts,
                             "branch": branch,
-                            "rows": update.rows.iter().filter(|row| rls_row_allowed(
-                                rls_tables,
-                                tenant,
-                                table,
-                                &row.value,
-                            )).map(|row| serde_json::json!({
+                            "rows": update.rows.iter().filter(|row| {
+                                rls_executor.row_allowed_by_rls(table, &row.value)
+                            }).map(|row| serde_json::json!({
                                 "pk": String::from_utf8_lossy(&row.pk),
                                 "value": String::from_utf8_lossy(&row.value),
                             })).collect::<Vec<_>>(),
@@ -6472,7 +6481,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             &mut sender,
                             &backend,
                             &qos,
-                            rls_tables,
+                            &rls_executor,
                             tenant,
                             database,
                             table,
@@ -6504,6 +6513,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
     }
 }
 
+#[cfg(test)]
 fn rls_row_allowed(
     rls_tables: &HashMap<String, String>,
     tenant: &str,
@@ -6521,6 +6531,7 @@ fn rls_row_allowed(
         .is_some_and(|row_tenant| row_tenant == tenant)
 }
 
+#[cfg(test)]
 fn realtime_change_allowed(
     rls_tables: &HashMap<String, String>,
     tenant: &str,
@@ -6536,6 +6547,22 @@ fn realtime_change_allowed(
             .is_none_or(|value| rls_row_allowed(rls_tables, tenant, &record.table, value))
 }
 
+fn realtime_change_allowed_by_executor<B: TxnBackend>(
+    executor: &Executor<B>,
+    tenant: &str,
+    branch: &str,
+    record: &ryme_realtime::ChangeRecord,
+) -> bool {
+    record.tenant == tenant
+        && record.branch == branch
+        && record
+            .after
+            .as_deref()
+            .or(record.before.as_deref())
+            .is_none_or(|value| executor.row_allowed_by_rls(&record.table, value))
+}
+
+#[cfg(test)]
 fn scan_realtime_rows<B: TxnBackend>(
     backend: &B,
     rls_tables: &HashMap<String, String>,
@@ -6576,6 +6603,46 @@ fn scan_realtime_rows<B: TxnBackend>(
     visible
 }
 
+fn scan_realtime_rows_with_executor<B: TxnBackend>(
+    backend: &B,
+    rls_executor: &Executor<BranchStorage>,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut txn = backend.begin();
+    let mut visible = Vec::with_capacity(limit);
+    let mut start_after = None;
+    loop {
+        let page = match start_after.as_deref() {
+            Some(start_after) => backend
+                .scan_after(&mut txn, tenant, database, table, start_after, limit)
+                .unwrap_or_default(),
+            None => backend.scan(&mut txn, tenant, database, table, limit).unwrap_or_default(),
+        };
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        start_after = page.last().map(|(pk, _)| pk.clone());
+        visible.extend(
+            page.into_iter().filter(|(_, value)| rls_executor.row_allowed_by_rls(table, value)),
+        );
+        if visible.len() >= limit {
+            visible.truncate(limit);
+            break;
+        }
+        if page_len < limit {
+            break;
+        }
+    }
+    visible
+}
+
 async fn send_query_snapshot<B: TxnBackend>(
     sender: &mut futures_util::stream::SplitSink<
         axum::extract::ws::WebSocket,
@@ -6583,7 +6650,7 @@ async fn send_query_snapshot<B: TxnBackend>(
     >,
     backend: &B,
     qos: &Arc<Mutex<QosRegistry>>,
-    rls_tables: &HashMap<String, String>,
+    rls_executor: &Executor<BranchStorage>,
     tenant: &str,
     database: &str,
     table: &str,
@@ -6591,7 +6658,8 @@ async fn send_query_snapshot<B: TxnBackend>(
     limit: usize,
     commit: u64,
 ) -> u64 {
-    let rows = scan_realtime_rows(backend, rls_tables, tenant, database, table, limit);
+    let rows =
+        scan_realtime_rows_with_executor(backend, rls_executor, tenant, database, table, limit);
     let snapshot = serde_json::json!({
         "type": "snapshot",
         "commit": commit,
@@ -7007,6 +7075,50 @@ mod realtime_policy_tests {
             sequence: 1,
         };
         assert!(!realtime_change_allowed(&policies, "tenant-a", "main", &record));
+    }
+
+    #[tokio::test]
+    async fn realtime_filters_rows_using_sql_policy_state() {
+        let executor = ryme_sql::Executor::new(String::from("tenant-a"), String::from("default"));
+        executor
+            .execute(
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                ryme_sql::parse(
+                    "CREATE POLICY own_messages ON messages FOR ALL USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(ryme_sql::parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        let hidden = ryme_realtime::ChangeRecord {
+            tenant: String::from("tenant-a"),
+            database: String::from("default"),
+            branch: String::from("main"),
+            table: String::from("messages"),
+            op: ryme_realtime::Operation::Insert,
+            pk: b"hidden".to_vec(),
+            before: None,
+            after: Some(br#"{"tenant_id":"tenant-b"}"#.to_vec()),
+            commit_ts: 1,
+            tx_id: 1,
+            sequence: 1,
+        };
+        let visible = ryme_realtime::ChangeRecord {
+            after: Some(br#"{"tenant_id":"tenant-a"}"#.to_vec()),
+            ..hidden.clone()
+        };
+        assert!(!realtime_change_allowed_by_executor(&executor, "tenant-a", "main", &hidden));
+        assert!(realtime_change_allowed_by_executor(&executor, "tenant-a", "main", &visible));
     }
 
     #[tokio::test]

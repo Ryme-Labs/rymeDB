@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Realtime CDC replay, live updates, and query snapshots now use the same
+  persisted SQL RLS state as PostgreSQL reads, so migration-created policies
+  protect WebSocket data as well as direct queries.
 - Common Supabase `CREATE POLICY ... FOR ALL` declarations using
   `auth.uid() = tenant_column` now install tenant-scoped read/write checks in
   the SQL executor and persist them with schema snapshots. `ALTER TABLE ...

@@ -5996,6 +5996,10 @@ where
             .is_some_and(|tenant| tenant == self.tenant)
     }
 
+    pub fn row_allowed_by_rls(&self, table: &str, value: &[u8]) -> bool {
+        self.rls_allows(table, value)
+    }
+
     fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
         if !self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table)) {
             return Ok(());
