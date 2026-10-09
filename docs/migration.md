@@ -176,6 +176,10 @@ Grouping: `SELECT <key|value|column|agg>, ... FROM t [WHERE ...] GROUP BY <key|v
 structured column values (including JSON paths), and returns one row per group.
 Bare select items must name the group field; aggregates reuse the scalar rules
 above, and null values share one group.
+Set reads: top-level `SELECT ... UNION [ALL] SELECT ...` combines compatible
+table projections under one transaction snapshot. `UNION` removes duplicate
+rows while `UNION ALL` preserves them; both branches must return the same
+number of projected columns.
 
 ## Observability
 

@@ -3,7 +3,7 @@ use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -266,6 +266,12 @@ pub enum Statement {
         limit: usize,
         #[serde(default)]
         offset: usize,
+    },
+    Union {
+        left: Box<Statement>,
+        right: Box<Statement>,
+        #[serde(default)]
+        all: bool,
     },
 }
 
@@ -826,6 +832,7 @@ impl Statement {
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
             Self::Distinct { statement, .. } => statement.table(),
+            Self::Union { left, .. } => left.table(),
         }
     }
 }
@@ -838,20 +845,26 @@ pub fn parse(input: &str) -> Result<Statement> {
     let head = tokens[0].to_ascii_uppercase();
     let is_distinct = head == "SELECT"
         && tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("DISTINCT"));
-    let mut statement = match head.as_str() {
-        "CREATE" => parse_create(&tokens, input),
-        "DROP" => parse_drop(&tokens),
-        "TRUNCATE" => parse_truncate(&tokens),
-        "ALTER" => parse_alter(&tokens, input),
-        "UPSERT" => parse_upsert(&tokens),
-        "INSERT" => parse_insert(&tokens, input),
-        "SELECT" => parse_select(&tokens, input),
-        "WITH" => parse_with(input),
-        "UPDATE" => parse_update(&tokens, input),
-        "DELETE" => parse_delete(&tokens, input),
-        "COPY" => parse_copy(&tokens),
-        "EXPLAIN" => parse_explain(input),
-        _ => Err(RymeError::InvalidArgument(String::from("unknown statement"))),
+    let mut statement = if matches!(head.as_str(), "SELECT" | "WITH")
+        && find_sql_keyword(input, "UNION", 0).is_some()
+    {
+        parse_union(input)
+    } else {
+        match head.as_str() {
+            "CREATE" => parse_create(&tokens, input),
+            "DROP" => parse_drop(&tokens),
+            "TRUNCATE" => parse_truncate(&tokens),
+            "ALTER" => parse_alter(&tokens, input),
+            "UPSERT" => parse_upsert(&tokens),
+            "INSERT" => parse_insert(&tokens, input),
+            "SELECT" => parse_select(&tokens, input),
+            "WITH" => parse_with(input),
+            "UPDATE" => parse_update(&tokens, input),
+            "DELETE" => parse_delete(&tokens, input),
+            "COPY" => parse_copy(&tokens),
+            "EXPLAIN" => parse_explain(input),
+            _ => Err(RymeError::InvalidArgument(String::from("unknown statement"))),
+        }
     }?;
     if is_distinct {
         statement = prepare_distinct(statement);
@@ -1637,6 +1650,36 @@ fn parse_with(raw: &str) -> Result<Statement> {
             .ok_or_else(|| RymeError::InvalidArgument(String::from("unsupported CTE shape")))?;
     }
     Ok(body)
+}
+
+fn parse_union(raw: &str) -> Result<Statement> {
+    let union_offset = find_sql_keyword(raw, "UNION", 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("union query")))?;
+    let left_sql = raw[..union_offset].trim();
+    let mut right_sql = raw[union_offset + "UNION".len()..].trim();
+    if left_sql.is_empty() || right_sql.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("union query")));
+    }
+    let mut all = false;
+    for modifier in ["ALL", "DISTINCT"] {
+        if right_sql
+            .get(..modifier.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(modifier))
+            && right_sql
+                .get(modifier.len()..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_none_or(|next| next.is_ascii_whitespace())
+        {
+            all = modifier.eq_ignore_ascii_case("ALL");
+            right_sql = right_sql[modifier.len()..].trim_start();
+            break;
+        }
+    }
+    Ok(Statement::Union {
+        left: Box::new(parse(left_sql)?),
+        right: Box::new(parse(right_sql)?),
+        all,
+    })
 }
 
 fn cte_source(statement: Statement) -> Option<(String, Vec<Predicate>)> {
@@ -4404,6 +4447,12 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::GroupBy { table, select, filter, .. } => {
             format!("group_by({table}) items {} filters {}", select.len(), filter.len())
         }
+        Statement::Union { left, right, all } => format!(
+            "union{}({}, {})",
+            if *all { " all" } else { "" },
+            describe_plan(left),
+            describe_plan(right)
+        ),
         Statement::Join { left, right, limit, offset, order, filter } => {
             let direction = match order.direction {
                 Direction::Asc => "asc",
@@ -4444,6 +4493,44 @@ fn apply_distinct(result: QueryResult, offset: usize, limit: usize) -> QueryResu
             QueryResult::Table { columns, rows }
         }
         result => result,
+    }
+}
+
+fn merge_union_results(left: QueryResult, right: QueryResult, all: bool) -> Result<QueryResult> {
+    match (left, right) {
+        (
+            QueryResult::Table { columns, rows: mut left_rows },
+            QueryResult::Table { columns: right_columns, rows: right_rows },
+        ) => {
+            if columns.len() != right_columns.len() {
+                return Err(RymeError::InvalidArgument(String::from("union column mismatch")));
+            }
+            left_rows.extend(right_rows);
+            if !all {
+                let mut seen = HashSet::new();
+                left_rows.retain(|row| seen.insert(row.clone()));
+            }
+            Ok(QueryResult::Table { columns, rows: left_rows })
+        }
+        (left, right) => {
+            let mut rows = Vec::new();
+            for result in [left, right] {
+                match result {
+                    QueryResult::Row { pk, value } => rows.push((pk, value)),
+                    QueryResult::Rows { rows: result_rows } => rows.extend(result_rows),
+                    _ => {
+                        return Err(RymeError::InvalidArgument(String::from(
+                            "union result shapes do not match",
+                        )))
+                    }
+                }
+            }
+            if !all {
+                let mut seen = HashSet::new();
+                rows.retain(|row| seen.insert(row.clone()));
+            }
+            Ok(QueryResult::Rows { rows })
+        }
     }
 }
 
@@ -9309,6 +9396,11 @@ where
         statement: Statement,
     ) -> Result<QueryResult> {
         match statement {
+            Statement::Union { left, right, all } => {
+                let left = self.execute_read_in_transaction(txn, *left)?;
+                let right = self.execute_read_in_transaction(txn, *right)?;
+                merge_union_results(left, right, all)
+            }
             Statement::SelectByKey { table, pk } => {
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 match self.manager.get(txn, &key)? {
@@ -9808,6 +9900,12 @@ where
             Statement::Distinct { statement, limit, offset } => {
                 let result = Box::pin(self.execute_with_base(*statement, isolation)).await?;
                 Ok(apply_distinct(result, offset, limit))
+            }
+            Statement::Union { left, right, all } => {
+                let mut txn = self.begin_with(isolation);
+                let left = self.execute_read_in_transaction(&mut txn, *left)?;
+                let right = self.execute_read_in_transaction(&mut txn, *right)?;
+                merge_union_results(left, right, all)
             }
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
             Statement::DropTable { table, if_exists } => {
@@ -13747,6 +13845,36 @@ mod tests {
             }
             _ => panic!("expected having rows"),
         }
+        let union = executor
+            .execute(
+                parse("SELECT value FROM tags WHERE value = 'red' UNION SELECT value FROM tags WHERE value = 'red'")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match union {
+            QueryResult::Table { columns, rows } => {
+                assert_eq!(columns, vec![String::from("value")]);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0], vec![b"red".to_vec()]);
+            }
+            _ => panic!("expected union table"),
+        }
+        let union_all = executor
+            .execute(
+                parse("SELECT value FROM tags WHERE value = 'red' UNION ALL SELECT value FROM tags WHERE value = 'red'")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(union_all, QueryResult::Table { rows, .. } if rows.len() == 6));
+        let plan =
+            executor.explain("SELECT value FROM tags UNION ALL SELECT value FROM tags").unwrap();
+        assert!(plan.contains("union all"));
+        assert!(executor
+            .execute(parse("SELECT value FROM tags UNION SELECT key, value FROM tags").unwrap())
+            .await
+            .is_err());
         let plan = executor.explain("SELECT key, COUNT(*) FROM tags GROUP BY key").unwrap();
         assert!(plan.contains("group_by(tags)"));
         assert!(parse("SELECT * FROM tags GROUP BY key").is_err());
