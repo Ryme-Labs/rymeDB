@@ -2558,6 +2558,16 @@ fn session_isolation(session: &HashMap<String, String>) -> Isolation {
     }
 }
 
+fn normalize_isolation_level(words: &[&str]) -> Option<&'static str> {
+    match words.iter().map(|word| word.to_ascii_lowercase()).collect::<Vec<_>>().as_slice() {
+        [level] if level == "serializable" => Some("serializable"),
+        [level] if level == "snapshot" => Some("snapshot"),
+        [first, second] if first == "read" && second == "committed" => Some("snapshot"),
+        [first, second] if first == "repeatable" && second == "read" => Some("snapshot"),
+        _ => None,
+    }
+}
+
 fn transaction_control(
     query: &str,
     session: &HashMap<String, String>,
@@ -2968,26 +2978,34 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
         "SET" => {
             let rest = query[3..].trim().trim_end_matches(';').trim();
             let words = rest.split_whitespace().collect::<Vec<_>>();
-            if words.first().is_some_and(|w| w.eq_ignore_ascii_case("SESSION")) {
+            if words.first().is_some_and(|w| w.eq_ignore_ascii_case("SESSION"))
+                && !words.get(1).is_some_and(|w| w.eq_ignore_ascii_case("CHARACTERISTICS"))
+            {
                 return session_command(
                     &format!("SET {}", rest["SESSION".len()..].trim()),
                     session,
                 );
             }
-            if words.len() >= 4
+            let isolation_words = if words.len() >= 4
                 && words[0].eq_ignore_ascii_case("TRANSACTION")
                 && words[1].eq_ignore_ascii_case("ISOLATION")
                 && words[2].eq_ignore_ascii_case("LEVEL")
             {
-                let level = words[3].trim_end_matches(';');
-                let normalized = match level.to_ascii_lowercase().as_str() {
-                    "serializable" => Some("serializable"),
-                    "snapshot" => Some("snapshot"),
-                    _ => None,
-                }?;
-                if words.len() != 4 {
-                    return None;
-                }
+                Some(&words[3..])
+            } else if words.len() >= 7
+                && words[0].eq_ignore_ascii_case("SESSION")
+                && words[1].eq_ignore_ascii_case("CHARACTERISTICS")
+                && words[2].eq_ignore_ascii_case("AS")
+                && words[3].eq_ignore_ascii_case("TRANSACTION")
+                && words[4].eq_ignore_ascii_case("ISOLATION")
+                && words[5].eq_ignore_ascii_case("LEVEL")
+            {
+                Some(&words[6..])
+            } else {
+                None
+            };
+            if let Some(isolation_words) = isolation_words {
+                let normalized = normalize_isolation_level(isolation_words)?;
                 session.insert(String::from("transaction_isolation"), String::from(normalized));
                 return Some(command_complete("SET"));
             }
@@ -3803,7 +3821,15 @@ mod tests {
         );
         assert_eq!(session_isolation(&session), Isolation::Serializable);
         assert!(session_command("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", &mut session)
-            .is_none());
+            .is_some());
+        assert_eq!(session.get("transaction_isolation"), Some(&String::from("snapshot")));
+        assert_eq!(session_isolation(&session), Isolation::Snapshot);
+        assert!(session_command(
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            &mut session,
+        )
+        .is_some());
+        assert_eq!(session.get("transaction_isolation"), Some(&String::from("snapshot")));
         assert!(session_command("SET TRANSACTION ISOLATION LEVEL SNAPSHOT EXTRA", &mut session)
             .is_none());
         assert!(session_command("SHOW transaction_isolation", &mut session).is_some());

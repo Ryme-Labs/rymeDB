@@ -49,6 +49,8 @@ protocol connections: `SELECT pg_catalog.version()`,
 Common session defaults including `server_version_num`,
 `default_transaction_isolation`, `session_authorization`, `is_superuser`, and
 `max_identifier_length` are available through `SHOW` and `current_setting`.
+`READ COMMITTED` and `REPEATABLE READ` requests map to the engine's snapshot
+isolation semantics, while `SERIALIZABLE` retains serializable validation.
 
 ## Supabase
 

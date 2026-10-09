@@ -28,6 +28,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - PostgreSQL session compatibility now exposes common driver defaults for
   `server_version_num`, `default_transaction_isolation`, authorization, and
   identifier limits through `SHOW` and `current_setting`.
+- PostgreSQL session commands now accept `READ COMMITTED`, `REPEATABLE READ`,
+  and `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL`.
 
 - PostgREST filtering now advances through ordered storage pages, so matching
   rows beyond the first page are not lost; non-key ordering scans the complete
