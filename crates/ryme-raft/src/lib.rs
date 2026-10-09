@@ -345,12 +345,11 @@ impl Cluster {
         let payload = encode_applied(commit_ts, &encode_writes(&writes)?);
         let index = self.nodes[leader].group.propose(payload)?;
         self.nodes[leader].group.acks[leader] = index;
-        self.replicate_from(leader);
-        self.apply_committed(leader);
+        self.replicate_from(leader)?;
         Ok(commit_ts)
     }
 
-    pub fn replicate_from(&mut self, leader: usize) {
+    pub fn replicate_from(&mut self, leader: usize) -> Result<()> {
         let term = self.nodes[leader].group.term;
         let commit = self.nodes[leader].group.commit_index;
         let log = self.nodes[leader].group.log.clone();
@@ -397,26 +396,26 @@ impl Cluster {
             let _ =
                 self.nodes[peer].group.append_entries(term, prev_index, prev_term, entries, commit);
         }
-        self.apply_reachable(leader);
+        self.apply_reachable(leader)
     }
 
-    fn apply_committed(&mut self, node: usize) {
+    fn apply_committed(&mut self, node: usize) -> Result<()> {
         let entries = self.nodes[node].group.committed_since(self.nodes[node].applied);
         for entry in entries {
-            if let Ok((commit_ts, payload)) = decode_applied(&entry.payload) {
-                if let Ok(writes) = decode_writes(&payload) {
-                    let _ = self.nodes[node].manager.apply_at(commit_ts, &writes);
-                }
-            }
+            let (commit_ts, payload) = decode_applied(&entry.payload)?;
+            let writes = decode_writes(&payload)?;
+            self.nodes[node].manager.replay_at(commit_ts, &writes)?;
             self.nodes[node].applied = entry.index;
         }
+        Ok(())
     }
 
-    fn apply_reachable(&mut self, from: usize) {
+    fn apply_reachable(&mut self, from: usize) -> Result<()> {
         let peers = self.reachable(from);
         for peer in peers {
-            self.apply_committed(peer);
+            self.apply_committed(peer)?;
         }
+        Ok(())
     }
 
     pub fn read_latest(&self, node: usize, key: &RecordKey) -> Result<Option<Vec<u8>>> {
@@ -458,7 +457,7 @@ mod tests {
         assert!(cluster.elect(1));
         cluster.client_write(1, writes(vec![("k", "v2")])).unwrap();
         cluster.revive(0);
-        cluster.replicate_from(1);
+        cluster.replicate_from(1).unwrap();
         assert_eq!(cluster.read_latest(0, &key).unwrap(), Some(b"v2".to_vec()));
         assert_eq!(cluster.commit_index(0), cluster.commit_index(1));
     }
@@ -474,7 +473,7 @@ mod tests {
         let failed = cluster.client_write(0, writes(vec![("k", "b")]));
         assert!(matches!(failed, Err(RymeError::Unavailable(_))));
         cluster.heal();
-        cluster.replicate_from(1);
+        cluster.replicate_from(1).unwrap();
         let key = RecordKey::new("t", "d", "s", b"k");
         assert_eq!(cluster.read_latest(0, &key).unwrap(), Some(b"a".to_vec()));
     }
@@ -496,5 +495,17 @@ mod tests {
         assert_eq!(follower.log.len(), 2);
         assert_eq!(follower.log[1].payload, b"good".to_vec());
         assert_eq!(follower.commit_index, 2);
+    }
+
+    #[test]
+    fn malformed_committed_payload_fails_closed() {
+        let mut cluster = Cluster::new(3).unwrap();
+        assert!(cluster.elect(0));
+        cluster.nodes[0].group.propose(b"corrupt".to_vec()).unwrap();
+        cluster.nodes[0].group.acks[0] = 1;
+
+        let result = cluster.replicate_from(0);
+        assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        assert_eq!(cluster.nodes[0].applied, 0);
     }
 }

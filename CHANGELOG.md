@@ -35,6 +35,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
+- The in-process Raft cluster now rejects malformed committed payloads and
+  propagates replay failures instead of silently advancing its applied index.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention
