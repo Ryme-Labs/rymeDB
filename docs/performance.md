@@ -131,8 +131,11 @@ the initial intra-region realtime target is
 record the CPU, memory, payload, connection count, publish concurrency, and
 server QoS tier beside the result. Broadcast channels use a dedicated
 32-shard registry and sequence allocation path, separate from CDC/query,
-presence, and durable-topic state. This is an end-to-end workload gate, not a
-claim about all realtime workloads or connection capacity.
+presence, and durable-topic state. Table CDC history and live-query topics
+also use a 32-shard registry, so unrelated tables do not contend on one
+global realtime mutex; per-topic sequence assignment remains ordered under
+that topic's shard lock. This is an end-to-end workload gate, not a claim
+about all realtime workloads or connection capacity.
 
 ## What we claim
 

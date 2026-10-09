@@ -38,6 +38,7 @@ pub struct QueryRow {
 pub const PRESENCE_MAX_MEMBERS: usize = 1000;
 pub const PRESENCE_MAX_TTL_SECS: u64 = 86400;
 const BROADCAST_SHARDS: usize = 32;
+const TABLE_TOPIC_SHARDS: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryUpdate {
@@ -54,8 +55,10 @@ pub struct QueryUpdate {
 #[derive(Debug, Clone)]
 pub struct Realtime {
     inner: Arc<Mutex<RealtimeInner>>,
+    table_topics: Arc<Vec<Mutex<TableTopicShard>>>,
     broadcast_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>>>,
     broadcast_capacity: usize,
+    capacity: usize,
     sequence: Arc<AtomicU64>,
 }
 
@@ -68,12 +71,15 @@ struct QueryTopic {
 
 #[derive(Debug)]
 struct RealtimeInner {
+    presence: HashMap<String, HashMap<String, PresenceMember>>,
+    durable: HashMap<String, DurableTopic>,
+}
+
+#[derive(Debug, Default)]
+struct TableTopicShard {
     topics: HashMap<String, broadcast::Sender<ChangeRecord>>,
     history: HashMap<String, std::collections::VecDeque<ChangeRecord>>,
     queries: HashMap<String, QueryTopic>,
-    presence: HashMap<String, HashMap<String, PresenceMember>>,
-    durable: HashMap<String, DurableTopic>,
-    capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,17 +142,17 @@ impl Realtime {
         let capacity = capacity.clamp(16, 100000);
         Self {
             inner: Arc::new(Mutex::new(RealtimeInner {
-                topics: HashMap::new(),
-                history: HashMap::new(),
-                queries: HashMap::new(),
                 presence: HashMap::new(),
                 durable: HashMap::new(),
-                capacity,
             })),
+            table_topics: Arc::new(
+                (0..TABLE_TOPIC_SHARDS).map(|_| Mutex::new(TableTopicShard::default())).collect(),
+            ),
             broadcast_topics: Arc::new(
                 (0..BROADCAST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             ),
             broadcast_capacity: capacity,
+            capacity,
             sequence: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -161,30 +167,40 @@ impl Realtime {
         (hasher.finish() as usize) % self.broadcast_topics.len()
     }
 
+    fn table_topic_shard(&self, key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.table_topics.len()
+    }
+
     pub fn publish(&self, event: NewChange) -> Result<u64> {
-        let mut inner =
-            self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
+        let key = branch_topic_key(&event.tenant, &event.database, &event.branch, &event.table);
+        let shard = self.table_topic_shard(&key);
+        let mut topics = self
+            .table_topics
+            .get(shard)
+            .ok_or_else(|| RymeError::Internal(String::from("realtime topic shard")))?
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("realtime topic lock")))?;
         let sequence = self.next_sequence();
         let record = ChangeRecord {
-            tenant: event.tenant.clone(),
-            database: event.database.clone(),
-            branch: event.branch.clone(),
-            table: event.table.clone(),
+            tenant: event.tenant,
+            database: event.database,
+            branch: event.branch,
+            table: event.table,
             op: event.op,
-            pk: event.pk.clone(),
-            before: event.before.clone(),
-            after: event.after.clone(),
+            pk: event.pk,
+            before: event.before,
+            after: event.after,
             commit_ts: event.commit_ts,
             tx_id: event.tx_id,
             sequence,
         };
-        let key = branch_topic_key(&event.tenant, &event.database, &event.branch, &event.table);
-        let capacity = inner.capacity;
         let sender =
-            inner.topics.entry(key.clone()).or_insert_with(|| broadcast::channel(capacity).0);
+            topics.topics.entry(key.clone()).or_insert_with(|| broadcast::channel(self.capacity).0);
         let _ = sender.send(record.clone());
-        let log = inner.history.entry(key).or_default();
-        while log.len() >= capacity {
+        let log = topics.history.entry(key).or_default();
+        while log.len() >= self.capacity {
             log.pop_front();
         }
         log.push_back(record);
@@ -203,10 +219,11 @@ impl Realtime {
         table: &str,
     ) -> bool {
         let key = branch_topic_key(tenant, database, branch, table);
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|inner| inner.topics.get(&key).map(|sender| sender.receiver_count() > 0))
+        let shard = self.table_topic_shard(&key);
+        self.table_topics
+            .get(shard)
+            .and_then(|topics| topics.lock().ok())
+            .and_then(|topics| topics.topics.get(&key).map(|sender| sender.receiver_count() > 0))
             .unwrap_or(false)
     }
 
@@ -227,12 +244,16 @@ impl Realtime {
         table: &str,
     ) -> broadcast::Receiver<ChangeRecord> {
         let key = branch_topic_key(tenant, database, branch, table);
-        let Ok(mut inner) = self.inner.lock() else {
+        let shard = self.table_topic_shard(&key);
+        let Some(topics) = self.table_topics.get(shard) else {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
         };
-        let capacity = inner.capacity;
-        inner.topics.entry(key).or_insert_with(|| broadcast::channel(capacity).0).subscribe()
+        let Ok(mut topics) = topics.lock() else {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        };
+        topics.topics.entry(key).or_insert_with(|| broadcast::channel(self.capacity).0).subscribe()
     }
 
     pub fn replay(
@@ -257,8 +278,12 @@ impl Realtime {
     ) -> Vec<ChangeRecord> {
         let limit = limit.clamp(1, 100000);
         let key = branch_topic_key(tenant, database, branch, table);
-        let Ok(inner) = self.inner.lock() else { return Vec::new() };
-        let Some(log) = inner.history.get(&key) else { return Vec::new() };
+        let shard = self.table_topic_shard(&key);
+        let Some(topics) = self.table_topics.get(shard).and_then(|topics| topics.lock().ok())
+        else {
+            return Vec::new();
+        };
+        let Some(log) = topics.history.get(&key) else { return Vec::new() };
         log.iter()
             .filter(|record| record.commit_ts > since_commit_ts)
             .take(limit)
@@ -291,13 +316,17 @@ impl Realtime {
     ) -> Vec<ChangeRecord> {
         let limit = limit.clamp(1, 100000);
         let key = branch_topic_key(tenant, database, branch, table);
-        let Ok(inner) = self.inner.lock() else { return Vec::new() };
-        let Some(log) = inner.history.get(&key) else { return Vec::new() };
+        let shard = self.table_topic_shard(&key);
+        let Some(topics) = self.table_topics.get(shard).and_then(|topics| topics.lock().ok())
+        else {
+            return Vec::new();
+        };
+        let Some(log) = topics.history.get(&key) else { return Vec::new() };
         log.iter().filter(|record| record.sequence > after_sequence).take(limit).cloned().collect()
     }
 
     pub fn history_capacity(&self) -> usize {
-        self.inner.lock().map(|inner| inner.capacity).unwrap_or(0)
+        self.capacity
     }
 
     pub fn query_limit(&self, tenant: &str, database: &str, table: &str) -> Option<usize> {
@@ -312,7 +341,8 @@ impl Realtime {
         table: &str,
     ) -> Option<usize> {
         let key = branch_topic_key(tenant, database, branch, table);
-        self.inner.lock().ok()?.queries.get(&key).map(|topic| topic.max_limit)
+        let shard = self.table_topic_shard(&key);
+        self.table_topics.get(shard)?.lock().ok()?.queries.get(&key).map(|topic| topic.max_limit)
     }
 
     pub fn query_subscribe(
@@ -335,13 +365,17 @@ impl Realtime {
     ) -> broadcast::Receiver<QueryUpdate> {
         let key = branch_topic_key(tenant, database, branch, table);
         let limit = limit.clamp(1, 1000);
-        let Ok(mut inner) = self.inner.lock() else {
+        let shard = self.table_topic_shard(&key);
+        let Some(topic_shard) = self.table_topics.get(shard) else {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
         };
-        let capacity = inner.capacity;
-        let topic = inner.queries.entry(key).or_insert_with(|| QueryTopic {
-            sender: broadcast::channel(capacity).0,
+        let Ok(mut topic_shard) = topic_shard.lock() else {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        };
+        let topic = topic_shard.queries.entry(key).or_insert_with(|| QueryTopic {
+            sender: broadcast::channel(self.capacity).0,
             max_limit: limit,
             latest_commit: 0,
         });
@@ -361,10 +395,11 @@ impl Realtime {
         table: &str,
     ) -> u64 {
         let key = branch_topic_key(tenant, database, branch, table);
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|inner| inner.queries.get(&key).map(|topic| topic.latest_commit))
+        let shard = self.table_topic_shard(&key);
+        self.table_topics
+            .get(shard)
+            .and_then(|topics| topics.lock().ok())
+            .and_then(|topics| topics.queries.get(&key).map(|topic| topic.latest_commit))
             .unwrap_or(0)
     }
 
@@ -390,13 +425,14 @@ impl Realtime {
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         limit: usize,
     ) -> Option<u64> {
-        let mut inner = self.inner.lock().ok()?;
         let key = branch_topic_key(tenant, database, branch, table);
-        if !inner.queries.contains_key(&key) {
+        let shard = self.table_topic_shard(&key);
+        let mut topics = self.table_topics.get(shard)?.lock().ok()?;
+        if !topics.queries.contains_key(&key) {
             return None;
         }
         let sequence = self.next_sequence();
-        let topic = inner.queries.get_mut(&key)?;
+        let topic = topics.queries.get_mut(&key)?;
         topic.latest_commit = topic.latest_commit.max(commit_ts);
         let truncated = rows.len() >= limit;
         let rows = rows.into_iter().take(limit).map(|(pk, value)| QueryRow { pk, value }).collect();
@@ -451,21 +487,33 @@ impl Realtime {
     }
 
     pub fn prune_idle(&self) -> usize {
-        let Ok(mut inner) = self.inner.lock() else { return 0 };
         let mut removed = 0;
-        let idle_topics: Vec<String> = inner
-            .topics
-            .iter()
-            .filter(|(key, sender)| {
-                sender.receiver_count() == 0
-                    && inner.history.get(*key).map(|log| log.is_empty()).unwrap_or(true)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in idle_topics {
-            inner.topics.remove(&key);
-            inner.history.remove(&key);
-            removed += 1;
+        for shard in self.table_topics.iter() {
+            let Ok(mut topics) = shard.lock() else { continue };
+            let idle_topics: Vec<String> = topics
+                .topics
+                .iter()
+                .filter(|(key, sender)| {
+                    sender.receiver_count() == 0
+                        && topics.history.get(*key).map(|log| log.is_empty()).unwrap_or(true)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in idle_topics {
+                topics.topics.remove(&key);
+                topics.history.remove(&key);
+                removed += 1;
+            }
+            let idle_queries: Vec<String> = topics
+                .queries
+                .iter()
+                .filter(|(_, topic)| topic.sender.receiver_count() == 0)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in idle_queries {
+                topics.queries.remove(&key);
+                removed += 1;
+            }
         }
         for shard in self.broadcast_topics.iter() {
             if let Ok(mut topics) = shard.lock() {
@@ -479,16 +527,6 @@ impl Realtime {
                     removed += 1;
                 }
             }
-        }
-        let idle_queries: Vec<String> = inner
-            .queries
-            .iter()
-            .filter(|(_, topic)| topic.sender.receiver_count() == 0)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in idle_queries {
-            inner.queries.remove(&key);
-            removed += 1;
         }
         removed
     }
@@ -745,6 +783,40 @@ mod tests {
         let by_sequence = realtime.replay_after_sequence("t", "d", "docs", all[0].sequence, 10);
         assert_eq!(by_sequence.len(), 2);
         assert_eq!(by_sequence[0].commit_ts, 20);
+    }
+
+    #[test]
+    fn concurrent_publish_keeps_topic_sequence_order() {
+        let realtime = Realtime::new(1024);
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let realtime = realtime.clone();
+                std::thread::spawn(move || {
+                    for index in 0..64u64 {
+                        realtime
+                            .publish(NewChange {
+                                tenant: String::from("t"),
+                                database: String::from("d"),
+                                branch: String::from("main"),
+                                table: String::from("docs"),
+                                op: Operation::Insert,
+                                pk: format!("{worker}-{index}").into_bytes(),
+                                before: None,
+                                after: None,
+                                commit_ts: index + 1,
+                                tx_id: index + 1,
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let records = realtime.replay("t", "d", "docs", 0, 1024);
+        assert_eq!(records.len(), 512);
+        assert!(records.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
     }
 
     #[test]
