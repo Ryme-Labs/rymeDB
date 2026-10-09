@@ -56,7 +56,8 @@ with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is`, `like`, `ilike`, and
 or a JSON array of objects with an `id`/`key` field,
 `PATCH /rest/v1/:table?<field>=eq.<value>` with a JSON object for filtered
 partial updates,
-`DELETE /rest/v1/:table?key=eq.<id>`.
+`DELETE /rest/v1/:table?<field>=eq.<value>` (including the legacy
+`key=eq.<id>` form).
 Filtered reads continue across storage pages, and non-key `order` clauses
 scan the complete filtered result before sorting.
 

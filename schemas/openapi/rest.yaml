@@ -1051,7 +1051,7 @@ paths:
           $ref: '#/components/responses/Forbidden'
     delete:
       tags: [rest]
-      description: Delete with key=eq.<id> required.
+      description: Delete rows selected by a PostgREST filter such as id=eq.<id> or key=eq.<id>.
       parameters:
         - $ref: '#/components/parameters/TableParam'
       responses:

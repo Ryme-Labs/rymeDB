@@ -163,6 +163,12 @@ async fn compat_rest_graphql_copy_explain() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains(r#""name":"Ada""#), "{text}");
     assert!(text.contains(r#""status":"away""#), "{text}");
+    let (status, body) = http_request(http, "DELETE /rest/v1/people?id=eq.p2", b"").await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains(r#""deleted":1"#));
+    let (status, body) = http_request(http, "GET /rest/v1/people?id=eq.p2", b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8_lossy(&body), "[]");
     let (status, body) =
         http_request(http, "POST /graphql", b"{\"query\":\"{ docs(key: \\\"k1\\\") }\"}").await;
     assert_eq!(status, 200);

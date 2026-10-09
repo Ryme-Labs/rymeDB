@@ -3141,36 +3141,50 @@ async fn rest_delete(
         return error_response(e);
     }
     let raw = raw.unwrap_or_default();
-    let mut target: Option<String> = None;
-    for pair in raw.split('&') {
-        let mut split = pair.splitn(2, '=');
-        if split.next().unwrap_or("") == "key" {
-            if let Some(rest) = split.next().unwrap_or("").strip_prefix("eq.") {
-                target = Some(url_decode(rest));
-            }
-        }
-    }
-    let Some(key) = target else {
+    if !rest_query_has_filter(&raw) {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from(
-            "key=eq.<id> required",
+            "filter required",
         )));
-    };
-    if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {
-        return error_response(e);
     }
     let gateway = match branch_gateway(&state, &headers, &principal.tenant) {
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    let key = key.into_bytes();
-    match gateway.delete(&principal, &table, key.clone()).await {
-        Ok(commit) => {
-            record_meter(&state, Metric::WriteUnit, 1);
-            note_range_write(&state, &range_routing_key(&table, &key), 1);
-            (StatusCode::OK, Json(serde_json::json!({ "commit": commit }))).into_response()
+    let keys = match rest_matching_keys(&gateway, &principal, &table, &raw) {
+        Ok(keys) => keys,
+        Err(e) => return error_response(e),
+    };
+    let mut deleted = 0u64;
+    let mut last_commit = 0u64;
+    for key in keys {
+        if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {
+            return error_response(e);
         }
-        Err(e) => error_response(e),
+        match gateway.delete(&principal, &table, key.clone()).await {
+            Ok(commit) => {
+                record_meter(&state, Metric::WriteUnit, 1);
+                note_range_write(&state, &range_routing_key(&table, &key), 1);
+                deleted += 1;
+                last_commit = commit;
+            }
+            Err(e) => return error_response(e),
+        }
     }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "commit": last_commit,
+            "deleted": deleted,
+        })),
+    )
+        .into_response()
+}
+
+fn rest_query_has_filter(raw: &str) -> bool {
+    raw.split('&').any(|pair| {
+        let name = url_decode(pair.split_once('=').map(|(name, _)| name).unwrap_or(pair));
+        !name.is_empty() && !matches!(name.as_str(), "select" | "limit" | "offset" | "order")
+    })
 }
 
 fn rest_body_rows(body: &RestWriteBody) -> Vec<(Vec<u8>, Vec<u8>)> {

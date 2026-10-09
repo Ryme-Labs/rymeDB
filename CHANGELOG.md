@@ -12,6 +12,8 @@ All notable changes to rymeDB are recorded here. Format follows
   filtered PATCH requests merge partial fields into existing JSON rows.
 - REST inserts also accept top-level JSON arrays used by Supabase bulk
   inserts, alongside the existing `{rows: [...]}` compatibility shape.
+- REST deletes now accept arbitrary PostgREST filters such as `id=eq.<id>`
+  and remove every matching row across storage pages.
 
 - PostgREST filtering now advances through ordered storage pages, so matching
   rows beyond the first page are not lost; non-key ordering scans the complete
