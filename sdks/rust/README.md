@@ -33,3 +33,7 @@ backoff until the subscription is closed or the retry limit is reached.
 
 `subscribe_query` and `subscribe_broadcast` are also available. HTTP and
 WebSocket URLs automatically switch from `http`/`https` to `ws`/`wss`.
+
+Supabase-style REST CRUD is available through `rest_insert`, `rest_upsert`,
+`rest_update`, and `rest_delete_where`, using `serde_json::Value` request
+bodies and PostgREST query strings.

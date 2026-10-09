@@ -21,6 +21,10 @@ The client returns JSON response bodies as strings, so applications can use
 their existing Jackson, Gson, or JSON-B setup. Set `RYME_API_KEY` or pass the
 API key to `new RymeClient(baseUrl, apiKey)`.
 
+REST CRUD supports both the legacy key/value overload and ordinary JSON
+objects or arrays: `restInsert`, `restUpsert`, `restUpdate(table, query,
+json)`, and `restDeleteWhere(table, query)`.
+
 Java 17's built-in WebSocket client is used for realtime subscriptions:
 
 ```java

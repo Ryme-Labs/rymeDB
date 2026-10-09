@@ -118,8 +118,24 @@ public final class RymeClient {
                 "{\"key\":" + json(key) + ",\"value\":" + json(value) + "}");
     }
 
+    public String restInsert(String table, String jsonBody) {
+        return request("POST", "/rest/v1/" + segment(table), jsonBody);
+    }
+
+    public String restUpsert(String table, String jsonBody) {
+        return request("POST", "/rest/v1/" + segment(table), jsonBody);
+    }
+
+    public String restUpdate(String table, String query, String jsonBody) {
+        return request("PATCH", "/rest/v1/" + segment(table) + querySuffix(query), jsonBody);
+    }
+
     public String restDelete(String table, String key) {
         return request("DELETE", "/rest/v1/" + segment(table) + "?key=eq." + encode(key), null);
+    }
+
+    public String restDeleteWhere(String table, String query) {
+        return request("DELETE", "/rest/v1/" + segment(table) + querySuffix(query), null);
     }
 
     public String graphql(String query) {
@@ -622,7 +638,8 @@ public final class RymeClient {
     }
 
     private static String querySuffix(String query) {
-        return query == null || query.isEmpty() ? "" : "?" + query;
+        if (query == null || query.isEmpty()) return "";
+        return "?" + (query.startsWith("?") ? query.substring(1) : query);
     }
 
     private static String queryParams(List<String> params) {

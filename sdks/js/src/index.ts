@@ -481,15 +481,25 @@ export class RymeHttpClient {
   }
 
   restInsert(table: string, row: unknown): Promise<unknown> {
-    const body = row as Record<string, unknown>;
-    if (body !== null && typeof body === "object" && "key" in body) {
-      return this.request<unknown>("POST", `/rest/v1/${table}`, body);
-    }
     return this.request<unknown>("POST", `/rest/v1/${table}`, row);
+  }
+
+  restUpsert(table: string, row: unknown): Promise<unknown> {
+    return this.request<unknown>("POST", `/rest/v1/${table}`, row);
+  }
+
+  restUpdate(table: string, query: string, changes: unknown): Promise<unknown> {
+    const suffix = query ? `?${query.replace(/^\?/, "")}` : "";
+    return this.request<unknown>("PATCH", `/rest/v1/${table}${suffix}`, changes);
   }
 
   restDelete(table: string, key: string): Promise<unknown> {
     return this.request<unknown>("DELETE", `/rest/v1/${table}?key=eq.${encodeURIComponent(key)}`);
+  }
+
+  restDeleteWhere(table: string, query: string): Promise<unknown> {
+    const suffix = query ? `?${query.replace(/^\?/, "")}` : "";
+    return this.request<unknown>("DELETE", `/rest/v1/${table}${suffix}`);
   }
 
   graphql(query: string): Promise<unknown> {

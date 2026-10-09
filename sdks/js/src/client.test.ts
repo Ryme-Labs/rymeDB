@@ -110,6 +110,27 @@ describe("RymeHttpClient", () => {
     server.close();
   });
 
+  it("sends Supabase-style REST CRUD requests", async () => {
+    const { server, seen } = stub(() => ({ status: 200, body: `{"ok":true}` }));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const client = new RymeHttpClient({ base: `http://127.0.0.1:${port}`, apiKey: "k" });
+
+    await client.restInsert("people", [{ id: "p1", name: "Ada" }]);
+    assert.equal(seen().method, "POST");
+    assert.equal(seen().url, "/rest/v1/people");
+    assert.deepEqual(JSON.parse(seen().body), [{ id: "p1", name: "Ada" }]);
+    await client.restUpsert("people", { id: "p1", name: "Ada" });
+    assert.equal(seen().method, "POST");
+    await client.restUpdate("people", "id=eq.p1", { name: "Grace" });
+    assert.equal(seen().method, "PATCH");
+    assert.equal(seen().url, "/rest/v1/people?id=eq.p1");
+    await client.restDeleteWhere("people", "id=eq.p1");
+    assert.equal(seen().method, "DELETE");
+    assert.equal(seen().url, "/rest/v1/people?id=eq.p1");
+    server.close();
+  });
+
   it("maps sql params and cluster replace payloads", async () => {
     const { server, seen } = stub(() => ({ status: 200, body: `{"ok":true}` }));
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

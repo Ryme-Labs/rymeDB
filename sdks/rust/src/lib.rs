@@ -486,6 +486,66 @@ impl RymeClient {
         Self::check(response).await
     }
 
+    pub async fn rest_insert(
+        &self,
+        table: &str,
+        row: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        let response = self
+            .auth(self.http.post(format!("{}/rest/v1/{table}", self.base)))
+            .json(row)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn rest_upsert(
+        &self,
+        table: &str,
+        row: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.rest_insert(table, row).await
+    }
+
+    pub async fn rest_update(
+        &self,
+        table: &str,
+        query: &str,
+        changes: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.trim_start_matches('?'))
+        };
+        let response = self
+            .auth(self.http.patch(format!("{}/rest/v1/{table}{suffix}", self.base)))
+            .json(changes)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
+    pub async fn rest_delete_where(
+        &self,
+        table: &str,
+        query: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.trim_start_matches('?'))
+        };
+        let response = self
+            .auth(self.http.delete(format!("{}/rest/v1/{table}{suffix}", self.base)))
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        Self::check(response).await
+    }
+
     pub async fn graphql(&self, query: &str) -> Result<serde_json::Value, ClientError> {
         let response = self
             .auth(self.http.post(format!("{}/graphql", self.base)))
@@ -1175,6 +1235,33 @@ mod tests {
         let got = seen(&state);
         assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/backups/copy"));
         assert_eq!(got.body, "{\"backup_id\":\"nightly-042\"}");
+    }
+
+    #[tokio::test]
+    async fn rest_crud_paths_and_bodies() {
+        let (base, state) = stub().await;
+        let client = RymeClient::new(base, String::from("k"));
+        client
+            .rest_insert("people", &serde_json::json!([{ "id": "p1" }]))
+            .await
+            .unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/rest/v1/people"));
+        assert_eq!(got.body, r#"[{"id":"p1"}]"#);
+        client
+            .rest_upsert("people", &serde_json::json!({ "id": "p1" }))
+            .await
+            .unwrap();
+        assert_eq!(seen(&state).method, "POST");
+        client
+            .rest_update("people", "id=eq.p1", &serde_json::json!({ "name": "Grace" }))
+            .await
+            .unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("PATCH", "/rest/v1/people?id=eq.p1"));
+        client.rest_delete_where("people", "id=eq.p1").await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("DELETE", "/rest/v1/people?id=eq.p1"));
     }
 
     #[tokio::test]

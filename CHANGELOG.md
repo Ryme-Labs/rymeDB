@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Java, npm, and Rust SDKs now expose matching JSON REST insert/upsert,
+  filtered update, and filtered delete helpers.
+
 - REST writes now accept ordinary JSON objects for Supabase-style inserts and
   filtered PATCH requests merge partial fields into existing JSON rows.
 - REST inserts also accept top-level JSON arrays used by Supabase bulk

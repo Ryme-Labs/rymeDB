@@ -55,3 +55,7 @@ Method coverage mirrors the server: kv get/put/delete/ttl, sql, scan,
 branches, checkpoint/latest/pitr/snapshot/restore/archive/archives, shards
 layout/move, cluster members/add/remove/transfer/replace, ready/metrics, and
 both streams. Tests: `pnpm build && pnpm test`.
+
+Supabase-style REST CRUD is available through `restInsert`, `restUpsert`,
+`restUpdate`, `restDelete`, and `restDeleteWhere`; insert bodies may be JSON
+objects or arrays, and update/delete methods accept PostgREST query strings.
