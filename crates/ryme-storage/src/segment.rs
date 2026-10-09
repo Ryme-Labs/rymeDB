@@ -1,6 +1,6 @@
 use super::{Engine, RecordKey};
 use ryme_error::{Result, RymeError};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -193,7 +193,7 @@ impl ImmutableSegment {
         self.engine.read(key, read_ts, now)
     }
 
-    fn version_at(&self, key: &RecordKey, read_ts: u64) -> Option<(u64, Option<Vec<u8>>, u64)> {
+    pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Option<(u64, Option<Vec<u8>>, u64)> {
         if !self.bloom_might_contain(key) || self.keys.binary_search(key).is_err() {
             return None;
         }
@@ -401,36 +401,56 @@ impl SegmentStore {
         Ok(Some(ImmutableSegment::decode(&bytes)?))
     }
 
-    pub fn get(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
+    fn read_segment(&self, path: &Path) -> Result<Arc<ImmutableSegment>> {
+        let id = parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+            .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(segment) = cache.get(id) {
+                return Ok(segment);
+            }
+            let bytes = std::fs::read(path)?;
+            let segment = Arc::new(ImmutableSegment::decode(&bytes)?);
+            cache.insert(id, Arc::clone(&segment), bytes.len() as u64);
+            Ok(segment)
+        } else {
+            Ok(Arc::new(ImmutableSegment::decode(&std::fs::read(path)?)?))
+        }
+    }
+
+    fn newest_paths(&self) -> Result<Vec<PathBuf>> {
         let mut paths = self.segment_paths()?;
         paths.sort_by_key(|path| {
             std::cmp::Reverse(parse_segment_name(
                 path.file_name().and_then(|name| name.to_str()).unwrap_or(""),
             ))
         });
-        for path in paths {
-            let id =
-                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
-                    .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
-            let segment = if let Ok(mut cache) = self.cache.lock() {
-                if let Some(segment) = cache.get(id) {
-                    segment
-                } else {
-                    let bytes = std::fs::read(&path)?;
-                    let segment = Arc::new(ImmutableSegment::decode(&bytes)?);
-                    cache.insert(id, Arc::clone(&segment), bytes.len() as u64);
-                    segment
+        Ok(paths)
+    }
+
+    pub fn get(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
+        let Some((_, value, expires_at)) = self.version_at(key, read_ts)? else {
+            return Ok(None);
+        };
+        if expires_at != 0 && expires_at <= now {
+            return Ok(None);
+        }
+        Ok(value)
+    }
+
+    pub fn version_at(
+        &self,
+        key: &RecordKey,
+        read_ts: u64,
+    ) -> Result<Option<(u64, Option<Vec<u8>>, u64)>> {
+        for path in self.newest_paths()? {
+            let segment = self.read_segment(&path)?;
+            let Some(version) = segment.version_at(key, read_ts) else {
+                if segment.is_snapshot() {
+                    return Ok(None);
                 }
-            } else {
-                Arc::new(ImmutableSegment::decode(&std::fs::read(&path)?)?)
-            };
-            let Some((_, value, expires_at)) = segment.version_at(key, read_ts) else {
                 continue;
             };
-            if expires_at != 0 && expires_at <= now {
-                return Ok(None);
-            }
-            return Ok(value);
+            return Ok(Some(version));
         }
         Ok(None)
     }
@@ -454,6 +474,84 @@ impl SegmentStore {
             found = true;
         }
         Ok(found.then_some((engine, max_commit_ts)))
+    }
+
+    pub fn max_commit_ts(&self) -> Result<u64> {
+        let mut max_commit_ts = 0;
+        for path in self.segment_paths()? {
+            let segment = ImmutableSegment::decode(&std::fs::read(path)?)?;
+            max_commit_ts = max_commit_ts.max(segment.meta.max_commit_ts);
+        }
+        Ok(max_commit_ts)
+    }
+
+    pub fn scan(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        read_ts: u64,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_from_segments(tenant, database, table, read_ts, now, None, limit)
+    }
+
+    pub fn scan_after(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        read_ts: u64,
+        now: u64,
+        start_after: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_from_segments(tenant, database, table, read_ts, now, Some(start_after), limit)
+    }
+
+    fn scan_from_segments(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        read_ts: u64,
+        now: u64,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut selected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        for path in self.newest_paths()? {
+            let segment = self.read_segment(&path)?;
+            for key in segment.engine.record_keys() {
+                if key.tenant != tenant
+                    || key.database != database
+                    || key.table != table
+                    || selected.contains_key(&key.pk)
+                {
+                    continue;
+                }
+                let Some((_, value, expires_at)) = segment.version_at(&key, read_ts) else {
+                    continue;
+                };
+                let value = if expires_at != 0 && expires_at <= now { None } else { value };
+                selected.insert(key.pk, value);
+            }
+            if segment.is_snapshot() {
+                break;
+            }
+        }
+        Ok(selected
+            .into_iter()
+            .filter(|(pk, value)| {
+                start_after.map(|after| pk.as_slice() > after).unwrap_or(true) && value.is_some()
+            })
+            .take(limit)
+            .filter_map(|(pk, value)| value.map(|value| (pk, value)))
+            .collect())
     }
 
     pub fn latest_path(&self) -> Result<Option<PathBuf>> {
@@ -542,8 +640,9 @@ impl SegmentStore {
                     .map(|(_, path, _)| path.clone()),
             );
         } else {
-            keep_paths
-                .extend(segments.iter().rev().take(keep.max(1)).map(|(_, path, _)| path.clone()));
+            // Without a full base, every delta is part of the recovery chain.
+            // Pruning a suffix here would silently make older keys unrecoverable.
+            return Ok(0);
         }
         let mut removed = 0;
         for (_, path, _) in segments {

@@ -1,9 +1,23 @@
 use ryme_error::{Result, RymeError};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
 mod segment;
 pub use segment::{ImmutableSegment, SegmentCacheStats, SegmentEntry, SegmentMeta, SegmentStore};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageMode {
+    Hot,
+    Standard,
+}
+
+impl Default for StorageMode {
+    fn default() -> Self {
+        Self::Hot
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TableVersion {
@@ -74,11 +88,7 @@ impl Engine {
         self.inner.keys().cloned().collect()
     }
 
-    pub(crate) fn version_at(
-        &self,
-        key: &RecordKey,
-        read_ts: u64,
-    ) -> Option<(u64, Option<Vec<u8>>, u64)> {
+    pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Option<(u64, Option<Vec<u8>>, u64)> {
         self.inner.get(key).and_then(|versions| {
             versions
                 .iter()
@@ -542,6 +552,11 @@ impl Engine {
     pub fn replace_from(&mut self, other: Engine) {
         self.inner = other.inner;
         self.bytes_held = other.bytes_held;
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
+        self.bytes_held = 0;
     }
 }
 

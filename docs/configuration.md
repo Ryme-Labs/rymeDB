@@ -26,6 +26,7 @@ runs on every boot.
 | `http_listen` | socket addr | `127.0.0.1:8080` | REST listener. |
 | `data_dir` | path | `/var/lib/rymedb` | WAL, snapshots, Raft state, main SQL schema metadata, and tenant-scoped branch schemas live here. |
 | `durability` | enum | `"local-durable"` | One of `strict`, `regional-fast`, `local-durable`, `memory` (kebab-case). The three durable tiers share one implementation in v1: fsync per commit plus Raft quorum where clustered. Only `memory` relaxes durability (no fsync); never select it for data you cannot lose. Pinned by `only_memory_relaxes_durability`. |
+| `storage_mode` | enum | `"hot"` | `hot` keeps the working set materialized in memory; `standard` starts from immutable NVMe segments, uses the bounded segment cache for point reads, and evicts committed rows from the resident engine after durable publication. |
 | `cache_bytes` | u64 | `67108864` (64 MiB) | Bounds the decoded immutable-segment read cache. Must be >= 1 MiB. Raise to 256 MiB–2 GiB on performance nodes. |
 | `max_connections` | u32 | `10000` | Must be non-zero. Excess PG/RESP connections get `53300` / `-ERR overloaded`; excess HTTP/HTTPS TCP connections are closed immediately; gRPC per-connection concurrency is capped at the same value. |
 | `http_max_body_bytes` | const | `2097152` (2 MiB) | Explicit `DefaultBodyLimit` on the HTTP router; oversize JSON bodies get `413`. Not yet operator-tunable in v1. |

@@ -222,7 +222,7 @@ impl Backend {
 
     fn spaces(&self) -> ryme_error::Result<Vec<(String, String, String)>> {
         match self {
-            Self::Single(manager) => manager.inner().spaces(),
+            Self::Single(manager) => manager.spaces(),
             Self::Cluster(backend) => backend.node().manager().spaces(),
             Self::Sharded(shards) => Ok(shards.spaces()),
             Self::Hybrid(hybrid) => {
@@ -243,9 +243,8 @@ impl Backend {
         };
         match self {
             Self::Single(manager) => {
-                for (tenant, database, table) in manager.inner().spaces().unwrap_or_default() {
-                    let bytes =
-                        manager.inner().table_bytes(&tenant, &database, &table).unwrap_or(0);
+                for (tenant, database, table) in manager.spaces().unwrap_or_default() {
+                    let bytes = manager.table_bytes(&tenant, &database, &table).unwrap_or(0);
                     add(tenant, bytes);
                 }
             }
@@ -290,7 +289,7 @@ impl Backend {
         use ryme_txn::TxnBackend;
         match self {
             Self::Single(manager) => {
-                let expired = manager.inner().expired_keys(tenant, database, table, limit)?;
+                let expired = manager.expired_keys(tenant, database, table, limit)?;
                 if expired.is_empty() {
                     return Ok(0);
                 }
@@ -329,7 +328,7 @@ impl Backend {
                 let manager = shards
                     .shard_manager(shard)
                     .ok_or_else(|| ryme_error::RymeError::Unavailable(String::from("shard")))?;
-                let expired = manager.inner().expired_keys(tenant, database, table, limit)?;
+                let expired = manager.expired_keys(tenant, database, table, limit)?;
                 if expired.is_empty() {
                     return Ok(0);
                 }
@@ -375,8 +374,7 @@ impl Backend {
                         let manager = local.shard_manager(shard).ok_or_else(|| {
                             ryme_error::RymeError::Unavailable(String::from("shard"))
                         })?;
-                        let expired =
-                            manager.inner().expired_keys(tenant, database, table, limit)?;
+                        let expired = manager.expired_keys(tenant, database, table, limit)?;
                         if expired.is_empty() {
                             return Ok(0);
                         }
@@ -952,11 +950,12 @@ impl SharedState {
             true => SyncPolicy::Always,
             false => SyncPolicy::Never,
         };
-        let durable = DurableManager::open_with_cache(
+        let durable = DurableManager::open_with_mode(
             &wal_dir,
             64 * 1024 * 1024,
             policy,
             config.cache_bytes,
+            config.storage_mode,
         )?;
         let open_node = |dir: std::path::PathBuf| -> ryme_error::Result<std::sync::Arc<Node>> {
             let peers: Vec<String> = config.cluster.peers.iter().map(|p| p.addr.clone()).collect();
@@ -993,19 +992,21 @@ impl SharedState {
                     .iter()
                     .map(|table| TableRef::new("default", "default", table))
                     .collect();
-                let local = ryme_shard::ShardSet::open_with_cache(
+                let local = ryme_shard::ShardSet::open_with_mode(
                     &config.data_dir.join("local"),
                     1,
                     policy,
                     config.cache_bytes,
+                    config.storage_mode,
                 )?;
                 Backend::Hybrid(HybridBackend::new(ClusterBackend::new(node), local, replicated))
             }
-            None if config.shards > 1 => Backend::Sharded(ryme_shard::ShardSet::open_with_cache(
+            None if config.shards > 1 => Backend::Sharded(ryme_shard::ShardSet::open_with_mode(
                 &config.data_dir,
                 config.shards,
                 policy,
                 config.cache_bytes,
+                config.storage_mode,
             )?),
             None => Backend::Single(durable.clone()),
         };

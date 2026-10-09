@@ -1,5 +1,5 @@
 use ryme_error::{Result, RymeError};
-use ryme_storage::{RecordKey, SegmentCacheStats};
+use ryme_storage::{RecordKey, SegmentCacheStats, StorageMode};
 use ryme_txn::{
     decode_writes, encode_writes, DurableManager, SyncPolicy, Transaction, TxnBackend, TxnManager,
 };
@@ -130,17 +130,28 @@ impl ShardSet {
         policy: SyncPolicy,
         cache_bytes: u64,
     ) -> Result<Self> {
+        Self::open_with_mode(data_dir, shards, policy, cache_bytes, StorageMode::Hot)
+    }
+
+    pub fn open_with_mode(
+        data_dir: &std::path::Path,
+        shards: usize,
+        policy: SyncPolicy,
+        cache_bytes: u64,
+        mode: StorageMode,
+    ) -> Result<Self> {
         if shards == 0 || shards > 256 {
             return Err(RymeError::InvalidArgument(String::from("shards")));
         }
         let mut managers = Vec::new();
         for index in 0..shards {
             let dir = data_dir.join("shards").join(index.to_string()).join("wal");
-            managers.push(DurableManager::open_with_cache(
+            managers.push(DurableManager::open_with_mode(
                 &dir,
                 64 * 1024 * 1024,
                 policy,
                 cache_bytes,
+                mode,
             )?);
         }
         let coordinator = Wal::open(&data_dir.join("coordinator"), 1024 * 1024)?;
@@ -252,7 +263,7 @@ impl ShardSet {
         let mut out = std::collections::BTreeSet::new();
         if let Ok(inner) = self.inner.lock() {
             for shard in inner.shards.iter() {
-                if let Ok(spaces) = shard.inner().spaces() {
+                if let Ok(spaces) = shard.spaces() {
                     out.extend(spaces);
                 }
             }
@@ -283,7 +294,7 @@ impl ShardSet {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::BTreeSet::new();
         for shard in inner.shards.iter() {
-            if let Ok(spaces) = shard.inner().spaces() {
+            if let Ok(spaces) = shard.spaces() {
                 for (tenant, database, table) in spaces {
                     seen.insert((tenant, database, table));
                 }
@@ -300,7 +311,7 @@ impl ShardSet {
             let bytes = inner
                 .shards
                 .get(shard)
-                .map(|shard| shard.inner().table_bytes(&tenant, &database, &table).unwrap_or(0))
+                .map(|shard| shard.table_bytes(&tenant, &database, &table).unwrap_or(0))
                 .unwrap_or(0);
             out.push((table_ref, shard, bytes));
         }
@@ -533,12 +544,11 @@ impl ShardSet {
         from: usize,
         to: usize,
     ) -> Result<MoveReport> {
-        let rows = source.inner().export_table(&table.tenant, &table.database, &table.table)?;
+        let rows = source.export_table(&table.tenant, &table.database, &table.table)?;
         let count = rows.len();
-        let bytes: u64 =
-            source.inner().table_bytes(&table.tenant, &table.database, &table.table)?;
+        let bytes: u64 = source.table_bytes(&table.tenant, &table.database, &table.table)?;
         let max = dest.inner().import_table(&table.tenant, &table.database, &table.table, rows)?;
-        let moved = dest.inner().table_bytes(&table.tenant, &table.database, &table.table)?;
+        let moved = dest.table_bytes(&table.tenant, &table.database, &table.table)?;
         if moved < bytes {
             return Err(RymeError::Corrupt(String::from("move verify")));
         }

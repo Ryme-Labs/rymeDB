@@ -25,6 +25,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - `cache_bytes` now bounds a decoded immutable-segment LRU for point reads;
   cache occupancy, hits, and misses are observable and entries are invalidated
   when segments are rewritten, compacted, or pruned.
+- Added `storage_mode = "standard"`: durable managers can recover without
+  materializing the full segment history, resolve point reads and scans from
+  immutable segments, and evict committed rows from the resident engine.
 - SDK distribution is limited to the Java, npm/TypeScript, and Rust clients;
   the release workflow packages and publishes those three artifacts and the
   Pages workflow builds their documentation.

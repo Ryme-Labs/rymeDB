@@ -1,5 +1,5 @@
 use ryme_error::{Result, RymeError};
-use ryme_storage::{Engine, RecordKey, SegmentCacheStats, SegmentEntry, SegmentStore};
+use ryme_storage::{Engine, RecordKey, SegmentCacheStats, SegmentEntry, SegmentStore, StorageMode};
 use ryme_wal::Wal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -254,7 +254,7 @@ impl TxnBackend for DurableManager {
     }
 
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
-        self.inner.expires_at(key)
+        DurableManager::expires_at(self, key)
     }
 
     fn commit(&self, txn: Transaction) -> impl std::future::Future<Output = Result<u64>> + Send {
@@ -340,6 +340,35 @@ impl TxnManager {
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
         let value = engine.read(key, txn.read_ts, now_unix())?;
+        txn.observed.entry(key.clone()).or_insert(value.is_some());
+        Ok(value)
+    }
+
+    pub fn get_with(
+        &self,
+        txn: &mut Transaction,
+        key: &RecordKey,
+        fallback: impl FnOnce() -> Result<Option<Vec<u8>>>,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(staged) = txn.writes.get(key) {
+            if staged.expires_at != 0 && staged.expires_at <= now_unix() {
+                return Ok(None);
+            }
+            return Ok(staged.value.clone());
+        }
+        txn.read_set.insert(key.clone());
+        let now = now_unix();
+        let (has_version, value) = {
+            let engine = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+            let has_version = engine.version_at(key, txn.read_ts).is_some();
+            let value = has_version.then(|| engine.read(key, txn.read_ts, now)).transpose()?;
+            (has_version, value.flatten())
+        };
+        let value = if has_version { value } else { fallback()? };
         txn.observed.entry(key.clone()).or_insert(value.is_some());
         Ok(value)
     }
@@ -634,6 +663,19 @@ impl TxnManager {
         Ok(engine.scan(tenant, database, table, txn.read_ts, now_unix(), limit))
     }
 
+    pub fn scan_with(
+        &self,
+        txn: &mut Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        _limit: usize,
+        fallback: impl FnOnce() -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        fallback()
+    }
+
     pub fn scan_after(
         &self,
         txn: &mut Transaction,
@@ -652,8 +694,50 @@ impl TxnManager {
         Ok(engine.scan_after(tenant, database, table, txn.read_ts, now_unix(), start_after, limit))
     }
 
+    pub fn scan_after_with(
+        &self,
+        txn: &mut Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        _start_after: &[u8],
+        _limit: usize,
+        fallback: impl FnOnce() -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        fallback()
+    }
+
+    pub fn advance_to(&self, commit_ts: u64) {
+        self.inner.clock.fetch_max(commit_ts + 1, Ordering::SeqCst);
+        self.inner.applied.fetch_max(commit_ts + 1, Ordering::SeqCst);
+    }
+
+    pub fn clear_engine(&self) -> Result<()> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        self.inner
+            .engine
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?
+            .clear();
+        Ok(())
+    }
+
     pub fn latest_commit(&self) -> u64 {
         self.inner.applied.load(Ordering::SeqCst)
+    }
+
+    pub fn memory_bytes(&self) -> Result<u64> {
+        Ok(self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?
+            .bytes_held())
     }
 
     pub fn gc_horizon(&self) -> u64 {
@@ -1000,6 +1084,7 @@ pub struct DurableManager {
     wal: Arc<Mutex<Wal>>,
     segments: Arc<SegmentStore>,
     policy: SyncPolicy,
+    mode: StorageMode,
     dir: std::path::PathBuf,
 }
 
@@ -1017,6 +1102,16 @@ impl DurableManager {
         policy: SyncPolicy,
         cache_bytes: u64,
     ) -> Result<Self> {
+        Self::open_with_mode(dir, segment_bytes, policy, cache_bytes, StorageMode::Hot)
+    }
+
+    pub fn open_with_mode(
+        dir: &Path,
+        segment_bytes: u64,
+        policy: SyncPolicy,
+        cache_bytes: u64,
+        mode: StorageMode,
+    ) -> Result<Self> {
         let wal = Wal::open(dir, segment_bytes)?;
         let segments = Arc::new(SegmentStore::open_with_cache(&dir.join("segments"), cache_bytes)?);
         let manager = Self {
@@ -1024,13 +1119,21 @@ impl DurableManager {
             wal: Arc::new(Mutex::new(wal)),
             segments,
             policy,
+            mode,
             dir: dir.to_path_buf(),
         };
-        let floor = match manager.load_latest_snapshot()? {
-            Some(floor) => floor,
-            None => manager.load_all_segments()?.unwrap_or(0),
+        let floor = match mode {
+            StorageMode::Hot => match manager.load_latest_snapshot()? {
+                Some(floor) => floor,
+                None => manager.load_all_segments()?.unwrap_or(0),
+            },
+            StorageMode::Standard => manager.segments.max_commit_ts()?,
         };
-        manager.recover_from(floor)?;
+        manager.inner.advance_to(floor);
+        let recovered = manager.recover_from(floor)?;
+        if mode == StorageMode::Standard && recovered > 0 {
+            manager.inner.clear_engine()?;
+        }
         Ok(manager)
     }
 
@@ -1050,9 +1153,91 @@ impl DurableManager {
         self.segments.cache_stats()
     }
 
+    pub fn storage_mode(&self) -> StorageMode {
+        self.mode
+    }
+
+    pub fn resident_bytes(&self) -> Result<u64> {
+        self.inner.memory_bytes()
+    }
+
+    pub fn latest_commit(&self) -> u64 {
+        self.inner.latest_commit()
+    }
+
+    fn materialized_segments(&self) -> Result<Engine> {
+        Ok(self.segments.load_all()?.map(|(engine, _)| engine).unwrap_or_default())
+    }
+
+    pub fn table_bytes(&self, tenant: &str, database: &str, table: &str) -> Result<u64> {
+        match self.mode {
+            StorageMode::Hot => self.inner.table_bytes(tenant, database, table),
+            StorageMode::Standard => {
+                let engine = self.materialized_segments()?;
+                Ok(engine.table_bytes(tenant, database, table))
+            }
+        }
+    }
+
+    pub fn export_table(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<ryme_storage::TableRows> {
+        match self.mode {
+            StorageMode::Hot => self.inner.export_table(tenant, database, table),
+            StorageMode::Standard => {
+                Ok(self.materialized_segments()?.export_table(tenant, database, table))
+            }
+        }
+    }
+
+    pub fn spaces(&self) -> Result<Vec<(String, String, String)>> {
+        match self.mode {
+            StorageMode::Hot => self.inner.spaces(),
+            StorageMode::Standard => Ok(self.materialized_segments()?.spaces()),
+        }
+    }
+
+    pub fn expired_keys(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        match self.mode {
+            StorageMode::Hot => self.inner.expired_keys(tenant, database, table, limit),
+            StorageMode::Standard => Ok(self.materialized_segments()?.expired(
+                tenant,
+                database,
+                table,
+                self.latest_commit(),
+                now_unix(),
+                limit,
+            )),
+        }
+    }
+
+    pub fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
+        match self.mode {
+            StorageMode::Hot => self.inner.expires_at(key),
+            StorageMode::Standard => Ok(self
+                .segments
+                .version_at(key, self.latest_commit().saturating_sub(1))?
+                .and_then(|(_, value, expires_at)| value.map(|_| expires_at))),
+        }
+    }
+
     pub fn write_snapshot(&self) -> Result<(u64, std::path::PathBuf)> {
-        let raw = self.inner.encode_snapshot()?;
-        let snapshot = Engine::decode_snapshot(&raw)?;
+        let snapshot = match self.mode {
+            StorageMode::Hot => Engine::decode_snapshot(&self.inner.encode_snapshot()?)?,
+            StorageMode::Standard => {
+                self.segments.load_all()?.map(|(engine, _)| engine).unwrap_or_default()
+            }
+        };
+        let raw = snapshot.encode_snapshot()?;
         let max = snapshot.max_commit_ts();
         self.segments.write(max, &snapshot)?;
         let dir = self.snapshot_dir();
@@ -1191,6 +1376,9 @@ impl DurableManager {
     }
 
     pub fn compact_segments(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
+        if self.mode == StorageMode::Standard {
+            return self.segments.compact();
+        }
         let _guard = self
             .inner
             .inner
@@ -1273,6 +1461,10 @@ impl DurableManager {
                 continue;
             }
             let writes = decode_writes(&record.payload)?;
+            if self.mode == StorageMode::Standard {
+                self.segments
+                    .write_delta(record.commit_ts, &segment_entries(record.commit_ts, &writes))?;
+            }
             self.inner.apply_at(record.commit_ts, &writes)?;
             applied += 1;
         }
@@ -1284,7 +1476,13 @@ impl DurableManager {
     }
 
     pub fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
-        self.inner.get(txn, key)
+        let read_ts = txn.read_ts;
+        match self.mode {
+            StorageMode::Hot => self.inner.get(txn, key),
+            StorageMode::Standard => {
+                self.inner.get_with(txn, key, || self.segments.get(key, read_ts, now_unix()))
+            }
+        }
     }
 
     pub fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
@@ -1313,7 +1511,15 @@ impl DurableManager {
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.inner.scan(txn, tenant, database, table, limit)
+        let read_ts = txn.read_ts;
+        match self.mode {
+            StorageMode::Hot => self.inner.scan(txn, tenant, database, table, limit),
+            StorageMode::Standard => {
+                self.inner.scan_with(txn, tenant, database, table, limit, || {
+                    self.segments.scan(tenant, database, table, read_ts, now_unix(), limit)
+                })
+            }
+        }
     }
 
     pub fn scan_after(
@@ -1325,7 +1531,25 @@ impl DurableManager {
         start_after: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.inner.scan_after(txn, tenant, database, table, start_after, limit)
+        let read_ts = txn.read_ts;
+        match self.mode {
+            StorageMode::Hot => {
+                self.inner.scan_after(txn, tenant, database, table, start_after, limit)
+            }
+            StorageMode::Standard => {
+                self.inner.scan_after_with(txn, tenant, database, table, start_after, limit, || {
+                    self.segments.scan_after(
+                        tenant,
+                        database,
+                        table,
+                        read_ts,
+                        now_unix(),
+                        start_after,
+                        limit,
+                    )
+                })
+            }
+        }
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<u64> {
@@ -1334,7 +1558,7 @@ impl DurableManager {
         }
         let policy = self.policy;
         let writes = txn.writes().clone();
-        self.inner.commit_durable_with(txn, |commit_ts, payload, _| {
+        let result = self.inner.commit_durable_with(txn, |commit_ts, payload, _| {
             let mut wal =
                 self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
             wal.append(commit_ts, payload)?;
@@ -1343,7 +1567,11 @@ impl DurableManager {
             }
             self.segments.write_delta(commit_ts, &segment_entries(commit_ts, &writes))?;
             Ok(())
-        })
+        });
+        if result.is_ok() && self.mode == StorageMode::Standard {
+            self.inner.clear_engine()?;
+        }
+        result
     }
 
     pub fn commit_at(
@@ -1371,7 +1599,11 @@ impl DurableManager {
             }
         }
         self.segments.write_delta(commit_ts, &segment_entries(commit_ts, &writes))?;
-        self.inner.commit_filtered_at(txn, commit_ts, keep)
+        let result = self.inner.commit_filtered_at(txn, commit_ts, keep);
+        if result.is_ok() && self.mode == StorageMode::Standard {
+            self.inner.clear_engine()?;
+        }
+        result
     }
 }
 
@@ -1743,6 +1975,54 @@ mod tests {
         let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"v".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_mode_reads_segments_without_resident_engine_state() {
+        let dir =
+            std::env::temp_dir().join(format!("ryme-standard-{}-{}", std::process::id(), now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let key = RecordKey::new("t", "d", "messages", b"1");
+        let mut first = manager.begin();
+        manager.put(&mut first, key.clone(), b"one".to_vec());
+        manager.commit(first).unwrap();
+        assert_eq!(manager.resident_bytes().unwrap(), 0);
+
+        let mut reader = manager.begin();
+        let mut second = manager.begin();
+        manager.put(&mut second, key.clone(), b"two".to_vec());
+        manager.commit(second).unwrap();
+        assert_eq!(manager.get(&mut reader, &key).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(manager.resident_bytes().unwrap(), 0);
+
+        let mut current = manager.begin();
+        assert_eq!(manager.get(&mut current, &key).unwrap(), Some(b"two".to_vec()));
+        assert_eq!(manager.resident_bytes().unwrap(), 0);
+        let rows = manager.scan(&mut current, "t", "d", "messages", 10).unwrap();
+        assert_eq!(rows, vec![(b"1".to_vec(), b"two".to_vec())]);
+        drop(manager);
+
+        let reopened = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"two".to_vec()));
+        assert_eq!(reopened.resident_bytes().unwrap(), 0);
+        assert!(reopened.segment_cache_stats().misses > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

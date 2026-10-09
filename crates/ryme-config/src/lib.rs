@@ -1,4 +1,5 @@
 use ryme_error::{Result, RymeError};
+pub use ryme_storage::StorageMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -37,6 +38,8 @@ pub struct Config {
     pub raft_tls: bool,
     pub data_dir: PathBuf,
     pub durability: Durability,
+    #[serde(default)]
+    pub storage_mode: StorageMode,
     pub cache_bytes: u64,
     pub max_connections: u32,
     #[serde(default)]
@@ -231,6 +234,7 @@ impl Default for Config {
             http_listen: loopback(8080),
             data_dir: PathBuf::from("/var/lib/rymedb"),
             durability: Durability::LocalDurable,
+            storage_mode: StorageMode::Hot,
             cache_bytes: 64 * 1024 * 1024,
             max_connections: 10000,
             archive: ArchiveConfig::default(),
@@ -361,6 +365,15 @@ mod tests {
         assert!(Durability::RegionalFast.is_durable());
         assert!(Durability::LocalDurable.is_durable());
         assert!(!Durability::Memory.is_durable());
+    }
+
+    #[test]
+    fn storage_mode_roundtrips() {
+        let config = Config { storage_mode: StorageMode::Standard, ..Config::default() };
+        let raw = serde_json::to_string(&config).unwrap();
+        assert!(raw.contains("\"storage_mode\":\"standard\""));
+        let loaded: Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(loaded.storage_mode, StorageMode::Standard);
     }
 
     #[test]

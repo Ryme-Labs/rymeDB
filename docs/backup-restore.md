@@ -59,7 +59,9 @@ so it cannot publish a partial state.
 Point reads use a bounded decoded-segment LRU sized by `cache_bytes`. The
 storage layer exposes occupancy, hit, and miss counters through
 `SegmentStore::cache_stats`; entries are invalidated when a segment is
-rewritten, compacted, or pruned.
+rewritten, compacted, or pruned. Set `storage_mode` to `standard` to avoid
+materializing the full segment history at startup; point reads and bounded
+scans resolve versions directly from the immutable segment chain.
 
 Archives include the SQL and control-plane metadata files: `schema.json`,
 `branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema
