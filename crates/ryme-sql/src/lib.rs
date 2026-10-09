@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetOperation {
@@ -34,6 +34,15 @@ pub enum Statement {
         schema: Option<String>,
         #[serde(default)]
         if_not_exists: bool,
+    },
+    CreatePolicy {
+        name: String,
+        table: String,
+        command: String,
+        #[serde(default)]
+        using: Option<String>,
+        #[serde(default)]
+        check: Option<String>,
     },
     CreateTable {
         table: String,
@@ -433,6 +442,10 @@ pub struct SchemaSnapshot {
     pub foreign_keys: BTreeMap<String, Vec<ForeignKeyConstraint>>,
     #[serde(default)]
     pub constraints: BTreeMap<String, Vec<ConstraintMetadata>>,
+    #[serde(default)]
+    pub rls_tables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub rls_write_tables: BTreeMap<String, String>,
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -463,6 +476,7 @@ impl Statement {
             self,
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
+                | Statement::CreatePolicy { .. }
                 | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
                 | Statement::InsertRows { .. }
@@ -884,6 +898,7 @@ impl Statement {
             | Self::DeleteUsing { table, .. }
             | Self::CopyFrom { table, .. } => table,
             Self::CreateSchema { .. } | Self::CreateExtension { .. } => "",
+            Self::CreatePolicy { table, .. } => table,
             Self::DropIndex { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
@@ -1598,6 +1613,9 @@ fn unquote(value: &str) -> String {
 }
 
 fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
+    if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("POLICY")) {
+        return parse_create_policy(tokens, raw);
+    }
     if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("SCHEMA")) {
         let mut name_index = 2;
         let if_not_exists =
@@ -1680,6 +1698,75 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         foreign_keys,
         named_constraints,
         if_not_exists,
+    })
+}
+
+fn parse_create_policy(tokens: &[String], raw: &str) -> Result<Statement> {
+    let name = tokens
+        .get(2)
+        .map(|value| unquote(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create policy name")))?;
+    let on_index = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("ON"))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create policy table")))?;
+    let table = tokens
+        .get(on_index + 1)
+        .map(|value| {
+            let qualified = unquote(value);
+            qualified.rsplit('.').next().unwrap_or(&qualified).to_string()
+        })
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create policy table")))?;
+    let command = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("FOR"))
+        .and_then(|index| tokens.get(index + 1))
+        .map(|value| value.to_ascii_uppercase())
+        .unwrap_or_else(|| String::from("ALL"));
+    let using = parse_policy_expression(raw, "USING");
+    let check = parse_policy_expression(raw, "WITH CHECK");
+    if using.is_none() && check.is_none() {
+        return Err(RymeError::InvalidArgument(String::from("create policy expression")));
+    }
+    Ok(Statement::CreatePolicy { name, table, command, using, check })
+}
+
+fn parse_policy_expression(raw: &str, keyword: &str) -> Option<String> {
+    let start = find_sql_keyword(raw, keyword, 0)? + keyword.len();
+    let rest = raw[start..].trim_start();
+    if rest.starts_with('(') {
+        let close = matching_paren(raw, start + raw[start..].find('(')?)?;
+        return Some(raw[start + raw[start..].find('(')? + 1..close].trim().to_string());
+    }
+    let end = [" USING", " WITH CHECK"]
+        .iter()
+        .filter_map(|suffix| rest.to_ascii_uppercase().find(suffix))
+        .min()
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim().trim_end_matches(';').to_string())
+}
+
+fn policy_tenant_column(expression: &str) -> Option<String> {
+    if !expression.to_ascii_lowercase().contains("auth.uid()") {
+        return None;
+    }
+    expression.split('=').map(str::trim).find_map(|side| {
+        let candidate = side.trim_matches(|character: char| {
+            character.is_ascii_whitespace() || character == '"' || character == '\''
+        });
+        if candidate.eq_ignore_ascii_case("auth.uid()")
+            || candidate.is_empty()
+            || candidate.contains('(')
+            || candidate.contains(')')
+            || !candidate.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '.'
+            })
+        {
+            return None;
+        }
+        Some(candidate.rsplit('.').next().unwrap_or(candidate).to_string())
     })
 }
 
@@ -4666,6 +4753,9 @@ pub fn describe_plan(statement: &Statement) -> String {
                 schema.as_deref().map_or(String::new(), |schema| format!(" in {schema}"))
             )
         }
+        Statement::CreatePolicy { name, table, command, .. } => {
+            format!("ddl create_policy({name}) on {table} for {command}")
+        }
         Statement::CreateTable { table, columns, .. } => {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
@@ -5263,7 +5353,8 @@ pub struct Executor<B = TxnManager> {
     isolation: Isolation,
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
-    rls_tables: Arc<HashMap<String, String>>,
+    rls_tables: Arc<RwLock<HashMap<String, String>>>,
+    rls_write_tables: Arc<RwLock<HashMap<String, String>>>,
     checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
     foreign_keys: Arc<Mutex<HashMap<String, Vec<ForeignKeyConstraint>>>>,
     constraints: Arc<Mutex<HashMap<String, Vec<ConstraintMetadata>>>>,
@@ -5292,7 +5383,8 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
-            rls_tables: Arc::new(HashMap::new()),
+            rls_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5315,7 +5407,8 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
-            rls_tables: Arc::new(HashMap::new()),
+            rls_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5343,7 +5436,8 @@ where
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
-            rls_tables: Arc::new(HashMap::new()),
+            rls_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5360,12 +5454,65 @@ where
     }
 
     pub fn with_rls_tables(mut self, rls_tables: HashMap<String, String>) -> Self {
-        self.rls_tables = Arc::new(rls_tables);
+        self.rls_tables = Arc::new(RwLock::new(rls_tables.clone()));
+        self.rls_write_tables = Arc::new(RwLock::new(rls_tables));
         self
     }
 
     pub fn set_rls_tables(&mut self, rls_tables: HashMap<String, String>) {
-        self.rls_tables = Arc::new(rls_tables);
+        if let Ok(mut configured) = self.rls_tables.write() {
+            configured.extend(rls_tables.clone());
+        }
+        if let Ok(mut configured) = self.rls_write_tables.write() {
+            configured.extend(rls_tables);
+        }
+    }
+
+    fn install_policy(
+        &self,
+        table: &str,
+        command: &str,
+        using: Option<&str>,
+        check: Option<&str>,
+    ) -> Result<()> {
+        let expressions = using.into_iter().chain(check);
+        let mut tenant_column = None;
+        for expression in expressions {
+            if expression.trim().eq_ignore_ascii_case("true") {
+                continue;
+            }
+            let Some(column) = policy_tenant_column(expression) else {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "unsupported RLS policy expression",
+                )));
+            };
+            if tenant_column.as_deref().is_some_and(|current| current != column.as_str()) {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "RLS policy columns do not match",
+                )));
+            }
+            tenant_column = Some(column);
+        }
+        if let Some(column) = tenant_column {
+            let command = command.to_ascii_uppercase();
+            let applies_read = matches!(command.as_str(), "ALL" | "SELECT" | "UPDATE" | "DELETE");
+            let applies_write = matches!(command.as_str(), "ALL" | "INSERT" | "UPDATE" | "DELETE");
+            if applies_read {
+                let mut rls_tables = self
+                    .rls_tables
+                    .write()
+                    .map_err(|_| RymeError::Internal(String::from("RLS lock")))?;
+                rls_tables.insert(table.to_string(), column.clone());
+            }
+            if applies_write {
+                let mut rls_tables = self
+                    .rls_write_tables
+                    .write()
+                    .map_err(|_| RymeError::Internal(String::from("RLS write lock")))?;
+                rls_tables.insert(table.to_string(), column);
+            }
+        }
+        Ok(())
     }
 
     pub fn with_branch(mut self, branch: String) -> Self {
@@ -5391,6 +5538,7 @@ where
             catalog: self.catalog,
             indexes: self.indexes,
             rls_tables: self.rls_tables,
+            rls_write_tables: self.rls_write_tables,
             checks: self.checks,
             foreign_keys: self.foreign_keys,
             constraints: self.constraints,
@@ -5493,7 +5641,29 @@ where
                     .collect()
             })
             .unwrap_or_default();
-        SchemaSnapshot { tables, indexes, checks, foreign_keys, constraints }
+        let rls_tables = self
+            .rls_tables
+            .read()
+            .map(|rls_tables| {
+                rls_tables.iter().map(|(table, column)| (table.clone(), column.clone())).collect()
+            })
+            .unwrap_or_default();
+        let rls_write_tables = self
+            .rls_write_tables
+            .read()
+            .map(|rls_tables| {
+                rls_tables.iter().map(|(table, column)| (table.clone(), column.clone())).collect()
+            })
+            .unwrap_or_default();
+        SchemaSnapshot {
+            tables,
+            indexes,
+            checks,
+            foreign_keys,
+            constraints,
+            rls_tables,
+            rls_write_tables,
+        }
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
@@ -5518,6 +5688,16 @@ where
             *constraints = snapshot.constraints.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("constraint lock")));
+        }
+        if let Ok(mut rls_tables) = self.rls_tables.write() {
+            *rls_tables = snapshot.rls_tables.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("RLS lock")));
+        }
+        if let Ok(mut rls_tables) = self.rls_write_tables.write() {
+            *rls_tables = snapshot.rls_write_tables.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("RLS write lock")));
         }
         if let Ok(mut indexes) = self.indexes.lock() {
             indexes.clear();
@@ -5554,6 +5734,7 @@ where
             catalog: Arc::new(Mutex::new(catalog)),
             indexes: Arc::new(Mutex::new(indexes)),
             rls_tables: self.rls_tables,
+            rls_write_tables: self.rls_write_tables,
             checks: Arc::new(Mutex::new(checks)),
             foreign_keys: Arc::new(Mutex::new(foreign_keys)),
             constraints: Arc::new(Mutex::new(constraints)),
@@ -5675,19 +5856,35 @@ where
     }
 
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
-        let Some(column) = self.rls_tables.get(table) else { return true };
+        let Some(column) = self.rls_tables.read().ok().and_then(|rls| rls.get(table).cloned())
+        else {
+            return true;
+        };
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return false;
         };
         object
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .find(|(name, _)| name.eq_ignore_ascii_case(&column))
             .and_then(|(_, value)| value.as_str())
             .is_some_and(|tenant| tenant == self.tenant)
     }
 
     fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
-        if self.rls_allows(table, value) {
+        let Some(column) =
+            self.rls_write_tables.read().ok().and_then(|rls| rls.get(table).cloned())
+        else {
+            return Ok(());
+        };
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
+            return Err(RymeError::Forbidden);
+        };
+        if object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&column))
+            .and_then(|(_, value)| value.as_str())
+            .is_some_and(|tenant| tenant == self.tenant)
+        {
             Ok(())
         } else {
             Err(RymeError::Forbidden)
@@ -6942,7 +7139,9 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
-        if self.rls_tables.contains_key(table) {
+        let rls_enabled =
+            self.rls_tables.read().ok().is_some_and(|rls_tables| rls_tables.contains_key(table));
+        if rls_enabled {
             if limit == 0 {
                 return Ok(Vec::new());
             }
@@ -8609,7 +8808,9 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match &statement {
-            Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {}
+            Statement::CreateSchema { .. }
+            | Statement::CreateExtension { .. }
+            | Statement::CreatePolicy { .. } => {}
             Statement::CreateTable {
                 table,
                 columns,
@@ -8662,6 +8863,10 @@ where
                 Ok((apply_distinct(result, offset, limit), changes))
             }
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::CreatePolicy { table, command, using, check, .. } => {
+                self.install_policy(&table, &command, using.as_deref(), check.as_deref())?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
@@ -10055,7 +10260,9 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match &statement {
-            Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {}
+            Statement::CreateSchema { .. }
+            | Statement::CreateExtension { .. }
+            | Statement::CreatePolicy { .. } => {}
             Statement::CreateTable {
                 table,
                 columns,
@@ -10092,6 +10299,7 @@ where
             &statement,
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
+                | Statement::CreatePolicy { .. }
                 | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
                 | Statement::DropIndex { .. }
@@ -10410,6 +10618,10 @@ where
                 merge_set_results(left, right, operation, all)
             }
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
+                Ok(QueryResult::Ok)
+            }
+            Statement::CreatePolicy { table, command, using, check, .. } => {
+                self.install_policy(&table, &command, using.as_deref(), check.as_deref())?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
@@ -11586,6 +11798,56 @@ mod tests {
         let hidden_delete =
             executor.execute(parse("DELETE FROM messages WHERE id = 'hidden'").unwrap()).await;
         assert!(matches!(hidden_delete, Err(RymeError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn sql_create_policy_installs_persisted_tenant_rls() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT, body TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, tenant_id, body) VALUES ('visible', 'tenant-a', 'hello'), ('hidden', 'tenant-b', 'secret')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let policy = parse(
+            "CREATE POLICY own_messages ON public.messages FOR ALL USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
+        )
+        .unwrap();
+        assert!(
+            matches!(policy, Statement::CreatePolicy { ref table, ref command, ref using, ref check, .. }
+            if table == "messages"
+                && command == "ALL"
+                && using.as_deref() == Some("auth.uid() = tenant_id")
+                && check.as_deref() == Some("auth.uid() = tenant_id"))
+        );
+        executor.execute(policy).await.unwrap();
+        let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+        let rejected = executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, tenant_id, body) VALUES ('blocked', 'tenant-b', 'nope')",
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(rejected, Err(RymeError::Forbidden)));
+
+        let snapshot = executor.schema_snapshot();
+        assert_eq!(snapshot.rls_tables.get("messages"), Some(&String::from("tenant_id")));
+        assert_eq!(snapshot.rls_write_tables.get("messages"), Some(&String::from("tenant_id")));
+        executor.restore_schema_snapshot(snapshot).unwrap();
     }
 
     #[tokio::test]

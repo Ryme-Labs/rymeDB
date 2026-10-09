@@ -8,6 +8,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Common Supabase `CREATE POLICY ... FOR ALL` declarations using
+  `auth.uid() = tenant_column` now install tenant-scoped read/write checks in
+  the SQL executor and persist them with schema snapshots; command-specific
+  policies keep separate read and write enforcement.
 - PostgreSQL migration setup now accepts `CREATE SCHEMA IF NOT EXISTS` and
   `CREATE EXTENSION IF NOT EXISTS ... [WITH SCHEMA ...]` declarations.
 - PostgreSQL aggregates now return protocol-level `NULL` for empty
