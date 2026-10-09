@@ -27,7 +27,8 @@ ryme backup pitr 1735689600
 `pitr` selects the checkpoint covering the target timestamp
 (`backups.select_pitr`). Record checkpoints on a schedule (the `interval_secs`
 archiver does this when an archive target is configured) so PITR targets
-actually resolve. The in-memory log keeps the newest 128 markers
+actually resolve. The control-plane snapshot in `data_dir/control.json` keeps
+the newest 128 markers
 (`BACKUP_LOG_KEEP`); effective PITR depth is additionally bounded by
 snapshot/WAL retention on disk.
 

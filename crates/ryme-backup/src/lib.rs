@@ -9,8 +9,9 @@ pub struct Checkpoint {
     pub created_unix: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackupLog {
+    #[serde(default)]
     checkpoints: Vec<Checkpoint>,
 }
 
@@ -41,6 +42,18 @@ impl BackupLog {
 
     pub fn latest(&self) -> Option<Checkpoint> {
         self.checkpoints.last().cloned()
+    }
+
+    pub fn from_checkpoints(checkpoints: Vec<Checkpoint>) -> Self {
+        let mut log = Self::new();
+        for checkpoint in checkpoints {
+            log.record(checkpoint);
+        }
+        log
+    }
+
+    pub fn checkpoints(&self) -> &[Checkpoint] {
+        &self.checkpoints
     }
 
     pub fn retain(&mut self, keep: usize) -> Vec<Checkpoint> {

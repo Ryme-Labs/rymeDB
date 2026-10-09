@@ -960,6 +960,31 @@ async fn extras_migrate_apply_executes_and_records() {
     assert!(text.contains("\"version\":1"), "{text}");
     assert!(text.contains("\"valid\":true"), "{text}");
     assert!(text.contains("\"migration_id\":\"m1\""), "{text}");
+    server.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let pg_listener = bind_listener().await;
+    let resp_listener = bind_listener().await;
+    let http_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp = resp_listener.local_addr().unwrap();
+    let http = http_listener.local_addr().unwrap();
+    let config = Config {
+        node_id: String::from("extras-ledger"),
+        data_dir: root.clone(),
+        pg_listen: pg,
+        resp_listen: resp,
+        http_listen: http,
+        ..Config::default()
+    };
+    let restarted = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, body) = http_request(http, "GET /v1/migrate/ledger", b"").await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains("\"migration_id\":\"m1\""), "{text}");
+    assert!(text.contains("\"version\":1"), "{text}");
     let (status, _) = http_request(http, "POST /v1/migrate/apply", apply.as_bytes()).await;
     assert_eq!(status, 409);
     let (status, _) =
@@ -972,7 +997,7 @@ async fn extras_migrate_apply_executes_and_records() {
     )
     .await;
     assert_eq!(status, 400);
-    server.abort();
+    restarted.abort();
     let _ = std::fs::remove_dir_all(&root);
 }
 

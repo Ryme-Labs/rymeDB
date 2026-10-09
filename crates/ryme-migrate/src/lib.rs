@@ -380,8 +380,9 @@ pub struct LedgerEntry {
     pub author: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Ledger {
+    #[serde(default)]
     entries: Vec<LedgerEntry>,
 }
 
@@ -451,6 +452,12 @@ impl Ledger {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub fn from_entries(entries: Vec<LedgerEntry>) -> Result<Self> {
+        let ledger = Self { entries };
+        ledger.verify()?;
+        Ok(ledger)
     }
 }
 

@@ -484,6 +484,7 @@ pub struct SharedState {
     database: String,
     branch_path: std::path::PathBuf,
     auth_path: std::path::PathBuf,
+    control_path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -516,6 +517,34 @@ fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("auth snapshot: {error}")))
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ControlSnapshot {
+    #[serde(default)]
+    backups: ryme_backup::BackupLog,
+    #[serde(default)]
+    migrations: ryme_migrate::Ledger,
+}
+
+fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSnapshot> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ControlSnapshot::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let snapshot: ControlSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("control snapshot: {error}")))?;
+    snapshot
+        .migrations
+        .verify()
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("control ledger: {error}")))?;
+    Ok(ControlSnapshot {
+        backups: ryme_backup::BackupLog::from_checkpoints(snapshot.backups.checkpoints().to_vec()),
+        migrations: snapshot.migrations,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -799,6 +828,39 @@ impl SharedState {
         Ok(())
     }
 
+    fn persist_control(&self) -> ryme_error::Result<()> {
+        let snapshot = {
+            let control = self
+                .control
+                .lock()
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+            ControlSnapshot {
+                backups: control.backups.clone(),
+                migrations: control.migrations.clone(),
+            }
+        };
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
+            ryme_error::RymeError::Internal(format!("control snapshot: {error}"))
+        })?;
+        if let Some(parent) = self.control_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self.control_path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(temporary, &self.control_path)?;
+        Ok(())
+    }
+
     pub fn build(config: &Config) -> ryme_error::Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
         let wal_dir = config.data_dir.join("wal");
@@ -876,8 +938,12 @@ impl SharedState {
         executor.set_read_only(config.read_only);
         let branch_path = config.data_dir.join("branches.json");
         let auth_path = config.data_dir.join("auth.json");
+        let control_path = config.data_dir.join("control.json");
         let auth_snapshot = load_auth_snapshot(&auth_path)?;
+        let control_snapshot = load_control_snapshot(&control_path)?;
         let mut control = ControlPlane::new();
+        control.backups = control_snapshot.backups;
+        control.migrations = control_snapshot.migrations;
         control.branches = ryme_branch::BranchManager::load(&branch_path)?;
         control.add_range(Range::new(
             String::from("range-0"),
@@ -992,6 +1058,7 @@ impl SharedState {
             database,
             branch_path,
             auth_path,
+            control_path,
         })
     }
 
@@ -2930,8 +2997,13 @@ async fn migrate_apply(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.migrations.apply(request.id, &request.sql, author, now_secs()) {
-        Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
+    let applied = control.migrations.apply(request.id, &request.sql, author, now_secs());
+    drop(control);
+    match applied {
+        Ok(entry) => match state.persist_control() {
+            Ok(()) => (StatusCode::CREATED, Json(entry)).into_response(),
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
@@ -5021,12 +5093,17 @@ async fn checkpoint_create(
         manifest_id: request.manifest_id.unwrap_or_else(|| String::from("genesis")),
         created_unix: now_secs(),
     };
-    let mut control = match state.control.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+    let recorded = match state.control.lock() {
+        Ok(mut control) => {
+            control.backups.record(checkpoint.clone());
+            Ok(())
+        }
+        Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    control.backups.record(checkpoint.clone());
-    (StatusCode::OK, Json(checkpoint)).into_response()
+    match recorded.and_then(|()| state.persist_control()) {
+        Ok(()) => (StatusCode::OK, Json(checkpoint)).into_response(),
+        Err(e) => error_response(e),
+    }
 }
 
 async fn checkpoint_latest(State(state): State<SharedState>, headers: HeaderMap) -> Response {
@@ -5153,13 +5230,17 @@ async fn backup_archive(
                 manifest_id: manifest.manifest_key(),
                 created_unix: now_secs(),
             };
-            match state.control.lock() {
-                Ok(mut guard) => guard.backups.record(checkpoint),
-                Err(_) => {
-                    return error_response(ryme_error::RymeError::Internal(String::from("lock")))
+            let recorded = match state.control.lock() {
+                Ok(mut guard) => {
+                    guard.backups.record(checkpoint);
+                    Ok(())
                 }
+                Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
+            };
+            match recorded.and_then(|()| state.persist_control()) {
+                Ok(()) => (StatusCode::OK, Json(manifest)).into_response(),
+                Err(e) => error_response(e),
             }
-            (StatusCode::OK, Json(manifest)).into_response()
         }
         Err(e) => error_response(e),
     }

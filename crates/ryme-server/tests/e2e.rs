@@ -422,6 +422,19 @@ async fn e2e_pitr_restore_roundtrip() {
     let (status, body) = http_request(http, "POST /v1/backups/checkpoint", b"{}").await;
     assert_eq!(status, 200);
     let target = checkpoint_commit(&body);
+    server.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let pg_listener = bind_listener().await;
+    let resp_listener = bind_listener().await;
+    let http_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp = resp_listener.local_addr().unwrap();
+    let http = http_listener.local_addr().unwrap();
+    let config = test_config(&root, pg, resp, http);
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
     let (status, _) = http_request(http, "PUT /v1/kv/docs/after", b"v-after").await;
     assert_eq!(status, 200);
     let (status, body) =
