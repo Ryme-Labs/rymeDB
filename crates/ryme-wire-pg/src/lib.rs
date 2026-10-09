@@ -2532,6 +2532,7 @@ fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
 fn session_default(name: &str) -> Option<&'static str> {
     match name.to_ascii_lowercase().as_str() {
         "server_version" => Some("16.0"),
+        "server_version_num" => Some("160000"),
         "server_encoding" => Some("UTF8"),
         "client_encoding" => Some("UTF8"),
         "datestyle" => Some("ISO, MDY"),
@@ -2540,7 +2541,11 @@ fn session_default(name: &str) -> Option<&'static str> {
         "integer_datetimes" => Some("on"),
         "standard_conforming_strings" => Some("on"),
         "transaction_isolation" => Some("serializable"),
+        "default_transaction_isolation" => Some("serializable"),
         "application_name" => Some(""),
+        "session_authorization" => Some("ryme"),
+        "is_superuser" => Some("off"),
+        "max_identifier_length" => Some("63"),
         "search_path" => Some("public"),
         _ => None,
     }
@@ -3045,7 +3050,12 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
                     "search_path",
                     "server_encoding",
                     "server_version",
+                    "server_version_num",
                     "standard_conforming_strings",
+                    "default_transaction_isolation",
+                    "session_authorization",
+                    "is_superuser",
+                    "max_identifier_length",
                     "timezone",
                     "transaction_isolation",
                 ];
@@ -3907,6 +3917,10 @@ mod tests {
         assert!(session_command("SET SESSION application_name = 'worker'", &mut session).is_some());
         let rows = session_select("SELECT current_setting('application_name')", &session).unwrap();
         assert_eq!(rows[0].1, "worker");
+        let rows =
+            session_select("SELECT current_setting('server_version_num')", &session).unwrap();
+        assert_eq!(rows[0].1, "160000");
+        assert!(session_command("SHOW default_transaction_isolation", &mut session).is_some());
         assert!(session_command("SHOW ALL", &mut session).is_some());
     }
 

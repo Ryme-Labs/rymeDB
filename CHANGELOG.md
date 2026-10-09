@@ -25,6 +25,9 @@ All notable changes to rymeDB are recorded here. Format follows
   `nullsfirst`/`nullslast` modifiers.
 - REST honors PostgREST `Prefer: return=minimal` mutations and emits exact
   `Content-Range` totals for `Prefer: count=exact` reads.
+- PostgreSQL session compatibility now exposes common driver defaults for
+  `server_version_num`, `default_transaction_isolation`, authorization, and
+  identifier limits through `SHOW` and `current_setting`.
 
 - PostgREST filtering now advances through ordered storage pages, so matching
   rows beyond the first page are not lost; non-key ordering scans the complete
