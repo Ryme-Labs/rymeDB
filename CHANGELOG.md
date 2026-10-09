@@ -113,6 +113,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` now skips existing primary or
   unique conflicts without overwriting rows, including multi-row inserts and
   `RETURNING`.
+- PostgreSQL conflict-target upserts now match declared primary or unique
+  columns, apply `EXCLUDED.column` assignments, support targeted `DO NOTHING`,
+  and return the updated row for single- and multi-row inserts.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
