@@ -123,6 +123,8 @@ claim about all realtime workloads or connection capacity.
 
 - Same-AZ loopback reads at p50 under 0.1 ms and p99 under 0.5 ms for hot
   128-byte keys against a single durable node.
+- Runtime `/metrics` and Prometheus output expose p50, p90, p95, p99, p99.9,
+  and max tail measurements for the request histogram.
 - Durable single-row writes acknowledged at p50 ~0.13 ms, p99 ~0.43 ms.
 - Metadata branch creation is O(1) in data size (manifest + WAL pointer).
   Pinned by `extras_branch_metadata_latency`: with 1000 rows loaded, the

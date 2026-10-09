@@ -2247,19 +2247,21 @@ async fn metrics(State(state): State<SharedState>) -> Json<serde_json::Value> {
         "p90_micros": histogram.p90_micros,
         "p95_micros": histogram.p95_micros,
         "p99_micros": histogram.p99_micros,
+        "p999_micros": histogram.p999_micros,
     }))
 }
 
 async fn prometheus(State(state): State<SharedState>) -> Response {
     let histogram = state.histogram.snapshot();
     let body = format!(
-        "# HELP rymedb_uptime_seconds node uptime\n# TYPE rymedb_uptime_seconds counter\nrymedb_uptime_seconds {} \n# HELP rymedb_commit_index latest commit\n# TYPE rymedb_commit_index gauge\nrymedb_commit_index {} \n# HELP rymedb_rest_microseconds rest latency\n# TYPE rymedb_rest_microseconds summary\nrymedb_rest_microseconds{{quantile=\"0.5\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.9\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.95\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.99\"}} {}\nrymedb_rest_microseconds_count {}\nrymedb_rest_microseconds_max {} \n",
+        "# HELP rymedb_uptime_seconds node uptime\n# TYPE rymedb_uptime_seconds counter\nrymedb_uptime_seconds {} \n# HELP rymedb_commit_index latest commit\n# TYPE rymedb_commit_index gauge\nrymedb_commit_index {} \n# HELP rymedb_rest_microseconds rest latency\n# TYPE rymedb_rest_microseconds summary\nrymedb_rest_microseconds{{quantile=\"0.5\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.9\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.95\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.99\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.999\"}} {}\nrymedb_rest_microseconds_count {}\nrymedb_rest_microseconds_max {} \n",
         now_secs().saturating_sub(state.started_unix),
         state.backend.latest_commit(),
         histogram.p50_micros,
         histogram.p90_micros,
         histogram.p95_micros,
         histogram.p99_micros,
+        histogram.p999_micros,
         histogram.count,
         histogram.max_micros
     );

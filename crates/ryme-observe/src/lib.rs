@@ -136,6 +136,7 @@ impl Histogram {
             p90_micros: quantile(0.90),
             p95_micros: quantile(0.95),
             p99_micros: quantile(0.99),
+            p999_micros: quantile(0.999),
         }
     }
 
@@ -145,11 +146,12 @@ impl Histogram {
         out.push_str(&format!("# HELP {name} {help}\n"));
         out.push_str(&format!("# TYPE {name} summary\n"));
         out.push_str(&format!(
-            "{name}{{quantile=\"0.5\"}} {}\n{name}{{quantile=\"0.9\"}} {}\n{name}{{quantile=\"0.95\"}} {}\n{name}{{quantile=\"0.99\"}} {}\n{name}_count {}\n{name}_max_microseconds {}\n",
+            "{name}{{quantile=\"0.5\"}} {}\n{name}{{quantile=\"0.9\"}} {}\n{name}{{quantile=\"0.95\"}} {}\n{name}{{quantile=\"0.99\"}} {}\n{name}{{quantile=\"0.999\"}} {}\n{name}_count {}\n{name}_max_microseconds {}\n",
             snap.p50_micros,
             snap.p90_micros,
             snap.p95_micros,
             snap.p99_micros,
+            snap.p999_micros,
             snap.count,
             snap.max_micros
         ));
@@ -172,6 +174,7 @@ pub struct HistogramSnapshot {
     pub p90_micros: u64,
     pub p95_micros: u64,
     pub p99_micros: u64,
+    pub p999_micros: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,6 +528,7 @@ mod tests {
         assert_eq!(snap.count, 100);
         assert!(snap.p50_micros >= 45 && snap.p50_micros <= 55);
         assert!(snap.p99_micros >= 95);
+        assert_eq!(snap.p999_micros, 100);
         assert_eq!(snap.max_micros, 100);
     }
 
