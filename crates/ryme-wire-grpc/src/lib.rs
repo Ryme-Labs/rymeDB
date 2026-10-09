@@ -514,6 +514,23 @@ where
                     .map(|(pk, value)| masked_row(&self.gateway, &table, pk, value))
                     .collect(),
             },
+            Ok(ryme_sql::QueryResult::Table { columns, rows }) => proto::SqlReply {
+                ok: true,
+                error: String::new(),
+                rows: rows
+                    .into_iter()
+                    .map(|row| {
+                        let pk = row.first().cloned().unwrap_or_default();
+                        let value = serde_json::json!({
+                            "columns": columns.clone(),
+                            "values": row,
+                        })
+                        .to_string()
+                        .into_bytes();
+                        masked_row(&self.gateway, &table, pk, value)
+                    })
+                    .collect(),
+            },
             Ok(ryme_sql::QueryResult::Returning { rows, .. }) => proto::SqlReply {
                 ok: true,
                 error: String::new(),

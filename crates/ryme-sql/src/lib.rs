@@ -45,6 +45,14 @@ pub enum Statement {
         order: Order,
         filter: Vec<Predicate>,
     },
+    SelectColumns {
+        table: String,
+        columns: Vec<String>,
+        limit: usize,
+        offset: usize,
+        order: Order,
+        filter: Vec<Predicate>,
+    },
     Aggregate {
         table: String,
         func: AggFunc,
@@ -137,6 +145,7 @@ pub enum QueryResult {
     Rows { rows: Vec<(Vec<u8>, Vec<u8>)> },
     Scalar { label: String, value: Vec<u8> },
     Returning { columns: Vec<String>, rows: Vec<Vec<Vec<u8>>> },
+    Table { columns: Vec<String>, rows: Vec<Vec<Vec<u8>>> },
 }
 
 pub type Row = (Vec<u8>, Vec<u8>);
@@ -269,6 +278,7 @@ impl Statement {
             | Self::Upsert { table, .. }
             | Self::SelectByKey { table, .. }
             | Self::SelectScan { table, .. }
+            | Self::SelectColumns { table, .. }
             | Self::Aggregate { table, .. }
             | Self::Join { left: table, .. }
             | Self::GroupBy { table, .. }
@@ -732,8 +742,9 @@ fn parse_select(tokens: &[String]) -> Result<Statement> {
     }
     let has_where = tokens.iter().any(|t| t.eq_ignore_ascii_case("WHERE"));
     let has_join = tokens.iter().any(|t| t.eq_ignore_ascii_case("JOIN"));
+    let projection = parse_projection(tokens)?;
     let filter = parse_where_filter(tokens)?;
-    if !has_join {
+    if projection.is_none() && !has_join {
         if let Some(pk) = point_lookup_key(tokens) {
             let exact_where = filter.len() == 1
                 && filter[0].field == Field::Key
@@ -748,7 +759,32 @@ fn parse_select(tokens: &[String]) -> Result<Statement> {
         return parse_join(tokens, &table);
     }
     let (limit, offset, order) = parse_scan_tail(tokens)?;
+    if let Some(columns) = projection {
+        return Ok(Statement::SelectColumns { table, columns, limit, offset, order, filter });
+    }
     Ok(Statement::SelectScan { table, limit, offset, order, filter })
+}
+
+fn parse_projection(tokens: &[String]) -> Result<Option<Vec<String>>> {
+    let from = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("FROM"))
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("missing table")))?;
+    let selected = &tokens[1..from];
+    if selected.is_empty() || (selected.len() == 1 && selected[0] == "*") {
+        return Ok(None);
+    }
+    let columns = selected
+        .iter()
+        .map(|token| {
+            if token == "*" {
+                Err(RymeError::InvalidArgument(String::from("select projection")))
+            } else {
+                Ok(unquote(token))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(columns))
 }
 
 fn parse_group(tokens: &[String], table: &str) -> Result<Statement> {
@@ -1093,6 +1129,18 @@ fn json_insert_value(value: Option<Vec<u8>>, data_type: &str) -> serde_json::Val
     serde_json::Value::String(text.into_owned())
 }
 
+fn json_result_bytes(value: &serde_json::Value) -> Vec<u8> {
+    match value {
+        serde_json::Value::String(text) => text.as_bytes().to_vec(),
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Bool(value) => value.to_string().into_bytes(),
+        serde_json::Value::Number(value) => value.to_string().into_bytes(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_vec(value).unwrap_or_default()
+        }
+    }
+}
+
 fn new_uuid_v4() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| RymeError::Internal(e.to_string()))?;
@@ -1164,6 +1212,9 @@ pub fn describe_plan(statement: &Statement) -> String {
                 "scan({table}) limit {limit} offset {offset} order {field} {direction} filters {} using ordered range",
                 filter.len()
             )
+        }
+        Statement::SelectColumns { table, columns, limit, offset, .. } => {
+            format!("project({table}) columns {} limit {limit} offset {offset}", columns.len())
         }
         Statement::Update { table, .. } => format!("write update({table}) point"),
         Statement::Delete { table, .. } => format!("write delete({table}) point"),
@@ -1523,6 +1574,96 @@ where
         let encoded = serde_json::to_vec(&serde_json::Value::Object(object))
             .map_err(|error| RymeError::Internal(error.to_string()))?;
         Ok((pk, encoded))
+    }
+
+    fn project_row(
+        &self,
+        table: &str,
+        columns: &[String],
+        pk: &[u8],
+        value: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let definitions = self.catalog_columns(table);
+        let primary_key = definitions
+            .iter()
+            .find(|definition| definition.primary_key)
+            .map(|definition| definition.name.as_str());
+        let object = serde_json::from_slice::<serde_json::Value>(value).ok();
+        columns
+            .iter()
+            .map(|column| {
+                if column.eq_ignore_ascii_case("key")
+                    || column.eq_ignore_ascii_case("pk")
+                    || column.eq_ignore_ascii_case("id")
+                    || primary_key.is_some_and(|name| name.eq_ignore_ascii_case(column))
+                {
+                    return pk.to_vec();
+                }
+                if column.eq_ignore_ascii_case("value")
+                    || column.eq_ignore_ascii_case("val")
+                    || column.eq_ignore_ascii_case("data")
+                {
+                    return value.to_vec();
+                }
+                let Some(serde_json::Value::Object(object)) = object.as_ref() else {
+                    return value.to_vec();
+                };
+                object
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                    .map(|(_, value)| json_result_bytes(value))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn select_columns_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        table: String,
+        columns: Vec<String>,
+        limit: usize,
+        offset: usize,
+        order: Order,
+        filter: Vec<Predicate>,
+    ) -> Result<QueryResult> {
+        let exact_key =
+            filter.len() == 1 && filter[0].field == Field::Key && filter[0].op == Cmp::Eq;
+        let rows = if exact_key {
+            let pk = filter[0].operand.clone();
+            self.manager
+                .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &pk))?
+                .map(|value| vec![(pk, value)])
+                .unwrap_or_default()
+        } else {
+            let cap = if filter.is_empty() && offset == 0 && order == Order::default() {
+                limit.clamp(1, 10000)
+            } else {
+                10000
+            };
+            self.scan_rows(txn, &table, &filter, cap)?
+        };
+        let mut rows: Vec<Row> = rows
+            .into_iter()
+            .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
+            .collect();
+        rows.sort_by(|left, right| {
+            let (first, second) = match order.field {
+                Field::Key => (&left.0, &right.0),
+                Field::Value => (&left.1, &right.1),
+            };
+            match order.direction {
+                Direction::Asc => first.cmp(second),
+                Direction::Desc => second.cmp(first),
+            }
+        });
+        let rows = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
+            .collect();
+        Ok(QueryResult::Table { columns, rows })
     }
 
     fn scan_all_rows(&self, table: &str) -> Result<Vec<Row>> {
@@ -2012,6 +2153,8 @@ where
                     None => Ok(QueryResult::Rows { rows: Vec::new() }),
                 }
             }
+            Statement::SelectColumns { table, columns, limit, offset, order, filter } => self
+                .select_columns_in_transaction(txn, table, columns, limit, offset, order, filter),
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
@@ -2307,6 +2450,12 @@ where
                     Some(value) => Ok(QueryResult::Row { pk, value }),
                     None => Ok(QueryResult::Rows { rows: Vec::new() }),
                 }
+            }
+            Statement::SelectColumns { table, columns, limit, offset, order, filter } => {
+                let mut txn = self.manager.begin_with(isolation);
+                self.select_columns_in_transaction(
+                    &mut txn, table, columns, limit, offset, order, filter,
+                )
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let mut txn = self.manager.begin_with(isolation);
@@ -2658,6 +2807,39 @@ mod tests {
         assert!(
             matches!(missing, Err(RymeError::InvalidArgument(message)) if message.contains("not-null"))
         );
+    }
+
+    #[tokio::test]
+    async fn named_projection_reads_schema_row_fields() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE events (id TEXT PRIMARY KEY, payload TEXT, count INTEGER)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO events (id, payload, count) VALUES ('e1', 'hello', 3)").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let statement = parse("SELECT payload, count FROM events WHERE id = 'e1'").unwrap();
+        assert!(matches!(statement, Statement::SelectColumns { ref columns, .. }
+            if columns == &[String::from("payload"), String::from("count")]));
+        let result = executor.execute(statement).await.unwrap();
+        assert!(matches!(result, QueryResult::Table { ref columns, ref rows }
+            if columns == &[String::from("payload"), String::from("count")]
+                && rows == &vec![vec![b"hello".to_vec(), b"3".to_vec()]]));
+
+        let result = executor
+            .execute(parse("SELECT id, payload FROM events WHERE id = 'e1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Table { ref rows, .. }
+            if rows == &vec![vec![b"e1".to_vec(), b"hello".to_vec()]]));
     }
 
     #[tokio::test]

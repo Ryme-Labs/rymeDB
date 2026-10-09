@@ -607,6 +607,27 @@ where
                 );
                 response
             }
+            Ok(ryme_sql::QueryResult::Table { columns, rows }) => {
+                let mut response = Response::ok();
+                response.rows = Some(
+                    rows.into_iter()
+                        .map(|row| {
+                            let pk = row.first().cloned().unwrap_or_default();
+                            let value = serde_json::json!({
+                                "columns": columns.clone(),
+                                "values": row,
+                            })
+                            .to_string();
+                            let masked = self.gateway.masked(&table, value.into_bytes());
+                            Row {
+                                pk: String::from_utf8_lossy(&pk).to_string(),
+                                value: String::from_utf8_lossy(&masked).to_string(),
+                            }
+                        })
+                        .collect(),
+                );
+                response
+            }
             Ok(ryme_sql::QueryResult::Returning { rows, .. }) => {
                 let mut response = Response::ok();
                 response.rows = Some(

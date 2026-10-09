@@ -1932,6 +1932,7 @@ dependencies = [
  "ryme-storage",
  "ryme-tls",
  "ryme-txn",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",

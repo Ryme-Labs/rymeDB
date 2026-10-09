@@ -4182,6 +4182,27 @@ async fn sql_exec(
                 .collect();
             (StatusCode::OK, Json(serde_json::json!({ "rows": items }))).into_response()
         }
+        Ok(QueryResult::Table { columns, rows }) => {
+            let egress: u64 = columns.iter().map(String::len).sum::<usize>() as u64
+                + rows.iter().flatten().map(Vec::len).sum::<usize>() as u64;
+            if let Err(e) = admit_egress(&state, &principal.tenant, egress) {
+                return error_response(e);
+            }
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|row| {
+                    serde_json::json!(row
+                        .into_iter()
+                        .map(|value| {
+                            String::from_utf8_lossy(&state.gateway.masked(&table_name, value))
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>())
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({ "columns": columns, "rows": items })))
+                .into_response()
+        }
         Ok(QueryResult::Returning { columns, rows }) => {
             let egress: u64 = columns.iter().map(String::len).sum::<usize>() as u64
                 + rows.iter().flatten().map(Vec::len).sum::<usize>() as u64;

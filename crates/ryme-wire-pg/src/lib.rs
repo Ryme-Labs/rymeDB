@@ -831,6 +831,9 @@ fn describe_query(query: &str) -> Vec<u8> {
         if let Statement::Returning { fields, .. } = &statement {
             return returning_description(fields);
         }
+        if let Statement::SelectColumns { columns, .. } = &statement {
+            return multi_row_description(columns);
+        }
         if matches!(
             statement,
             ryme_sql::Statement::SelectByKey { .. } | ryme_sql::Statement::SelectScan { .. }
@@ -2060,6 +2063,14 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
             for (_, value) in rows {
                 let text = String::from_utf8_lossy(&value).into_owned();
                 out.extend(data_row(text));
+            }
+            out.extend(command_complete("SELECT"));
+            out
+        }
+        QueryResult::Table { columns, rows } => {
+            let mut out = multi_row_description(&columns);
+            for row in rows {
+                out.extend(data_row_values(&row));
             }
             out.extend(command_complete("SELECT"));
             out
