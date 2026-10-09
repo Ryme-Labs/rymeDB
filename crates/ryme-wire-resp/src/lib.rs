@@ -1551,6 +1551,36 @@ where
                     encode_simple("OK")
                 }
             }
+            "SETNX" => {
+                if command.args.len() != 2 {
+                    return encode_error(String::from("wrong args"));
+                }
+                let record =
+                    RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+                match self.manager.get(txn, &record) {
+                    Ok(Some(_)) => encode_integer(0),
+                    Ok(None) => {
+                        self.manager.put(txn, record, command.args[1].clone());
+                        encode_integer(1)
+                    }
+                    Err(error) => encode_error(error.to_string()),
+                }
+            }
+            "GETSET" => {
+                if command.args.len() != 2 {
+                    return encode_error(String::from("wrong args"));
+                }
+                let record =
+                    RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+                match self.manager.get(txn, &record) {
+                    Ok(previous) => {
+                        self.manager.put(txn, record, command.args[1].clone());
+                        previous.map_or_else(encode_null, |value| encode_bulk(&value))
+                    }
+                    Err(error) => encode_error(error.to_string()),
+                }
+            }
+            "GETEX" => self.getex(txn, &command.args),
             "GETDEL" => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
@@ -1725,6 +1755,24 @@ where
                     self.manager.put(txn, record, pair[1].clone());
                 }
                 encode_simple("OK")
+            }
+            "MSETNX" => {
+                if command.args.is_empty() || !command.args.len().is_multiple_of(2) {
+                    return encode_error(String::from("wrong args"));
+                }
+                let mut records = Vec::with_capacity(command.args.len() / 2);
+                for pair in command.args.as_chunks::<2>().0 {
+                    let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &pair[0]);
+                    match self.manager.get(txn, &record) {
+                        Ok(Some(_)) => return encode_integer(0),
+                        Ok(None) => records.push((record, pair[1].clone())),
+                        Err(error) => return encode_error(error.to_string()),
+                    }
+                }
+                for (record, value) in records {
+                    self.manager.put(txn, record, value);
+                }
+                encode_integer(1)
             }
             "HSET" => {
                 if command.args.len() < 3 || command.args.len().is_multiple_of(2) {
@@ -4515,6 +4563,32 @@ where
         }
     }
 
+    fn getex(&self, txn: &mut Transaction, args: &[Vec<u8>]) -> Vec<u8> {
+        if args.is_empty() {
+            return encode_error(String::from("wrong args"));
+        }
+        let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &args[0]);
+        let option = match parse_getex_option(&args[1..]) {
+            Ok(option) => option,
+            Err(error) => return encode_error(error),
+        };
+        let value = match self.manager.get(txn, &record) {
+            Ok(value) => value,
+            Err(error) => return encode_error(error.to_string()),
+        };
+        let Some(value) = value else {
+            return encode_null();
+        };
+        match option {
+            GetExOption::Keep => {}
+            GetExOption::Persist => self.manager.put_with_ttl(txn, record, value.clone(), 0),
+            GetExOption::Expires(expires_at) => {
+                self.manager.put_with_ttl(txn, record, value.clone(), expires_at)
+            }
+        }
+        encode_bulk(&value)
+    }
+
     fn expire_key(
         &self,
         txn: &mut Transaction,
@@ -4604,6 +4678,43 @@ enum ExpireMode {
     OnlyPresent,
     Greater,
     Less,
+}
+
+enum GetExOption {
+    Keep,
+    Persist,
+    Expires(u64),
+}
+
+fn parse_getex_option(args: &[Vec<u8>]) -> std::result::Result<GetExOption, String> {
+    if args.is_empty() {
+        return Ok(GetExOption::Keep);
+    }
+    if args.len() == 1 && args[0].eq_ignore_ascii_case(b"PERSIST") {
+        return Ok(GetExOption::Persist);
+    }
+    if args.len() != 2 {
+        return Err(String::from("syntax"));
+    }
+    let mode = std::str::from_utf8(&args[0]).map_err(|_| String::from("syntax"))?;
+    let amount = std::str::from_utf8(&args[1])
+        .map_err(|_| String::from("value is not an integer or out of range"))?
+        .parse::<i64>()
+        .map_err(|_| String::from("value is not an integer or out of range"))?;
+    if amount < 0 {
+        return Err(String::from("invalid expire time in 'getex' command"));
+    }
+    let now = ryme_txn::now_unix();
+    match mode.to_ascii_uppercase().as_str() {
+        "EX" if amount > 0 => Ok(GetExOption::Expires(now.saturating_add(amount as u64))),
+        "PX" if amount > 0 => {
+            Ok(GetExOption::Expires(now.saturating_add((amount as u64).div_ceil(1000))))
+        }
+        "EXAT" => Ok(GetExOption::Expires(amount as u64)),
+        "PXAT" => Ok(GetExOption::Expires((amount as u64).div_ceil(1000))),
+        "EX" | "PX" => Err(String::from("invalid expire time in 'getex' command")),
+        _ => Err(String::from("syntax")),
+    }
 }
 
 struct SetOptions {
@@ -5059,6 +5170,9 @@ fn is_known(name: &str) -> bool {
             | "AUTH"
             | "GET"
             | "SET"
+            | "SETNX"
+            | "GETSET"
+            | "GETEX"
             | "GETDEL"
             | "EXPIRE"
             | "PEXPIRE"
@@ -5077,6 +5191,7 @@ fn is_known(name: &str) -> bool {
             | "INCRBYFLOAT"
             | "MGET"
             | "MSET"
+            | "MSETNX"
             | "HSET"
             | "HGET"
             | "HDEL"

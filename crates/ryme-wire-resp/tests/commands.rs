@@ -143,6 +143,27 @@ async fn multi_key_ops() {
 }
 
 #[tokio::test]
+async fn string_conditionals_and_getex_are_atomic() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["DEL", "lock", "a", "b", "session"]).await, ":0");
+    assert_eq!(command(addr, &["SETNX", "lock", "owner-1"]).await, ":1");
+    assert_eq!(command(addr, &["SETNX", "lock", "owner-2"]).await, ":0");
+    assert_eq!(command(addr, &["GETSET", "lock", "owner-3"]).await, "$7\r\nowner-1");
+    assert_eq!(command(addr, &["GET", "lock"]).await, "$7\r\nowner-3");
+
+    assert_eq!(command(addr, &["MSETNX", "a", "1", "b", "2"]).await, ":1");
+    assert_eq!(command(addr, &["MSETNX", "b", "new", "c", "3"]).await, ":0");
+    assert_eq!(command(addr, &["GET", "c"]).await, "$-1");
+
+    assert_eq!(command(addr, &["SET", "session", "token", "EX", "30"]).await, "+OK");
+    assert_eq!(command(addr, &["GETEX", "session", "EX", "5"]).await, "$5\r\ntoken");
+    assert!(command(addr, &["TTL", "session"]).await.contains(":5"));
+    assert_eq!(command(addr, &["GETEX", "session", "PERSIST"]).await, "$5\r\ntoken");
+    assert_eq!(command(addr, &["TTL", "session"]).await, ":-1");
+    assert_eq!(command(addr, &["GETEX", "missing", "EX", "5"]).await, "$-1");
+}
+
+#[tokio::test]
 async fn hash_ops() {
     let addr = serve().await;
     assert_eq!(command(addr, &["DEL", "h"]).await, ":0");

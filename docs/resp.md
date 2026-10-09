@@ -13,7 +13,7 @@ pins every row):
 | Connection | `PING`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` |
 | Scripting | `EVAL`, `EVALSHA`, `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH [SYNC|ASYNC]` (sandboxed Lua 5.4) |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` (atomic, see below) |
-| Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`GET`), `GETDEL`, `MGET`, `MSET`, `APPEND`, `STRLEN` |
+| Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`GET`), `SETNX`, `GETSET`, `GETEX`, `GETDEL`, `MGET`, `MSET`, `MSETNX`, `APPEND`, `STRLEN` |
 | Counters | `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT` (clean float formatting, saturating integers) |
 | Keys | `DEL`, `EXISTS`, `TYPE` (`string`/`none` in v1), `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST` |
 | Hashes | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HLEN`, `HGETALL`, `HKEYS`, `HVALS` |

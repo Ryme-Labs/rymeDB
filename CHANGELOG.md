@@ -6,6 +6,8 @@
 - RESP now supports sandboxed Lua 5.4 scripts through `EVAL`, `EVALSHA`, and
   the `SCRIPT LOAD`/`EXISTS`/`FLUSH` cache commands, including `redis.pcall`
   and `SCRIPT FLUSH ASYNC` compatibility.
+- RESP string compatibility now includes atomic `SETNX`, `MSETNX`, `GETSET`,
+  and expiry-aware `GETEX` operations.
 - PostgreSQL wire connections now support ephemeral `LISTEN`, `UNLISTEN`, and
   `NOTIFY` delivery with standard asynchronous `NotificationResponse` frames,
   scoped by tenant and database; notification delivery and listener changes
