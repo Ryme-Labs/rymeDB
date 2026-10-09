@@ -1527,6 +1527,11 @@ async fn cors_options(headers: HeaderMap) -> Response {
 
 async fn cors_headers(request: axum::http::Request<axum::body::Body>, next: Next) -> Response {
     let origin = request.headers().get("origin").cloned();
+    if request.method() == axum::http::Method::OPTIONS {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        apply_cors_headers(&mut response, origin.as_ref());
+        return response;
+    }
     let mut response = next.run(request).await;
     apply_cors_headers(&mut response, origin.as_ref());
     response

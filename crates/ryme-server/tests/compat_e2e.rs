@@ -98,6 +98,13 @@ async fn compat_rest_graphql_copy_explain() {
     assert!(headers.contains("access-control-allow-origin: http://localhost:3000"), "{headers}");
     assert!(headers.contains("access-control-allow-methods:"), "{headers}");
     assert!(headers.contains("access-control-allow-headers:"), "{headers}");
+    let (status, body, headers) =
+        http_request_headers(http, "OPTIONS /v1/presence/join", None, b"").await;
+    assert_eq!(status, 204);
+    assert!(body.is_empty());
+    assert!(headers
+        .to_ascii_lowercase()
+        .contains("access-control-allow-origin: http://localhost:3000"));
     let (status, _) = http_request(
         http,
         "POST /v1/sql/copy",
