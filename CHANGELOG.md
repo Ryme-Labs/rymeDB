@@ -32,6 +32,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Scheduled backup drills now materialize and clean up a temporary restore
   directory, exercising the real checksum, decryption, and atomic publish path
   instead of only reading and verifying archive objects.
+- Branch overlay pagination now reads parent pages from the requested cursor
+  and merges only branch-local changes, avoiding a full-table scan on every
+  `scan_after` request.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention

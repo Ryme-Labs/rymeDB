@@ -484,6 +484,34 @@ where
         }
         Ok(rows)
     }
+
+    fn scan_all_after(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start_after: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        const PAGE: usize = 1024;
+        let page_limit = limit.min(PAGE);
+        let mut rows =
+            self.base.scan_after(txn, tenant, database, table, start_after, page_limit)?;
+        while rows.len() < limit && rows.len() >= page_limit && !rows.is_empty() {
+            let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
+            let next_limit = (limit - rows.len()).min(PAGE);
+            let next = self.base.scan_after(txn, tenant, database, table, &last, next_limit)?;
+            if next.is_empty() {
+                break;
+            }
+            rows.extend(next);
+        }
+        Ok(rows)
+    }
 }
 
 impl<B> ryme_txn::TxnBackend for BranchBackend<B>
@@ -617,8 +645,35 @@ where
         if !self.overlay {
             return self.base.scan_after(txn, tenant, database, table, start_after, limit);
         }
-        let rows = self.scan(txn, tenant, database, table, usize::MAX)?;
-        Ok(rows.into_iter().filter(|(pk, _)| pk.as_slice() > start_after).take(limit).collect())
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let overlay = self.overlay_rows(txn, tenant, table)?;
+        let parent_limit = limit.saturating_add(overlay.len());
+        let mut parent_txn = self.parent_transaction();
+        let parent = self.scan_all_after(
+            &mut parent_txn,
+            tenant,
+            database,
+            table,
+            start_after,
+            parent_limit,
+        )?;
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = parent.into_iter().collect();
+        for (pk, value) in overlay {
+            if pk.as_slice() <= start_after {
+                continue;
+            }
+            match value {
+                Some(value) => {
+                    merged.insert(pk, value);
+                }
+                None => {
+                    merged.remove(&pk);
+                }
+            }
+        }
+        Ok(merged.into_iter().take(limit).collect())
     }
 }
 
@@ -801,6 +856,10 @@ mod tests {
         assert_eq!(branch.get(&mut read_txn, &child_key).unwrap(), Some(b"from-child".to_vec()));
         assert_eq!(
             branch.scan(&mut read_txn, "tenant", "default", "docs", 10).unwrap(),
+            vec![(b"child".to_vec(), b"from-child".to_vec())]
+        );
+        assert_eq!(
+            branch.scan_after(&mut read_txn, "tenant", "default", "docs", b"a", 10).unwrap(),
             vec![(b"child".to_vec(), b"from-child".to_vec())]
         );
 
