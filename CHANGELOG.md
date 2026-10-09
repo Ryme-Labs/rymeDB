@@ -8,6 +8,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Common PostgreSQL `CREATE OR REPLACE FUNCTION` and `CREATE TRIGGER` schema
+  declarations are now persisted with snapshots. `BEFORE` row triggers that
+  assign `NEW.<column>` from `now()`, `CURRENT_TIMESTAMP`, or
+  `clock_timestamp()` update inserted/updated rows and `RETURNING` values.
 - PostgreSQL wire batching and Supabase dump analysis now preserve
   dollar-quoted function/procedure bodies, including semicolons inside `$$`
   blocks and tagged dollar quotes.

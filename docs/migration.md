@@ -63,6 +63,11 @@ policy command follow PostgreSQL default-deny behavior.
 Policy metadata is available through `pg_catalog.pg_policies`, including the
 policy name, command, `USING`, and `WITH CHECK` expressions used by migration
 verification and ORM introspection.
+Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
+persisted in schema snapshots. `BEFORE` row triggers that assign
+`NEW.column = now()` (or the equivalent current-timestamp expressions) are
+executed for inserts and updates; arbitrary PL/pgSQL statements still require
+manual compatibility review.
 
 Dump analysis: `POST /v1/migrate/supabase` with `{dump}` returns tables and
 `CREATE POLICY` entries with detected tenant columns (`auth.uid() = <col>`
@@ -153,6 +158,9 @@ generate integer primary keys when omitted and recover their next value from
 durable rows after executor restart,
 `CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields or
 multiple declared columns,
+common `CREATE OR REPLACE FUNCTION` and `CREATE TRIGGER` declarations with
+timestamp assignments to `NEW` rows,
+and `DROP TRIGGER IF EXISTS name ON table`,
 with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
 (`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, `pg_index`, and `pg_policies`),
 and indexed equality lookup,

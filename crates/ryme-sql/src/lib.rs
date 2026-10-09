@@ -35,6 +35,20 @@ pub enum Statement {
         #[serde(default)]
         if_not_exists: bool,
     },
+    CreateFunction {
+        name: String,
+        body: String,
+        language: String,
+        #[serde(default)]
+        replace: bool,
+    },
+    CreateTrigger {
+        name: String,
+        table: String,
+        timing: String,
+        events: Vec<String>,
+        function: String,
+    },
     CreatePolicy {
         name: String,
         table: String,
@@ -78,6 +92,12 @@ pub enum Statement {
     },
     DropIndex {
         name: String,
+        #[serde(default)]
+        if_exists: bool,
+    },
+    DropTrigger {
+        name: String,
+        table: String,
         #[serde(default)]
         if_exists: bool,
     },
@@ -393,6 +413,25 @@ pub struct ConstraintMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub language: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerDefinition {
+    pub name: String,
+    pub table: String,
+    pub timing: String,
+    #[serde(default)]
+    pub events: Vec<String>,
+    pub function: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: String,
@@ -456,6 +495,10 @@ pub struct SchemaSnapshot {
     #[serde(default)]
     pub constraints: BTreeMap<String, Vec<ConstraintMetadata>>,
     #[serde(default)]
+    pub functions: BTreeMap<String, FunctionDefinition>,
+    #[serde(default)]
+    pub triggers: BTreeMap<String, TriggerDefinition>,
+    #[serde(default)]
     pub rls_tables: BTreeMap<String, String>,
     #[serde(default)]
     pub rls_write_tables: BTreeMap<String, String>,
@@ -514,8 +557,11 @@ impl Statement {
             self,
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
+                | Statement::CreateFunction { .. }
+                | Statement::CreateTrigger { .. }
                 | Statement::CreatePolicy { .. }
                 | Statement::DropPolicy { .. }
+                | Statement::DropTrigger { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
@@ -950,10 +996,14 @@ impl Statement {
             | Self::DeleteWhere { table, .. }
             | Self::DeleteUsing { table, .. }
             | Self::CopyFrom { table, .. } => table,
-            Self::CreateSchema { .. } | Self::CreateExtension { .. } => "",
+            Self::CreateSchema { .. }
+            | Self::CreateExtension { .. }
+            | Self::CreateFunction { .. } => "",
+            Self::CreateTrigger { table, .. } => table,
             Self::CreatePolicy { table, .. } => table,
             Self::DropPolicy { table, .. } => table,
             Self::DropIndex { name, .. } => name,
+            Self::DropTrigger { table, .. } => table,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
             Self::Distinct { statement, .. } => statement.table(),
@@ -1125,6 +1175,21 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| RymeError::InvalidArgument(String::from("drop policy table")))?;
         return Ok(Statement::DropPolicy { name: object, table, if_exists });
+    }
+    if kind.eq_ignore_ascii_case("TRIGGER") {
+        let on_pos = tokens
+            .iter()
+            .enumerate()
+            .skip(object_pos + 1)
+            .find(|(_, token)| token.eq_ignore_ascii_case("ON"))
+            .map(|(position, _)| position)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("drop trigger table")))?;
+        let table = tokens
+            .get(on_pos + 1)
+            .map(|value| unqualified_name(value))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("drop trigger table")))?;
+        return Ok(Statement::DropTrigger { name: object, table, if_exists });
     }
     if kind.eq_ignore_ascii_case("TABLE") {
         return Ok(Statement::DropTable { table: object, if_exists });
@@ -1711,6 +1776,21 @@ fn unquote(value: &str) -> String {
 }
 
 fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
+    let kind_index = if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("OR"))
+        && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("REPLACE"))
+    {
+        3
+    } else {
+        1
+    };
+    if tokens.get(kind_index).is_some_and(|token| {
+        token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE")
+    }) {
+        return parse_create_function(tokens, raw, kind_index);
+    }
+    if tokens.get(kind_index).is_some_and(|token| token.eq_ignore_ascii_case("TRIGGER")) {
+        return parse_create_trigger(tokens);
+    }
     if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("POLICY")) {
         return parse_create_policy(tokens, raw);
     }
@@ -1797,6 +1877,172 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         named_constraints,
         if_not_exists,
     })
+}
+
+fn unqualified_name(value: &str) -> String {
+    let unquoted = unquote(value.trim());
+    let value = unquoted.trim_end_matches("() ");
+    value.rsplit('.').next().unwrap_or(value).to_string()
+}
+
+fn parse_create_function(tokens: &[String], raw: &str, kind_index: usize) -> Result<Statement> {
+    let keyword = tokens
+        .get(kind_index)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create function")))?;
+    let keyword_pos = find_sql_keyword(raw, keyword, 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("create function")))?;
+    let rest = raw[keyword_pos + keyword.len()..].trim_start();
+    let name_end = rest
+        .find(['(', ' ', '\t', '\n', '\r'])
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("function name")))?;
+    let name = unqualified_name(&rest[..name_end]);
+    if name.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("function name")));
+    }
+    let body = extract_function_body(raw).unwrap_or_default();
+    let language = tokens
+        .iter()
+        .rposition(|token| token.eq_ignore_ascii_case("LANGUAGE"))
+        .and_then(|index| tokens.get(index + 1))
+        .map(|value| unquote(value))
+        .unwrap_or_default();
+    Ok(Statement::CreateFunction { name, body, language, replace: kind_index == 3 })
+}
+
+fn extract_function_body(raw: &str) -> Option<String> {
+    let as_pos = find_sql_keyword(raw, "AS", 0)?;
+    let body = raw[as_pos + 2..].trim_start();
+    if body.starts_with('$') {
+        let bytes = body.as_bytes();
+        let end = dollar_quote_end(bytes, 0)?;
+        let tag = &body[..end];
+        let close = body[end..].find(tag)? + end;
+        return Some(body[end..close].to_string());
+    }
+    let quoted_end = body.rfind('\'')?;
+    (quoted_end > 0).then(|| unquote(&body[..=quoted_end]))
+}
+
+fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut index = start + 1;
+    if bytes.get(index) == Some(&b'$') {
+        return Some(index + 1);
+    }
+    if !bytes.get(index).is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_') {
+        return None;
+    }
+    index += 1;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+        index += 1;
+    }
+    (bytes.get(index) == Some(&b'$')).then_some(index + 1)
+}
+
+fn trigger_now_columns(body: &str) -> Vec<String> {
+    let lower = body.to_ascii_lowercase();
+    let mut columns: Vec<String> = Vec::new();
+    let mut search = 0;
+    while let Some(found) = lower[search..].find("new.") {
+        let start = search + found + 4;
+        let end = start
+            + lower[start..]
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .map(char::len_utf8)
+                .sum::<usize>();
+        let mut rest = end;
+        while lower.as_bytes().get(rest).is_some_and(u8::is_ascii_whitespace) {
+            rest += 1;
+        }
+        let assignment = if lower[rest..].starts_with(":=") {
+            rest + 2
+        } else if lower[rest..].starts_with('=') {
+            rest + 1
+        } else {
+            search = start;
+            continue;
+        };
+        let expression_end =
+            lower[assignment..].find(';').map_or(lower.len(), |offset| assignment + offset);
+        let expression = lower[assignment..expression_end].trim();
+        if expression.contains("now()")
+            || expression.contains("current_timestamp")
+            || expression.contains("clock_timestamp()")
+        {
+            let column = body[start..end].trim().to_string();
+            if !column.is_empty()
+                && !columns.iter().any(|current| current.eq_ignore_ascii_case(&column))
+            {
+                columns.push(column);
+            }
+        }
+        search = end;
+    }
+    columns
+}
+
+fn parse_create_trigger(tokens: &[String]) -> Result<Statement> {
+    let name = tokens
+        .get(2)
+        .map(|value| unqualified_name(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("trigger name")))?;
+    let timing_index = tokens
+        .iter()
+        .position(|token| {
+            token.eq_ignore_ascii_case("BEFORE")
+                || token.eq_ignore_ascii_case("AFTER")
+                || token.eq_ignore_ascii_case("INSTEAD")
+        })
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("trigger timing")))?;
+    let timing = if tokens[timing_index].eq_ignore_ascii_case("INSTEAD") {
+        String::from("INSTEAD OF")
+    } else {
+        tokens[timing_index].to_ascii_uppercase()
+    };
+    let on_index = tokens
+        .iter()
+        .enumerate()
+        .skip(timing_index + 1)
+        .find(|(_, token)| token.eq_ignore_ascii_case("ON"))
+        .map(|(index, _)| index)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("trigger table")))?;
+    let table = tokens
+        .get(on_index + 1)
+        .map(|value| unqualified_name(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("trigger table")))?;
+    let events = tokens[timing_index + 1..on_index]
+        .iter()
+        .filter(|token| {
+            matches!(
+                token.to_ascii_uppercase().as_str(),
+                "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE"
+            )
+        })
+        .map(|token| token.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("trigger event")));
+    }
+    let function_index = tokens
+        .iter()
+        .enumerate()
+        .skip(on_index + 2)
+        .find(|(_, token)| {
+            token.eq_ignore_ascii_case("FUNCTION") || token.eq_ignore_ascii_case("PROCEDURE")
+        })
+        .map(|(index, _)| index + 1)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("trigger function")))?;
+    let function = tokens
+        .get(function_index)
+        .map(|value| unqualified_name(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("trigger function")))?;
+    Ok(Statement::CreateTrigger { name, table, timing, events, function })
 }
 
 fn parse_create_policy(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -4851,6 +5097,13 @@ pub fn describe_plan(statement: &Statement) -> String {
                 schema.as_deref().map_or(String::new(), |schema| format!(" in {schema}"))
             )
         }
+        Statement::CreateFunction { name, language, .. } => {
+            format!("ddl create_function({name}) language {language}")
+        }
+        Statement::CreateTrigger { name, table, timing, events, function } => format!(
+            "ddl create_trigger({name} on {table} {timing} {} -> {function})",
+            events.join("/")
+        ),
         Statement::CreatePolicy { name, table, command, .. } => {
             format!("ddl create_policy({name}) on {table} for {command}")
         }
@@ -4865,6 +5118,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         }
         Statement::DropTable { table, .. } => format!("ddl drop_table({table})"),
         Statement::DropIndex { name, .. } => format!("ddl drop_index({name})"),
+        Statement::DropTrigger { name, table, .. } => {
+            format!("ddl drop_trigger({name}) on {table}")
+        }
         Statement::TruncateTable { table, restart_identity, cascade } => {
             format!(
                 "write truncate({table}) {} {}",
@@ -5465,6 +5721,8 @@ pub struct Executor<B = TxnManager> {
     checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
     foreign_keys: Arc<Mutex<HashMap<String, Vec<ForeignKeyConstraint>>>>,
     constraints: Arc<Mutex<HashMap<String, Vec<ConstraintMetadata>>>>,
+    functions: Arc<Mutex<HashMap<String, FunctionDefinition>>>,
+    triggers: Arc<Mutex<HashMap<String, TriggerDefinition>>>,
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
@@ -5498,6 +5756,8 @@ impl Executor<TxnManager> {
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
+            functions: Arc::new(Mutex::new(HashMap::new())),
+            triggers: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5525,6 +5785,8 @@ impl Executor<TxnManager> {
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
+            functions: Arc::new(Mutex::new(HashMap::new())),
+            triggers: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5557,6 +5819,8 @@ where
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
+            functions: Arc::new(Mutex::new(HashMap::new())),
+            triggers: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5654,6 +5918,98 @@ where
             }
         }
         Ok(())
+    }
+
+    fn install_function(&self, definition: FunctionDefinition, replace: bool) -> Result<()> {
+        let mut functions = self
+            .functions
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("function lock")))?;
+        if !replace && functions.contains_key(&definition.name) {
+            return Err(RymeError::Conflict(format!("function {}", definition.name)));
+        }
+        functions.insert(definition.name.clone(), definition);
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn install_trigger(&self, definition: TriggerDefinition) -> Result<()> {
+        let function_exists = self
+            .functions
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("function lock")))?
+            .contains_key(&definition.function);
+        if !function_exists {
+            return Err(RymeError::NotFound(format!("function {}", definition.function)));
+        }
+        let key = format!("{}\0{}", definition.table, definition.name);
+        let mut triggers =
+            self.triggers.lock().map_err(|_| RymeError::Internal(String::from("trigger lock")))?;
+        if triggers.contains_key(&key) {
+            return Err(RymeError::Conflict(format!("trigger {}", definition.name)));
+        }
+        triggers.insert(key, definition);
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn drop_trigger(&self, name: &str, table: &str, if_exists: bool) -> Result<()> {
+        let key = format!("{table}\0{name}");
+        let removed = self
+            .triggers
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("trigger lock")))?
+            .remove(&key)
+            .is_some();
+        if !removed && !if_exists {
+            return Err(RymeError::NotFound(format!("trigger {name}")));
+        }
+        if removed {
+            self.schema_dirty.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn apply_before_triggers(&self, table: &str, event: &str, value: &[u8]) -> Result<Vec<u8>> {
+        let triggers = self
+            .triggers
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("trigger lock")))?
+            .values()
+            .filter(|trigger| {
+                trigger.table.eq_ignore_ascii_case(table)
+                    && trigger.timing.eq_ignore_ascii_case("BEFORE")
+                    && trigger.events.iter().any(|candidate| candidate.eq_ignore_ascii_case(event))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if triggers.is_empty() {
+            return Ok(value.to_vec());
+        }
+        let functions = self
+            .functions
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("function lock")))?
+            .clone();
+        let mut row = serde_json::from_slice::<serde_json::Value>(value)
+            .map_err(|_| RymeError::InvalidArgument(String::from("trigger row")))?;
+        let Some(object) = row.as_object_mut() else { return Ok(value.to_vec()) };
+        for trigger in triggers {
+            let Some(function) = functions.get(&trigger.function) else { continue };
+            for column in trigger_now_columns(&function.body) {
+                let actual = object
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&column))
+                    .cloned()
+                    .unwrap_or(column);
+                object.insert(
+                    actual,
+                    serde_json::Value::Number(serde_json::Number::from(ryme_txn::now_unix())),
+                );
+            }
+        }
+        serde_json::to_vec(&row)
+            .map_err(|_| RymeError::InvalidArgument(String::from("trigger row")))
     }
 
     fn rebuild_rls_policy_maps(&self) -> Result<()> {
@@ -5788,6 +6144,8 @@ where
             checks: self.checks,
             foreign_keys: self.foreign_keys,
             constraints: self.constraints,
+            functions: self.functions,
+            triggers: self.triggers,
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
@@ -5918,12 +6276,29 @@ where
                 policies.iter().map(|(key, policy)| (key.clone(), policy.clone())).collect()
             })
             .unwrap_or_default();
+        let functions = self
+            .functions
+            .lock()
+            .map(|functions| {
+                functions
+                    .iter()
+                    .map(|(name, definition)| (name.clone(), definition.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let triggers = self
+            .triggers
+            .lock()
+            .map(|triggers| triggers.iter().map(|key| (key.0.clone(), key.1.clone())).collect())
+            .unwrap_or_default();
         SchemaSnapshot {
             tables,
             indexes,
             checks,
             foreign_keys,
             constraints,
+            functions,
+            triggers,
             rls_tables,
             rls_write_tables,
             rls_enabled,
@@ -5933,6 +6308,8 @@ where
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
+        let functions = snapshot.functions;
+        let triggers = snapshot.triggers;
         {
             let mut catalog = self
                 .catalog
@@ -5954,6 +6331,16 @@ where
             *constraints = snapshot.constraints.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("constraint lock")));
+        }
+        if let Ok(mut stored) = self.functions.lock() {
+            *stored = functions.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("function lock")));
+        }
+        if let Ok(mut stored) = self.triggers.lock() {
+            *stored = triggers.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("trigger lock")));
         }
         let legacy_rls_enabled: HashSet<String> = snapshot.rls_tables.keys().cloned().collect();
         let rls_enabled: HashSet<String> = if snapshot.rls_enabled.is_empty() {
@@ -6040,6 +6427,9 @@ where
             self.foreign_keys.lock().map(|foreign_keys| foreign_keys.clone()).unwrap_or_default();
         let constraints =
             self.constraints.lock().map(|constraints| constraints.clone()).unwrap_or_default();
+        let functions =
+            self.functions.lock().map(|functions| functions.clone()).unwrap_or_default();
+        let triggers = self.triggers.lock().map(|triggers| triggers.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -6059,6 +6449,8 @@ where
             checks: Arc::new(Mutex::new(checks)),
             foreign_keys: Arc::new(Mutex::new(foreign_keys)),
             constraints: Arc::new(Mutex::new(constraints)),
+            functions: Arc::new(Mutex::new(functions)),
+            triggers: Arc::new(Mutex::new(triggers)),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -7046,6 +7438,7 @@ where
                 &before,
                 source_value,
             )?;
+            let after = self.apply_before_triggers(&table, "UPDATE", &after)?;
             let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
             self.enforce_rls(&table, &after)?;
             self.enforce_checks(&table, &new_pk, &after)?;
@@ -8429,6 +8822,9 @@ where
         if let Ok(mut constraints) = self.constraints.lock() {
             constraints.remove(&table);
         }
+        if let Ok(mut triggers) = self.triggers.lock() {
+            triggers.retain(|_, trigger| !trigger.table.eq_ignore_ascii_case(&table));
+        }
         let prefix = format!("{}\0{}\0{}\0", self.tenant, self.database, table);
         if let Ok(mut sequences) = self.sequence_next.lock() {
             sequences.retain(|key, _| !key.starts_with(&prefix));
@@ -9146,8 +9542,11 @@ where
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
+            | Statement::CreateFunction { .. }
+            | Statement::CreateTrigger { .. }
             | Statement::CreatePolicy { .. }
             | Statement::DropPolicy { .. }
+            | Statement::DropTrigger { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -9201,6 +9600,18 @@ where
                 Ok((apply_distinct(result, offset, limit), changes))
             }
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::CreateFunction { name, body, language, replace } => {
+                self.install_function(FunctionDefinition { name, body, language }, replace)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::CreateTrigger { name, table, timing, events, function } => {
+                self.install_trigger(TriggerDefinition { name, table, timing, events, function })?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::DropTrigger { name, table, if_exists } => {
+                self.drop_trigger(&name, &table, if_exists)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreatePolicy { name, table, command, using, check } => {
@@ -9387,6 +9798,7 @@ where
             }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
+                let value = self.apply_before_triggers(&table, "INSERT", &value)?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys(txn, &table, &pk, &value)?;
@@ -9411,6 +9823,7 @@ where
             }
             Statement::InsertIgnore { table, pk, value } => {
                 self.reject_if_read_only()?;
+                let value = self.apply_before_triggers(&table, "INSERT", &value)?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys(txn, &table, &pk, &value)?;
@@ -9446,6 +9859,7 @@ where
                 conflict_filter,
                 do_nothing,
             } => {
+                let value = self.apply_before_triggers(&table, "INSERT", &value)?;
                 self.execute_insert_conflict_in_transaction(
                     txn,
                     table,
@@ -9460,6 +9874,7 @@ where
             }
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
+                let value = self.apply_before_triggers(&table, "INSERT", &value)?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys(txn, &table, &pk, &value)?;
@@ -9512,6 +9927,7 @@ where
                     self.enforce_rls(&table, &before)?;
                     let after =
                         self.materialize_update_row(&table, &pk, assignments.clone(), &before)?;
+                    let after = self.apply_before_triggers(&table, "UPDATE", &after)?;
                     let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
                     self.enforce_rls(&table, &after)?;
                     self.enforce_checks(&table, &new_pk, &after)?;
@@ -9582,6 +9998,7 @@ where
             }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
+                let value = self.apply_before_triggers(&table, "UPDATE", &value)?;
                 let before_key = pk.clone();
                 let new_pk = self.primary_key_for_row(&table, &pk, &value)?;
                 self.enforce_rls(&table, &value)?;
@@ -10242,20 +10659,38 @@ where
                 .await
             }
             Statement::Insert { table, pk, value } => {
-                let pk_for_result = pk.clone();
-                let value_for_result = value.clone();
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Insert { table, pk, value })
                     .await?;
-                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
+                Ok((result, changes))
             }
             Statement::Upsert { table, pk, value } => {
-                let pk_for_result = pk.clone();
-                let value_for_result = value.clone();
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Upsert { table, pk, value })
                     .await?;
-                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
+                Ok((result, changes))
             }
             Statement::InsertIgnore { table, pk, value } => {
                 let pk_for_result = pk.clone();
@@ -10266,7 +10701,16 @@ where
                 let result = if changes.is_empty() {
                     QueryResult::Returning { columns: returning_columns(&fields), rows: Vec::new() }
                 } else {
-                    returning_result(&fields, pk_for_result, value_for_result)
+                    changes
+                        .last()
+                        .and_then(|change| {
+                            change.after.as_ref().map(|after| {
+                                returning_result(&fields, change.pk.clone(), after.clone())
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            returning_result(&fields, pk_for_result, value_for_result)
+                        })
                 };
                 Ok((result, changes))
             }
@@ -10313,20 +10757,38 @@ where
                     .get(txn, &key)?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
                 let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
-                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
-                let value_for_result = value.clone();
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Update { table, pk, value })
                     .await?;
-                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
+                Ok((result, changes))
             }
             Statement::Update { table, pk, value } => {
-                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
-                let value_for_result = value.clone();
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Update { table, pk, value })
                     .await?;
-                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
+                Ok((result, changes))
             }
             Statement::UpdateWhere { table, assignments, filter } => {
                 let statement = Statement::UpdateWhere { table, assignments, filter };
@@ -10608,8 +11070,11 @@ where
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
+            | Statement::CreateFunction { .. }
+            | Statement::CreateTrigger { .. }
             | Statement::CreatePolicy { .. }
             | Statement::DropPolicy { .. }
+            | Statement::DropTrigger { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -10647,8 +11112,11 @@ where
             &statement,
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
+                | Statement::CreateFunction { .. }
+                | Statement::CreateTrigger { .. }
                 | Statement::CreatePolicy { .. }
                 | Statement::DropPolicy { .. }
+                | Statement::DropTrigger { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
@@ -10779,16 +11247,42 @@ where
                 Ok(result)
             }
             Statement::Insert { table, pk, value } => {
-                let pk_for_result = pk.clone();
-                let value_for_result = value.clone();
-                self.execute_with_base(Statement::Insert { table, pk, value }, isolation).await?;
-                Ok(returning_result(&fields, pk_for_result, value_for_result))
+                let mut txn = self.begin_with(isolation);
+                let (_, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::Insert { table, pk, value })
+                    .await?;
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
             }
             Statement::Upsert { table, pk, value } => {
-                let pk_for_result = pk.clone();
-                let value_for_result = value.clone();
-                self.execute_with_base(Statement::Upsert { table, pk, value }, isolation).await?;
-                Ok(returning_result(&fields, pk_for_result, value_for_result))
+                let mut txn = self.begin_with(isolation);
+                let (_, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::Upsert { table, pk, value })
+                    .await?;
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
             }
             Statement::InsertIgnore { table, pk, value } => {
                 let mut txn = self.begin_with(isolation);
@@ -10803,7 +11297,16 @@ where
                 let result = if changes.is_empty() {
                     QueryResult::Returning { columns: returning_columns(&fields), rows: Vec::new() }
                 } else {
-                    returning_result(&fields, pk_for_result, value_for_result)
+                    changes
+                        .last()
+                        .and_then(|change| {
+                            change.after.as_ref().map(|after| {
+                                returning_result(&fields, change.pk.clone(), after.clone())
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            returning_result(&fields, pk_for_result, value_for_result)
+                        })
                 };
                 self.commit_transaction(txn, changes).await?;
                 Ok(result)
@@ -10854,19 +11357,41 @@ where
                     .get(&mut txn, &key)?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
                 let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
-                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
-                let value_for_result = value.clone();
                 let (_result, changes) = self
                     .execute_in_transaction_base(&mut txn, Statement::Update { table, pk, value })
                     .await?;
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
                 self.commit_transaction(txn, changes).await?;
-                Ok(returning_result(&fields, pk_for_result, value_for_result))
+                Ok(result)
             }
             Statement::Update { table, pk, value } => {
-                let pk_for_result = self.primary_key_for_row(&table, &pk, &value)?;
-                let value_for_result = value.clone();
-                self.execute_with_base(Statement::Update { table, pk, value }, isolation).await?;
-                Ok(returning_result(&fields, pk_for_result, value_for_result))
+                let mut txn = self.begin_with(isolation);
+                let (_, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::Update { table, pk, value })
+                    .await?;
+                let result = changes
+                    .last()
+                    .and_then(|change| {
+                        change.after.as_ref().map(|after| {
+                            returning_result(&fields, change.pk.clone(), after.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| QueryResult::Returning {
+                        columns: returning_columns(&fields),
+                        rows: Vec::new(),
+                    });
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
             }
             Statement::UpdateWhere { table, assignments, filter } => {
                 let mut txn = self.begin_with(isolation);
@@ -10968,6 +11493,18 @@ where
                 merge_set_results(left, right, operation, all)
             }
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
+                Ok(QueryResult::Ok)
+            }
+            Statement::CreateFunction { name, body, language, replace } => {
+                self.install_function(FunctionDefinition { name, body, language }, replace)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::CreateTrigger { name, table, timing, events, function } => {
+                self.install_trigger(TriggerDefinition { name, table, timing, events, function })?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::DropTrigger { name, table, if_exists } => {
+                self.drop_trigger(&name, &table, if_exists)?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreatePolicy { name, table, command, using, check } => {
@@ -12229,6 +12766,75 @@ mod tests {
         executor.restore_schema_snapshot(snapshot).unwrap();
         let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn sql_functions_and_triggers_update_rows_and_survive_restore() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE profiles (id TEXT PRIMARY KEY, updated_at BIGINT, body TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let function = parse(
+            "CREATE OR REPLACE FUNCTION public.set_updated_at() RETURNS trigger AS $$ BEGIN NEW.updated_at = now(); RETURN NEW; END; $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        assert!(
+            matches!(function, Statement::CreateFunction { ref name, ref body, replace: true, .. }
+            if name == "set_updated_at" && body.contains("NEW.updated_at"))
+        );
+        executor.execute(function).await.unwrap();
+        let trigger = parse(
+            "CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.profiles FOR EACH ROW EXECUTE FUNCTION public.set_updated_at()",
+        )
+        .unwrap();
+        assert!(
+            matches!(trigger, Statement::CreateTrigger { ref table, ref events, ref function, .. }
+            if table == "profiles" && events == &[String::from("UPDATE")] && function == "set_updated_at")
+        );
+        executor.execute(trigger).await.unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO profiles (id, updated_at, body) VALUES ('p1', 0, 'hello')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let updated = executor
+            .execute(
+                parse("UPDATE profiles SET updated_at = 1 WHERE id = 'p1' RETURNING updated_at")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let timestamp = match updated {
+            QueryResult::Returning { rows, .. } => rows[0][0].clone(),
+            result => panic!("expected returning row, got {result:?}"),
+        };
+        assert!(String::from_utf8(timestamp).unwrap().parse::<u64>().unwrap() > 1);
+
+        let snapshot = executor.schema_snapshot();
+        assert!(snapshot.functions.contains_key("set_updated_at"));
+        assert!(snapshot.triggers.contains_key("profiles\0set_updated_at"));
+        executor.restore_schema_snapshot(snapshot).unwrap();
+        executor
+            .execute(parse("UPDATE profiles SET updated_at = 2 WHERE id = 'p1'").unwrap())
+            .await
+            .unwrap();
+        let updated = executor
+            .execute(parse("SELECT updated_at FROM profiles WHERE id = 'p1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(updated, QueryResult::Table { ref rows, .. }
+            if rows[0][0].as_slice() != b"2"));
+        let drop = parse("DROP TRIGGER IF EXISTS set_updated_at ON profiles").unwrap();
+        assert!(matches!(drop, Statement::DropTrigger { ref name, ref table, if_exists: true }
+            if name == "set_updated_at" && table == "profiles"));
+        executor.execute(drop).await.unwrap();
+        assert!(!executor.schema_snapshot().triggers.contains_key("profiles\0set_updated_at"));
     }
 
     #[tokio::test]
