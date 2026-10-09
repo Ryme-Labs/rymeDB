@@ -211,6 +211,7 @@ pub enum ColumnAlteration {
     DropDefault,
     SetNotNull,
     DropNotNull,
+    SetType(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -966,6 +967,41 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
             && tokens.get(action_pos + 2).is_some_and(|token| token.eq_ignore_ascii_case("NULL"))
         {
             ColumnAlteration::DropNotNull
+        } else if tokens.get(action_pos).is_some_and(|token| token.eq_ignore_ascii_case("TYPE"))
+            || (tokens.get(action_pos).is_some_and(|token| token.eq_ignore_ascii_case("SET"))
+                && tokens
+                    .get(action_pos + 1)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("DATA"))
+                && tokens
+                    .get(action_pos + 2)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("TYPE")))
+        {
+            let type_pos =
+                if tokens.get(action_pos).is_some_and(|token| token.eq_ignore_ascii_case("TYPE")) {
+                    action_pos + 1
+                } else {
+                    action_pos + 3
+                };
+            let using_pos =
+                tokens.iter().enumerate().skip(type_pos).find_map(|(position, token)| {
+                    token.eq_ignore_ascii_case("USING").then_some(position)
+                });
+            if using_pos.is_some() {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "alter column type using expressions are not supported",
+                )));
+            }
+            let data_type = tokens
+                .get(type_pos..)
+                .unwrap_or_default()
+                .join(" ")
+                .trim_end_matches(';')
+                .trim()
+                .to_ascii_lowercase();
+            if data_type.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from("alter column type")));
+            }
+            ColumnAlteration::SetType(data_type)
         } else {
             return Err(RymeError::InvalidArgument(String::from("alter column")));
         };
@@ -2652,6 +2688,8 @@ fn json_insert_value(value: Option<Vec<u8>>, data_type: &str) -> serde_json::Val
         || data_type.contains("serial")
         || data_type.contains("numeric")
         || data_type.contains("decimal")
+        || data_type.eq_ignore_ascii_case("real")
+        || data_type.eq_ignore_ascii_case("double precision")
     {
         if let Ok(parsed) = trimmed.parse::<i64>() {
             return serde_json::Value::Number(parsed.into());
@@ -2725,6 +2763,39 @@ fn json_result_bytes(value: &serde_json::Value) -> Vec<u8> {
             serde_json::to_vec(value).unwrap_or_default()
         }
     }
+}
+
+fn convert_json_column_value(
+    value: &serde_json::Value,
+    data_type: &str,
+) -> Result<serde_json::Value> {
+    if value.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    let converted = json_insert_value(Some(json_result_bytes(value)), data_type);
+    let invalid = if data_type.contains("int")
+        || data_type.contains("serial")
+        || data_type.contains("numeric")
+        || data_type.contains("decimal")
+        || data_type.eq_ignore_ascii_case("real")
+        || data_type.eq_ignore_ascii_case("double precision")
+    {
+        !converted.is_number()
+    } else if data_type.eq_ignore_ascii_case("bool") || data_type.eq_ignore_ascii_case("boolean") {
+        !converted.is_boolean()
+    } else if data_type.eq_ignore_ascii_case("json") || data_type.eq_ignore_ascii_case("jsonb") {
+        matches!(converted, serde_json::Value::String(_))
+    } else if data_type.ends_with("[]") || data_type.eq_ignore_ascii_case("array") {
+        !converted.is_array()
+    } else {
+        false
+    };
+    if invalid {
+        return Err(RymeError::InvalidArgument(format!(
+            "invalid input syntax for type {data_type}"
+        )));
+    }
+    Ok(converted)
 }
 
 fn json_projection_bytes(
@@ -5831,6 +5902,89 @@ where
         if !existing.iter().any(|definition| definition.name.eq_ignore_ascii_case(&column)) {
             return Err(RymeError::NotFound(String::from("column")));
         }
+        if let ColumnAlteration::SetType(data_type) = &alteration {
+            let definition = existing
+                .iter()
+                .find(|definition| definition.name.eq_ignore_ascii_case(&column))
+                .cloned()
+                .ok_or_else(|| RymeError::NotFound(String::from("column")))?;
+            let rows = self.scan_all_rows(&table)?;
+            if definition.primary_key && !rows.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "changing the type of a populated primary key column is not supported",
+                )));
+            }
+            let mut updates = Vec::with_capacity(rows.len());
+            for (pk, before) in rows {
+                let serde_json::Value::Object(mut object) = serde_json::from_slice(&before)
+                    .map_err(|_| RymeError::InvalidArgument(String::from("schema row")))?
+                else {
+                    return Err(RymeError::InvalidArgument(String::from("schema row")));
+                };
+                let actual_name = object
+                    .keys()
+                    .find(|name| name.eq_ignore_ascii_case(&column))
+                    .cloned()
+                    .ok_or_else(|| {
+                        RymeError::InvalidArgument(format!("unknown column {column}"))
+                    })?;
+                let current = object
+                    .get(&actual_name)
+                    .ok_or_else(|| RymeError::InvalidArgument(String::from("schema row")))?;
+                let converted = convert_json_column_value(current, data_type)?;
+                object.insert(actual_name, converted);
+                let after = serde_json::to_vec(&serde_json::Value::Object(object))
+                    .map_err(|error| RymeError::Internal(error.to_string()))?;
+                updates.push((pk, before, after));
+            }
+
+            let index_definitions = self.catalog_indexes(&table);
+            for index_definition in index_definitions.iter().filter(|definition| definition.unique)
+            {
+                let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+                for (pk, _, after) in &updates {
+                    let Some(indexed) = index_value(index_definition, pk, after) else { continue };
+                    if entries.insert(indexed, pk.clone()).is_some() {
+                        return Err(RymeError::Conflict(format!(
+                            "unique index {}",
+                            index_definition.name
+                        )));
+                    }
+                }
+            }
+            if !updates.is_empty() {
+                let mut txn = self.begin_with(self.isolation);
+                for (pk, _, after) in &updates {
+                    self.enforce_checks(&table, pk, after)?;
+                    self.enforce_foreign_keys(&mut txn, &table, pk, after)?;
+                }
+                for (pk, _, after) in &updates {
+                    self.manager.put(
+                        &mut txn,
+                        RecordKey::new(&self.tenant, &self.database, &table, pk),
+                        after.clone(),
+                    );
+                }
+                self.manager.commit(txn).await?;
+            }
+            let mut catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
+            let updated = catalog
+                .get_mut(&table)
+                .and_then(|definitions| {
+                    definitions
+                        .iter_mut()
+                        .find(|definition| definition.name.eq_ignore_ascii_case(&column))
+                })
+                .ok_or_else(|| RymeError::NotFound(String::from("column")))?;
+            updated.data_type = data_type.clone();
+            drop(catalog);
+            self.rebuild_index_entries(&table)?;
+            self.schema_dirty.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
         if matches!(&alteration, ColumnAlteration::SetNotNull) {
             for (_, value) in self.scan_all_rows(&table)? {
                 let serde_json::Value::Object(object) = serde_json::from_slice(&value)
@@ -5866,6 +6020,7 @@ where
             ColumnAlteration::DropDefault => definition.column_default = None,
             ColumnAlteration::SetNotNull => definition.nullable = false,
             ColumnAlteration::DropNotNull => definition.nullable = true,
+            ColumnAlteration::SetType(_) => unreachable!("column type handled before catalog lock"),
         }
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
@@ -8307,6 +8462,14 @@ mod tests {
                 ..
             } if expression == "length > 0"
         ));
+        assert!(matches!(
+            parse("ALTER TABLE messages ALTER COLUMN length TYPE BIGINT").unwrap(),
+            Statement::AlterTableColumn {
+                column,
+                alteration: ColumnAlteration::SetType(data_type),
+                ..
+            } if column == "length" && data_type == "bigint"
+        ));
     }
 
     #[tokio::test]
@@ -9056,6 +9219,58 @@ mod tests {
             .await
             .is_err());
         assert!(executor.catalog_columns("events").iter().all(|column| column.name != "note"));
+    }
+
+    #[tokio::test]
+    async fn alter_table_column_type_converts_existing_values_and_rebuilds_indexes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE events (id TEXT PRIMARY KEY, count TEXT UNIQUE, enabled TEXT, metadata TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO events (id, count, enabled, metadata) VALUES ('e1', '7', 'true', '{\"kind\":\"chat\"}')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE events ALTER COLUMN count TYPE INTEGER").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("ALTER TABLE events ALTER COLUMN enabled SET DATA TYPE BOOLEAN").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE events ALTER COLUMN metadata TYPE JSONB").unwrap())
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(parse("SELECT count, enabled, metadata FROM events WHERE id = 'e1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Table { rows, .. }
+        if rows == vec![vec![
+            b"7".to_vec(),
+            b"true".to_vec(),
+            br#"{"kind":"chat"}"#.to_vec()
+        ]]));
+        assert!(executor
+            .catalog_columns("events")
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case("count"))
+            .is_some_and(|column| column.data_type == "integer"));
+        let indexed =
+            executor.execute(parse("SELECT * FROM events WHERE count = 7").unwrap()).await.unwrap();
+        assert!(matches!(indexed, QueryResult::Rows { rows } if rows.len() == 1));
     }
 
     #[tokio::test]
