@@ -98,8 +98,8 @@ with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT (columns) DO UPDATE` uses
 the matching primary or unique constraint and supports `EXCLUDED.column`
-assignments, while targeted or untargeted `ON CONFLICT DO NOTHING` skips
-conflicting rows,
+assignments and a conditional `WHERE` predicate, while targeted or untargeted
+`ON CONFLICT DO NOTHING` skips conflicting rows,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
 `ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
 JSONB projections support PostgreSQL `->` and `->>` operators, including

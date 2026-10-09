@@ -89,6 +89,8 @@ pub enum Statement {
         conflict_target: Vec<String>,
         #[serde(default)]
         conflict_update: Vec<(String, InsertValue)>,
+        #[serde(default)]
+        conflict_filter: Vec<Predicate>,
     },
     InsertRows {
         table: String,
@@ -101,6 +103,8 @@ pub enum Statement {
         conflict_target: Vec<String>,
         #[serde(default)]
         conflict_update: Vec<(String, InsertValue)>,
+        #[serde(default)]
+        conflict_filter: Vec<Predicate>,
     },
     Upsert {
         table: String,
@@ -120,6 +124,8 @@ pub enum Statement {
         target_columns: Vec<String>,
         #[serde(default)]
         assignments: Vec<(String, InsertValue)>,
+        #[serde(default)]
+        conflict_filter: Vec<Predicate>,
         #[serde(default)]
         do_nothing: bool,
     },
@@ -1710,8 +1716,12 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
     if let Some((columns, rows)) = parse_standard_insert_rows(raw)? {
         let conflict = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
-        let (conflict_target, conflict_update, on_conflict_do_nothing) =
-            if conflict { parse_conflict_clause(raw)? } else { (Vec::new(), Vec::new(), false) };
+        let (conflict_target, conflict_update, on_conflict_do_nothing, conflict_filter) =
+            if conflict {
+                parse_conflict_clause(raw)?
+            } else {
+                (Vec::new(), Vec::new(), false, Vec::new())
+            };
         let upsert = conflict && !on_conflict_do_nothing;
         if rows.len() == 1 {
             let values = rows.into_iter().next().unwrap_or_default();
@@ -1723,6 +1733,7 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             });
         }
         return Ok(Statement::InsertRows {
@@ -1733,6 +1744,7 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
             on_conflict_do_nothing,
             conflict_target,
             conflict_update,
+            conflict_filter,
         });
     }
     let (pk, value) = if let Some(values) =
@@ -1760,7 +1772,9 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     Ok(Statement::Insert { table, pk, value })
 }
 
-fn parse_conflict_clause(raw: &str) -> Result<(Vec<String>, Vec<(String, InsertValue)>, bool)> {
+fn parse_conflict_clause(
+    raw: &str,
+) -> Result<(Vec<String>, Vec<(String, InsertValue)>, bool, Vec<Predicate>)> {
     let upper = raw.to_ascii_uppercase();
     let conflict_pos = upper
         .find("ON CONFLICT")
@@ -1790,7 +1804,7 @@ fn parse_conflict_clause(raw: &str) -> Result<(Vec<String>, Vec<(String, InsertV
     };
     let action = raw[do_pos + 2..].trim().trim_end_matches(';').trim();
     if action.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("NOTHING")) {
-        return Ok((target_columns, Vec::new(), true));
+        return Ok((target_columns, Vec::new(), true, Vec::new()));
     }
     let update_pos = action
         .to_ascii_uppercase()
@@ -1802,11 +1816,10 @@ fn parse_conflict_clause(raw: &str) -> Result<(Vec<String>, Vec<(String, InsertV
         .map(|offset| update_pos + "UPDATE".len() + offset)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("conflict update")))?;
     let assignments_start = set_pos + "SET".len();
-    let assignments_end = action[assignments_start..]
-        .to_ascii_uppercase()
-        .find("RETURNING")
-        .map(|offset| assignments_start + offset)
-        .unwrap_or(action.len());
+    let returning_pos = find_sql_keyword(action, "RETURNING", assignments_start);
+    let where_pos = find_sql_keyword(action, "WHERE", assignments_start);
+    let assignments_end =
+        [where_pos, returning_pos].into_iter().flatten().min().unwrap_or(action.len());
     let assignments_text = action[assignments_start..assignments_end].trim();
     if assignments_text.is_empty() {
         return Err(RymeError::InvalidArgument(String::from("conflict update")));
@@ -1826,7 +1839,14 @@ fn parse_conflict_clause(raw: &str) -> Result<(Vec<String>, Vec<(String, InsertV
             Ok((unquote(column.trim()), value))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((target_columns, assignments, false))
+    let conflict_filter = where_pos
+        .map(|start| {
+            let end = returning_pos.unwrap_or(action.len());
+            parse_where_filter(&tokenize(&action[start..end]))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok((target_columns, assignments, false, conflict_filter))
 }
 
 fn parse_standard_insert_rows(raw: &str) -> Result<Option<(Vec<String>, Vec<Vec<InsertValue>>)>> {
@@ -2863,6 +2883,56 @@ fn json_result_bytes(value: &serde_json::Value) -> Vec<u8> {
             serde_json::to_vec(value).unwrap_or_default()
         }
     }
+}
+
+fn excluded_value_bytes(expression: &[u8], incoming: &[u8]) -> Option<Vec<u8>> {
+    let expression = std::str::from_utf8(expression).ok()?.trim();
+    let (prefix, column) = expression.split_once('.')?;
+    if !prefix.eq_ignore_ascii_case("EXCLUDED") {
+        return Some(expression.as_bytes().to_vec());
+    }
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(incoming) else {
+        return Some(incoming.to_vec());
+    };
+    object
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(column.trim()))
+        .and_then(|(_, value)| (!value.is_null()).then(|| json_result_bytes(value)))
+}
+
+fn substitute_excluded_predicate(predicate: &Predicate, incoming: &[u8]) -> Option<Predicate> {
+    if predicate.column.as_deref().is_some_and(|column| {
+        column.split_once('.').is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case("EXCLUDED"))
+    }) {
+        return None;
+    }
+    let mut substituted = predicate.clone();
+    if let Some(value) = excluded_value_bytes(&predicate.operand, incoming) {
+        substituted.operand = value;
+    } else if std::str::from_utf8(&predicate.operand).ok().is_some_and(|operand| {
+        operand.split_once('.').is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case("EXCLUDED"))
+    }) {
+        return None;
+    }
+    let mut operands = Vec::with_capacity(predicate.operands.len());
+    for operand in &predicate.operands {
+        let Some(value) = excluded_value_bytes(operand, incoming) else {
+            return None;
+        };
+        operands.push(value);
+    }
+    substituted.operands = operands;
+    substituted.alternatives = predicate
+        .alternatives
+        .iter()
+        .map(|branch| {
+            branch
+                .iter()
+                .map(|nested| substitute_excluded_predicate(nested, incoming))
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(substituted)
 }
 
 fn convert_json_column_value(
@@ -6415,6 +6485,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
                 let statement = if !conflict_target.is_empty() || !conflict_update.is_empty() {
@@ -6424,6 +6495,7 @@ where
                         value,
                         target_columns: conflict_target,
                         assignments: conflict_update,
+                        conflict_filter,
                         do_nothing: on_conflict_do_nothing,
                     }
                 } else if on_conflict_do_nothing {
@@ -6443,6 +6515,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 let changes = self
                     .execute_insert_rows_in_transaction(
@@ -6454,6 +6527,7 @@ where
                         on_conflict_do_nothing,
                         conflict_target,
                         conflict_update,
+                        conflict_filter,
                     )
                     .await?;
                 Ok((QueryResult::Ok, changes))
@@ -6516,6 +6590,7 @@ where
                 value,
                 target_columns,
                 assignments,
+                conflict_filter,
                 do_nothing,
             } => {
                 self.execute_insert_conflict_in_transaction(
@@ -6525,6 +6600,7 @@ where
                     value,
                     target_columns,
                     assignments,
+                    conflict_filter,
                     do_nothing,
                 )
                 .await
@@ -6869,6 +6945,21 @@ where
         Ok(None)
     }
 
+    fn conflict_filter_matches(
+        &self,
+        predicates: &[Predicate],
+        pk: &[u8],
+        existing: &[u8],
+        incoming: &[u8],
+    ) -> bool {
+        predicates.iter().all(|predicate| {
+            let Some(predicate) = substitute_excluded_predicate(predicate, incoming) else {
+                return false;
+            };
+            predicate.matches(pk, existing)
+        })
+    }
+
     fn resolve_conflict_assignments(
         &self,
         table: &str,
@@ -6918,6 +7009,7 @@ where
         value: Vec<u8>,
         target_columns: Vec<String>,
         assignments: Vec<(String, InsertValue)>,
+        conflict_filter: Vec<Predicate>,
         do_nothing: bool,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         self.reject_if_read_only()?;
@@ -6928,6 +7020,16 @@ where
             return Box::pin(self.execute_in_transaction_base(txn, statement)).await;
         };
         if do_nothing {
+            return Ok((QueryResult::Ok, Vec::new()));
+        }
+        if !conflict_filter.is_empty()
+            && !self.conflict_filter_matches(
+                &conflict_filter,
+                &existing_pk,
+                &existing_value,
+                &value,
+            )
+        {
             return Ok((QueryResult::Ok, Vec::new()));
         }
         if assignments.is_empty() {
@@ -6950,6 +7052,7 @@ where
         on_conflict_do_nothing: bool,
         conflict_target: Vec<String>,
         conflict_update: Vec<(String, InsertValue)>,
+        conflict_filter: Vec<Predicate>,
     ) -> Result<Vec<TransactionChange>> {
         let mut changes = Vec::new();
         for values in rows {
@@ -6961,6 +7064,7 @@ where
                     value,
                     target_columns: conflict_target.clone(),
                     assignments: conflict_update.clone(),
+                    conflict_filter: conflict_filter.clone(),
                     do_nothing: on_conflict_do_nothing,
                 }
             } else if on_conflict_do_nothing {
@@ -6987,6 +7091,7 @@ where
         on_conflict_do_nothing: bool,
         conflict_target: Vec<String>,
         conflict_update: Vec<(String, InsertValue)>,
+        conflict_filter: Vec<Predicate>,
         fields: &[ReturningField],
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         let result_columns = returning_columns(fields);
@@ -7001,6 +7106,7 @@ where
                     value: value.clone(),
                     target_columns: conflict_target.clone(),
                     assignments: conflict_update.clone(),
+                    conflict_filter: conflict_filter.clone(),
                     do_nothing: on_conflict_do_nothing,
                 }
             } else if on_conflict_do_nothing {
@@ -7048,6 +7154,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
                 let statement = if !conflict_target.is_empty() || !conflict_update.is_empty() {
@@ -7057,6 +7164,7 @@ where
                         value,
                         target_columns: conflict_target,
                         assignments: conflict_update,
+                        conflict_filter,
                         do_nothing: on_conflict_do_nothing,
                     }
                 } else if on_conflict_do_nothing {
@@ -7076,6 +7184,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 self.execute_returning_rows_in_transaction(
                     txn,
@@ -7086,6 +7195,7 @@ where
                     on_conflict_do_nothing,
                     conflict_target,
                     conflict_update,
+                    conflict_filter,
                     &fields,
                 )
                 .await
@@ -7125,6 +7235,7 @@ where
                 value,
                 target_columns,
                 assignments,
+                conflict_filter,
                 do_nothing,
             } => {
                 let (_, changes) = self
@@ -7136,6 +7247,7 @@ where
                             value,
                             target_columns,
                             assignments,
+                            conflict_filter,
                             do_nothing,
                         },
                     )
@@ -7490,6 +7602,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
                 let statement = if !conflict_target.is_empty() || !conflict_update.is_empty() {
@@ -7499,6 +7612,7 @@ where
                         value,
                         target_columns: conflict_target,
                         assignments: conflict_update,
+                        conflict_filter,
                         do_nothing: on_conflict_do_nothing,
                     }
                 } else if on_conflict_do_nothing {
@@ -7518,6 +7632,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 let mut txn = self.begin_with(isolation);
                 let (result, changes) = self
@@ -7530,6 +7645,7 @@ where
                         on_conflict_do_nothing,
                         conflict_target,
                         conflict_update,
+                        conflict_filter,
                         &fields,
                     )
                     .await?;
@@ -7572,6 +7688,7 @@ where
                 value,
                 target_columns,
                 assignments,
+                conflict_filter,
                 do_nothing,
             } => {
                 let mut txn = self.begin_with(isolation);
@@ -7584,6 +7701,7 @@ where
                             value,
                             target_columns,
                             assignments,
+                            conflict_filter,
                             do_nothing,
                         },
                     )
@@ -7735,6 +7853,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
                 let statement = if !conflict_target.is_empty() || !conflict_update.is_empty() {
@@ -7744,6 +7863,7 @@ where
                         value,
                         target_columns: conflict_target,
                         assignments: conflict_update,
+                        conflict_filter,
                         do_nothing: on_conflict_do_nothing,
                     }
                 } else if on_conflict_do_nothing {
@@ -7763,6 +7883,7 @@ where
                 on_conflict_do_nothing,
                 conflict_target,
                 conflict_update,
+                conflict_filter,
             } => {
                 self.reject_if_read_only()?;
                 let mut txn = self.begin_with(isolation);
@@ -7776,6 +7897,7 @@ where
                         on_conflict_do_nothing,
                         conflict_target,
                         conflict_update,
+                        conflict_filter,
                     )
                     .await?;
                 self.commit_transaction(txn, changes).await?;
@@ -7798,6 +7920,7 @@ where
                 value,
                 target_columns,
                 assignments,
+                conflict_filter,
                 do_nothing,
             } => {
                 let mut txn = self.begin_with(isolation);
@@ -7810,6 +7933,7 @@ where
                             value,
                             target_columns,
                             assignments,
+                            conflict_filter,
                             do_nothing,
                         },
                     )
@@ -8293,6 +8417,55 @@ mod tests {
             }
             _ => panic!("expected preserved account"),
         }
+    }
+
+    #[tokio::test]
+    async fn conflict_updates_honor_where_and_excluded_predicates() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE versions (id TEXT PRIMARY KEY, email TEXT UNIQUE, version INTEGER, name TEXT)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO versions (id, email, version, name) VALUES ('1', 'a@example.com', 1, 'Ada')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let stale = executor
+            .execute(
+                parse(
+                    "INSERT INTO versions (id, email, version, name) VALUES ('2', 'a@example.com', 1, 'Stale') ON CONFLICT (email) DO UPDATE SET version = EXCLUDED.version, name = EXCLUDED.name WHERE version < EXCLUDED.version RETURNING *",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(stale, QueryResult::Returning { rows, .. } if rows.is_empty()));
+
+        let fresh = executor
+            .execute(
+                parse(
+                    "INSERT INTO versions (id, email, version, name) VALUES ('3', 'a@example.com', 2, 'Grace') ON CONFLICT (email) DO UPDATE SET version = EXCLUDED.version, name = EXCLUDED.name WHERE version < EXCLUDED.version RETURNING id, version, name",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            fresh,
+            QueryResult::Returning { ref rows, .. }
+                if rows == &vec![vec![b"1".to_vec(), b"2".to_vec(), b"Grace".to_vec()]]
+        ));
     }
 
     #[tokio::test]

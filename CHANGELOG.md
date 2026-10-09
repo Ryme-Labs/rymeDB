@@ -116,6 +116,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - PostgreSQL conflict-target upserts now match declared primary or unique
   columns, apply `EXCLUDED.column` assignments, support targeted `DO NOTHING`,
   and return the updated row for single- and multi-row inserts.
+- Conflict-target updates now support a `WHERE` predicate, including the
+  common optimistic-version form that compares an existing column with an
+  `EXCLUDED` value.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
