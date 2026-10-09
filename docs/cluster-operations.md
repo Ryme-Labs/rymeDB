@@ -172,7 +172,11 @@ write accounting is skipped entirely. Merges stay manual: only an operator
 can fuse ranges.
 
 On a local sharded backend (`shards > 1` without cluster mode), the persisted
-range topology is also the data-plane placement map. Point reads/writes route
+range topology is also the data-plane placement map once range splitting has
+been activated. A fresh deployment exposes a synthetic `range-0` through the
+control API but leaves data-plane routing in whole-table mode, so
+`POST /v1/shards/move` remains available until the first split or autosplit.
+After activation, point reads/writes route
 by `table\0primary-key`; a split or merge migrates affected rows between local
 shards before the new topology is persisted, and range assignments survive a
 restart. `POST /v1/shards/move` remains available for whole-table placement.

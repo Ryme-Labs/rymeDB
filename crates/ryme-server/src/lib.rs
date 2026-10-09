@@ -1081,6 +1081,7 @@ impl SharedState {
         let control_path = config.data_dir.join("control.json");
         let auth_snapshot = load_auth_snapshot(&auth_path)?;
         let control_snapshot = load_control_snapshot(&control_path)?;
+        let has_persisted_ranges = !control_snapshot.ranges.is_empty();
         let mut control = ControlPlane::new();
         control.backups = control_snapshot.backups;
         control.migrations = control_snapshot.migrations;
@@ -1096,16 +1097,24 @@ impl SharedState {
         } else {
             control.restore_ranges(control_snapshot.ranges)?;
         }
-        let placements = control
-            .ranges()
-            .into_iter()
-            .map(|range| ryme_shard::RangePlacement {
-                id: range.id,
-                start: range.start,
-                end: range.end,
-                shard: 0,
-            })
-            .collect();
+        // Keep the synthetic control-plane range visible for the range API, but
+        // do not activate data-plane range routing until an operator has split
+        // or autosplit it. Fresh sharded deployments must still support
+        // whole-table placement through /v1/shards/move.
+        let placements = if !has_persisted_ranges {
+            Vec::new()
+        } else {
+            control
+                .ranges()
+                .into_iter()
+                .map(|range| ryme_shard::RangePlacement {
+                    id: range.id,
+                    start: range.start,
+                    end: range.end,
+                    shard: 0,
+                })
+                .collect()
+        };
         match &backend {
             Backend::Sharded(shards) => shards.set_range_topology(placements)?,
             Backend::Hybrid(hybrid) => hybrid.local().set_range_topology(placements)?,

@@ -14,6 +14,9 @@ All notable changes to rymeDB are recorded here. Format follows
   broadcast, vector, topic, and branch endpoints.
 - Browser clients can read REST pagination totals through exposed
   `Content-Range` and `Range-Unit` headers; `x-api-key` is accepted in preflights.
+- Fresh sharded deployments keep whole-table placement available until range
+  splitting is explicitly activated; the default control-plane range is no
+  longer installed as an active data-plane route.
 
 - Java, npm, and Rust SDKs now expose matching JSON REST insert/upsert,
   filtered update, and filtered delete helpers.
