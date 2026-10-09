@@ -26,8 +26,9 @@ repository configuration values:
 - `GITHUB_TOKEN`: supplied by Actions for GitHub Packages and release uploads
 
 Java packages are published to the repository's GitHub Maven registry. npm
-and Cargo packages are published to their public registries. A manual run can
-set the `publish` input when a tag is not being pushed.
+and Cargo packages are published to their public registries. Release upload
+collects artifacts recursively so Maven files under `target/` are included. A
+manual run can set the `publish` input when a tag is not being pushed.
 
 The Pages builder and release workflow fail if `sdks/` contains anything other
 than `java`, `js` (npm), and `rust`, keeping the supported SDK surface explicit.
