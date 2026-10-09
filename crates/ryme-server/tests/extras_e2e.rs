@@ -368,6 +368,7 @@ async fn extras_branch_lifecycle_and_billing() {
         http_listen: http,
         ..Config::default()
     };
+    let restart_config = config.clone();
     let server = tokio::spawn(async move {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
@@ -404,6 +405,19 @@ async fn extras_branch_lifecycle_and_billing() {
     let (status, body) = http_request(http, "GET /v1/billing/summary", b"").await;
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&body).contains("default"));
+    server.abort();
+
+    let pg_listener = bind_listener().await;
+    let resp_listener = bind_listener().await;
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(restart_config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, body) = http_request(http, "GET /v1/branches/preview-9", b"").await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains("preview-9"));
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }

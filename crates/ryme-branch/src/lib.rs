@@ -1,6 +1,7 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Branch {
@@ -18,7 +19,7 @@ pub struct Manifest {
     pub wal_start: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BranchManager {
     branches: HashMap<String, Branch>,
     manifests: HashMap<String, Manifest>,
@@ -28,6 +29,28 @@ pub struct BranchManager {
 impl BranchManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(error) => return Err(error.into()),
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| RymeError::Corrupt(format!("branch metadata: {error}")))
+    }
+
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| RymeError::Internal(format!("branch metadata: {error}")))?;
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(temporary, path)?;
+        Ok(())
     }
 
     pub fn create_root(&mut self, id: String, manifest: Manifest) -> Result<()> {
@@ -234,5 +257,26 @@ mod tests {
         assert!(manager.create_child(String::from("a/b"), "main", 1).is_err());
         assert!(manager.create_child(String::from("a..b"), "main", 1).is_err());
         assert!(manager.create_child("a".repeat(128), "main", 1).is_ok());
+    }
+
+    #[test]
+    fn persists_and_reloads_branch_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-branches-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut manager = root_manager();
+        manager.create_child(String::from("preview"), "main", 7).unwrap();
+        manager.persist(&path).unwrap();
+
+        let restored = BranchManager::load(&path).unwrap();
+        assert_eq!(restored.get("preview").unwrap().base_commit_ts, 7);
+        assert!(restored.diff("main", "preview").unwrap().0.is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }

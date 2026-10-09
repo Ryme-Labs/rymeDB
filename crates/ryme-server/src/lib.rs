@@ -479,6 +479,7 @@ pub struct SharedState {
     node_id: String,
     tenant: String,
     database: String,
+    branch_path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -801,7 +802,9 @@ impl SharedState {
                 .with_realtime(realtime.clone());
         executor.set_rls_tables(config.rls_tables.clone());
         executor.set_read_only(config.read_only);
+        let branch_path = config.data_dir.join("branches.json");
         let mut control = ControlPlane::new();
+        control.branches = ryme_branch::BranchManager::load(&branch_path)?;
         control.add_range(Range::new(
             String::from("range-0"),
             Vec::new(),
@@ -809,14 +812,17 @@ impl SharedState {
             config.node_id.clone(),
             0,
         ));
-        let _ = control.branches.create_root(
-            branch.clone(),
-            ryme_branch::Manifest {
-                id: String::from("genesis"),
-                segments: Vec::new(),
-                wal_start: 0,
-            },
-        );
+        if control.branches.list().is_empty() {
+            control.branches.create_root(
+                branch.clone(),
+                ryme_branch::Manifest {
+                    id: String::from("genesis"),
+                    segments: Vec::new(),
+                    wal_start: 0,
+                },
+            )?;
+            control.branches.persist(&branch_path)?;
+        }
         let keys = ApiKeyStore::new();
         let api_key =
             std::env::var("RYME_API_KEY").unwrap_or_else(|_| String::from("ryme-dev-key"));
@@ -908,6 +914,7 @@ impl SharedState {
             node_id: config.node_id.clone(),
             tenant,
             database,
+            branch_path,
         })
     }
 
@@ -4333,8 +4340,15 @@ async fn branch_create(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.create_branch(request.id, &request.parent, request.base_commit_ts) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+    let mut branches = control.branches.clone();
+    match branches.create_child(request.id, &request.parent, request.base_commit_ts) {
+        Ok(()) => match branches.persist(&state.branch_path) {
+            Ok(()) => {
+                control.branches = branches;
+                (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+            }
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
@@ -4373,10 +4387,15 @@ async fn branch_delete(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.delete_branch(&id) {
-        Ok(garbage) => {
-            (StatusCode::OK, Json(serde_json::json!({ "garbage": garbage }))).into_response()
-        }
+    let mut branches = control.branches.clone();
+    match branches.delete(&id) {
+        Ok(garbage) => match branches.persist(&state.branch_path) {
+            Ok(()) => {
+                control.branches = branches;
+                (StatusCode::OK, Json(serde_json::json!({ "garbage": garbage }))).into_response()
+            }
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
@@ -4418,8 +4437,15 @@ async fn branch_reset(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.reset_branch(&id, request.base_commit_ts) {
-        Ok(branch) => (StatusCode::OK, Json(branch)).into_response(),
+    let mut branches = control.branches.clone();
+    match branches.reset(&id, request.base_commit_ts) {
+        Ok(branch) => match branches.persist(&state.branch_path) {
+            Ok(()) => {
+                control.branches = branches;
+                (StatusCode::OK, Json(branch)).into_response()
+            }
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
@@ -4440,8 +4466,15 @@ async fn branch_promote(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.promote_branch(&id) {
-        Ok(branch) => (StatusCode::OK, Json(branch)).into_response(),
+    let mut branches = control.branches.clone();
+    match branches.promote(&id) {
+        Ok(branch) => match branches.persist(&state.branch_path) {
+            Ok(()) => {
+                control.branches = branches;
+                (StatusCode::OK, Json(branch)).into_response()
+            }
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
