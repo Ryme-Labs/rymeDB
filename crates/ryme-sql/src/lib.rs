@@ -18,6 +18,8 @@ pub enum Statement {
         name: String,
         table: String,
         field: Field,
+        #[serde(default)]
+        column: Option<String>,
         unique: bool,
     },
     Insert {
@@ -135,6 +137,8 @@ pub struct IndexDefinition {
     pub name: String,
     pub table: String,
     pub field: Field,
+    #[serde(default)]
+    pub column: Option<String>,
     pub unique: bool,
 }
 
@@ -613,8 +617,10 @@ fn parse_create_index(tokens: &[String]) -> Result<Statement> {
     let field_token = tokens
         .get(on_pos + 2)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("index field")))?;
-    let field = parse_field(field_token).unwrap_or(Field::Value);
-    Ok(Statement::CreateIndex { name, table, field, unique })
+    let (field, column) = parse_field(field_token)
+        .map(|field| (field, None))
+        .unwrap_or_else(|| (Field::Value, Some(unquote(field_token))));
+    Ok(Statement::CreateIndex { name, table, field, column, unique })
 }
 
 fn parse_column_definitions(raw: &str) -> Vec<ColumnDefinition> {
@@ -1521,6 +1527,23 @@ fn json_column_value<'a>(
     }
 }
 
+fn index_value(definition: &IndexDefinition, pk: &[u8], value: &[u8]) -> Option<Vec<u8>> {
+    if let Some(column) = definition.column.as_deref() {
+        let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
+            return None;
+        };
+        let selected = json_column_value(column, &object)?;
+        if selected.is_null() {
+            return None;
+        }
+        return Some(json_result_bytes(selected));
+    }
+    Some(match definition.field {
+        Field::Key => pk.to_vec(),
+        Field::Value => value.to_vec(),
+    })
+}
+
 fn json_projection_value<'a>(
     expression: &str,
     object: &'a serde_json::Map<String, serde_json::Value>,
@@ -1605,11 +1628,11 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::CreateTable { table, columns } => {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
-        Statement::CreateIndex { name, table, field, unique } => {
-            let field = match field {
+        Statement::CreateIndex { name, table, field, column, unique } => {
+            let field = column.as_deref().unwrap_or(match field {
                 Field::Key => "key",
                 Field::Value => "value",
-            };
+            });
             format!("ddl {}index({name}) on {table}({field})", if *unique { "unique " } else { "" })
         }
         Statement::Insert { table, .. } => format!("write insert({table}) point"),
@@ -2506,10 +2529,7 @@ where
         let rows = self.scan_all_rows(&definition.table)?;
         let mut entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = BTreeMap::new();
         for (pk, value) in rows {
-            let indexed = match definition.field {
-                Field::Key => pk.clone(),
-                Field::Value => value,
-            };
+            let Some(indexed) = index_value(&definition, &pk, &value) else { continue };
             let pks = entries.entry(indexed).or_default();
             if definition.unique && !pks.is_empty() && !pks.contains(&pk) {
                 return Err(RymeError::Conflict(format!("unique index {}", definition.name)));
@@ -2528,12 +2548,11 @@ where
     }
 
     fn indexed_candidates(&self, table: &str, filter: &[Predicate]) -> Option<Vec<Vec<u8>>> {
-        let predicate = filter.iter().find(|predicate| {
-            predicate.column.is_none() && predicate.field == Field::Value && predicate.op == Cmp::Eq
-        })?;
+        let predicate = filter.iter().find(|predicate| predicate.op == Cmp::Eq)?;
         let indexes = self.indexes.lock().ok()?;
-        let state =
-            indexes.get(table)?.iter().find(|state| state.definition.field == predicate.field)?;
+        let state = indexes.get(table)?.iter().find(|state| {
+            state.definition.field == predicate.field && state.definition.column == predicate.column
+        })?;
         Some(state.entries.get(&predicate.operand)?.iter().cloned().collect())
     }
 
@@ -2542,13 +2561,10 @@ where
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
-            let indexed = match state.definition.field {
-                Field::Key => pk,
-                Field::Value => value,
-            };
+            let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
             if state
                 .entries
-                .get(indexed)
+                .get(&indexed)
                 .is_some_and(|pks| pks.iter().any(|existing| existing.as_slice() != pk))
             {
                 return Err(RymeError::Conflict(format!("unique index {}", state.definition.name)));
@@ -2562,9 +2578,8 @@ where
         let Some(table_indexes) = indexes.get_mut(&change.table) else { return };
         for state in table_indexes {
             if let Some(before) = change.before.as_ref() {
-                let indexed = match state.definition.field {
-                    Field::Key => change.pk.clone(),
-                    Field::Value => before.clone(),
+                let Some(indexed) = index_value(&state.definition, &change.pk, before) else {
+                    continue;
                 };
                 if let Some(pks) = state.entries.get_mut(&indexed) {
                     pks.remove(&change.pk);
@@ -2574,9 +2589,8 @@ where
                 }
             }
             if let Some(after) = change.after.as_ref() {
-                let indexed = match state.definition.field {
-                    Field::Key => change.pk.clone(),
-                    Field::Value => after.clone(),
+                let Some(indexed) = index_value(&state.definition, &change.pk, after) else {
+                    continue;
                 };
                 state.entries.entry(indexed).or_default().insert(change.pk.clone());
             }
@@ -2923,8 +2937,8 @@ where
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
-            Statement::CreateIndex { name, table, field, unique } => {
-                self.create_index(IndexDefinition { name, table, field, unique })?;
+            Statement::CreateIndex { name, table, field, column, unique } => {
+                self.create_index(IndexDefinition { name, table, field, column, unique })?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::Explain { plan, .. } => Ok((
@@ -3244,9 +3258,8 @@ where
                         occupied.remove(&previous);
                     }
                     let Some(after) = change.after.as_ref() else { continue };
-                    let indexed = match state.definition.field {
-                        Field::Key => change.pk.clone(),
-                        Field::Value => after.clone(),
+                    let Some(indexed) = index_value(&state.definition, &change.pk, after) else {
+                        continue;
                     };
                     if occupied.get(&indexed).is_some_and(|existing| existing != &change.pk) {
                         return Err(RymeError::Conflict(format!(
@@ -3542,8 +3555,8 @@ where
     ) -> Result<QueryResult> {
         match statement {
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
-            Statement::CreateIndex { name, table, field, unique } => {
-                self.create_index(IndexDefinition { name, table, field, unique })?;
+            Statement::CreateIndex { name, table, field, column, unique } => {
+                self.create_index(IndexDefinition { name, table, field, column, unique })?;
                 Ok(QueryResult::Ok)
             }
             Statement::CopyFrom { table, rows } => {
@@ -4600,6 +4613,7 @@ mod tests {
                 name: String::from("messages_value_idx"),
                 table: String::from("messages"),
                 field: Field::Value,
+                column: None,
                 unique: false,
             }
         );
@@ -4686,6 +4700,50 @@ mod tests {
             .unwrap();
         assert!(executor
             .execute(parse("INSERT INTO messages KEY '4' VALUE 'three'").unwrap())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn named_unique_indexes_enforce_schema_columns() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE profiles (id TEXT PRIMARY KEY, email TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO profiles (id, email) VALUES ('p1', 'ada@example.com'), ('p2', 'grace@example.com')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("CREATE UNIQUE INDEX profiles_email_unique ON profiles (email)").unwrap(),
+            )
+            .await
+            .unwrap();
+        let indexes = executor.catalog_indexes("profiles");
+        assert_eq!(indexes[0].column.as_deref(), Some("email"));
+
+        let result = executor
+            .execute(parse("SELECT id FROM profiles WHERE email = 'grace@example.com'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"p2".to_vec()]])
+        );
+        assert!(executor
+            .execute(
+                parse("INSERT INTO profiles (id, email) VALUES ('p3', 'ada@example.com')").unwrap(),
+            )
+            .await
+            .is_err());
+        assert!(executor
+            .execute(
+                parse("UPDATE profiles SET email = 'ada@example.com' WHERE id = 'p2'").unwrap(),
+            )
             .await
             .is_err());
     }

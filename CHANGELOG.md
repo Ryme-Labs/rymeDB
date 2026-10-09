@@ -43,6 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
   first page on large unindexed tables.
 - SQL predicates now support `LIKE` and `ILIKE` wildcard matching with `%` and
   `_` patterns.
+- Named and JSON-path indexes now preserve their indexed column metadata and
+  enforce unique constraints across inserts, updates, and transactions.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
