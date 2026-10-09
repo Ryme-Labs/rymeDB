@@ -587,7 +587,7 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(name_index)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
-    Ok(Statement::CreateTable { table, columns: parse_column_definitions(raw) })
+    Ok(Statement::CreateTable { table, columns: parse_column_definitions(raw)? })
 }
 
 fn parse_create_index(tokens: &[String]) -> Result<Statement> {
@@ -623,13 +623,39 @@ fn parse_create_index(tokens: &[String]) -> Result<Statement> {
     Ok(Statement::CreateIndex { name, table, field, column, unique })
 }
 
-fn parse_column_definitions(raw: &str) -> Vec<ColumnDefinition> {
-    let Some(open) = raw.find('(') else { return Vec::new() };
-    let Some(close) = raw.rfind(')') else { return Vec::new() };
+fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
+    let Some(open) = raw.find('(') else { return Ok(Vec::new()) };
+    let Some(close) = raw.rfind(')') else { return Ok(Vec::new()) };
     if close <= open {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    split_sql_items(&raw[open + 1..close])
+    let items = split_sql_items(&raw[open + 1..close]);
+    let mut table_primary = Vec::new();
+    for item in &items {
+        let words: Vec<&str> = item.split_whitespace().collect();
+        let table_constraint = words.first().is_some_and(|word| {
+            word.eq_ignore_ascii_case("PRIMARY") || word.eq_ignore_ascii_case("CONSTRAINT")
+        });
+        if !table_constraint || !item.to_ascii_uppercase().contains("PRIMARY KEY") {
+            continue;
+        }
+        let constraint_open = item
+            .find('(')
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("primary key columns")))?;
+        let constraint_close = matching_paren(item, constraint_open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("primary key columns")))?;
+        table_primary.extend(
+            split_sql_items(&item[constraint_open + 1..constraint_close])
+                .into_iter()
+                .map(|column| unquote(column.trim())),
+        );
+    }
+    if table_primary.len() > 1 {
+        return Err(RymeError::InvalidArgument(String::from(
+            "composite primary keys are not supported",
+        )));
+    }
+    let mut columns: Vec<ColumnDefinition> = items
         .into_iter()
         .filter_map(|definition| {
             let words: Vec<&str> = definition.split_whitespace().collect();
@@ -682,7 +708,19 @@ fn parse_column_definitions(raw: &str) -> Vec<ColumnDefinition> {
                 auto_increment,
             })
         })
-        .collect()
+        .collect();
+    if let Some(primary) = table_primary.first() {
+        let Some(column) =
+            columns.iter_mut().find(|column| column.name.eq_ignore_ascii_case(primary))
+        else {
+            return Err(RymeError::InvalidArgument(format!(
+                "unknown primary key column {primary}"
+            )));
+        };
+        column.primary_key = true;
+        column.nullable = false;
+    }
+    Ok(columns)
 }
 
 fn split_sql_items(input: &str) -> Vec<String> {
@@ -4603,6 +4641,24 @@ mod tests {
         assert!(!columns[0].nullable);
         assert_eq!(columns[1].column_default.as_deref(), Some("0"));
         assert_eq!(columns[2].column_default.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn parses_table_level_primary_keys() {
+        let statement = parse(
+            "CREATE TABLE users (id BIGINT, email TEXT, CONSTRAINT users_pkey PRIMARY KEY (id))",
+        )
+        .unwrap();
+        let Statement::CreateTable { columns, .. } = statement else {
+            panic!("expected create table")
+        };
+        assert!(columns[0].primary_key);
+        assert!(!columns[0].nullable);
+        assert!(!columns[1].primary_key);
+        assert!(parse(
+            "CREATE TABLE users (left_id BIGINT, right_id BIGINT, PRIMARY KEY (left_id, right_id))"
+        )
+        .is_err());
     }
 
     #[test]
