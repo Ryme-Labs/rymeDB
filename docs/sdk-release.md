@@ -6,6 +6,10 @@ The repository publishes only three SDKs:
 - Rust crate `rymedb-client` from `sdks/rust`
 - Java package `com.rymelabs:rymedb-client` from `sdks/java`
 
+Those are the complete supported SDK set. New SDK directories are intentionally
+not published by the release workflow; the Pages site also links these three
+README files directly.
+
 The `sdk-release` workflow builds and tests all three on changes to `sdks/`.
 Push a `v*` tag after updating the version in each manifest to publish them.
 The workflow uploads npm, Cargo, and Maven build artifacts to the GitHub

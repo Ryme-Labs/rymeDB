@@ -2,6 +2,24 @@
   "name": "@rymelabs/rymedb",
   "version": "0.1.0",
   "type": "module",
+  "description": "Typed npm client for the rymeDB HTTP and realtime APIs",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ryme-Labs/rymeDB.git",
+    "directory": "sdks/js"
+  },
+  "homepage": "https://ryme-labs.github.io/rymeDB/",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

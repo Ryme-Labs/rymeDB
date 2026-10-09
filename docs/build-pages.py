@@ -12,6 +12,7 @@ SPEC = ROOT / "schemas" / "openapi" / "rest.yaml"
 README = ROOT / "README.md"
 IMAGES = ROOT / "images"
 REPO = "https://github.com/Ryme-Labs/rymeDB"
+SDK_DIRS = (("java", "Java SDK"), ("js", "npm SDK"), ("rust", "Rust SDK"))
 
 CSS = """
 :root { color-scheme: light dark; }
@@ -75,26 +76,44 @@ def build(out):
     docs_out = out / "docs"
     api_out = out / "api"
     spec_out = out / "openapi"
+    sdk_out = out / "sdks"
     docs_out.mkdir(parents=True)
     api_out.mkdir(parents=True)
     spec_out.mkdir(parents=True)
+    sdk_out.mkdir(parents=True)
     (out / ".nojekyll").write_text("", encoding="utf-8")
 
     md_files = sorted(DOCS.glob("*.md"))
     entries = [(p.stem, title_of(p, p.stem)) for p in md_files]
 
-    def nav(active=""):
-        items = ["<li><a href=\"../index.html\"" + (" class=\"active\"" if active == "home" else "") + ">Home</a></li>"]
-        items.append("<li><a href=\"../api/index.html\"" + (" class=\"active\"" if active == "api" else "") + ">API reference</a></li>")
+    sdk_entries = []
+    for slug, title in SDK_DIRS:
+        readme = ROOT / "sdks" / slug / "README.md"
+        if readme.exists():
+            sdk_entries.append((slug, title, readme))
+
+    def nav(active="", base=".."):
+        items = ["<li><a href=\"" + base + "/index.html\"" + (" class=\"active\"" if active == "home" else "") + ">Home</a></li>"]
+        items.append("<li><a href=\"" + base + "/api/index.html\"" + (" class=\"active\"" if active == "api" else "") + ">API reference</a></li>")
         for slug, title in entries:
             cls = " class=\"active\"" if active == slug else ""
-            items.append("<li><a href=\"../docs/" + slug + ".html\"" + cls + ">" + title + "</a></li>")
+            items.append("<li><a href=\"" + base + "/docs/" + slug + ".html\"" + cls + ">" + title + "</a></li>")
+        for slug, title, _ in sdk_entries:
+            cls = " class=\"active\"" if active == "sdk-" + slug else ""
+            items.append("<li><a href=\"" + base + "/sdks/" + slug + ".html\"" + cls + ">" + title + "</a></li>")
         return "".join(items)
 
     for path in md_files:
         body = render_md(path.read_text(encoding="utf-8"))
         (docs_out / (path.stem + ".html")).write_text(
-            page(title_of(path, path.stem), body, nav(path.stem), root_prefix=".."),
+            page(title_of(path, path.stem), body, nav(path.stem, ".."), root_prefix=".."),
+            encoding="utf-8",
+        )
+
+    for slug, title, readme in sdk_entries:
+        body = render_md(readme.read_text(encoding="utf-8"))
+        (sdk_out / (slug + ".html")).write_text(
+            page(title, body, nav("sdk-" + slug, ".."), root_prefix=".."),
             encoding="utf-8",
         )
 
@@ -109,6 +128,10 @@ def build(out):
         "<div class=\"card\"><a href=\"docs/" + slug + ".html\">" + title + "</a></div>"
         for slug, title in entries
     )
+    sdk_cards = "".join(
+        "<div class=\"card\"><a href=\"sdks/" + slug + ".html\">" + title + "</a></div>"
+        for slug, title, _ in sdk_entries
+    )
     readme_body = render_md(README.read_text(encoding="utf-8")) if README.exists() else ""
     home_body = (
         "<h1>rymeDB documentation</h1>\n"
@@ -118,9 +141,10 @@ def build(out):
         "<a href=\"openapi/rest.yaml\">rest.yaml</a> · "
         "<a href=\"openapi/rest.json\">rest.json</a></p>\n"
         "<h2>Guides</h2>\n<div class=\"cards\">" + cards + "</div>\n"
+        "<h2>SDKs</h2>\n<div class=\"cards\">" + sdk_cards + "</div>\n"
         "<hr>\n" + readme_body
     )
-    (out / "index.html").write_text(page("Home", home_body, nav("home"), root_prefix="."), encoding="utf-8")
+    (out / "index.html").write_text(page("Home", home_body, nav("home", "."), root_prefix="."), encoding="utf-8")
 
     api_body = (
         "<h1>REST API reference</h1>\n"
@@ -134,12 +158,12 @@ def build(out):
         "  SwaggerUIBundle({ url: \"../openapi/rest.yaml\", dom_id: \"#swagger-ui\" });\n"
         "};\n</script>\n"
     )
-    (api_out / "index.html").write_text(page("API reference", api_body, nav("api"), root_prefix=".."), encoding="utf-8")
+    (api_out / "index.html").write_text(page("API reference", api_body, nav("api", ".."), root_prefix=".."), encoding="utf-8")
 
     if IMAGES.exists():
         shutil.copytree(IMAGES, out / "images", dirs_exist_ok=True)
 
-    print("pages ok: " + str(len(entries)) + " guides, " + str(path_count) + " api paths -> " + str(out))
+    print("pages ok: " + str(len(entries)) + " guides, " + str(len(sdk_entries)) + " SDKs, " + str(path_count) + " api paths -> " + str(out))
 
 
 def main():
