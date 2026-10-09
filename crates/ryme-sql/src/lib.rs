@@ -4985,7 +4985,7 @@ pub fn aggregate_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, field: Field) 
                 }
             }
             if count == 0 {
-                b"0".to_vec()
+                SQL_NULL_SENTINEL.to_vec()
             } else {
                 format_number(total).into_bytes()
             }
@@ -5004,7 +5004,7 @@ pub fn aggregate_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, field: Field) 
                 }
             }
             if count == 0 {
-                b"null".to_vec()
+                SQL_NULL_SENTINEL.to_vec()
             } else {
                 format_number(total / count as f64).into_bytes()
             }
@@ -5016,7 +5016,7 @@ pub fn aggregate_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, field: Field) 
                 Field::Value => value.clone(),
             })
             .min()
-            .unwrap_or_else(|| b"null".to_vec()),
+            .unwrap_or_else(|| SQL_NULL_SENTINEL.to_vec()),
         AggFunc::Max => rows
             .iter()
             .map(|(pk, value)| match field {
@@ -5024,7 +5024,7 @@ pub fn aggregate_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, field: Field) 
                 Field::Value => value.clone(),
             })
             .max()
-            .unwrap_or_else(|| b"null".to_vec()),
+            .unwrap_or_else(|| SQL_NULL_SENTINEL.to_vec()),
     }
 }
 
@@ -5051,7 +5051,7 @@ fn aggregate_column_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, column: &st
                 }
             }
             if count == 0 {
-                b"0".to_vec()
+                SQL_NULL_SENTINEL.to_vec()
             } else {
                 format_number(total).into_bytes()
             }
@@ -5066,13 +5066,13 @@ fn aggregate_column_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, column: &st
                 }
             }
             if count == 0 {
-                b"null".to_vec()
+                SQL_NULL_SENTINEL.to_vec()
             } else {
                 format_number(total / count as f64).into_bytes()
             }
         }
-        AggFunc::Min => values.into_iter().min().unwrap_or_else(|| b"null".to_vec()),
-        AggFunc::Max => values.into_iter().max().unwrap_or_else(|| b"null".to_vec()),
+        AggFunc::Min => values.into_iter().min().unwrap_or_else(|| SQL_NULL_SENTINEL.to_vec()),
+        AggFunc::Max => values.into_iter().max().unwrap_or_else(|| SQL_NULL_SENTINEL.to_vec()),
     }
 }
 
@@ -14109,20 +14109,27 @@ mod tests {
                 .unwrap();
         }
         for (sql, label, value) in [
-            ("SELECT COUNT(*) FROM nums", "count", "4"),
-            ("SELECT COUNT(*) FROM nums WHERE value != 'oops'", "count", "3"),
-            ("SELECT SUM(value) FROM nums", "sum", "60"),
-            ("SELECT AVG(value) FROM nums", "avg", "20"),
-            ("SELECT MIN(value) FROM nums", "min", "10"),
-            ("SELECT MAX(value) FROM nums", "max", "oops"),
-            ("SELECT MIN(key) FROM nums", "min", "a"),
-            ("SELECT AVG(value) FROM nums WHERE key = 'ghost'", "avg", "null"),
-            ("SELECT SUM(value) FROM nums WHERE key = 'ghost'", "sum", "0"),
+            ("SELECT COUNT(*) FROM nums", "count", Some("4")),
+            ("SELECT COUNT(*) FROM nums WHERE value != 'oops'", "count", Some("3")),
+            ("SELECT SUM(value) FROM nums", "sum", Some("60")),
+            ("SELECT AVG(value) FROM nums", "avg", Some("20")),
+            ("SELECT MIN(value) FROM nums", "min", Some("10")),
+            ("SELECT MAX(value) FROM nums", "max", Some("oops")),
+            ("SELECT MIN(key) FROM nums", "min", Some("a")),
+            ("SELECT AVG(value) FROM nums WHERE key = 'ghost'", "avg", None),
+            ("SELECT SUM(value) FROM nums WHERE key = 'ghost'", "sum", None),
+            ("SELECT MIN(value) FROM nums WHERE key = 'ghost'", "min", None),
+            ("SELECT MAX(value) FROM nums WHERE key = 'ghost'", "max", None),
         ] {
             match executor.execute(parse(sql).unwrap()).await.unwrap() {
                 QueryResult::Scalar { label: got_label, value: got_value } => {
                     assert_eq!(got_label, label, "{sql}");
-                    assert_eq!(String::from_utf8(got_value).unwrap(), value, "{sql}");
+                    match value {
+                        Some(expected) => {
+                            assert_eq!(String::from_utf8(got_value).unwrap(), expected, "{sql}");
+                        }
+                        None => assert_eq!(got_value, SQL_NULL_SENTINEL, "{sql}"),
+                    }
                 }
                 _ => panic!("expected scalar for {sql}"),
             }

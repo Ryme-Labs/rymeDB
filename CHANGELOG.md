@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL aggregates now return protocol-level `NULL` for empty
+  `SUM`, `AVG`, `MIN`, and `MAX` results, and scalar aggregate descriptions
+  preserve their function labels.
 - PostgreSQL table projections and `RETURNING` now preserve nullable
   schema/JSON fields as protocol-level `NULL` cells instead of empty strings.
 - PostgreSQL column projections now preserve explicit `AS` aliases in core

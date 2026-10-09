@@ -2459,10 +2459,9 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
             out.extend(command_complete("SELECT 1"));
             out
         }
-        QueryResult::Scalar { label: _, value } => {
-            let text = String::from_utf8_lossy(&value).into_owned();
-            let mut out = row_description();
-            out.extend(data_row(text));
+        QueryResult::Scalar { label, value } => {
+            let mut out = multi_row_description(&[label]);
+            out.extend(data_row_values(&[value]));
             out.extend(command_complete("SELECT 1"));
             out
         }
@@ -2847,5 +2846,15 @@ mod tests {
         assert_eq!(u16::from_be_bytes([packet[5], packet[6]]), 2);
         assert_eq!(i32::from_be_bytes(packet[7..11].try_into().unwrap()), -1);
         assert_eq!(i32::from_be_bytes(packet[11..15].try_into().unwrap()), 5);
+    }
+
+    #[test]
+    fn scalar_results_preserve_labels_and_nulls() {
+        let packet = encode_result(QueryResult::Scalar {
+            label: String::from("sum"),
+            value: SQL_NULL_SENTINEL.to_vec(),
+        });
+        assert!(packet.windows(b"sum\0".len()).any(|window| window == b"sum\0"));
+        assert!(packet.windows(4).any(|window| window == (-1i32).to_be_bytes()));
     }
 }
