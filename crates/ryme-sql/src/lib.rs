@@ -81,6 +81,11 @@ pub enum Statement {
         pk: Vec<u8>,
         value: Vec<u8>,
     },
+    UpdateRow {
+        table: String,
+        pk: Vec<u8>,
+        assignments: Vec<(String, InsertValue)>,
+    },
     Delete {
         table: String,
         pk: Vec<u8>,
@@ -131,6 +136,7 @@ impl Statement {
                 | Statement::InsertRow { .. }
                 | Statement::Upsert { .. }
                 | Statement::Update { .. }
+                | Statement::UpdateRow { .. }
                 | Statement::Delete { .. }
                 | Statement::CopyFrom { .. }
                 | Statement::Returning { .. }
@@ -283,6 +289,7 @@ impl Statement {
             | Self::Join { left: table, .. }
             | Self::GroupBy { table, .. }
             | Self::Update { table, .. }
+            | Self::UpdateRow { table, .. }
             | Self::Delete { table, .. }
             | Self::CopyFrom { table, .. } => table,
             Self::Returning { statement, .. } => statement.table(),
@@ -547,6 +554,27 @@ fn split_sql_items(input: &str) -> Vec<String> {
     items
 }
 
+fn split_assignment(input: &str) -> Option<(&str, &str)> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (index, ch) in input.char_indices() {
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => return Some((&input[..index], &input[index + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
     if let Some((columns, values)) = parse_standard_insert_row(raw)? {
@@ -684,6 +712,36 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(1)
         .cloned()
         .ok_or_else(|| RymeError::InvalidArgument(String::from("update table")))?;
+    if let Some(set) = tokens.iter().position(|token| token.eq_ignore_ascii_case("SET")) {
+        let where_pos = tokens
+            .iter()
+            .position(|token| token.eq_ignore_ascii_case("WHERE"))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("update predicate")))?;
+        if where_pos <= set + 1 {
+            return Err(RymeError::InvalidArgument(String::from("update assignments")));
+        }
+        let pk = value_after(&tokens[where_pos..], &["KEY", "PK", "ID"])?.into_bytes();
+        let upper = raw.to_ascii_uppercase();
+        let set_offset = upper
+            .find(" SET ")
+            .map(|offset| offset + 5)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("update assignments")))?;
+        let where_offset = upper[set_offset..]
+            .find(" WHERE ")
+            .map(|offset| set_offset + offset)
+            .unwrap_or(raw.len());
+        let assignment_text = raw[set_offset..where_offset].trim();
+        let mut assignments = Vec::new();
+        for assignment in split_sql_items(assignment_text) {
+            let (column, value) = split_assignment(&assignment)
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("update assignment")))?;
+            assignments.push((unquote(column.trim()), parse_insert_value(value.trim())?));
+        }
+        if assignments.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("update assignments")));
+        }
+        return Ok(Statement::UpdateRow { table, pk, assignments });
+    }
     let (pk, value) = key_value_from(tokens).or_else(|_| {
         let pk = value_after(tokens, &["KEY", "PK", "ID"])?;
         let set = tokens
@@ -695,7 +753,6 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
             .ok_or_else(|| RymeError::InvalidArgument(String::from("update value")))?;
         Ok::<(Vec<u8>, Vec<u8>), RymeError>((pk.into_bytes(), eval_operand(value)?.into_bytes()))
     })?;
-    let _ = raw;
     Ok(Statement::Update { table, pk, value })
 }
 
@@ -1129,6 +1186,19 @@ fn json_insert_value(value: Option<Vec<u8>>, data_type: &str) -> serde_json::Val
     serde_json::Value::String(text.into_owned())
 }
 
+fn json_update_value(
+    value: Option<Vec<u8>>,
+    previous: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let data_type = match previous {
+        Some(serde_json::Value::Bool(_)) => "boolean",
+        Some(serde_json::Value::Number(_)) => "numeric",
+        Some(serde_json::Value::Array(_) | serde_json::Value::Object(_)) => "jsonb",
+        _ => "text",
+    };
+    json_insert_value(value, data_type)
+}
+
 fn json_result_bytes(value: &serde_json::Value) -> Vec<u8> {
     match value {
         serde_json::Value::String(text) => text.as_bytes().to_vec(),
@@ -1217,6 +1287,9 @@ pub fn describe_plan(statement: &Statement) -> String {
             format!("project({table}) columns {} limit {limit} offset {offset}", columns.len())
         }
         Statement::Update { table, .. } => format!("write update({table}) point"),
+        Statement::UpdateRow { table, assignments, .. } => {
+            format!("write update({table}) columns {}", assignments.len())
+        }
         Statement::Delete { table, .. } => format!("write delete({table}) point"),
         Statement::CopyFrom { table, .. } => format!("bulk ingest({table}) batched put"),
         Statement::Returning { statement, fields } => {
@@ -1574,6 +1647,117 @@ where
         let encoded = serde_json::to_vec(&serde_json::Value::Object(object))
             .map_err(|error| RymeError::Internal(error.to_string()))?;
         Ok((pk, encoded))
+    }
+
+    fn materialize_update_row(
+        &self,
+        table: &str,
+        pk: &[u8],
+        assignments: Vec<(String, InsertValue)>,
+        current: &[u8],
+    ) -> Result<Vec<u8>> {
+        let definitions = self.catalog_columns(table);
+        if definitions.is_empty() {
+            if let Ok(serde_json::Value::Object(mut object)) =
+                serde_json::from_slice::<serde_json::Value>(current)
+            {
+                let primary_key = object
+                    .keys()
+                    .find(|name| {
+                        name.eq_ignore_ascii_case("id")
+                            || name.eq_ignore_ascii_case("pk")
+                            || name.eq_ignore_ascii_case("key")
+                    })
+                    .cloned();
+                for (column, value) in assignments {
+                    if primary_key.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(&column))
+                    {
+                        return Err(RymeError::InvalidArgument(String::from(
+                            "updating the primary key is not supported",
+                        )));
+                    }
+                    let previous = object.get(&column);
+                    let resolved = match value {
+                        InsertValue::Value(value) => json_update_value(Some(value), previous),
+                        InsertValue::Null => serde_json::Value::Null,
+                        InsertValue::Default => {
+                            return Err(RymeError::InvalidArgument(String::from(
+                                "default update value requires table schema",
+                            )));
+                        }
+                    };
+                    object.insert(column, resolved);
+                }
+                return serde_json::to_vec(&serde_json::Value::Object(object))
+                    .map_err(|error| RymeError::Internal(error.to_string()));
+            }
+            if assignments.len() == 1 {
+                let (_, value) = assignments.into_iter().next().ok_or_else(|| {
+                    RymeError::InvalidArgument(String::from("update assignments"))
+                })?;
+                return match value {
+                    InsertValue::Value(value) => Ok(value),
+                    InsertValue::Null => Ok(Vec::new()),
+                    InsertValue::Default => {
+                        Err(RymeError::InvalidArgument(String::from("default update value")))
+                    }
+                };
+            }
+            return Err(RymeError::InvalidArgument(String::from(
+                "schema required for column update",
+            )));
+        }
+        let mut object = serde_json::from_slice::<serde_json::Value>(current)
+            .map_err(|_| RymeError::InvalidArgument(String::from("row is not a schema record")))?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                RymeError::InvalidArgument(String::from("row is not a schema record"))
+            })?;
+        let primary_key = definitions
+            .iter()
+            .find(|definition| definition.primary_key)
+            .map(|definition| definition.name.as_str())
+            .or_else(|| {
+                definitions
+                    .iter()
+                    .find(|definition| definition.name.eq_ignore_ascii_case("id"))
+                    .map(|definition| definition.name.as_str())
+            });
+        for (column, value) in assignments {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.name.eq_ignore_ascii_case(&column))
+                .ok_or_else(|| RymeError::InvalidArgument(format!("unknown column {column}")))?;
+            if primary_key.is_some_and(|name| name.eq_ignore_ascii_case(&column)) {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "updating the primary key is not supported",
+                )));
+            }
+            let resolved = match value {
+                InsertValue::Value(value) => Some(value),
+                InsertValue::Null => None,
+                InsertValue::Default => {
+                    definition.column_default.as_deref().map(eval_default).transpose()?.flatten()
+                }
+            };
+            if resolved.is_none() && !definition.nullable {
+                return Err(RymeError::InvalidArgument(format!(
+                    "null value in column {} violates not-null constraint",
+                    definition.name
+                )));
+            }
+            object.insert(
+                definition.name.clone(),
+                json_insert_value(resolved, &definition.data_type),
+            );
+        }
+        object.insert(
+            primary_key.unwrap_or("id").to_string(),
+            serde_json::Value::String(String::from_utf8_lossy(pk).to_string()),
+        );
+        serde_json::to_vec(&serde_json::Value::Object(object))
+            .map_err(|error| RymeError::Internal(error.to_string()))
     }
 
     fn project_row(
@@ -1983,6 +2167,18 @@ where
                     }],
                 ))
             }
+            Statement::UpdateRow { table, pk, assignments } => {
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let current = self
+                    .manager
+                    .get(txn, &key)?
+                    .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
+                let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
+                Box::pin(
+                    self.execute_in_transaction_base(txn, Statement::Update { table, pk, value }),
+                )
+                .await
+            }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -2055,6 +2251,20 @@ where
                 let value_for_result = value.clone();
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Upsert { table, pk, value })
+                    .await?;
+                Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+            }
+            Statement::UpdateRow { table, pk, assignments } => {
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let current = self
+                    .manager
+                    .get(txn, &key)?
+                    .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
+                let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                let (_, changes) = self
+                    .execute_in_transaction_base(txn, Statement::Update { table, pk, value })
                     .await?;
                 Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
             }
@@ -2347,6 +2557,22 @@ where
                 self.execute_with_base(Statement::Upsert { table, pk, value }, isolation).await?;
                 Ok(returning_result(&fields, pk_for_result, value_for_result))
             }
+            Statement::UpdateRow { table, pk, assignments } => {
+                let mut txn = self.manager.begin_with(isolation);
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let current = self
+                    .manager
+                    .get(&mut txn, &key)?
+                    .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
+                let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                let (_result, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::Update { table, pk, value })
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(returning_result(&fields, pk_for_result, value_for_result))
+            }
             Statement::Update { table, pk, value } => {
                 let pk_for_result = pk.clone();
                 let value_for_result = value.clone();
@@ -2615,6 +2841,21 @@ where
                 });
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
+            Statement::UpdateRow { table, pk, assignments } => {
+                self.reject_if_read_only()?;
+                let mut txn = self.manager.begin_with(isolation);
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let current = self
+                    .manager
+                    .get(&mut txn, &key)?
+                    .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
+                let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
+                let (result, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::Update { table, pk, value })
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
+            }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let mut txn = self.manager.begin_with(isolation);
@@ -2840,6 +3081,50 @@ mod tests {
             .unwrap();
         assert!(matches!(result, QueryResult::Table { ref rows, .. }
             if rows == &vec![vec![b"e1".to_vec(), b"hello".to_vec()]]));
+    }
+
+    #[tokio::test]
+    async fn standard_update_preserves_unmodified_schema_columns() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE profiles (id TEXT PRIMARY KEY, payload TEXT, count INTEGER DEFAULT 0)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO profiles (id, payload, count) VALUES ('p1', 'before', 3)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let statement = parse(
+            "UPDATE profiles SET payload = 'after', count = DEFAULT WHERE id = 'p1' RETURNING *",
+        )
+        .unwrap();
+        assert!(matches!(statement, Statement::Returning { ref statement, .. }
+            if matches!(statement.as_ref(), Statement::UpdateRow { assignments, .. } if assignments.len() == 2)));
+        let result = executor.execute(statement).await.unwrap();
+        let returned = match result {
+            QueryResult::Returning { rows, .. } => rows,
+            other => panic!("expected returning rows: {other:?}"),
+        };
+        assert_eq!(returned[0][0], b"p1".to_vec());
+        let returned_object: serde_json::Value = serde_json::from_slice(&returned[0][1]).unwrap();
+        assert_eq!(returned_object["payload"], "after");
+        assert_eq!(returned_object["count"], 0);
+
+        let result = executor
+            .execute(parse("SELECT payload, count FROM profiles WHERE id = 'p1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Table { ref rows, .. }
+            if rows == &vec![vec![b"after".to_vec(), b"0".to_vec()]]));
     }
 
     #[tokio::test]
