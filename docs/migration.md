@@ -124,6 +124,8 @@ simple one or more `WITH name AS (SELECT * FROM source [WHERE ...])` CTEs can
 feed outer selects and `INSERT ... SELECT` statements,
 prepared PostgreSQL parameters are bound outside SQL literals/comments with
 multi-digit placeholder support and scalar type preservation,
+`ALTER TABLE ... ALTER COLUMN ... TYPE ... USING column::type` is accepted for
+standard self-column casts,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
 `ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
 JSONB projections support PostgreSQL `->` and `->>` operators, including

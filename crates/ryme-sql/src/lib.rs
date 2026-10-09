@@ -1149,13 +1149,16 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
                 tokens.iter().enumerate().skip(type_pos).find_map(|(position, token)| {
                     token.eq_ignore_ascii_case("USING").then_some(position)
                 });
-            if using_pos.is_some() {
-                return Err(RymeError::InvalidArgument(String::from(
-                    "alter column type using expressions are not supported",
-                )));
+            if let Some(using_pos) = using_pos {
+                let expression = tokens.get(using_pos + 1..).unwrap_or_default().join(" ");
+                if !is_simple_type_using_expression(&expression, &column) {
+                    return Err(RymeError::InvalidArgument(String::from(
+                        "alter column type using expressions are not supported",
+                    )));
+                }
             }
             let data_type = tokens
-                .get(type_pos..)
+                .get(type_pos..using_pos.unwrap_or(tokens.len()))
                 .unwrap_or_default()
                 .join(" ")
                 .trim_end_matches(';')
@@ -1560,6 +1563,15 @@ fn parse_named_table_constraints(raw: &str) -> Result<Vec<TableConstraint>> {
         }
     }
     Ok(constraints)
+}
+
+fn is_simple_type_using_expression(expression: &str, column: &str) -> bool {
+    let expression = expression.trim();
+    if expression.eq_ignore_ascii_case(column) {
+        return true;
+    }
+    let Some((source, cast_type)) = expression.split_once("::") else { return false };
+    source.trim().eq_ignore_ascii_case(column) && !cast_type.trim().is_empty()
 }
 
 fn parse_with(raw: &str) -> Result<Statement> {
@@ -11751,6 +11763,17 @@ mod tests {
                 ..
             } if column == "length" && data_type == "bigint"
         ));
+        assert!(matches!(
+            parse("ALTER TABLE messages ALTER COLUMN length TYPE BIGINT USING length::BIGINT")
+                .unwrap(),
+            Statement::AlterTableColumn {
+                column,
+                alteration: ColumnAlteration::SetType(data_type),
+                ..
+            } if column == "length" && data_type == "bigint"
+        ));
+        assert!(parse("ALTER TABLE messages ALTER COLUMN length TYPE BIGINT USING other::BIGINT")
+            .is_err());
     }
 
     #[tokio::test]
@@ -12570,7 +12593,10 @@ mod tests {
             .await
             .unwrap();
         executor
-            .execute(parse("ALTER TABLE events ALTER COLUMN count TYPE INTEGER").unwrap())
+            .execute(
+                parse("ALTER TABLE events ALTER COLUMN count TYPE INTEGER USING count::INTEGER")
+                    .unwrap(),
+            )
             .await
             .unwrap();
         executor
