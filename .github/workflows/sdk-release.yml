@@ -3,17 +3,25 @@ name: sdk-release
 on:
   push:
     branches: [main]
-    tags: ["v*"]
     paths:
       - "sdks/**"
       - "docs/sdk-release.md"
       - ".github/workflows/sdk-release.yml"
+      - ".github/workflows/sdk-tag-release.yml"
   pull_request:
     paths:
       - "sdks/**"
       - "docs/sdk-release.md"
       - ".github/workflows/sdk-release.yml"
+      - ".github/workflows/sdk-tag-release.yml"
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the tested SDKs to their registries
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
     inputs:
       publish:
         description: Publish the tested SDKs to their registries

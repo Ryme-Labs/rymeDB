@@ -1,0 +1,16 @@
+name: sdk-tag-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    uses: ./.github/workflows/sdk-release.yml
+    with:
+      publish: true
+    secrets: inherit
