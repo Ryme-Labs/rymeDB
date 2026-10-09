@@ -13,6 +13,8 @@ pub enum Statement {
     CreateTable {
         table: String,
         columns: Vec<ColumnDefinition>,
+        #[serde(default)]
+        if_not_exists: bool,
     },
     DropTable {
         table: String,
@@ -776,7 +778,9 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(name_index)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create table")))?;
-    Ok(Statement::CreateTable { table, columns: parse_column_definitions(raw)? })
+    let if_not_exists =
+        tokens.get(table_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+    Ok(Statement::CreateTable { table, columns: parse_column_definitions(raw)?, if_not_exists })
 }
 
 fn parse_create_index(tokens: &[String]) -> Result<Statement> {
@@ -2013,7 +2017,7 @@ fn parse_explain(input: &str) -> Result<Statement> {
 
 pub fn describe_plan(statement: &Statement) -> String {
     match statement {
-        Statement::CreateTable { table, columns } => {
+        Statement::CreateTable { table, columns, .. } => {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
         Statement::DropTable { table, .. } => format!("ddl drop_table({table})"),
@@ -3333,6 +3337,27 @@ where
         }
     }
 
+    fn create_table(
+        &self,
+        table: String,
+        columns: Vec<ColumnDefinition>,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let exists = self
+            .catalog
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
+            .contains_key(&table);
+        if exists {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(RymeError::Conflict(String::from("table exists")));
+        }
+        self.register_table(table, columns);
+        Ok(())
+    }
+
     async fn drop_table(&self, table: String, if_exists: bool) -> Result<()> {
         self.reject_if_read_only()?;
         let present = self
@@ -3804,8 +3829,8 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match &statement {
-            Statement::CreateTable { table, columns } => {
-                self.register_table(table.clone(), columns.clone());
+            Statement::CreateTable { table, columns, if_not_exists } => {
+                self.create_table(table.clone(), columns.clone(), *if_not_exists)?;
             }
             Statement::DropTable { .. } => {}
             Statement::TruncateTable { .. } => {}
@@ -4401,8 +4426,8 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match &statement {
-            Statement::CreateTable { table, columns } => {
-                self.register_table(table.clone(), columns.clone());
+            Statement::CreateTable { table, columns, if_not_exists } => {
+                self.create_table(table.clone(), columns.clone(), *if_not_exists)?;
             }
             Statement::DropTable { .. } => {}
             Statement::TruncateTable { .. } => {}
@@ -5379,7 +5404,7 @@ mod tests {
         )
         .unwrap();
         let (table, columns) = match &statement {
-            Statement::CreateTable { table, columns } => (table.clone(), columns.clone()),
+            Statement::CreateTable { table, columns, .. } => (table.clone(), columns.clone()),
             _ => panic!("expected create table"),
         };
         assert_eq!(table, "public.messages");
@@ -5397,6 +5422,21 @@ mod tests {
         executor.execute(statement).await.unwrap();
         assert_eq!(executor.catalog_tables(), vec![String::from("public.messages")]);
         assert_eq!(executor.catalog_columns("public.messages"), columns);
+    }
+
+    #[tokio::test]
+    async fn create_table_if_not_exists_is_idempotent_but_duplicate_create_fails() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+
+        assert!(executor
+            .execute(parse("CREATE TABLE users (id INTEGER PRIMARY KEY)").unwrap())
+            .await
+            .is_err());
+        let statement = parse("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)").unwrap();
+        assert!(matches!(statement, Statement::CreateTable { if_not_exists: true, .. }));
+        executor.execute(statement).await.unwrap();
+        assert_eq!(executor.catalog_columns("users")[0].data_type, "text");
     }
 
     #[tokio::test]

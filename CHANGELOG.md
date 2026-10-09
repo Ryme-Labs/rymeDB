@@ -47,6 +47,8 @@ All notable changes to rymeDB are recorded here. Format follows
   enforce unique constraints across inserts, updates, and transactions.
 - `CREATE TABLE` now recognizes single-column table-level `PRIMARY KEY`
   constraints and rejects unsupported composite primary keys explicitly.
+- Duplicate `CREATE TABLE` statements now fail, while `CREATE TABLE IF NOT
+  EXISTS` remains idempotent without replacing the existing schema.
 - Inline and single-column table-level `UNIQUE` constraints now create durable
   named indexes and reject duplicate inserts and updates.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,
