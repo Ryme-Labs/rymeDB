@@ -95,7 +95,8 @@ and `SET DEFAULT`,
 `DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, and `DROP INDEX [IF EXISTS]`,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
-`INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
+`INSERT INTO table (...) VALUES (...)`; `ON CONFLICT DO UPDATE` maps to upsert,
+while `ON CONFLICT DO NOTHING` skips conflicting rows,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
 `ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
 JSONB projections support PostgreSQL `->` and `->>` operators, including

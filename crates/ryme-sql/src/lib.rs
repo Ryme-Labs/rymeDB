@@ -83,14 +83,23 @@ pub enum Statement {
         columns: Vec<String>,
         values: Vec<InsertValue>,
         upsert: bool,
+        #[serde(default)]
+        on_conflict_do_nothing: bool,
     },
     InsertRows {
         table: String,
         columns: Vec<String>,
         rows: Vec<Vec<InsertValue>>,
         upsert: bool,
+        #[serde(default)]
+        on_conflict_do_nothing: bool,
     },
     Upsert {
+        table: String,
+        pk: Vec<u8>,
+        value: Vec<u8>,
+    },
+    InsertIgnore {
         table: String,
         pk: Vec<u8>,
         value: Vec<u8>,
@@ -316,6 +325,7 @@ impl Statement {
                 | Statement::InsertRow { .. }
                 | Statement::InsertRows { .. }
                 | Statement::Upsert { .. }
+                | Statement::InsertIgnore { .. }
                 | Statement::Update { .. }
                 | Statement::UpdateRow { .. }
                 | Statement::UpdateWhere { .. }
@@ -690,6 +700,7 @@ impl Statement {
             | Self::InsertRow { table, .. }
             | Self::InsertRows { table, .. }
             | Self::Upsert { table, .. }
+            | Self::InsertIgnore { table, .. }
             | Self::SelectByKey { table, .. }
             | Self::SelectScan { table, .. }
             | Self::SelectColumns { table, .. }
@@ -1613,12 +1624,23 @@ fn split_assignment(input: &str) -> Option<(&str, &str)> {
 fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
     if let Some((columns, rows)) = parse_standard_insert_rows(raw)? {
-        let upsert = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
+        let conflict = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
+        let on_conflict_do_nothing = conflict
+            && tokens.windows(2).any(|window| {
+                window[0].eq_ignore_ascii_case("DO") && window[1].eq_ignore_ascii_case("NOTHING")
+            });
+        let upsert = conflict && !on_conflict_do_nothing;
         if rows.len() == 1 {
             let values = rows.into_iter().next().unwrap_or_default();
-            return Ok(Statement::InsertRow { table, columns, values, upsert });
+            return Ok(Statement::InsertRow {
+                table,
+                columns,
+                values,
+                upsert,
+                on_conflict_do_nothing,
+            });
         }
-        return Ok(Statement::InsertRows { table, columns, rows, upsert });
+        return Ok(Statement::InsertRows { table, columns, rows, upsert, on_conflict_do_nothing });
     }
     let (pk, value) = if let Some(values) =
         tokens.iter().position(|token| token.eq_ignore_ascii_case("VALUES"))
@@ -1635,6 +1657,11 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     };
     let _ = raw;
     if tokens.iter().any(|t| t.eq_ignore_ascii_case("CONFLICT")) {
+        if tokens.windows(2).any(|window| {
+            window[0].eq_ignore_ascii_case("DO") && window[1].eq_ignore_ascii_case("NOTHING")
+        }) {
+            return Ok(Statement::InsertIgnore { table, pk, value });
+        }
         return Ok(Statement::Upsert { table, pk, value });
     }
     Ok(Statement::Insert { table, pk, value })
@@ -2936,6 +2963,7 @@ pub fn describe_plan(statement: &Statement) -> String {
             )
         }
         Statement::Upsert { table, .. } => format!("write upsert({table}) point"),
+        Statement::InsertIgnore { table, .. } => format!("write insert({table}) ignore conflicts"),
         Statement::SelectByKey { table, .. } => {
             format!("point_lookup({table}) using primary index")
         }
@@ -5881,18 +5909,27 @@ where
                 }
                 Ok((QueryResult::Ok, changes))
             }
-            Statement::InsertRow { table, columns, values, upsert } => {
+            Statement::InsertRow { table, columns, values, upsert, on_conflict_do_nothing } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
-                let statement = if upsert {
+                let statement = if on_conflict_do_nothing {
+                    Statement::InsertIgnore { table, pk, value }
+                } else if upsert {
                     Statement::Upsert { table, pk, value }
                 } else {
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_in_transaction_base(txn, statement)).await
             }
-            Statement::InsertRows { table, columns, rows, upsert } => {
+            Statement::InsertRows { table, columns, rows, upsert, on_conflict_do_nothing } => {
                 let changes = self
-                    .execute_insert_rows_in_transaction(txn, table, columns, rows, upsert)
+                    .execute_insert_rows_in_transaction(
+                        txn,
+                        table,
+                        columns,
+                        rows,
+                        upsert,
+                        on_conflict_do_nothing,
+                    )
                     .await?;
                 Ok((QueryResult::Ok, changes))
             }
@@ -5915,6 +5952,33 @@ where
                         pk,
                         op: Operation::Insert,
                         before,
+                        after: Some(value),
+                    }],
+                ))
+            }
+            Statement::InsertIgnore { table, pk, value } => {
+                self.reject_if_read_only()?;
+                self.enforce_rls(&table, &value)?;
+                self.enforce_checks(&table, &pk, &value)?;
+                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                if self.manager.get(txn, &key)?.is_some() {
+                    return Ok((QueryResult::Ok, Vec::new()));
+                }
+                if let Err(error) = self.check_unique(&table, &pk, &value) {
+                    if matches!(error, RymeError::Conflict(_)) {
+                        return Ok((QueryResult::Ok, Vec::new()));
+                    }
+                    return Err(error);
+                }
+                self.manager.put(txn, key, value.clone());
+                Ok((
+                    QueryResult::Ok,
+                    vec![TransactionChange {
+                        table,
+                        pk,
+                        op: Operation::Insert,
+                        before: None,
                         after: Some(value),
                     }],
                 ))
@@ -6098,11 +6162,14 @@ where
         columns: Vec<String>,
         rows: Vec<Vec<InsertValue>>,
         upsert: bool,
+        on_conflict_do_nothing: bool,
     ) -> Result<Vec<TransactionChange>> {
         let mut changes = Vec::new();
         for values in rows {
             let (pk, value) = self.materialize_insert_row(&table, columns.clone(), values)?;
-            let statement = if upsert {
+            let statement = if on_conflict_do_nothing {
+                Statement::InsertIgnore { table: table.clone(), pk, value }
+            } else if upsert {
                 Statement::Upsert { table: table.clone(), pk, value }
             } else {
                 Statement::Insert { table: table.clone(), pk, value }
@@ -6121,6 +6188,7 @@ where
         columns: Vec<String>,
         rows: Vec<Vec<InsertValue>>,
         upsert: bool,
+        on_conflict_do_nothing: bool,
         fields: &[ReturningField],
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         let result_columns = returning_columns(fields);
@@ -6128,18 +6196,28 @@ where
         let mut changes = Vec::new();
         for values in rows {
             let (pk, value) = self.materialize_insert_row(&table, columns.clone(), values)?;
-            let statement = if upsert {
+            let statement = if on_conflict_do_nothing {
+                Statement::InsertIgnore {
+                    table: table.clone(),
+                    pk: pk.clone(),
+                    value: value.clone(),
+                }
+            } else if upsert {
                 Statement::Upsert { table: table.clone(), pk: pk.clone(), value: value.clone() }
             } else {
                 Statement::Insert { table: table.clone(), pk: pk.clone(), value: value.clone() }
             };
             let (_, mut row_changes) =
                 Box::pin(self.execute_in_transaction_base(txn, statement)).await?;
+            let inserted = !row_changes.is_empty();
             changes.append(&mut row_changes);
-            let QueryResult::Returning { rows, .. } = returning_result(fields, pk, value) else {
-                unreachable!("returning result always contains rows");
-            };
-            result_rows.extend(rows);
+            if inserted {
+                let QueryResult::Returning { rows, .. } = returning_result(fields, pk, value)
+                else {
+                    unreachable!("returning result always contains rows");
+                };
+                result_rows.extend(rows);
+            }
         }
         Ok((QueryResult::Returning { columns: result_columns, rows: result_rows }, changes))
     }
@@ -6151,18 +6229,26 @@ where
         fields: Vec<ReturningField>,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
-            Statement::InsertRow { table, columns, values, upsert } => {
+            Statement::InsertRow { table, columns, values, upsert, on_conflict_do_nothing } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
-                let statement = if upsert {
+                let statement = if on_conflict_do_nothing {
+                    Statement::InsertIgnore { table, pk, value }
+                } else if upsert {
                     Statement::Upsert { table, pk, value }
                 } else {
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_returning_in_transaction(txn, statement, fields)).await
             }
-            Statement::InsertRows { table, columns, rows, upsert } => {
+            Statement::InsertRows { table, columns, rows, upsert, on_conflict_do_nothing } => {
                 self.execute_returning_rows_in_transaction(
-                    txn, table, columns, rows, upsert, &fields,
+                    txn,
+                    table,
+                    columns,
+                    rows,
+                    upsert,
+                    on_conflict_do_nothing,
+                    &fields,
                 )
                 .await
             }
@@ -6181,6 +6267,19 @@ where
                     .execute_in_transaction_base(txn, Statement::Upsert { table, pk, value })
                     .await?;
                 Ok((returning_result(&fields, pk_for_result, value_for_result), changes))
+            }
+            Statement::InsertIgnore { table, pk, value } => {
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                let (_, changes) = self
+                    .execute_in_transaction_base(txn, Statement::InsertIgnore { table, pk, value })
+                    .await?;
+                let result = if changes.is_empty() {
+                    QueryResult::Returning { columns: returning_columns(&fields), rows: Vec::new() }
+                } else {
+                    returning_result(&fields, pk_for_result, value_for_result)
+                };
+                Ok((result, changes))
             }
             Statement::UpdateRow { table, pk, assignments } => {
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -6507,20 +6606,28 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match statement {
-            Statement::InsertRow { table, columns, values, upsert } => {
+            Statement::InsertRow { table, columns, values, upsert, on_conflict_do_nothing } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
-                let statement = if upsert {
+                let statement = if on_conflict_do_nothing {
+                    Statement::InsertIgnore { table, pk, value }
+                } else if upsert {
                     Statement::Upsert { table, pk, value }
                 } else {
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_returning(statement, fields, isolation)).await
             }
-            Statement::InsertRows { table, columns, rows, upsert } => {
+            Statement::InsertRows { table, columns, rows, upsert, on_conflict_do_nothing } => {
                 let mut txn = self.begin_with(isolation);
                 let (result, changes) = self
                     .execute_returning_rows_in_transaction(
-                        &mut txn, table, columns, rows, upsert, &fields,
+                        &mut txn,
+                        table,
+                        columns,
+                        rows,
+                        upsert,
+                        on_conflict_do_nothing,
+                        &fields,
                     )
                     .await?;
                 self.commit_transaction(txn, changes).await?;
@@ -6537,6 +6644,24 @@ where
                 let value_for_result = value.clone();
                 self.execute_with_base(Statement::Upsert { table, pk, value }, isolation).await?;
                 Ok(returning_result(&fields, pk_for_result, value_for_result))
+            }
+            Statement::InsertIgnore { table, pk, value } => {
+                let mut txn = self.begin_with(isolation);
+                let pk_for_result = pk.clone();
+                let value_for_result = value.clone();
+                let (_, changes) = self
+                    .execute_in_transaction_base(
+                        &mut txn,
+                        Statement::InsertIgnore { table, pk, value },
+                    )
+                    .await?;
+                let result = if changes.is_empty() {
+                    QueryResult::Returning { columns: returning_columns(&fields), rows: Vec::new() }
+                } else {
+                    returning_result(&fields, pk_for_result, value_for_result)
+                };
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
             }
             Statement::UpdateRow { table, pk, assignments } => {
                 let mut txn = self.begin_with(isolation);
@@ -6663,20 +6788,40 @@ where
             Statement::Explain { plan, .. } => {
                 Ok(QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() })
             }
-            Statement::InsertRow { table, columns, values, upsert } => {
+            Statement::InsertRow { table, columns, values, upsert, on_conflict_do_nothing } => {
                 let (pk, value) = self.materialize_insert_row(&table, columns, values)?;
-                let statement = if upsert {
+                let statement = if on_conflict_do_nothing {
+                    Statement::InsertIgnore { table, pk, value }
+                } else if upsert {
                     Statement::Upsert { table, pk, value }
                 } else {
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_with_base(statement, isolation)).await
             }
-            Statement::InsertRows { table, columns, rows, upsert } => {
+            Statement::InsertRows { table, columns, rows, upsert, on_conflict_do_nothing } => {
                 self.reject_if_read_only()?;
                 let mut txn = self.begin_with(isolation);
                 let changes = self
-                    .execute_insert_rows_in_transaction(&mut txn, table, columns, rows, upsert)
+                    .execute_insert_rows_in_transaction(
+                        &mut txn,
+                        table,
+                        columns,
+                        rows,
+                        upsert,
+                        on_conflict_do_nothing,
+                    )
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::InsertIgnore { table, pk, value } => {
+                let mut txn = self.begin_with(isolation);
+                let (_, changes) = self
+                    .execute_in_transaction_base(
+                        &mut txn,
+                        Statement::InsertIgnore { table, pk, value },
+                    )
                     .await?;
                 self.commit_transaction(txn, changes).await?;
                 Ok(QueryResult::Ok)
@@ -7032,7 +7177,7 @@ mod tests {
         let executor = Executor::new(String::from("t"), String::from("d"));
         let insert = parse("INSERT INTO users (id, value) VALUES ('1', 'ada')").unwrap();
         assert!(
-            matches!(insert, Statement::InsertRow { ref table, ref columns, ref values, upsert: false }
+            matches!(insert, Statement::InsertRow { ref table, ref columns, ref values, upsert: false, .. }
             if table == "users"
                 && columns == &[String::from("id"), String::from("value")]
                 && values == &[InsertValue::Value(b"1".to_vec()), InsertValue::Value(b"ada".to_vec())])
@@ -7050,6 +7195,40 @@ mod tests {
             QueryResult::Row { value, .. } => assert_eq!(value, b"grace"),
             _ => panic!("expected row"),
         }
+
+        let ignore =
+            parse("INSERT INTO users (id, value) VALUES ('1', 'ignored') ON CONFLICT DO NOTHING")
+                .unwrap();
+        assert!(matches!(
+            ignore,
+            Statement::InsertRow { upsert: false, on_conflict_do_nothing: true, .. }
+        ));
+        executor.execute(ignore).await.unwrap();
+        let row = executor.execute(parse("SELECT * FROM users KEY '1'").unwrap()).await.unwrap();
+        assert!(matches!(row, QueryResult::Row { value, .. } if value == b"grace"));
+
+        let returned = executor
+            .execute(
+                parse(
+                    "INSERT INTO users (id, value) VALUES ('1', 'ignored-again') ON CONFLICT DO NOTHING RETURNING *",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(returned, QueryResult::Returning { rows, .. } if rows.is_empty()));
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO users (id, value) VALUES ('1', 'ignored'), ('2', 'ada') ON CONFLICT DO NOTHING",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(executor.execute(parse("SELECT * FROM users KEY '2'").unwrap()).await.unwrap(), QueryResult::Row { value, .. } if value == b"ada")
+        );
     }
 
     #[tokio::test]

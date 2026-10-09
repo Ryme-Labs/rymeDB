@@ -104,6 +104,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Standard predicate mutations now support updating and deleting every visible
   row matching a `WHERE` clause in one transaction, including multi-row
   `RETURNING` results.
+- PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` now skips existing primary or
+  unique conflicts without overwriting rows, including multi-row inserts and
+  `RETURNING`.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
