@@ -313,6 +313,8 @@ pub enum Cmp {
     ILike,
     In,
     NotIn,
+    Between,
+    NotBetween,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +458,18 @@ impl Predicate {
             }
             Cmp::In => self.operands.iter().any(|operand| target == operand),
             Cmp::NotIn => self.operands.iter().all(|operand| target != operand),
+            Cmp::Between | Cmp::NotBetween => {
+                let is_between = self.operands.len() == 2
+                    && compare_operands(target, &self.operands[0])
+                        .is_some_and(|order| !order.is_lt())
+                    && compare_operands(target, &self.operands[1])
+                        .is_some_and(|order| !order.is_gt());
+                if self.op == Cmp::Between {
+                    is_between
+                } else {
+                    !is_between
+                }
+            }
         }
     }
 }
@@ -1816,6 +1830,15 @@ fn parse_filter(clause: &[String]) -> Result<Vec<Predicate>> {
     let mut current: Vec<String> = Vec::new();
     for token in clause.iter().chain(std::iter::once(&String::from("AND"))) {
         if token.eq_ignore_ascii_case("AND") {
+            let between_value_separator = (current.len() == 3
+                && current[1].eq_ignore_ascii_case("BETWEEN"))
+                || (current.len() == 4
+                    && current[1].eq_ignore_ascii_case("NOT")
+                    && current[2].eq_ignore_ascii_case("BETWEEN"));
+            if between_value_separator {
+                current.push(token.clone());
+                continue;
+            }
             if !current.is_empty() {
                 out.push(parse_predicate(&current)?);
                 current.clear();
@@ -1926,6 +1949,23 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
         let (field, column) = parse_predicate_field(&parts[0]);
         let operands = parts[3..].iter().map(|part| unquote(part).into_bytes()).collect();
         return Ok(Predicate { field, column, op: Cmp::NotIn, operand: Vec::new(), operands });
+    }
+    if parts.len() == 5
+        && parts[1].eq_ignore_ascii_case("BETWEEN")
+        && parts[3].eq_ignore_ascii_case("AND")
+    {
+        let (field, column) = parse_predicate_field(&parts[0]);
+        let operands = vec![unquote(&parts[2]).into_bytes(), unquote(&parts[4]).into_bytes()];
+        return Ok(Predicate { field, column, op: Cmp::Between, operand: Vec::new(), operands });
+    }
+    if parts.len() == 6
+        && parts[1].eq_ignore_ascii_case("NOT")
+        && parts[2].eq_ignore_ascii_case("BETWEEN")
+        && parts[4].eq_ignore_ascii_case("AND")
+    {
+        let (field, column) = parse_predicate_field(&parts[0]);
+        let operands = vec![unquote(&parts[3]).into_bytes(), unquote(&parts[5]).into_bytes()];
+        return Ok(Predicate { field, column, op: Cmp::NotBetween, operand: Vec::new(), operands });
     }
     if parts.len() == 4 {
         let (field, column) = parse_predicate_field(&parts[0]);
@@ -6839,7 +6879,10 @@ mod tests {
             executor.explain("SELECT * FROM docs WHERE value = 'x' ORDER BY value DESC").unwrap();
         assert!(plan.contains("filters 1"));
         assert!(plan.contains("desc"));
-        assert!(parse("SELECT * FROM docs WHERE key BETWEEN 'a' AND 'b'").is_err());
+        let between = parse("SELECT * FROM docs WHERE key BETWEEN 'a' AND 'b'").unwrap();
+        assert!(
+            matches!(between, Statement::SelectScan { filter, .. } if filter[0].op == Cmp::Between)
+        );
     }
 
     #[tokio::test]
@@ -6904,6 +6947,35 @@ mod tests {
         assert!(
             matches!(result, QueryResult::Rows { rows } if rows == vec![(b"m3".to_vec(), br#"{"room":"support"}"#.to_vec())])
         );
+    }
+
+    #[tokio::test]
+    async fn where_between_and_not_between_match_inclusive_ranges() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        for (id, score) in [("a", 10), ("b", 20), ("c", 30)] {
+            executor
+                .execute(
+                    parse(&format!("INSERT INTO scores KEY '{id}' VALUE '{{\"score\":{score}}}'"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let statement = parse("SELECT * FROM scores WHERE score BETWEEN 10 AND 20").unwrap();
+        let Statement::SelectScan { filter, .. } = &statement else {
+            panic!("expected select scan")
+        };
+        assert_eq!(filter[0].op, Cmp::Between);
+        assert_eq!(filter[0].operands, vec![b"10".to_vec(), b"20".to_vec()]);
+        let result = executor.execute(statement).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 2));
+
+        let result = executor
+            .execute(parse("SELECT * FROM scores WHERE score NOT BETWEEN 10 AND 20").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 1));
     }
 
     #[test]
