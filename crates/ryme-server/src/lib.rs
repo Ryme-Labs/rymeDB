@@ -6898,7 +6898,14 @@ fn archive_metadata_files(
     data_dir: &std::path::Path,
 ) -> ryme_error::Result<Vec<(String, Vec<u8>)>> {
     let mut files = Vec::new();
-    for name in ["schema.json", "branches.json", "control.json", "topics.json", "auth.json"] {
+    for name in [
+        "schema.json",
+        "branches.json",
+        "control.json",
+        "topics.json",
+        "auth.json",
+        "placements.json",
+    ] {
         let path = data_dir.join(name);
         match std::fs::read(&path) {
             Ok(bytes) => files.push((String::from(name), bytes)),
@@ -7042,6 +7049,7 @@ mod realtime_policy_tests {
         std::fs::create_dir_all(dir.join("branch-schemas/tenant/preview")).unwrap();
         std::fs::write(dir.join("schema.json"), b"main-schema").unwrap();
         std::fs::write(dir.join("branches.json"), b"branches").unwrap();
+        std::fs::write(dir.join("placements.json"), b"placements").unwrap();
         std::fs::write(dir.join("branch-schemas/tenant/preview/schema.json"), b"branch-schema")
             .unwrap();
 
@@ -7049,7 +7057,12 @@ mod realtime_policy_tests {
         let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["branch-schemas/tenant/preview/schema.json", "branches.json", "schema.json"]
+            vec![
+                "branch-schemas/tenant/preview/schema.json",
+                "branches.json",
+                "placements.json",
+                "schema.json",
+            ]
         );
         assert_eq!(files[0].1, b"branch-schema".to_vec());
         let _ = std::fs::remove_dir_all(&dir);

@@ -69,7 +69,8 @@ latest snapshot pointer. A restart therefore keeps the restored state instead
 of replaying writes that occurred after the restore target.
 
 Archives include the SQL and control-plane metadata files: `schema.json`,
-`branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema
+`branches.json`, `control.json`, `topics.json`, `auth.json`, and the durable
+shard placement map `placements.json` when sharding is enabled. Branch schema
 snapshots are stored under `branch-schemas/<tenant>/<branch>.json`. Restore
 preserves those relative paths, so branch definitions and branch-only tables
 survive a disaster-recovery restore alongside the committed rows. The server

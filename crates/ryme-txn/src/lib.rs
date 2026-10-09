@@ -1264,6 +1264,45 @@ impl DurableManager {
         }
     }
 
+    pub fn import_table(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        rows: ryme_storage::TableRows,
+    ) -> Result<u64> {
+        if self.mode == StorageMode::Hot {
+            return self.inner.import_table(tenant, database, table, rows);
+        }
+
+        let mut deltas: BTreeMap<u64, Vec<SegmentEntry>> = BTreeMap::new();
+        let mut max = 0u64;
+        for (pk, versions) in rows {
+            let key = RecordKey {
+                tenant: tenant.to_string(),
+                database: database.to_string(),
+                table: table.to_string(),
+                pk,
+            };
+            for version in versions {
+                max = max.max(version.commit_ts);
+                deltas.entry(version.commit_ts).or_default().push(SegmentEntry {
+                    key: key.clone(),
+                    commit_ts: version.commit_ts,
+                    value: version.value,
+                    expires_at: version.expires_at,
+                });
+            }
+        }
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
+        for (commit_ts, entries) in deltas {
+            self.segments.write_delta(commit_ts, &entries)?;
+        }
+        self.inner.advance_to(max);
+        Ok(max)
+    }
+
     pub fn spaces(&self) -> Result<Vec<(String, String, String)>> {
         match self.mode {
             StorageMode::Hot => self.inner.spaces(),

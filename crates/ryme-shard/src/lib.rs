@@ -4,11 +4,12 @@ use ryme_txn::{
     decode_writes, encode_writes, DurableManager, SyncPolicy, Transaction, TxnBackend, TxnManager,
 };
 use ryme_wal::Wal;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TableRef {
     pub tenant: String,
     pub database: String,
@@ -50,6 +51,7 @@ struct ShardCtx {
 #[derive(Debug)]
 struct ShardInner {
     base_dir: std::path::PathBuf,
+    placement_path: std::path::PathBuf,
     shards: Vec<DurableManager>,
     place: HashMap<TableRef, usize>,
     paused: HashSet<TableRef>,
@@ -80,9 +82,12 @@ fn hash_table(table: &TableRef, buckets: usize) -> usize {
 
 type DecisionParts = Vec<(u32, Vec<u8>)>;
 
+const COORDINATOR_DECISION_VERSION: u8 = 1;
+const COORDINATOR_PLACEMENT_VERSION: u8 = 2;
+
 fn encode_decision(commit_ts: u64, parts: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(1u8);
+    out.push(COORDINATOR_DECISION_VERSION);
     out.extend_from_slice(&commit_ts.to_le_bytes());
     out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
     for (shard, payload) in parts {
@@ -91,6 +96,74 @@ fn encode_decision(commit_ts: u64, parts: &[(u32, Vec<u8>)]) -> Vec<u8> {
         out.extend_from_slice(payload);
     }
     out
+}
+
+fn encode_placement(table: &TableRef, shard: usize) -> Result<Vec<u8>> {
+    let shard = u32::try_from(shard)
+        .map_err(|_| RymeError::InvalidArgument(String::from("placement shard")))?;
+    let mut out = vec![COORDINATOR_PLACEMENT_VERSION];
+    for component in [&table.tenant, &table.database, &table.table] {
+        let bytes = component.as_bytes();
+        let length = u32::try_from(bytes.len())
+            .map_err(|_| RymeError::InvalidArgument(String::from("placement name")))?;
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    out.extend_from_slice(&shard.to_le_bytes());
+    Ok(out)
+}
+
+fn decode_placement(raw: &[u8]) -> Result<(TableRef, usize)> {
+    if raw.first() != Some(&COORDINATOR_PLACEMENT_VERSION) {
+        return Err(RymeError::Corrupt(String::from("placement")));
+    }
+    let mut offset = 1usize;
+    let mut components = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let length =
+            raw.get(offset..offset + 4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .ok_or_else(|| RymeError::Corrupt(String::from("placement")))? as usize;
+        offset = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(length))
+            .ok_or_else(|| RymeError::Corrupt(String::from("placement")))?;
+        let start = offset - length;
+        let component = std::str::from_utf8(
+            raw.get(start..offset).ok_or_else(|| RymeError::Corrupt(String::from("placement")))?,
+        )
+        .map_err(|_| RymeError::Corrupt(String::from("placement")))?
+        .to_string();
+        components.push(component);
+    }
+    let shard = raw
+        .get(offset..offset + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| RymeError::Corrupt(String::from("placement")))?;
+    if offset + 4 != raw.len() {
+        return Err(RymeError::Corrupt(String::from("placement")));
+    }
+    Ok((TableRef::new(&components[0], &components[1], &components[2]), shard as usize))
+}
+
+fn load_placements(path: &std::path::Path, shard_count: usize) -> Result<HashMap<TableRef, usize>> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let entries: Vec<(TableRef, usize)> = serde_json::from_slice(&raw)
+        .map_err(|error| RymeError::Corrupt(format!("placements: {error}")))?;
+    let mut placements = HashMap::with_capacity(entries.len());
+    for (table, shard) in entries {
+        if shard >= shard_count {
+            return Err(RymeError::Corrupt(String::from("placement shard")));
+        }
+        placements.insert(table, shard);
+    }
+    Ok(placements)
 }
 
 fn decode_decision(raw: &[u8]) -> Result<(u64, DecisionParts)> {
@@ -155,11 +228,14 @@ impl ShardSet {
             )?);
         }
         let coordinator = Wal::open(&data_dir.join("coordinator"), 1024 * 1024)?;
+        let placement_path = data_dir.join("placements.json");
+        let place = load_placements(&placement_path, shards)?;
         let set = Self {
             inner: Arc::new(Mutex::new(ShardInner {
                 base_dir: data_dir.to_path_buf(),
+                placement_path,
                 shards: managers,
-                place: HashMap::new(),
+                place,
                 paused: HashSet::new(),
                 side: HashMap::new(),
                 coordinator: Mutex::new(coordinator),
@@ -179,15 +255,56 @@ impl ShardSet {
             .join("coordinator");
         let records = Wal::read_all(&dir)?;
         for record in records {
-            let (commit_ts, parts) = decode_decision(&record.payload)?;
-            for (shard, payload) in parts {
-                let manager = self
-                    .manager_for(shard as usize)
-                    .ok_or_else(|| RymeError::Corrupt(String::from("cohort")))?;
-                let writes = decode_writes(&payload)?;
-                manager.replay_at(commit_ts, &writes)?;
+            match record.payload.first() {
+                Some(&COORDINATOR_DECISION_VERSION) => {
+                    let (commit_ts, parts) = decode_decision(&record.payload)?;
+                    for (shard, payload) in parts {
+                        let manager = self
+                            .manager_for(shard as usize)
+                            .ok_or_else(|| RymeError::Corrupt(String::from("cohort")))?;
+                        let writes = decode_writes(&payload)?;
+                        manager.replay_at(commit_ts, &writes)?;
+                    }
+                }
+                Some(&COORDINATOR_PLACEMENT_VERSION) => {
+                    let (table, shard) = decode_placement(&record.payload)?;
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+                    if shard >= inner.shards.len() {
+                        return Err(RymeError::Corrupt(String::from("placement shard")));
+                    }
+                    inner.place.insert(table, shard);
+                }
+                _ => return Err(RymeError::Corrupt(String::from("coordinator record"))),
             }
         }
+        self.persist_placement_snapshot()?;
+        Ok(())
+    }
+
+    fn persist_placement_snapshot(&self) -> Result<()> {
+        let inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        Self::persist_placement_snapshot_locked(&inner)
+    }
+
+    fn persist_placement_snapshot_locked(inner: &ShardInner) -> Result<()> {
+        let (path, entries) = {
+            let mut entries: Vec<_> =
+                inner.place.iter().map(|(table, shard)| (table.clone(), *shard)).collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            (inner.placement_path.clone(), entries)
+        };
+        let bytes = serde_json::to_vec(&entries)
+            .map_err(|error| RymeError::Internal(format!("placements: {error}")))?;
+        let temporary = path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&temporary)?;
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, path)?;
         Ok(())
     }
 
@@ -530,9 +647,47 @@ impl ShardSet {
             .ok_or_else(|| RymeError::NotFound(String::from("shard")))?;
         inner.paused.insert(table_ref.clone());
         let result = Self::transfer_inner(&table_ref, &source, &dest, from, to);
-        if result.is_ok() {
-            inner.place.insert(table_ref.clone(), to);
-        }
+        let result = match result {
+            Err(error) => Err(error),
+            Ok(report) => (|| -> Result<MoveReport> {
+                let placement = encode_placement(&table_ref, to)?;
+                let commit_ts = inner
+                    .shards
+                    .iter()
+                    .map(|shard| shard.inner().latest_commit())
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let mut coordinator = inner
+                    .coordinator
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("coordinator lock")))?;
+                coordinator.append(commit_ts, &placement)?;
+                coordinator.sync()?;
+                drop(coordinator);
+
+                let previous = inner.place.insert(table_ref.clone(), to);
+                if let Err(error) = Self::persist_placement_snapshot_locked(&inner) {
+                    match previous {
+                        Some(shard) => {
+                            inner.place.insert(table_ref.clone(), shard);
+                        }
+                        None => {
+                            inner.place.remove(&table_ref);
+                        }
+                    }
+                    Err(error)
+                } else {
+                    source.inner().drop_table(
+                        &table_ref.tenant,
+                        &table_ref.database,
+                        &table_ref.table,
+                    )?;
+                    source.write_snapshot()?;
+                    Ok(report)
+                }
+            })(),
+        };
         inner.paused.remove(&table_ref);
         result
     }
@@ -547,12 +702,12 @@ impl ShardSet {
         let rows = source.export_table(&table.tenant, &table.database, &table.table)?;
         let count = rows.len();
         let bytes: u64 = source.table_bytes(&table.tenant, &table.database, &table.table)?;
-        let max = dest.inner().import_table(&table.tenant, &table.database, &table.table, rows)?;
+        let max = dest.import_table(&table.tenant, &table.database, &table.table, rows)?;
+        dest.write_snapshot()?;
         let moved = dest.table_bytes(&table.tenant, &table.database, &table.table)?;
         if moved < bytes {
             return Err(RymeError::Corrupt(String::from("move verify")));
         }
-        source.inner().drop_table(&table.tenant, &table.database, &table.table)?;
         Ok(MoveReport { table: table.clone(), from, to, rows: count, bytes, max_commit_ts: max })
     }
 }
@@ -1063,6 +1218,65 @@ mod tests {
         assert_eq!(
             backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"3")).unwrap(),
             Some(b"c".to_vec())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moved_placement_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-move-restart-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target;
+        {
+            let backend = ShardSet::open_with_mode(
+                &dir,
+                4,
+                SyncPolicy::Never,
+                64 * 1024 * 1024,
+                StorageMode::Standard,
+            )
+            .unwrap();
+            commit_table(&backend, "t", "d", "users", writes(vec![("1", "a")]));
+            let before = backend.route(&TableRef::new("t", "d", "users"));
+            target = (before + 1) % 4;
+            backend.move_table("t", "d", "users", Some(target)).unwrap();
+            assert!(dir.join("placements.json").is_file());
+        }
+
+        let backend = ShardSet::open_with_mode(
+            &dir,
+            4,
+            SyncPolicy::Never,
+            64 * 1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        assert_eq!(backend.route(&TableRef::new("t", "d", "users")), target);
+        let mut txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"1")).unwrap(),
+            Some(b"a".to_vec())
+        );
+        drop(backend);
+        std::fs::remove_dir_all(dir.join("coordinator")).unwrap();
+
+        let backend = ShardSet::open_with_mode(
+            &dir,
+            4,
+            SyncPolicy::Never,
+            64 * 1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        assert_eq!(backend.route(&TableRef::new("t", "d", "users")), target);
+        let mut txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"1")).unwrap(),
+            Some(b"a".to_vec())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

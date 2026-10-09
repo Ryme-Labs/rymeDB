@@ -1862,6 +1862,7 @@ dependencies = [
  "ryme-txn",
  "ryme-wal",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
