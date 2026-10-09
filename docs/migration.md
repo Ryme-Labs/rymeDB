@@ -166,11 +166,11 @@ are treated as ordinary projected columns; named schema columns and JSON paths
 are resolved from structured rows, and `COUNT(column)` excludes SQL `NULL`.
 Grouped queries also support `HAVING` predicates over group columns and
 aggregate aliases such as `COUNT(*) > 1`.
-Key-equality joins: `SELECT * FROM a JOIN b ON KEY = KEY [WHERE ...]
-[ORDER BY ...] [LIMIT n] [OFFSET n]` hash-joins on primary-key bytes and
-returns rows shaped `{"left": ..., "right": ...}` (lossy UTF-8). Only
-inner key-equality joins; other `ON` shapes are rejected, never
-misexecuted.
+Key-equality joins: `SELECT * FROM a [LEFT|RIGHT|FULL] [OUTER] JOIN b ON KEY = KEY
+[WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n]` hash-joins on primary-key
+bytes and returns rows shaped `{"left": ..., "right": ...}` (lossy UTF-8),
+using JSON `null` for the unmatched side of an outer join. Other `ON` shapes
+are rejected, never misexecuted.
 Grouping: `SELECT <key|value|column|agg>, ... FROM t [WHERE ...] GROUP BY <key|value|column>
 [ORDER BY ...] [LIMIT n] [OFFSET n]` groups exact key/value bytes and
 structured column values (including JSON paths), and returns one row per group.

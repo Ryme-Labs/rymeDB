@@ -188,6 +188,8 @@ pub enum Statement {
     Join {
         left: String,
         right: String,
+        #[serde(default)]
+        join_type: JoinType,
         limit: usize,
         offset: usize,
         order: Order,
@@ -522,6 +524,20 @@ pub struct Predicate {
 pub enum Direction {
     Asc,
     Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+impl Default for JoinType {
+    fn default() -> Self {
+        Self::Inner
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -933,18 +949,21 @@ fn prepare_distinct(statement: Statement) -> Statement {
             limit,
             offset,
         },
-        Statement::Join { left, right, limit, offset, order, filter } => Statement::Distinct {
-            statement: Box::new(Statement::Join {
-                left,
-                right,
-                limit: default_distinct_limit(),
-                offset: 0,
-                order,
-                filter,
-            }),
-            limit,
-            offset,
-        },
+        Statement::Join { left, right, join_type, limit, offset, order, filter } => {
+            Statement::Distinct {
+                statement: Box::new(Statement::Join {
+                    left,
+                    right,
+                    join_type,
+                    limit: default_distinct_limit(),
+                    offset: 0,
+                    order,
+                    filter,
+                }),
+                limit,
+                offset,
+            }
+        }
         statement => Statement::Distinct {
             statement: Box::new(statement),
             limit: default_distinct_limit(),
@@ -3223,6 +3242,21 @@ fn parse_join(tokens: &[String], left: &str) -> Result<Statement> {
         .find(|(_, t)| t.eq_ignore_ascii_case("JOIN"))
         .map(|(index, _)| index)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("join table")))?;
+    let join_type = match tokens.get(join_pos.wrapping_sub(1)).map(String::as_str) {
+        Some(token) if token.eq_ignore_ascii_case("LEFT") => JoinType::Left,
+        Some(token) if token.eq_ignore_ascii_case("RIGHT") => JoinType::Right,
+        Some(token) if token.eq_ignore_ascii_case("FULL") => JoinType::Full,
+        Some(token) if token.eq_ignore_ascii_case("INNER") => JoinType::Inner,
+        Some(token) if token.eq_ignore_ascii_case("OUTER") => {
+            match tokens.get(join_pos.wrapping_sub(2)).map(String::as_str) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("LEFT") => JoinType::Left,
+                Some(prefix) if prefix.eq_ignore_ascii_case("RIGHT") => JoinType::Right,
+                Some(prefix) if prefix.eq_ignore_ascii_case("FULL") => JoinType::Full,
+                _ => return Err(RymeError::InvalidArgument(String::from("join type"))),
+            }
+        }
+        _ => JoinType::Inner,
+    };
     let right = tokens
         .get(join_pos + 1)
         .cloned()
@@ -3254,6 +3288,7 @@ fn parse_join(tokens: &[String], left: &str) -> Result<Statement> {
     Ok(Statement::Join {
         left: left.to_string(),
         right: unquote(&right),
+        join_type,
         limit,
         offset,
         order,
@@ -4453,13 +4488,19 @@ pub fn describe_plan(statement: &Statement) -> String {
             describe_plan(left),
             describe_plan(right)
         ),
-        Statement::Join { left, right, limit, offset, order, filter } => {
+        Statement::Join { left, right, join_type, limit, offset, order, filter } => {
             let direction = match order.direction {
                 Direction::Asc => "asc",
                 Direction::Desc => "desc",
             };
+            let join_name = match join_type {
+                JoinType::Inner => "hash_join",
+                JoinType::Left => "hash_left_join",
+                JoinType::Right => "hash_right_join",
+                JoinType::Full => "hash_full_join",
+            };
             format!(
-                "hash_join({left},{right}) limit {limit} offset {offset} order {direction} filters {} using key index",
+                "{join_name}({left},{right}) limit {limit} offset {offset} order {direction} filters {} using key index",
                 filter.len()
             )
         }
@@ -4532,6 +4573,66 @@ fn merge_union_results(left: QueryResult, right: QueryResult, all: bool) -> Resu
             Ok(QueryResult::Rows { rows })
         }
     }
+}
+
+fn join_rows(
+    left_rows: Vec<Row>,
+    right_rows: Vec<Row>,
+    join_type: JoinType,
+    filter: &[Predicate],
+    order: &Order,
+    offset: usize,
+    limit: usize,
+) -> QueryResult {
+    let mut right_index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    for (pk, value) in &right_rows {
+        right_index.entry(pk.clone()).or_insert_with(|| value.clone());
+    }
+    let mut matched_right = HashSet::new();
+    let mut rows = Vec::new();
+    for (pk, left_value) in left_rows {
+        if let Some(right_value) = right_index.get(&pk) {
+            matched_right.insert(pk.clone());
+            rows.push((
+                pk,
+                serde_json::json!({
+                    "left": String::from_utf8_lossy(&left_value),
+                    "right": String::from_utf8_lossy(right_value),
+                })
+                .to_string()
+                .into_bytes(),
+            ));
+        } else if matches!(join_type, JoinType::Left | JoinType::Full) {
+            rows.push((
+                pk,
+                serde_json::json!({
+                    "left": String::from_utf8_lossy(&left_value),
+                    "right": serde_json::Value::Null,
+                })
+                .to_string()
+                .into_bytes(),
+            ));
+        }
+    }
+    if matches!(join_type, JoinType::Right | JoinType::Full) {
+        for (pk, right_value) in right_rows {
+            if matched_right.contains(&pk) {
+                continue;
+            }
+            rows.push((
+                pk,
+                serde_json::json!({
+                    "left": serde_json::Value::Null,
+                    "right": String::from_utf8_lossy(&right_value),
+                })
+                .to_string()
+                .into_bytes(),
+            ));
+        }
+    }
+    rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
+    rows.sort_by(|left, right| compare_order(order, left, right));
+    QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() }
 }
 
 pub fn aggregate_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, field: Field) -> Vec<u8> {
@@ -9519,30 +9620,10 @@ where
                 out.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
-            Statement::Join { left, right, limit, offset, order, filter } => {
+            Statement::Join { left, right, join_type, limit, offset, order, filter } => {
                 let left_rows = self.scan_rows(txn, &left, &[], usize::MAX)?;
                 let right_rows = self.scan_rows(txn, &right, &[], usize::MAX)?;
-                let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-                for (pk, value) in right_rows {
-                    index.entry(pk).or_insert(value);
-                }
-                let mut rows: Vec<(Vec<u8>, Vec<u8>)> = left_rows
-                    .into_iter()
-                    .filter_map(|(pk, left_value)| {
-                        index.get(&pk).map(|right_value| {
-                            let merged = serde_json::json!({
-                                "left": String::from_utf8_lossy(&left_value),
-                                "right": String::from_utf8_lossy(right_value),
-                            })
-                            .to_string()
-                            .into_bytes();
-                            (pk, merged)
-                        })
-                    })
-                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
-                    .collect();
-                rows.sort_by(|a, b| compare_order(&order, a, b));
-                Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
+                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit))
             }
             _ => Err(RymeError::InvalidArgument(String::from(
                 "statement is not readable in a transaction",
@@ -10265,31 +10346,11 @@ where
                 out.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
-            Statement::Join { left, right, limit, offset, order, filter } => {
+            Statement::Join { left, right, join_type, limit, offset, order, filter } => {
                 let mut txn = self.begin_with(isolation);
                 let left_rows = self.scan_rows(&mut txn, &left, &[], usize::MAX)?;
                 let right_rows = self.scan_rows(&mut txn, &right, &[], usize::MAX)?;
-                let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-                for (pk, value) in right_rows {
-                    index.entry(pk).or_insert(value);
-                }
-                let mut rows: Vec<(Vec<u8>, Vec<u8>)> = left_rows
-                    .into_iter()
-                    .filter_map(|(pk, left_value)| {
-                        index.get(&pk).map(|right_value| {
-                            let merged = serde_json::json!({
-                                "left": String::from_utf8_lossy(&left_value),
-                                "right": String::from_utf8_lossy(right_value),
-                            })
-                            .to_string()
-                            .into_bytes();
-                            (pk, merged)
-                        })
-                    })
-                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
-                    .collect();
-                rows.sort_by(|a, b| compare_order(&order, a, b));
-                Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
+                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit))
             }
             Statement::UpdateRow { table, pk, assignments } => {
                 self.reject_if_read_only()?;
@@ -13952,6 +14013,46 @@ mod tests {
         }
         let plan = executor.explain("SELECT * FROM users JOIN orders ON KEY = KEY").unwrap();
         assert!(plan.contains("hash_join(users,orders)"));
+        let left_rows = executor
+            .execute(
+                parse("SELECT * FROM users LEFT JOIN orders ON KEY = KEY ORDER BY key ASC")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match left_rows {
+            QueryResult::Rows { rows } => {
+                assert_eq!(rows.len(), 3);
+                let orphan: serde_json::Value = serde_json::from_slice(&rows[2].1).unwrap();
+                assert_eq!(orphan["left"], "orphan");
+                assert!(orphan["right"].is_null());
+            }
+            _ => panic!("expected left join rows"),
+        }
+        let right_rows = executor
+            .execute(
+                parse("SELECT * FROM users RIGHT JOIN orders ON KEY = KEY ORDER BY key ASC")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match right_rows {
+            QueryResult::Rows { rows } => {
+                assert_eq!(rows.len(), 3);
+                let stray: serde_json::Value = serde_json::from_slice(&rows[2].1).unwrap();
+                assert!(stray["left"].is_null());
+                assert_eq!(stray["right"], "stray");
+            }
+            _ => panic!("expected right join rows"),
+        }
+        let full_rows = executor
+            .execute(parse("SELECT * FROM users FULL OUTER JOIN orders ON KEY = KEY").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(full_rows, QueryResult::Rows { rows } if rows.len() == 4));
+        let left_plan =
+            executor.explain("SELECT * FROM users LEFT JOIN orders ON KEY = KEY").unwrap();
+        assert!(left_plan.contains("hash_left_join(users,orders)"));
         assert!(parse("SELECT * FROM users JOIN orders ON VALUE = VALUE").is_err());
         assert!(parse("SELECT * FROM users JOIN orders").is_err());
         assert!(parse("SELECT * FROM users JOIN ON KEY = KEY").is_err());
