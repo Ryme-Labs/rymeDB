@@ -61,7 +61,7 @@ async fn simple(socket: &mut tokio::net::TcpStream, sql: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn range_hook_records_pg_writes_by_table() {
+async fn range_hook_records_pg_writes_by_primary_key() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let moved = seen.clone();
     let hook = RangeLoadHook::armed(Arc::new(move |key: &[u8], count: u64| {
@@ -77,8 +77,11 @@ async fn range_hook_records_pg_writes_by_table() {
     let mut socket = startup(addr).await;
     let inserted = simple(&mut socket, "INSERT INTO docs KEY 'k1' VALUE 'v1'").await;
     assert!(String::from_utf8_lossy(&inserted).contains("OK"), "{inserted:?}");
+    let updated = simple(&mut socket, "UPDATE docs KEY 'k1' VALUE 'v2'").await;
+    assert!(String::from_utf8_lossy(&updated).contains("OK"), "{updated:?}");
+    let deleted = simple(&mut socket, "DELETE FROM docs KEY 'k1'").await;
+    assert!(String::from_utf8_lossy(&deleted).contains("OK"), "{deleted:?}");
     let _ = simple(&mut socket, "SELECT * FROM docs KEY 'k1'").await;
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0], (b"docs".to_vec(), 1));
+    assert_eq!(&*seen, &vec![(b"k1".to_vec(), 1), (b"k1".to_vec(), 1), (b"k1".to_vec(), 1)]);
 }

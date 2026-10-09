@@ -58,6 +58,46 @@ struct SessionTransaction {
     savepoints: Vec<Savepoint>,
 }
 
+fn note_range_changes(
+    hook: &RangeLoadHook,
+    table: &str,
+    changes: &[TransactionChange],
+    count: u64,
+) {
+    if changes.is_empty() {
+        hook.note(table.as_bytes(), count.max(1));
+    } else {
+        for change in changes {
+            hook.note(&change.pk, 1);
+        }
+    }
+}
+
+fn statement_range_keys(statement: &Statement) -> Option<Vec<Vec<u8>>> {
+    match statement {
+        Statement::Insert { pk, .. }
+        | Statement::Upsert { pk, .. }
+        | Statement::InsertIgnore { pk, .. }
+        | Statement::InsertConflict { pk, .. }
+        | Statement::Update { pk, .. }
+        | Statement::UpdateRow { pk, .. }
+        | Statement::Delete { pk, .. } => Some(vec![pk.clone()]),
+        Statement::CopyFrom { rows, .. } => Some(rows.iter().map(|(pk, _)| pk.clone()).collect()),
+        Statement::Returning { statement, .. } => statement_range_keys(statement),
+        _ => None,
+    }
+}
+
+fn note_statement_range(hook: &RangeLoadHook, table: &str, keys: Option<&[Vec<u8>]>, count: u64) {
+    if let Some(keys) = keys {
+        for key in keys {
+            hook.note(key, 1);
+        }
+    } else {
+        hook.note(table.as_bytes(), count.max(1));
+    }
+}
+
 struct Savepoint {
     name: String,
     checkpoint: TransactionCheckpoint,
@@ -685,11 +725,14 @@ where
                                         .await
                                     {
                                         Ok((_result, changes)) => {
+                                            note_range_changes(
+                                                &limits.range_hook,
+                                                &table,
+                                                &changes,
+                                                count.max(1) as u64,
+                                            );
                                             transaction.changes.extend(changes);
                                             observe_statement(&limits, true);
-                                            limits
-                                                .range_hook
-                                                .note(table.as_bytes(), count.max(1) as u64);
                                             let fingerprint = limits.slow_log.as_ref().map(|_| {
                                                 query_fingerprint(&format!(
                                                     "COPY {table} FROM STDIN"
@@ -709,6 +752,11 @@ where
                                         }
                                     }
                                 } else {
+                                    let range_keys = if limits.range_hook.is_armed() {
+                                        statement_range_keys(&statement)
+                                    } else {
+                                        None
+                                    };
                                     let result = match statement {
                                         Statement::CopyFrom { table, rows, .. } => {
                                             executor.bulk_upsert(table, rows).await.map(|_| ())
@@ -718,7 +766,12 @@ where
                                     match result {
                                         Ok(()) => {
                                             observe_statement(&limits, true);
-                                            limits.range_hook.note(table.as_bytes(), count as u64);
+                                            note_statement_range(
+                                                &limits.range_hook,
+                                                &table,
+                                                range_keys.as_deref(),
+                                                count as u64,
+                                            );
                                             let fingerprint = limits.slow_log.as_ref().map(|_| {
                                                 query_fingerprint(&format!(
                                                     "COPY {table} FROM STDIN"
@@ -2712,13 +2765,20 @@ where
     }
     let write = statement.is_write();
     let table = statement.table().to_string();
+    let range_keys =
+        if limits.range_hook.is_armed() { statement_range_keys(&statement) } else { None };
     let fingerprint = limits.slow_log.as_ref().map(|_| query_fingerprint(&table));
     let start = std::time::Instant::now();
     if let Some(transaction) = active.as_mut() {
         match executor.execute_in_transaction(&mut transaction.txn, statement).await {
             Ok((result, changes)) => {
                 if write {
-                    limits.range_hook.note(table.as_bytes(), changes.len().max(1) as u64);
+                    note_range_changes(
+                        &limits.range_hook,
+                        &table,
+                        &changes,
+                        changes.len().max(1) as u64,
+                    );
                 }
                 transaction.changes.extend(changes);
                 observe_statement(limits, write);
@@ -2735,7 +2795,7 @@ where
             Ok(result) => {
                 observe_statement(limits, write);
                 if write {
-                    limits.range_hook.note(table.as_bytes(), 1);
+                    note_statement_range(&limits.range_hook, &table, range_keys.as_deref(), 1);
                 }
                 record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
                 encode_result(result)
