@@ -10,7 +10,7 @@ pins every row):
 
 | Group | Commands |
 | --- | --- |
-| Connection | `PING`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` |
+| Connection | `PING`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` (atomic, see below) |
 | Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`GET`), `GETDEL`, `MGET`, `MSET`, `APPEND`, `STRLEN` |
 | Counters | `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT` (clean float formatting, saturating integers) |

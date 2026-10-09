@@ -57,6 +57,7 @@ struct ClientState {
     id: u64,
     authenticated: bool,
     subscriptions: std::collections::BTreeSet<Vec<u8>>,
+    patterns: std::collections::BTreeSet<Vec<u8>>,
     pubsub: Option<PubSubBus>,
 }
 
@@ -70,12 +71,14 @@ struct PubSubMessage {
 struct PubSubBus {
     sender: broadcast::Sender<PubSubMessage>,
     counts: Arc<Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
+    pattern_counts: Arc<Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
 }
 
 fn new_pubsub() -> PubSubBus {
     PubSubBus {
         sender: broadcast::channel(4096).0,
         counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        pattern_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }
 }
 
@@ -101,11 +104,40 @@ impl PubSubBus {
         }
     }
 
+    fn add_pattern(&self, pattern: &[u8]) {
+        if let Ok(mut counts) = self.pattern_counts.lock() {
+            *counts.entry(pattern.to_vec()).or_default() += 1;
+        }
+    }
+
+    fn remove_pattern(&self, pattern: &[u8]) {
+        if let Ok(mut counts) = self.pattern_counts.lock() {
+            if let Some(count) = counts.get_mut(pattern) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(pattern);
+                }
+            }
+        }
+    }
+
     fn publish(&self, channel: Vec<u8>, payload: Vec<u8>) -> usize {
-        let delivered =
+        let exact =
             self.counts.lock().ok().and_then(|counts| counts.get(&channel).copied()).unwrap_or(0);
+        let patterned = self
+            .pattern_counts
+            .lock()
+            .ok()
+            .map(|counts| {
+                counts
+                    .iter()
+                    .filter(|(pattern, _)| glob_match(pattern, &channel))
+                    .map(|(_, count)| *count)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
         let _ = self.sender.send(PubSubMessage { channel, payload });
-        delivered
+        exact.saturating_add(patterned)
     }
 }
 
@@ -114,6 +146,9 @@ impl Drop for ClientState {
         if let Some(pubsub) = &self.pubsub {
             for channel in &self.subscriptions {
                 pubsub.remove(channel);
+            }
+            for pattern in &self.patterns {
+                pubsub.remove_pattern(pattern);
             }
         }
     }
@@ -333,6 +368,7 @@ where
             id: self.next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             authenticated: self.authenticator.is_none(),
             subscriptions: std::collections::BTreeSet::new(),
+            patterns: std::collections::BTreeSet::new(),
             pubsub: Some(self.pubsub.clone()),
         }
     }
@@ -482,7 +518,7 @@ where
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"subscribe"),
                 encode_bulk(channel),
-                encode_integer(client.subscriptions.len() as i64),
+                encode_integer(subscription_count(client) as i64),
             ]));
         }
         replies.into_iter().flatten().collect()
@@ -509,10 +545,98 @@ where
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"unsubscribe"),
                 encode_bulk(&channel),
-                encode_integer(client.subscriptions.len() as i64),
+                encode_integer(subscription_count(client) as i64),
             ]));
         }
         replies.into_iter().flatten().collect()
+    }
+
+    fn psubscribe(&self, patterns: &[Vec<u8>], client: &mut ClientState) -> Vec<u8> {
+        if patterns.is_empty() {
+            return encode_error(String::from("wrong args"));
+        }
+        let mut replies = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            if client.patterns.insert(pattern.clone()) {
+                self.pubsub.add_pattern(pattern);
+            }
+            replies.push(encode_raw_array(vec![
+                encode_bulk(b"psubscribe"),
+                encode_bulk(pattern),
+                encode_integer(subscription_count(client) as i64),
+            ]));
+        }
+        replies.into_iter().flatten().collect()
+    }
+
+    fn punsubscribe(&self, patterns: &[Vec<u8>], client: &mut ClientState) -> Vec<u8> {
+        let patterns: Vec<Vec<u8>> = if patterns.is_empty() {
+            client.patterns.iter().cloned().collect()
+        } else {
+            patterns.to_vec()
+        };
+        if patterns.is_empty() {
+            return encode_raw_array(vec![
+                encode_bulk(b"punsubscribe"),
+                encode_null(),
+                encode_integer(subscription_count(client) as i64),
+            ]);
+        }
+        let mut replies = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            if client.patterns.remove(&pattern) {
+                self.pubsub.remove_pattern(&pattern);
+            }
+            replies.push(encode_raw_array(vec![
+                encode_bulk(b"punsubscribe"),
+                encode_bulk(&pattern),
+                encode_integer(subscription_count(client) as i64),
+            ]));
+        }
+        replies.into_iter().flatten().collect()
+    }
+
+    fn pubsub_command(&self, args: &[Vec<u8>]) -> Vec<u8> {
+        let Some(subcommand) = args.first() else {
+            return encode_error(String::from("wrong args"));
+        };
+        match subcommand.to_ascii_uppercase().as_slice() {
+            b"NUMSUB" => {
+                let Ok(counts) = self.pubsub.counts.lock() else {
+                    return encode_error(String::from("pubsub lock"));
+                };
+                let mut reply = Vec::with_capacity((args.len().saturating_sub(1)) * 2);
+                for channel in &args[1..] {
+                    reply.push(encode_bulk(channel));
+                    reply.push(encode_integer(counts.get(channel).copied().unwrap_or(0) as i64));
+                }
+                encode_raw_array(reply)
+            }
+            b"NUMPAT" if args.len() == 1 => {
+                let count = self
+                    .pubsub
+                    .pattern_counts
+                    .lock()
+                    .ok()
+                    .map(|counts| counts.values().sum::<usize>())
+                    .unwrap_or(0);
+                encode_integer(count as i64)
+            }
+            b"CHANNELS" if args.len() <= 2 => {
+                let Ok(counts) = self.pubsub.counts.lock() else {
+                    return encode_error(String::from("pubsub lock"));
+                };
+                let pattern = args.get(1).map(Vec::as_slice).unwrap_or(b"*");
+                encode_raw_array(
+                    counts
+                        .iter()
+                        .filter(|(channel, count)| **count > 0 && glob_match(pattern, channel))
+                        .map(|(channel, _)| encode_bulk(channel))
+                        .collect(),
+                )
+            }
+            _ => encode_error(String::from("syntax error")),
+        }
     }
 
     fn cdc_pending(
@@ -642,7 +766,9 @@ where
                 read = reader.read(&mut buffer) => {
                     Some(read.map_err(|e| RymeError::Io(e.to_string()))?)
                 }
-                message = pubsub.recv(), if !client.subscriptions.is_empty() => {
+                message = pubsub.recv(),
+                    if !client.subscriptions.is_empty() || !client.patterns.is_empty() =>
+                {
                     if let Ok(message) = message {
                         if client.subscriptions.contains(&message.channel) {
                             let reply = encode_raw_array(vec![
@@ -651,6 +777,17 @@ where
                                 encode_bulk(&message.payload),
                             ]);
                             writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                        }
+                        for pattern in &client.patterns {
+                            if glob_match(pattern, &message.channel) {
+                                let reply = encode_raw_array(vec![
+                                    encode_bulk(b"pmessage"),
+                                    encode_bulk(pattern),
+                                    encode_bulk(&message.channel),
+                                    encode_bulk(&message.payload),
+                                ]);
+                                writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                            }
                         }
                     }
                     None
@@ -743,6 +880,9 @@ where
             }
             "SUBSCRIBE" => self.subscribe(&command.args, client),
             "UNSUBSCRIBE" => self.unsubscribe(&command.args, client),
+            "PSUBSCRIBE" => self.psubscribe(&command.args, client),
+            "PUNSUBSCRIBE" => self.punsubscribe(&command.args, client),
+            "PUBSUB" => self.pubsub_command(&command.args),
             "MULTI" => {
                 if multi.is_some() {
                     return encode_error(String::from("MULTI calls can not be nested"));
@@ -4540,6 +4680,10 @@ fn is_known(name: &str) -> bool {
             | "XAUTOCLAIM"
             | "XINFO"
     )
+}
+
+fn subscription_count(client: &ClientState) -> usize {
+    client.subscriptions.len().saturating_add(client.patterns.len())
 }
 
 fn decode_command(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {

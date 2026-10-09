@@ -73,6 +73,23 @@ async fn pubsub_delivers_messages_to_subscribed_connections() {
         read_reply(&mut subscriber).await,
         "*3\r\n$11\r\nunsubscribe\r\n$4\r\nchat\r\n:0\r\n"
     );
+
+    subscriber.write_all(b"*2\r\n$10\r\nPSUBSCRIBE\r\n$6\r\nroom:*\r\n").await.unwrap();
+    assert_eq!(
+        read_reply(&mut subscriber).await,
+        "*3\r\n$10\r\npsubscribe\r\n$6\r\nroom:*\r\n:1\r\n"
+    );
+    assert_eq!(command(addr, &["PUBLISH", "room:1", "hello"]).await, ":1");
+    assert_eq!(
+        read_reply(&mut subscriber).await,
+        "*4\r\n$8\r\npmessage\r\n$6\r\nroom:*\r\n$6\r\nroom:1\r\n$5\r\nhello\r\n"
+    );
+    assert_eq!(command(addr, &["PUBSUB", "NUMPAT"]).await, ":1");
+    subscriber.write_all(b"*1\r\n$12\r\nPUNSUBSCRIBE\r\n").await.unwrap();
+    assert_eq!(
+        read_reply(&mut subscriber).await,
+        "*3\r\n$12\r\npunsubscribe\r\n$6\r\nroom:*\r\n:0\r\n"
+    );
 }
 
 #[tokio::test]
