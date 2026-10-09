@@ -78,6 +78,9 @@ persisted as database privilege metadata. Role rows are available through
 `pg_catalog.pg_roles`, while table grants are exposed through
 `information_schema.table_privileges`; privilege enforcement remains at the
 authenticated gateway/RLS boundary until SQL sessions carry an explicit role.
+`ALTER DEFAULT PRIVILEGES` for tables and sequences is also persisted and
+applied to subsequently created tables, views, and sequences, including
+schema-scoped defaults and `FOR ROLE` owner selectors.
 Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
 persisted in schema snapshots. `BEFORE` row triggers that assign
 `NEW.column = now()` (or the equivalent current-timestamp expressions) are
@@ -149,6 +152,7 @@ common migration declarations `CREATE SCHEMA IF NOT EXISTS` and
 `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, including
 `nextval`, `currval`, and `setval` sequence calls,
 `CREATE ROLE`, `DROP ROLE`, `GRANT`, and `REVOKE` privilege declarations,
+`ALTER DEFAULT PRIVILEGES` declarations for tables and sequences,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT (columns) DO UPDATE` uses

@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL `ALTER DEFAULT PRIVILEGES` declarations now persist table and
+  sequence default ACLs and apply matching grants to subsequently created
+  tables, views, and sequences, including schema snapshot restoration.
 - PostgreSQL `CREATE ROLE`/`DROP ROLE` and `GRANT`/`REVOKE` declarations now
   persist role and table/schema/sequence privilege metadata through schema
   snapshots. `pg_roles` and `information_schema.table_privileges` expose the
