@@ -22,11 +22,13 @@ Explicit wire transactions support `SAVEPOINT name`, `RELEASE SAVEPOINT name`,
 and `ROLLBACK TO SAVEPOINT name`; rollback restores staged writes and the
 transaction's conflict-tracking state before continuing.
 
-1. Export schema, then bulk load with PostgreSQL `COPY table FROM STDIN`
+1. Export schema, then bulk load with PostgreSQL `COPY table [(columns...)] FROM STDIN`
    through the wire gateway or `POST /v1/sql/copy` in 500-row transactions
    (max 10000 rows per request). The wire path accepts tab-separated text,
-   decodes standard COPY escapes, and returns `COPY n` after the final
-   `CopyDone` message.
+   decodes standard COPY escapes and `\\N` nulls into declared SQL columns,
+   applies normal defaults/identity values, and returns `COPY n` after the
+   final `CopyDone` message. Schemaless key/value tables retain their two-field
+   compatibility path.
 2. Parse `COPY ... FROM stdin` tab-separated dumps with `ryme-migrate`
    `parse_copy_text`, or `INSERT INTO ... VALUES` lines with
    `parse_insert_line`.
@@ -157,6 +159,7 @@ common migration declarations `CREATE SCHEMA IF NOT EXISTS` and
 `DROP VIEW [IF EXISTS]`,
 `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, including
 `nextval`, `currval`, and `setval` sequence calls,
+typed PostgreSQL `COPY FROM STDIN` column lists with null/default handling,
 `CREATE ROLE`, `DROP ROLE`, `GRANT`, and `REVOKE` privilege declarations,
 `ALTER DEFAULT PRIVILEGES` declarations for tables and sequences,
 named transaction savepoints with `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO`,

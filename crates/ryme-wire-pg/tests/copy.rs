@@ -79,6 +79,49 @@ async fn copy_text_protocol_ingests_rows_and_completes() {
 }
 
 #[tokio::test]
+async fn copy_text_protocol_ingests_declared_sql_columns_and_nulls() {
+    let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    let mut socket = startup(addr).await;
+    let created = simple(
+        &mut socket,
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT, active BOOLEAN DEFAULT true)",
+    )
+    .await;
+    assert!(!created.iter().any(|(tag, _)| *tag == b'E'));
+
+    socket.write_all(&frame(b'Q', b"COPY events (id, body) FROM STDIN\0")).await.unwrap();
+    let (tag, body) = read_frame(&mut socket).await;
+    assert_eq!(tag, b'G');
+    assert_eq!(body, [0, 0, 2, 0, 0, 0, 0]);
+
+    socket.write_all(&frame(b'd', b"1\thello\n2\t\\N\n")).await.unwrap();
+    socket.write_all(&frame(b'c', &[])).await.unwrap();
+    let frames = read_until_ready(&mut socket).await;
+    assert!(frames
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("COPY 2") }));
+
+    let rows = simple(&mut socket, "SELECT id, body, active FROM events").await;
+    assert!(rows
+        .iter()
+        .any(|(tag, body)| { *tag == b'D' && String::from_utf8_lossy(body).contains("hello") }));
+    let defaulted = simple(&mut socket, "SELECT active FROM events WHERE id = 1").await;
+    assert!(defaulted
+        .iter()
+        .any(|(tag, body)| { *tag == b'D' && String::from_utf8_lossy(body).contains("true") }));
+    let null_body = simple(&mut socket, "SELECT body FROM events WHERE id = 2").await;
+    assert!(null_body.iter().any(|(tag, body)| {
+        *tag == b'D' && body.windows(4).any(|part| part == (-1i32).to_be_bytes())
+    }));
+}
+
+#[tokio::test]
 async fn copy_inside_transaction_stages_until_commit_and_rolls_back() {
     let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

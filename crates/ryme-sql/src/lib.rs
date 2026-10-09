@@ -497,6 +497,8 @@ pub enum Statement {
     },
     CopyFrom {
         table: String,
+        #[serde(default)]
+        columns: Vec<String>,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     },
     Returning {
@@ -5811,7 +5813,20 @@ fn parse_copy(tokens: &[String]) -> Result<Statement> {
         .or_else(|| table_after(tokens, "FROM").ok())
         .or_else(|| table_after(tokens, "TO").ok())
         .ok_or_else(|| RymeError::InvalidArgument(String::from("copy table")))?;
-    Ok(Statement::CopyFrom { table, rows: Vec::new() })
+    let from_or_to = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("FROM") || token.eq_ignore_ascii_case("TO"));
+    let columns = from_or_to
+        .filter(|position| *position > 2)
+        .map(|position| {
+            tokens[2..position]
+                .iter()
+                .map(|column| unquote(column))
+                .filter(|column| !column.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Statement::CopyFrom { table, columns, rows: Vec::new() })
 }
 
 fn parse_explain(input: &str) -> Result<Statement> {
@@ -11109,10 +11124,15 @@ where
                 QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() },
                 Vec::new(),
             )),
-            Statement::CopyFrom { table, rows } => {
+            Statement::CopyFrom { table, columns, rows } => {
                 self.reject_if_read_only()?;
                 if rows.len() > 10000 {
                     return Err(RymeError::InvalidArgument(String::from("batch too large")));
+                }
+                if !columns.is_empty() {
+                    return Err(RymeError::InvalidArgument(String::from(
+                        "COPY column rows require the wire COPY path",
+                    )));
                 }
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, value) in rows {
@@ -13123,8 +13143,13 @@ where
                 )?;
                 Ok(QueryResult::Ok)
             }
-            Statement::CopyFrom { table, rows } => {
+            Statement::CopyFrom { table, columns, rows } => {
                 self.reject_if_read_only()?;
+                if !columns.is_empty() {
+                    return Err(RymeError::InvalidArgument(String::from(
+                        "COPY column rows require the wire COPY path",
+                    )));
+                }
                 self.bulk_upsert(table, rows).await?;
                 Ok(QueryResult::Ok)
             }

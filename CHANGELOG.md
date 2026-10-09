@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL wire `COPY FROM STDIN` now accepts declared SQL column lists and
+  typed text fields, including `\\N` nulls and omitted-column defaults, while
+  retaining the key/value bulk-ingest path for schemaless tables.
 - PostgreSQL wire transactions now support named `SAVEPOINT`, `RELEASE
   SAVEPOINT`, and `ROLLBACK TO SAVEPOINT` controls, restoring staged MVCC
   writes, read dependencies, and realtime change metadata at rollback.

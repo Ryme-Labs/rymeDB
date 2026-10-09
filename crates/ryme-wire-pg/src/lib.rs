@@ -7,8 +7,8 @@ use ryme_observe::{
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
-    bind, parse, Executor, Field, ForeignKeyAction, QueryResult, ReturningField, RoleDefinition,
-    Statement, TransactionChange, SQL_NULL_SENTINEL,
+    bind, parse, Executor, Field, ForeignKeyAction, InsertValue, QueryResult, ReturningField,
+    RoleDefinition, Statement, TransactionChange, SQL_NULL_SENTINEL,
 };
 use ryme_txn::{Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager};
 use std::collections::HashMap;
@@ -42,8 +42,13 @@ struct Portal {
 }
 
 enum CopyInState {
-    Receiving { table: String, data: Vec<u8> },
+    Receiving { table: String, columns: Vec<String>, data: Vec<u8> },
     Failed { message: String },
+}
+
+enum DecodedCopy {
+    KeyValue(Vec<(Vec<u8>, Vec<u8>)>),
+    Columns { columns: Vec<String>, rows: Vec<Vec<InsertValue>> },
 }
 
 struct SessionTransaction {
@@ -624,7 +629,7 @@ where
 
         if copy_in.is_some() {
             match (copy_in.take(), tag) {
-                (Some(CopyInState::Receiving { table, mut data }), b'd') => {
+                (Some(CopyInState::Receiving { table, columns, mut data }), b'd') => {
                     const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
                     if data.len().saturating_add(payload.len()) > MAX_COPY_BYTES {
                         copy_in = Some(CopyInState::Failed {
@@ -632,15 +637,42 @@ where
                         });
                     } else {
                         data.extend_from_slice(&payload);
-                        copy_in = Some(CopyInState::Receiving { table, data });
+                        copy_in = Some(CopyInState::Receiving { table, columns, data });
                     }
                     continue;
                 }
-                (Some(CopyInState::Receiving { table, data }), b'c') => {
-                    let response = match decode_copy_rows(&data) {
-                        Ok(rows) => {
-                            let statement =
-                                Statement::CopyFrom { table: table.clone(), rows: rows.clone() };
+                (Some(CopyInState::Receiving { table, columns, data }), b'c') => {
+                    let response = match decode_copy_rows(
+                        &data,
+                        &columns,
+                        &executor
+                            .catalog_columns(&table)
+                            .into_iter()
+                            .map(|column| column.name)
+                            .collect::<Vec<_>>(),
+                    ) {
+                        Ok(decoded) => {
+                            let count = match &decoded {
+                                DecodedCopy::KeyValue(rows) => rows.len(),
+                                DecodedCopy::Columns { rows, .. } => rows.len(),
+                            };
+                            let statement = match decoded {
+                                DecodedCopy::KeyValue(rows) => Statement::CopyFrom {
+                                    table: table.clone(),
+                                    columns: Vec::new(),
+                                    rows,
+                                },
+                                DecodedCopy::Columns { columns, rows } => Statement::InsertRows {
+                                    table: table.clone(),
+                                    columns,
+                                    rows,
+                                    upsert: false,
+                                    on_conflict_do_nothing: false,
+                                    conflict_target: Vec::new(),
+                                    conflict_update: Vec::new(),
+                                    conflict_filter: Vec::new(),
+                                },
+                            };
                             if let Some(denied) =
                                 admit_statement(&limits, &statement, data.len() as u64)
                             {
@@ -653,7 +685,6 @@ where
                                         .await
                                     {
                                         Ok((_result, changes)) => {
-                                            let count = rows.len();
                                             transaction.changes.extend(changes);
                                             observe_statement(&limits, true);
                                             limits
@@ -678,8 +709,14 @@ where
                                         }
                                     }
                                 } else {
-                                    match executor.bulk_upsert(table.clone(), rows).await {
-                                        Ok(count) => {
+                                    let result = match statement {
+                                        Statement::CopyFrom { table, rows, .. } => {
+                                            executor.bulk_upsert(table, rows).await.map(|_| ())
+                                        }
+                                        statement => executor.execute(statement).await.map(|_| ()),
+                                    };
+                                    match result {
+                                        Ok(()) => {
                                             observe_statement(&limits, true);
                                             limits.range_hook.note(table.as_bytes(), count as u64);
                                             let fingerprint = limits.slow_log.as_ref().map(|_| {
@@ -782,9 +819,13 @@ where
                         out.extend_from_slice(&response);
                     } else {
                         match parse(trimmed) {
-                            Ok(Statement::CopyFrom { table, rows }) if rows.is_empty() => {
+                            Ok(Statement::CopyFrom { table, columns, rows }) if rows.is_empty() => {
                                 out.extend_from_slice(&copy_in_response());
-                                copy_in = Some(CopyInState::Receiving { table, data: Vec::new() });
+                                copy_in = Some(CopyInState::Receiving {
+                                    table,
+                                    columns,
+                                    data: Vec::new(),
+                                });
                                 awaiting_copy = true;
                                 break;
                             }
@@ -3182,8 +3223,48 @@ fn copy_fail_message(payload: &[u8]) -> String {
     }
 }
 
-fn decode_copy_rows(data: &[u8]) -> std::result::Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+fn decode_copy_rows(
+    data: &[u8],
+    requested_columns: &[String],
+    table_columns: &[String],
+) -> std::result::Result<DecodedCopy, String> {
     const MAX_COPY_ROWS: usize = 10_000;
+    let columns = if requested_columns.is_empty() {
+        table_columns.to_vec()
+    } else {
+        requested_columns.to_vec()
+    };
+    if !columns.is_empty() {
+        let mut rows = Vec::new();
+        for raw_line in data.split(|byte| *byte == b'\n') {
+            let line = raw_line.strip_suffix(&[b'\r'][..]).unwrap_or(raw_line);
+            if line.is_empty() || line == b"\\." {
+                continue;
+            }
+            if rows.len() >= MAX_COPY_ROWS {
+                return Err(String::from("COPY exceeds the 10000 row limit"));
+            }
+            let fields = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
+            if fields.len() != columns.len() {
+                return Err(format!(
+                    "COPY row has {} fields but table expects {}",
+                    fields.len(),
+                    columns.len()
+                ));
+            }
+            let mut values = Vec::with_capacity(fields.len());
+            for field in fields {
+                let value = decode_copy_field(field)?;
+                if value.as_ref().is_some_and(|value| value.len() > 4 * 1024 * 1024) {
+                    return Err(String::from("COPY field exceeds the 4 MiB limit"));
+                }
+                values.push(value.map_or(InsertValue::Null, InsertValue::Value));
+            }
+            rows.push(values);
+        }
+        return Ok(DecodedCopy::Columns { columns, rows });
+    }
+
     let mut rows = Vec::new();
     for raw_line in data.split(|byte| *byte == b'\n') {
         let line = raw_line.strip_suffix(&[b'\r'][..]).unwrap_or(raw_line);
@@ -3199,8 +3280,9 @@ fn decode_copy_rows(data: &[u8]) -> std::result::Result<Vec<(Vec<u8>, Vec<u8>)>,
         if line[separator + 1..].contains(&b'\t') {
             return Err(String::from("COPY rows must contain exactly two columns"));
         }
-        let key = decode_copy_field(&line[..separator])?;
-        let value = decode_copy_field(&line[separator + 1..])?;
+        let key = decode_copy_field(&line[..separator])?
+            .ok_or_else(|| String::from("COPY key cannot be NULL"))?;
+        let value = decode_copy_field(&line[separator + 1..])?.unwrap_or_default();
         if key.is_empty() {
             return Err(String::from("COPY key cannot be empty"));
         }
@@ -3212,12 +3294,12 @@ fn decode_copy_rows(data: &[u8]) -> std::result::Result<Vec<(Vec<u8>, Vec<u8>)>,
         }
         rows.push((key, value));
     }
-    Ok(rows)
+    Ok(DecodedCopy::KeyValue(rows))
 }
 
-fn decode_copy_field(field: &[u8]) -> std::result::Result<Vec<u8>, String> {
+fn decode_copy_field(field: &[u8]) -> std::result::Result<Option<Vec<u8>>, String> {
     if field == b"\\N" {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let mut decoded = Vec::with_capacity(field.len());
     let mut index = 0;
@@ -3240,7 +3322,7 @@ fn decode_copy_field(field: &[u8]) -> std::result::Result<Vec<u8>, String> {
         });
         index += 1;
     }
-    Ok(decoded)
+    Ok(Some(decoded))
 }
 
 fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
