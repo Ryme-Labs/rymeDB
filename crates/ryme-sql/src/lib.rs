@@ -44,6 +44,13 @@ pub enum Statement {
         #[serde(default)]
         check: Option<String>,
     },
+    AlterTableRls {
+        table: String,
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        forced: Option<bool>,
+    },
     CreateTable {
         table: String,
         columns: Vec<ColumnDefinition>,
@@ -446,6 +453,10 @@ pub struct SchemaSnapshot {
     pub rls_tables: BTreeMap<String, String>,
     #[serde(default)]
     pub rls_write_tables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub rls_enabled: BTreeSet<String>,
+    #[serde(default)]
+    pub rls_forced: BTreeSet<String>,
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -477,6 +488,7 @@ impl Statement {
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
                 | Statement::CreatePolicy { .. }
+                | Statement::AlterTableRls { .. }
                 | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
                 | Statement::InsertRows { .. }
@@ -875,6 +887,7 @@ impl Statement {
             | Self::AlterTableDropColumn { table, .. }
             | Self::AlterTableRenameColumn { table, .. }
             | Self::AlterTableColumn { table, .. }
+            | Self::AlterTableRls { table, .. }
             | Self::CreateIndex { table, .. }
             | Self::Insert { table, .. }
             | Self::InsertRow { table, .. }
@@ -1118,6 +1131,32 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(2)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table")))?;
+    if tokens.get(3).is_some_and(|token| {
+        token.eq_ignore_ascii_case("ENABLE") || token.eq_ignore_ascii_case("DISABLE")
+    }) {
+        let enabled = tokens.get(3).map(|token| token.eq_ignore_ascii_case("ENABLE"));
+        if !tokens.get(4).is_some_and(|token| token.eq_ignore_ascii_case("ROW"))
+            || !tokens.get(5).is_some_and(|token| token.eq_ignore_ascii_case("LEVEL"))
+            || !tokens.get(6).is_some_and(|token| token.eq_ignore_ascii_case("SECURITY"))
+        {
+            return Err(RymeError::InvalidArgument(String::from("alter table row security")));
+        }
+        return Ok(Statement::AlterTableRls { table, enabled, forced: None });
+    }
+    if tokens.get(3).is_some_and(|token| {
+        token.eq_ignore_ascii_case("FORCE") || token.eq_ignore_ascii_case("NO")
+    }) {
+        let forced = tokens.get(3).is_some_and(|token| token.eq_ignore_ascii_case("FORCE"));
+        let row_pos = if forced { 4 } else { 5 };
+        if (!forced && !tokens.get(4).is_some_and(|token| token.eq_ignore_ascii_case("FORCE")))
+            || !tokens.get(row_pos).is_some_and(|token| token.eq_ignore_ascii_case("ROW"))
+            || !tokens.get(row_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("LEVEL"))
+            || !tokens.get(row_pos + 2).is_some_and(|token| token.eq_ignore_ascii_case("SECURITY"))
+        {
+            return Err(RymeError::InvalidArgument(String::from("alter table row security")));
+        }
+        return Ok(Statement::AlterTableRls { table, enabled: None, forced: Some(forced) });
+    }
     if let Some(drop_pos) = tokens.iter().enumerate().skip(3).find_map(|(position, token)| {
         if !token.eq_ignore_ascii_case("DROP") {
             return None;
@@ -4756,6 +4795,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::CreatePolicy { name, table, command, .. } => {
             format!("ddl create_policy({name}) on {table} for {command}")
         }
+        Statement::AlterTableRls { table, enabled, forced } => {
+            format!("ddl alter_table({table}) row_security({enabled:?}, {forced:?})")
+        }
         Statement::CreateTable { table, columns, .. } => {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
@@ -5355,6 +5397,8 @@ pub struct Executor<B = TxnManager> {
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
     rls_tables: Arc<RwLock<HashMap<String, String>>>,
     rls_write_tables: Arc<RwLock<HashMap<String, String>>>,
+    rls_enabled: Arc<RwLock<HashSet<String>>>,
+    rls_forced: Arc<RwLock<HashSet<String>>>,
     checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
     foreign_keys: Arc<Mutex<HashMap<String, Vec<ForeignKeyConstraint>>>>,
     constraints: Arc<Mutex<HashMap<String, Vec<ConstraintMetadata>>>>,
@@ -5385,6 +5429,8 @@ impl Executor<TxnManager> {
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_enabled: Arc::new(RwLock::new(HashSet::new())),
+            rls_forced: Arc::new(RwLock::new(HashSet::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5409,6 +5455,8 @@ impl Executor<TxnManager> {
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_enabled: Arc::new(RwLock::new(HashSet::new())),
+            rls_forced: Arc::new(RwLock::new(HashSet::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5438,6 +5486,8 @@ where
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_enabled: Arc::new(RwLock::new(HashSet::new())),
+            rls_forced: Arc::new(RwLock::new(HashSet::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5456,6 +5506,12 @@ where
     pub fn with_rls_tables(mut self, rls_tables: HashMap<String, String>) -> Self {
         self.rls_tables = Arc::new(RwLock::new(rls_tables.clone()));
         self.rls_write_tables = Arc::new(RwLock::new(rls_tables));
+        self.rls_enabled = Arc::new(RwLock::new(
+            self.rls_tables
+                .read()
+                .map(|tables| tables.keys().cloned().collect())
+                .unwrap_or_default(),
+        ));
         self
     }
 
@@ -5464,8 +5520,42 @@ where
             configured.extend(rls_tables.clone());
         }
         if let Ok(mut configured) = self.rls_write_tables.write() {
-            configured.extend(rls_tables);
+            configured.extend(rls_tables.clone());
         }
+        if let Ok(mut enabled) = self.rls_enabled.write() {
+            enabled.extend(rls_tables.keys().cloned());
+        }
+    }
+
+    fn set_rls_state(
+        &self,
+        table: &str,
+        enabled: Option<bool>,
+        forced: Option<bool>,
+    ) -> Result<()> {
+        if let Some(enabled) = enabled {
+            let mut tables = self
+                .rls_enabled
+                .write()
+                .map_err(|_| RymeError::Internal(String::from("RLS state lock")))?;
+            if enabled {
+                tables.insert(table.to_string());
+            } else {
+                tables.remove(table);
+            }
+        }
+        if let Some(forced) = forced {
+            let mut tables = self
+                .rls_forced
+                .write()
+                .map_err(|_| RymeError::Internal(String::from("RLS force lock")))?;
+            if forced {
+                tables.insert(table.to_string());
+            } else {
+                tables.remove(table);
+            }
+        }
+        Ok(())
     }
 
     fn install_policy(
@@ -5539,6 +5629,8 @@ where
             indexes: self.indexes,
             rls_tables: self.rls_tables,
             rls_write_tables: self.rls_write_tables,
+            rls_enabled: self.rls_enabled,
+            rls_forced: self.rls_forced,
             checks: self.checks,
             foreign_keys: self.foreign_keys,
             constraints: self.constraints,
@@ -5655,6 +5747,16 @@ where
                 rls_tables.iter().map(|(table, column)| (table.clone(), column.clone())).collect()
             })
             .unwrap_or_default();
+        let rls_enabled = self
+            .rls_enabled
+            .read()
+            .map(|tables| tables.iter().cloned().collect())
+            .unwrap_or_default();
+        let rls_forced = self
+            .rls_forced
+            .read()
+            .map(|tables| tables.iter().cloned().collect())
+            .unwrap_or_default();
         SchemaSnapshot {
             tables,
             indexes,
@@ -5663,6 +5765,8 @@ where
             constraints,
             rls_tables,
             rls_write_tables,
+            rls_enabled,
+            rls_forced,
         }
     }
 
@@ -5689,6 +5793,13 @@ where
         } else {
             return Err(RymeError::Internal(String::from("constraint lock")));
         }
+        let legacy_rls_enabled: HashSet<String> = snapshot.rls_tables.keys().cloned().collect();
+        let rls_enabled: HashSet<String> = if snapshot.rls_enabled.is_empty() {
+            legacy_rls_enabled
+        } else {
+            snapshot.rls_enabled.into_iter().collect()
+        };
+        let rls_forced: HashSet<String> = snapshot.rls_forced.into_iter().collect();
         if let Ok(mut rls_tables) = self.rls_tables.write() {
             *rls_tables = snapshot.rls_tables.into_iter().collect();
         } else {
@@ -5698,6 +5809,16 @@ where
             *rls_tables = snapshot.rls_write_tables.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("RLS write lock")));
+        }
+        if let Ok(mut tables) = self.rls_enabled.write() {
+            *tables = rls_enabled;
+        } else {
+            return Err(RymeError::Internal(String::from("RLS state lock")));
+        }
+        if let Ok(mut tables) = self.rls_forced.write() {
+            *tables = rls_forced;
+        } else {
+            return Err(RymeError::Internal(String::from("RLS force lock")));
         }
         if let Ok(mut indexes) = self.indexes.lock() {
             indexes.clear();
@@ -5735,6 +5856,8 @@ where
             indexes: Arc::new(Mutex::new(indexes)),
             rls_tables: self.rls_tables,
             rls_write_tables: self.rls_write_tables,
+            rls_enabled: self.rls_enabled,
+            rls_forced: self.rls_forced,
             checks: Arc::new(Mutex::new(checks)),
             foreign_keys: Arc::new(Mutex::new(foreign_keys)),
             constraints: Arc::new(Mutex::new(constraints)),
@@ -5856,6 +5979,9 @@ where
     }
 
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
+        if !self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table)) {
+            return true;
+        }
         let Some(column) = self.rls_tables.read().ok().and_then(|rls| rls.get(table).cloned())
         else {
             return true;
@@ -5871,6 +5997,9 @@ where
     }
 
     fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
+        if !self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table)) {
+            return Ok(());
+        }
         let Some(column) =
             self.rls_write_tables.read().ok().and_then(|rls| rls.get(table).cloned())
         else {
@@ -7139,8 +7268,14 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
-        let rls_enabled =
-            self.rls_tables.read().ok().is_some_and(|rls_tables| rls_tables.contains_key(table));
+        let rls_enabled = self.rls_enabled.read().ok().is_some_and(|tables| {
+            tables.contains(table)
+                && self
+                    .rls_tables
+                    .read()
+                    .ok()
+                    .is_some_and(|rls_tables| rls_tables.contains_key(table))
+        });
         if rls_enabled {
             if limit == 0 {
                 return Ok(Vec::new());
@@ -8810,7 +8945,8 @@ where
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
-            | Statement::CreatePolicy { .. } => {}
+            | Statement::CreatePolicy { .. }
+            | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
                 columns,
@@ -8867,6 +9003,10 @@ where
             }
             Statement::CreatePolicy { table, command, using, check, .. } => {
                 self.install_policy(&table, &command, using.as_deref(), check.as_deref())?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterTableRls { table, enabled, forced } => {
+                self.set_rls_state(&table, enabled, forced)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
@@ -10262,7 +10402,8 @@ where
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
-            | Statement::CreatePolicy { .. } => {}
+            | Statement::CreatePolicy { .. }
+            | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
                 columns,
@@ -10300,6 +10441,7 @@ where
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
                 | Statement::CreatePolicy { .. }
+                | Statement::AlterTableRls { .. }
                 | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
                 | Statement::DropIndex { .. }
@@ -10622,6 +10764,10 @@ where
             }
             Statement::CreatePolicy { table, command, using, check, .. } => {
                 self.install_policy(&table, &command, using.as_deref(), check.as_deref())?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterTableRls { table, enabled, forced } => {
+                self.set_rls_state(&table, enabled, forced)?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
@@ -11833,7 +11979,27 @@ mod tests {
         );
         executor.execute(policy).await.unwrap();
         let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 2));
+        let enable = parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap();
+        assert!(matches!(
+            enable,
+            Statement::AlterTableRls { enabled: Some(true), forced: None, .. }
+        ));
+        executor.execute(enable).await.unwrap();
+        let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+        let force = parse("ALTER TABLE messages FORCE ROW LEVEL SECURITY").unwrap();
+        assert!(matches!(
+            force,
+            Statement::AlterTableRls { enabled: None, forced: Some(true), .. }
+        ));
+        executor.execute(force).await.unwrap();
+        let no_force = parse("ALTER TABLE messages NO FORCE ROW LEVEL SECURITY").unwrap();
+        assert!(matches!(
+            no_force,
+            Statement::AlterTableRls { enabled: None, forced: Some(false), .. }
+        ));
+        executor.execute(no_force).await.unwrap();
         let rejected = executor
             .execute(
                 parse(
@@ -11847,7 +12013,10 @@ mod tests {
         let snapshot = executor.schema_snapshot();
         assert_eq!(snapshot.rls_tables.get("messages"), Some(&String::from("tenant_id")));
         assert_eq!(snapshot.rls_write_tables.get("messages"), Some(&String::from("tenant_id")));
+        assert!(snapshot.rls_enabled.contains("messages"));
         executor.restore_schema_snapshot(snapshot).unwrap();
+        let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
     }
 
     #[tokio::test]
