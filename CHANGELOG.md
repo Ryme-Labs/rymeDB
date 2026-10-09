@@ -122,6 +122,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - SQL `UPDATE` and conflict-target assignments now support atomic numeric and
   text expressions, including `count = count + 1`, `count + EXCLUDED.count`,
   concatenation, `COALESCE`, `GREATEST`, and `LEAST`.
+- PostgreSQL `INSERT INTO table DEFAULT VALUES` now materializes identity and
+  column defaults through the normal constraint, transaction, and `RETURNING`
+  paths.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

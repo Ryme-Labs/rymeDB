@@ -1715,6 +1715,20 @@ fn split_assignment(input: &str) -> Option<(&str, &str)> {
 
 fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
+    if tokens.windows(2).any(|window| {
+        window[0].eq_ignore_ascii_case("DEFAULT") && window[1].eq_ignore_ascii_case("VALUES")
+    }) {
+        return Ok(Statement::InsertRow {
+            table,
+            columns: Vec::new(),
+            values: Vec::new(),
+            upsert: false,
+            on_conflict_do_nothing: false,
+            conflict_target: Vec::new(),
+            conflict_update: Vec::new(),
+            conflict_filter: Vec::new(),
+        });
+    }
     if let Some((columns, rows)) = parse_standard_insert_rows(raw)? {
         let conflict = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
         let (conflict_target, conflict_update, on_conflict_do_nothing, conflict_filter) =
@@ -4627,10 +4641,23 @@ where
         columns: Vec<String>,
         values: Vec<InsertValue>,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let definitions = self.catalog_columns(table);
+        let (columns, values) = if columns.is_empty() && values.is_empty() {
+            if definitions.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "DEFAULT VALUES requires a table schema",
+                )));
+            }
+            (
+                definitions.iter().map(|definition| definition.name.clone()).collect(),
+                definitions.iter().map(|_| InsertValue::Default).collect(),
+            )
+        } else {
+            (columns, values)
+        };
         if columns.is_empty() || columns.len() != values.len() {
             return Err(RymeError::InvalidArgument(String::from("insert column/value count")));
         }
-        let definitions = self.catalog_columns(table);
         if definitions.is_empty()
             && columns.len() == 2
             && (columns[0].eq_ignore_ascii_case("id")
@@ -4687,6 +4714,11 @@ where
                     )));
                 }
             };
+            if resolved.is_none() && definition.is_some_and(|definition| !definition.nullable) {
+                return Err(RymeError::InvalidArgument(format!(
+                    "null value in column {column} violates not-null constraint"
+                )));
+            }
             supplied.insert(name, resolved);
         }
 
@@ -8767,6 +8799,35 @@ mod tests {
             }
             _ => panic!("expected counter row"),
         }
+    }
+
+    #[tokio::test]
+    async fn default_values_use_identity_and_column_defaults() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let statement = parse("INSERT INTO events DEFAULT VALUES RETURNING id, state").unwrap();
+        assert!(matches!(
+            statement,
+            Statement::Returning { ref statement, .. }
+                if matches!(statement.as_ref(), Statement::InsertRow { columns, values, .. } if columns.is_empty() && values.is_empty())
+        ));
+        executor
+            .execute(
+                parse("CREATE TABLE events (id SERIAL PRIMARY KEY, state TEXT DEFAULT 'queued')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first = executor.execute(statement).await.unwrap();
+        assert!(matches!(
+            first,
+            QueryResult::Returning { ref rows, .. }
+                if rows == &vec![vec![b"1".to_vec(), b"queued".to_vec()]]
+        ));
+        executor.execute(parse("INSERT INTO events DEFAULT VALUES").unwrap()).await.unwrap();
+        assert!(matches!(
+            executor.execute(parse("SELECT * FROM events KEY '2'").unwrap()).await.unwrap(),
+            QueryResult::Row { .. }
+        ));
     }
 
     #[tokio::test]
