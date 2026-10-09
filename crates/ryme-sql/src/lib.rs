@@ -104,9 +104,18 @@ pub enum Statement {
         pk: Vec<u8>,
         assignments: Vec<(String, InsertValue)>,
     },
+    UpdateWhere {
+        table: String,
+        assignments: Vec<(String, InsertValue)>,
+        filter: Vec<Predicate>,
+    },
     Delete {
         table: String,
         pk: Vec<u8>,
+    },
+    DeleteWhere {
+        table: String,
+        filter: Vec<Predicate>,
     },
     CopyFrom {
         table: String,
@@ -192,7 +201,9 @@ impl Statement {
                 | Statement::Upsert { .. }
                 | Statement::Update { .. }
                 | Statement::UpdateRow { .. }
+                | Statement::UpdateWhere { .. }
                 | Statement::Delete { .. }
+                | Statement::DeleteWhere { .. }
                 | Statement::CopyFrom { .. }
                 | Statement::Returning { .. }
         )
@@ -441,7 +452,9 @@ impl Statement {
             | Self::GroupBy { table, .. }
             | Self::Update { table, .. }
             | Self::UpdateRow { table, .. }
+            | Self::UpdateWhere { table, .. }
             | Self::Delete { table, .. }
+            | Self::DeleteWhere { table, .. }
             | Self::CopyFrom { table, .. } => table,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
@@ -1026,7 +1039,6 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
         if where_pos <= set + 1 {
             return Err(RymeError::InvalidArgument(String::from("update assignments")));
         }
-        let pk = value_after(&tokens[where_pos..], &["KEY", "PK", "ID"])?.into_bytes();
         let upper = raw.to_ascii_uppercase();
         let set_offset = upper
             .find(" SET ")
@@ -1046,7 +1058,14 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
         if assignments.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("update assignments")));
         }
-        return Ok(Statement::UpdateRow { table, pk, assignments });
+        if let Ok(pk) = value_after(&tokens[where_pos..], &["KEY", "PK", "ID"]) {
+            return Ok(Statement::UpdateRow { table, pk: pk.into_bytes(), assignments });
+        }
+        let filter = parse_where_filter(tokens)?;
+        if filter.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("update predicate")));
+        }
+        return Ok(Statement::UpdateWhere { table, assignments, filter });
     }
     let (pk, value) = key_value_from(tokens).or_else(|_| {
         let pk = value_after(tokens, &["KEY", "PK", "ID"])?;
@@ -1064,6 +1083,20 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
 
 fn parse_delete(tokens: &[String]) -> Result<Statement> {
     let table = table_after(tokens, "FROM")?;
+    if tokens.iter().any(|token| token.eq_ignore_ascii_case("WHERE")) {
+        let filter = parse_where_filter(tokens)?;
+        if filter.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("delete predicate")));
+        }
+        if filter.len() == 1
+            && filter[0].column.is_none()
+            && filter[0].field == Field::Key
+            && filter[0].op == Cmp::Eq
+        {
+            return Ok(Statement::Delete { table, pk: filter[0].operand.clone() });
+        }
+        return Ok(Statement::DeleteWhere { table, filter });
+    }
     let pk = value_after(tokens, &["KEY", "PK", "ID"])?;
     Ok(Statement::Delete { table, pk: pk.into_bytes() })
 }
@@ -1439,6 +1472,7 @@ fn parse_where_filter(tokens: &[String]) -> Result<Vec<Predicate>> {
         && !tokens[index].eq_ignore_ascii_case("GROUP")
         && !tokens[index].eq_ignore_ascii_case("JOIN")
         && !tokens[index].eq_ignore_ascii_case("ON")
+        && !tokens[index].eq_ignore_ascii_case("RETURNING")
     {
         clause.push(tokens[index].clone());
         index += 1;
@@ -1889,7 +1923,13 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::UpdateRow { table, assignments, .. } => {
             format!("write update({table}) columns {}", assignments.len())
         }
+        Statement::UpdateWhere { table, assignments, filter } => {
+            format!("write update({table}) columns {} filters {}", assignments.len(), filter.len())
+        }
         Statement::Delete { table, .. } => format!("write delete({table}) point"),
+        Statement::DeleteWhere { table, filter } => {
+            format!("write delete({table}) filters {}", filter.len())
+        }
         Statement::CopyFrom { table, .. } => format!("bulk ingest({table}) batched put"),
         Statement::Returning { statement, fields } => {
             format!("{} returning {} fields", describe_plan(statement), fields.len())
@@ -3461,6 +3501,31 @@ where
                 )
                 .await
             }
+            Statement::UpdateWhere { table, assignments, filter } => {
+                self.reject_if_read_only()?;
+                let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
+                let mut changes = Vec::with_capacity(rows.len());
+                for (pk, before) in rows {
+                    self.enforce_rls(&table, &before)?;
+                    let after =
+                        self.materialize_update_row(&table, &pk, assignments.clone(), &before)?;
+                    self.enforce_rls(&table, &after)?;
+                    self.check_unique(&table, &pk, &after)?;
+                    self.manager.put(
+                        txn,
+                        RecordKey::new(&self.tenant, &self.database, &table, &pk),
+                        after.clone(),
+                    );
+                    changes.push(TransactionChange {
+                        table: table.clone(),
+                        pk,
+                        op: Operation::Update,
+                        before: Some(before),
+                        after: Some(after),
+                    });
+                }
+                Ok((QueryResult::Ok, changes))
+            }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
@@ -3502,6 +3567,24 @@ where
                         after: None,
                     }],
                 ))
+            }
+            Statement::DeleteWhere { table, filter } => {
+                self.reject_if_read_only()?;
+                let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
+                let mut changes = Vec::with_capacity(rows.len());
+                for (pk, before) in rows {
+                    self.enforce_rls(&table, &before)?;
+                    self.manager
+                        .delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
+                    changes.push(TransactionChange {
+                        table: table.clone(),
+                        pk,
+                        op: Operation::Delete,
+                        before: Some(before),
+                        after: None,
+                    });
+                }
+                Ok((QueryResult::Ok, changes))
             }
             statement => Ok((self.execute_read_in_transaction(txn, statement)?, Vec::new())),
         }
@@ -4212,6 +4295,18 @@ where
                 self.commit_transaction(txn, changes).await?;
                 Ok(result)
             }
+            Statement::UpdateWhere { table, assignments, filter } => {
+                self.reject_if_read_only()?;
+                let mut txn = self.begin_with(isolation);
+                let (_, changes) = self
+                    .execute_in_transaction_base(
+                        &mut txn,
+                        Statement::UpdateWhere { table, assignments, filter },
+                    )
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(QueryResult::Ok)
+            }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
                 self.enforce_rls(&table, &value)?;
@@ -4259,6 +4354,15 @@ where
                 if self.realtime.is_some() {
                     self.emit(&table, pk, Operation::Delete, before, None, commit_ts)?;
                 }
+                Ok(QueryResult::Ok)
+            }
+            Statement::DeleteWhere { table, filter } => {
+                self.reject_if_read_only()?;
+                let mut txn = self.begin_with(isolation);
+                let (_, changes) = self
+                    .execute_in_transaction_base(&mut txn, Statement::DeleteWhere { table, filter })
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::Returning { .. } => {
@@ -4596,6 +4700,55 @@ mod tests {
             .unwrap();
         assert!(matches!(result, QueryResult::Table { ref rows, .. }
             if rows == &vec![vec![b"after".to_vec()]]));
+    }
+
+    #[tokio::test]
+    async fn predicate_mutations_update_and_delete_multiple_rows() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE accounts (id TEXT PRIMARY KEY, status TEXT, score INTEGER)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO accounts (id, status, score) VALUES ('a1', 'active', 1), ('a2', 'active', 2), ('a3', 'closed', 3)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let updated = executor
+            .execute(parse("UPDATE accounts SET score = 10 WHERE status = 'active'").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(updated, QueryResult::Ok);
+        let result = executor
+            .execute(parse("SELECT id, score FROM accounts ORDER BY id ASC").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { rows, .. }
+                if rows == vec![
+                    vec![b"a1".to_vec(), b"10".to_vec()],
+                    vec![b"a2".to_vec(), b"10".to_vec()],
+                    vec![b"a3".to_vec(), b"3".to_vec()]
+                ]
+        ));
+
+        let deleted = executor
+            .execute(parse("DELETE FROM accounts WHERE status = 'closed'").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(deleted, QueryResult::Ok);
+        let remaining =
+            executor.execute(parse("SELECT COUNT(*) FROM accounts").unwrap()).await.unwrap();
+        assert!(matches!(remaining, QueryResult::Scalar { value, .. } if value == b"2"));
     }
 
     #[tokio::test]
