@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use ryme_archive::{Archiver, BackupManifest};
 use ryme_auth::{
     ApiKeyStore, CredentialStore, JwtVerifier, OidcConfig, PasskeyRegistry, PolicyEngine,
-    Principal, Role,
+    Principal, RefreshTokenStore, Role,
 };
 use ryme_backup::Checkpoint;
 use ryme_config::{Config, OtelConfig};
@@ -457,6 +457,7 @@ pub struct SharedState {
     dek_ring: Arc<Mutex<KeyRing>>,
     indexes: Arc<Mutex<PartitionedIndex>>,
     credentials: Arc<Mutex<CredentialStore>>,
+    refresh_tokens: RefreshTokenStore,
     passkeys: Arc<Mutex<PasskeyRegistry>>,
     native_listen: Option<std::net::SocketAddr>,
     grpc_tls_listen: Option<std::net::SocketAddr>,
@@ -880,6 +881,7 @@ impl SharedState {
             dek_ring,
             indexes: Arc::new(Mutex::new(PartitionedIndex::new(config.index_partitions))),
             credentials: Arc::new(Mutex::new(CredentialStore::new())),
+            refresh_tokens: RefreshTokenStore::new(),
             passkeys: Arc::new(Mutex::new(PasskeyRegistry::new())),
             native_listen: config.native_listen,
             grpc_tls_listen: config.grpc_tls_listen,
@@ -2975,9 +2977,16 @@ pub struct AuthVerifyRequest {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AuthTokenRequest {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub password: String,
+    #[serde(default)]
     pub code: Option<String>,
+    #[serde(default)]
+    pub grant_type: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3143,8 +3152,23 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     };
     let credentials = state.credentials.clone();
     let keys = state.keys.clone();
+    let refresh_tokens = state.refresh_tokens.clone();
     let now = ryme_txn::now_unix();
     let issued = tokio::task::spawn_blocking(move || {
+        if request.refresh_token.is_some() || request.grant_type.as_deref() == Some("refresh_token")
+        {
+            if request.grant_type.as_deref().is_some_and(|grant| grant != "refresh_token") {
+                return Err(ryme_error::RymeError::InvalidArgument(String::from("grant_type")));
+            }
+            let presented =
+                request.refresh_token.as_deref().ok_or(ryme_error::RymeError::Unauthorized)?;
+            let (principal, refresh_token) = refresh_tokens.rotate(presented, now)?;
+            let (key, tenant) = issue_api_key(&keys, &principal);
+            return Ok((key, tenant, refresh_token));
+        }
+        if request.grant_type.as_deref().is_some_and(|grant| grant != "password") {
+            return Err(ryme_error::RymeError::InvalidArgument(String::from("grant_type")));
+        }
         let principal = match credentials.lock() {
             Ok(store) => match store.verify_password(&request.id, &request.password) {
                 Ok(principal) => principal,
@@ -3160,14 +3184,22 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
                 }
             }
         }
-        Ok(issue_api_key(&keys, &principal))
+        let refresh_token = refresh_tokens.issue(principal.clone(), now)?;
+        let (key, tenant) = issue_api_key(&keys, &principal);
+        Ok((key, tenant, refresh_token))
     })
     .await;
     match issued {
-        Ok(Ok((key, tenant))) => {
-            (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
-                .into_response()
-        }
+        Ok(Ok((key, tenant, refresh_token))) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "key": key,
+                "tenant": tenant,
+                "refresh_token": refresh_token,
+                "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
+            })),
+        )
+            .into_response(),
         Ok(Err(e)) => error_response(e),
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("task"))),
     }

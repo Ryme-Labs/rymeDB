@@ -1521,7 +1521,30 @@ async fn extras_auth_token_issues_usable_keys() {
     assert_eq!(status, 201);
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let key = parsed.get("key").and_then(|v| v.as_str()).unwrap().to_string();
+    let refresh_token = parsed.get("refresh_token").and_then(|v| v.as_str()).unwrap().to_string();
     assert!(key.starts_with("ryme_"));
+    let (status, body) = http_request(
+        http,
+        "POST /v1/auth/token",
+        format!("{{\"grant_type\":\"refresh_token\",\"refresh_token\":\"{refresh_token}\"}}")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let refreshed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let refreshed_key = refreshed.get("key").and_then(|v| v.as_str()).unwrap();
+    let next_refresh = refreshed.get("refresh_token").and_then(|v| v.as_str()).unwrap();
+    assert_ne!(next_refresh, refresh_token);
+    let (status, _) = bearer_request(http, refreshed_key, "GET /v1/ranges", b"").await;
+    assert_eq!(status, 200);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/auth/token",
+        format!("{{\"grant_type\":\"refresh_token\",\"refresh_token\":\"{refresh_token}\"}}")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 401);
     let (status, body) = bearer_request(http, &key, "GET /v1/ranges", b"").await;
     assert_eq!(status, 200);
     assert!(body.is_array());

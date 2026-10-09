@@ -149,4 +149,7 @@ masking, and OIDC: `POST /v1/auth/oidc/login` builds the provider
 authorization URL from `RYME_OIDC_*` env; `POST /v1/auth/oidc/token`
 verifies an HS256 ID token (`iss`/`aud`/`exp`) and returns a principal
 receipt. RS256/JWKS discovery is future work; configure one HMAC provider
-per node.
+per node. `POST /v1/auth/token` returns the existing API key plus an opaque
+30-day refresh token. Send `{"grant_type":"refresh_token",
+"refresh_token":"..."}` to rotate it; each refresh token is single-use,
+stored only as a digest, and replaying a rotated token returns `401`.

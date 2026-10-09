@@ -350,6 +350,90 @@ pub fn random_bytes(count: usize) -> Vec<u8> {
     out
 }
 
+pub const REFRESH_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+const MAX_REFRESH_SESSIONS: usize = 100_000;
+
+#[derive(Debug, Clone)]
+pub struct RefreshTokenStore {
+    inner: Arc<RwLock<HashMap<String, RefreshSession>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshSession {
+    principal: Principal,
+    expires_at: u64,
+}
+
+impl RefreshTokenStore {
+    pub fn new() -> Self {
+        Self { inner: Arc::new(RwLock::new(HashMap::new())) }
+    }
+
+    pub fn issue(&self, principal: Principal, now_secs: u64) -> Result<String> {
+        let raw = base64_url_encode(&random_bytes(32));
+        let digest = Self::digest(&raw);
+        let mut sessions =
+            self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
+        sessions.retain(|_, session| session.expires_at > now_secs);
+        if sessions.len() >= MAX_REFRESH_SESSIONS {
+            return Err(RymeError::Overload(String::from("refresh sessions")));
+        }
+        sessions.insert(
+            digest,
+            RefreshSession {
+                principal,
+                expires_at: now_secs.saturating_add(REFRESH_TOKEN_TTL_SECS),
+            },
+        );
+        Ok(raw)
+    }
+
+    pub fn rotate(&self, presented: &str, now_secs: u64) -> Result<(Principal, String)> {
+        if presented.is_empty() {
+            return Err(RymeError::Unauthorized);
+        }
+        let digest = Self::digest(presented);
+        let mut sessions =
+            self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
+        let session = sessions.remove(&digest).ok_or(RymeError::Unauthorized)?;
+        if session.expires_at <= now_secs {
+            return Err(RymeError::Unauthorized);
+        }
+        let raw = base64_url_encode(&random_bytes(32));
+        let next_digest = Self::digest(&raw);
+        sessions.insert(
+            next_digest,
+            RefreshSession {
+                principal: session.principal.clone(),
+                expires_at: now_secs.saturating_add(REFRESH_TOKEN_TTL_SECS),
+            },
+        );
+        Ok((session.principal, raw))
+    }
+
+    pub fn revoke(&self, presented: &str) -> bool {
+        self.inner
+            .write()
+            .map(|mut sessions| sessions.remove(&Self::digest(presented)).is_some())
+            .unwrap_or(false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().map(|sessions| sessions.len()).unwrap_or(0)
+    }
+
+    fn digest(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        base64_url_encode(&Sha256::digest(token.as_bytes()))
+    }
+}
+
+impl Default for RefreshTokenStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PasswordHash {
     pub salt_b64: String,
@@ -743,6 +827,21 @@ mod tests {
         assert!(store.remove("secret-key"));
         assert!(store.authenticate("secret-key").is_err());
         assert!(store.owner_of("secret-key").is_none());
+    }
+
+    #[test]
+    fn refresh_tokens_rotate_once_and_expire() {
+        let store = RefreshTokenStore::new();
+        let mut roles = HashSet::new();
+        roles.insert(Role::ReadWrite);
+        let principal = Principal { id: String::from("u"), tenant: String::from("t"), roles };
+        let first = store.issue(principal.clone(), 100).unwrap();
+        let (rotated_principal, second) = store.rotate(&first, 101).unwrap();
+        assert_eq!(rotated_principal.id, principal.id);
+        assert_ne!(first, second);
+        assert!(store.rotate(&first, 101).is_err());
+        assert!(store.rotate(&second, 101 + REFRESH_TOKEN_TTL_SECS).is_err());
+        assert_eq!(store.len(), 0);
     }
 
     #[test]
