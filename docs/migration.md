@@ -29,12 +29,16 @@ transaction's conflict-tracking state before continuing.
    applies normal defaults/identity values, and returns `COPY n` after the
    final `CopyDone` message. Schemaless key/value tables retain their two-field
    compatibility path.
-2. Parse `COPY ... FROM stdin` tab-separated dumps with `ryme-migrate`
+2. Export table data with PostgreSQL `COPY table [(columns...)] TO STDOUT`.
+   The wire gateway emits text-format `CopyOutResponse`, chunked `CopyData`,
+   `CopyDone`, and `COPY n`, preserving SQL nulls and COPY escaping while
+   applying the session's RLS visibility rules.
+3. Parse `COPY ... FROM stdin` tab-separated dumps with `ryme-migrate`
    `parse_copy_text`, or `INSERT INTO ... VALUES` lines with
    `parse_insert_line`.
-3. Validate with `validate_rows`, chunk with `chunk_rows`, gate cutover with
+4. Validate with `validate_rows`, chunk with `chunk_rows`, gate cutover with
    `plan_cutover(snapshot_rows, cdc_lag_ms)` (ready when lag <= 1000 ms).
-4. Verify types, nulls, sequences, constraints, prepared statements,
+5. Verify types, nulls, sequences, constraints, prepared statements,
    timezones, JSON, arrays, `RETURNING`, `ON CONFLICT`, session variables,
    and named transaction savepoints.
 

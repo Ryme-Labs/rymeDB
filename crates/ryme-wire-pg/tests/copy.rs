@@ -71,6 +71,14 @@ async fn copy_text_protocol_ingests_rows_and_completes() {
         .iter()
         .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("COPY 2") }));
 
+    let frames = simple(&mut socket, "COPY docs TO STDOUT").await;
+    let data = frames
+        .iter()
+        .filter(|(tag, _)| *tag == b'd')
+        .flat_map(|(_, body)| body.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(data, b"k1\tv1\nk2\tv\\t2\n");
+
     socket.write_all(&frame(b'Q', b"SELECT * FROM docs KEY 'k2'\0")).await.unwrap();
     let frames = read_until_ready(&mut socket).await;
     assert!(frames
@@ -119,6 +127,41 @@ async fn copy_text_protocol_ingests_declared_sql_columns_and_nulls() {
     assert!(null_body.iter().any(|(tag, body)| {
         *tag == b'D' && body.windows(4).any(|part| part == (-1i32).to_be_bytes())
     }));
+}
+
+#[tokio::test]
+async fn copy_to_streams_text_rows_with_nulls() {
+    let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    let mut socket = startup(addr).await;
+    let created = simple(
+        &mut socket,
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, body TEXT, active BOOLEAN DEFAULT true)",
+    )
+    .await;
+    assert!(!created.iter().any(|(tag, _)| *tag == b'E'));
+    socket.write_all(&frame(b'Q', b"COPY events (id, body) FROM STDIN\0")).await.unwrap();
+    assert_eq!(read_frame(&mut socket).await.0, b'G');
+    socket.write_all(&frame(b'd', b"1\thello\n2\t\\N\n")).await.unwrap();
+    socket.write_all(&frame(b'c', &[])).await.unwrap();
+    let _ = read_until_ready(&mut socket).await;
+
+    let frames = simple(&mut socket, "COPY events (id, body) TO STDOUT").await;
+    assert!(frames.iter().any(|(tag, body)| *tag == b'H' && body[1..3] == [0, 2]));
+    let data = frames
+        .iter()
+        .filter(|(tag, _)| *tag == b'd')
+        .flat_map(|(_, body)| body.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(data, b"1\thello\n2\t\\N\n");
+    assert!(frames
+        .iter()
+        .any(|(tag, body)| *tag == b'C' && String::from_utf8_lossy(body).contains("COPY 2")));
 }
 
 #[tokio::test]

@@ -829,6 +829,64 @@ where
                                 awaiting_copy = true;
                                 break;
                             }
+                            Ok(Statement::CopyTo { table, columns }) => {
+                                let statement = Statement::CopyTo { table, columns };
+                                if let Some(denied) =
+                                    admit_statement(&limits, &statement, trimmed.len() as u64)
+                                {
+                                    if let Some(transaction) = active_transaction.as_mut() {
+                                        transaction.failed = true;
+                                    }
+                                    out.extend_from_slice(&denied);
+                                    break;
+                                }
+                                let start = std::time::Instant::now();
+                                match execute_copy_to_for_session(
+                                    &executor,
+                                    statement,
+                                    &session,
+                                    &mut active_transaction,
+                                )
+                                .await
+                                {
+                                    Ok(QueryResult::Table { columns, rows }) => {
+                                        observe_statement(&limits, false);
+                                        record_timing(
+                                            &limits,
+                                            limits
+                                                .slow_log
+                                                .as_ref()
+                                                .map(|_| query_fingerprint(trimmed)),
+                                            String::from("COPY"),
+                                            start.elapsed().as_micros() as u64,
+                                        );
+                                        out.extend_from_slice(&copy_out_response(&columns));
+                                        for row in &rows {
+                                            out.extend_from_slice(&copy_data(
+                                                &encode_copy_text_row(row),
+                                            ));
+                                        }
+                                        out.extend_from_slice(&copy_done());
+                                        out.extend_from_slice(&command_complete(&format!(
+                                            "COPY {}",
+                                            rows.len()
+                                        )));
+                                    }
+                                    Ok(_) => {
+                                        out.extend_from_slice(&encode_error_code(
+                                            "42601",
+                                            String::from("COPY TO requires tabular data"),
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        out.extend_from_slice(&encode_error_code(
+                                            error_code(&error),
+                                            error.to_string(),
+                                        ));
+                                    }
+                                }
+                                break;
+                            }
                             Ok(statement) => {
                                 let response = execute_statement_for_session(
                                     &executor,
@@ -2687,6 +2745,34 @@ where
     }
 }
 
+async fn execute_copy_to_for_session<B>(
+    executor: &Arc<Executor<B>>,
+    statement: Statement,
+    session: &HashMap<String, String>,
+    active: &mut Option<SessionTransaction>,
+) -> Result<QueryResult>
+where
+    B: TxnBackend,
+{
+    if let Some(transaction) = active.as_mut() {
+        if transaction.failed {
+            return Err(RymeError::InvalidArgument(String::from("current transaction is aborted")));
+        }
+        match executor.execute_in_transaction(&mut transaction.txn, statement).await {
+            Ok((result, changes)) => {
+                transaction.changes.extend(changes);
+                Ok(result)
+            }
+            Err(error) => {
+                transaction.failed = true;
+                Err(error)
+            }
+        }
+    } else {
+        executor.execute_with(statement, session_isolation(session)).await
+    }
+}
+
 async fn prepared_command<B>(
     query: &str,
     statements: &mut HashMap<String, String>,
@@ -3207,6 +3293,48 @@ fn copy_in_response() -> Vec<u8> {
     body.extend_from_slice(&0i16.to_be_bytes());
     body.extend_from_slice(&0i16.to_be_bytes());
     frame(b'G', &body)
+}
+
+fn copy_out_response(columns: &[String]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(3 + columns.len() * 2);
+    body.push(0); // text format
+    body.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+    for _ in columns {
+        body.extend_from_slice(&0i16.to_be_bytes());
+    }
+    frame(b'H', &body)
+}
+
+fn copy_data(data: &[u8]) -> Vec<u8> {
+    frame(b'd', data)
+}
+
+fn copy_done() -> Vec<u8> {
+    frame(b'c', b"")
+}
+
+fn encode_copy_text_row(row: &[Vec<u8>]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for (index, field) in row.iter().enumerate() {
+        if index > 0 {
+            encoded.push(b'\t');
+        }
+        if field == SQL_NULL_SENTINEL {
+            encoded.extend_from_slice(b"\\N");
+            continue;
+        }
+        for byte in field {
+            match byte {
+                b'\\' => encoded.extend_from_slice(b"\\\\"),
+                b'\t' => encoded.extend_from_slice(b"\\t"),
+                b'\n' => encoded.extend_from_slice(b"\\n"),
+                b'\r' => encoded.extend_from_slice(b"\\r"),
+                byte => encoded.push(*byte),
+            }
+        }
+    }
+    encoded.push(b'\n');
+    encoded
 }
 
 fn copy_complete(rows: usize) -> Vec<u8> {

@@ -501,6 +501,11 @@ pub enum Statement {
         columns: Vec<String>,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    CopyTo {
+        table: String,
+        #[serde(default)]
+        columns: Vec<String>,
+    },
     Returning {
         statement: Box<Statement>,
         fields: Vec<ReturningField>,
@@ -1273,7 +1278,8 @@ impl Statement {
             | Self::Delete { table, .. }
             | Self::DeleteWhere { table, .. }
             | Self::DeleteUsing { table, .. }
-            | Self::CopyFrom { table, .. } => table,
+            | Self::CopyFrom { table, .. }
+            | Self::CopyTo { table, .. } => table,
             Self::CreateSchema { .. }
             | Self::CreateExtension { .. }
             | Self::CreateSequence { .. }
@@ -5826,7 +5832,11 @@ fn parse_copy(tokens: &[String]) -> Result<Statement> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Ok(Statement::CopyFrom { table, columns, rows: Vec::new() })
+    if from_or_to.is_some_and(|position| tokens[position].eq_ignore_ascii_case("TO")) {
+        Ok(Statement::CopyTo { table, columns })
+    } else {
+        Ok(Statement::CopyFrom { table, columns, rows: Vec::new() })
+    }
 }
 
 fn parse_explain(input: &str) -> Result<Statement> {
@@ -6032,6 +6042,9 @@ pub fn describe_plan(statement: &Statement) -> String {
             )
         }
         Statement::CopyFrom { table, .. } => format!("bulk ingest({table}) batched put"),
+        Statement::CopyTo { table, columns } => {
+            format!("bulk export({table}) {} columns", columns.len())
+        }
         Statement::Returning { statement, fields } => {
             format!("{} returning {} fields", describe_plan(statement), fields.len())
         }
@@ -9036,6 +9049,38 @@ where
             rows.extend(next);
         }
         Ok(rows)
+    }
+
+    fn copy_to_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        table: String,
+        requested_columns: Vec<String>,
+    ) -> Result<QueryResult> {
+        let columns = if requested_columns.is_empty() {
+            let columns = self
+                .catalog_columns(&table)
+                .into_iter()
+                .map(|column| column.name)
+                .collect::<Vec<_>>();
+            if columns.is_empty() {
+                vec![String::from("key"), String::from("value")]
+            } else {
+                columns
+            }
+        } else {
+            requested_columns
+        };
+        if columns.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("COPY table columns")));
+        }
+        let rows = self
+            .scan_all_rows_in_transaction(txn, &table)?
+            .into_iter()
+            .filter(|(_, value)| self.rls_allows(&table, value))
+            .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
+            .collect();
+        Ok(QueryResult::Table { columns, rows })
     }
 
     fn create_index(&self, definition: IndexDefinition, if_not_exists: bool) -> Result<()> {
@@ -12392,6 +12437,9 @@ where
                     txn, table, columns, aliases, limit, offset, order, filter,
                 )
             }
+            Statement::CopyTo { table, columns } => {
+                self.copy_to_in_transaction(txn, table, columns)
+            }
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
@@ -13345,6 +13393,10 @@ where
                 self.select_columns_in_transaction(
                     &mut txn, table, columns, aliases, limit, offset, order, filter,
                 )
+            }
+            Statement::CopyTo { table, columns } => {
+                let mut txn = self.begin_with(isolation);
+                self.copy_to_in_transaction(&mut txn, table, columns)
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let mut txn = self.begin_with(isolation);
@@ -16942,6 +16994,41 @@ mod tests {
         assert_eq!(count, 2);
         let parsed = parse("COPY docs FROM stdin").unwrap();
         assert!(matches!(parsed, Statement::CopyFrom { table, .. } if table == "docs"));
+    }
+
+    #[tokio::test]
+    async fn copy_to_projects_all_rows_and_preserves_nulls() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT, active BOOLEAN)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO docs (id, body, active) VALUES ('1', 'hello', true)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO docs (id, body, active) VALUES ('2', NULL, false)").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(parse("COPY docs TO STDOUT").unwrap(), Statement::CopyTo { ref table, ref columns } if table == "docs" && columns.is_empty())
+        );
+        let result =
+            executor.execute(parse("COPY docs (id, body) TO STDOUT").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Table { ref columns, ref rows }
+        if columns == &[String::from("id"), String::from("body")]
+            && rows == &vec![
+                vec![b"1".to_vec(), b"hello".to_vec()],
+                vec![b"2".to_vec(), SQL_NULL_SENTINEL.to_vec()]
+            ]));
     }
 
     #[tokio::test]
