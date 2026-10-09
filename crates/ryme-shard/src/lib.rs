@@ -1,5 +1,5 @@
 use ryme_error::{Result, RymeError};
-use ryme_storage::RecordKey;
+use ryme_storage::{RecordKey, SegmentCacheStats};
 use ryme_txn::{
     decode_writes, encode_writes, DurableManager, SyncPolicy, Transaction, TxnBackend, TxnManager,
 };
@@ -121,13 +121,27 @@ fn decode_decision(raw: &[u8]) -> Result<(u64, DecisionParts)> {
 
 impl ShardSet {
     pub fn open(data_dir: &std::path::Path, shards: usize, policy: SyncPolicy) -> Result<Self> {
+        Self::open_with_cache(data_dir, shards, policy, 64 * 1024 * 1024)
+    }
+
+    pub fn open_with_cache(
+        data_dir: &std::path::Path,
+        shards: usize,
+        policy: SyncPolicy,
+        cache_bytes: u64,
+    ) -> Result<Self> {
         if shards == 0 || shards > 256 {
             return Err(RymeError::InvalidArgument(String::from("shards")));
         }
         let mut managers = Vec::new();
         for index in 0..shards {
             let dir = data_dir.join("shards").join(index.to_string()).join("wal");
-            managers.push(DurableManager::open(&dir, 64 * 1024 * 1024, policy)?);
+            managers.push(DurableManager::open_with_cache(
+                &dir,
+                64 * 1024 * 1024,
+                policy,
+                cache_bytes,
+            )?);
         }
         let coordinator = Wal::open(&data_dir.join("coordinator"), 1024 * 1024)?;
         let set = Self {
@@ -168,6 +182,13 @@ impl ShardSet {
 
     pub fn shard_count(&self) -> usize {
         self.inner.lock().map(|inner| inner.shards.len()).unwrap_or(0)
+    }
+
+    pub fn segment_cache_stats(&self) -> Vec<SegmentCacheStats> {
+        self.inner
+            .lock()
+            .map(|inner| inner.shards.iter().map(DurableManager::segment_cache_stats).collect())
+            .unwrap_or_default()
     }
 
     pub fn latest_commit(&self) -> u64 {

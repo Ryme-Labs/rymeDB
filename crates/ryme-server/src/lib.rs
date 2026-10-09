@@ -952,7 +952,12 @@ impl SharedState {
             true => SyncPolicy::Always,
             false => SyncPolicy::Never,
         };
-        let durable = DurableManager::open(&wal_dir, 64 * 1024 * 1024, policy)?;
+        let durable = DurableManager::open_with_cache(
+            &wal_dir,
+            64 * 1024 * 1024,
+            policy,
+            config.cache_bytes,
+        )?;
         let open_node = |dir: std::path::PathBuf| -> ryme_error::Result<std::sync::Arc<Node>> {
             let peers: Vec<String> = config.cluster.peers.iter().map(|p| p.addr.clone()).collect();
             let peer_ids: Vec<usize> = config.cluster.peers.iter().map(|p| p.id).collect();
@@ -988,13 +993,19 @@ impl SharedState {
                     .iter()
                     .map(|table| TableRef::new("default", "default", table))
                     .collect();
-                let local = ryme_shard::ShardSet::open(&config.data_dir.join("local"), 1, policy)?;
+                let local = ryme_shard::ShardSet::open_with_cache(
+                    &config.data_dir.join("local"),
+                    1,
+                    policy,
+                    config.cache_bytes,
+                )?;
                 Backend::Hybrid(HybridBackend::new(ClusterBackend::new(node), local, replicated))
             }
-            None if config.shards > 1 => Backend::Sharded(ryme_shard::ShardSet::open(
+            None if config.shards > 1 => Backend::Sharded(ryme_shard::ShardSet::open_with_cache(
                 &config.data_dir,
                 config.shards,
                 policy,
+                config.cache_bytes,
             )?),
             None => Backend::Single(durable.clone()),
         };

@@ -1,12 +1,15 @@
 use super::{Engine, RecordKey};
 use ryme_error::{Result, RymeError};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const SEGMENT_MAGIC: u32 = 0x5259_5347;
 const SEGMENT_VERSION: u16 = 1;
 const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
+const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentKind {
@@ -28,6 +31,89 @@ pub struct SegmentMeta {
     pub max_commit_ts: u64,
     pub entries: u64,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentCacheStats {
+    pub limit_bytes: u64,
+    pub used_bytes: u64,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+#[derive(Debug)]
+struct SegmentReadCache {
+    limit_bytes: u64,
+    used_bytes: u64,
+    entries: HashMap<u64, (Arc<ImmutableSegment>, u64)>,
+    order: VecDeque<u64>,
+    hits: u64,
+    misses: u64,
+}
+
+impl SegmentReadCache {
+    fn new(limit_bytes: u64) -> Self {
+        Self {
+            limit_bytes,
+            used_bytes: 0,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, id: u64) -> Option<Arc<ImmutableSegment>> {
+        let segment = self.entries.get(&id).map(|(segment, _)| Arc::clone(segment));
+        if segment.is_some() {
+            self.hits += 1;
+            self.touch(id);
+        } else {
+            self.misses += 1;
+        }
+        segment
+    }
+
+    fn insert(&mut self, id: u64, segment: Arc<ImmutableSegment>, bytes: u64) {
+        if self.limit_bytes == 0 || bytes > self.limit_bytes {
+            return;
+        }
+        self.remove(id);
+        while self.used_bytes + bytes > self.limit_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, old_bytes)) = self.entries.remove(&oldest) {
+                self.used_bytes = self.used_bytes.saturating_sub(old_bytes);
+            }
+        }
+        self.used_bytes += bytes;
+        self.entries.insert(id, (segment, bytes));
+        self.order.push_back(id);
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Some((_, bytes)) = self.entries.remove(&id) {
+            self.used_bytes = self.used_bytes.saturating_sub(bytes);
+        }
+        self.order.retain(|candidate| *candidate != id);
+    }
+
+    fn touch(&mut self, id: u64) {
+        self.order.retain(|candidate| *candidate != id);
+        self.order.push_back(id);
+    }
+
+    fn stats(&self) -> SegmentCacheStats {
+        SegmentCacheStats {
+            limit_bytes: self.limit_bytes,
+            used_bytes: self.used_bytes,
+            entries: self.entries.len(),
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -240,16 +326,34 @@ impl ImmutableSegment {
 #[derive(Debug, Clone)]
 pub struct SegmentStore {
     dir: PathBuf,
+    cache: Arc<Mutex<SegmentReadCache>>,
 }
 
 impl SegmentStore {
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_with_cache(dir, DEFAULT_SEGMENT_CACHE_BYTES)
+    }
+
+    pub fn open_with_cache(dir: &Path, cache_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        Ok(Self { dir: dir.to_path_buf() })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            cache: Arc::new(Mutex::new(SegmentReadCache::new(cache_bytes))),
+        })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn cache_stats(&self) -> SegmentCacheStats {
+        self.cache.lock().map(|cache| cache.stats()).unwrap_or(SegmentCacheStats {
+            limit_bytes: 0,
+            used_bytes: 0,
+            entries: 0,
+            hits: 0,
+            misses: 0,
+        })
     }
 
     pub fn write(&self, id: u64, engine: &Engine) -> Result<(SegmentMeta, PathBuf)> {
@@ -268,6 +372,9 @@ impl SegmentStore {
 
     fn write_segment(&self, segment: ImmutableSegment) -> Result<(SegmentMeta, PathBuf)> {
         let id = segment.meta.id;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(id);
+        }
         let path = self.dir.join(segment_name(id));
         let temporary =
             self.dir.join(format!("{segment_name}.tmp", segment_name = segment_name(id)));
@@ -302,7 +409,21 @@ impl SegmentStore {
             ))
         });
         for path in paths {
-            let segment = ImmutableSegment::decode(&std::fs::read(path)?)?;
+            let id =
+                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+                    .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
+            let segment = if let Ok(mut cache) = self.cache.lock() {
+                if let Some(segment) = cache.get(id) {
+                    segment
+                } else {
+                    let bytes = std::fs::read(&path)?;
+                    let segment = Arc::new(ImmutableSegment::decode(&bytes)?);
+                    cache.insert(id, Arc::clone(&segment), bytes.len() as u64);
+                    segment
+                }
+            } else {
+                Arc::new(ImmutableSegment::decode(&std::fs::read(&path)?)?)
+            };
             let Some((_, value, expires_at)) = segment.version_at(key, read_ts) else {
                 continue;
             };
@@ -381,7 +502,15 @@ impl SegmentStore {
         let (meta, newest) = self.write(max_commit_ts, &engine)?;
         for path in self.segment_paths()? {
             if path != newest {
-                std::fs::remove_file(path)?;
+                let id = parse_segment_name(
+                    path.file_name().and_then(|name| name.to_str()).unwrap_or(""),
+                );
+                std::fs::remove_file(&path)?;
+                if let Some(id) = id {
+                    if let Ok(mut cache) = self.cache.lock() {
+                        cache.remove(id);
+                    }
+                }
             }
         }
         Ok(Some(meta))
@@ -421,7 +550,14 @@ impl SegmentStore {
             if keep_paths.contains(&path) {
                 continue;
             }
-            if std::fs::remove_file(path).is_ok() {
+            let id =
+                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
+            if std::fs::remove_file(&path).is_ok() {
+                if let Some(id) = id {
+                    if let Ok(mut cache) = self.cache.lock() {
+                        cache.remove(id);
+                    }
+                }
                 removed += 1;
             }
         }
@@ -693,6 +829,29 @@ mod tests {
         assert_eq!(store.get(&first, 11, 0).unwrap(), Some(b"one".to_vec()));
         assert_eq!(store.get(&first, 12, 0).unwrap(), None);
         assert_eq!(store.get(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_store_cache_tracks_hits_and_respects_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open_with_cache(&dir, 1024 * 1024).unwrap();
+        let mut engine = Engine::new();
+        let key = RecordKey::new("tenant", "db", "items", b"cached");
+        engine.apply(key.clone(), 10, Some(b"value".to_vec())).unwrap();
+        store.write(10, &engine).unwrap();
+        assert_eq!(store.get(&key, 10, 0).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(store.get(&key, 10, 0).unwrap(), Some(b"value".to_vec()));
+        let stats = store.cache_stats();
+        assert!(stats.hits >= 1);
+        assert!(stats.misses >= 1);
+        assert!(stats.used_bytes <= stats.limit_bytes);
+        assert_eq!(stats.entries, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

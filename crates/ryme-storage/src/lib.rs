@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 mod segment;
-pub use segment::{ImmutableSegment, SegmentEntry, SegmentMeta, SegmentStore};
+pub use segment::{ImmutableSegment, SegmentCacheStats, SegmentEntry, SegmentMeta, SegmentStore};
 
 #[derive(Debug, Clone)]
 pub struct TableVersion {

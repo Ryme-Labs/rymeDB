@@ -1,5 +1,5 @@
 use ryme_error::{Result, RymeError};
-use ryme_storage::{Engine, RecordKey, SegmentEntry, SegmentStore};
+use ryme_storage::{Engine, RecordKey, SegmentCacheStats, SegmentEntry, SegmentStore};
 use ryme_wal::Wal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -1004,11 +1004,21 @@ pub struct DurableManager {
 }
 
 const SEGMENT_COMPACTION_THRESHOLD: usize = 64;
+const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl DurableManager {
     pub fn open(dir: &Path, segment_bytes: u64, policy: SyncPolicy) -> Result<Self> {
+        Self::open_with_cache(dir, segment_bytes, policy, DEFAULT_SEGMENT_CACHE_BYTES)
+    }
+
+    pub fn open_with_cache(
+        dir: &Path,
+        segment_bytes: u64,
+        policy: SyncPolicy,
+        cache_bytes: u64,
+    ) -> Result<Self> {
         let wal = Wal::open(dir, segment_bytes)?;
-        let segments = Arc::new(SegmentStore::open(&dir.join("segments"))?);
+        let segments = Arc::new(SegmentStore::open_with_cache(&dir.join("segments"), cache_bytes)?);
         let manager = Self {
             inner: TxnManager::new(),
             wal: Arc::new(Mutex::new(wal)),
@@ -1034,6 +1044,10 @@ impl DurableManager {
 
     pub fn segment_dir(&self) -> std::path::PathBuf {
         self.segments.dir().to_path_buf()
+    }
+
+    pub fn segment_cache_stats(&self) -> SegmentCacheStats {
+        self.segments.cache_stats()
     }
 
     pub fn write_snapshot(&self) -> Result<(u64, std::path::PathBuf)> {

@@ -22,6 +22,9 @@ All notable changes to rymeDB are recorded here. Format follows
   startup merges the segment set when snapshots are unavailable, retention
   prunes safely around the newest base, compacts at 64 segments, and archive
   jobs include the artifacts.
+- `cache_bytes` now bounds a decoded immutable-segment LRU for point reads;
+  cache occupancy, hits, and misses are observable and entries are invalidated
+  when segments are rewritten, compacted, or pruned.
 - SDK distribution is limited to the Java, npm/TypeScript, and Rust clients;
   the release workflow packages and publishes those three artifacts and the
   Pages workflow builds their documentation.

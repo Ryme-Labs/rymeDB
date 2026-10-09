@@ -56,6 +56,11 @@ MVCC state into one new full base segment and removes superseded files. The
 compaction holds the transaction commit gate while taking its consistent base,
 so it cannot publish a partial state.
 
+Point reads use a bounded decoded-segment LRU sized by `cache_bytes`. The
+storage layer exposes occupancy, hit, and miss counters through
+`SegmentStore::cache_stats`; entries are invalidated when a segment is
+rewritten, compacted, or pruned.
+
 Archives include the SQL and control-plane metadata files: `schema.json`,
 `branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema
 snapshots are stored under `branch-schemas/<tenant>/<branch>.json`. Restore
