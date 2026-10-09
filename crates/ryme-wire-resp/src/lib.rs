@@ -1,3 +1,4 @@
+use mlua::{HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Value as LuaValue, VmState};
 use ryme_error::{Result, RymeError};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{
@@ -9,7 +10,7 @@ use ryme_router::RangeLoadHook;
 use ryme_storage::RecordKey;
 use ryme_txn::{Transaction, TxnBackend, TxnManager};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -37,6 +38,7 @@ pub struct RespGateway<B = TxnManager> {
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
     pubsub: PubSubBus,
+    scripts: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     next_client_id: Arc<AtomicU64>,
     read_only: bool,
 }
@@ -231,6 +233,7 @@ impl RespGateway<TxnManager> {
             traces: None,
             range_hook: RangeLoadHook::default(),
             pubsub: new_pubsub(),
+            scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
         }
@@ -253,6 +256,7 @@ impl RespGateway<TxnManager> {
             traces: None,
             range_hook: RangeLoadHook::default(),
             pubsub: new_pubsub(),
+            scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
         }
@@ -280,6 +284,7 @@ where
             traces: None,
             range_hook: RangeLoadHook::default(),
             pubsub: new_pubsub(),
+            scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
         }
@@ -713,6 +718,154 @@ where
             }
             _ => encode_error(String::from("syntax error")),
         }
+    }
+
+    fn script_command(&self, args: &[Vec<u8>]) -> Vec<u8> {
+        let Some(subcommand) = args.first() else {
+            return encode_error(String::from("wrong args"));
+        };
+        match subcommand.to_ascii_uppercase().as_slice() {
+            b"LOAD" if args.len() == 2 => {
+                let script = args[1].clone();
+                let sha = script_sha1(&script);
+                if let Ok(mut scripts) = self.scripts.lock() {
+                    scripts.insert(sha.clone(), script);
+                } else {
+                    return encode_error(String::from("script cache lock"));
+                }
+                encode_bulk(sha.as_bytes())
+            }
+            b"EXISTS" if args.len() > 1 => {
+                let Ok(scripts) = self.scripts.lock() else {
+                    return encode_error(String::from("script cache lock"));
+                };
+                encode_raw_array(
+                    args[1..]
+                        .iter()
+                        .map(|sha| {
+                            let exists = std::str::from_utf8(sha)
+                                .ok()
+                                .is_some_and(|sha| scripts.contains_key(sha));
+                            encode_integer(i64::from(exists))
+                        })
+                        .collect(),
+                )
+            }
+            b"FLUSH"
+                if args.len() == 1
+                    || (args.len() == 2 && args[1].eq_ignore_ascii_case(b"SYNC")) =>
+            {
+                if let Ok(mut scripts) = self.scripts.lock() {
+                    scripts.clear();
+                    encode_simple("OK")
+                } else {
+                    encode_error(String::from("script cache lock"))
+                }
+            }
+            _ => encode_error(String::from("syntax error")),
+        }
+    }
+
+    fn eval_command(&self, txn: &mut Transaction, command: &str, args: &[Vec<u8>]) -> Vec<u8> {
+        if args.len() < 2 {
+            return encode_error(String::from("wrong args"));
+        }
+        let script = if command == "EVAL" {
+            args[0].clone()
+        } else {
+            let Ok(sha) = std::str::from_utf8(&args[0]) else {
+                return encode_noscript();
+            };
+            let Ok(scripts) = self.scripts.lock() else {
+                return encode_error(String::from("script cache lock"));
+            };
+            let Some(script) = scripts.get(sha) else {
+                return encode_noscript();
+            };
+            script.clone()
+        };
+        let key_count = match std::str::from_utf8(&args[1])
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            Some(count) if count <= args.len().saturating_sub(2) => count,
+            _ => return encode_error(String::from("value is not an integer or out of range")),
+        };
+        if script.len() > 1024 * 1024 {
+            return encode_error(String::from("script exceeds the 1 MiB limit"));
+        }
+        let keys = args[2..2 + key_count].to_vec();
+        let argv = args[2 + key_count..].to_vec();
+        if command == "EVAL" {
+            let sha = script_sha1(&script);
+            if let Ok(mut scripts) = self.scripts.lock() {
+                scripts.insert(sha, script.clone());
+            }
+        }
+        match self.run_lua_script(txn, &script, &keys, &argv) {
+            Ok(reply) => reply,
+            Err(error) => encode_error(format!("Error running script: {error}")),
+        }
+    }
+
+    fn run_lua_script(
+        &self,
+        txn: &mut Transaction,
+        script: &[u8],
+        keys: &[Vec<u8>],
+        argv: &[Vec<u8>],
+    ) -> std::result::Result<Vec<u8>, String> {
+        let script =
+            std::str::from_utf8(script).map_err(|_| String::from("script is not UTF-8"))?;
+        let lua = Lua::new_with(
+            StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH,
+            LuaOptions::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        lua.set_memory_limit(8 * 1024 * 1024).map_err(|error| error.to_string())?;
+        let instruction_counter = Arc::new(AtomicUsize::new(0));
+        lua.set_hook(HookTriggers::new().every_nth_instruction(1_000), move |_, _| {
+            if instruction_counter.fetch_add(1_000, Ordering::Relaxed) >= 100_000 {
+                return Err(mlua::Error::RuntimeError(String::from(
+                    "script exceeded the instruction limit",
+                )));
+            }
+            Ok(VmState::Continue)
+        });
+        let result = lua.scope(|scope| {
+            let call = scope.create_function_mut(|lua, values: MultiValue| {
+                let mut values = values.into_iter();
+                let command =
+                    values.next().map(lua_value_bytes).transpose()?.ok_or_else(|| {
+                        mlua::Error::RuntimeError(String::from("missing command"))
+                    })?;
+                let name = std::str::from_utf8(&command)
+                    .map_err(|_| mlua::Error::RuntimeError(String::from("command is not UTF-8")))?
+                    .to_ascii_uppercase();
+                if matches!(
+                    name.as_str(),
+                    "EVAL" | "EVALSHA" | "SCRIPT" | "SUBSCRIBE" | "PSUBSCRIBE"
+                ) {
+                    return Err(mlua::Error::RuntimeError(String::from(
+                        "command is not allowed in scripts",
+                    )));
+                }
+                let args = values.map(lua_value_bytes).collect::<mlua::Result<Vec<_>>>()?;
+                let reply = self.dispatch_in(txn, RespCommand { name, args });
+                parse_lua_resp(&reply).map_err(mlua::Error::RuntimeError)?.into_lua(lua)
+            })?;
+            let redis = lua.create_table()?;
+            redis.set("call", call)?;
+            lua.globals().set("redis", redis)?;
+            lua.globals().set("KEYS", lua_bytes_table(&lua, keys)?)?;
+            lua.globals().set("ARGV", lua_bytes_table(&lua, argv)?)?;
+            for name in ["collectgarbage", "dofile", "loadfile", "require"] {
+                lua.globals().set(name, LuaValue::Nil)?;
+            }
+            lua.load(script).set_name("rymedb-eval").eval::<LuaValue>()
+        });
+        let value = result.map_err(|error| error.to_string())?;
+        lua_value_resp(&value)
     }
 
     fn cdc_pending(
@@ -1314,6 +1467,8 @@ where
     fn dispatch_in(&self, txn: &mut Transaction, command: RespCommand) -> Vec<u8> {
         match command.name.as_str() {
             "PING" => encode_simple("PONG"),
+            "EVAL" | "EVALSHA" => self.eval_command(txn, &command.name, &command.args),
+            "SCRIPT" => self.script_command(&command.args),
             "PUBLISH" => {
                 if command.args.len() != 2 {
                     return encode_error(String::from("wrong args"));
@@ -4491,6 +4646,145 @@ struct RespCommand {
     args: Vec<Vec<u8>>,
 }
 
+#[derive(Debug)]
+enum LuaRespValue {
+    Null,
+    Integer(i64),
+    Bulk(Vec<u8>),
+    Simple(Vec<u8>),
+    Array(Vec<LuaRespValue>),
+    Error(String),
+}
+
+impl LuaRespValue {
+    fn into_lua(self, lua: &Lua) -> mlua::Result<LuaValue> {
+        match self {
+            Self::Null => Ok(LuaValue::Nil),
+            Self::Integer(value) => Ok(LuaValue::Integer(value)),
+            Self::Bulk(value) | Self::Simple(value) => {
+                Ok(LuaValue::String(lua.create_string(value)?))
+            }
+            Self::Array(values) => {
+                let table = lua.create_table()?;
+                for (index, value) in values.into_iter().enumerate() {
+                    table.set(index + 1, value.into_lua(lua)?)?;
+                }
+                Ok(LuaValue::Table(table))
+            }
+            Self::Error(error) => Err(mlua::Error::RuntimeError(error)),
+        }
+    }
+}
+
+fn lua_value_bytes(value: LuaValue) -> mlua::Result<Vec<u8>> {
+    match value {
+        LuaValue::String(value) => Ok(value.as_bytes().to_vec()),
+        LuaValue::Integer(value) => Ok(value.to_string().into_bytes()),
+        LuaValue::Number(value) if value.is_finite() => Ok(value.to_string().into_bytes()),
+        LuaValue::Boolean(value) => Ok(if value { b"1".to_vec() } else { b"0".to_vec() }),
+        _ => Err(mlua::Error::RuntimeError(String::from("command argument is not a string"))),
+    }
+}
+
+fn lua_bytes_table(lua: &Lua, values: &[Vec<u8>]) -> mlua::Result<mlua::Table> {
+    let table = lua.create_table()?;
+    for (index, value) in values.iter().enumerate() {
+        table.set(index + 1, lua.create_string(value)?)?;
+    }
+    Ok(table)
+}
+
+fn lua_value_resp(value: &LuaValue) -> std::result::Result<Vec<u8>, String> {
+    match value {
+        LuaValue::Nil | LuaValue::Boolean(false) => Ok(encode_null()),
+        LuaValue::Boolean(true) => Ok(encode_integer(1)),
+        LuaValue::Integer(value) => Ok(encode_integer(*value)),
+        LuaValue::Number(value) if value.is_finite() && value.fract() == 0.0 => {
+            Ok(encode_integer(*value as i64))
+        }
+        LuaValue::Number(value) if value.is_finite() => {
+            Ok(encode_bulk(value.to_string().as_bytes()))
+        }
+        LuaValue::String(value) => Ok(encode_bulk(value.as_bytes().as_ref())),
+        LuaValue::Table(table) => {
+            let mut values = Vec::new();
+            for value in table.sequence_values::<LuaValue>() {
+                values.push(lua_value_resp(&value.map_err(|error| error.to_string())?)?);
+            }
+            Ok(encode_raw_array(values))
+        }
+        _ => Err(String::from("script returned an unsupported value")),
+    }
+}
+
+fn parse_lua_resp(input: &[u8]) -> std::result::Result<LuaRespValue, String> {
+    fn parse(input: &[u8], offset: &mut usize) -> std::result::Result<LuaRespValue, String> {
+        let kind = *input.get(*offset).ok_or_else(|| String::from("short reply"))?;
+        *offset += 1;
+        let line_end = find_crlf(&input[*offset..])
+            .map(|end| end + *offset)
+            .ok_or_else(|| String::from("short reply"))?;
+        let line = &input[*offset..line_end];
+        *offset = line_end + 2;
+        match kind {
+            b'+' => Ok(LuaRespValue::Simple(line.to_vec())),
+            b'-' => Ok(LuaRespValue::Error(String::from_utf8_lossy(line).into_owned())),
+            b':' => Ok(LuaRespValue::Integer(
+                std::str::from_utf8(line)
+                    .map_err(|_| String::from("invalid integer"))?
+                    .parse()
+                    .map_err(|_| String::from("invalid integer"))?,
+            )),
+            b'$' => {
+                let length: i64 = std::str::from_utf8(line)
+                    .map_err(|_| String::from("invalid bulk length"))?
+                    .parse()
+                    .map_err(|_| String::from("invalid bulk length"))?;
+                if length < 0 {
+                    return Ok(LuaRespValue::Null);
+                }
+                let length = usize::try_from(length).map_err(|_| String::from("bulk too large"))?;
+                let end = (*offset).saturating_add(length);
+                if end + 2 > input.len() || &input[end..end + 2] != b"\r\n" {
+                    return Err(String::from("short bulk reply"));
+                }
+                let value = input[*offset..end].to_vec();
+                *offset = end + 2;
+                Ok(LuaRespValue::Bulk(value))
+            }
+            b'*' => {
+                let length: i64 = std::str::from_utf8(line)
+                    .map_err(|_| String::from("invalid array length"))?
+                    .parse()
+                    .map_err(|_| String::from("invalid array length"))?;
+                if length < 0 {
+                    return Ok(LuaRespValue::Null);
+                }
+                let mut values = Vec::with_capacity(length as usize);
+                for _ in 0..length {
+                    values.push(parse(input, offset)?);
+                }
+                Ok(LuaRespValue::Array(values))
+            }
+            _ => Err(String::from("unsupported reply type")),
+        }
+    }
+
+    let mut offset = 0;
+    let value = parse(input, &mut offset)?;
+    if offset != input.len() {
+        return Err(String::from("trailing reply data"));
+    }
+    Ok(value)
+}
+
+fn script_sha1(script: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut digest = Sha1::new();
+    digest.update(script);
+    format!("{:x}", digest.finalize())
+}
+
 #[derive(Debug, Default)]
 struct Multi {
     queue: Vec<RespCommand>,
@@ -4716,6 +5010,9 @@ fn is_known(name: &str) -> bool {
         "PING"
             | "ECHO"
             | "PUBLISH"
+            | "EVAL"
+            | "EVALSHA"
+            | "SCRIPT"
             | "AUTH"
             | "GET"
             | "SET"
@@ -4883,6 +5180,10 @@ fn encode_simple(value: &str) -> Vec<u8> {
 
 fn encode_error(message: String) -> Vec<u8> {
     format!("-ERR {message}\r\n").into_bytes()
+}
+
+fn encode_noscript() -> Vec<u8> {
+    b"-NOSCRIPT No matching script. Please use EVAL.\r\n".to_vec()
 }
 
 fn encode_integer(value: i64) -> Vec<u8> {

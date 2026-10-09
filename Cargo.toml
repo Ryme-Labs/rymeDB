@@ -73,6 +73,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 bytes = "1"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+sha1 = "0.10"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.7", features = ["ws"] }

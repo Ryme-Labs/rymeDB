@@ -11,6 +11,7 @@ pins every row):
 | Group | Commands |
 | --- | --- |
 | Connection | `PING`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` |
+| Scripting | `EVAL`, `EVALSHA`, `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH` (sandboxed Lua 5.4) |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` (atomic, see below) |
 | Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`GET`), `GETDEL`, `MGET`, `MSET`, `APPEND`, `STRLEN` |
 | Counters | `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT` (clean float formatting, saturating integers) |
@@ -101,10 +102,15 @@ arity, `value is not an integer or out of range`) surface as error elements in t
 while the remaining commands still apply, matching Redis. Nested
 `MULTI` and bare `EXEC`/`DISCARD` are rejected.
 
-Not yet covered: Lua scripting. RESP pub/sub is in-memory and best-effort;
-durable replay and query subscriptions remain available through the WebSocket
-realtime API. `KEYS` is supported for compatibility, but it scans the complete
-keyspace synchronously; use `SCAN` for production traffic.
+Lua scripts run atomically inside the command transaction and receive the
+standard `KEYS` and `ARGV` tables plus `redis.call`. The runtime loads only
+safe table/string/math/UTF-8 libraries, disables filesystem/process helpers,
+limits scripts to 1 MiB, 8 MiB of Lua memory, and 100,000 VM instructions.
+`redis.pcall`, script debugging, and arbitrary Redis module APIs are not
+exposed yet. RESP pub/sub is in-memory and best-effort; durable replay and
+query subscriptions remain available through
+the WebSocket realtime API. `KEYS` is supported for compatibility, but it
+scans the complete keyspace synchronously; use `SCAN` for production traffic.
 These return `unknown command` rather than a wrong answer.
 
 ## Connection management
