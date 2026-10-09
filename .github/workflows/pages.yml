@@ -8,6 +8,9 @@ on:
       - "schemas/openapi/**"
       - "images/**"
       - "README.md"
+      - "sdks/java/**"
+      - "sdks/js/**"
+      - "sdks/rust/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -22,13 +25,21 @@ concurrency:
 
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install page builder deps
-        run: pip install pyyaml markdown
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install page builder dependencies
+        run: python -m pip install --disable-pip-version-check pyyaml markdown
 
       - name: Validate OpenAPI spec
         run: python3 schemas/openapi/validate.py

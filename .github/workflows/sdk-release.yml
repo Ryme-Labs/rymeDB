@@ -1,0 +1,211 @@
+name: sdk-release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "sdks/**"
+      - "docs/sdk-release.md"
+      - ".github/workflows/sdk-release.yml"
+  pull_request:
+    paths:
+      - "sdks/**"
+      - "docs/sdk-release.md"
+      - ".github/workflows/sdk-release.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the tested SDKs to their registries
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sdk-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: Build npm SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and test
+        run: |
+          pnpm --filter @rymelabs/rymedb build
+          pnpm --filter @rymelabs/rymedb test
+
+      - name: Pack npm artifact
+        run: mkdir -p "$RUNNER_TEMP/npm" && npm pack --pack-destination "$RUNNER_TEMP/npm"
+        working-directory: sdks/js
+
+      - name: Upload npm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-npm
+          path: ${{ runner.temp }}/npm/*.tgz
+          if-no-files-found: error
+
+  rust:
+    name: Build Rust SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --manifest-path sdks/rust/Cargo.toml --locked
+
+      - name: Package crate
+        run: cargo package --manifest-path sdks/rust/Cargo.toml --locked
+
+      - name: Upload Cargo artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-cargo
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  java:
+    name: Build Java SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      - name: Verify Maven package
+        run: mvn --batch-mode --update-snapshots -f sdks/java/pom.xml verify
+
+      - name: Upload Maven artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-maven
+          path: sdks/java/target/*.jar
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm SDK
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
+    needs: npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build package
+        run: pnpm --filter @rymelabs/rymedb build
+
+      - name: Publish npm package
+        working-directory: sdks/js
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  publish-cargo:
+    name: Publish Rust SDK
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
+    needs: rust
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --manifest-path sdks/rust/Cargo.toml --locked
+
+  publish-java:
+    name: Publish Java SDK
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
+    needs: java
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+          cache: maven
+
+      - name: Publish Maven package to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: mvn --batch-mode -f sdks/java/pom.xml deploy -DskipTests
+
+  release:
+    name: Upload SDK release artifacts
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: [npm, rust, java]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download SDK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-*
+          path: release
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes
