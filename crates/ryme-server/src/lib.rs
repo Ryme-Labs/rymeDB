@@ -449,6 +449,7 @@ pub struct SharedState {
     keys: ApiKeyStore,
     jwt: Option<JwtVerifier>,
     oidc: Option<OidcConfig>,
+    oidc_jwt: Option<JwtVerifier>,
     control: Arc<Mutex<ControlPlane>>,
     latency: LatencyWindow,
     histogram: Histogram,
@@ -1111,18 +1112,42 @@ impl SharedState {
             None => None,
         };
         let dek_ring = load_or_create_ring(&config.data_dir, &tenant)?;
-        let oidc = match (
-            std::env::var("RYME_OIDC_ISSUER").ok(),
-            std::env::var("RYME_OIDC_AUDIENCE").ok(),
-            std::env::var("RYME_OIDC_SECRET").ok(),
-        ) {
-            (Some(issuer), Some(audience), Some(secret)) => Some(OidcConfig {
+        let oidc_issuer = std::env::var("RYME_OIDC_ISSUER").ok();
+        let oidc_audience = std::env::var("RYME_OIDC_AUDIENCE").ok();
+        let oidc_secret = std::env::var("RYME_OIDC_SECRET").ok();
+        let oidc_jwks_path = std::env::var_os("RYME_OIDC_JWKS_FILE")
+            .or_else(|| std::env::var_os("RYME_JWT_JWKS_FILE"));
+        let oidc_enabled = oidc_secret.is_some() || oidc_jwks_path.is_some();
+        let oidc = match (oidc_issuer, oidc_audience) {
+            (Some(issuer), Some(audience)) if oidc_enabled => Some(OidcConfig {
                 issuer,
                 audience,
-                client_secret: secret.into_bytes(),
+                client_secret: oidc_secret.unwrap_or_default().into_bytes(),
                 auth_endpoint: std::env::var("RYME_OIDC_AUTH_ENDPOINT").unwrap_or_default(),
                 client_id: std::env::var("RYME_OIDC_CLIENT_ID").unwrap_or_default(),
             }),
+            (None, None) if !oidc_enabled => None,
+            _ if oidc_enabled => {
+                return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                    "oidc issuer and audience are required",
+                )))
+            }
+            _ => None,
+        };
+        let oidc_jwt = match (&oidc, oidc_jwks_path) {
+            (Some(config), Some(path)) => Some(load_jwks_verifier(
+                std::path::Path::new(&path),
+                std::env::var("RYME_OIDC_JWK_KID")
+                    .ok()
+                    .or_else(|| std::env::var("RYME_JWT_JWK_KID").ok()),
+                Some(config.issuer.clone()),
+                Some(config.audience.clone()),
+            )?),
+            (None, Some(_)) => {
+                return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                    "oidc issuer and audience are required with a jwks file",
+                )))
+            }
             _ => None,
         };
         Ok(Self {
@@ -1137,6 +1162,7 @@ impl SharedState {
             keys,
             jwt,
             oidc,
+            oidc_jwt,
             control: Arc::new(Mutex::new(control)),
             latency: LatencyWindow::new(),
             histogram: Histogram::new(1024),
@@ -3823,7 +3849,11 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
         return error_response(ryme_error::RymeError::Unavailable(String::from("oidc")));
     };
     let now = ryme_txn::now_unix();
-    match config.verify_id_token(&request.id_token, now) {
+    let verified = match state.oidc_jwt.as_ref() {
+        Some(verifier) => verifier.principal_from_token(&request.id_token, now),
+        None => config.verify_id_token(&request.id_token, now),
+    };
+    match verified {
         Ok(principal) => {
             let (key, tenant) = issue_api_key(&state.keys, &principal);
             match state.persist_auth() {
@@ -6773,11 +6803,23 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
     let Some(path) = std::env::var_os("RYME_JWT_JWKS_FILE") else {
         return Ok(None);
     };
-    let raw = std::fs::read(&path).map_err(|error| {
-        ryme_error::RymeError::InvalidArgument(format!(
-            "jwt jwks file {}: {error}",
-            std::path::Path::new(&path).display()
-        ))
+    let verifier = load_jwks_verifier(
+        std::path::Path::new(&path),
+        std::env::var("RYME_JWT_JWK_KID").ok(),
+        issuer,
+        audience,
+    )?;
+    Ok(Some(verifier))
+}
+
+fn load_jwks_verifier(
+    path: &std::path::Path,
+    requested_kid: Option<String>,
+    issuer: Option<String>,
+    audience: Option<String>,
+) -> ryme_error::Result<JwtVerifier> {
+    let raw = std::fs::read(path).map_err(|error| {
+        ryme_error::RymeError::InvalidArgument(format!("jwt jwks file {}: {error}", path.display()))
     })?;
     let document: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks: {error}")))?;
@@ -6785,7 +6827,6 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
         .get("keys")
         .and_then(|value| value.as_array())
         .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks keys")))?;
-    let requested_kid = std::env::var("RYME_JWT_JWK_KID").ok();
     let selected_keys = keys
         .iter()
         .filter(|key| key.get("kty").and_then(|value| value.as_str()) == Some("RSA"))
@@ -6838,7 +6879,7 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
             )))
         }
     };
-    Ok(Some(verifier))
+    Ok(verifier)
 }
 
 fn wire_tenant(

@@ -101,6 +101,10 @@ For OIDC/JWT verification, set `RYME_JWT_SECRET` for HS256 or set
 RS256. The verifier selects a matching `kid` from the token, which permits key
 rotation; `RYME_JWT_JWK_KID` can restrict the mounted set to one key. Set
 `RYME_JWT_ISSUER` and `RYME_JWT_AUDIENCE` together to enforce those claims.
+The `/v1/auth/oidc/token` exchange can use the same mounted file, or an
+explicit `RYME_OIDC_JWKS_FILE` and optional `RYME_OIDC_JWK_KID`; its OIDC
+issuer and audience are taken from `RYME_OIDC_ISSUER` and
+`RYME_OIDC_AUDIENCE`.
 
 Application-auth state is stored atomically in `data_dir/auth.json`. It contains
 password hashes, OTP/passkey metadata, API-key digests, and refresh-token
