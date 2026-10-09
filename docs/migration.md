@@ -51,7 +51,8 @@ protocol connections: `SELECT pg_catalog.version()`,
 
 REST: `GET /rest/v1/:table?select=&key=eq.<id>&order=key.desc&limit=&offset=`,
 with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is`, `like`, `ilike`, and
-`not.<operator>` filters plus field projection/aliases,
+`not.<operator>`, `or=(...)`, and `and=(...)` filters plus field
+projection/aliases,
 `POST /rest/v1/:table` with `{key, value}`, `{rows: [...]}`, a JSON object,
 or a JSON array of objects with an `id`/`key` field,
 `PATCH /rest/v1/:table?<field>=eq.<value>` with a JSON object for filtered

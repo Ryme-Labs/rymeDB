@@ -988,7 +988,7 @@ paths:
   /rest/v1/{table}:
     get:
       tags: [rest]
-      description: Supabase-style list with select, key=eq.<id>, order, limit, offset.
+      description: Supabase-style list with select, PostgREST filters including or/and groups, order, limit, offset.
       parameters:
         - $ref: '#/components/parameters/TableParam'
         - name: select

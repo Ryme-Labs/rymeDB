@@ -2792,6 +2792,17 @@ fn filter_rows_by_query(rows: Vec<(Vec<u8>, Vec<u8>)>, raw: &str) -> Vec<(Vec<u8
 }
 
 fn rest_filter_matches(row: &serde_json::Value, field: &str, expression: &str) -> bool {
+    if field.eq_ignore_ascii_case("or") || field.eq_ignore_ascii_case("and") {
+        let mut matches = rest_compound_filters(expression).into_iter().filter_map(|filter| {
+            let (field, expression) = filter.split_once('.')?;
+            Some(rest_filter_matches(row, field, expression))
+        });
+        return if field.eq_ignore_ascii_case("or") {
+            matches.any(|matched| matched)
+        } else {
+            matches.all(|matched| matched)
+        };
+    }
     let Some(actual) = row.get(field) else { return false };
     let (operator, expected) = expression.split_once('.').unwrap_or(("eq", expression));
     if actual.is_null() && !operator.eq_ignore_ascii_case("is") {
@@ -2836,6 +2847,35 @@ fn rest_filter_matches(row: &serde_json::Value, field: &str, expression: &str) -
         },
         _ => false,
     }
+}
+
+fn rest_compound_filters(expression: &str) -> Vec<&str> {
+    let value = expression
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(expression);
+    let mut filters = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let filter = value[start..index].trim();
+                if !filter.is_empty() {
+                    filters.push(filter);
+                }
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let filter = value[start..].trim();
+    if !filter.is_empty() {
+        filters.push(filter);
+    }
+    filters
 }
 
 fn rest_scalar_text(value: &serde_json::Value) -> Option<String> {
@@ -2942,6 +2982,20 @@ mod rest_compatibility_tests {
         assert_eq!(filter_rows_by_query(rows.clone(), "name=ilike.*ali*&deleted=is.null").len(), 1);
         assert_eq!(filter_rows_by_query(rows.clone(), "name=like.Ali%&deleted=is.null").len(), 1);
         assert_eq!(filter_rows_by_query(rows, "name=not.ilike.*ali*").len(), 1);
+    }
+
+    #[test]
+    fn postgrest_compound_filters_have_expected_semantics() {
+        let rows = vec![
+            (b"one".to_vec(), br#"{"status":"ready","score":12}"#.to_vec()),
+            (b"two".to_vec(), br#"{"status":"queued","score":4}"#.to_vec()),
+            (b"three".to_vec(), br#"{"status":"failed","score":2}"#.to_vec()),
+        ];
+        assert_eq!(
+            filter_rows_by_query(rows.clone(), "or=(status.eq.ready,status.eq.queued)").len(),
+            2
+        );
+        assert_eq!(filter_rows_by_query(rows, "and=(status.neq.failed,score.gte.4)").len(), 2);
     }
 }
 
