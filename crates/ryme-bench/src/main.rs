@@ -402,17 +402,20 @@ fn local_bench(ops: usize, value_bytes: usize) {
     let seconds = elapsed.as_secs_f64().max(0.000001);
     let throughput = applied as f64 / seconds;
     println!("ops={applied} seconds={seconds:.3} qps={throughput:.0}");
-    let probe_start = Instant::now();
-    let mut hits = 0usize;
-    for index in 0..10000.min(ops) {
-        let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
-        let mut txn = manager.begin();
-        if manager.get(&mut txn, &key).unwrap_or(None).is_some() {
-            hits += 1;
+    let probe_ops = 10000.min(ops);
+    if probe_ops > 0 {
+        let probe_start = Instant::now();
+        let mut hits = 0usize;
+        for index in 0..probe_ops {
+            let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
+            let mut txn = manager.begin();
+            if manager.get(&mut txn, &key).unwrap_or(None).is_some() {
+                hits += 1;
+            }
         }
+        let probe_micros = probe_start.elapsed().as_micros().max(1);
+        println!("probe_hits={hits} probe_mean_micros={}", probe_micros / probe_ops as u128);
     }
-    let probe_micros = probe_start.elapsed().as_micros().max(1);
-    println!("probe_hits={hits} probe_mean_micros={}", probe_micros / 10000);
 }
 
 fn pick_key(counter: u64, keyspace: usize, hotspot_percent: u64, worker: usize) -> String {
@@ -449,6 +452,12 @@ async fn read_reply(socket: &mut tokio::net::TcpStream, scratch: &mut Vec<u8>) -
             Err(_) => return None,
         }
     }
+}
+
+fn worker_ops(total: usize, workers: usize, worker: usize) -> usize {
+    let workers = workers.max(1);
+    let base = total / workers;
+    base + usize::from(worker < total % workers)
 }
 
 fn find_frame_end(buffer: &[u8]) -> Option<usize> {
@@ -511,11 +520,21 @@ struct TaskConfig {
     hotspot_percent: u64,
     workload: String,
     pipeline: usize,
+    ready_gate: Arc<tokio::sync::Barrier>,
+    start_gate: Arc<tokio::sync::Barrier>,
 }
 
 async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
-    let mut socket = tokio::net::TcpStream::connect(&task.addr).await.unwrap();
-    socket.set_nodelay(true).unwrap();
+    let socket = match tokio::net::TcpStream::connect(&task.addr).await {
+        Ok(socket) if socket.set_nodelay(true).is_ok() => Some(socket),
+        _ => None,
+    };
+    task.ready_gate.wait().await;
+    task.start_gate.wait().await;
+    let mut socket = match socket {
+        Some(socket) => socket,
+        None => return (Vec::new(), task.ops as u64),
+    };
     let mut scratch = Vec::new();
     let mut latencies: Vec<u64> = Vec::with_capacity(task.ops);
     let mut errors = 0u64;
@@ -527,18 +546,34 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
             let key_bytes = key.into_bytes();
             let counter_key = format!("txc-{}-{}", task.worker, counter % 128);
             let start = Instant::now();
-            socket.write_all(&encode(&[b"MULTI"])).await.unwrap();
-            socket.write_all(&encode(&[b"SET", &key_bytes, &task.value])).await.unwrap();
-            socket.write_all(&encode(&[b"INCRBY", counter_key.as_bytes(), b"1"])).await.unwrap();
-            socket.write_all(&encode(&[b"GET", &key_bytes])).await.unwrap();
-            socket.write_all(&encode(&[b"EXEC"])).await.unwrap();
+            let frames = [
+                encode(&[b"MULTI"]),
+                encode(&[b"SET", &key_bytes, &task.value]),
+                encode(&[b"INCRBY", counter_key.as_bytes(), b"1"]),
+                encode(&[b"GET", &key_bytes]),
+                encode(&[b"EXEC"]),
+            ];
+            let mut write_failed = false;
+            for frame in frames {
+                if socket.write_all(&frame).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
+            }
+            if write_failed {
+                errors += (task.ops - index) as u64;
+                break;
+            }
             let mut replies = 0u8;
             let mut failed = false;
+            let mut connection_lost = false;
             for _ in 0..5 {
                 match read_reply(&mut socket, &mut scratch).await {
                     Some(false) => replies += 1,
-                    _ => {
+                    Some(true) => failed = true,
+                    None => {
                         failed = true;
+                        connection_lost = true;
                         break;
                     }
                 }
@@ -546,6 +581,9 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
             let micros = start.elapsed().as_micros() as u64;
             if !failed && replies == 5 {
                 latencies.push(micros);
+            } else if connection_lost {
+                errors += (task.ops - index) as u64;
+                break;
             } else {
                 errors += 1;
             }
@@ -554,6 +592,7 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
         }
         let batch = task.pipeline.max(1).min(task.ops - index);
         let start = Instant::now();
+        let mut write_failed = false;
         for offset in 0..batch {
             let counter = (index + offset) as u64;
             let key = pick_key(counter, task.keyspace, task.hotspot_percent, task.worker);
@@ -565,14 +604,25 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
             if write {
                 let key_bytes = key.into_bytes();
                 let frame = encode(&[b"SET", &key_bytes, &task.value]);
-                socket.write_all(&frame).await.unwrap();
+                if socket.write_all(&frame).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
             } else {
                 let key_bytes = key.into_bytes();
                 let frame = encode(&[b"GET", &key_bytes]);
-                socket.write_all(&frame).await.unwrap();
+                if socket.write_all(&frame).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
             }
         }
+        if write_failed {
+            errors += (task.ops - index) as u64;
+            break;
+        }
         let mut ok = true;
+        let mut connection_lost = false;
         let mut batch_errors = 0u64;
         for _ in 0..batch {
             match read_reply(&mut socket, &mut scratch).await {
@@ -580,6 +630,7 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
                 Some(true) => batch_errors += 1,
                 None => {
                     ok = false;
+                    connection_lost = true;
                     break;
                 }
             }
@@ -590,6 +641,9 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
             for _ in 0..batch.saturating_sub(batch_errors as usize) {
                 latencies.push(micros / batch as u64);
             }
+        } else if connection_lost {
+            errors += (task.ops - index) as u64;
+            break;
         } else {
             errors += batch as u64;
         }
@@ -600,24 +654,30 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
 
 async fn resp_bench(config: RespBench) {
     let value = vec![7u8; config.value_bytes];
-    let per_worker = config.ops / config.concurrency.max(1);
+    let workers = config.concurrency.max(1);
+    let ready_gate = Arc::new(tokio::sync::Barrier::new(workers + 1));
+    let start_gate = Arc::new(tokio::sync::Barrier::new(workers + 1));
     let mut handles = Vec::new();
-    for worker in 0..config.concurrency.max(1) {
+    for worker in 0..workers {
         let task = TaskConfig {
             addr: config.addr.clone(),
-            ops: per_worker,
+            ops: worker_ops(config.ops, workers, worker),
             worker,
             value: value.clone(),
             keyspace: config.keyspace,
             hotspot_percent: config.hotspot_percent,
             workload: config.workload.clone(),
             pipeline: config.pipeline,
+            ready_gate: ready_gate.clone(),
+            start_gate: start_gate.clone(),
         };
         handles.push(tokio::spawn(async move { run_worker(task).await }));
     }
+    ready_gate.wait().await;
+    let start = Instant::now();
+    start_gate.wait().await;
     let mut all: Vec<u64> = Vec::new();
     let mut errors = 0u64;
-    let start = Instant::now();
     for handle in handles {
         let (mut latencies, task_errors) = handle.await.unwrap();
         errors += task_errors;
@@ -638,9 +698,13 @@ async fn resp_bench(config: RespBench) {
         "workload": config.workload,
         "pipeline": config.pipeline,
         "ops": count,
+        "requested_ops": config.ops,
+        "successful_ops": count,
+        "failed_ops": errors,
         "errors": errors,
         "seconds": (elapsed * 1000.0).round() / 1000.0,
         "qps": (count as f64 / elapsed).round() as u64,
+        "attempted_qps": (config.ops as f64 / elapsed).round() as u64,
         "p50_us": percentile(50.0),
         "p90_us": percentile(90.0),
         "p95_us": percentile(95.0),
@@ -653,11 +717,13 @@ async fn resp_bench(config: RespBench) {
         println!("{result}");
     } else {
         println!(
-            "target={} workload={} pipeline={} ops={count} errors={errors} qps={:.0} p50={}us p90={}us p95={}us p99={}us p999={}us max={}us",
+            "target={} workload={} pipeline={} requested_ops={} successful_ops={count} failed_ops={errors} qps={:.0} attempted_qps={:.0} p50={}us p90={}us p95={}us p99={}us p999={}us max={}us",
             config.addr,
             config.workload,
             config.pipeline,
+            config.ops,
             count as f64 / elapsed,
+            config.ops as f64 / elapsed,
             percentile(50.0),
             percentile(90.0),
             percentile(95.0),
@@ -665,5 +731,24 @@ async fn resp_bench(config: RespBench) {
             percentile(99.9),
             all.last().copied().unwrap_or(0),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_ops;
+
+    #[test]
+    fn worker_split_preserves_requested_operations() {
+        for total in 0..32 {
+            for workers in 1..8 {
+                let assigned: usize =
+                    (0..workers).map(|worker| worker_ops(total, workers, worker)).sum();
+                assert_eq!(assigned, total);
+                let counts: Vec<_> =
+                    (0..workers).map(|worker| worker_ops(total, workers, worker)).collect();
+                assert!(counts.windows(2).all(|pair| pair[0].abs_diff(pair[1]) <= 1));
+            }
+        }
     }
 }

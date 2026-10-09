@@ -24,6 +24,12 @@ writes measured 7.3k blocks/s; repeat runs on identical state measured
 ~35k, so that single point reads as shared-hardware noise — re-run before
 quoting either way.
 
+The RESP harness establishes all client connections before starting its timed
+window and divides the requested operation count exactly across workers. JSON
+results retain the legacy `ops` field for successful operations and also report
+`requested_ops`, `successful_ops`, `failed_ops`, and `attempted_qps`; a run is
+only comparable when `failed_ops=0` and `successful_ops=requested_ops`.
+
 ## Fresh run (2026-10-02, durable local WAL, single node)
 
 | workload | qps | p50 | p90 | p95 | p99 | p99.9 | max | errors |
