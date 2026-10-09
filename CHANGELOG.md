@@ -48,6 +48,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - `CREATE TABLE` now recognizes column-level and table-level `PRIMARY KEY`
   constraints, including composite keys encoded as stable length-delimited
   storage keys.
+- `ALTER TABLE ... ADD PRIMARY KEY` now validates existing rows, rekeys stored
+  records for single and composite keys, and rebuilds secondary indexes.
 - Duplicate `CREATE TABLE` statements now fail, while `CREATE TABLE IF NOT
   EXISTS` remains idempotent without replacing the existing schema.
 - Duplicate `CREATE INDEX` statements now fail unless `IF NOT EXISTS` is used;

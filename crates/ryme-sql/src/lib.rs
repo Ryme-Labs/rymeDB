@@ -215,6 +215,11 @@ pub enum ColumnAlteration {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableConstraint {
+    PrimaryKey {
+        #[serde(default)]
+        name: Option<String>,
+        columns: Vec<String>,
+    },
     Unique {
         #[serde(default)]
         name: Option<String>,
@@ -1065,6 +1070,27 @@ fn parse_alter_table_constraint(definition: &str) -> Result<Option<TableConstrai
             return Err(RymeError::InvalidArgument(String::from("unique constraint")));
         }
         return Ok(Some(TableConstraint::Unique { name, columns }));
+    }
+    if kind_token.eq_ignore_ascii_case("PRIMARY") {
+        let upper = definition.to_ascii_uppercase();
+        let primary = upper
+            .find("PRIMARY KEY")
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("primary key constraint")))?;
+        let open = definition[primary + 11..]
+            .find('(')
+            .map(|offset| primary + 11 + offset)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("primary key constraint")))?;
+        let close = matching_paren(definition, open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("primary key constraint")))?;
+        let columns = split_sql_items(&definition[open + 1..close])
+            .into_iter()
+            .map(|column| unquote(column.trim()))
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("primary key constraint")));
+        }
+        return Ok(Some(TableConstraint::PrimaryKey { name, columns }));
     }
     if kind_token.eq_ignore_ascii_case("FOREIGN") {
         let foreign = definition
@@ -5046,6 +5072,159 @@ where
         )
     }
 
+    async fn add_primary_key_constraint(&self, table: String, columns: Vec<String>) -> Result<()> {
+        let table = self
+            .canonical_table_name(&table)
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        if columns.is_empty()
+            || columns.iter().any(|column| {
+                columns.iter().filter(|other| other.eq_ignore_ascii_case(column)).count() > 1
+            })
+        {
+            return Err(RymeError::InvalidArgument(String::from("primary key constraint")));
+        }
+        let definitions = self.catalog_columns(&table);
+        if definitions.is_empty() {
+            return Err(RymeError::NotFound(String::from("table columns")));
+        }
+        if definitions.iter().any(|definition| definition.primary_key) {
+            return Err(RymeError::Conflict(String::from("primary key already exists")));
+        }
+        let primary_definitions = columns
+            .iter()
+            .map(|column| {
+                definitions
+                    .iter()
+                    .find(|definition| definition.name.eq_ignore_ascii_case(column))
+                    .cloned()
+                    .ok_or_else(|| {
+                        RymeError::InvalidArgument(format!("unknown primary key column {column}"))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let rows = self.scan_all_rows(&table)?;
+        let mut rekeyed = Vec::with_capacity(rows.len());
+        let mut new_keys = BTreeSet::new();
+        for (old_pk, value) in rows {
+            let serde_json::Value::Object(object) = serde_json::from_slice(&value)
+                .map_err(|_| RymeError::InvalidArgument(String::from("schema row")))?
+            else {
+                return Err(RymeError::InvalidArgument(String::from("schema row")));
+            };
+            let parts = primary_definitions
+                .iter()
+                .map(|definition| {
+                    let selected = object
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&definition.name))
+                        .map(|(_, selected)| selected)
+                        .filter(|selected| !selected.is_null())
+                        .ok_or_else(|| {
+                            RymeError::InvalidArgument(format!(
+                                "null value in column {} violates not-null constraint",
+                                definition.name
+                            ))
+                        })?;
+                    let part = json_result_bytes(selected);
+                    if part.is_empty() {
+                        return Err(RymeError::InvalidArgument(String::from(
+                            "null value in primary key",
+                        )));
+                    }
+                    Ok(part)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let new_pk = if parts.len() == 1 {
+                parts.into_iter().next().unwrap_or_default()
+            } else {
+                encode_key_parts(&parts).ok_or_else(|| {
+                    RymeError::InvalidArgument(String::from("null value in primary key"))
+                })?
+            };
+            if !new_keys.insert(new_pk.clone()) {
+                return Err(RymeError::Conflict(String::from("duplicate primary key")));
+            }
+            rekeyed.push((old_pk, new_pk, value));
+        }
+
+        if rekeyed.iter().any(|(old_pk, new_pk, _)| old_pk != new_pk) {
+            let mut txn = self.begin_with(self.isolation);
+            for (old_pk, new_pk, _) in &rekeyed {
+                if old_pk != new_pk {
+                    self.manager.delete(
+                        &mut txn,
+                        RecordKey::new(&self.tenant, &self.database, &table, old_pk),
+                    );
+                }
+            }
+            for (_, new_pk, value) in &rekeyed {
+                self.manager.put(
+                    &mut txn,
+                    RecordKey::new(&self.tenant, &self.database, &table, new_pk),
+                    value.clone(),
+                );
+            }
+            self.manager.commit(txn).await?;
+        }
+
+        {
+            let mut catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
+            let definitions = catalog
+                .get_mut(&table)
+                .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+            for definition in definitions {
+                if columns.iter().any(|column| column.eq_ignore_ascii_case(&definition.name)) {
+                    definition.primary_key = true;
+                    definition.nullable = false;
+                }
+            }
+        }
+        self.rebuild_index_entries(&table)?;
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn rebuild_index_entries(&self, table: &str) -> Result<()> {
+        let rows = self.scan_all_rows(table)?;
+        let definitions = {
+            let indexes =
+                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            indexes
+                .get(table)
+                .map(|states| {
+                    states.iter().map(|state| state.definition.clone()).collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let mut entries = definitions
+            .iter()
+            .map(|definition| (definition.name.clone(), BTreeMap::new()))
+            .collect::<HashMap<_, BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>>>();
+        for (pk, value) in rows {
+            for definition in &definitions {
+                let Some(indexed) = index_value(definition, &pk, &value) else { continue };
+                entries
+                    .get_mut(&definition.name)
+                    .expect("index definition was initialized")
+                    .entry(indexed)
+                    .or_default()
+                    .insert(pk.clone());
+            }
+        }
+        let mut indexes =
+            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+        if let Some(states) = indexes.get_mut(table) {
+            for state in states {
+                state.entries = entries.remove(&state.definition.name).unwrap_or_default();
+            }
+        }
+        Ok(())
+    }
+
     fn add_check_constraint(&self, table: String, expression: String) -> Result<()> {
         let table = self
             .canonical_table_name(&table)
@@ -5125,6 +5304,9 @@ where
     async fn add_table_constraint(&self, table: String, constraint: TableConstraint) -> Result<()> {
         self.reject_if_read_only()?;
         match constraint {
+            TableConstraint::PrimaryKey { name: _, columns } => {
+                self.add_primary_key_constraint(table, columns).await
+            }
             TableConstraint::Unique { name, columns } => {
                 self.add_unique_constraint(table, name, columns)
             }
@@ -8097,6 +8279,14 @@ mod tests {
     #[test]
     fn parses_alter_table_constraints() {
         assert!(matches!(
+            parse("ALTER TABLE messages ADD CONSTRAINT messages_pk PRIMARY KEY (tenant_id, id)").unwrap(),
+            Statement::AlterTableAddConstraint {
+                constraint: TableConstraint::PrimaryKey { name: Some(name), columns },
+                ..
+            } if name == "messages_pk"
+                && columns == vec![String::from("tenant_id"), String::from("id")]
+        ));
+        assert!(matches!(
             parse("ALTER TABLE messages ADD CONSTRAINT messages_user_fk FOREIGN KEY (user_id) REFERENCES users (id)").unwrap(),
             Statement::AlterTableAddConstraint {
                 constraint: TableConstraint::ForeignKey { name: Some(name), .. },
@@ -8117,6 +8307,51 @@ mod tests {
                 ..
             } if expression == "length > 0"
         ));
+    }
+
+    #[tokio::test]
+    async fn alter_table_add_primary_key_rekeys_existing_rows() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE records (legacy TEXT, account TEXT, sequence INTEGER, body TEXT)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO records (legacy, account, sequence, body) VALUES ('legacy-1', 'room', 1, 'hello')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE records ADD PRIMARY KEY (account, sequence)").unwrap())
+            .await
+            .unwrap();
+
+        let old_key = executor
+            .execute(parse("SELECT * FROM records WHERE key = 'legacy-1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(old_key, QueryResult::Rows { ref rows } if rows.is_empty()));
+        let row = executor
+            .execute(parse("SELECT body FROM records WHERE account = 'room'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(row, QueryResult::Table { ref rows, .. }
+            if rows == &vec![vec![b"hello".to_vec()]]));
+
+        let duplicate = executor
+            .execute(
+                parse("INSERT INTO records (legacy, account, sequence, body) VALUES ('legacy-2', 'room', 1, 'again')")
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(duplicate, Err(RymeError::Conflict(_))));
     }
 
     #[tokio::test]
