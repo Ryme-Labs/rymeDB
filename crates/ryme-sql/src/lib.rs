@@ -17,10 +17,14 @@ pub enum Statement {
     AlterTableAddColumn {
         table: String,
         column: ColumnDefinition,
+        #[serde(default)]
+        if_not_exists: bool,
     },
     AlterTableDropColumn {
         table: String,
         column: String,
+        #[serde(default)]
+        if_exists: bool,
     },
     AlterTableRenameColumn {
         table: String,
@@ -515,17 +519,23 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .skip(3)
         .find_map(|(position, token)| token.eq_ignore_ascii_case("DROP").then_some(position))
     {
-        let column_pos =
+        let initial_column_pos =
             if tokens.get(drop_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
                 drop_pos + 2
             } else {
                 drop_pos + 1
             };
+        let if_exists =
+            tokens.get(initial_column_pos).is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+                && tokens
+                    .get(initial_column_pos + 1)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"));
+        let column_pos = if if_exists { initial_column_pos + 2 } else { initial_column_pos };
         let column = tokens
             .get(column_pos)
             .map(|value| unquote(value))
             .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
-        return Ok(Statement::AlterTableDropColumn { table, column });
+        return Ok(Statement::AlterTableDropColumn { table, column, if_exists });
     }
     if let Some(rename_pos) = tokens
         .iter()
@@ -559,12 +569,21 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .skip(3)
         .find_map(|(position, token)| token.eq_ignore_ascii_case("ADD").then_some(position))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table add")))?;
-    let column_pos =
+    let initial_column_pos =
         if tokens.get(add_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
             add_pos + 2
         } else {
             add_pos + 1
         };
+    let if_not_exists =
+        tokens.get(initial_column_pos).is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+            && tokens
+                .get(initial_column_pos + 1)
+                .is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+            && tokens
+                .get(initial_column_pos + 2)
+                .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"));
+    let column_pos = if if_not_exists { initial_column_pos + 3 } else { initial_column_pos };
     let column_name = tokens
         .get(column_pos)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
@@ -576,13 +595,19 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
     if definition.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("COLUMN")) {
         definition = definition[6..].trim().to_string();
     }
+    if if_not_exists
+        && definition.len() >= 13
+        && definition[..13].eq_ignore_ascii_case("IF NOT EXISTS")
+    {
+        definition = definition[13..].trim().to_string();
+    }
     let mut columns = parse_column_definitions(&format!("CREATE TABLE _ ({definition})"))?;
     let column = columns
         .drain(..)
         .next()
         .filter(|column| column.name.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
-    Ok(Statement::AlterTableAddColumn { table, column })
+    Ok(Statement::AlterTableAddColumn { table, column, if_not_exists })
 }
 
 fn parse_returning_fields(tokens: &[String]) -> Result<Vec<ReturningField>> {
@@ -1951,10 +1976,10 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::CreateTable { table, columns } => {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
-        Statement::AlterTableAddColumn { table, column } => {
+        Statement::AlterTableAddColumn { table, column, .. } => {
             format!("ddl alter_table({table}) add_column({})", column.name)
         }
-        Statement::AlterTableDropColumn { table, column } => {
+        Statement::AlterTableDropColumn { table, column, .. } => {
             format!("ddl alter_table({table}) drop_column({column})")
         }
         Statement::AlterTableRenameColumn { table, from, to } => {
@@ -3266,7 +3291,12 @@ where
         }
     }
 
-    async fn alter_table_add_column(&self, table: String, column: ColumnDefinition) -> Result<()> {
+    async fn alter_table_add_column(
+        &self,
+        table: String,
+        column: ColumnDefinition,
+        if_not_exists: bool,
+    ) -> Result<()> {
         self.reject_if_read_only()?;
         if column.primary_key {
             return Err(RymeError::InvalidArgument(String::from(
@@ -3281,6 +3311,9 @@ where
             .cloned()
             .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
         if existing.iter().any(|definition| definition.name.eq_ignore_ascii_case(&column.name)) {
+            if if_not_exists {
+                return Ok(());
+            }
             return Err(RymeError::Conflict(String::from("column")));
         }
 
@@ -3368,7 +3401,12 @@ where
         Ok(())
     }
 
-    async fn alter_table_drop_column(&self, table: String, column: String) -> Result<()> {
+    async fn alter_table_drop_column(
+        &self,
+        table: String,
+        column: String,
+        if_exists: bool,
+    ) -> Result<()> {
         self.reject_if_read_only()?;
         let existing = self
             .catalog
@@ -3381,7 +3419,13 @@ where
             .iter()
             .find(|definition| definition.name.eq_ignore_ascii_case(&column))
             .cloned()
-            .ok_or_else(|| RymeError::NotFound(String::from("column")))?;
+            .ok_or_else(|| RymeError::NotFound(String::from("column")));
+        let Ok(dropped) = dropped else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(RymeError::NotFound(String::from("column")));
+        };
         if dropped.primary_key {
             return Err(RymeError::InvalidArgument(String::from(
                 "dropping a primary key column is not supported",
@@ -3666,12 +3710,12 @@ where
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match statement {
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
-            Statement::AlterTableAddColumn { table, column } => {
-                self.alter_table_add_column(table, column).await?;
+            Statement::AlterTableAddColumn { table, column, if_not_exists } => {
+                self.alter_table_add_column(table, column, if_not_exists).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
-            Statement::AlterTableDropColumn { table, column } => {
-                self.alter_table_drop_column(table, column).await?;
+            Statement::AlterTableDropColumn { table, column, if_exists } => {
+                self.alter_table_drop_column(table, column, if_exists).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::AlterTableRenameColumn { table, from, to } => {
@@ -4356,12 +4400,12 @@ where
     ) -> Result<QueryResult> {
         match statement {
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
-            Statement::AlterTableAddColumn { table, column } => {
-                self.alter_table_add_column(table, column).await?;
+            Statement::AlterTableAddColumn { table, column, if_not_exists } => {
+                self.alter_table_add_column(table, column, if_not_exists).await?;
                 Ok(QueryResult::Ok)
             }
-            Statement::AlterTableDropColumn { table, column } => {
-                self.alter_table_drop_column(table, column).await?;
+            Statement::AlterTableDropColumn { table, column, if_exists } => {
+                self.alter_table_drop_column(table, column, if_exists).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::AlterTableRenameColumn { table, from, to } => {
@@ -5806,6 +5850,14 @@ mod tests {
             .unwrap();
 
         executor.execute(parse("ALTER TABLE events DROP COLUMN obsolete").unwrap()).await.unwrap();
+        executor
+            .execute(parse("ALTER TABLE events DROP COLUMN IF EXISTS missing").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE events ADD COLUMN IF NOT EXISTS keep TEXT").unwrap())
+            .await
+            .unwrap();
 
         assert!(executor
             .catalog_columns("events")

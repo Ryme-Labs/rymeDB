@@ -55,6 +55,8 @@ All notable changes to rymeDB are recorded here. Format follows
   cleans dependent named indexes, and persists the updated schema.
 - `ALTER TABLE ... RENAME COLUMN` now migrates stored JSON fields and keeps
   schema-column indexes and uniqueness checks aligned with the new name.
+- `ALTER TABLE ... ADD/DROP COLUMN IF [NOT] EXISTS` now supports idempotent
+  migration scripts.
 - SQL aggregate parsing now requires function-call parentheses, so columns named
   `count`, `sum`, `avg`, `min`, or `max` remain valid projections.
 - Aggregates, grouping, and key joins now page through all visible rows instead
