@@ -143,7 +143,8 @@ and indexed equality lookup,
 predicate mutations such as `UPDATE t SET status = 'ready' WHERE id = '...'`
 and `DELETE FROM t WHERE status = 'expired'`, with `RETURNING` rows for bulk
 mutations,
-named projections such as `SELECT payload, count FROM t WHERE id = '...'`,
+named projections such as `SELECT payload, count FROM t WHERE id = '...'` and
+explicit column aliases such as `SELECT payload AS body FROM t`,
 `COPY t FROM stdin` (bulk path), `SELECT DISTINCT`, and `EXPLAIN <sql>` (planned access path),
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:
 `gen_random_uuid()` (v4) and `now()` (unix seconds) evaluate in KEY/VALUE

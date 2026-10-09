@@ -185,6 +185,8 @@ pub enum Statement {
     SelectColumns {
         table: String,
         columns: Vec<String>,
+        #[serde(default)]
+        aliases: Vec<Option<String>>,
         limit: usize,
         offset: usize,
         order: Order,
@@ -939,11 +941,12 @@ fn prepare_distinct(statement: Statement) -> Statement {
             limit,
             offset,
         },
-        Statement::SelectColumns { table, columns, limit, offset, order, filter } => {
+        Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter } => {
             Statement::Distinct {
                 statement: Box::new(Statement::SelectColumns {
                     table,
                     columns,
+                    aliases,
                     limit: default_distinct_limit(),
                     offset: 0,
                     order,
@@ -1858,7 +1861,7 @@ fn rewrite_simple_cte(query: Statement, body: Statement, cte_name: &str) -> Opti
             filter.extend(body_filter);
             Some(Statement::SelectScan { table: source_table, limit, offset, order, filter })
         }
-        Statement::SelectColumns { table, columns, limit, offset, order, filter }
+        Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter }
             if table.eq_ignore_ascii_case(cte_name) =>
         {
             let mut combined = source_filter;
@@ -1866,6 +1869,7 @@ fn rewrite_simple_cte(query: Statement, body: Statement, cte_name: &str) -> Opti
             Some(Statement::SelectColumns {
                 table: source_table,
                 columns,
+                aliases,
                 limit,
                 offset,
                 order,
@@ -3193,7 +3197,7 @@ fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
     }
     let has_where = tokens.iter().any(|t| t.eq_ignore_ascii_case("WHERE"));
     let has_join = tokens.iter().any(|t| t.eq_ignore_ascii_case("JOIN"));
-    let projection = parse_projection(tokens)?;
+    let projection = parse_projection(tokens, raw)?;
     let filter = parse_where_filter(tokens)?;
     if projection.is_none() && !has_join {
         if let Some(pk) = point_lookup_key(tokens) {
@@ -3210,37 +3214,58 @@ fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
         return parse_join(tokens, &table);
     }
     let (limit, offset, order) = parse_scan_tail(tokens)?;
-    if let Some(columns) = projection {
-        return Ok(Statement::SelectColumns { table, columns, limit, offset, order, filter });
+    if let Some((columns, aliases)) = projection {
+        return Ok(Statement::SelectColumns {
+            table,
+            columns,
+            aliases,
+            limit,
+            offset,
+            order,
+            filter,
+        });
     }
     Ok(Statement::SelectScan { table, limit, offset, order, filter })
 }
 
-fn parse_projection(tokens: &[String]) -> Result<Option<Vec<String>>> {
-    let from = tokens
+fn parse_projection(
+    tokens: &[String],
+    raw: &str,
+) -> Result<Option<(Vec<String>, Vec<Option<String>>)>> {
+    let _from = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("FROM"))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("missing table")))?;
-    let start = if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("DISTINCT")) {
-        2
-    } else {
-        1
-    };
-    let selected = &tokens[start..from];
-    if selected.is_empty() || (selected.len() == 1 && selected[0] == "*") {
+    let selected = select_items(raw)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("select projection")))?;
+    if selected.is_empty() || (selected.len() == 1 && selected[0].trim() == "*") {
         return Ok(None);
     }
-    let columns = selected
-        .iter()
-        .map(|token| {
-            if token == "*" {
-                Err(RymeError::InvalidArgument(String::from("select projection")))
-            } else {
-                Ok(normalize_column_reference(token))
+    let mut columns = Vec::with_capacity(selected.len());
+    let mut aliases = Vec::with_capacity(selected.len());
+    for item in selected {
+        let item = item.trim();
+        if item == "*" {
+            return Err(RymeError::InvalidArgument(String::from("select projection")));
+        }
+        let (source, alias) = if let Some(position) = find_sql_keyword(item, "AS", 0) {
+            let source = item[..position].trim();
+            let alias = unquote(item[position + "AS".len()..].trim());
+            if source.is_empty() || alias.is_empty() || tokenize(&alias).len() != 1 {
+                return Err(RymeError::InvalidArgument(String::from("select alias")));
             }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Some(columns))
+            (source, Some(alias))
+        } else {
+            (item, None)
+        };
+        let source_tokens = tokenize(source);
+        if source_tokens.len() != 1 {
+            return Err(RymeError::InvalidArgument(String::from("select projection")));
+        }
+        columns.push(normalize_column_reference(source));
+        aliases.push(alias);
+    }
+    Ok(Some((columns, aliases)))
 }
 
 fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
@@ -6614,6 +6639,7 @@ where
         txn: &mut Transaction,
         table: String,
         columns: Vec<String>,
+        aliases: Vec<Option<String>>,
         limit: usize,
         offset: usize,
         order: Order,
@@ -6649,7 +6675,14 @@ where
             .take(limit)
             .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
             .collect();
-        Ok(QueryResult::Table { columns, rows })
+        let output_columns = columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                aliases.get(index).and_then(|alias| alias.clone()).unwrap_or_else(|| column.clone())
+            })
+            .collect();
+        Ok(QueryResult::Table { columns: output_columns, rows })
     }
 
     fn scan_all_rows(&self, table: &str) -> Result<Vec<Row>> {
@@ -9815,8 +9848,11 @@ where
                 }
             }
             Statement::SelectValues { columns, values } => select_values_result(columns, values),
-            Statement::SelectColumns { table, columns, limit, offset, order, filter } => self
-                .select_columns_in_transaction(txn, table, columns, limit, offset, order, filter),
+            Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter } => {
+                self.select_columns_in_transaction(
+                    txn, table, columns, aliases, limit, offset, order, filter,
+                )
+            }
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
@@ -10535,10 +10571,10 @@ where
                 }
             }
             Statement::SelectValues { columns, values } => select_values_result(columns, values),
-            Statement::SelectColumns { table, columns, limit, offset, order, filter } => {
+            Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter } => {
                 let mut txn = self.begin_with(isolation);
                 self.select_columns_in_transaction(
-                    &mut txn, table, columns, limit, offset, order, filter,
+                    &mut txn, table, columns, aliases, limit, offset, order, filter,
                 )
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
@@ -11351,6 +11387,16 @@ mod tests {
             .unwrap();
         assert!(matches!(result, QueryResult::Table { ref rows, .. }
             if rows == &vec![vec![b"e1".to_vec(), b"hello".to_vec()]]));
+
+        let statement =
+            parse("SELECT payload AS body, count AS total FROM events WHERE id = 'e1'").unwrap();
+        assert!(matches!(statement, Statement::SelectColumns { ref columns, ref aliases, .. }
+            if columns == &[String::from("payload"), String::from("count")]
+                && aliases == &[Some(String::from("body")), Some(String::from("total"))]));
+        let result = executor.execute(statement).await.unwrap();
+        assert!(matches!(result, QueryResult::Table { ref columns, ref rows }
+            if columns == &[String::from("body"), String::from("total")]
+                && rows == &vec![vec![b"hello".to_vec(), b"3".to_vec()]]));
 
         let returned = executor
             .execute(

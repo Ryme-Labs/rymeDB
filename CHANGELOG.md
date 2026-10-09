@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL column projections now preserve explicit `AS` aliases in core
+  results and wire-level row descriptions.
 - Scalar PostgreSQL reads without `FROM` now run through the shared SQL
   executor, including literals, built-in session values, casts, and bound
   placeholders across simple and extended wire requests, with protocol-level

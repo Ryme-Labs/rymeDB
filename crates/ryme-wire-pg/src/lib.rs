@@ -1066,8 +1066,18 @@ fn describe_query(query: &str) -> Vec<u8> {
         if let Statement::Returning { fields, .. } = &statement {
             return returning_description(fields);
         }
-        if let Statement::SelectColumns { columns, .. } = &statement {
-            return multi_row_description(columns);
+        if let Statement::SelectColumns { columns, aliases, .. } = &statement {
+            let names = columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    aliases
+                        .get(index)
+                        .and_then(|alias| alias.clone())
+                        .unwrap_or_else(|| column.clone())
+                })
+                .collect::<Vec<_>>();
+            return multi_row_description(&names);
         }
         if let Statement::SelectValues { columns, .. } = &statement {
             return multi_row_description(columns);
@@ -2823,6 +2833,9 @@ mod tests {
         assert_eq!(describe_query("SELECT 1")[0], b'T');
         assert!(parse("SELECT 1, 2 AS n").is_ok());
         assert_eq!(describe_query("SELECT 1, 2 AS n")[0], b'T');
+        let aliased = describe_query("SELECT payload AS body, count AS total FROM events");
+        assert!(aliased.windows(b"body\0".len()).any(|window| window == b"body\0"));
+        assert!(aliased.windows(b"total\0".len()).any(|window| window == b"total\0"));
         assert_eq!(describe_query("INSERT INTO t KEY '1' VALUE 'v'")[0], b'n');
         assert_eq!(describe_query("SELECT nonsense()")[0], b'n');
     }
