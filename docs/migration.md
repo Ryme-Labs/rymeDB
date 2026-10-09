@@ -48,6 +48,9 @@ HTTP/WebSocket endpoints directly.
 Auth accepts Supabase-style JWT claims (`sub`, `tenant`, `roles`, `exp`)
 where feasible; use separate issuers for app users versus operators.
 
+RLS-filtered scans continue through storage pages before applying user-facing
+limits, so leading rows from other tenants do not starve authorized results.
+
 Dump analysis: `POST /v1/migrate/supabase` with `{dump}` returns tables and
 `CREATE POLICY` entries with detected tenant columns (`auth.uid() = <col>`
 maps to `allow_table` RLS). CLI: `ryme migrate supabase dump.sql`.

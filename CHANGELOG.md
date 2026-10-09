@@ -45,6 +45,9 @@ All notable changes to rymeDB are recorded here. Format follows
   reinitialize their next value from durable rows after executor restart.
 - Runtime latency metrics now expose p99.9 alongside p50/p90/p95/p99 and max
   in JSON and Prometheus formats.
+- RLS-protected scans now paginate through unauthorized rows before applying
+  query limits, so tenants receive the requested visible rows even when other
+  tenants occupy earlier key ranges.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention

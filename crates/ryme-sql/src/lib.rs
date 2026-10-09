@@ -2408,6 +2408,94 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
+        if self.rls_tables.contains_key(table) {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            const PAGE: usize = 1024;
+            if txn.writes().is_empty() {
+                let mut visible = Vec::new();
+                let mut after = None;
+                loop {
+                    let page = match after.as_deref() {
+                        Some(after) => self.manager.scan_after(
+                            txn,
+                            &self.tenant,
+                            &self.database,
+                            table,
+                            after,
+                            PAGE,
+                        )?,
+                        None => {
+                            self.manager.scan(txn, &self.tenant, &self.database, table, PAGE)?
+                        }
+                    };
+                    if page.is_empty() {
+                        break;
+                    }
+                    let page_len = page.len();
+                    let last = page.last().map(|(pk, _)| pk.clone());
+                    visible.extend(page.into_iter().filter(|(pk, value)| {
+                        self.rls_allows(table, value)
+                            && filter.iter().all(|predicate| predicate.matches(pk, value))
+                    }));
+                    if visible.len() >= limit || page_len < PAGE {
+                        break;
+                    }
+                    after = last;
+                }
+                visible.truncate(limit);
+                return Ok(visible);
+            }
+
+            let mut merged = BTreeMap::new();
+            let mut after = None;
+            loop {
+                let page = match after.as_deref() {
+                    Some(after) => self.manager.scan_after(
+                        txn,
+                        &self.tenant,
+                        &self.database,
+                        table,
+                        after,
+                        PAGE,
+                    )?,
+                    None => self.manager.scan(txn, &self.tenant, &self.database, table, PAGE)?,
+                };
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                let last = page.last().map(|(pk, _)| pk.clone());
+                merged.extend(page);
+                if page_len < PAGE {
+                    break;
+                }
+                after = last;
+            }
+            for (key, write) in txn.writes() {
+                if key.tenant != self.tenant || key.database != self.database || key.table != table
+                {
+                    continue;
+                }
+                match write.value.as_ref() {
+                    Some(value) => {
+                        merged.insert(key.pk.clone(), value.clone());
+                    }
+                    None => {
+                        merged.remove(&key.pk);
+                    }
+                }
+            }
+            return Ok(merged
+                .into_iter()
+                .filter(|(pk, value)| {
+                    self.rls_allows(table, value)
+                        && filter.iter().all(|predicate| predicate.matches(pk, value))
+                })
+                .take(limit)
+                .collect());
+        }
         if txn.writes().is_empty() {
             if let Some(candidates) = self.indexed_candidates(table, filter) {
                 let mut rows = Vec::with_capacity(candidates.len());
@@ -3756,6 +3844,18 @@ mod tests {
             RecordKey::new("tenant-a", "d", "messages", b"hidden"),
             br#"{"id":"hidden","tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
         );
+        for index in 0..1023 {
+            manager.put(
+                &mut txn,
+                RecordKey::new(
+                    "tenant-a",
+                    "d",
+                    "messages",
+                    format!("hidden-{index:04}").as_bytes(),
+                ),
+                br#"{"id":"hidden","tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
+            );
+        }
         manager.commit(txn).unwrap();
 
         let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
