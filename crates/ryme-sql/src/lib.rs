@@ -233,6 +233,8 @@ pub enum Cmp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Predicate {
     pub field: Field,
+    #[serde(default)]
+    pub column: Option<String>,
     pub op: Cmp,
     pub operand: Vec<u8>,
 }
@@ -310,9 +312,27 @@ impl Default for Order {
 
 impl Predicate {
     pub fn matches(&self, pk: &[u8], value: &[u8]) -> bool {
-        let target = match self.field {
-            Field::Key => pk,
-            Field::Value => value,
+        let column_value;
+        let target = if let Some(column) = self.column.as_deref() {
+            let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
+                return false;
+            };
+            let selected = if column.contains("->") {
+                json_projection_bytes(column, &object)
+            } else {
+                object
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                    .map(|(_, value)| json_result_bytes(value))
+            };
+            let Some(selected) = selected else { return false };
+            column_value = selected;
+            column_value.as_slice()
+        } else {
+            match self.field {
+                Field::Key => pk,
+                Field::Value => value,
+            }
         };
         match self.op {
             Cmp::Eq => target == self.operand.as_slice(),
@@ -1191,21 +1211,36 @@ fn parse_filter(clause: &[String]) -> Result<Vec<Predicate>> {
     Ok(out)
 }
 
+fn parse_predicate_field(raw: &str) -> (Field, Option<String>) {
+    parse_field(raw)
+        .map(|field| (field, None))
+        .unwrap_or_else(|| (Field::Value, Some(unquote(raw))))
+}
+
 fn parse_predicate(parts: &[String]) -> Result<Predicate> {
     if parts.len() == 2 {
-        let field = parse_field(&parts[0])
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("where field")))?;
-        return Ok(Predicate { field, op: Cmp::Eq, operand: unquote(&parts[1]).into_bytes() });
+        let (field, column) = parse_predicate_field(&parts[0]);
+        return Ok(Predicate {
+            field,
+            column,
+            op: Cmp::Eq,
+            operand: unquote(&parts[1]).into_bytes(),
+        });
     }
     if parts.len() == 3 {
-        let field = parse_field(&parts[0])
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("where field")))?;
+        let (field, column) = parse_predicate_field(&parts[0]);
         if parts[1] == "=" {
-            return Ok(Predicate { field, op: Cmp::Eq, operand: unquote(&parts[2]).into_bytes() });
+            return Ok(Predicate {
+                field,
+                column,
+                op: Cmp::Eq,
+                operand: unquote(&parts[2]).into_bytes(),
+            });
         }
         if parts[1] == "!" || parts[1] == "!=" || parts[1] == "<>" {
             return Ok(Predicate {
                 field,
+                column,
                 op: Cmp::NotEq,
                 operand: unquote(&parts[2]).into_bytes(),
             });
@@ -1218,11 +1253,12 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
             _ => None,
         };
         if let Some(op) = op {
-            return Ok(Predicate { field, op, operand: unquote(&parts[2]).into_bytes() });
+            return Ok(Predicate { field, column, op, operand: unquote(&parts[2]).into_bytes() });
         }
         if parts[1].eq_ignore_ascii_case("CONTAINS") {
             return Ok(Predicate {
                 field,
+                column,
                 op: Cmp::Contains,
                 operand: unquote(&parts[2]).into_bytes(),
             });
@@ -2307,8 +2343,10 @@ where
         order: Order,
         filter: Vec<Predicate>,
     ) -> Result<QueryResult> {
-        let exact_key =
-            filter.len() == 1 && filter[0].field == Field::Key && filter[0].op == Cmp::Eq;
+        let exact_key = filter.len() == 1
+            && filter[0].column.is_none()
+            && filter[0].field == Field::Key
+            && filter[0].op == Cmp::Eq;
         let rows = if exact_key {
             let pk = filter[0].operand.clone();
             self.manager
@@ -2399,9 +2437,9 @@ where
     }
 
     fn indexed_candidates(&self, table: &str, filter: &[Predicate]) -> Option<Vec<Vec<u8>>> {
-        let predicate = filter
-            .iter()
-            .find(|predicate| predicate.field == Field::Value && predicate.op == Cmp::Eq)?;
+        let predicate = filter.iter().find(|predicate| {
+            predicate.column.is_none() && predicate.field == Field::Value && predicate.op == Cmp::Eq
+        })?;
         let indexes = self.indexes.lock().ok()?;
         let state =
             indexes.get(table)?.iter().find(|state| state.definition.field == predicate.field)?;
@@ -4237,6 +4275,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_filters_match_schema_columns_and_json_paths() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE events (id TEXT PRIMARY KEY, count INTEGER, payload JSONB)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO events (id, count, payload) VALUES ('e1', 2, '{\"name\":\"Ada\"}')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO events (id, count, payload) VALUES ('e2', 4, '{\"name\":\"Grace\"}')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(parse("SELECT id FROM events WHERE count >= 3").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"e2".to_vec()]])
+        );
+
+        let result = executor
+            .execute(parse("SELECT id FROM events WHERE payload->>'name' = 'Ada'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"e1".to_vec()]])
+        );
+    }
+
+    #[tokio::test]
     async fn serial_columns_generate_and_recover_next_ids() {
         let manager = TxnManager::new();
         let executor =
@@ -4540,7 +4620,7 @@ mod tests {
             executor.explain("SELECT * FROM docs WHERE value = 'x' ORDER BY value DESC").unwrap();
         assert!(plan.contains("filters 1"));
         assert!(plan.contains("desc"));
-        assert!(parse("SELECT * FROM docs WHERE nonsense 'x'").is_err());
+        assert!(parse("SELECT * FROM docs WHERE key BETWEEN 'a' AND 'b'").is_err());
     }
 
     #[test]
