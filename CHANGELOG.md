@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL wire batching and Supabase dump analysis now preserve
+  dollar-quoted function/procedure bodies, including semicolons inside `$$`
+  blocks and tagged dollar quotes.
 - PostgreSQL `pg_catalog.pg_policies` now exposes persisted policy names,
   commands, roles, and `USING`/`WITH CHECK` expressions for Supabase and ORM
   introspection.

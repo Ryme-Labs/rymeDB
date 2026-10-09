@@ -199,7 +199,7 @@ pub struct SupabaseSchema {
 pub fn parse_supabase_dump(text: &str) -> SupabaseSchema {
     let mut tables: Vec<String> = Vec::new();
     let mut policies: Vec<SupabasePolicy> = Vec::new();
-    for chunk in text.split(';') {
+    for chunk in split_sql_statements(text) {
         let line = chunk.trim().to_string();
         if line.is_empty() {
             continue;
@@ -220,6 +220,97 @@ pub fn parse_supabase_dump(text: &str) -> SupabaseSchema {
         }
     }
     SupabaseSchema { tables, policies }
+}
+
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<u8> = None;
+    let mut dollar_quote: Option<Vec<u8>> = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(tag) = dollar_quote.as_ref() {
+            if bytes[index..].starts_with(tag) {
+                index += tag.len();
+                dollar_quote = None;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(open) = quote {
+            if byte == open {
+                if bytes.get(index + 1) == Some(&open) {
+                    index += 1;
+                } else {
+                    quote = None;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if byte == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            line_comment = true;
+            index += 2;
+            continue;
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            block_comment = true;
+            index += 2;
+            continue;
+        } else if byte == b'$' {
+            if let Some(end) = dollar_quote_end(bytes, index) {
+                dollar_quote = Some(bytes[index..end].to_vec());
+                index = end;
+                continue;
+            }
+        } else if byte == b';' {
+            parts.push(&sql[start..index]);
+            start = index + 1;
+        }
+        index += 1;
+    }
+    parts.push(&sql[start..]);
+    parts
+}
+
+fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut index = start + 1;
+    if bytes.get(index) == Some(&b'$') {
+        return Some(index + 1);
+    }
+    if !bytes.get(index).is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_') {
+        return None;
+    }
+    index += 1;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+        index += 1;
+    }
+    (bytes.get(index) == Some(&b'$')).then_some(index + 1)
 }
 
 fn identifier_after(line: &str, keyword: &str) -> Option<String> {
@@ -515,6 +606,15 @@ mod tests {
         assert_eq!(policy.tenant_column, Some(String::from("user_id")));
         assert_eq!(schema.policies[1].command, "INSERT");
         assert_eq!(schema.policies[1].tenant_column, None);
+    }
+
+    #[test]
+    fn supabase_dump_keeps_dollar_quoted_function_bodies_together() {
+        let dump = "CREATE FUNCTION touch_row() RETURNS trigger AS $$ BEGIN PERFORM 1; RETURN NEW; END; $$ LANGUAGE plpgsql; CREATE TABLE public.messages (id uuid); CREATE POLICY own ON public.messages FOR SELECT USING (auth.uid() = id);";
+        let schema = parse_supabase_dump(dump);
+        assert_eq!(schema.tables, vec![String::from("messages")]);
+        assert_eq!(schema.policies.len(), 1);
+        assert_eq!(schema.policies[0].name, "own");
     }
 
     #[test]

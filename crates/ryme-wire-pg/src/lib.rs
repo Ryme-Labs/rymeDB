@@ -1853,9 +1853,19 @@ fn split_statements(query: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut quote: Option<u8> = None;
+    let mut dollar_quote: Option<Vec<u8>> = None;
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
+        if let Some(tag) = dollar_quote.as_ref() {
+            if bytes[index..].starts_with(tag) {
+                index += tag.len();
+                dollar_quote = None;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
         if let Some(open) = quote {
             if byte == open {
                 if index + 1 < bytes.len() && bytes[index + 1] == open {
@@ -1866,6 +1876,12 @@ fn split_statements(query: &str) -> Vec<&str> {
             }
         } else if byte == b'\'' || byte == b'"' {
             quote = Some(byte);
+        } else if byte == b'$' {
+            if let Some(end) = dollar_quote_end(bytes, index) {
+                dollar_quote = Some(bytes[index..end].to_vec());
+                index = end;
+                continue;
+            }
         } else if byte == b';' {
             parts.push(&query[start..index]);
             start = index + 1;
@@ -1881,6 +1897,24 @@ fn split_statements(query: &str) -> Vec<&str> {
     }
     parts.push(&query[start..]);
     parts
+}
+
+fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut index = start + 1;
+    if bytes.get(index) == Some(&b'$') {
+        return Some(index + 1);
+    }
+    if !bytes.get(index).is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_') {
+        return None;
+    }
+    index += 1;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+        index += 1;
+    }
+    (bytes.get(index) == Some(&b'$')).then_some(index + 1)
 }
 
 fn session_default(name: &str) -> Option<&'static str> {
@@ -2804,6 +2838,14 @@ mod tests {
         assert_eq!(
             split_statements("-- leading\nSELECT 1; -- trailing"),
             vec!["", "\nSELECT 1", " ", ""]
+        );
+        assert_eq!(
+            split_statements("CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN PERFORM 1; RETURN NEW; END; $$ LANGUAGE plpgsql; SELECT 1"),
+            vec!["CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN PERFORM 1; RETURN NEW; END; $$ LANGUAGE plpgsql", " SELECT 1"]
+        );
+        assert_eq!(
+            split_statements("SELECT $tag$inside; body$tag$; SELECT 2"),
+            vec!["SELECT $tag$inside; body$tag$", " SELECT 2"]
         );
     }
 

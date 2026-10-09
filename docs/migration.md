@@ -68,6 +68,8 @@ Dump analysis: `POST /v1/migrate/supabase` with `{dump}` returns tables and
 `CREATE POLICY` entries with detected tenant columns (`auth.uid() = <col>`
 maps to `allow_table` RLS). CLI: `ryme migrate supabase dump.sql`.
 `WITH CHECK`-only policies yield empty expressions and need manual review.
+The PostgreSQL wire gateway and dump analyzer keep semicolons inside
+PostgreSQL dollar-quoted function/procedure bodies within one statement.
 
 ## Neon
 
