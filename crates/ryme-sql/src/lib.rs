@@ -877,7 +877,13 @@ fn prepare_distinct(statement: Statement) -> Statement {
 fn parse_drop(tokens: &[String]) -> Result<Statement> {
     let kind =
         tokens.get(1).ok_or_else(|| RymeError::InvalidArgument(String::from("drop object")))?;
-    let initial_object_pos = 2;
+    let initial_object_pos = if kind.eq_ignore_ascii_case("INDEX")
+        && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("CONCURRENTLY"))
+    {
+        3
+    } else {
+        2
+    };
     let if_exists =
         tokens.get(initial_object_pos).is_some_and(|token| token.eq_ignore_ascii_case("IF"))
             && tokens
@@ -1335,6 +1341,9 @@ fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
         .position(|token| token.eq_ignore_ascii_case("INDEX"))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create index")))?;
     let mut name_pos = index_pos + 1;
+    if tokens.get(name_pos).is_some_and(|token| token.eq_ignore_ascii_case("CONCURRENTLY")) {
+        name_pos += 1;
+    }
     if tokens.get(name_pos).is_some_and(|token| token.eq_ignore_ascii_case("IF")) {
         if !tokens.get(name_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
             || !tokens.get(name_pos + 2).is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
@@ -1347,8 +1356,15 @@ fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
         .get(name_pos)
         .map(|token| unquote(token))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("index name")))?;
-    let if_not_exists =
-        tokens.get(index_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+    let if_not_exists = tokens.get(name_pos.saturating_sub(1)).is_some_and(|token| {
+        token.eq_ignore_ascii_case("EXISTS")
+            && tokens
+                .get(name_pos.saturating_sub(2))
+                .is_some_and(|previous| previous.eq_ignore_ascii_case("NOT"))
+            && tokens
+                .get(name_pos.saturating_sub(3))
+                .is_some_and(|previous| previous.eq_ignore_ascii_case("IF"))
+    });
     let table = table_after(tokens, "ON")?;
     let raw_upper = raw.to_ascii_uppercase();
     let raw_on = raw_upper
@@ -10052,7 +10068,20 @@ mod tests {
             Statement::CreateIndex { name, if_not_exists: true, .. } if name == "messages_value_idx"
         ));
         assert!(matches!(
+            parse("CREATE INDEX CONCURRENTLY messages_value_idx ON messages (value)").unwrap(),
+            Statement::CreateIndex { name, if_not_exists: false, .. } if name == "messages_value_idx"
+        ));
+        assert!(matches!(
+            parse("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS messages_value_unique ON messages (value)").unwrap(),
+            Statement::CreateIndex { name, unique: true, if_not_exists: true, .. }
+                if name == "messages_value_unique"
+        ));
+        assert!(matches!(
             parse("DROP INDEX IF EXISTS messages_value_idx").unwrap(),
+            Statement::DropIndex { name, if_exists: true } if name == "messages_value_idx"
+        ));
+        assert!(matches!(
+            parse("DROP INDEX CONCURRENTLY IF EXISTS messages_value_idx").unwrap(),
             Statement::DropIndex { name, if_exists: true } if name == "messages_value_idx"
         ));
     }
@@ -10240,8 +10269,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(executor.catalog_indexes("messages")[0].field, Field::Value);
+        executor
+            .execute(
+                parse("CREATE INDEX CONCURRENTLY messages_key_idx ON messages (key)").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executor.catalog_indexes("messages").len(), 2);
 
         executor.execute(parse("DROP INDEX messages_value_idx").unwrap()).await.unwrap();
+        executor
+            .execute(parse("DROP INDEX CONCURRENTLY messages_key_idx").unwrap())
+            .await
+            .unwrap();
         assert!(executor.catalog_indexes("messages").is_empty());
         assert!(executor.execute(parse("DROP INDEX messages_value_idx").unwrap()).await.is_err());
         executor.execute(parse("DROP INDEX IF EXISTS messages_value_idx").unwrap()).await.unwrap();

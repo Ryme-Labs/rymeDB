@@ -86,6 +86,8 @@ rows written directly in the branch overlay.
 
 Projections, predicates, ordering, grouping, and RETURNING accept common
 relation-qualified references such as source.id and source.payload.
+CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY are accepted for
+compatibility; index publication remains atomic.
 
 `CREATE TABLE` (including `IF NOT EXISTS`, column types, single-column and composite
 `PRIMARY KEY` constraints, single-column and composite `UNIQUE` constraints,

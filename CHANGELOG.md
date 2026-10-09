@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY syntax is
+  accepted for migration compatibility while using the engine's atomic index
+  builder.
 - SQL projections, predicates, ordering, grouping, and RETURNING now accept
   relation-qualified column references such as source.id.
 - SQL table and secondary-index metadata now persists atomically in
