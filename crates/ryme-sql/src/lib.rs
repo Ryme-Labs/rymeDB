@@ -20,6 +20,8 @@ pub enum Statement {
         #[serde(default)]
         foreign_keys: Vec<ForeignKeyConstraint>,
         #[serde(default)]
+        named_constraints: Vec<TableConstraint>,
+        #[serde(default)]
         if_not_exists: bool,
     },
     DropTable {
@@ -38,6 +40,12 @@ pub enum Statement {
         restart_identity: bool,
         #[serde(default)]
         cascade: bool,
+    },
+    AlterTableDropConstraint {
+        table: String,
+        constraint: String,
+        #[serde(default)]
+        if_exists: bool,
     },
     AlterTableAddColumn {
         table: String,
@@ -306,6 +314,20 @@ pub enum TableConstraint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConstraintKind {
+    PrimaryKey { columns: Vec<String> },
+    Unique { index_name: String },
+    Check { expression: String },
+    ForeignKey { constraint: ForeignKeyConstraint },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstraintMetadata {
+    pub name: String,
+    pub kind: ConstraintKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: String,
@@ -366,6 +388,8 @@ pub struct SchemaSnapshot {
     pub checks: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub foreign_keys: BTreeMap<String, Vec<ForeignKeyConstraint>>,
+    #[serde(default)]
+    pub constraints: BTreeMap<String, Vec<ConstraintMetadata>>,
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -768,6 +792,7 @@ impl Statement {
             Self::CreateTable { table, .. }
             | Self::DropTable { table, .. }
             | Self::TruncateTable { table, .. }
+            | Self::AlterTableDropConstraint { table, .. }
             | Self::AlterTableAddColumn { table, .. }
             | Self::AlterTableAddConstraint { table, .. }
             | Self::AlterTableDropColumn { table, .. }
@@ -993,6 +1018,22 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
             tokens.iter().take(position).skip(3).any(|token| token.eq_ignore_ascii_case("ALTER"));
         (!is_column_alter).then_some(position)
     }) {
+        if tokens.get(drop_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("CONSTRAINT")) {
+            let initial_constraint_pos = drop_pos + 2;
+            let if_exists = tokens
+                .get(initial_constraint_pos)
+                .is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+                && tokens
+                    .get(initial_constraint_pos + 1)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"));
+            let constraint_pos =
+                if if_exists { initial_constraint_pos + 2 } else { initial_constraint_pos };
+            let constraint = tokens
+                .get(constraint_pos)
+                .map(|value| unquote(value))
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("alter constraint")))?;
+            return Ok(Statement::AlterTableDropConstraint { table, constraint, if_exists });
+        }
         let initial_column_pos =
             if tokens.get(drop_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
                 drop_pos + 2
@@ -1388,14 +1429,35 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
     let if_not_exists =
         tokens.get(table_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
     let (columns, unique_constraints, checks, foreign_keys) = parse_table_definition(raw)?;
+    let named_constraints = parse_named_table_constraints(raw)?;
     Ok(Statement::CreateTable {
         table,
         columns,
         unique_constraints,
         checks,
         foreign_keys,
+        named_constraints,
         if_not_exists,
     })
+}
+
+fn parse_named_table_constraints(raw: &str) -> Result<Vec<TableConstraint>> {
+    let Some(open) = raw.find('(') else { return Ok(Vec::new()) };
+    let Some(close) = matching_paren(raw, open) else { return Ok(Vec::new()) };
+    let mut constraints = Vec::new();
+    for item in split_sql_items(&raw[open + 1..close]) {
+        if !item
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("CONSTRAINT"))
+        {
+            continue;
+        }
+        if let Some(constraint) = parse_alter_table_constraint(&item)? {
+            constraints.push(constraint);
+        }
+    }
+    Ok(constraints)
 }
 
 fn parse_create_index(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -3862,6 +3924,9 @@ pub fn describe_plan(statement: &Statement) -> String {
                 if *cascade { "cascade" } else { "restrict" }
             )
         }
+        Statement::AlterTableDropConstraint { table, constraint, .. } => {
+            format!("ddl alter_table({table}) drop_constraint({constraint})")
+        }
         Statement::AlterTableAddColumn { table, column, .. } => {
             format!("ddl alter_table({table}) add_column({})", column.name)
         }
@@ -4248,6 +4313,7 @@ pub struct Executor<B = TxnManager> {
     rls_tables: Arc<HashMap<String, String>>,
     checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
     foreign_keys: Arc<Mutex<HashMap<String, Vec<ForeignKeyConstraint>>>>,
+    constraints: Arc<Mutex<HashMap<String, Vec<ConstraintMetadata>>>>,
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
@@ -4276,6 +4342,7 @@ impl Executor<TxnManager> {
             rls_tables: Arc::new(HashMap::new()),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
+            constraints: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -4298,6 +4365,7 @@ impl Executor<TxnManager> {
             rls_tables: Arc::new(HashMap::new()),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
+            constraints: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -4325,6 +4393,7 @@ where
             rls_tables: Arc::new(HashMap::new()),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
+            constraints: Arc::new(Mutex::new(HashMap::new())),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -4371,6 +4440,7 @@ where
             rls_tables: self.rls_tables,
             checks: self.checks,
             foreign_keys: self.foreign_keys,
+            constraints: self.constraints,
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
@@ -4460,7 +4530,17 @@ where
                     .collect()
             })
             .unwrap_or_default();
-        SchemaSnapshot { tables, indexes, checks, foreign_keys }
+        let constraints = self
+            .constraints
+            .lock()
+            .map(|constraints| {
+                constraints
+                    .iter()
+                    .map(|(table, entries)| (table.clone(), entries.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        SchemaSnapshot { tables, indexes, checks, foreign_keys, constraints }
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
@@ -4480,6 +4560,11 @@ where
             *foreign_keys = snapshot.foreign_keys.into_iter().collect();
         } else {
             return Err(RymeError::Internal(String::from("foreign key lock")));
+        }
+        if let Ok(mut constraints) = self.constraints.lock() {
+            *constraints = snapshot.constraints.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("constraint lock")));
         }
         if let Ok(mut indexes) = self.indexes.lock() {
             indexes.clear();
@@ -4502,6 +4587,8 @@ where
         let checks = self.checks.lock().map(|checks| checks.clone()).unwrap_or_default();
         let foreign_keys =
             self.foreign_keys.lock().map(|foreign_keys| foreign_keys.clone()).unwrap_or_default();
+        let constraints =
+            self.constraints.lock().map(|constraints| constraints.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -4516,6 +4603,7 @@ where
             rls_tables: self.rls_tables,
             checks: Arc::new(Mutex::new(checks)),
             foreign_keys: Arc::new(Mutex::new(foreign_keys)),
+            constraints: Arc::new(Mutex::new(constraints)),
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
@@ -5788,6 +5876,14 @@ where
                 indexes.remove(&table);
             }
         }
+        if let Ok(mut constraints) = self.constraints.lock() {
+            for entries in constraints.values_mut() {
+                entries.retain(|entry| {
+                    !matches!(&entry.kind, ConstraintKind::Unique { index_name } if index_name == &name)
+                });
+            }
+            constraints.retain(|_, entries| !entries.is_empty());
+        }
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -6196,6 +6292,7 @@ where
         unique_constraints: Vec<Vec<String>>,
         checks: Vec<String>,
         foreign_keys: Vec<ForeignKeyConstraint>,
+        named_constraints: Vec<TableConstraint>,
         if_not_exists: bool,
     ) -> Result<()> {
         let exists = self
@@ -6258,6 +6355,63 @@ where
                 },
                 false,
             )?;
+        }
+        for constraint in named_constraints {
+            let (TableConstraint::PrimaryKey { name: Some(name), columns }
+            | TableConstraint::Unique { name: Some(name), columns }) = &constraint
+            else {
+                if let TableConstraint::Check { name: Some(name), expression } = &constraint {
+                    self.remember_constraint(
+                        &table,
+                        ConstraintMetadata {
+                            name: name.clone(),
+                            kind: ConstraintKind::Check { expression: expression.clone() },
+                        },
+                    )?;
+                } else if let TableConstraint::ForeignKey { name: Some(name), constraint } =
+                    &constraint
+                {
+                    let normalized = self.normalize_foreign_key(&table, constraint.clone())?;
+                    self.remember_constraint(
+                        &table,
+                        ConstraintMetadata {
+                            name: name.clone(),
+                            kind: ConstraintKind::ForeignKey { constraint: normalized },
+                        },
+                    )?;
+                }
+                continue;
+            };
+            let kind = match &constraint {
+                TableConstraint::PrimaryKey { .. } => {
+                    ConstraintKind::PrimaryKey { columns: columns.clone() }
+                }
+                TableConstraint::Unique { .. } => {
+                    let index_name = self
+                        .catalog_indexes(&table)
+                        .into_iter()
+                        .find(|index| {
+                            index.unique
+                                && if columns.len() == 1 && index.columns.is_empty() {
+                                    index.column.as_deref().is_some_and(|column| {
+                                        column.eq_ignore_ascii_case(&columns[0])
+                                    })
+                                } else {
+                                    index.columns.len() == columns.len()
+                                        && index
+                                            .columns
+                                            .iter()
+                                            .zip(columns)
+                                            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+                                }
+                        })
+                        .map(|index| index.name)
+                        .ok_or_else(|| RymeError::NotFound(String::from("unique constraint")))?;
+                    ConstraintKind::Unique { index_name }
+                }
+                _ => unreachable!("handled named constraint branch"),
+            };
+            self.remember_constraint(&table, ConstraintMetadata { name: name.clone(), kind })?;
         }
         Ok(())
     }
@@ -6524,19 +6678,194 @@ where
 
     async fn add_table_constraint(&self, table: String, constraint: TableConstraint) -> Result<()> {
         self.reject_if_read_only()?;
+        let table_name = self
+            .canonical_table_name(&table)
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
         match constraint {
-            TableConstraint::PrimaryKey { name: _, columns } => {
-                self.add_primary_key_constraint(table, columns).await
+            TableConstraint::PrimaryKey { name, columns } => {
+                self.add_primary_key_constraint(table, columns.clone()).await?;
+                let name = name.unwrap_or_else(|| format!("{table_name}_pkey"));
+                self.remember_constraint(
+                    &table_name,
+                    ConstraintMetadata { name, kind: ConstraintKind::PrimaryKey { columns } },
+                )
             }
             TableConstraint::Unique { name, columns } => {
-                self.add_unique_constraint(table, name, columns)
+                let index_name = name
+                    .clone()
+                    .unwrap_or_else(|| format!("{table_name}_{}_unique", columns.join("_")));
+                self.add_unique_constraint(table, name, columns.clone())?;
+                self.remember_constraint(
+                    &table_name,
+                    ConstraintMetadata {
+                        name: index_name.clone(),
+                        kind: ConstraintKind::Unique { index_name },
+                    },
+                )
             }
-            TableConstraint::Check { name: _, expression } => {
-                self.add_check_constraint(table, expression)
+            TableConstraint::Check { name, expression } => {
+                self.add_check_constraint(table, expression.clone())?;
+                if let Some(name) = name {
+                    self.remember_constraint(
+                        &table_name,
+                        ConstraintMetadata { name, kind: ConstraintKind::Check { expression } },
+                    )?;
+                }
+                Ok(())
             }
-            TableConstraint::ForeignKey { name: _, constraint } => {
-                self.add_foreign_key_constraint(table, constraint)
+            TableConstraint::ForeignKey { name, constraint } => {
+                self.add_foreign_key_constraint(table, constraint.clone())?;
+                if let Some(name) = name {
+                    self.remember_constraint(
+                        &table_name,
+                        ConstraintMetadata {
+                            name,
+                            kind: ConstraintKind::ForeignKey { constraint },
+                        },
+                    )?;
+                }
+                Ok(())
             }
+        }
+    }
+
+    fn remember_constraint(&self, table: &str, metadata: ConstraintMetadata) -> Result<()> {
+        let mut constraints = self
+            .constraints
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("constraint lock")))?;
+        let entries = constraints.entry(table.to_string()).or_default();
+        if entries.iter().any(|entry| entry.name.eq_ignore_ascii_case(&metadata.name)) {
+            return Err(RymeError::Conflict(String::from("constraint exists")));
+        }
+        entries.push(metadata);
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn find_constraint(&self, table: &str, name: &str) -> Option<ConstraintMetadata> {
+        self.constraints.lock().ok().and_then(|constraints| {
+            constraints.get(table).and_then(|entries| {
+                entries.iter().find(|entry| entry.name.eq_ignore_ascii_case(name)).cloned()
+            })
+        })
+    }
+
+    fn forget_constraint(&self, table: &str, name: &str) {
+        if let Ok(mut constraints) = self.constraints.lock() {
+            if let Some(entries) = constraints.get_mut(table) {
+                entries.retain(|entry| !entry.name.eq_ignore_ascii_case(name));
+                if entries.is_empty() {
+                    constraints.remove(table);
+                }
+            }
+        }
+    }
+
+    fn drop_constraint(&self, table: String, name: String, if_exists: bool) -> Result<()> {
+        self.reject_if_read_only()?;
+        let table = self
+            .canonical_table_name(&table)
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        let metadata = self.find_constraint(&table, &name);
+        if let Some(metadata) = metadata {
+            match &metadata.kind {
+                ConstraintKind::Unique { index_name } => {
+                    self.drop_index(index_name.clone(), if_exists)?;
+                }
+                ConstraintKind::Check { expression } => {
+                    let mut checks = self
+                        .checks
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("check constraint lock")))?;
+                    let Some(expressions) = checks.get_mut(&table) else {
+                        if if_exists {
+                            return Ok(());
+                        }
+                        return Err(RymeError::NotFound(String::from("constraint")));
+                    };
+                    let Some(position) =
+                        expressions.iter().position(|candidate| candidate == expression)
+                    else {
+                        if if_exists {
+                            return Ok(());
+                        }
+                        return Err(RymeError::NotFound(String::from("constraint")));
+                    };
+                    expressions.remove(position);
+                    if expressions.is_empty() {
+                        checks.remove(&table);
+                    }
+                    self.schema_dirty.store(true, Ordering::SeqCst);
+                }
+                ConstraintKind::ForeignKey { constraint } => {
+                    let mut foreign_keys = self
+                        .foreign_keys
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?;
+                    let Some(entries) = foreign_keys.get_mut(&table) else {
+                        if if_exists {
+                            return Ok(());
+                        }
+                        return Err(RymeError::NotFound(String::from("constraint")));
+                    };
+                    let Some(position) =
+                        entries.iter().position(|candidate| candidate == constraint)
+                    else {
+                        if if_exists {
+                            return Ok(());
+                        }
+                        return Err(RymeError::NotFound(String::from("constraint")));
+                    };
+                    entries.remove(position);
+                    if entries.is_empty() {
+                        foreign_keys.remove(&table);
+                    }
+                    self.schema_dirty.store(true, Ordering::SeqCst);
+                }
+                ConstraintKind::PrimaryKey { columns } => {
+                    if columns.len() != 1 {
+                        return Err(RymeError::InvalidArgument(String::from(
+                            "dropping a composite primary key is not supported",
+                        )));
+                    }
+                    let mut catalog = self
+                        .catalog
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
+                    let definitions = catalog
+                        .get_mut(&table)
+                        .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+                    let Some(definition) = definitions
+                        .iter_mut()
+                        .find(|definition| definition.name.eq_ignore_ascii_case(&columns[0]))
+                    else {
+                        if if_exists {
+                            return Ok(());
+                        }
+                        return Err(RymeError::NotFound(String::from("constraint")));
+                    };
+                    definition.primary_key = false;
+                    self.schema_dirty.store(true, Ordering::SeqCst);
+                }
+            }
+            self.forget_constraint(&table, &metadata.name);
+            return Ok(());
+        }
+
+        let index_name = self
+            .catalog_indexes(&table)
+            .into_iter()
+            .find(|index| index.name.eq_ignore_ascii_case(&name))
+            .map(|index| index.name);
+        if let Some(index_name) = index_name {
+            self.drop_index(index_name, false)?;
+            return Ok(());
+        }
+        if if_exists {
+            Ok(())
+        } else {
+            Err(RymeError::NotFound(String::from("constraint")))
         }
     }
 
@@ -6594,6 +6923,9 @@ where
         }
         if let Ok(mut foreign_keys) = self.foreign_keys.lock() {
             foreign_keys.remove(&table);
+        }
+        if let Ok(mut constraints) = self.constraints.lock() {
+            constraints.remove(&table);
         }
         let prefix = format!("{}\0{}\0{}\0", self.tenant, self.database, table);
         if let Ok(mut sequences) = self.sequence_next.lock() {
@@ -7316,6 +7648,7 @@ where
                 unique_constraints,
                 checks,
                 foreign_keys,
+                named_constraints,
                 if_not_exists,
             } => {
                 self.create_table(
@@ -7324,12 +7657,14 @@ where
                     unique_constraints.clone(),
                     checks.clone(),
                     foreign_keys.clone(),
+                    named_constraints.clone(),
                     *if_not_exists,
                 )?;
             }
             Statement::DropTable { .. } => {}
             Statement::DropIndex { .. } => {}
             Statement::TruncateTable { .. } => {}
+            Statement::AlterTableDropConstraint { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableAddConstraint { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
@@ -7365,6 +7700,10 @@ where
             }
             Statement::TruncateTable { table, restart_identity, cascade } => {
                 self.truncate_table(table, restart_identity, cascade).await?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterTableDropConstraint { table, constraint, if_exists } => {
+                self.drop_constraint(table, constraint, if_exists)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
@@ -8760,6 +9099,7 @@ where
                 unique_constraints,
                 checks,
                 foreign_keys,
+                named_constraints,
                 if_not_exists,
             } => {
                 self.create_table(
@@ -8768,12 +9108,14 @@ where
                     unique_constraints.clone(),
                     checks.clone(),
                     foreign_keys.clone(),
+                    named_constraints.clone(),
                     *if_not_exists,
                 )?;
             }
             Statement::DropTable { .. } => {}
             Statement::DropIndex { .. } => {}
             Statement::TruncateTable { .. } => {}
+            Statement::AlterTableDropConstraint { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableAddConstraint { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
@@ -8788,6 +9130,7 @@ where
             Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
                 | Statement::DropIndex { .. }
+                | Statement::AlterTableDropConstraint { .. }
                 | Statement::AlterTableAddColumn { .. }
                 | Statement::AlterTableAddConstraint { .. }
                 | Statement::AlterTableDropColumn { .. }
@@ -9106,6 +9449,10 @@ where
             }
             Statement::TruncateTable { table, restart_identity, cascade } => {
                 self.truncate_table(table, restart_identity, cascade).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterTableDropConstraint { table, constraint, if_exists } => {
+                self.drop_constraint(table, constraint, if_exists)?;
                 Ok(QueryResult::Ok)
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
@@ -12181,6 +12528,92 @@ mod tests {
             executor.execute(parse("SELECT id FROM users").unwrap()).await.unwrap(),
             QueryResult::Table { rows, .. } if rows == vec![vec![b"1".to_vec()]]
         ));
+    }
+
+    #[tokio::test]
+    async fn drop_named_constraints_removes_enforcement_and_survives_schema_restore() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let accounts_statement = parse("CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT, age INTEGER, CONSTRAINT accounts_email_key UNIQUE (email), CONSTRAINT accounts_age_check CHECK (age > 0))").unwrap();
+        assert!(matches!(
+            &accounts_statement,
+            Statement::CreateTable { named_constraints, .. } if named_constraints.len() == 2
+        ));
+        executor.execute(accounts_statement).await.unwrap();
+        executor.execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT, CONSTRAINT messages_user_fk FOREIGN KEY (user_id) REFERENCES users (id))").unwrap())
+            .await
+            .unwrap();
+        let snapshot = executor.schema_snapshot();
+        assert_eq!(snapshot.constraints["accounts"].len(), 2);
+        assert_eq!(snapshot.constraints["messages"].len(), 1);
+
+        executor
+            .execute(
+                parse("INSERT INTO accounts (id, email, age) VALUES ('1', 'a@example.com', 1)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(executor
+            .execute(
+                parse("INSERT INTO accounts (id, email, age) VALUES ('2', 'a@example.com', 2)")
+                    .unwrap()
+            )
+            .await
+            .is_err());
+        assert!(executor
+            .execute(
+                parse("INSERT INTO accounts (id, email, age) VALUES ('3', 'b@example.com', 0)")
+                    .unwrap()
+            )
+            .await
+            .is_err());
+        assert!(executor
+            .execute(parse("INSERT INTO messages (id, user_id) VALUES ('m1', 'missing')").unwrap())
+            .await
+            .is_err());
+
+        executor
+            .execute(parse("ALTER TABLE accounts DROP CONSTRAINT accounts_email_key").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_age_check").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE messages DROP CONSTRAINT messages_user_fk").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO accounts (id, email, age) VALUES ('2', 'a@example.com', 0)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (id, user_id) VALUES ('m1', 'missing')").unwrap())
+            .await
+            .unwrap();
+
+        let restored = Executor::new(String::from("t"), String::from("d"));
+        restored.restore_schema_snapshot(snapshot).unwrap();
+        assert_eq!(restored.schema_snapshot().constraints["accounts"].len(), 2);
+        restored
+            .execute(parse("ALTER TABLE accounts DROP CONSTRAINT accounts_email_key").unwrap())
+            .await
+            .unwrap();
+        assert!(restored
+            .execute(
+                parse("INSERT INTO accounts (id, email, age) VALUES ('4', 'a@example.com', 3)")
+                    .unwrap()
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

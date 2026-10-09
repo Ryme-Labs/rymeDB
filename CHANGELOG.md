@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL `ALTER TABLE ... DROP CONSTRAINT [IF EXISTS]` now removes named
+  unique, check, foreign-key, and single-column primary-key constraints and
+  persists their metadata across schema snapshots.
 - PostgreSQL TRUNCATE options now support `RESTART IDENTITY`,
   `CONTINUE IDENTITY`, and foreign-key `CASCADE`/`RESTRICT` behavior.
 - PostgreSQL DELETE ... USING now joins target and source rows by qualified

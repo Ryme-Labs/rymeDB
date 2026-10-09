@@ -98,6 +98,7 @@ join columns, source predicates, and RETURNING.
 `PRIMARY KEY` constraints, single-column and composite `UNIQUE` constraints,
 `CHECK`, `FOREIGN KEY ... REFERENCES`, `NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
 `ALTER TABLE ... ADD PRIMARY KEY` and `ADD CONSTRAINT` for `UNIQUE`, `CHECK`, and `FOREIGN KEY ... REFERENCES`,
+plus `ALTER TABLE ... DROP CONSTRAINT [IF EXISTS]` for named constraints,
 `DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability/type changes
 (including `ALTER COLUMN ... TYPE` for supported scalar, boolean, array, and JSON values)
 (including `IF [NOT] EXISTS` where supported), plus
