@@ -66,6 +66,11 @@ under the branch namespace, and branch deletes mask (but do not remove) parent
 rows. `main` keeps the live view.
 Resetting a branch advances its storage epoch, so prior branch-local writes are
 discarded from the new view; deleting a branch removes its selectable metadata.
+`GET /v1/branches/<id>/diff?against=<branch>` keeps the manifest comparison
+fields and adds `changes`: effective row differences with the table name,
+base64url primary key, and base64url values on each side (`null` means the row
+is absent). This includes changes inherited from the branch snapshot, not only
+rows written directly in the branch overlay.
 
 ## SQL dialect
 

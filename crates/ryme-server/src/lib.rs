@@ -25,7 +25,7 @@ use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
 use ryme_sql::{bind, parse, Executor, QueryResult};
 use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -4721,6 +4721,108 @@ pub struct BranchDiffQuery {
     pub against: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct BranchRowDiff {
+    table: String,
+    pk: String,
+    left: Option<String>,
+    right: Option<String>,
+}
+
+fn scan_branch_diff_rows<B: TxnBackend>(
+    backend: &B,
+    tenant: &str,
+    database: &str,
+    table: &str,
+) -> ryme_error::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    const PAGE: usize = 1024;
+    let mut rows = BTreeMap::new();
+    let mut txn = backend.begin();
+    let mut start_after = None;
+    loop {
+        let page = match start_after.as_deref() {
+            Some(start_after) => {
+                backend.scan_after(&mut txn, tenant, database, table, start_after, PAGE)?
+            }
+            None => backend.scan(&mut txn, tenant, database, table, PAGE)?,
+        };
+        let count = page.len();
+        if let Some((last, _)) = page.last() {
+            start_after = Some(last.clone());
+        }
+        rows.extend(page);
+        if count < PAGE {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+fn branch_diff_data(
+    state: &SharedState,
+    tenant: &str,
+    left: &ryme_branch::Branch,
+    right: &ryme_branch::Branch,
+) -> ryme_error::Result<Vec<BranchRowDiff>> {
+    let left_backend = if left.id == "main" {
+        BranchStorage::passthrough(state.backend.clone(), state.database.clone())
+    } else {
+        BranchStorage::new(
+            state.backend.clone(),
+            state.database.clone(),
+            left.id.clone(),
+            left.base_commit_ts,
+            left.storage_epoch,
+        )
+    };
+    let right_backend = if right.id == "main" {
+        BranchStorage::passthrough(state.backend.clone(), state.database.clone())
+    } else {
+        BranchStorage::new(
+            state.backend.clone(),
+            state.database.clone(),
+            right.id.clone(),
+            right.base_commit_ts,
+            right.storage_epoch,
+        )
+    };
+    let local_left = left_backend.local_database();
+    let local_right = right_backend.local_database();
+    let mut tables = BTreeSet::new();
+    for (row_tenant, database, table) in state.backend.spaces()? {
+        if row_tenant != tenant {
+            continue;
+        }
+        if database == state.database
+            || local_left.is_some_and(|local| database == local)
+            || local_right.is_some_and(|local| database == local)
+        {
+            tables.insert(table);
+        }
+    }
+
+    let mut changes = Vec::new();
+    for table in tables {
+        let left_rows = scan_branch_diff_rows(&left_backend, tenant, &state.database, &table)?;
+        let right_rows = scan_branch_diff_rows(&right_backend, tenant, &state.database, &table)?;
+        let keys: BTreeSet<Vec<u8>> = left_rows.keys().chain(right_rows.keys()).cloned().collect();
+        for pk in keys {
+            let left_value = left_rows.get(&pk);
+            let right_value = right_rows.get(&pk);
+            if left_value == right_value {
+                continue;
+            }
+            changes.push(BranchRowDiff {
+                table: table.clone(),
+                pk: ryme_auth::base64_url_encode(&pk),
+                left: left_value.map(|value| ryme_auth::base64_url_encode(value)),
+                right: right_value.map(|value| ryme_auth::base64_url_encode(value)),
+            });
+        }
+    }
+    Ok(changes)
+}
+
 async fn branch_diff(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -4731,16 +4833,37 @@ async fn branch_diff(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let control = match state.control.lock() {
-        Ok(guard) => guard,
+    let branches = match state.control.lock() {
+        Ok(guard) => guard.branches.clone(),
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.branches.diff_for(&principal.tenant, &id, &query.against) {
-        Ok((only_left, only_right)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "only_left": only_left, "only_right": only_right })),
-        )
-            .into_response(),
+    let diff = branches
+        .get_for(&principal.tenant, &id)
+        .and_then(|left| {
+            branches.get_for(&principal.tenant, &query.against).map(|right| (left, right))
+        })
+        .and_then(|(left, right)| {
+            branches
+                .diff_for(&principal.tenant, &id, &query.against)
+                .map(|manifest_diff| (left, right, manifest_diff))
+        });
+    match diff {
+        Ok((left_branch, right_branch, (only_left, only_right))) => {
+            let changes =
+                match branch_diff_data(&state, &principal.tenant, &left_branch, &right_branch) {
+                    Ok(changes) => changes,
+                    Err(e) => return error_response(e),
+                };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "only_left": only_left,
+                    "only_right": only_right,
+                    "changes": changes,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => error_response(e),
     }
 }

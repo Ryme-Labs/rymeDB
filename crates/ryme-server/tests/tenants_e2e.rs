@@ -246,6 +246,16 @@ async fn tenants_share_no_presence_or_partitions() {
     assert_eq!(body, serde_json::Value::String(String::from("branch-write")));
     let (status, _) = bearer_request(http, &alpha, "GET /v1/kv/docs/branch-write", b"").await;
     assert_eq!(status, 404);
+    let (status, body) =
+        bearer_request(http, &alpha, "GET /v1/branches/preview/diff?against=main", b"").await;
+    assert_eq!(status, 200);
+    let changes = body.get("changes").and_then(|value| value.as_array()).unwrap();
+    assert!(changes.iter().any(|change| {
+        change.get("table").and_then(|value| value.as_str()) == Some("docs")
+            && change.get("pk").and_then(|value| value.as_str()) == Some("YnJhbmNoLXdyaXRl")
+            && change.get("left").and_then(|value| value.as_str()).is_some()
+            && change.get("right").is_some_and(serde_json::Value::is_null)
+    }));
     let (status, _) = bearer_request(http, &alpha, "POST /v1/branches/preview/promote", b"").await;
     assert_eq!(status, 200);
     let (status, body) = bearer_request(http, &alpha, "GET /v1/kv/docs/branch-write", b"").await;
