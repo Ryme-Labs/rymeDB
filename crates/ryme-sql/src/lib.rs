@@ -229,6 +229,7 @@ pub enum InsertValue {
     Default,
     Null,
     Excluded(String),
+    Expression(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1835,7 +1836,7 @@ fn parse_conflict_clause(
                 .filter(|(prefix, _)| prefix.trim().eq_ignore_ascii_case("EXCLUDED"))
                 .map(|(_, column)| InsertValue::Excluded(unquote(column.trim())))
                 .map(Ok)
-                .unwrap_or_else(|| parse_insert_value(raw_value))?;
+                .unwrap_or_else(|| parse_assignment_value(raw_value))?;
             Ok((unquote(column.trim()), value))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1949,6 +1950,60 @@ fn parse_insert_value(raw: &str) -> Result<InsertValue> {
     Ok(InsertValue::Value(eval_operand(raw)?.into_bytes()))
 }
 
+fn parse_assignment_value(raw: &str) -> Result<InsertValue> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("DEFAULT") {
+        return Ok(InsertValue::Default);
+    }
+    if trimmed.eq_ignore_ascii_case("NULL") {
+        return Ok(InsertValue::Null);
+    }
+    if let Some((prefix, column)) = trimmed.split_once('.') {
+        if prefix.trim().eq_ignore_ascii_case("EXCLUDED") {
+            return Ok(InsertValue::Excluded(unquote(column.trim())));
+        }
+    }
+    if assignment_contains_expression(trimmed) {
+        return Ok(InsertValue::Expression(trimmed.to_string()));
+    }
+    parse_insert_value(trimmed)
+}
+
+fn assignment_contains_expression(raw: &str) -> bool {
+    if raw.len() >= 2 && raw.starts_with('-') && raw[1..].trim().parse::<f64>().is_ok() {
+        return false;
+    }
+    if raw.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("COALESCE("))
+        || raw.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("GREATEST("))
+        || raw.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("LEAST("))
+    {
+        return true;
+    }
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (position, ch) in raw.char_indices() {
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '+' | '*' | '/' if depth == 0 => return true,
+            '-' if depth == 0 && !raw[..position].trim().is_empty() => return true,
+            '|' if depth == 0 && raw[..position].ends_with('|') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn parse_upsert(tokens: &[String]) -> Result<Statement> {
     let table = if let Ok(table) = table_after(tokens, "INTO") {
         table
@@ -1989,7 +2044,7 @@ fn parse_update(tokens: &[String], raw: &str) -> Result<Statement> {
         for assignment in split_sql_items(assignment_text) {
             let (column, value) = split_assignment(&assignment)
                 .ok_or_else(|| RymeError::InvalidArgument(String::from("update assignment")))?;
-            assignments.push((unquote(column.trim()), parse_insert_value(value.trim())?));
+            assignments.push((unquote(column.trim()), parse_assignment_value(value.trim())?));
         }
         if assignments.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("update assignments")));
@@ -2835,6 +2890,174 @@ fn json_update_value(
         _ => "text",
     };
     json_insert_value(value, data_type)
+}
+
+fn expression_value(
+    expression: &str,
+    current: &serde_json::Map<String, serde_json::Value>,
+    incoming: Option<&[u8]>,
+) -> Result<serde_json::Value> {
+    let expression = expression.trim();
+    if expression.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("empty update expression")));
+    }
+    if expression.starts_with('(')
+        && matching_paren(expression, 0) == Some(expression.len().saturating_sub(1))
+    {
+        return expression_value(&expression[1..expression.len() - 1], current, incoming);
+    }
+    for operators in [&["||"][..], &["+", "-"][..], &["*", "/"][..]] {
+        if let Some((position, operator)) = find_expression_operator(expression, operators) {
+            let left = expression_value(&expression[..position], current, incoming)?;
+            let right =
+                expression_value(&expression[position + operator.len()..], current, incoming)?;
+            return apply_expression_operator(&left, &right, operator);
+        }
+    }
+    if let Some(open) = expression.find('(') {
+        if expression.ends_with(')') {
+            let function = expression[..open].trim();
+            let close = matching_paren(expression, open);
+            if close == Some(expression.len() - 1) {
+                let args = split_sql_items(&expression[open + 1..expression.len() - 1])
+                    .into_iter()
+                    .map(|argument| expression_value(&argument, current, incoming))
+                    .collect::<Result<Vec<_>>>()?;
+                if function.eq_ignore_ascii_case("COALESCE") {
+                    return args.into_iter().find(|value| !value.is_null()).ok_or_else(|| {
+                        RymeError::InvalidArgument(String::from("COALESCE needs an argument"))
+                    });
+                }
+                if function.eq_ignore_ascii_case("GREATEST")
+                    || function.eq_ignore_ascii_case("LEAST")
+                {
+                    let mut numbers =
+                        args.iter().filter_map(serde_json::Value::as_f64).collect::<Vec<_>>();
+                    if numbers.is_empty() {
+                        return Ok(serde_json::Value::Null);
+                    }
+                    if function.eq_ignore_ascii_case("GREATEST") {
+                        let value = numbers.drain(..).reduce(f64::max).unwrap_or(f64::NAN);
+                        return number_json_value(value);
+                    }
+                    let value = numbers.drain(..).reduce(f64::min).unwrap_or(f64::NAN);
+                    return number_json_value(value);
+                }
+            }
+        }
+    }
+    let unquoted = unquote(expression);
+    if unquoted.eq_ignore_ascii_case("NULL") {
+        return Ok(serde_json::Value::Null);
+    }
+    if unquoted.eq_ignore_ascii_case("TRUE") || unquoted.eq_ignore_ascii_case("FALSE") {
+        return Ok(serde_json::Value::Bool(unquoted.eq_ignore_ascii_case("TRUE")));
+    }
+    if let Ok(value) = unquoted.parse::<i64>() {
+        return Ok(serde_json::Value::Number(value.into()));
+    }
+    if let Ok(value) = unquoted.parse::<f64>() {
+        return number_json_value(value);
+    }
+    if let Some((prefix, column)) = unquoted.split_once('.') {
+        if prefix.eq_ignore_ascii_case("EXCLUDED") {
+            let incoming = incoming.ok_or_else(|| {
+                RymeError::InvalidArgument(String::from("EXCLUDED outside conflict update"))
+            })?;
+            if let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(incoming) {
+                return Ok(object
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(column.trim()))
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(serde_json::Value::Null));
+            }
+            return Ok(serde_json::Value::String(String::from_utf8_lossy(incoming).to_string()));
+        }
+    }
+    if let Some(value) = json_column_value(&unquoted, current) {
+        return Ok(value.clone());
+    }
+    Err(RymeError::InvalidArgument(format!("unknown update expression {expression}")))
+}
+
+fn find_expression_operator<'a>(
+    expression: &str,
+    operators: &[&'a str],
+) -> Option<(usize, &'a str)> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    let bytes = expression.as_bytes();
+    for (position, ch) in expression.char_indices() {
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                for operator in operators {
+                    if expression[position..].starts_with(*operator)
+                        && !(*operator == "-"
+                            && bytes[..position].iter().all(u8::is_ascii_whitespace))
+                    {
+                        return Some((position, *operator));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn apply_expression_operator(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    operator: &str,
+) -> Result<serde_json::Value> {
+    if left.is_null() || right.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    if operator == "||" {
+        let mut result = String::from_utf8_lossy(&json_result_bytes(left)).to_string();
+        result.push_str(&String::from_utf8_lossy(&json_result_bytes(right)));
+        return Ok(serde_json::Value::String(result));
+    }
+    let left = left
+        .as_f64()
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("numeric update expression")))?;
+    let right = right
+        .as_f64()
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("numeric update expression")))?;
+    let result = match operator {
+        "+" => left + right,
+        "-" => left - right,
+        "*" => left * right,
+        "/" if right != 0.0 => left / right,
+        "/" => return Err(RymeError::InvalidArgument(String::from("division by zero"))),
+        _ => return Err(RymeError::InvalidArgument(String::from("update expression operator"))),
+    };
+    number_json_value(result)
+}
+
+fn number_json_value(value: f64) -> Result<serde_json::Value> {
+    if !value.is_finite() {
+        return Err(RymeError::InvalidArgument(String::from("non-finite update expression")));
+    }
+    if value.fract() == 0.0 && value.abs() < i64::MAX as f64 {
+        Ok(serde_json::Value::Number((value as i64).into()))
+    } else {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("numeric update expression")))
+    }
 }
 
 fn parse_array_literal(raw: &str) -> Option<serde_json::Value> {
@@ -4458,6 +4681,11 @@ where
                         "EXCLUDED is only valid in conflict updates",
                     )));
                 }
+                InsertValue::Expression(_) => {
+                    return Err(RymeError::InvalidArgument(String::from(
+                        "expressions are only valid in updates",
+                    )));
+                }
             };
             supplied.insert(name, resolved);
         }
@@ -4549,6 +4777,17 @@ where
         assignments: Vec<(String, InsertValue)>,
         current: &[u8],
     ) -> Result<Vec<u8>> {
+        self.materialize_update_row_with_incoming(table, pk, assignments, current, None)
+    }
+
+    fn materialize_update_row_with_incoming(
+        &self,
+        table: &str,
+        pk: &[u8],
+        assignments: Vec<(String, InsertValue)>,
+        current: &[u8],
+        incoming: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
         let definitions = self.catalog_columns(table);
         if definitions.is_empty() {
             if let Ok(serde_json::Value::Object(mut object)) =
@@ -4569,6 +4808,9 @@ where
                                 "EXCLUDED is only valid in conflict updates",
                             )));
                         }
+                        InsertValue::Expression(expression) => {
+                            expression_value(&expression, &object, incoming)?
+                        }
                     };
                     object.insert(column, resolved);
                 }
@@ -4587,6 +4829,9 @@ where
                     }
                     InsertValue::Excluded(_) => Err(RymeError::InvalidArgument(String::from(
                         "EXCLUDED is only valid in conflict updates",
+                    ))),
+                    InsertValue::Expression(_) => Err(RymeError::InvalidArgument(String::from(
+                        "structured row required for update expression",
                     ))),
                 };
             }
@@ -4621,6 +4866,10 @@ where
                     return Err(RymeError::InvalidArgument(String::from(
                         "EXCLUDED is only valid in conflict updates",
                     )));
+                }
+                InsertValue::Expression(expression) => {
+                    let value = expression_value(&expression, &object, incoming)?;
+                    (!value.is_null()).then(|| json_result_bytes(&value))
                 }
             };
             if resolved.is_none() && !definition.nullable {
@@ -7036,8 +7285,13 @@ where
             return Err(RymeError::InvalidArgument(String::from("conflict update")));
         }
         let assignments = self.resolve_conflict_assignments(&table, assignments, &value)?;
-        let after =
-            self.materialize_update_row(&table, &existing_pk, assignments, &existing_value)?;
+        let after = self.materialize_update_row_with_incoming(
+            &table,
+            &existing_pk,
+            assignments,
+            &existing_value,
+            Some(&value),
+        )?;
         let statement = Statement::Update { table, pk: existing_pk, value: after };
         Box::pin(self.execute_in_transaction_base(txn, statement)).await
     }
@@ -8466,6 +8720,53 @@ mod tests {
             QueryResult::Returning { ref rows, .. }
                 if rows == &vec![vec![b"1".to_vec(), b"2".to_vec(), b"Grace".to_vec()]]
         ));
+    }
+
+    #[tokio::test]
+    async fn update_and_conflict_assignments_support_atomic_expressions() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE counters (id TEXT PRIMARY KEY, name TEXT UNIQUE, count INTEGER)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO counters (id, name, count) VALUES ('1', 'hits', 1)").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let updated = executor
+            .execute(
+                parse("UPDATE counters SET count = count + 1 WHERE id = '1' RETURNING count")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            updated,
+            QueryResult::Returning { ref rows, .. } if rows == &vec![vec![b"2".to_vec()]]
+        ));
+
+        executor
+            .execute(
+                parse("INSERT INTO counters (id, name, count) VALUES ('2', 'hits', 3) ON CONFLICT (name) DO UPDATE SET count = count + EXCLUDED.count")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match executor.execute(parse("SELECT * FROM counters KEY '1'").unwrap()).await.unwrap() {
+            QueryResult::Row { value, .. } => {
+                let row: serde_json::Value = serde_json::from_slice(&value).unwrap();
+                assert_eq!(row.get("count"), Some(&serde_json::Value::Number(5.into())));
+            }
+            _ => panic!("expected counter row"),
+        }
     }
 
     #[tokio::test]

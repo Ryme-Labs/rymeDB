@@ -119,6 +119,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Conflict-target updates now support a `WHERE` predicate, including the
   common optimistic-version form that compares an existing column with an
   `EXCLUDED` value.
+- SQL `UPDATE` and conflict-target assignments now support atomic numeric and
+  text expressions, including `count = count + 1`, `count + EXCLUDED.count`,
+  concatenation, `COALESCE`, `GREATEST`, and `LEAST`.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.

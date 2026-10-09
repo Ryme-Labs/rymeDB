@@ -100,6 +100,9 @@ with PostgreSQL `information_schema.tables` and
 the matching primary or unique constraint and supports `EXCLUDED.column`
 assignments and a conditional `WHERE` predicate, while targeted or untargeted
 `ON CONFLICT DO NOTHING` skips conflicting rows,
+and `UPDATE`/conflict assignments support atomic numeric and text expressions
+such as `count = count + 1`, `count + EXCLUDED.count`, concatenation,
+`COALESCE`, `GREATEST`, and `LEAST`,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
 `ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
 JSONB projections support PostgreSQL `->` and `->>` operators, including
