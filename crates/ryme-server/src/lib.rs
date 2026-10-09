@@ -23,7 +23,7 @@ use ryme_raft::net::{ClusterBackend, Node};
 use ryme_realtime::Realtime;
 use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
-use ryme_sql::{bind, parse, Executor, QueryResult};
+use ryme_sql::{bind, parse, Executor, QueryResult, Statement};
 use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -2588,6 +2588,21 @@ fn range_routing_key(table: &str, key: &[u8]) -> Vec<u8> {
     routing
 }
 
+fn sql_range_keys(statement: &Statement) -> Option<Vec<Vec<u8>>> {
+    match statement {
+        Statement::Insert { pk, .. }
+        | Statement::Upsert { pk, .. }
+        | Statement::InsertIgnore { pk, .. }
+        | Statement::InsertConflict { pk, .. }
+        | Statement::Update { pk, .. }
+        | Statement::UpdateRow { pk, .. }
+        | Statement::Delete { pk, .. } => Some(vec![pk.clone()]),
+        Statement::CopyFrom { rows, .. } => Some(rows.iter().map(|(pk, _)| pk.clone()).collect()),
+        Statement::Returning { statement, .. } => sql_range_keys(statement),
+        _ => None,
+    }
+}
+
 fn note_range_write(state: &SharedState, routing_key: &[u8], count: u64) {
     if state.autosplit_writes == 0 {
         return;
@@ -2778,6 +2793,7 @@ async fn rest_insert(
         match gateway.put(&principal, &table, key.clone(), value.clone()).await {
             Ok(commit) => {
                 record_meter(&state, Metric::WriteUnit, 1);
+                note_range_write(&state, &range_routing_key(&table, &key), 1);
                 inserted.push(rest_row_to_json(&key, &value));
                 let _ = commit;
             }
@@ -2834,9 +2850,11 @@ async fn rest_delete(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    match gateway.delete(&principal, &table, key.into_bytes()).await {
+    let key = key.into_bytes();
+    match gateway.delete(&principal, &table, key.clone()).await {
         Ok(commit) => {
             record_meter(&state, Metric::WriteUnit, 1);
+            note_range_write(&state, &range_routing_key(&table, &key), 1);
             (StatusCode::OK, Json(serde_json::json!({ "commit": commit }))).into_response()
         }
         Err(e) => error_response(e),
@@ -3006,7 +3024,9 @@ async fn sql_copy(
     match executor.bulk_upsert(request.table.clone(), rows.clone()).await {
         Ok(count) => {
             record_meter(&state, Metric::WriteUnit, count as u64);
-            note_range_write(&state, request.table.as_bytes(), count as u64);
+            for (key, _) in rows.iter().take(count) {
+                note_range_write(&state, &range_routing_key(&request.table, key), 1);
+            }
             let micros = elapsed_micros(start);
             state.latency.observe_micros(micros);
             state.histogram.record(micros);
@@ -4749,6 +4769,7 @@ async fn sql_exec(
     }
     let table_name = statement.table().to_string();
     let write_statement = statement.is_write();
+    let range_keys = if write_statement { sql_range_keys(&statement) } else { None };
     let executor = match branch_executor(&state, &headers, &principal.tenant) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
@@ -4848,7 +4869,13 @@ async fn sql_exec(
         Err(e) => error_response(e),
     };
     if write_statement && result.status() == StatusCode::OK {
-        note_range_write(&state, table_name.as_bytes(), 1);
+        if let Some(keys) = range_keys.as_deref() {
+            for key in keys {
+                note_range_write(&state, &range_routing_key(&table_name, key), 1);
+            }
+        } else {
+            note_range_write(&state, table_name.as_bytes(), 1);
+        }
     }
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);

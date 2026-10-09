@@ -190,15 +190,36 @@ where
         self
     }
 
-    fn note_table_key(&self, table: &str, pk: &str, count: u64) {
+    fn note_routing_key(&self, table: &str, pk: &[u8], count: u64) {
         if !self.range_hook.is_armed() {
             return;
         }
         let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
         routing.extend_from_slice(table.as_bytes());
         routing.push(0);
-        routing.extend_from_slice(pk.as_bytes());
+        routing.extend_from_slice(pk);
         self.range_hook.note(&routing, count);
+    }
+
+    fn note_table_key(&self, table: &str, pk: &str, count: u64) {
+        self.note_routing_key(table, pk.as_bytes(), count);
+    }
+
+    fn sql_range_keys(statement: &ryme_sql::Statement) -> Option<Vec<Vec<u8>>> {
+        match statement {
+            ryme_sql::Statement::Insert { pk, .. }
+            | ryme_sql::Statement::Upsert { pk, .. }
+            | ryme_sql::Statement::InsertIgnore { pk, .. }
+            | ryme_sql::Statement::InsertConflict { pk, .. }
+            | ryme_sql::Statement::Update { pk, .. }
+            | ryme_sql::Statement::UpdateRow { pk, .. }
+            | ryme_sql::Statement::Delete { pk, .. } => Some(vec![pk.clone()]),
+            ryme_sql::Statement::CopyFrom { rows, .. } => {
+                Some(rows.iter().map(|(pk, _)| pk.clone()).collect())
+            }
+            ryme_sql::Statement::Returning { statement, .. } => Self::sql_range_keys(statement),
+            _ => None,
+        }
     }
 
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {
@@ -558,6 +579,11 @@ where
             return response;
         }
         let table = statement.table().to_string();
+        let range_keys = if write && self.range_hook.is_armed() {
+            Self::sql_range_keys(&statement)
+        } else {
+            None
+        };
         let fingerprint = self.slow_log.as_ref().map(|_| query_fingerprint(&request.sql));
         let mut executor = ryme_sql::Executor::with_backend(
             principal.tenant.clone(),
@@ -571,7 +597,13 @@ where
         let response = match executor.execute(statement).await {
             Ok(ryme_sql::QueryResult::Ok) => {
                 if write {
-                    self.range_hook.note(table.as_bytes(), 1);
+                    if let Some(keys) = range_keys.as_deref() {
+                        for key in keys {
+                            self.note_routing_key(&table, key, 1);
+                        }
+                    } else {
+                        self.range_hook.note(table.as_bytes(), 1);
+                    }
                 }
                 Response::ok()
             }

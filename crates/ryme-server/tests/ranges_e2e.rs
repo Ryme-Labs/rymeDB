@@ -382,7 +382,7 @@ async fn resp_command(addr: std::net::SocketAddr, parts: &[&str]) -> String {
 }
 
 #[tokio::test]
-async fn ranges_autosplit_counts_wire_gateway_writes() {
+async fn ranges_autosplit_counts_gateway_writes() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root = std::env::temp_dir().join(format!(
         "ryme-autosplit-wire-{}-{}",
@@ -408,12 +408,16 @@ async fn ranges_autosplit_counts_wire_gateway_writes() {
     assert_eq!(resp_command(resp, &["SET", "w2", "v2"]).await, "+OK");
     assert_eq!(resp_command(resp, &["SET", "w3", "v3"]).await, "+OK");
     assert_eq!(resp_command(resp, &["INCR", "counter"]).await, ":1");
+    let (status, _) = http_request(http, "POST /rest/v1/t", br#"{"key":"rest","value":"v"}"#).await;
+    assert_eq!(status, 201);
+    let (status, _) = http_request(http, "DELETE /rest/v1/t?key=eq.rest", b"").await;
+    assert_eq!(status, 200);
     let (status, body) = http_request(http, "GET /v1/ranges/loads", b"").await;
     assert_eq!(status, 200);
     assert_eq!(body.as_array().map(Vec::len), Some(1));
     assert_eq!(body[0]["id"], "range-0");
     assert_eq!(body[0]["epoch"], 0);
-    assert_eq!(body[0]["writes"], 4);
+    assert_eq!(body[0]["writes"], 6);
     let (status, body) = http_request(http, "POST /v1/ranges/autosplit", b"").await;
     assert_eq!(status, 200);
     let split = body["split"].as_array().cloned().unwrap_or_default();

@@ -98,6 +98,23 @@ where
         routing
     }
 
+    fn sql_range_keys(statement: &ryme_sql::Statement) -> Option<Vec<Vec<u8>>> {
+        match statement {
+            ryme_sql::Statement::Insert { pk, .. }
+            | ryme_sql::Statement::Upsert { pk, .. }
+            | ryme_sql::Statement::InsertIgnore { pk, .. }
+            | ryme_sql::Statement::InsertConflict { pk, .. }
+            | ryme_sql::Statement::Update { pk, .. }
+            | ryme_sql::Statement::UpdateRow { pk, .. }
+            | ryme_sql::Statement::Delete { pk, .. } => Some(vec![pk.clone()]),
+            ryme_sql::Statement::CopyFrom { rows, .. } => {
+                Some(rows.iter().map(|(pk, _)| pk.clone()).collect())
+            }
+            ryme_sql::Statement::Returning { statement, .. } => Self::sql_range_keys(statement),
+            _ => None,
+        }
+    }
+
     pub async fn serve(self, addr: std::net::SocketAddr) -> Result<()> {
         tonic::transport::Server::builder()
             .add_service(proto::ryme_server::RymeServer::new(self))
@@ -476,6 +493,11 @@ where
             return Err(status_of(e));
         }
         let table = statement.table().to_string();
+        let range_keys = if write && self.range_hook.is_armed() {
+            Self::sql_range_keys(&statement)
+        } else {
+            None
+        };
         let fingerprint = self.slow_log.as_ref().map(|_| query_fingerprint(&inner.sql));
         let mut executor = ryme_sql::Executor::with_backend(
             principal.tenant.clone(),
@@ -489,7 +511,13 @@ where
         let response = match executor.execute(statement).await {
             Ok(ryme_sql::QueryResult::Ok) => {
                 if write && self.range_hook.is_armed() {
-                    self.range_hook.note(table.as_bytes(), 1);
+                    if let Some(keys) = range_keys.as_deref() {
+                        for key in keys {
+                            self.range_hook.note(&Self::table_key(&table, key), 1);
+                        }
+                    } else {
+                        self.range_hook.note(table.as_bytes(), 1);
+                    }
                 }
                 proto::SqlReply { ok: true, error: String::new(), rows: Vec::new() }
             }
