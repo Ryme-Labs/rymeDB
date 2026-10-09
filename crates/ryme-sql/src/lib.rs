@@ -1489,6 +1489,7 @@ pub struct Executor<B = TxnManager> {
     isolation: Isolation,
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
+    rls_tables: Arc<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1509,6 +1510,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
+            rls_tables: Arc::new(HashMap::new()),
         }
     }
 
@@ -1523,6 +1525,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
+            rls_tables: Arc::new(HashMap::new()),
         }
     }
 }
@@ -1542,12 +1545,22 @@ where
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
+            rls_tables: Arc::new(HashMap::new()),
         }
     }
 
     pub fn with_realtime(mut self, realtime: Realtime) -> Self {
         self.realtime = Some(realtime);
         self
+    }
+
+    pub fn with_rls_tables(mut self, rls_tables: HashMap<String, String>) -> Self {
+        self.rls_tables = Arc::new(rls_tables);
+        self
+    }
+
+    pub fn set_rls_tables(&mut self, rls_tables: HashMap<String, String>) {
+        self.rls_tables = Arc::new(rls_tables);
     }
 
     pub fn with_branch(mut self, branch: String) -> Self {
@@ -1611,6 +1624,30 @@ where
             .into_iter()
             .map(|state| state.definition)
             .collect()
+    }
+
+    fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
+        let Some(column) = self.rls_tables.get(table) else { return true };
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
+            return false;
+        };
+        object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .and_then(|(_, value)| value.as_str())
+            .is_some_and(|tenant| tenant == self.tenant)
+    }
+
+    fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
+        if self.rls_allows(table, value) {
+            Ok(())
+        } else {
+            Err(RymeError::Forbidden)
+        }
+    }
+
+    fn filter_rls_rows(&self, table: &str, rows: impl IntoIterator<Item = Row>) -> Vec<Row> {
+        rows.into_iter().filter(|(_, value)| self.rls_allows(table, value)).collect()
     }
 
     fn materialize_insert_row(
@@ -1889,6 +1926,7 @@ where
             let pk = filter[0].operand.clone();
             self.manager
                 .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &pk))?
+                .filter(|value| self.rls_allows(&table, value))
                 .map(|value| vec![(pk, value)])
                 .unwrap_or_default()
         } else {
@@ -2044,7 +2082,7 @@ where
                         rows.push((pk, value));
                     }
                 }
-                return Ok(rows);
+                return Ok(self.filter_rls_rows(table, rows));
             }
         }
         let mut rows = self.manager.scan(txn, &self.tenant, &self.database, table, limit)?;
@@ -2066,7 +2104,7 @@ where
             }
             rows = merged.into_iter().take(limit).collect();
         }
-        Ok(rows)
+        Ok(self.filter_rls_rows(table, rows))
     }
 
     fn register_table(&self, table: String, columns: Vec<ColumnDefinition>) {
@@ -2115,10 +2153,12 @@ where
             return;
         };
         let mut txn = self.manager.begin();
-        let rows = self
-            .manager
-            .scan(&mut txn, &self.tenant, &self.database, table, limit)
-            .unwrap_or_default();
+        let rows = self.filter_rls_rows(
+            table,
+            self.manager
+                .scan(&mut txn, &self.tenant, &self.database, table, limit)
+                .unwrap_or_default(),
+        );
         let _ = realtime.publish_query(&self.tenant, &self.database, table, commit_ts, rows, limit);
     }
 
@@ -2179,6 +2219,7 @@ where
                     if value.len() > 4 * 1024 * 1024 {
                         return Err(RymeError::Overload(String::from("value")));
                     }
+                    self.enforce_rls(&table, &value)?;
                     let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                     let before = self.manager.get(txn, &key)?;
                     self.check_unique(&table, &pk, &value)?;
@@ -2210,6 +2251,7 @@ where
             }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
+                self.enforce_rls(&table, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if before.is_some() {
@@ -2230,8 +2272,12 @@ where
             }
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
+                self.enforce_rls(&table, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
+                if let Some(before) = before.as_deref() {
+                    self.enforce_rls(&table, before)?;
+                }
                 self.check_unique(&table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
                 Ok((
@@ -2259,11 +2305,13 @@ where
             }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
+                self.enforce_rls(&table, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(txn, &key)?;
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
+                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
                 self.check_unique(&table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
                 Ok((
@@ -2284,6 +2332,7 @@ where
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
+                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
                 self.manager.delete(txn, key);
                 Ok((
                     QueryResult::Ok,
@@ -2496,8 +2545,11 @@ where
             Statement::SelectByKey { table, pk } => {
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 match self.manager.get(txn, &key)? {
-                    Some(value) => Ok(QueryResult::Row { pk, value }),
+                    Some(value) if self.rls_allows(&table, &value) => {
+                        Ok(QueryResult::Row { pk, value })
+                    }
                     None => Ok(QueryResult::Rows { rows: Vec::new() }),
+                    Some(_) => Ok(QueryResult::Rows { rows: Vec::new() }),
                 }
             }
             Statement::SelectColumns { table, columns, limit, offset, order, filter } => self
@@ -2523,7 +2575,10 @@ where
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, filter } => {
-                let rows = self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?;
+                let rows = self.filter_rls_rows(
+                    &table,
+                    self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?,
+                );
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
@@ -2534,7 +2589,10 @@ where
                 })
             }
             Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
-                let rows = self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?;
+                let rows = self.filter_rls_rows(
+                    &table,
+                    self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?,
+                );
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
                     if !filter.iter().all(|p| p.matches(&pk, &value)) {
@@ -2604,10 +2662,14 @@ where
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Join { left, right, limit, offset, order, filter } => {
-                let left_rows =
-                    self.manager.scan(txn, &self.tenant, &self.database, &left, 10000)?;
-                let right_rows =
-                    self.manager.scan(txn, &self.tenant, &self.database, &right, 10000)?;
+                let left_rows = self.filter_rls_rows(
+                    &left,
+                    self.manager.scan(txn, &self.tenant, &self.database, &left, 10000)?,
+                );
+                let right_rows = self.filter_rls_rows(
+                    &right,
+                    self.manager.scan(txn, &self.tenant, &self.database, &right, 10000)?,
+                );
                 let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
                 for (pk, value) in right_rows {
                     index.entry(pk).or_insert(value);
@@ -2780,6 +2842,7 @@ where
             }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
+                self.enforce_rls(&table, &value)?;
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
@@ -2804,10 +2867,14 @@ where
             }
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
+                self.enforce_rls(&table, &value)?;
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 let existed = before.is_some();
+                if let Some(before) = before.as_deref() {
+                    self.enforce_rls(&table, before)?;
+                }
                 self.check_unique(&table, &pk, &value)?;
                 let after = self.realtime.as_ref().map(|_| value.clone());
                 self.manager.put(&mut txn, key, value.clone());
@@ -2829,8 +2896,11 @@ where
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 match self.manager.get(&mut txn, &key)? {
-                    Some(value) => Ok(QueryResult::Row { pk, value }),
+                    Some(value) if self.rls_allows(&table, &value) => {
+                        Ok(QueryResult::Row { pk, value })
+                    }
                     None => Ok(QueryResult::Rows { rows: Vec::new() }),
+                    Some(_) => Ok(QueryResult::Rows { rows: Vec::new() }),
                 }
             }
             Statement::SelectColumns { table, columns, limit, offset, order, filter } => {
@@ -2862,8 +2932,10 @@ where
             }
             Statement::Aggregate { table, func, field, filter } => {
                 let mut txn = self.manager.begin_with(isolation);
-                let rows =
-                    self.manager.scan(&mut txn, &self.tenant, &self.database, &table, 10000)?;
+                let rows = self.filter_rls_rows(
+                    &table,
+                    self.manager.scan(&mut txn, &self.tenant, &self.database, &table, 10000)?,
+                );
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
                     .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
@@ -2875,13 +2947,16 @@ where
             }
             Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
                 let mut txn = self.manager.begin_with(isolation);
-                let rows = self.manager.scan(
-                    &mut txn,
-                    &self.tenant,
-                    &self.database,
+                let rows = self.filter_rls_rows(
                     table.as_str(),
-                    10000,
-                )?;
+                    self.manager.scan(
+                        &mut txn,
+                        &self.tenant,
+                        &self.database,
+                        table.as_str(),
+                        10000,
+                    )?,
+                );
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
                     if !filter.iter().all(|p| p.matches(&pk, &value)) {
@@ -2952,20 +3027,26 @@ where
             }
             Statement::Join { left, right, limit, offset, order, filter } => {
                 let mut txn = self.manager.begin_with(isolation);
-                let left_rows = self.manager.scan(
-                    &mut txn,
-                    &self.tenant,
-                    &self.database,
+                let left_rows = self.filter_rls_rows(
                     left.as_str(),
-                    10000,
-                )?;
-                let right_rows = self.manager.scan(
-                    &mut txn,
-                    &self.tenant,
-                    &self.database,
+                    self.manager.scan(
+                        &mut txn,
+                        &self.tenant,
+                        &self.database,
+                        left.as_str(),
+                        10000,
+                    )?,
+                );
+                let right_rows = self.filter_rls_rows(
                     right.as_str(),
-                    10000,
-                )?;
+                    self.manager.scan(
+                        &mut txn,
+                        &self.tenant,
+                        &self.database,
+                        right.as_str(),
+                        10000,
+                    )?,
+                );
                 let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
                 for (pk, value) in right_rows {
                     index.entry(pk).or_insert(value);
@@ -3014,12 +3095,14 @@ where
             }
             Statement::Update { table, pk, value } => {
                 self.reject_if_read_only()?;
+                self.enforce_rls(&table, &value)?;
                 let mut txn = self.manager.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get(&mut txn, &key)?;
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
+                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
                 self.check_unique(&table, &pk, &value)?;
                 let after = self.realtime.as_ref().map(|_| value.clone());
                 self.manager.put(&mut txn, key, value.clone());
@@ -3044,6 +3127,7 @@ where
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
+                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
                 self.manager.delete(&mut txn, key);
                 let commit_ts = self.manager.commit(txn).await?;
                 self.apply_index_change(&TransactionChange {
@@ -3254,6 +3338,63 @@ mod tests {
         assert!(matches!(returned, QueryResult::Returning { ref columns, ref rows }
             if columns == &[String::from("id"), String::from("payload"), String::from("count")]
                 && rows == &vec![vec![b"e1".to_vec(), b"changed".to_vec(), b"4".to_vec()]]));
+    }
+
+    #[tokio::test]
+    async fn sql_rls_filters_reads_and_rejects_hidden_mutations() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d")).with_rls_tables(
+            HashMap::from([(String::from("messages"), String::from("tenant_id"))]),
+        );
+        executor
+            .execute(
+                parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT, body TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, tenant_id, body) VALUES ('visible', 'tenant-a', 'hello')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let manager = executor.manager().clone();
+        let mut txn = manager.begin();
+        manager.put(
+            &mut txn,
+            RecordKey::new("tenant-a", "d", "messages", b"hidden"),
+            br#"{"id":"hidden","tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
+        );
+        manager.commit(txn).unwrap();
+
+        let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+        let hidden = executor
+            .execute(parse("SELECT * FROM messages WHERE id = 'hidden'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(hidden, QueryResult::Rows { ref rows } if rows.is_empty()));
+
+        let bad_insert = executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, tenant_id, body) VALUES ('bad', 'tenant-b', 'nope')",
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(bad_insert, Err(RymeError::Forbidden)));
+        let hidden_update = executor
+            .execute(parse("UPDATE messages SET body = 'changed' WHERE id = 'hidden'").unwrap())
+            .await;
+        assert!(matches!(hidden_update, Err(RymeError::Forbidden)));
+        let hidden_delete =
+            executor.execute(parse("DELETE FROM messages WHERE id = 'hidden'").unwrap()).await;
+        assert!(matches!(hidden_delete, Err(RymeError::Forbidden)));
     }
 
     #[tokio::test]

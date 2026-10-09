@@ -440,6 +440,7 @@ pub struct SharedState {
     durable: DurableManager,
     gateway: Gateway<Backend>,
     executor: Executor<Backend>,
+    rls_tables: HashMap<String, String>,
     realtime: Realtime,
     keys: ApiKeyStore,
     jwt: Option<JwtVerifier>,
@@ -798,6 +799,7 @@ impl SharedState {
         let mut executor =
             Executor::with_backend(tenant.clone(), database.clone(), backend.clone())
                 .with_realtime(realtime.clone());
+        executor.set_rls_tables(config.rls_tables.clone());
         executor.set_read_only(config.read_only);
         let mut control = ControlPlane::new();
         control.add_range(Range::new(
@@ -854,6 +856,7 @@ impl SharedState {
             durable,
             gateway,
             executor,
+            rls_tables: config.rls_tables.clone(),
             realtime,
             keys,
             jwt,
@@ -1377,6 +1380,7 @@ fn spawn_gateways(
     let mut pg_executor =
         Executor::with_backend(state.tenant.clone(), state.database.clone(), state.backend.clone())
             .with_realtime(state.realtime.clone());
+    pg_executor.set_rls_tables(state.rls_tables.clone());
     pg_executor.set_read_only(state.read_only);
     let range_hook: ryme_router::RangeLoadHook = if autosplit_writes > 0 {
         let control = state.control.clone();
