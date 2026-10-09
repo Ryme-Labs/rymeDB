@@ -227,6 +227,8 @@ pub enum Cmp {
     Gte,
     Lt,
     Lte,
+    IsNull,
+    IsNotNull,
     Contains,
 }
 
@@ -312,19 +314,26 @@ impl Default for Order {
 
 impl Predicate {
     pub fn matches(&self, pk: &[u8], value: &[u8]) -> bool {
+        if matches!(self.op, Cmp::IsNull | Cmp::IsNotNull) {
+            let is_null = if let Some(column) = self.column.as_deref() {
+                let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
+                    return false;
+                };
+                json_column_value(column, &object).is_some_and(serde_json::Value::is_null)
+            } else {
+                match self.field {
+                    Field::Key => pk.is_empty() || pk.eq_ignore_ascii_case(b"null"),
+                    Field::Value => value.is_empty() || value.eq_ignore_ascii_case(b"null"),
+                }
+            };
+            return if self.op == Cmp::IsNull { is_null } else { !is_null };
+        }
         let column_value;
         let target = if let Some(column) = self.column.as_deref() {
             let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
                 return false;
             };
-            let selected = if column.contains("->") {
-                json_projection_bytes(column, &object)
-            } else {
-                object
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                    .map(|(_, value)| json_result_bytes(value))
-            };
+            let selected = json_column_value(column, &object).map(json_result_bytes);
             let Some(selected) = selected else { return false };
             column_value = selected;
             column_value.as_slice()
@@ -341,6 +350,7 @@ impl Predicate {
             Cmp::Gte => compare_operands(target, &self.operand).is_some_and(|order| !order.is_lt()),
             Cmp::Lt => compare_operands(target, &self.operand).is_some_and(|order| order.is_lt()),
             Cmp::Lte => compare_operands(target, &self.operand).is_some_and(|order| !order.is_gt()),
+            Cmp::IsNull | Cmp::IsNotNull => false,
             Cmp::Contains => {
                 let text = String::from_utf8_lossy(target);
                 let want = String::from_utf8_lossy(&self.operand);
@@ -1229,6 +1239,14 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
     }
     if parts.len() == 3 {
         let (field, column) = parse_predicate_field(&parts[0]);
+        if parts[1].eq_ignore_ascii_case("IS") {
+            let op = if parts[2].eq_ignore_ascii_case("NULL") {
+                Cmp::IsNull
+            } else {
+                return Err(RymeError::InvalidArgument(String::from("where predicate")));
+            };
+            return Ok(Predicate { field, column, op, operand: Vec::new() });
+        }
         if parts[1] == "=" {
             return Ok(Predicate {
                 field,
@@ -1262,6 +1280,15 @@ fn parse_predicate(parts: &[String]) -> Result<Predicate> {
                 op: Cmp::Contains,
                 operand: unquote(&parts[2]).into_bytes(),
             });
+        }
+    }
+    if parts.len() == 4 {
+        let (field, column) = parse_predicate_field(&parts[0]);
+        if parts[1].eq_ignore_ascii_case("IS")
+            && parts[2].eq_ignore_ascii_case("NOT")
+            && parts[3].eq_ignore_ascii_case("NULL")
+        {
+            return Ok(Predicate { field, column, op: Cmp::IsNotNull, operand: Vec::new() });
         }
     }
     Err(RymeError::InvalidArgument(String::from("where predicate")))
@@ -1430,6 +1457,28 @@ fn json_projection_bytes(
     expression: &str,
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<Vec<u8>> {
+    let (current, text_result) = json_projection_value(expression, object)?;
+    Some(if text_result { json_result_bytes(current) } else { serde_json::to_vec(current).ok()? })
+}
+
+fn json_column_value<'a>(
+    expression: &str,
+    object: &'a serde_json::Map<String, serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    if expression.contains("->") {
+        json_projection_value(expression, object).map(|(value, _)| value)
+    } else {
+        object
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(expression))
+            .map(|(_, value)| value)
+    }
+}
+
+fn json_projection_value<'a>(
+    expression: &str,
+    object: &'a serde_json::Map<String, serde_json::Value>,
+) -> Option<(&'a serde_json::Value, bool)> {
     let operator = expression.find("->")?;
     let base = expression[..operator].trim();
     let mut current = object.get(base)?;
@@ -1458,11 +1507,7 @@ fn json_projection_bytes(
         };
         tail = &tail[consumed..];
         if tail.is_empty() {
-            return Some(if text_result {
-                json_result_bytes(current)
-            } else {
-                serde_json::to_vec(current).ok()?
-            });
+            return Some((current, text_result));
         }
         if !tail.starts_with("->") {
             return None;
@@ -4279,22 +4324,28 @@ mod tests {
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor
             .execute(
-                parse("CREATE TABLE events (id TEXT PRIMARY KEY, count INTEGER, payload JSONB)")
-                    .unwrap(),
+                parse(
+                    "CREATE TABLE events (id TEXT PRIMARY KEY, count INTEGER, payload JSONB, note TEXT)",
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
         executor
             .execute(
-                parse("INSERT INTO events (id, count, payload) VALUES ('e1', 2, '{\"name\":\"Ada\"}')")
-                    .unwrap(),
+                parse(
+                    "INSERT INTO events (id, count, payload, note) VALUES ('e1', 2, '{\"name\":\"Ada\"}', NULL)",
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
         executor
             .execute(
-                parse("INSERT INTO events (id, count, payload) VALUES ('e2', 4, '{\"name\":\"Grace\"}')")
-                    .unwrap(),
+                parse(
+                    "INSERT INTO events (id, count, payload, note) VALUES ('e2', 4, '{\"name\":\"Grace\"}', 'ok')",
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -4313,6 +4364,22 @@ mod tests {
             .unwrap();
         assert!(
             matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"e1".to_vec()]])
+        );
+
+        let result = executor
+            .execute(parse("SELECT id FROM events WHERE note IS NULL").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"e1".to_vec()]])
+        );
+
+        let result = executor
+            .execute(parse("SELECT id FROM events WHERE note IS NOT NULL").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Table { rows, .. } if rows == vec![vec![b"e2".to_vec()]])
         );
     }
 
