@@ -1430,15 +1430,24 @@ impl Node {
             inner.acks.insert(self.id, index);
             index
         };
-        self.replicate_once().await;
-        self.replicate_once().await;
-        let mut inner = self.inner.lock().await;
-        inner.advance_commit();
-        let committed = inner.commit_index;
-        let last = inner.last_index();
-        drop(inner);
-        if committed < last {
-            return Err(RymeError::Unavailable(String::from("no quorum")));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            self.replicate_once().await;
+            let (role, committed, last) = {
+                let mut inner = self.inner.lock().await;
+                inner.advance_commit();
+                (inner.role, inner.commit_index, inner.last_index())
+            };
+            if committed >= last {
+                break;
+            }
+            if role != Role::Leader {
+                return Err(RymeError::Unavailable(String::from("stepped down")));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RymeError::Unavailable(String::from("no quorum")));
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
         Ok(index)
     }
