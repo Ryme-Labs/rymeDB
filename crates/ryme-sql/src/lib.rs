@@ -71,6 +71,8 @@ pub enum Statement {
         table: String,
         func: AggFunc,
         field: Field,
+        #[serde(default)]
+        column: Option<String>,
         filter: Vec<Predicate>,
     },
     Join {
@@ -299,7 +301,7 @@ impl AggFunc {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectItem {
     Field(Field),
-    Agg(AggFunc, Field),
+    Agg(AggFunc, Field, Option<String>),
 }
 
 impl SelectItem {
@@ -307,7 +309,7 @@ impl SelectItem {
         match self {
             Self::Field(Field::Key) => String::from("key"),
             Self::Field(Field::Value) => String::from("value"),
-            Self::Agg(func, _) => func.label().to_string(),
+            Self::Agg(func, _, _) => func.label().to_string(),
         }
     }
 }
@@ -1119,7 +1121,7 @@ fn find_sql_keyword(input: &str, keyword: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn parse_aggregate_item(raw: &str) -> Option<Result<(AggFunc, Field)>> {
+fn parse_aggregate_item(raw: &str) -> Option<Result<(AggFunc, Field, Option<String>)>> {
     let item = raw.trim();
     let name_end = item.find(|character: char| character.is_whitespace() || character == '(')?;
     let func = AggFunc::parse(&item[..name_end])?;
@@ -1128,13 +1130,12 @@ fn parse_aggregate_item(raw: &str) -> Option<Result<(AggFunc, Field)>> {
     }
     let tokens = tokenize(item);
     let field = match tokens.get(1).map(String::as_str) {
-        Some("*") if func == AggFunc::Count => Ok(Field::Value),
+        Some("*") if func == AggFunc::Count => Ok((Field::Value, None)),
         Some("*") => Err(RymeError::InvalidArgument(String::from("aggregate field"))),
-        Some(name) => parse_field(name)
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("aggregate field"))),
+        Some(name) => Ok(parse_predicate_field(name)),
         None => Err(RymeError::InvalidArgument(String::from("aggregate field"))),
     };
-    Some(field.map(|field| (func, field)))
+    Some(field.map(|(field, column)| (func, field, column)))
 }
 
 fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -1145,9 +1146,9 @@ fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
     if let Some(items) = select_items(raw) {
         if items.len() == 1 {
             if let Some(aggregate) = parse_aggregate_item(&items[0]) {
-                let (func, field) = aggregate?;
+                let (func, field, column) = aggregate?;
                 let filter = parse_where_filter(tokens)?;
-                return Ok(Statement::Aggregate { table, func, field, filter });
+                return Ok(Statement::Aggregate { table, func, field, column, filter });
             }
         }
     }
@@ -1208,8 +1209,8 @@ fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
         select_items(raw).ok_or_else(|| RymeError::InvalidArgument(String::from("select item")))?;
     for item in items {
         if let Some(aggregate) = parse_aggregate_item(&item) {
-            let (func, field) = aggregate?;
-            select.push(SelectItem::Agg(func, field));
+            let (func, field, column) = aggregate?;
+            select.push(SelectItem::Agg(func, field, column));
             continue;
         }
         let item_tokens = tokenize(&item);
@@ -1916,6 +1917,66 @@ pub fn aggregate_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, field: Field) 
             .max()
             .unwrap_or_else(|| b"null".to_vec()),
     }
+}
+
+fn aggregate_column_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, column: &str) -> Vec<u8> {
+    let values: Vec<Vec<u8>> = rows
+        .iter()
+        .filter_map(|(_, raw)| {
+            let serde_json::Value::Object(object) = serde_json::from_slice(raw).ok()? else {
+                return None;
+            };
+            let value = json_column_value(column, &object)?;
+            (!value.is_null()).then(|| json_result_bytes(value))
+        })
+        .collect();
+    match func {
+        AggFunc::Count => values.len().to_string().into_bytes(),
+        AggFunc::Sum => {
+            let mut total = 0.0f64;
+            let mut count = 0u64;
+            for value in &values {
+                if let Some(number) = parse_number(value) {
+                    total += number;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                b"0".to_vec()
+            } else {
+                format_number(total).into_bytes()
+            }
+        }
+        AggFunc::Avg => {
+            let mut total = 0.0f64;
+            let mut count = 0u64;
+            for value in &values {
+                if let Some(number) = parse_number(value) {
+                    total += number;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                b"null".to_vec()
+            } else {
+                format_number(total / count as f64).into_bytes()
+            }
+        }
+        AggFunc::Min => values.into_iter().min().unwrap_or_else(|| b"null".to_vec()),
+        AggFunc::Max => values.into_iter().max().unwrap_or_else(|| b"null".to_vec()),
+    }
+}
+
+fn aggregate_target_rows(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    func: AggFunc,
+    field: Field,
+    column: Option<&str>,
+) -> Vec<u8> {
+    column.map_or_else(
+        || aggregate_rows(rows, func, field),
+        |column| aggregate_column_rows(rows, func, column),
+    )
 }
 
 fn parse_number(raw: &[u8]) -> Option<f64> {
@@ -3603,7 +3664,7 @@ where
                 });
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
-            Statement::Aggregate { table, func, field, filter } => {
+            Statement::Aggregate { table, func, field, column, filter } => {
                 let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
@@ -3611,7 +3672,7 @@ where
                     .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
-                    value: aggregate_rows(&rows, func, field),
+                    value: aggregate_target_rows(&rows, func, field, column.as_deref()),
                 })
             }
             Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
@@ -3654,12 +3715,15 @@ where
                                     ),
                                 );
                             }
-                            SelectItem::Agg(func, field) => {
+                            SelectItem::Agg(func, field, column) => {
                                 record.insert(
                                     func.label().to_string(),
                                     serde_json::Value::String(
-                                        String::from_utf8_lossy(&aggregate_rows(
-                                            members, *func, *field,
+                                        String::from_utf8_lossy(&aggregate_target_rows(
+                                            members,
+                                            *func,
+                                            *field,
+                                            column.as_deref(),
                                         ))
                                         .to_string(),
                                     ),
@@ -3962,7 +4026,7 @@ where
                 });
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
-            Statement::Aggregate { table, func, field, filter } => {
+            Statement::Aggregate { table, func, field, column, filter } => {
                 let mut txn = self.begin_with(isolation);
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
@@ -3971,7 +4035,7 @@ where
                     .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
-                    value: aggregate_rows(&rows, func, field),
+                    value: aggregate_target_rows(&rows, func, field, column.as_deref()),
                 })
             }
             Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
@@ -4015,12 +4079,15 @@ where
                                     ),
                                 );
                             }
-                            SelectItem::Agg(func, field) => {
+                            SelectItem::Agg(func, field, column) => {
                                 record.insert(
                                     func.label().to_string(),
                                     serde_json::Value::String(
-                                        String::from_utf8_lossy(&aggregate_rows(
-                                            members, *func, *field,
+                                        String::from_utf8_lossy(&aggregate_target_rows(
+                                            members,
+                                            *func,
+                                            *field,
+                                            column.as_deref(),
                                         ))
                                         .to_string(),
                                     ),
@@ -5406,6 +5473,13 @@ mod tests {
             )
             .await
             .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO metrics (id, count, sum, avg, min, max) VALUES ('m2', NULL, NULL, NULL, NULL, NULL)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         for (column, expected) in
             [("count", b"1"), ("sum", b"2"), ("avg", b"3"), ("min", b"4"), ("max", b"5")]
@@ -5419,6 +5493,11 @@ mod tests {
                 "{column}"
             );
         }
+        let sum = executor.execute(parse("SELECT SUM(sum) FROM metrics").unwrap()).await.unwrap();
+        assert!(matches!(sum, QueryResult::Scalar { value, .. } if value == b"2"));
+        let count =
+            executor.execute(parse("SELECT COUNT(count) FROM metrics").unwrap()).await.unwrap();
+        assert!(matches!(count, QueryResult::Scalar { value, .. } if value == b"1"));
     }
 
     #[tokio::test]
@@ -5436,12 +5515,12 @@ mod tests {
             .unwrap();
 
         let aggregate =
-            executor.execute(parse("SELECT COUNT(*) FROM metrics").unwrap()).await.unwrap();
+            executor.execute(parse("SELECT COUNT(amount) FROM metrics").unwrap()).await.unwrap();
         assert!(matches!(aggregate, QueryResult::Scalar { value, .. } if value == b"10001"));
 
         let groups = executor
             .execute(
-                parse("SELECT key, COUNT(*) FROM metrics GROUP BY key OFFSET 10000 LIMIT 1")
+                parse("SELECT key, SUM(amount) FROM metrics GROUP BY key OFFSET 10000 LIMIT 1")
                     .unwrap(),
             )
             .await

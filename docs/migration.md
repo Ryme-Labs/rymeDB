@@ -116,7 +116,8 @@ Aggregates: `SELECT COUNT(*) | COUNT(field) | SUM(field) | AVG(field) | MIN(fiel
 FROM t [WHERE ...]` compute over all visible filtered rows; numerics parse
 as f64 with non-numeric values skipped (`SUM` over none yields `0`,
 `AVG`/`MIN`/`MAX` over none yield `null`). Aggregate names without parentheses
-are treated as ordinary projected columns.
+are treated as ordinary projected columns; named schema columns and JSON paths
+are resolved from structured rows, and `COUNT(column)` excludes SQL `NULL`.
 Key-equality joins: `SELECT * FROM a JOIN b ON KEY = KEY [WHERE ...]
 [ORDER BY ...] [LIMIT n] [OFFSET n]` hash-joins on primary-key bytes and
 returns rows shaped `{"left": ..., "right": ...}` (lossy UTF-8). Only
