@@ -2133,7 +2133,7 @@ fn branch_snapshot(
     state: &SharedState,
     headers: &HeaderMap,
     tenant: &str,
-) -> ryme_error::Result<Option<(String, u64)>> {
+) -> ryme_error::Result<Option<(String, u64, u64)>> {
     let branch = headers
         .get("x-ryme-branch")
         .and_then(|value| value.to_str().ok())
@@ -2153,7 +2153,7 @@ fn branch_snapshot(
             "branch has no data snapshot",
         )));
     }
-    Ok(Some((selected.id, selected.base_commit_ts)))
+    Ok(Some((selected.id, selected.base_commit_ts, selected.storage_epoch)))
 }
 
 fn validate_branch_selection(
@@ -2172,12 +2172,13 @@ fn branch_gateway(
 ) -> ryme_error::Result<Gateway<BranchStorage>> {
     let gateway = state.gateway.clone();
     match branch_snapshot(state, headers, tenant)? {
-        Some((branch, base_commit_ts)) => {
+        Some((branch, base_commit_ts, storage_epoch)) => {
             let manager = ryme_branch::BranchBackend::new(
                 state.backend.clone(),
                 state.database.clone(),
                 branch.clone(),
                 base_commit_ts,
+                storage_epoch,
             );
             Ok(gateway.with_backend_manager(manager).with_branch(branch))
         }
@@ -2192,12 +2193,13 @@ fn branch_executor(
 ) -> ryme_error::Result<Executor<BranchStorage>> {
     let executor = state.executor.clone().with_tenant(tenant.to_string());
     match branch_snapshot(state, headers, tenant)? {
-        Some((branch, base_commit_ts)) => {
+        Some((branch, base_commit_ts, storage_epoch)) => {
             let manager = ryme_branch::BranchBackend::new(
                 state.backend.clone(),
                 state.database.clone(),
                 branch.clone(),
                 base_commit_ts,
+                storage_epoch,
             );
             Ok(executor.with_backend_manager(manager).with_branch(branch))
         }
@@ -4599,7 +4601,12 @@ async fn branch_reset(
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     let mut branches = control.branches.clone();
-    match branches.reset_for(&principal.tenant, &id, request.base_commit_ts) {
+    let base_commit_ts = if request.base_commit_ts == 0 {
+        state.backend.latest_commit()
+    } else {
+        request.base_commit_ts
+    };
+    match branches.reset_for(&principal.tenant, &id, base_commit_ts) {
         Ok(branch) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
@@ -4633,6 +4640,7 @@ async fn promote_branch_data(
         state.database.clone(),
         child.id.clone(),
         child.base_commit_ts,
+        child.storage_epoch,
     );
     let local_database = branch
         .local_database()

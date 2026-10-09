@@ -10,6 +10,8 @@ pub struct Branch {
     pub tenant: String,
     pub parent_id: Option<String>,
     pub base_commit_ts: u64,
+    #[serde(default)]
+    pub storage_epoch: u64,
     pub manifest_id: String,
     pub schema_version: u64,
 }
@@ -98,6 +100,7 @@ impl BranchManager {
                 tenant: tenant.to_string(),
                 parent_id: None,
                 base_commit_ts: 0,
+                storage_epoch: 0,
                 manifest_id: manifest.id,
                 schema_version: 1,
             },
@@ -142,6 +145,7 @@ impl BranchManager {
                 tenant: tenant.to_string(),
                 parent_id: Some(parent.to_string()),
                 base_commit_ts,
+                storage_epoch: 0,
                 manifest_id,
                 schema_version: parent_branch.schema_version,
             },
@@ -234,6 +238,7 @@ impl BranchManager {
             .get_mut(&scoped_key(tenant, id))
             .ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
         branch.base_commit_ts = base_commit_ts;
+        branch.storage_epoch = branch.storage_epoch.saturating_add(1);
         Ok(branch.clone())
     }
 
@@ -308,13 +313,19 @@ where
         Self { base, branch_database: String::new(), base_commit_ts: 0, overlay: false }
     }
 
-    pub fn new(base: B, database: String, branch: String, base_commit_ts: u64) -> Self {
-        Self {
-            branch_database: format!("{database}\0branch\0{branch}"),
-            base,
-            base_commit_ts,
-            overlay: true,
-        }
+    pub fn new(
+        base: B,
+        database: String,
+        branch: String,
+        base_commit_ts: u64,
+        storage_epoch: u64,
+    ) -> Self {
+        let branch_database = if storage_epoch == 0 {
+            format!("{database}\0branch\0{branch}")
+        } else {
+            format!("{database}\0branch\0{branch}\0epoch\0{storage_epoch}")
+        };
+        Self { branch_database, base, base_commit_ts, overlay: true }
     }
 
     pub fn local_database(&self) -> Option<&str> {
@@ -588,6 +599,7 @@ mod tests {
         manager.create_child(String::from("preview"), "main", 7).unwrap();
         let branch = manager.reset("preview", 42).unwrap();
         assert_eq!(branch.base_commit_ts, 42);
+        assert_eq!(branch.storage_epoch, 1);
         assert!(manager.reset("ghost", 1).is_err());
     }
 
@@ -670,6 +682,7 @@ mod tests {
             String::from("default"),
             String::from("preview"),
             parent_commit,
+            0,
         );
         let mut write_txn = branch.begin();
         assert_eq!(branch.get(&mut write_txn, &parent_key).unwrap(), Some(b"from-parent".to_vec()));

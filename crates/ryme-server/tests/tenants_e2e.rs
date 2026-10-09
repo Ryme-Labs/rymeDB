@@ -251,6 +251,18 @@ async fn tenants_share_no_presence_or_partitions() {
     let (status, body) = bearer_request(http, &alpha, "GET /v1/kv/docs/branch-write", b"").await;
     assert_eq!(status, 200);
     assert_eq!(body, serde_json::Value::String(String::from("branch-write")));
+    let (status, _) =
+        bearer_request(http, &alpha, "POST /v1/branches/preview/reset", br#"{"base_commit_ts":1}"#)
+            .await;
+    assert_eq!(status, 200);
+    let (status, _) =
+        bearer_branch_request(http, &alpha, "preview", "GET /v1/kv/docs/branch-write", b"").await;
+    assert_eq!(status, 404);
+    let (status, _) = bearer_request(http, &alpha, "DELETE /v1/branches/preview", b"").await;
+    assert_eq!(status, 200);
+    let (status, _) =
+        bearer_branch_request(http, &alpha, "preview", "GET /v1/kv/docs/branch-write", b"").await;
+    assert_eq!(status, 404);
     let (status, _) = bearer_request(http, &beta, "POST /v1/branches", branch.as_bytes()).await;
     assert_eq!(status, 200);
     let (status, _) = bearer_request(http, KEY, "GET /v1/branches/preview", b"").await;
