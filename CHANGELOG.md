@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- SQL projections, predicates, ordering, grouping, and RETURNING now accept
+  relation-qualified column references such as source.id.
 - SQL table and secondary-index metadata now persists atomically in
   `data_dir/schema.json`, is shared by HTTP and PostgreSQL gateways, restored
   with rebuilt index entries, isolated for branch executors, and included in

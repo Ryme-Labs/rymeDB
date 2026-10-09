@@ -1204,7 +1204,7 @@ fn parse_returning_fields(tokens: &[String]) -> Result<Vec<ReturningField>> {
                 Field::Value => ReturningField::Value,
             });
         } else {
-            fields.push(ReturningField::Column(unquote(token)));
+            fields.push(ReturningField::Column(normalize_column_reference(token)));
         }
     }
     if fields.is_empty() {
@@ -2344,7 +2344,7 @@ fn parse_projection(tokens: &[String]) -> Result<Option<Vec<String>>> {
             if token == "*" {
                 Err(RymeError::InvalidArgument(String::from("select projection")))
             } else {
-                Ok(unquote(token))
+                Ok(normalize_column_reference(token))
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2371,7 +2371,7 @@ fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
                 select.push(SelectItem::Field(field));
                 continue;
             }
-            select.push(SelectItem::Column(unquote(&item_tokens[0])));
+            select.push(SelectItem::Column(normalize_column_reference(&item_tokens[0])));
             continue;
         }
         return Err(RymeError::InvalidArgument(String::from("select item")));
@@ -2394,7 +2394,7 @@ fn parse_group(tokens: &[String], table: &str, raw: &str) -> Result<Statement> {
         .ok_or_else(|| RymeError::InvalidArgument(String::from("group field")))?;
     let (group, group_column) = parse_field(group_token)
         .map(|field| (field, None))
-        .unwrap_or((Field::Value, Some(unquote(group_token))));
+        .unwrap_or((Field::Value, Some(normalize_column_reference(group_token))));
     for item in &select {
         match item {
             SelectItem::Field(field) => {
@@ -2505,7 +2505,7 @@ fn parse_scan_tail(tokens: &[String]) -> Result<(usize, usize, Order)> {
                     order.column = None;
                 } else {
                     order.field = Field::Value;
-                    order.column = Some(unquote(field));
+                    order.column = Some(normalize_column_reference(field));
                 }
             }
             if let Some(direction) = tokens.get(index + 3) {
@@ -2661,9 +2661,27 @@ fn parse_filter(clause: &[String]) -> Result<Vec<Predicate>> {
 }
 
 fn parse_predicate_field(raw: &str) -> (Field, Option<String>) {
-    parse_field(raw)
+    let normalized = normalize_column_reference(raw);
+    parse_field(&normalized)
         .map(|field| (field, None))
-        .unwrap_or_else(|| (Field::Value, Some(unquote(raw))))
+        .unwrap_or_else(|| (Field::Value, Some(normalized)))
+}
+
+fn normalize_column_reference(raw: &str) -> String {
+    let unquoted = unquote(raw.trim());
+    let Some(operator) = unquoted.find("->") else {
+        return unquoted
+            .rsplit_once('.')
+            .map(|(_, column)| column.to_string())
+            .unwrap_or(unquoted);
+    };
+    let base = &unquoted[..operator];
+    let base = base
+        .rsplit_once('.')
+        .map(|(_, column)| column)
+        .unwrap_or(base)
+        .trim();
+    format!("{}{}", base, &unquoted[operator..])
 }
 
 fn parse_predicate(parts: &[String]) -> Result<Predicate> {
@@ -9217,6 +9235,40 @@ mod tests {
         assert!(matches!(
             executor.execute(parse("SELECT * FROM archive KEY '2'").unwrap()).await.unwrap(),
             QueryResult::Rows { rows } if rows.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn insert_select_accepts_qualified_source_columns() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE source (id TEXT PRIMARY KEY, payload TEXT, active BOOLEAN)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE TABLE archive (id TEXT PRIMARY KEY, payload TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO source (id, payload, active) VALUES ('1', 'keep', true), ('2', 'skip', false)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let statement = parse(
+            "INSERT INTO archive (id, payload) SELECT s.id, s.payload FROM source AS s WHERE s.active = true RETURNING archive.id, archive.payload",
+        )
+        .unwrap();
+        let result = executor.execute(statement).await.unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Returning { ref rows, .. }
+                if rows == &vec![vec![b"1".to_vec(), b"keep".to_vec()]]
         ));
     }
 
