@@ -180,7 +180,7 @@ async fn pg_ssl_upgrade_roundtrip() {
         if tag == b'Z' {
             break;
         }
-        assert_eq!(tag, b'S');
+        assert!(tag == b'S' || tag == b'K');
     }
     let query = b"SELECT * FROM docs KEY 'tls1'";
     let mut q = vec![b'Q'];

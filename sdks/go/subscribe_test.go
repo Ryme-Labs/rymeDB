@@ -90,6 +90,21 @@ func TestSubscribeTableFromSendsWatermark(t *testing.T) {
 	}
 }
 
+func TestSubscribeTableFromSequenceSendsExactCursor(t *testing.T) {
+	client, gotPath := stubSocketServer(t, []string{})
+	sequence := uint64(11)
+	sub, err := client.SubscribeTableFromSequence("docs", &sequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	for _, want := range []string{"table=docs", "from_sequence=11", "api_key=k"} {
+		if !strings.Contains(*gotPath, want) {
+			t.Fatalf("missing %s in path: %s", want, *gotPath)
+		}
+	}
+}
+
 func TestSubscribeQueryReceivesSnapshotThenUpdate(t *testing.T) {
 	client, gotPath := stubSocketServer(t, []string{
 		`{"type":"snapshot","commit":7,"rows":[{"pk":"k1","value":"one"}]}`,

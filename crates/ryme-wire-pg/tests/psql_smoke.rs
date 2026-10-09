@@ -53,6 +53,31 @@ async fn psql_smoke() {
     let (ok, out) = psql(addr, "SELECT * FROM docs KEY 'k1';").await;
     assert!(ok, "{out}");
     assert!(out.contains("v1"), "{out}");
+    let (ok, _) = psql(addr, "INSERT INTO docs (id, value) VALUES ('k2', 'v2');").await;
+    assert!(ok);
+    let (ok, _) = psql(
+        addr,
+        "INSERT INTO docs (id, value) VALUES ('k2', 'v3') ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value;",
+    )
+    .await;
+    assert!(ok);
+    let (ok, out) = psql(addr, "SELECT * FROM docs KEY 'k2';").await;
+    assert!(ok, "{out}");
+    assert!(out.contains("v3"), "{out}");
+    let (ok, out) = psql(
+        addr,
+        "BEGIN; INSERT INTO docs (id, value) VALUES ('tx', 'inside'); SELECT * FROM docs KEY 'tx'; COMMIT;",
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(out.contains("inside"), "{out}");
+    let (ok, out) = psql(
+        addr,
+        "BEGIN; INSERT INTO docs (id, value) VALUES ('rolled', 'gone'); ROLLBACK; SELECT * FROM docs KEY 'rolled';",
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert!(!out.contains("gone"), "{out}");
     let (ok, out) = psql(addr, "SET application_name TO 'smoke'; SHOW application_name;").await;
     assert!(ok, "{out}");
     assert!(out.contains("smoke"), "{out}");

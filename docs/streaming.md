@@ -7,9 +7,10 @@ browser `WebSocket` clients cannot set headers).
 
 ## `GET /v1/stream?table=<name>` — change feed
 
-Pushes one JSON text frame per committed change to the table. Auth requires
-any valid credential; no read-permission check is performed. Each frame is a
-`ChangeRecord` (`crates/ryme-realtime/src/lib.rs`):
+Pushes one JSON text frame per committed change to the table. Auth requires a
+read-capable credential (`readwrite`, `readonly`, `realtime_subscriber`, or an
+administrative role). Each frame is a `ChangeRecord`
+(`crates/ryme-realtime/src/lib.rs`):
 ```json
 {
   "tenant": "default", "database": "default", "branch": "main",
@@ -22,10 +23,11 @@ any valid credential; no read-permission check is performed. Each frame is a
 - `op` is `INSERT`, `UPDATE`, or `DELETE` (uppercase).
 - `pk` and `after` are **byte arrays** (JSON number arrays), not strings:
   `[107, 49]` decodes to `"k1"`. `after` is `null` on deletes.
-- The server skips (does not redeliver) messages when a slow consumer lags
-  behind the broadcast channel, so a `/v1/stream` consumer **can miss
-  changes under lag**. If you need at-least-complete state, use
-  `/v1/query-stream` below.
+- If a slow consumer lags behind the broadcast channel, the server replays
+  the missing changes from the retained topic ring. If retention is no longer
+  sufficient, the socket closes instead of silently presenting an incomplete
+  stream; use `/v1/query-stream` below when automatic state resynchronization
+  is preferred.
 - Resume with `?from=<commit>`: the socket first replays retained changes
   with `commit_ts` after the watermark (oldest-first, up to the full ring
   retention), then
@@ -38,8 +40,19 @@ any valid credential; no read-permission check is performed. Each frame is a
   replayed. REST/SQL/native/gRPC writes always publish; RESP only
   publishes while the table has subscribers (a throughput optimization),
   so RESP-only writes made with zero subscribers are absent from replay.
+- For exact reconnects, use `?from_sequence=<sequence>` from the last
+  delivered `ChangeRecord`. This distinguishes multiple writes sharing one
+  commit timestamp and uses the same retained ring for recovery. The JS,
+  Python, and Go SDKs expose this cursor as `fromSequence`, `from_sequence`,
+  and `SubscribeTableFromSequence` respectively.
 - Send a Close frame (or just disconnect) to stop; the server breaks the
   forwarding loop on close.
+- Idle stream sessions receive a WebSocket ping every 30 seconds, and client
+  ping frames are answered with pong frames so gateways and clients can detect
+  dead connections without application-level polling.
+- A WebSocket send is bounded by a 10-second timeout; persistently stalled
+  consumers are disconnected so their connection task and retained buffers do
+  not grow without bound.
 
 ## `GET /v1/query-stream?table=<name>[&limit=<n>]` — live query
 

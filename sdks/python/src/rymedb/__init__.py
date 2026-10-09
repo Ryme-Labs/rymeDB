@@ -452,11 +452,17 @@ class RymeHttpClient:
         )
 
     def subscribe_table(
-        self, table: str, timeout: float = 30.0, from_commit: int | None = None
+        self,
+        table: str,
+        timeout: float = 30.0,
+        from_commit: int | None = None,
+        from_sequence: int | None = None,
     ) -> Subscription:
         path = f"/v1/stream?table={quote(table)}"
         if from_commit is not None:
             path += f"&from={from_commit}"
+        if from_sequence is not None:
+            path += f"&from_sequence={from_sequence}"
         return Subscription(self._socket_url(path), timeout)
 
     def subscribe_query(

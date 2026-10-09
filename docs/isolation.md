@@ -32,8 +32,10 @@ SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
 The setting is per connection and applies to simple and extended
 protocol queries. `RESET transaction_isolation` and `RESET ALL` restore
-the `SERIALIZABLE` default. No other level is accepted; there are no
-multi-statement transaction blocks, so each statement commits on its own.
+the `SERIALIZABLE` default. `BEGIN`/`START TRANSACTION`, `COMMIT`, and
+`ROLLBACK` hold one MVCC transaction across statements; a transaction that
+encounters an error returns `25P02` until it is rolled back. Outside an
+explicit block, each statement commits independently.
 
 ## Conflict errors
 

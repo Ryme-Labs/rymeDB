@@ -300,6 +300,23 @@ describe("RymeHttpClient", () => {
     close();
   });
 
+  it("appends the exact sequence cursor to stream urls", async () => {
+    const frames: string[] = [];
+    const { server, requests, close } = wsStub(frames);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const sub = subscribeTable(
+      `http://127.0.0.1:${port}`,
+      "docs",
+      () => {},
+      { fromSequence: 11 },
+    );
+    await sub.ready;
+    sub.close();
+    assert.equal(requests[0], "/v1/stream?table=docs&from_sequence=11");
+    close();
+  });
+
   it("streams query snapshots and updates over websocket", async () => {
     const frames = [
       `{"type":"snapshot","commit":7,"rows":[{"pk":"k1","value":"one"}]}`,

@@ -12,7 +12,7 @@ pins every row):
 | --- | --- |
 | Connection | `PING` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD` (atomic, see below) |
-| Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`), `GETDEL`, `MGET`, `MSET`, `APPEND`, `STRLEN` |
+| Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`GET`), `GETDEL`, `MGET`, `MSET`, `APPEND`, `STRLEN` |
 | Counters | `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT` (clean float formatting, saturating integers) |
 | Keys | `DEL`, `EXISTS`, `TYPE` (`string`/`none` in v1), `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST` |
 | Hashes | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HLEN`, `HGETALL`, `HKEYS`, `HVALS` |
@@ -20,7 +20,7 @@ pins every row):
 | Blocking lists | `BLPOP`, `BRPOP`, `BLMOVE` (commit-wakeup, timeout or `0` for indefinite) |
 | Sets | `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER` |
 | Sorted sets | `ZADD` (`NX`/`XX`/`GT`/`LT`), `ZSCORE`, `ZRANK`, `ZREVRANK`, `ZRANGE` (index ranges, `REV`, `WITHSCORES`), `ZREM`, `ZCARD`, `ZCOUNT`, `ZINCRBY` |
-| Iteration | `SCAN` (cursor, `MATCH`, `COUNT`) |
+| Iteration | `SCAN` (cursor, `MATCH`, `COUNT`), `KEYS` (full glob scan) |
 | Streams | `XADD` (auto/explicit IDs, `MAXLEN`/`MINID`), `XRANGE`, `XREVRANGE` (`COUNT`), `XLEN`, `XTRIM`, `XREAD` (`BLOCK`, `COUNT`), `XDEL`, `XGROUP` (`CREATE`/`DESTROY`/`SETID`), `XREADGROUP` (`BLOCK`, `COUNT`), `XACK`, `XPENDING` (summary), `XAUTOCLAIM`, `XINFO` (`STREAM`/`GROUPS`/`CONSUMERS`/`HELP`) |
 | HyperLogLog | `PFADD`, `PFCOUNT`, `PFMERGE` (p=14, ~0.81% std error) |
 | Geospatial | `GEOADD`, `GEODIST` (`m`/`km`/`mi`/`ft`), `GEOPOS`, `GEOHASH`, `GEOSEARCH` (`FROMMEMBER`/`FROMLONLAT`, `BYRADIUS`/`BYBOX`, `ASC`/`DESC`, `COUNT`, `WITHDIST`/`WITHCOORD`), `GEORADIUS`, `GEORADIUSBYMEMBER` (`WITHDIST`/`WITHHASH`/`WITHCOORD`, `STORE`/`STOREDIST`) |
@@ -94,9 +94,9 @@ arity, `value is not an integer or out of range`) surface as error elements in t
 while the remaining commands still apply, matching Redis. Nested
 `MULTI` and bare `EXEC`/`DISCARD` are rejected.
 
-Not yet covered: Lua
-scripting, pub/sub over RESP (use the WebSocket realtime API instead),
-`KEYS` (use `SCAN`).
+Not yet covered: Lua scripting and pub/sub over RESP (use the WebSocket
+realtime API instead). `KEYS` is supported for compatibility, but it scans
+the complete keyspace synchronously; use `SCAN` for production traffic.
 These return `unknown command` rather than a wrong answer.
 
 ## Connection management

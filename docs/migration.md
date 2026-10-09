@@ -12,8 +12,15 @@ archives cover data, not control metadata.
 
 ## PostgreSQL
 
-1. Export schema, then bulk load with `POST /v1/sql/copy` in 500-row
-   transactions (max 10000 rows per request).
+The wire gateway advertises `BackendKeyData` and honors PostgreSQL
+`CancelRequest` packets, returning SQLSTATE `57014` for a canceled statement
+at the next execution boundary.
+
+1. Export schema, then bulk load with PostgreSQL `COPY table FROM STDIN`
+   through the wire gateway or `POST /v1/sql/copy` in 500-row transactions
+   (max 10000 rows per request). The wire path accepts tab-separated text,
+   decodes standard COPY escapes, and returns `COPY n` after the final
+   `CopyDone` message.
 2. Parse `COPY ... FROM stdin` tab-separated dumps with `ryme-migrate`
    `parse_copy_text`, or `INSERT INTO ... VALUES` lines with
    `parse_insert_line`.
@@ -51,7 +58,8 @@ at the logical level; internal page formats are never imported.
 
 ## SQL dialect
 
-`CREATE TABLE`, `INSERT`, `UPSERT` (`ON CONFLICT` maps to upsert),
+`CREATE TABLE`, custom key/value `INSERT`, and PostgreSQL-style
+`INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
 `SELECT * FROM t KEY 'k'`, `SELECT * FROM t LIMIT n`, `UPDATE`, `DELETE`,
 `COPY t FROM stdin` (bulk path), `EXPLAIN <sql>` (planned access path),
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:

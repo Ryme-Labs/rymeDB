@@ -575,6 +575,7 @@ pub struct StreamQuery {
     pub table: String,
     pub api_key: Option<String>,
     pub from: Option<u64>,
+    pub from_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3370,6 +3371,9 @@ async fn presence_join(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_publish() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     if request.channel.is_empty() || request.member.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
     }
@@ -3417,6 +3421,9 @@ async fn presence_leave(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_publish() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     match state.realtime.presence_leave(&principal.tenant, &request.channel, &request.member) {
         Ok(removed) => {
             (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
@@ -3434,6 +3441,9 @@ async fn presence_list(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let now = ryme_txn::now_unix();
     let members = state.realtime.presence_list(&principal.tenant, &channel, now);
     (StatusCode::OK, Json(members)).into_response()
@@ -3490,6 +3500,9 @@ async fn broadcast_stream(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     if channel.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("channel")));
     }
@@ -3513,8 +3526,19 @@ async fn forward_broadcast(
 ) {
     let mut receiver = realtime.broadcast_subscribe(tenant, channel);
     let (mut sender, mut incoming) = socket.split();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if !send_realtime_message(
+                    &mut sender,
+                    axum::extract::ws::Message::Ping(Vec::new()),
+                )
+                .await {
+                    break;
+                }
+            }
             message = receiver.recv() => {
                 match message {
                     Ok(record) => {
@@ -3522,7 +3546,11 @@ async fn forward_broadcast(
                         if !stream_egress(&qos, tenant, text.len() as u64) {
                             break;
                         }
-                        if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
+                        if !send_realtime_message(
+                            &mut sender,
+                            axum::extract::ws::Message::Text(text),
+                        )
+                        .await {
                             break;
                         }
                     }
@@ -3533,6 +3561,15 @@ async fn forward_broadcast(
             next = incoming.next() => {
                 match next {
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
+                        if !send_realtime_message(
+                            &mut sender,
+                            axum::extract::ws::Message::Pong(payload),
+                        )
+                        .await {
+                            break;
+                        }
+                    }
                     _ => continue,
                 }
             }
@@ -5159,6 +5196,9 @@ async fn stream(
         Ok(principal) => principal,
         Err(_) => return error_response(ryme_error::RymeError::Unauthorized),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
     }
@@ -5167,9 +5207,11 @@ async fn stream(
     let database = state.database.clone();
     let table = query.table.clone();
     let from = query.from.unwrap_or(u64::MAX);
+    let from_sequence = query.from_sequence;
     let qos = state.qos.clone();
     upgrade.on_upgrade(move |socket| async move {
-        forward_changes(socket, realtime, qos, &tenant, &database, &table, from).await;
+        forward_changes(socket, realtime, qos, &tenant, &database, &table, from, from_sequence)
+            .await;
     })
 }
 
@@ -5180,6 +5222,21 @@ fn stream_egress(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64) -> boo
     }
 }
 
+const REALTIME_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn send_realtime_message(
+    sender: &mut futures_util::stream::SplitSink<
+        axum::extract::ws::WebSocket,
+        axum::extract::ws::Message,
+    >,
+    message: axum::extract::ws::Message,
+) -> bool {
+    tokio::time::timeout(REALTIME_SEND_TIMEOUT, sender.send(message))
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false)
+}
+
 async fn forward_changes(
     socket: axum::extract::ws::WebSocket,
     realtime: Realtime,
@@ -5188,10 +5245,20 @@ async fn forward_changes(
     database: &str,
     table: &str,
     from: u64,
+    from_sequence: Option<u64>,
 ) {
     let mut receiver = realtime.subscribe(tenant, database, table);
-    let replayed = realtime.replay(tenant, database, table, from, realtime.history_capacity());
-    let mut seen_sequence = 0u64;
+    let replayed = match from_sequence {
+        Some(sequence) => realtime.replay_after_sequence(
+            tenant,
+            database,
+            table,
+            sequence,
+            realtime.history_capacity(),
+        ),
+        None => realtime.replay(tenant, database, table, from, realtime.history_capacity()),
+    };
+    let mut seen_sequence = from_sequence.unwrap_or(0);
     let (mut sender, mut incoming) = socket.split();
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
@@ -5199,12 +5266,23 @@ async fn forward_changes(
         if !stream_egress(&qos, tenant, text.len() as u64) {
             return;
         }
-        if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
+        if !send_realtime_message(&mut sender, axum::extract::ws::Message::Text(text)).await {
             return;
         }
     }
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if !send_realtime_message(
+                    &mut sender,
+                    axum::extract::ws::Message::Ping(Vec::new()),
+                )
+                .await {
+                    break;
+                }
+            }
             message = receiver.recv() => {
                 match message {
                     Ok(record) => {
@@ -5216,17 +5294,62 @@ async fn forward_changes(
                         if !stream_egress(&qos, tenant, text.len() as u64) {
                             break;
                         }
-                        if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
+                        if !send_realtime_message(
+                            &mut sender,
+                            axum::extract::ws::Message::Text(text),
+                        )
+                        .await {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        let recovered = realtime.replay_after_sequence(
+                            tenant,
+                            database,
+                            table,
+                            seen_sequence,
+                            realtime.history_capacity(),
+                        );
+                        // The topic ring is bounded. If it no longer contains
+                        // every skipped topic event, close instead of silently
+                        // delivering a permanently incomplete change stream.
+                        if recovered.len() < skipped as usize {
+                            break;
+                        }
+                        for record in recovered {
+                            if record.sequence <= seen_sequence {
+                                continue;
+                            }
+                            seen_sequence = record.sequence;
+                            let text = serde_json::to_string(&record)
+                                .unwrap_or_else(|_| String::from("{}"));
+                            if !stream_egress(&qos, tenant, text.len() as u64) {
+                                return;
+                            }
+                            if !send_realtime_message(
+                                &mut sender,
+                                axum::extract::ws::Message::Text(text),
+                            )
+                            .await {
+                                return;
+                            }
+                        }
+                    }
                     Err(_) => break,
                 }
             }
             next = incoming.next() => {
                 match next {
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
+                        if !send_realtime_message(
+                            &mut sender,
+                            axum::extract::ws::Message::Pong(payload),
+                        )
+                        .await {
+                            break;
+                        }
+                    }
                     _ => continue,
                 }
             }
@@ -5277,8 +5400,19 @@ async fn forward_query(
     let (mut sender, mut incoming) = socket.split();
     let mut snapshot_commit =
         send_query_snapshot(&mut sender, &backend, &qos, tenant, database, table, limit).await;
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if !send_realtime_message(
+                    &mut sender,
+                    axum::extract::ws::Message::Ping(Vec::new()),
+                )
+                .await {
+                    break;
+                }
+            }
             message = receiver.recv() => {
                 match message {
                     Ok(update) => {
@@ -5299,7 +5433,11 @@ async fn forward_query(
                         if !stream_egress(&qos, tenant, text.len() as u64) {
                             break;
                         }
-                        if sender.send(axum::extract::ws::Message::Text(text)).await.is_err() {
+                        if !send_realtime_message(
+                            &mut sender,
+                            axum::extract::ws::Message::Text(text),
+                        )
+                        .await {
                             break;
                         }
                     }
@@ -5321,6 +5459,15 @@ async fn forward_query(
             next = incoming.next() => {
                 match next {
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
+                        if !send_realtime_message(
+                            &mut sender,
+                            axum::extract::ws::Message::Pong(payload),
+                        )
+                        .await {
+                            break;
+                        }
+                    }
                     _ => continue,
                 }
             }
@@ -5359,7 +5506,7 @@ async fn send_query_snapshot(
     if !stream_egress(qos, tenant, text.len() as u64) {
         return commit;
     }
-    let _ = sender.send(axum::extract::ws::Message::Text(text)).await;
+    let _ = send_realtime_message(sender, axum::extract::ws::Message::Text(text)).await;
     commit
 }
 

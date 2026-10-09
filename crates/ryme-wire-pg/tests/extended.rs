@@ -52,7 +52,7 @@ async fn extended_query_flow() {
         if tag == b'Z' {
             break;
         }
-        assert_eq!(tag, b'S');
+        assert!(tag == b'S' || tag == b'K');
     }
     let mut parse_body = cstring("stmt1");
     parse_body.extend(cstring("SELECT * FROM t KEY $1"));

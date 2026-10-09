@@ -200,6 +200,24 @@ impl Realtime {
             .collect()
     }
 
+    /// Replay retained changes after an exact per-topic sequence watermark.
+    /// Unlike commit timestamps, sequences distinguish multiple writes in the
+    /// same transaction and are therefore safe for reconnecting consumers.
+    pub fn replay_after_sequence(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Vec<ChangeRecord> {
+        let limit = limit.clamp(1, 100000);
+        let key = topic_key(tenant, database, table);
+        let Ok(inner) = self.inner.lock() else { return Vec::new() };
+        let Some(log) = inner.history.get(&key) else { return Vec::new() };
+        log.iter().filter(|record| record.sequence > after_sequence).take(limit).cloned().collect()
+    }
+
     pub fn history_capacity(&self) -> usize {
         self.inner.lock().map(|inner| inner.capacity).unwrap_or(0)
     }
@@ -522,6 +540,9 @@ mod tests {
         assert!(realtime.replay("t", "d", "docs", 30, 10).is_empty());
         assert_eq!(realtime.replay("t", "d", "docs", 0, 2).len(), 2);
         assert_eq!(realtime.replay("t", "d", "docs", 0, 5000).len(), 3);
+        let by_sequence = realtime.replay_after_sequence("t", "d", "docs", all[0].sequence, 10);
+        assert_eq!(by_sequence.len(), 2);
+        assert_eq!(by_sequence[0].commit_ts, 20);
     }
 
     #[test]

@@ -268,6 +268,9 @@ where
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        // Batch ordinary pipelined replies to reduce syscall overhead while
+        // keeping the response buffer bounded for connection-level fairness.
+        const WRITE_BATCH_BYTES: usize = 64 * 1024;
         let mut pending: Vec<u8> = Vec::new();
         let mut chunk = vec![0u8; 65536];
         loop {
@@ -276,13 +279,25 @@ where
                 return Ok(());
             }
             pending.extend_from_slice(&chunk[..read]);
-            while let Some((body, consumed)) = decode_frame(&pending)? {
-                pending.drain(0..consumed);
+            let mut consumed = 0usize;
+            let mut replies = Vec::with_capacity(WRITE_BATCH_BYTES);
+            while let Some((body, frame_bytes)) = decode_frame(&pending[consumed..])? {
+                consumed += frame_bytes;
                 let response = self.dispatch(&body).await;
                 let raw = serde_json::to_vec(&response)
                     .map_err(|e| RymeError::Internal(e.to_string()))?;
                 let frame = encode_frame(&raw)?;
-                socket.write_all(&frame).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                replies.extend_from_slice(&frame);
+                if replies.len() >= WRITE_BATCH_BYTES {
+                    socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    replies.clear();
+                }
+            }
+            if consumed > 0 {
+                pending.drain(..consumed);
+            }
+            if !replies.is_empty() {
+                socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             if pending.len() > MAX_FRAME + 4 {
                 return Err(RymeError::Overload(String::from("request")));

@@ -150,6 +150,27 @@ async fn client_setinfo_accepted_like_drivers() {
 }
 
 #[tokio::test]
+async fn pipelined_reply_flushes_before_a_blocking_command() {
+    let addr = serve().await;
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let frame = |parts: &[&str]| {
+        let mut out = format!("*{}\r\n", parts.len());
+        for part in parts {
+            out.push_str(&format!("${}\r\n{part}\r\n", part.len()));
+        }
+        out
+    };
+    let pipeline = format!("{}{}", frame(&["PING"]), frame(&["BLPOP", "empty", "1"]));
+    socket.write_all(pipeline.as_bytes()).await.unwrap();
+    let first =
+        tokio::time::timeout(Duration::from_millis(250), read_frame(&mut socket)).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&first), "+PONG\r\n");
+    let second =
+        tokio::time::timeout(Duration::from_secs(2), read_frame(&mut socket)).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&second), "*-1\r\n");
+}
+
+#[tokio::test]
 async fn echo_roundtrip() {
     let addr = serve().await;
     assert_eq!(command(addr, &["ECHO", "hello"]).await, "$5\r\nhello");

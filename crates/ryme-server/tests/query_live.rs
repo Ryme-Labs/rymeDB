@@ -235,7 +235,14 @@ async fn live_cdc_stream_resumes_from_commit() {
     let _ = put_commit(http, "docs", "r4", "four").await;
     let live = next_text(&mut resumed).await;
     assert_eq!(change_pk(&live), "r4", "{live}");
+    let sequence4 = live.get("sequence").and_then(|v| v.as_u64()).unwrap();
     resumed.close(None).await.unwrap();
+    let _ = put_commit(http, "docs", "r5", "five").await;
+    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}&from_sequence={sequence4}");
+    let (mut exact, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let replayed = next_text(&mut exact).await;
+    assert_eq!(change_pk(&replayed), "r5", "{replayed}");
+    exact.close(None).await.unwrap();
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }

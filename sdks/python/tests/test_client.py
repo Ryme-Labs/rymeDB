@@ -344,6 +344,18 @@ def test_subscribe_table_appends_from_watermark():
     assert requests[0] == "/v1/stream?table=docs&from=7&api_key=k"
 
 
+def test_subscribe_table_appends_exact_sequence_cursor():
+    from rymedb import Subscription
+
+    port, requests, thread = _ws_stub([])
+    client = RymeHttpClient(f"http://127.0.0.1:{port}", api_key="k")
+    sub = client.subscribe_table("docs", timeout=5.0, from_sequence=11)
+    assert isinstance(sub, Subscription)
+    sub.close()
+    thread.join(timeout=5.0)
+    assert requests[0] == "/v1/stream?table=docs&from_sequence=11&api_key=k"
+
+
 def test_subscribe_query_receives_snapshot_then_update():
     frames = [
         '{"type":"snapshot","commit":7,"rows":[{"pk":"k1","value":"one"}]}',

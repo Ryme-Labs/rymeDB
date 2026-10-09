@@ -1,7 +1,7 @@
 use ryme_error::{Result, RymeError};
 use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_storage::RecordKey;
-use ryme_txn::{Isolation, TxnBackend, TxnManager};
+use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -95,6 +95,14 @@ pub enum QueryResult {
 }
 
 pub type Row = (Vec<u8>, Vec<u8>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionChange {
+    pub table: String,
+    pub pk: Vec<u8>,
+    pub op: Operation,
+    pub after: Option<Vec<u8>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Field {
@@ -322,7 +330,19 @@ fn parse_create(tokens: &[String]) -> Result<Statement> {
 
 fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
-    let (pk, value) = key_value_from(tokens)?;
+    let (pk, value) = if let Some(values) =
+        tokens.iter().position(|token| token.eq_ignore_ascii_case("VALUES"))
+    {
+        let pk = tokens
+            .get(values + 1)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("missing values")))?;
+        let value = tokens
+            .get(values + 2)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("missing values")))?;
+        (eval_operand(pk)?.into_bytes(), eval_operand(value)?.into_bytes())
+    } else {
+        key_value_from(tokens)?
+    };
     let _ = raw;
     if tokens.iter().any(|t| t.eq_ignore_ascii_case("CONFLICT")) {
         return Ok(Statement::Upsert { table, pk, value });
@@ -719,13 +739,13 @@ fn new_uuid_v4() -> Result<String> {
 }
 
 fn parse_copy(tokens: &[String]) -> Result<Statement> {
-    let table =
-        table_after(tokens, "FROM").or_else(|_| table_after(tokens, "TO")).or_else(|_| {
-            tokens
-                .get(1)
-                .map(|v| unquote(v))
-                .ok_or_else(|| RymeError::InvalidArgument(String::from("copy table")))
-        })?;
+    let table = tokens
+        .get(1)
+        .filter(|token| !token.eq_ignore_ascii_case("FROM") && !token.eq_ignore_ascii_case("TO"))
+        .map(|value| unquote(value))
+        .or_else(|| table_after(tokens, "FROM").ok())
+        .or_else(|| table_after(tokens, "TO").ok())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("copy table")))?;
     Ok(Statement::CopyFrom { table, rows: Vec::new() })
 }
 
@@ -1008,6 +1028,279 @@ where
 
     pub async fn execute(&self, statement: Statement) -> Result<QueryResult> {
         self.execute_with(statement, self.isolation).await
+    }
+
+    pub fn begin_transaction(&self, isolation: Isolation) -> Transaction {
+        self.manager.begin_with(isolation)
+    }
+
+    pub async fn execute_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        statement: Statement,
+    ) -> Result<(QueryResult, Vec<TransactionChange>)> {
+        match statement {
+            Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
+            Statement::Explain { plan, .. } => Ok((
+                QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() },
+                Vec::new(),
+            )),
+            Statement::CopyFrom { table, rows } => {
+                self.reject_if_read_only()?;
+                if rows.len() > 10000 {
+                    return Err(RymeError::InvalidArgument(String::from("batch too large")));
+                }
+                let mut changes = Vec::with_capacity(rows.len());
+                for (pk, value) in rows {
+                    if pk.is_empty() || pk.len() > 1024 {
+                        return Err(RymeError::InvalidArgument(String::from("key")));
+                    }
+                    if value.len() > 4 * 1024 * 1024 {
+                        return Err(RymeError::Overload(String::from("value")));
+                    }
+                    let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                    let existed = self.manager.get(txn, &key)?.is_some();
+                    self.manager.put(txn, key, value.clone());
+                    changes.push(TransactionChange {
+                        table: table.clone(),
+                        pk,
+                        op: if existed { Operation::Update } else { Operation::Insert },
+                        after: Some(value),
+                    });
+                }
+                Ok((QueryResult::Ok, changes))
+            }
+            Statement::Insert { table, pk, value } => {
+                self.reject_if_read_only()?;
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                if self.manager.get(txn, &key)?.is_some() {
+                    return Err(RymeError::Conflict(String::from("exists")));
+                }
+                self.manager.put(txn, key, value.clone());
+                Ok((
+                    QueryResult::Ok,
+                    vec![TransactionChange {
+                        table,
+                        pk,
+                        op: Operation::Insert,
+                        after: Some(value),
+                    }],
+                ))
+            }
+            Statement::Upsert { table, pk, value } => {
+                self.reject_if_read_only()?;
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let existed = self.manager.get(txn, &key)?.is_some();
+                self.manager.put(txn, key, value.clone());
+                Ok((
+                    QueryResult::Ok,
+                    vec![TransactionChange {
+                        table,
+                        pk,
+                        op: if existed { Operation::Update } else { Operation::Insert },
+                        after: Some(value),
+                    }],
+                ))
+            }
+            Statement::Update { table, pk, value } => {
+                self.reject_if_read_only()?;
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                if self.manager.get(txn, &key)?.is_none() {
+                    return Err(RymeError::NotFound(String::from("row")));
+                }
+                self.manager.put(txn, key, value.clone());
+                Ok((
+                    QueryResult::Ok,
+                    vec![TransactionChange {
+                        table,
+                        pk,
+                        op: Operation::Update,
+                        after: Some(value),
+                    }],
+                ))
+            }
+            Statement::Delete { table, pk } => {
+                self.reject_if_read_only()?;
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                if self.manager.get(txn, &key)?.is_none() {
+                    return Err(RymeError::NotFound(String::from("row")));
+                }
+                self.manager.delete(txn, key);
+                Ok((
+                    QueryResult::Ok,
+                    vec![TransactionChange { table, pk, op: Operation::Delete, after: None }],
+                ))
+            }
+            statement => Ok((self.execute_read_in_transaction(txn, statement)?, Vec::new())),
+        }
+    }
+
+    pub async fn commit_transaction(
+        &self,
+        txn: Transaction,
+        changes: Vec<TransactionChange>,
+    ) -> Result<u64> {
+        let commit_ts = self.manager.commit(txn).await?;
+        for change in changes {
+            self.emit(&change.table, change.pk, change.op, change.after, commit_ts)?;
+        }
+        Ok(commit_ts)
+    }
+
+    fn execute_read_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        statement: Statement,
+    ) -> Result<QueryResult> {
+        match statement {
+            Statement::SelectByKey { table, pk } => {
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                match self.manager.get(txn, &key)? {
+                    Some(value) => Ok(QueryResult::Row { pk, value }),
+                    None => Ok(QueryResult::Rows { rows: Vec::new() }),
+                }
+            }
+            Statement::SelectScan { table, limit, offset, order, filter } => {
+                let plain = filter.is_empty() && offset == 0 && order == Order::default();
+                let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
+                let rows = self.manager.scan(txn, &self.tenant, &self.database, &table, cap)?;
+                let mut rows: Vec<(Vec<u8>, Vec<u8>)> = rows
+                    .into_iter()
+                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let (left, right) = match order.field {
+                        Field::Key => (&a.0, &b.0),
+                        Field::Value => (&a.1, &b.1),
+                    };
+                    match order.direction {
+                        Direction::Asc => left.cmp(right),
+                        Direction::Desc => right.cmp(left),
+                    }
+                });
+                Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
+            }
+            Statement::Aggregate { table, func, field, filter } => {
+                let rows = self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?;
+                let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
+                    .into_iter()
+                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
+                    .collect();
+                Ok(QueryResult::Scalar {
+                    label: func.label().to_string(),
+                    value: aggregate_rows(&rows, func, field),
+                })
+            }
+            Statement::GroupBy { table, select, group, filter, limit, offset, order } => {
+                let rows = self.manager.scan(txn, &self.tenant, &self.database, &table, 10000)?;
+                let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
+                for (pk, value) in rows {
+                    if !filter.iter().all(|p| p.matches(&pk, &value)) {
+                        continue;
+                    }
+                    let key = match group {
+                        Field::Key => pk.clone(),
+                        Field::Value => value.clone(),
+                    };
+                    groups.entry(key).or_default().push((pk, value));
+                }
+                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for (group_key, members) in &groups {
+                    let mut record = serde_json::Map::new();
+                    for item in &select {
+                        match item {
+                            SelectItem::Field(Field::Key) => {
+                                record.insert(
+                                    String::from("key"),
+                                    serde_json::Value::String(
+                                        String::from_utf8_lossy(group_key).to_string(),
+                                    ),
+                                );
+                            }
+                            SelectItem::Field(Field::Value) => {
+                                record.insert(
+                                    String::from("value"),
+                                    serde_json::Value::String(
+                                        String::from_utf8_lossy(
+                                            &members
+                                                .first()
+                                                .map(|(_, value)| value.clone())
+                                                .unwrap_or_default(),
+                                        )
+                                        .to_string(),
+                                    ),
+                                );
+                            }
+                            SelectItem::Agg(func, field) => {
+                                record.insert(
+                                    func.label().to_string(),
+                                    serde_json::Value::String(
+                                        String::from_utf8_lossy(&aggregate_rows(
+                                            members, *func, *field,
+                                        ))
+                                        .to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    out.push((
+                        group_key.clone(),
+                        serde_json::Value::Object(record).to_string().into_bytes(),
+                    ));
+                }
+                out.sort_by(|a, b| {
+                    let (first, second) = match order.field {
+                        Field::Key => (&a.0, &b.0),
+                        Field::Value => (&a.1, &b.1),
+                    };
+                    match order.direction {
+                        Direction::Asc => first.cmp(second),
+                        Direction::Desc => second.cmp(first),
+                    }
+                });
+                Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
+            }
+            Statement::Join { left, right, limit, offset, order, filter } => {
+                let left_rows =
+                    self.manager.scan(txn, &self.tenant, &self.database, &left, 10000)?;
+                let right_rows =
+                    self.manager.scan(txn, &self.tenant, &self.database, &right, 10000)?;
+                let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+                for (pk, value) in right_rows {
+                    index.entry(pk).or_insert(value);
+                }
+                let mut rows: Vec<(Vec<u8>, Vec<u8>)> = left_rows
+                    .into_iter()
+                    .filter_map(|(pk, left_value)| {
+                        index.get(&pk).map(|right_value| {
+                            let merged = serde_json::json!({
+                                "left": String::from_utf8_lossy(&left_value),
+                                "right": String::from_utf8_lossy(right_value),
+                            })
+                            .to_string()
+                            .into_bytes();
+                            (pk, merged)
+                        })
+                    })
+                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let (first, second) = match order.field {
+                        Field::Key => (&a.0, &b.0),
+                        Field::Value => (&a.1, &b.1),
+                    };
+                    match order.direction {
+                        Direction::Asc => first.cmp(second),
+                        Direction::Desc => second.cmp(first),
+                    }
+                });
+                Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
+            }
+            _ => Err(RymeError::InvalidArgument(String::from(
+                "statement is not readable in a transaction",
+            ))),
+        }
     }
 
     pub async fn execute_with(
@@ -1321,6 +1614,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_values_insert_and_conflict_upsert() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let insert = parse("INSERT INTO users (id, value) VALUES ('1', 'ada')").unwrap();
+        assert!(matches!(insert, Statement::Insert { ref table, ref pk, ref value }
+            if table == "users" && pk == b"1" && value == b"ada"));
+        executor.execute(insert).await.unwrap();
+
+        let upsert = parse(
+            "INSERT INTO users (id, value) VALUES ('1', 'grace') ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .unwrap();
+        assert!(matches!(upsert, Statement::Upsert { .. }));
+        executor.execute(upsert).await.unwrap();
+        let row = executor.execute(parse("SELECT * FROM users KEY '1'").unwrap()).await.unwrap();
+        match row {
+            QueryResult::Row { value, .. } => assert_eq!(value, b"grace"),
+            _ => panic!("expected row"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_stages_reads_until_commit() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let (_, changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO users KEY '1' VALUE 'ada'").unwrap(),
+            )
+            .await
+            .unwrap();
+        let (row, more_changes) = executor
+            .execute_in_transaction(&mut txn, parse("SELECT * FROM users KEY '1'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(row, QueryResult::Row { value, .. } if value == b"ada"));
+        assert!(more_changes.is_empty());
+        executor.commit_transaction(txn, changes).await.unwrap();
+
+        let committed =
+            executor.execute(parse("SELECT * FROM users KEY '1'").unwrap()).await.unwrap();
+        assert!(matches!(committed, QueryResult::Row { .. }));
+    }
+
+    #[tokio::test]
     async fn upsert_overwrites() {
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor.execute(parse("INSERT INTO users KEY '1' VALUE 'a'").unwrap()).await.unwrap();
@@ -1354,7 +1692,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         let parsed = parse("COPY docs FROM stdin").unwrap();
-        assert!(matches!(parsed, Statement::CopyFrom { .. }));
+        assert!(matches!(parsed, Statement::CopyFrom { table, .. } if table == "docs"));
     }
 
     #[tokio::test]

@@ -666,6 +666,7 @@ export interface SubscribeOptions {
   apiKey?: string;
   limit?: number;
   from?: number;
+  fromSequence?: number;
 }
 
 export interface Subscription {
@@ -681,6 +682,7 @@ export function subscribeTable(
 ): Subscription {
   let query = `/v1/stream?table=${encodeURIComponent(table)}`;
   if (options?.from !== undefined) query += `&from=${options.from}`;
+  if (options?.fromSequence !== undefined) query += `&from_sequence=${options.fromSequence}`;
   return openSocket(base, query, options, (data) => {
     onMessage(JSON.parse(data) as ChangeRecord);
   });

@@ -78,13 +78,27 @@ func (c *HttpClient) socketURL(path string, params map[string]string) string {
 }
 
 func (c *HttpClient) SubscribeTable(table string) (*Subscription, error) {
-	return c.SubscribeTableFrom(table, nil)
+	return c.subscribeTable(table, nil, nil)
 }
 
 func (c *HttpClient) SubscribeTableFrom(table string, from *uint64) (*Subscription, error) {
+	return c.subscribeTable(table, from, nil)
+}
+
+// SubscribeTableFromSequence resumes from an exact ChangeRecord sequence.
+// This is safer than a commit timestamp when one transaction changes several
+// rows with the same commit_ts.
+func (c *HttpClient) SubscribeTableFromSequence(table string, sequence *uint64) (*Subscription, error) {
+	return c.subscribeTable(table, nil, sequence)
+}
+
+func (c *HttpClient) subscribeTable(table string, from *uint64, sequence *uint64) (*Subscription, error) {
 	params := map[string]string{"table": table}
 	if from != nil {
 		params["from"] = fmt.Sprintf("%d", *from)
+	}
+	if sequence != nil {
+		params["from_sequence"] = fmt.Sprintf("%d", *sequence)
 	}
 	conn, err := websocket.Dial(
 		c.socketURL("/v1/stream", params),

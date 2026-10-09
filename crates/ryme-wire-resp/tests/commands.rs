@@ -52,6 +52,15 @@ async fn counters_roundtrip() {
 }
 
 #[tokio::test]
+async fn set_get_returns_the_previous_value_atomically() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["SET", "cache:key", "v1", "GET"]).await, "$-1");
+    assert_eq!(command(addr, &["SET", "cache:key", "v2", "GET"]).await, "$2\r\nv1");
+    assert_eq!(command(addr, &["SET", "missing", "v", "XX", "GET"]).await, "$-1");
+    assert_eq!(command(addr, &["GET", "missing"]).await, "$-1");
+}
+
+#[tokio::test]
 async fn float_counter_formats_cleanly() {
     let addr = serve().await;
     assert_eq!(command(addr, &["DEL", "f"]).await, ":0");
@@ -210,6 +219,19 @@ async fn scan_match_filters() {
     assert!(reply.contains("mx:1") && reply.contains("mx:2"), "glob page: {reply}");
     assert!(command(addr, &["SCAN", "zz"]).await.starts_with("-ERR"));
     assert!(command(addr, &["SCAN", "0", "TYPE", "string"]).await.starts_with("-ERR"));
+}
+
+#[tokio::test]
+async fn keys_matches_the_full_keyspace() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["MSET", "chat:1", "a", "chat:2", "b", "other", "c"]).await, "+OK");
+    let reply = command(addr, &["KEYS", "chat:?"]).await;
+    assert_eq!(reply, "*2\r\n$6\r\nchat:1\r\n$6\r\nchat:2");
+    assert_eq!(
+        command(addr, &["KEYS", "*"]).await,
+        "*3\r\n$6\r\nchat:1\r\n$6\r\nchat:2\r\n$5\r\nother"
+    );
+    assert!(command(addr, &["KEYS"]).await.starts_with("-ERR"));
 }
 
 #[tokio::test]

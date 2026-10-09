@@ -6,10 +6,11 @@ use ryme_observe::{
 };
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
-use ryme_sql::{bind, parse, Executor, QueryResult, Statement};
-use ryme_txn::{Isolation, TxnBackend, TxnManager};
+use ryme_sql::{bind, parse, Executor, QueryResult, Statement, TransactionChange};
+use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -32,6 +33,54 @@ struct Portal {
     statement: String,
     params: Vec<String>,
     cached: Option<(String, Statement)>,
+}
+
+enum CopyInState {
+    Receiving { table: String, data: Vec<u8> },
+    Failed { message: String },
+}
+
+struct SessionTransaction {
+    txn: Transaction,
+    changes: Vec<TransactionChange>,
+    failed: bool,
+}
+
+enum TransactionControl {
+    Begin(Isolation),
+    Commit,
+    Rollback,
+}
+
+static NEXT_BACKEND_PID: AtomicU32 = AtomicU32::new(1);
+static BACKEND_CANCELLATIONS: LazyLock<Mutex<HashMap<(u32, u32), Weak<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn register_backend() -> (u32, u32, Arc<AtomicBool>) {
+    let pid = NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed).max(1);
+    let secret = pid.rotate_left(13) ^ 0x9e37_79b9;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    if let Ok(mut backends) = BACKEND_CANCELLATIONS.lock() {
+        backends.retain(|_, signal| signal.strong_count() > 0);
+        backends.insert((pid, secret), Arc::downgrade(&cancellation));
+    }
+    (pid, secret, cancellation)
+}
+
+fn unregister_backend(pid: u32, secret: u32) {
+    if let Ok(mut backends) = BACKEND_CANCELLATIONS.lock() {
+        backends.remove(&(pid, secret));
+    }
+}
+
+fn cancel_backend(pid: u32, secret: u32) {
+    let signal = BACKEND_CANCELLATIONS
+        .lock()
+        .ok()
+        .and_then(|backends| backends.get(&(pid, secret)).and_then(Weak::upgrade));
+    if let Some(signal) = signal {
+        signal.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +336,28 @@ where
     }
 }
 
+async fn serve_authenticated<B, S>(
+    mut socket: S,
+    executor: Arc<Executor<B>>,
+    limits: ConnLimits,
+) -> std::result::Result<(), RymeError>
+where
+    B: TxnBackend,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (pid, secret, cancellation) = register_backend();
+    let result = async {
+        send_auth_ok(&mut socket).await?;
+        send_greeting(&mut socket).await?;
+        send_backend_key_data(&mut socket, pid, secret).await?;
+        send_ready(&mut socket).await?;
+        serve_loop(socket, executor, limits, cancellation).await
+    }
+    .await;
+    unregister_backend(pid, secret);
+    result
+}
+
 async fn handle_connection<B>(
     mut socket: TcpStream,
     executor: Arc<Executor<B>>,
@@ -296,6 +367,7 @@ async fn handle_connection<B>(
 where
     B: TxnBackend,
 {
+    const CANCEL_REQUEST_CODE: u32 = 80877102;
     let mut length_buffer = [0u8; 4];
     socket.read_exact(&mut length_buffer).await.map_err(|e| RymeError::Io(e.to_string()))?;
     let startup_len = u32::from_be_bytes(length_buffer) as usize;
@@ -322,10 +394,7 @@ where
                 }
                 let mut rest = vec![0u8; startup_len - 4];
                 tls_stream.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                send_auth_ok(&mut tls_stream).await?;
-                send_greeting(&mut tls_stream).await?;
-                send_ready(&mut tls_stream).await?;
-                return serve_loop(tls_stream, executor, limits).await;
+                return serve_authenticated(tls_stream, executor, limits).await;
             }
             socket.write_all(b"N").await.map_err(|e| RymeError::Io(e.to_string()))?;
             socket
@@ -338,10 +407,7 @@ where
             }
             let mut rest = vec![0u8; retry - 4];
             socket.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
-            send_auth_ok(&mut socket).await?;
-            send_greeting(&mut socket).await?;
-            send_ready(&mut socket).await?;
-            return serve_loop(socket, executor, limits).await;
+            return serve_authenticated(socket, executor, limits).await;
         }
         return Err(RymeError::InvalidArgument(String::from("startup")));
     }
@@ -350,16 +416,26 @@ where
     }
     let mut rest = vec![0u8; startup_len - 4];
     socket.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
-    send_auth_ok(&mut socket).await?;
-    send_greeting(&mut socket).await?;
-    send_ready(&mut socket).await?;
-    serve_loop(socket, executor, limits).await
+    // CancelRequest is a standalone 16-byte startup packet containing the
+    // backend pid and secret. It has no response; signal the matching live
+    // session and close this short-lived cancel connection.
+    if startup_len == 16
+        && rest.len() == 12
+        && u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) == CANCEL_REQUEST_CODE
+    {
+        let pid = u32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]);
+        let secret = u32::from_be_bytes([rest[8], rest[9], rest[10], rest[11]]);
+        cancel_backend(pid, secret);
+        return Ok(());
+    }
+    serve_authenticated(socket, executor, limits).await
 }
 
 async fn serve_loop<B, S>(
     mut socket: S,
     executor: Arc<Executor<B>>,
     limits: ConnLimits,
+    cancellation: Arc<AtomicBool>,
 ) -> std::result::Result<(), RymeError>
 where
     B: TxnBackend,
@@ -369,6 +445,8 @@ where
     let mut portals: HashMap<String, Portal> = HashMap::new();
     let mut prepared_cache: HashMap<String, (String, Statement)> = HashMap::new();
     let mut session: HashMap<String, String> = HashMap::new();
+    let mut copy_in: Option<CopyInState> = None;
+    let mut active_transaction: Option<SessionTransaction> = None;
     loop {
         let tag = match socket.read_u8().await {
             Ok(tag) => tag,
@@ -380,12 +458,106 @@ where
         }
         let mut payload = vec![0u8; length - 4];
         socket.read_exact(&mut payload).await.map_err(|e| RymeError::Io(e.to_string()))?;
+
+        if cancellation.swap(false, Ordering::Acquire) && copy_in.is_none() {
+            let response =
+                encode_error_code("57014", String::from("canceling statement due to user request"));
+            socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+            send_ready(&mut socket).await?;
+            continue;
+        }
+
+        if copy_in.is_some() {
+            match (copy_in.take(), tag) {
+                (Some(CopyInState::Receiving { table, mut data }), b'd') => {
+                    const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
+                    if data.len().saturating_add(payload.len()) > MAX_COPY_BYTES {
+                        copy_in = Some(CopyInState::Failed {
+                            message: String::from("COPY data exceeds the 64 MiB limit"),
+                        });
+                    } else {
+                        data.extend_from_slice(&payload);
+                        copy_in = Some(CopyInState::Receiving { table, data });
+                    }
+                    continue;
+                }
+                (Some(CopyInState::Receiving { table, data }), b'c') => {
+                    let response = match decode_copy_rows(&data) {
+                        Ok(rows) => {
+                            let statement =
+                                Statement::CopyFrom { table: table.clone(), rows: rows.clone() };
+                            if let Some(denied) =
+                                admit_statement(&limits, &statement, data.len() as u64)
+                            {
+                                denied
+                            } else {
+                                let start = std::time::Instant::now();
+                                match executor.bulk_upsert(table.clone(), rows).await {
+                                    Ok(count) => {
+                                        observe_statement(&limits, true);
+                                        limits.range_hook.note(table.as_bytes(), count as u64);
+                                        let fingerprint = limits.slow_log.as_ref().map(|_| {
+                                            query_fingerprint(&format!("COPY {table} FROM STDIN"))
+                                        });
+                                        record_timing(
+                                            &limits,
+                                            fingerprint,
+                                            table,
+                                            start.elapsed().as_micros() as u64,
+                                        );
+                                        copy_complete(count)
+                                    }
+                                    Err(error) => {
+                                        encode_error_code(error_code(&error), error.to_string())
+                                    }
+                                }
+                            }
+                        }
+                        Err(message) => encode_error_code("22P04", message),
+                    };
+                    let response = match admit_response(&limits, response.len() as u64) {
+                        Some(denied) => denied,
+                        None => response,
+                    };
+                    socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    send_ready(&mut socket).await?;
+                    continue;
+                }
+                (Some(CopyInState::Receiving { .. }), b'f') => {
+                    let response = encode_error_code("57014", copy_fail_message(&payload));
+                    socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    send_ready(&mut socket).await?;
+                    continue;
+                }
+                (Some(CopyInState::Failed { message }), b'd') => {
+                    copy_in = Some(CopyInState::Failed { message });
+                    continue;
+                }
+                (Some(CopyInState::Failed { message }), b'c' | b'f') => {
+                    let response = encode_error_code("22P04", message);
+                    socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    send_ready(&mut socket).await?;
+                    continue;
+                }
+                (Some(CopyInState::Receiving { .. }), _)
+                | (Some(CopyInState::Failed { .. }), _) => {
+                    let response =
+                        encode_error_code("08P01", String::from("unexpected message during COPY"));
+                    socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    send_ready(&mut socket).await?;
+                    continue;
+                }
+                (None, _) => unreachable!(),
+            }
+        }
+
         match tag {
             b'X' => return Ok(()),
             b'Q' => {
                 let query = String::from_utf8_lossy(&payload);
                 let mut out = Vec::new();
                 let mut failed = false;
+                let mut awaiting_copy = false;
                 for statement in split_statements(&query) {
                     let trimmed = statement.trim_matches(|c| c == '\0' || c == ';' || c == ' ');
                     if trimmed.is_empty() {
@@ -394,7 +566,16 @@ where
                     if failed {
                         break;
                     }
-                    if let Some(response) = session_command(trimmed, &mut session) {
+                    if let Some(control) = transaction_control(trimmed, &session) {
+                        out.extend_from_slice(
+                            &handle_transaction_control(
+                                control,
+                                &executor,
+                                &mut active_transaction,
+                            )
+                            .await,
+                        );
+                    } else if let Some(response) = session_command(trimmed, &mut session) {
                         out.extend_from_slice(&response);
                     } else if let Some(response) = prepared_command(
                         trimmed,
@@ -403,52 +584,33 @@ where
                         &executor,
                         &session,
                         &limits,
+                        &mut active_transaction,
                     )
                     .await
                     {
                         out.extend_from_slice(&response);
                     } else {
                         match parse(trimmed) {
+                            Ok(Statement::CopyFrom { table, rows }) if rows.is_empty() => {
+                                out.extend_from_slice(&copy_in_response());
+                                copy_in = Some(CopyInState::Receiving { table, data: Vec::new() });
+                                awaiting_copy = true;
+                                break;
+                            }
                             Ok(statement) => {
-                                if let Some(denied) =
-                                    admit_statement(&limits, &statement, trimmed.len() as u64)
-                                {
-                                    out.extend_from_slice(&denied);
+                                let response = execute_statement_for_session(
+                                    &executor,
+                                    &limits,
+                                    statement,
+                                    trimmed.len() as u64,
+                                    &session,
+                                    &mut active_transaction,
+                                )
+                                .await;
+                                if response.first() == Some(&b'E') {
                                     failed = true;
-                                } else {
-                                    let write = statement.is_write();
-                                    let table = statement.table().to_string();
-                                    let fingerprint = limits
-                                        .slow_log
-                                        .as_ref()
-                                        .map(|_| query_fingerprint(trimmed));
-                                    let start = std::time::Instant::now();
-                                    match executor
-                                        .execute_with(statement, session_isolation(&session))
-                                        .await
-                                    {
-                                        Ok(result) => {
-                                            observe_statement(&limits, write);
-                                            if write {
-                                                limits.range_hook.note(table.as_bytes(), 1);
-                                            }
-                                            record_timing(
-                                                &limits,
-                                                fingerprint,
-                                                table,
-                                                start.elapsed().as_micros() as u64,
-                                            );
-                                            out.extend_from_slice(&encode_result(result));
-                                        }
-                                        Err(e) => {
-                                            out.extend_from_slice(&encode_error_code(
-                                                error_code(&e),
-                                                e.to_string(),
-                                            ));
-                                            failed = true;
-                                        }
-                                    }
                                 }
+                                out.extend_from_slice(&response);
                             }
                             Err(_) => match session_select(trimmed) {
                                 Some(rows) => out.extend_from_slice(&encode_session_rows(rows)),
@@ -458,6 +620,9 @@ where
                                         format!("unsupported statement: {trimmed}"),
                                     ));
                                     failed = true;
+                                    if let Some(transaction) = active_transaction.as_mut() {
+                                        transaction.failed = true;
+                                    }
                                 }
                             },
                         }
@@ -466,12 +631,20 @@ where
                 if out.is_empty() {
                     out.extend_from_slice(&frame(b'I', b""));
                 }
+                if cancellation.swap(false, Ordering::Acquire) {
+                    out = encode_error_code(
+                        "57014",
+                        String::from("canceling statement due to user request"),
+                    );
+                }
                 let out = match admit_response(&limits, out.len() as u64) {
                     Some(denied) => denied,
                     None => out,
                 };
                 socket.write_all(&out).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                send_ready(&mut socket).await?;
+                if !awaiting_copy {
+                    send_ready(&mut socket).await?;
+                }
             }
             b'P' => match parse_prepare(&payload) {
                 Ok((name, query)) => {
@@ -538,49 +711,33 @@ where
                                     Err(e) => Err(e),
                                 },
                             };
-                            match parsed {
-                                Ok(statement) => {
-                                    if let Some(denied) =
-                                        admit_statement(&limits, &statement, bound.len() as u64)
-                                    {
-                                        denied
-                                    } else {
-                                        let write = statement.is_write();
-                                        let table = statement.table().to_string();
-                                        let fingerprint = limits
-                                            .slow_log
-                                            .as_ref()
-                                            .map(|_| query_fingerprint(&bound));
-                                        let start = std::time::Instant::now();
-                                        match executor
-                                            .execute_with(statement, session_isolation(&session))
-                                            .await
-                                        {
-                                            Ok(result) => {
-                                                observe_statement(&limits, write);
-                                                if write {
-                                                    limits.range_hook.note(table.as_bytes(), 1);
-                                                }
-                                                record_timing(
-                                                    &limits,
-                                                    fingerprint,
-                                                    table,
-                                                    start.elapsed().as_micros() as u64,
-                                                );
-                                                encode_result(result)
-                                            }
-                                            Err(e) => {
-                                                encode_error_code(error_code(&e), e.to_string())
-                                            }
-                                        }
+                            if let Some(control) = transaction_control(trimmed, &session) {
+                                handle_transaction_control(
+                                    control,
+                                    &executor,
+                                    &mut active_transaction,
+                                )
+                                .await
+                            } else {
+                                match parsed {
+                                    Ok(statement) => {
+                                        execute_statement_for_session(
+                                            &executor,
+                                            &limits,
+                                            statement,
+                                            bound.len() as u64,
+                                            &session,
+                                            &mut active_transaction,
+                                        )
+                                        .await
                                     }
+                                    Err(_) => match session_select(
+                                        bound.trim_matches(|c| c == '\0' || c == ';' || c == ' '),
+                                    ) {
+                                        Some(rows) => encode_session_rows(rows),
+                                        None => encode_error_code("42601", String::from("syntax")),
+                                    },
                                 }
-                                Err(_) => match session_select(
-                                    bound.trim_matches(|c| c == '\0' || c == ';' || c == ' '),
-                                ) {
-                                    Some(rows) => encode_session_rows(rows),
-                                    None => encode_error_code("42601", String::from("syntax")),
-                                },
                             }
                         }
                         None => encode_error(String::from("unknown statement")),
@@ -590,6 +747,14 @@ where
                 let response = match admit_response(&limits, response.len() as u64) {
                     Some(denied) => denied,
                     None => response,
+                };
+                let response = if cancellation.swap(false, Ordering::Acquire) {
+                    encode_error_code(
+                        "57014",
+                        String::from("canceling statement due to user request"),
+                    )
+                } else {
+                    response
                 };
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
@@ -696,6 +861,139 @@ fn session_isolation(session: &HashMap<String, String>) -> Isolation {
     }
 }
 
+fn transaction_control(
+    query: &str,
+    session: &HashMap<String, String>,
+) -> Option<TransactionControl> {
+    let normalized = query.trim().trim_end_matches(';').trim();
+    let upper = normalized.to_ascii_uppercase();
+    if upper == "BEGIN"
+        || upper == "BEGIN TRANSACTION"
+        || upper == "START TRANSACTION"
+        || upper.starts_with("BEGIN ISOLATION LEVEL ")
+        || upper.starts_with("START TRANSACTION ISOLATION LEVEL ")
+    {
+        let isolation = if upper.contains("ISOLATION LEVEL SNAPSHOT") {
+            Isolation::Snapshot
+        } else if upper.contains("ISOLATION LEVEL READ COMMITTED") {
+            Isolation::Snapshot
+        } else {
+            session_isolation(session)
+        };
+        return Some(TransactionControl::Begin(isolation));
+    }
+    if upper == "COMMIT" || upper == "COMMIT TRANSACTION" || upper == "END" {
+        return Some(TransactionControl::Commit);
+    }
+    if upper == "ROLLBACK" || upper == "ROLLBACK TRANSACTION" {
+        return Some(TransactionControl::Rollback);
+    }
+    None
+}
+
+async fn handle_transaction_control<B>(
+    control: TransactionControl,
+    executor: &Arc<Executor<B>>,
+    active: &mut Option<SessionTransaction>,
+) -> Vec<u8>
+where
+    B: TxnBackend,
+{
+    match control {
+        TransactionControl::Begin(isolation) => {
+            if active.is_some() {
+                encode_error_code("25001", String::from("transaction already in progress"))
+            } else {
+                *active = Some(SessionTransaction {
+                    txn: executor.begin_transaction(isolation),
+                    changes: Vec::new(),
+                    failed: false,
+                });
+                command_complete("BEGIN")
+            }
+        }
+        TransactionControl::Commit => {
+            let Some(state) = active.take() else {
+                return command_complete("COMMIT");
+            };
+            if state.failed {
+                return encode_error_code(
+                    "25P02",
+                    String::from("current transaction is aborted, commands ignored until end of transaction block"),
+                );
+            }
+            match executor.commit_transaction(state.txn, state.changes).await {
+                Ok(_) => command_complete("COMMIT"),
+                Err(error) => encode_error_code(error_code(&error), error.to_string()),
+            }
+        }
+        TransactionControl::Rollback => {
+            active.take();
+            command_complete("ROLLBACK")
+        }
+    }
+}
+
+async fn execute_statement_for_session<B>(
+    executor: &Arc<Executor<B>>,
+    limits: &ConnLimits,
+    statement: Statement,
+    bytes: u64,
+    session: &HashMap<String, String>,
+    active: &mut Option<SessionTransaction>,
+) -> Vec<u8>
+where
+    B: TxnBackend,
+{
+    if active.as_ref().is_some_and(|transaction| transaction.failed) {
+        return encode_error_code(
+            "25P02",
+            String::from(
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ),
+        );
+    }
+    if let Some(denied) = admit_statement(limits, &statement, bytes) {
+        if let Some(transaction) = active.as_mut() {
+            transaction.failed = true;
+        }
+        return denied;
+    }
+    let write = statement.is_write();
+    let table = statement.table().to_string();
+    let fingerprint = limits.slow_log.as_ref().map(|_| query_fingerprint(&table));
+    let start = std::time::Instant::now();
+    if let Some(transaction) = active.as_mut() {
+        match executor.execute_in_transaction(&mut transaction.txn, statement).await {
+            Ok((result, changes)) => {
+                if write {
+                    limits.range_hook.note(table.as_bytes(), changes.len().max(1) as u64);
+                }
+                transaction.changes.extend(changes);
+                observe_statement(limits, write);
+                record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
+                encode_result(result)
+            }
+            Err(error) => {
+                transaction.failed = true;
+                encode_error_code(error_code(&error), error.to_string())
+            }
+        }
+    } else {
+        match executor.execute_with(statement, session_isolation(session)).await {
+            Ok(result) => {
+                observe_statement(limits, write);
+                if write {
+                    limits.range_hook.note(table.as_bytes(), 1);
+                }
+                record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
+                encode_result(result)
+            }
+            Err(error) => encode_error_code(error_code(&error), error.to_string()),
+        }
+    }
+}
+
 async fn prepared_command<B>(
     query: &str,
     statements: &mut HashMap<String, String>,
@@ -703,6 +1001,7 @@ async fn prepared_command<B>(
     executor: &Arc<Executor<B>>,
     session: &HashMap<String, String>,
     limits: &ConnLimits,
+    active: &mut Option<SessionTransaction>,
 ) -> Option<Vec<u8>>
 where
     B: TxnBackend,
@@ -778,30 +1077,17 @@ where
                 },
             };
             match parsed {
-                Ok(statement) => {
-                    if let Some(denied) = admit_statement(limits, &statement, bound.len() as u64) {
-                        Some(denied)
-                    } else {
-                        let write = statement.is_write();
-                        let table = statement.table().to_string();
-                        let fingerprint =
-                            limits.slow_log.as_ref().map(|_| query_fingerprint(&bound));
-                        let start = std::time::Instant::now();
-                        match executor.execute_with(statement, session_isolation(session)).await {
-                            Ok(result) => {
-                                observe_statement(limits, write);
-                                record_timing(
-                                    limits,
-                                    fingerprint,
-                                    table,
-                                    start.elapsed().as_micros() as u64,
-                                );
-                                Some(encode_result(result))
-                            }
-                            Err(e) => Some(encode_error_code(error_code(&e), e.to_string())),
-                        }
-                    }
-                }
+                Ok(statement) => Some(
+                    execute_statement_for_session(
+                        executor,
+                        limits,
+                        statement,
+                        bound.len() as u64,
+                        session,
+                        active,
+                    )
+                    .await,
+                ),
                 Err(_) => {
                     Some(encode_error_code("42601", format!("unsupported statement: {query}")))
                 }
@@ -1183,6 +1469,90 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
     }
 }
 
+fn copy_in_response() -> Vec<u8> {
+    let mut body = Vec::with_capacity(9);
+    body.push(0); // text format
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&0i16.to_be_bytes());
+    body.extend_from_slice(&0i16.to_be_bytes());
+    frame(b'G', &body)
+}
+
+fn copy_complete(rows: usize) -> Vec<u8> {
+    command_complete(&format!("COPY {rows}"))
+}
+
+fn copy_fail_message(payload: &[u8]) -> String {
+    let message = payload.split(|byte| *byte == 0).next().unwrap_or(payload);
+    let message = String::from_utf8_lossy(message).trim().to_string();
+    if message.is_empty() {
+        String::from("COPY failed")
+    } else {
+        message
+    }
+}
+
+fn decode_copy_rows(data: &[u8]) -> std::result::Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+    const MAX_COPY_ROWS: usize = 10_000;
+    let mut rows = Vec::new();
+    for raw_line in data.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(&[b'\r'][..]).unwrap_or(raw_line);
+        if line.is_empty() || line == b"\\." {
+            continue;
+        }
+        if rows.len() >= MAX_COPY_ROWS {
+            return Err(String::from("COPY exceeds the 10000 row limit"));
+        }
+        let Some(separator) = line.iter().position(|byte| *byte == b'\t') else {
+            return Err(String::from("COPY text rows require key and value columns"));
+        };
+        if line[separator + 1..].contains(&b'\t') {
+            return Err(String::from("COPY rows must contain exactly two columns"));
+        }
+        let key = decode_copy_field(&line[..separator])?;
+        let value = decode_copy_field(&line[separator + 1..])?;
+        if key.is_empty() {
+            return Err(String::from("COPY key cannot be empty"));
+        }
+        if key.len() > 1024 {
+            return Err(String::from("COPY key exceeds the 1024 byte limit"));
+        }
+        if value.len() > 4 * 1024 * 1024 {
+            return Err(String::from("COPY value exceeds the 4 MiB limit"));
+        }
+        rows.push((key, value));
+    }
+    Ok(rows)
+}
+
+fn decode_copy_field(field: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    if field == b"\\N" {
+        return Ok(Vec::new());
+    }
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while index < field.len() {
+        if field[index] != b'\\' {
+            decoded.push(field[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(escaped) = field.get(index).copied() else {
+            return Err(String::from("COPY field ends with an incomplete escape"));
+        };
+        decoded.push(match escaped {
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b'\\' => b'\\',
+            other => other,
+        });
+        index += 1;
+    }
+    Ok(decoded)
+}
+
 fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + body.len());
     out.push(tag);
@@ -1291,6 +1661,17 @@ where
     body.extend_from_slice(&0u32.to_be_bytes());
     let packet = frame(b'R', &body);
     socket.write_all(&packet).await.map_err(|e| RymeError::Io(e.to_string()))?;
+    Ok(())
+}
+
+async fn send_backend_key_data<S>(socket: &mut S, pid: u32, secret: u32) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&pid.to_be_bytes());
+    body.extend_from_slice(&secret.to_be_bytes());
+    socket.write_all(&frame(b'K', &body)).await.map_err(|e| RymeError::Io(e.to_string()))?;
     Ok(())
 }
 

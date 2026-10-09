@@ -435,6 +435,11 @@ where
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        // Keep parsing and writing decoupled for a small bounded batch.  This is
+        // especially important for pipelined clients: one write per command
+        // turns a single read into a syscall storm, while an unbounded reply
+        // buffer would let a client consume arbitrary memory.
+        const WRITE_BATCH_BYTES: usize = 64 * 1024;
         let mut buffer = vec![0u8; 65536];
         let mut pending: Vec<u8> = Vec::new();
         let mut multi: Option<Multi> = None;
@@ -445,18 +450,48 @@ where
                 return Ok(());
             }
             pending.extend_from_slice(&buffer[..read]);
-            while let Some((command, consumed)) = decode_command(&pending)? {
-                pending.drain(0..consumed);
+            let mut consumed = 0usize;
+            let mut replies = Vec::with_capacity(WRITE_BATCH_BYTES);
+            while let Some((command, command_bytes)) = decode_command(&pending[consumed..])? {
+                consumed += command_bytes;
+                if !replies.is_empty() && Self::may_block(&command, &multi) {
+                    socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    replies.clear();
+                }
                 let reply = self.dispatch_conn(command, &mut multi, &mut client).await;
                 let reply = match self.admit_response(reply.len() as u64) {
                     Some(denied) => denied,
                     None => reply,
                 };
-                socket.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                replies.extend_from_slice(&reply);
+                if replies.len() >= WRITE_BATCH_BYTES {
+                    socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    replies.clear();
+                }
+            }
+            // Compact once after the whole parse pass.  Draining per command
+            // makes large pipelines repeatedly memmove the unread suffix.
+            if consumed > 0 {
+                pending.drain(..consumed);
+            }
+            if !replies.is_empty() {
+                socket.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             if pending.len() > 1024 * 1024 {
                 return Err(RymeError::Overload(String::from("request")));
             }
+        }
+    }
+
+    fn may_block(command: &RespCommand, multi: &Option<Multi>) -> bool {
+        if multi.is_some() {
+            return false;
+        }
+        match command.name.as_str() {
+            "BLPOP" | "BRPOP" | "BLMOVE" => true,
+            "XREAD" => Self::xread_waits(&command.args),
+            "XREADGROUP" => Self::xread_waits(&command.args),
+            _ => false,
         }
     }
 
@@ -832,7 +867,11 @@ where
                 };
                 let record =
                     RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
-                let exists = self.manager.get(txn, &record).unwrap_or(None).is_some();
+                let previous = match self.manager.get(txn, &record) {
+                    Ok(value) => value,
+                    Err(e) => return encode_error(e.to_string()),
+                };
+                let exists = previous.is_some();
                 if options.only_missing && exists {
                     return encode_null();
                 }
@@ -843,7 +882,11 @@ where
                     Some(ts) => self.manager.put_with_ttl(txn, record, command.args[1].clone(), ts),
                     None => self.manager.put(txn, record, command.args[1].clone()),
                 }
-                encode_simple("OK")
+                if options.return_previous {
+                    previous.map_or_else(encode_null, |value| encode_bulk(&value))
+                } else {
+                    encode_simple("OK")
+                }
             }
             "GETDEL" => match command.args.first() {
                 Some(key) => {
@@ -1348,6 +1391,41 @@ where
                 Ok(reply) => reply,
                 Err(e) => encode_error(e),
             },
+            "KEYS" => {
+                if command.args.len() != 1 {
+                    return encode_error(String::from("wrong args"));
+                }
+                let pattern = &command.args[0];
+                let mut after = Vec::new();
+                let mut keys = Vec::new();
+                loop {
+                    let rows = match self.manager.scan_after(
+                        txn,
+                        &self.tenant,
+                        &self.database,
+                        KV_TABLE,
+                        &after,
+                        512,
+                    ) {
+                        Ok(rows) => rows,
+                        Err(e) => return encode_error(e.to_string()),
+                    };
+                    if rows.is_empty() {
+                        break;
+                    }
+                    let short_page = rows.len() < 512;
+                    for (key, _) in rows {
+                        after = key.clone();
+                        if glob_match(pattern, &key) {
+                            keys.push(Some(key));
+                        }
+                    }
+                    if short_page {
+                        break;
+                    }
+                }
+                encode_array(keys)
+            }
             "XADD" => match self.xadd(txn, &command.args) {
                 Ok(id) => encode_bulk(id.as_bytes()),
                 Err(e) => encode_error(e),
@@ -3869,10 +3947,16 @@ struct SetOptions {
     expires_at: Option<u64>,
     only_missing: bool,
     only_present: bool,
+    return_previous: bool,
 }
 
 fn parse_set_options(args: &[Vec<u8>]) -> std::result::Result<SetOptions, String> {
-    let mut options = SetOptions { expires_at: None, only_missing: false, only_present: false };
+    let mut options = SetOptions {
+        expires_at: None,
+        only_missing: false,
+        only_present: false,
+        return_previous: false,
+    };
     let mut index = 0;
     while index < args.len() {
         let name = std::str::from_utf8(&args[index]).map_err(|_| String::from("syntax"))?;
@@ -3883,6 +3967,10 @@ fn parse_set_options(args: &[Vec<u8>]) -> std::result::Result<SetOptions, String
             }
             "XX" => {
                 options.only_present = true;
+                index += 1;
+            }
+            "GET" => {
+                options.return_previous = true;
                 index += 1;
             }
             "EX" | "PX" | "EXAT" | "PXAT" => {
@@ -4198,6 +4286,7 @@ fn is_known(name: &str) -> bool {
             | "ZCOUNT"
             | "ZINCRBY"
             | "SCAN"
+            | "KEYS"
             | "XADD"
             | "XRANGE"
             | "XREVRANGE"
