@@ -59,18 +59,70 @@ impl BranchManager {
             normalized.insert(key, branch);
         }
         manager.branches = normalized;
+        manager.rebuild_refs()?;
         Ok(manager)
     }
 
     pub fn persist(&self, path: &Path) -> Result<()> {
+        self.validate()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec(self)
             .map_err(|error| RymeError::Internal(format!("branch metadata: {error}")))?;
         let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, bytes)?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
         std::fs::rename(temporary, path)?;
+        Ok(())
+    }
+
+    fn rebuild_refs(&mut self) -> Result<()> {
+        self.validate_branches()?;
+        let mut refs = HashMap::new();
+        for branch in self.branches.values() {
+            *refs.entry(branch.manifest_id.clone()).or_insert(0) += 1;
+        }
+        self.refs = refs;
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.validate_branches()?;
+        let mut expected = HashMap::new();
+        for branch in self.branches.values() {
+            *expected.entry(branch.manifest_id.clone()).or_insert(0) += 1;
+        }
+        if self.refs != expected {
+            return Err(RymeError::Corrupt(String::from("branch manifest references")));
+        }
+        Ok(())
+    }
+
+    fn validate_branches(&self) -> Result<()> {
+        for (key, branch) in &self.branches {
+            if key != &scoped_key(&branch.tenant, &branch.id)
+                || branch.id.is_empty()
+                || branch.id.len() > 128
+                || branch.id.contains('/')
+                || branch.id.contains("..")
+                || branch.id.contains('\0')
+            {
+                return Err(RymeError::Corrupt(String::from("branch identity")));
+            }
+            if !self.manifests.contains_key(&branch.manifest_id) {
+                return Err(RymeError::Corrupt(String::from("branch manifest")));
+            }
+            if let Some(parent) = &branch.parent_id {
+                if !self.branches.contains_key(&scoped_key(&branch.tenant, parent)) {
+                    return Err(RymeError::Corrupt(String::from("branch parent")));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -158,6 +210,13 @@ impl BranchManager {
     }
 
     pub fn delete_for(&mut self, tenant: &str, id: &str) -> Result<Vec<String>> {
+        if self
+            .branches
+            .values()
+            .any(|branch| branch.tenant == tenant && branch.parent_id.as_deref() == Some(id))
+        {
+            return Err(RymeError::Conflict(String::from("branch has children")));
+        }
         let branch = self
             .branches
             .remove(&scoped_key(tenant, id))
@@ -651,6 +710,52 @@ mod tests {
         assert_eq!(restored.get("preview").unwrap().base_commit_ts, 7);
         assert!(restored.diff("main", "preview").unwrap().0.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_rebuilds_manifest_refs_instead_of_trusting_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-branches-refs-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut manager = root_manager();
+        manager.create_child(String::from("preview"), "main", 7).unwrap();
+        manager.refs.clear();
+        std::fs::write(&path, serde_json::to_vec(&manager).unwrap()).unwrap();
+
+        let restored = BranchManager::load(&path).unwrap();
+        assert_eq!(restored.refs.get("genesis"), Some(&2));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_rejects_missing_manifest() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-branches-corrupt-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut manager = root_manager();
+        manager.branches.get_mut("default\0main").unwrap().manifest_id = String::from("gone");
+        std::fs::write(&path, serde_json::to_vec(&manager).unwrap()).unwrap();
+
+        assert!(BranchManager::load(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parent_cannot_be_deleted_while_children_exist() {
+        let mut manager = root_manager();
+        manager.create_child(String::from("preview"), "main", 7).unwrap();
+        assert!(matches!(manager.delete("main"), Err(RymeError::Conflict(_))));
+        assert!(manager.get("main").is_ok());
     }
 
     #[test]

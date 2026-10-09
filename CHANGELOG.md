@@ -17,6 +17,9 @@ All notable changes to rymeDB are recorded here. Format follows
   preserving branch-only tables and indexes across executor recreation while
   keeping branch DDL out of `main`; child branches inherit their parent
   schema snapshot, and archives preserve the nested branch metadata paths.
+- Branch metadata persistence now fsyncs the replacement file, rebuilds
+  manifest reference counts during recovery, rejects missing manifests or
+  parents, and prevents deleting a branch that still has children.
 - Durable commits now append checksummed immutable `.sst` delta segments, while
   snapshots produce full sorted bases with sparse indexes and Bloom filters;
   startup merges the segment set when snapshots are unavailable, retention
