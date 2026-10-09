@@ -54,6 +54,8 @@ with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is`, `like`, `ilike`, and
 `not.<operator>` filters plus field projection/aliases,
 `POST /rest/v1/:table` with `{key, value}` or `{rows: [...]}`,
 `DELETE /rest/v1/:table?key=eq.<id>`.
+Filtered reads continue across storage pages, and non-key `order` clauses
+scan the complete filtered result before sorting.
 
 GraphQL: `POST /graphql` with `{ table(key: "k") }` or `{ table(limit: 100) }`.
 

@@ -2706,11 +2706,24 @@ async fn rest_list(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    let rows = match gateway.scan(&principal, &table, limit.saturating_add(offset)) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(e),
-    };
-    let filtered = rest_list_filtered(rows, raw.as_deref().unwrap_or(""));
+    let raw = raw.as_deref().unwrap_or("");
+    let target = limit.saturating_add(offset);
+    let full_order_scan = rest_order_requires_full_scan(query.order.as_deref());
+    let page_limit = if full_order_scan { 256 } else { target.clamp(1, 1000) };
+    let mut cursor = None;
+    let mut filtered = Vec::new();
+    loop {
+        let (page, next) =
+            match gateway.scan_page(&principal, &table, cursor.as_deref(), page_limit) {
+                Ok(page) => page,
+                Err(e) => return error_response(e),
+            };
+        filtered.extend(rest_list_filtered(page, raw));
+        if (!full_order_scan && filtered.len() >= target) || next.is_none() {
+            break;
+        }
+        cursor = next;
+    }
     let ordered = order_rows(filtered, query.order.as_deref());
     let paged: Vec<(Vec<u8>, Vec<u8>)> = ordered.into_iter().skip(offset).take(limit).collect();
     let egress: u64 = paged.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
@@ -2964,6 +2977,14 @@ fn order_rows(rows: Vec<(Vec<u8>, Vec<u8>)>, order: Option<&str>) -> Vec<(Vec<u8
         }
     });
     rows
+}
+
+fn rest_order_requires_full_scan(order: Option<&str>) -> bool {
+    let spec = order.and_then(|value| value.split(',').next()).unwrap_or("key.asc");
+    let mut parts = spec.split('.');
+    let field = parts.next().unwrap_or("key").trim();
+    let descending = parts.next().is_some_and(|direction| direction.eq_ignore_ascii_case("desc"));
+    field != "key" || descending
 }
 
 async fn rest_insert(

@@ -112,6 +112,29 @@ async fn compat_rest_graphql_copy_explain() {
     assert!(text.contains(r#""status":"ready""#), "{text}");
     assert!(!text.contains("owner"), "{text}");
     assert!(!text.contains("p2"), "{text}");
+    let rows = (0..257)
+        .map(|index| {
+            let value = serde_json::json!({
+                "status": if index == 256 { "ready" } else { "queued" },
+            });
+            serde_json::json!({
+                "key": format!("row-{index:03}"),
+                "value": serde_json::to_string(&value).unwrap(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "table": "long_profiles",
+        "rows": rows,
+    }))
+    .unwrap();
+    let (status, _) = http_request(http, "POST /v1/sql/copy", &body).await;
+    assert_eq!(status, 200);
+    let (status, body) =
+        http_request(http, "GET /rest/v1/long_profiles?status=eq.ready&limit=1", b"").await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains("row-256"), "filtered match beyond first page: {text}");
     let (status, _) =
         http_request(http, "POST /rest/v1/docs", b"{\"key\":\"k3\",\"value\":\"v3\"}").await;
     assert_eq!(status, 201);

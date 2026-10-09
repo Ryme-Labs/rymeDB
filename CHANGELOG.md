@@ -8,6 +8,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgREST filtering now advances through ordered storage pages, so matching
+  rows beyond the first page are not lost; non-key ordering scans the complete
+  filtered result before sorting.
+
 - Cluster CDC streams now use deterministic commit-derived cursors, so a
   reconnect through another live gateway resumes from the same sequence
   watermark instead of using that gateway's local realtime counter.

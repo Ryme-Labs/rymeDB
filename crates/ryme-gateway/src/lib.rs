@@ -348,6 +348,48 @@ where
         Ok(visible)
     }
 
+    /// Read one ordered storage page and return the internal cursor needed for
+    /// the next page. The cursor is never exposed to callers as a data value;
+    /// it only lets higher-level APIs keep filtering past rows that did not
+    /// match their predicate.
+    pub fn scan_page(
+        &self,
+        principal: &Principal,
+        table: &str,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>)> {
+        self.policies.predicate(principal, table)?;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let mut txn = self.begin();
+        let page = match start_after {
+            Some(start_after) => self.manager.scan_after(
+                &mut txn,
+                &principal.tenant,
+                &self.database,
+                table,
+                start_after,
+                limit,
+            )?,
+            None => self.manager.scan(&mut txn, &principal.tenant, &self.database, table, limit)?,
+        };
+        let next = if page.len() == limit { page.last().map(|(pk, _)| pk.clone()) } else { None };
+        if !self.policies.has_table_policy(table) {
+            return Ok((page, next));
+        }
+        let visible = page
+            .into_iter()
+            .filter_map(|(pk, value)| match self.policies.row_allowed(principal, table, &value) {
+                Ok(true) => Some(Ok((pk, value))),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((visible, next))
+    }
+
     pub fn manager_clone(&self) -> B
     where
         B: Clone,
@@ -481,6 +523,25 @@ mod tests {
             roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
         };
         assert!(gateway.get(&other_tenant, "messages", b"visible").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_page_advances_past_storage_pages() {
+        let gateway = gateway();
+        let principal = owner();
+        for key in ["a", "b", "c"] {
+            gateway
+                .put(&principal, "docs", key.as_bytes().to_vec(), key.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+        let (first, cursor) = gateway.scan_page(&principal, "docs", None, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        let cursor = cursor.expect("full page has a cursor");
+        let (second, next) = gateway.scan_page(&principal, "docs", Some(&cursor), 2).unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(next.is_none());
+        assert_eq!(second[0].0, b"c");
     }
 
     #[tokio::test]
