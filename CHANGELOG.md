@@ -49,6 +49,8 @@ All notable changes to rymeDB are recorded here. Format follows
   constraints and rejects unsupported composite primary keys explicitly.
 - Duplicate `CREATE TABLE` statements now fail, while `CREATE TABLE IF NOT
   EXISTS` remains idempotent without replacing the existing schema.
+- Duplicate `CREATE INDEX` statements now fail unless `IF NOT EXISTS` is used;
+  `DROP INDEX [IF EXISTS]` removes durable index metadata and entries.
 - Inline and single-column table-level `UNIQUE` constraints now create durable
   named indexes and reject duplicate inserts and updates.
 - `ALTER TABLE ... ADD COLUMN` now backfills existing JSON rows from defaults,

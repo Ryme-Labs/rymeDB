@@ -21,6 +21,11 @@ pub enum Statement {
         #[serde(default)]
         if_exists: bool,
     },
+    DropIndex {
+        name: String,
+        #[serde(default)]
+        if_exists: bool,
+    },
     TruncateTable {
         table: String,
     },
@@ -48,6 +53,8 @@ pub enum Statement {
         #[serde(default)]
         column: Option<String>,
         unique: bool,
+        #[serde(default)]
+        if_not_exists: bool,
     },
     Insert {
         table: String,
@@ -483,6 +490,7 @@ impl Statement {
             | Self::Delete { table, .. }
             | Self::DeleteWhere { table, .. }
             | Self::CopyFrom { table, .. } => table,
+            Self::DropIndex { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
         }
@@ -520,21 +528,26 @@ pub fn parse(input: &str) -> Result<Statement> {
 }
 
 fn parse_drop(tokens: &[String]) -> Result<Statement> {
-    if !tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("TABLE")) {
-        return Err(RymeError::InvalidArgument(String::from("drop table")));
-    }
-    let initial_table_pos = 2;
+    let kind =
+        tokens.get(1).ok_or_else(|| RymeError::InvalidArgument(String::from("drop object")))?;
+    let initial_object_pos = 2;
     let if_exists =
-        tokens.get(initial_table_pos).is_some_and(|token| token.eq_ignore_ascii_case("IF"))
+        tokens.get(initial_object_pos).is_some_and(|token| token.eq_ignore_ascii_case("IF"))
             && tokens
-                .get(initial_table_pos + 1)
+                .get(initial_object_pos + 1)
                 .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"));
-    let table_pos = if if_exists { initial_table_pos + 2 } else { initial_table_pos };
-    let table = tokens
-        .get(table_pos)
+    let object_pos = if if_exists { initial_object_pos + 2 } else { initial_object_pos };
+    let object = tokens
+        .get(object_pos)
         .map(|value| unquote(value))
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("drop table")))?;
-    Ok(Statement::DropTable { table, if_exists })
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("drop object")))?;
+    if kind.eq_ignore_ascii_case("TABLE") {
+        return Ok(Statement::DropTable { table: object, if_exists });
+    }
+    if kind.eq_ignore_ascii_case("INDEX") {
+        return Ok(Statement::DropIndex { name: object, if_exists });
+    }
+    Err(RymeError::InvalidArgument(String::from("drop object")))
 }
 
 fn parse_truncate(tokens: &[String]) -> Result<Statement> {
@@ -802,6 +815,8 @@ fn parse_create_index(tokens: &[String]) -> Result<Statement> {
         .get(name_pos)
         .map(|token| unquote(token))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("index name")))?;
+    let if_not_exists =
+        tokens.get(index_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
     let table = table_after(tokens, "ON")?;
     let on_pos = tokens
         .iter()
@@ -813,7 +828,7 @@ fn parse_create_index(tokens: &[String]) -> Result<Statement> {
     let (field, column) = parse_field(field_token)
         .map(|field| (field, None))
         .unwrap_or_else(|| (Field::Value, Some(unquote(field_token))));
-    Ok(Statement::CreateIndex { name, table, field, column, unique })
+    Ok(Statement::CreateIndex { name, table, field, column, unique, if_not_exists })
 }
 
 fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
@@ -2021,6 +2036,7 @@ pub fn describe_plan(statement: &Statement) -> String {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
         Statement::DropTable { table, .. } => format!("ddl drop_table({table})"),
+        Statement::DropIndex { name, .. } => format!("ddl drop_index({name})"),
         Statement::TruncateTable { table } => format!("write truncate({table})"),
         Statement::AlterTableAddColumn { table, column, .. } => {
             format!("ddl alter_table({table}) add_column({})", column.name)
@@ -2031,7 +2047,7 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::AlterTableRenameColumn { table, from, to } => {
             format!("ddl alter_table({table}) rename_column({from}, {to})")
         }
-        Statement::CreateIndex { name, table, field, column, unique } => {
+        Statement::CreateIndex { name, table, field, column, unique, .. } => {
             let field = column.as_deref().unwrap_or(match field {
                 Field::Key => "key",
                 Field::Value => "value",
@@ -2539,7 +2555,7 @@ where
             return Err(RymeError::Internal(String::from("index lock")));
         }
         for definition in snapshot.indexes {
-            self.create_index(definition)?;
+            self.create_index(definition, false)?;
         }
         self.schema_dirty.store(false, Ordering::SeqCst);
         Ok(())
@@ -3017,8 +3033,18 @@ where
         Ok(rows)
     }
 
-    fn create_index(&self, definition: IndexDefinition) -> Result<()> {
+    fn create_index(&self, definition: IndexDefinition, if_not_exists: bool) -> Result<()> {
         self.reject_if_read_only()?;
+        {
+            let indexes =
+                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            if indexes.values().flatten().any(|state| state.definition.name == definition.name) {
+                if if_not_exists {
+                    return Ok(());
+                }
+                return Err(RymeError::Conflict(String::from("index exists")));
+            }
+        }
         let rows = self.scan_all_rows(&definition.table)?;
         let mut entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = BTreeMap::new();
         for (pk, value) in rows {
@@ -3032,10 +3058,29 @@ where
         let mut indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let table_indexes = indexes.entry(definition.table.clone()).or_default();
-        if table_indexes.iter().any(|state| state.definition.name == definition.name) {
-            return Ok(());
-        }
         table_indexes.push(IndexState { definition, entries });
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn drop_index(&self, name: String, if_exists: bool) -> Result<()> {
+        self.reject_if_read_only()?;
+        let mut indexes =
+            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+        let Some(table) = indexes.iter().find_map(|(table, states)| {
+            states.iter().any(|state| state.definition.name == name).then(|| table.clone())
+        }) else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(RymeError::NotFound(String::from("index")));
+        };
+        if let Some(states) = indexes.get_mut(&table) {
+            states.retain(|state| state.definition.name != name);
+            if states.is_empty() {
+                indexes.remove(&table);
+            }
+        }
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -3833,6 +3878,7 @@ where
                 self.create_table(table.clone(), columns.clone(), *if_not_exists)?;
             }
             Statement::DropTable { .. } => {}
+            Statement::DropIndex { .. } => {}
             Statement::TruncateTable { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
@@ -3876,8 +3922,15 @@ where
                 self.alter_table_rename_column(table, from, to).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
-            Statement::CreateIndex { name, table, field, column, unique } => {
-                self.create_index(IndexDefinition { name, table, field, column, unique })?;
+            Statement::DropIndex { name, if_exists } => {
+                self.drop_index(name, if_exists)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::CreateIndex { name, table, field, column, unique, if_not_exists } => {
+                self.create_index(
+                    IndexDefinition { name, table, field, column, unique },
+                    if_not_exists,
+                )?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::Explain { plan, .. } => Ok((
@@ -4430,6 +4483,7 @@ where
                 self.create_table(table.clone(), columns.clone(), *if_not_exists)?;
             }
             Statement::DropTable { .. } => {}
+            Statement::DropIndex { .. } => {}
             Statement::TruncateTable { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
@@ -4442,6 +4496,7 @@ where
             &statement,
             Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
+                | Statement::DropIndex { .. }
                 | Statement::AlterTableAddColumn { .. }
                 | Statement::AlterTableDropColumn { .. }
                 | Statement::AlterTableRenameColumn { .. }
@@ -4561,6 +4616,10 @@ where
                 self.drop_table(table, if_exists).await?;
                 Ok(QueryResult::Ok)
             }
+            Statement::DropIndex { name, if_exists } => {
+                self.drop_index(name, if_exists)?;
+                Ok(QueryResult::Ok)
+            }
             Statement::TruncateTable { table } => {
                 self.truncate_table(table).await?;
                 Ok(QueryResult::Ok)
@@ -4577,8 +4636,11 @@ where
                 self.alter_table_rename_column(table, from, to).await?;
                 Ok(QueryResult::Ok)
             }
-            Statement::CreateIndex { name, table, field, column, unique } => {
-                self.create_index(IndexDefinition { name, table, field, column, unique })?;
+            Statement::CreateIndex { name, table, field, column, unique, if_not_exists } => {
+                self.create_index(
+                    IndexDefinition { name, table, field, column, unique },
+                    if_not_exists,
+                )?;
                 Ok(QueryResult::Ok)
             }
             Statement::CopyFrom { table, rows } => {
@@ -5770,6 +5832,7 @@ mod tests {
                 field: Field::Value,
                 column: None,
                 unique: false,
+                if_not_exists: false,
             }
         );
         assert!(matches!(
@@ -5778,8 +5841,38 @@ mod tests {
         ));
         assert!(matches!(
             parse("CREATE INDEX IF NOT EXISTS messages_value_idx ON messages (value)").unwrap(),
-            Statement::CreateIndex { name, .. } if name == "messages_value_idx"
+            Statement::CreateIndex { name, if_not_exists: true, .. } if name == "messages_value_idx"
         ));
+        assert!(matches!(
+            parse("DROP INDEX IF EXISTS messages_value_idx").unwrap(),
+            Statement::DropIndex { name, if_exists: true } if name == "messages_value_idx"
+        ));
+    }
+
+    #[tokio::test]
+    async fn index_ddl_enforces_existence_and_can_remove_index_metadata() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE messages").unwrap()).await.unwrap();
+        executor
+            .execute(parse("CREATE INDEX messages_value_idx ON messages (value)").unwrap())
+            .await
+            .unwrap();
+        assert!(executor
+            .execute(parse("CREATE INDEX messages_value_idx ON messages (key)").unwrap())
+            .await
+            .is_err());
+        executor
+            .execute(
+                parse("CREATE INDEX IF NOT EXISTS messages_value_idx ON messages (key)").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executor.catalog_indexes("messages")[0].field, Field::Value);
+
+        executor.execute(parse("DROP INDEX messages_value_idx").unwrap()).await.unwrap();
+        assert!(executor.catalog_indexes("messages").is_empty());
+        assert!(executor.execute(parse("DROP INDEX messages_value_idx").unwrap()).await.is_err());
+        executor.execute(parse("DROP INDEX IF EXISTS messages_value_idx").unwrap()).await.unwrap();
     }
 
     #[tokio::test]

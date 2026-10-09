@@ -87,7 +87,7 @@ rows written directly in the branch overlay.
 `CREATE TABLE` (including `IF NOT EXISTS`, column types, `PRIMARY KEY`, `UNIQUE`,
 `NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
 `DROP COLUMN`, and `RENAME COLUMN` (including `IF [NOT] EXISTS`), plus
-`DROP TABLE [IF EXISTS]` and `TRUNCATE TABLE`,
+`DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, and `DROP INDEX [IF EXISTS]`,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT` maps to upsert,
