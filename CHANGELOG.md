@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL TRUNCATE options now support `RESTART IDENTITY`,
+  `CONTINUE IDENTITY`, and foreign-key `CASCADE`/`RESTRICT` behavior.
 - PostgreSQL DELETE ... USING now joins target and source rows by qualified
   columns, supports source-filtered deletes and RETURNING, and preserves
   transaction, foreign-key, RLS, and CDC handling.

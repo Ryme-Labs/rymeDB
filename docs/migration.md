@@ -104,6 +104,8 @@ join columns, source predicates, and RETURNING.
 foreign-key actions `ON DELETE`/`ON UPDATE RESTRICT`, `CASCADE`, `SET NULL`,
 and `SET DEFAULT`,
 `DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, and `DROP INDEX [IF EXISTS]`,
+including `TRUNCATE ... RESTART IDENTITY`, `CONTINUE IDENTITY`, and
+foreign-key `CASCADE`/`RESTRICT`,
 with PostgreSQL `information_schema.tables` and
 `information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
 `INSERT INTO table (...) VALUES (...)`; `ON CONFLICT (columns) DO UPDATE` uses

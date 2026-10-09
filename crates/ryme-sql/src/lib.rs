@@ -34,6 +34,10 @@ pub enum Statement {
     },
     TruncateTable {
         table: String,
+        #[serde(default)]
+        restart_identity: bool,
+        #[serde(default)]
+        cascade: bool,
     },
     AlterTableAddColumn {
         table: String,
@@ -927,13 +931,50 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
 }
 
 fn parse_truncate(tokens: &[String]) -> Result<Statement> {
-    let table_pos =
+    let mut table_pos =
         if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("TABLE")) { 2 } else { 1 };
+    if tokens.get(table_pos).is_some_and(|token| token.eq_ignore_ascii_case("ONLY")) {
+        table_pos += 1;
+    }
     let table = tokens
         .get(table_pos)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("truncate table")))?;
-    Ok(Statement::TruncateTable { table })
+    let mut restart_identity = false;
+    let mut cascade = false;
+    let mut position = table_pos + 1;
+    while position < tokens.len() {
+        match tokens[position].to_ascii_uppercase().as_str() {
+            "RESTART"
+                if tokens
+                    .get(position + 1)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("IDENTITY")) =>
+            {
+                restart_identity = true;
+                position += 2;
+            }
+            "CONTINUE"
+                if tokens
+                    .get(position + 1)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("IDENTITY")) =>
+            {
+                restart_identity = false;
+                position += 2;
+            }
+            "CASCADE" => {
+                cascade = true;
+                position += 1;
+            }
+            "RESTRICT" => {
+                cascade = false;
+                position += 1;
+            }
+            _ => {
+                return Err(RymeError::InvalidArgument(String::from("truncate option")));
+            }
+        }
+    }
+    Ok(Statement::TruncateTable { table, restart_identity, cascade })
 }
 
 fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -3814,7 +3855,13 @@ pub fn describe_plan(statement: &Statement) -> String {
         }
         Statement::DropTable { table, .. } => format!("ddl drop_table({table})"),
         Statement::DropIndex { name, .. } => format!("ddl drop_index({name})"),
-        Statement::TruncateTable { table } => format!("write truncate({table})"),
+        Statement::TruncateTable { table, restart_identity, cascade } => {
+            format!(
+                "write truncate({table}) {} {}",
+                if *restart_identity { "restart_identity" } else { "continue_identity" },
+                if *cascade { "cascade" } else { "restrict" }
+            )
+        }
         Statement::AlterTableAddColumn { table, column, .. } => {
             format!("ddl alter_table({table}) add_column({})", column.name)
         }
@@ -6556,50 +6603,86 @@ where
         Ok(())
     }
 
-    async fn truncate_table(&self, table: String) -> Result<()> {
+    async fn truncate_table(
+        &self,
+        table: String,
+        restart_identity: bool,
+        cascade: bool,
+    ) -> Result<()> {
         self.reject_if_read_only()?;
-        let present = self
-            .catalog
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
-            .contains_key(&table);
-        if !present {
-            return Err(RymeError::NotFound(String::from("table")));
-        }
-        if self
+        let table = self
+            .canonical_table_name(&table)
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        let foreign_keys = self
             .foreign_keys
             .lock()
             .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
-            .iter()
-            .any(|(child_table, constraints)| {
-                child_table != &table
-                    && constraints
-                        .iter()
-                        .any(|constraint| constraint.referenced_table.eq_ignore_ascii_case(&table))
-            })
-        {
+            .clone();
+        let mut tables = vec![table.clone()];
+        if cascade {
+            let mut position = 0;
+            while position < tables.len() {
+                let parent = tables[position].clone();
+                for (child_table, constraints) in &foreign_keys {
+                    if child_table.eq_ignore_ascii_case(&parent)
+                        || tables.iter().any(|table| table.eq_ignore_ascii_case(child_table))
+                        || !constraints.iter().any(|constraint| {
+                            constraint.referenced_table.eq_ignore_ascii_case(&parent)
+                        })
+                    {
+                        continue;
+                    }
+                    tables.push(child_table.clone());
+                }
+                position += 1;
+            }
+        } else if foreign_keys.iter().any(|(child_table, constraints)| {
+            !child_table.eq_ignore_ascii_case(&table)
+                && constraints
+                    .iter()
+                    .any(|constraint| constraint.referenced_table.eq_ignore_ascii_case(&table))
+        }) {
             return Err(RymeError::Conflict(String::from("table is referenced by a foreign key")));
         }
 
-        let rows = self.scan_all_rows(&table)?;
-        if !rows.is_empty() {
+        let mut rows_by_table = Vec::with_capacity(tables.len());
+        let mut total_rows = 0;
+        for table in &tables {
+            let rows = self.scan_all_rows(table)?;
+            total_rows += rows.len();
+            rows_by_table.push((table, rows));
+        }
+        if total_rows > 0 {
             let mut txn = self.begin_with(self.isolation);
-            for (pk, _) in &rows {
-                self.manager
-                    .delete(&mut txn, RecordKey::new(&self.tenant, &self.database, &table, pk));
+            for (table, rows) in &rows_by_table {
+                for (pk, _) in rows {
+                    self.manager
+                        .delete(&mut txn, RecordKey::new(&self.tenant, &self.database, table, pk));
+                }
             }
             self.manager.commit(txn).await?;
         }
-        if let Ok(mut indexes) = self.indexes.lock() {
-            if let Some(table_indexes) = indexes.get_mut(&table) {
-                for state in table_indexes {
-                    state.entries.clear();
+        {
+            let mut indexes =
+                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            for table in &tables {
+                if let Some(table_indexes) = indexes.get_mut(table) {
+                    for state in table_indexes {
+                        state.entries.clear();
+                    }
                 }
             }
         }
-        let prefix = format!("{}\0{}\0{}\0", self.tenant, self.database, table);
-        if let Ok(mut sequences) = self.sequence_next.lock() {
-            sequences.retain(|key, _| !key.starts_with(&prefix));
+        if restart_identity {
+            let prefixes = tables
+                .iter()
+                .map(|table| format!("{}\0{}\0{}\0", self.tenant, self.database, table))
+                .collect::<Vec<_>>();
+            let mut sequences = self
+                .sequence_next
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("sequence lock")))?;
+            sequences.retain(|key, _| !prefixes.iter().any(|prefix| key.starts_with(prefix)));
         }
         Ok(())
     }
@@ -7280,8 +7363,8 @@ where
                 self.drop_table(table, if_exists).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
-            Statement::TruncateTable { table } => {
-                self.truncate_table(table).await?;
+            Statement::TruncateTable { table, restart_identity, cascade } => {
+                self.truncate_table(table, restart_identity, cascade).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
@@ -9021,8 +9104,8 @@ where
                 self.drop_index(name, if_exists)?;
                 Ok(QueryResult::Ok)
             }
-            Statement::TruncateTable { table } => {
-                self.truncate_table(table).await?;
+            Statement::TruncateTable { table, restart_identity, cascade } => {
+                self.truncate_table(table, restart_identity, cascade).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
@@ -12062,6 +12145,42 @@ mod tests {
             .execute(parse("INSERT INTO events (id, name) VALUES ('e3', 'world')").unwrap())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn truncate_identity_options_and_cascade_match_postgres_semantics() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE users (id SERIAL PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE TABLE messages (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users (id))").unwrap())
+            .await
+            .unwrap();
+        executor.execute(parse("INSERT INTO users DEFAULT VALUES").unwrap()).await.unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (user_id) VALUES (1)").unwrap())
+            .await
+            .unwrap();
+
+        assert!(executor.execute(parse("TRUNCATE TABLE users").unwrap()).await.is_err());
+        executor
+            .execute(parse("TRUNCATE TABLE users CASCADE CONTINUE IDENTITY").unwrap())
+            .await
+            .unwrap();
+        executor.execute(parse("INSERT INTO users DEFAULT VALUES").unwrap()).await.unwrap();
+        assert!(matches!(
+            executor.execute(parse("SELECT id FROM users").unwrap()).await.unwrap(),
+            QueryResult::Table { rows, .. } if rows == vec![vec![b"2".to_vec()]]
+        ));
+
+        executor.execute(parse("TRUNCATE users CASCADE RESTART IDENTITY").unwrap()).await.unwrap();
+        executor.execute(parse("INSERT INTO users DEFAULT VALUES").unwrap()).await.unwrap();
+        assert!(matches!(
+            executor.execute(parse("SELECT id FROM users").unwrap()).await.unwrap(),
+            QueryResult::Table { rows, .. } if rows == vec![vec![b"1".to_vec()]]
+        ));
     }
 
     #[tokio::test]
