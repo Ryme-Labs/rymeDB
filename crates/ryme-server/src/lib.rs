@@ -1117,7 +1117,15 @@ impl SharedState {
         let oidc_secret = std::env::var("RYME_OIDC_SECRET").ok();
         let oidc_jwks_path = std::env::var_os("RYME_OIDC_JWKS_FILE")
             .or_else(|| std::env::var_os("RYME_JWT_JWKS_FILE"));
-        let oidc_enabled = oidc_secret.is_some() || oidc_jwks_path.is_some();
+        let oidc_jwks_url = if oidc_jwks_path.is_none() {
+            std::env::var("RYME_OIDC_JWKS_URL")
+                .ok()
+                .or_else(|| std::env::var("RYME_JWT_JWKS_URL").ok())
+        } else {
+            None
+        };
+        let oidc_enabled =
+            oidc_secret.is_some() || oidc_jwks_path.is_some() || oidc_jwks_url.is_some();
         let oidc = match (oidc_issuer, oidc_audience) {
             (Some(issuer), Some(audience)) if oidc_enabled => Some(OidcConfig {
                 issuer,
@@ -1134,16 +1142,23 @@ impl SharedState {
             }
             _ => None,
         };
-        let oidc_jwt = match (&oidc, oidc_jwks_path) {
-            (Some(config), Some(path)) => Some(load_jwks_verifier(
+        let oidc_kid = std::env::var("RYME_OIDC_JWK_KID")
+            .ok()
+            .or_else(|| std::env::var("RYME_JWT_JWK_KID").ok());
+        let oidc_jwt = match (&oidc, oidc_jwks_path, oidc_jwks_url) {
+            (Some(config), Some(path), _) => Some(load_jwks_verifier(
                 std::path::Path::new(&path),
-                std::env::var("RYME_OIDC_JWK_KID")
-                    .ok()
-                    .or_else(|| std::env::var("RYME_JWT_JWK_KID").ok()),
+                oidc_kid,
                 Some(config.issuer.clone()),
                 Some(config.audience.clone()),
             )?),
-            (None, Some(_)) => {
+            (Some(config), None, Some(url)) => Some(load_jwks_verifier_url(
+                &url,
+                oidc_kid,
+                Some(config.issuer.clone()),
+                Some(config.audience.clone()),
+            )?),
+            (None, Some(_), _) | (None, None, Some(_)) => {
                 return Err(ryme_error::RymeError::InvalidArgument(String::from(
                     "oidc issuer and audience are required with a jwks file",
                 )))
@@ -6801,6 +6816,15 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
     }
 
     let Some(path) = std::env::var_os("RYME_JWT_JWKS_FILE") else {
+        if let Ok(url) = std::env::var("RYME_JWT_JWKS_URL") {
+            let verifier = load_jwks_verifier_url(
+                &url,
+                std::env::var("RYME_JWT_JWK_KID").ok(),
+                issuer,
+                audience,
+            )?;
+            return Ok(Some(verifier));
+        }
         return Ok(None);
     };
     let verifier = load_jwks_verifier(
@@ -6812,6 +6836,28 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
     Ok(Some(verifier))
 }
 
+fn load_jwks_verifier_url(
+    url: &str,
+    requested_kid: Option<String>,
+    issuer: Option<String>,
+    audience: Option<String>,
+) -> ryme_error::Result<JwtVerifier> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            ryme_error::RymeError::InvalidArgument(format!("jwt jwks client: {error}"))
+        })?;
+    let response =
+        client.get(url).send().and_then(|response| response.error_for_status()).map_err(
+            |error| ryme_error::RymeError::Unavailable(format!("jwt jwks url: {error}")),
+        )?;
+    let raw = response
+        .bytes()
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks url body: {error}")))?;
+    load_jwks_verifier_bytes(&raw, requested_kid, issuer, audience)
+}
+
 fn load_jwks_verifier(
     path: &std::path::Path,
     requested_kid: Option<String>,
@@ -6821,6 +6867,15 @@ fn load_jwks_verifier(
     let raw = std::fs::read(path).map_err(|error| {
         ryme_error::RymeError::InvalidArgument(format!("jwt jwks file {}: {error}", path.display()))
     })?;
+    load_jwks_verifier_bytes(&raw, requested_kid, issuer, audience)
+}
+
+fn load_jwks_verifier_bytes(
+    raw: &[u8],
+    requested_kid: Option<String>,
+    issuer: Option<String>,
+    audience: Option<String>,
+) -> ryme_error::Result<JwtVerifier> {
     let document: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks: {error}")))?;
     let keys = document
@@ -7209,6 +7264,36 @@ mod realtime_policy_tests {
         );
         assert_eq!(files[0].1, b"branch-schema".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jwks_url_loader_fetches_and_selects_requested_key() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body =
+            br#"{"keys":[{"kty":"RSA","kid":"url-key","alg":"RS256","n":"AQAB","e":"AQAB"}]}"#;
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            )
+            .unwrap();
+        });
+        let verifier = load_jwks_verifier_url(
+            &format!("http://{address}/jwks.json"),
+            Some(String::from("url-key")),
+            Some(String::from("issuer")),
+            Some(String::from("audience")),
+        )
+        .unwrap();
+        assert!(verifier.principal_from_token("invalid.token.value", 0).is_err());
+        server.join().unwrap();
     }
 
     #[test]

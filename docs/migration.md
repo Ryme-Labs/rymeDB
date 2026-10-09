@@ -297,8 +297,8 @@ receipt. It can also verify RS256 tokens from a mounted JWKS JSON file. Set
 `RYME_JWT_JWK_KID` to restrict the mounted set. Tokens with a `kid` select the
 matching RSA key, allowing normal signing-key rotation.
 The OIDC exchange may use `RYME_OIDC_JWKS_FILE` (or the shared JWT JWKS file)
-and `RYME_OIDC_JWK_KID`; its issuer and audience come from the `RYME_OIDC_*`
-settings.
+or the corresponding `RYME_OIDC_JWKS_URL`, plus `RYME_OIDC_JWK_KID`; its
+issuer and audience come from the `RYME_OIDC_*` settings.
 For either mode, set `RYME_JWT_ISSUER` and `RYME_JWT_AUDIENCE` together to
 enforce the expected issuer and audience. Configure one JWT verification mode
 per node: an HMAC secret or a mounted JWKS provider for RS256. `POST
