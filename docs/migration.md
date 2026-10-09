@@ -176,10 +176,11 @@ Grouping: `SELECT <key|value|column|agg>, ... FROM t [WHERE ...] GROUP BY <key|v
 structured column values (including JSON paths), and returns one row per group.
 Bare select items must name the group field; aggregates reuse the scalar rules
 above, and null values share one group.
-Set reads: top-level `SELECT ... UNION [ALL] SELECT ...` combines compatible
-table projections under one transaction snapshot. `UNION` removes duplicate
-rows while `UNION ALL` preserves them; both branches must return the same
-number of projected columns.
+Set reads: top-level `SELECT ... UNION [ALL] SELECT ...`, `INTERSECT [ALL]`,
+and `EXCEPT [ALL]` combine compatible table projections under one transaction
+snapshot. Distinct operations remove duplicate rows; `ALL` preserves
+multiset counts. Chained operations follow PostgreSQL precedence, with
+`INTERSECT` binding more tightly than `UNION` and `EXCEPT`.
 
 ## Observability
 

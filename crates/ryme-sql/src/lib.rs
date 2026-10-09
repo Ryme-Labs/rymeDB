@@ -8,6 +8,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetOperation {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl Default for SetOperation {
+    fn default() -> Self {
+        Self::Union
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Statement {
     CreateTable {
@@ -274,6 +287,8 @@ pub enum Statement {
         right: Box<Statement>,
         #[serde(default)]
         all: bool,
+        #[serde(default)]
+        operation: SetOperation,
     },
 }
 
@@ -861,27 +876,26 @@ pub fn parse(input: &str) -> Result<Statement> {
     let head = tokens[0].to_ascii_uppercase();
     let is_distinct = head == "SELECT"
         && tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("DISTINCT"));
-    let mut statement = if matches!(head.as_str(), "SELECT" | "WITH")
-        && find_sql_keyword(input, "UNION", 0).is_some()
-    {
-        parse_union(input)
-    } else {
-        match head.as_str() {
-            "CREATE" => parse_create(&tokens, input),
-            "DROP" => parse_drop(&tokens),
-            "TRUNCATE" => parse_truncate(&tokens),
-            "ALTER" => parse_alter(&tokens, input),
-            "UPSERT" => parse_upsert(&tokens),
-            "INSERT" => parse_insert(&tokens, input),
-            "SELECT" => parse_select(&tokens, input),
-            "WITH" => parse_with(input),
-            "UPDATE" => parse_update(&tokens, input),
-            "DELETE" => parse_delete(&tokens, input),
-            "COPY" => parse_copy(&tokens),
-            "EXPLAIN" => parse_explain(input),
-            _ => Err(RymeError::InvalidArgument(String::from("unknown statement"))),
-        }
-    }?;
+    let mut statement =
+        if matches!(head.as_str(), "SELECT" | "WITH") && find_set_operator(input).is_some() {
+            parse_set_operation(input)
+        } else {
+            match head.as_str() {
+                "CREATE" => parse_create(&tokens, input),
+                "DROP" => parse_drop(&tokens),
+                "TRUNCATE" => parse_truncate(&tokens),
+                "ALTER" => parse_alter(&tokens, input),
+                "UPSERT" => parse_upsert(&tokens),
+                "INSERT" => parse_insert(&tokens, input),
+                "SELECT" => parse_select(&tokens, input),
+                "WITH" => parse_with(input),
+                "UPDATE" => parse_update(&tokens, input),
+                "DELETE" => parse_delete(&tokens, input),
+                "COPY" => parse_copy(&tokens),
+                "EXPLAIN" => parse_explain(input),
+                _ => Err(RymeError::InvalidArgument(String::from("unknown statement"))),
+            }
+        }?;
     if is_distinct {
         statement = prepare_distinct(statement);
     }
@@ -1671,13 +1685,82 @@ fn parse_with(raw: &str) -> Result<Statement> {
     Ok(body)
 }
 
-fn parse_union(raw: &str) -> Result<Statement> {
-    let union_offset = find_sql_keyword(raw, "UNION", 0)
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("union query")))?;
-    let left_sql = raw[..union_offset].trim();
-    let mut right_sql = raw[union_offset + "UNION".len()..].trim();
+fn find_set_operator(input: &str) -> Option<(usize, SetOperation)> {
+    let keywords = [
+        ("UNION", SetOperation::Union, 1usize),
+        ("EXCEPT", SetOperation::Except, 1usize),
+        ("INTERSECT", SetOperation::Intersect, 2usize),
+    ];
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut selected: Option<(usize, SetOperation, usize)> = None;
+    for (index, ch) in input.char_indices() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                continue;
+            }
+            '(' => {
+                depth += 1;
+                continue;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            _ => {}
+        }
+        if depth != 0 {
+            continue;
+        }
+        for (keyword, operation, precedence) in keywords {
+            if !input[index..]
+                .get(..keyword.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+            {
+                continue;
+            }
+            let previous_is_word = input[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| previous.is_ascii_alphanumeric() || previous == '_');
+            let next_is_word = input[index + keyword.len()..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_');
+            if previous_is_word || next_is_word {
+                continue;
+            }
+            let replace = selected.is_none_or(|(selected_index, _, selected_precedence)| {
+                precedence < selected_precedence
+                    || (precedence == selected_precedence && index > selected_index)
+            });
+            if replace {
+                selected = Some((index, operation, precedence));
+            }
+        }
+    }
+    selected.map(|(index, operation, _)| (index, operation))
+}
+
+fn parse_set_operation(raw: &str) -> Result<Statement> {
+    let (operation_offset, operation) = find_set_operator(raw)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("set operation")))?;
+    let keyword_len = match operation {
+        SetOperation::Union => "UNION".len(),
+        SetOperation::Intersect => "INTERSECT".len(),
+        SetOperation::Except => "EXCEPT".len(),
+    };
+    let left_sql = raw[..operation_offset].trim();
+    let mut right_sql = raw[operation_offset + keyword_len..].trim();
     if left_sql.is_empty() || right_sql.is_empty() {
-        return Err(RymeError::InvalidArgument(String::from("union query")));
+        return Err(RymeError::InvalidArgument(String::from("set operation")));
     }
     let mut all = false;
     for modifier in ["ALL", "DISTINCT"] {
@@ -1698,6 +1781,7 @@ fn parse_union(raw: &str) -> Result<Statement> {
         left: Box::new(parse(left_sql)?),
         right: Box::new(parse(right_sql)?),
         all,
+        operation,
     })
 }
 
@@ -4482,12 +4566,19 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::GroupBy { table, select, filter, .. } => {
             format!("group_by({table}) items {} filters {}", select.len(), filter.len())
         }
-        Statement::Union { left, right, all } => format!(
-            "union{}({}, {})",
-            if *all { " all" } else { "" },
-            describe_plan(left),
-            describe_plan(right)
-        ),
+        Statement::Union { left, right, all, operation } => {
+            let operation = match operation {
+                SetOperation::Union => "union",
+                SetOperation::Intersect => "intersect",
+                SetOperation::Except => "except",
+            };
+            format!(
+                "{operation}{}({}, {})",
+                if *all { " all" } else { "" },
+                describe_plan(left),
+                describe_plan(right)
+            )
+        }
         Statement::Join { left, right, join_type, limit, offset, order, filter } => {
             let direction = match order.direction {
                 Direction::Asc => "asc",
@@ -4537,40 +4628,113 @@ fn apply_distinct(result: QueryResult, offset: usize, limit: usize) -> QueryResu
     }
 }
 
-fn merge_union_results(left: QueryResult, right: QueryResult, all: bool) -> Result<QueryResult> {
+fn apply_set_operation<T>(
+    mut left: Vec<T>,
+    right: Vec<T>,
+    operation: SetOperation,
+    all: bool,
+) -> Vec<T>
+where
+    T: Clone + Eq + std::hash::Hash,
+{
+    match operation {
+        SetOperation::Union => {
+            left.extend(right);
+            if !all {
+                let mut seen = HashSet::new();
+                left.retain(|row| seen.insert(row.clone()));
+            }
+            left
+        }
+        SetOperation::Intersect => {
+            if all {
+                let mut counts = right.into_iter().fold(HashMap::new(), |mut counts, row| {
+                    *counts.entry(row).or_insert(0usize) += 1;
+                    counts
+                });
+                left.into_iter()
+                    .filter(|row| {
+                        let Some(count) = counts.get_mut(row) else { return false };
+                        if *count == 0 {
+                            return false;
+                        }
+                        *count -= 1;
+                        true
+                    })
+                    .collect()
+            } else {
+                let right = right.into_iter().collect::<HashSet<_>>();
+                let mut seen = HashSet::new();
+                left.into_iter()
+                    .filter(|row| right.contains(row) && seen.insert(row.clone()))
+                    .collect()
+            }
+        }
+        SetOperation::Except => {
+            if all {
+                let mut counts = right.into_iter().fold(HashMap::new(), |mut counts, row| {
+                    *counts.entry(row).or_insert(0usize) += 1;
+                    counts
+                });
+                left.into_iter()
+                    .filter(|row| {
+                        let Some(count) = counts.get_mut(row) else { return true };
+                        if *count == 0 {
+                            return true;
+                        }
+                        *count -= 1;
+                        false
+                    })
+                    .collect()
+            } else {
+                let right = right.into_iter().collect::<HashSet<_>>();
+                let mut seen = HashSet::new();
+                left.into_iter()
+                    .filter(|row| !right.contains(row) && seen.insert(row.clone()))
+                    .collect()
+            }
+        }
+    }
+}
+
+fn merge_set_results(
+    left: QueryResult,
+    right: QueryResult,
+    operation: SetOperation,
+    all: bool,
+) -> Result<QueryResult> {
     match (left, right) {
         (
-            QueryResult::Table { columns, rows: mut left_rows },
+            QueryResult::Table { columns, rows: left_rows },
             QueryResult::Table { columns: right_columns, rows: right_rows },
         ) => {
             if columns.len() != right_columns.len() {
-                return Err(RymeError::InvalidArgument(String::from("union column mismatch")));
+                return Err(RymeError::InvalidArgument(String::from(
+                    "set operation column mismatch",
+                )));
             }
-            left_rows.extend(right_rows);
-            if !all {
-                let mut seen = HashSet::new();
-                left_rows.retain(|row| seen.insert(row.clone()));
-            }
-            Ok(QueryResult::Table { columns, rows: left_rows })
+            Ok(QueryResult::Table {
+                columns,
+                rows: apply_set_operation(left_rows, right_rows, operation, all),
+            })
         }
         (left, right) => {
-            let mut rows = Vec::new();
-            for result in [left, right] {
-                match result {
-                    QueryResult::Row { pk, value } => rows.push((pk, value)),
-                    QueryResult::Rows { rows: result_rows } => rows.extend(result_rows),
-                    _ => {
-                        return Err(RymeError::InvalidArgument(String::from(
-                            "union result shapes do not match",
-                        )))
-                    }
-                }
-            }
-            if !all {
-                let mut seen = HashSet::new();
-                rows.retain(|row| seen.insert(row.clone()));
-            }
-            Ok(QueryResult::Rows { rows })
+            let rows = |result| match result {
+                QueryResult::Row { pk, value } => Some(vec![(pk, value)]),
+                QueryResult::Rows { rows } => Some(rows),
+                _ => None,
+            };
+            let Some(left) = rows(left) else {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "set operation result shapes do not match",
+                )));
+            };
+            let Some(right) = rows(right) else {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "set operation result shapes do not match",
+                )));
+            };
+            Ok(QueryResult::Rows { rows: apply_set_operation(left, right, operation, all) })
         }
     }
 }
@@ -9497,10 +9661,10 @@ where
         statement: Statement,
     ) -> Result<QueryResult> {
         match statement {
-            Statement::Union { left, right, all } => {
+            Statement::Union { left, right, all, operation } => {
                 let left = self.execute_read_in_transaction(txn, *left)?;
                 let right = self.execute_read_in_transaction(txn, *right)?;
-                merge_union_results(left, right, all)
+                merge_set_results(left, right, operation, all)
             }
             Statement::SelectByKey { table, pk } => {
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -9982,11 +10146,11 @@ where
                 let result = Box::pin(self.execute_with_base(*statement, isolation)).await?;
                 Ok(apply_distinct(result, offset, limit))
             }
-            Statement::Union { left, right, all } => {
+            Statement::Union { left, right, all, operation } => {
                 let mut txn = self.begin_with(isolation);
                 let left = self.execute_read_in_transaction(&mut txn, *left)?;
                 let right = self.execute_read_in_transaction(&mut txn, *right)?;
-                merge_union_results(left, right, all)
+                merge_set_results(left, right, operation, all)
             }
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
             Statement::DropTable { table, if_exists } => {
@@ -13929,9 +14093,44 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(union_all, QueryResult::Table { rows, .. } if rows.len() == 6));
+        let intersect = executor
+            .execute(
+                parse("SELECT value FROM tags WHERE value = 'red' INTERSECT SELECT value FROM tags WHERE value = 'red'")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(intersect, QueryResult::Table { rows, .. } if rows.len() == 1));
+        let intersect_all = executor
+            .execute(
+                parse("SELECT value FROM tags WHERE value = 'red' INTERSECT ALL SELECT value FROM tags WHERE value = 'red'")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(intersect_all, QueryResult::Table { rows, .. } if rows.len() == 3));
+        let except = executor
+            .execute(
+                parse("SELECT value FROM tags EXCEPT SELECT value FROM tags WHERE value = 'blue'")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(except, QueryResult::Table { rows, .. } if rows.len() == 1));
+        let chained = executor
+            .execute(
+                parse("SELECT value FROM tags WHERE value = 'red' UNION SELECT value FROM tags WHERE value = 'blue' INTERSECT SELECT value FROM tags WHERE value = 'blue'")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(chained, QueryResult::Table { rows, .. } if rows.len() == 2));
         let plan =
             executor.explain("SELECT value FROM tags UNION ALL SELECT value FROM tags").unwrap();
         assert!(plan.contains("union all"));
+        let intersect_plan =
+            executor.explain("SELECT value FROM tags INTERSECT SELECT value FROM tags").unwrap();
+        assert!(intersect_plan.contains("intersect"));
         assert!(executor
             .execute(parse("SELECT value FROM tags UNION SELECT key, value FROM tags").unwrap())
             .await

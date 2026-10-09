@@ -8,8 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
-- Top-level PostgreSQL `UNION` and `UNION ALL` queries now combine compatible
-  table projections under one transaction snapshot with duplicate handling.
+- Top-level PostgreSQL `UNION`, `INTERSECT`, and `EXCEPT` queries now combine
+  compatible table projections under one transaction snapshot with distinct
+  and `ALL` multiset handling.
 - PostgreSQL key-equality joins now support `LEFT`, `RIGHT`, and `FULL OUTER`
   semantics with explicit `NULL` values for unmatched rows.
 - Grouped PostgreSQL queries now support `HAVING` predicates over group columns
