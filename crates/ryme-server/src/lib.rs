@@ -1087,6 +1087,19 @@ impl SharedState {
         } else {
             control.restore_ranges(control_snapshot.ranges)?;
         }
+        if let Backend::Sharded(shards) = &backend {
+            let placements = control
+                .ranges()
+                .into_iter()
+                .map(|range| ryme_shard::RangePlacement {
+                    id: range.id,
+                    start: range.start,
+                    end: range.end,
+                    shard: 0,
+                })
+                .collect();
+            shards.set_range_topology(placements)?;
+        }
         if control.branches.list_for(&tenant).is_empty() {
             control.branches.create_root_for(
                 &tenant,
@@ -2103,15 +2116,31 @@ fn spawn_gateways(
         }
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(autosplit_interval)).await;
-            let created = match autosplit_state.control.lock() {
-                Ok(mut control) => control.auto_split_once(autosplit_writes).unwrap_or_default(),
-                Err(_) => Vec::new(),
-            };
-            if !created.is_empty() {
-                if let Err(error) = autosplit_state.persist_control() {
-                    tracing::error!(%error, "failed to persist auto-split topology");
+            let result = match autosplit_state.control.lock() {
+                Ok(mut control) => {
+                    let previous = control.ranges();
+                    match control.auto_split_once(autosplit_writes) {
+                        Ok(created) => Ok((created, previous, control.ranges())),
+                        Err(error) => Err(error),
+                    }
                 }
-                tracing::info!(ranges = ?created, "auto-split hot ranges");
+                Err(_) => Err(ryme_error::RymeError::Internal(String::from("control lock"))),
+            };
+            match result {
+                Ok((created, previous, updated)) if !created.is_empty() => {
+                    if let Err(error) = sync_range_topology(&autosplit_state, &updated) {
+                        if let Ok(mut control) = autosplit_state.control.lock() {
+                            let _ = control.restore_ranges(previous);
+                        }
+                        tracing::error!(%error, "failed to apply auto-split topology");
+                    } else if let Err(error) = autosplit_state.persist_control() {
+                        tracing::error!(%error, "failed to persist auto-split topology");
+                    } else {
+                        tracing::info!(ranges = ?created, "auto-split hot ranges");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "auto-split failed"),
             }
         }
     });
@@ -5939,6 +5968,7 @@ async fn range_split(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
+    let previous = control.ranges();
     match control.split_range(
         &request.id,
         request.mid.into_bytes(),
@@ -5947,7 +5977,14 @@ async fn range_split(
         request.expected_epoch,
     ) {
         Ok(()) => {
+            let updated = control.ranges();
+            if let Err(error) = sync_range_topology(&state, &updated) {
+                let _ = control.restore_ranges(previous.clone());
+                return error_response(error);
+            }
             if let Err(error) = state.persist_control_locked(&control) {
+                let _ = control.restore_ranges(previous.clone());
+                let _ = sync_range_topology(&state, &previous);
                 return error_response(error);
             }
             let left = control.router_get(&request.left_id);
@@ -5983,6 +6020,7 @@ async fn range_merge(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
+    let previous = control.ranges();
     match control.merge_ranges(
         &request.left_id,
         &request.right_id,
@@ -5991,7 +6029,14 @@ async fn range_merge(
         request.expected_right_epoch,
     ) {
         Ok(()) => {
+            let updated = control.ranges();
+            if let Err(error) = sync_range_topology(&state, &updated) {
+                let _ = control.restore_ranges(previous.clone());
+                return error_response(error);
+            }
             if let Err(error) = state.persist_control_locked(&control) {
+                let _ = control.restore_ranges(previous.clone());
+                let _ = sync_range_topology(&state, &previous);
                 return error_response(error);
             }
             match control.router_get(&request.merged_id) {
@@ -6000,6 +6045,23 @@ async fn range_merge(
             }
         }
         Err(e) => error_response(e),
+    }
+}
+
+fn sync_range_topology(state: &SharedState, ranges: &[Range]) -> ryme_error::Result<()> {
+    let placements = ranges
+        .iter()
+        .cloned()
+        .map(|range| ryme_shard::RangePlacement {
+            id: range.id,
+            start: range.start,
+            end: range.end,
+            shard: 0,
+        })
+        .collect();
+    match &state.backend {
+        Backend::Sharded(shards) => shards.set_range_topology(placements),
+        _ => Ok(()),
     }
 }
 
@@ -6035,10 +6097,18 @@ async fn range_autosplit(
             return (StatusCode::OK, Json(serde_json::json!({ "split": [] }))).into_response();
         }
     };
+    let previous = control.ranges();
     match control.auto_split_once(threshold) {
         Ok(created) => {
             if !created.is_empty() {
+                let updated = control.ranges();
+                if let Err(error) = sync_range_topology(&state, &updated) {
+                    let _ = control.restore_ranges(previous.clone());
+                    return error_response(error);
+                }
                 if let Err(error) = state.persist_control_locked(&control) {
+                    let _ = control.restore_ranges(previous.clone());
+                    let _ = sync_range_topology(&state, &previous);
                     return error_response(error);
                 }
             }

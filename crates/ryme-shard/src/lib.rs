@@ -5,7 +5,7 @@ use ryme_txn::{
 };
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -40,6 +40,14 @@ pub struct MoveReport {
     pub max_commit_ts: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangePlacement {
+    pub id: String,
+    pub start: Vec<u8>,
+    pub end: Vec<u8>,
+    pub shard: usize,
+}
+
 #[derive(Debug)]
 struct ShardCtx {
     shard: Option<usize>,
@@ -52,8 +60,11 @@ struct ShardCtx {
 struct ShardInner {
     base_dir: std::path::PathBuf,
     placement_path: std::path::PathBuf,
+    range_placement_path: std::path::PathBuf,
     shards: Vec<DurableManager>,
     place: HashMap<TableRef, usize>,
+    range_assignments: HashMap<String, usize>,
+    ranges: Vec<RangePlacement>,
     paused: HashSet<TableRef>,
     side: HashMap<u64, ShardCtx>,
     coordinator: Mutex<Wal>,
@@ -166,6 +177,56 @@ fn load_placements(path: &std::path::Path, shard_count: usize) -> Result<HashMap
     Ok(placements)
 }
 
+fn load_range_assignments(
+    path: &std::path::Path,
+    shard_count: usize,
+) -> Result<HashMap<String, usize>> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let entries: HashMap<String, usize> = serde_json::from_slice(&raw)
+        .map_err(|error| RymeError::Corrupt(format!("range placements: {error}")))?;
+    if entries.values().any(|shard| *shard >= shard_count) {
+        return Err(RymeError::Corrupt(String::from("range placement shard")));
+    }
+    Ok(entries)
+}
+
+fn persist_range_assignments(
+    path: &std::path::Path,
+    assignments: &HashMap<String, usize>,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(assignments)
+        .map_err(|error| RymeError::Internal(format!("range placements: {error}")))?;
+    let temporary = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn range_key(key: &RecordKey) -> Vec<u8> {
+    let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
+    routing.extend_from_slice(key.table.as_bytes());
+    routing.push(0);
+    routing.extend_from_slice(&key.pk);
+    routing
+}
+
+fn route_range(ranges: &[RangePlacement], key: &[u8]) -> Option<usize> {
+    ranges.iter().rev().find(|range| range.start.as_slice() <= key).and_then(|range| {
+        if range.end.is_empty() || key < range.end.as_slice() {
+            Some(range.shard)
+        } else {
+            None
+        }
+    })
+}
+
 fn decode_decision(raw: &[u8]) -> Result<(u64, DecisionParts)> {
     let corrupt = || RymeError::Corrupt(String::from("decision"));
     if raw.first() != Some(&1u8) || raw.len() < 13 {
@@ -229,13 +290,18 @@ impl ShardSet {
         }
         let coordinator = Wal::open(&data_dir.join("coordinator"), 1024 * 1024)?;
         let placement_path = data_dir.join("placements.json");
+        let range_placement_path = data_dir.join("range-placements.json");
         let place = load_placements(&placement_path, shards)?;
+        let range_assignments = load_range_assignments(&range_placement_path, shards)?;
         let set = Self {
             inner: Arc::new(Mutex::new(ShardInner {
                 base_dir: data_dir.to_path_buf(),
                 placement_path,
+                range_placement_path,
                 shards: managers,
                 place,
+                range_assignments,
+                ranges: Vec::new(),
                 paused: HashSet::new(),
                 side: HashMap::new(),
                 coordinator: Mutex::new(coordinator),
@@ -396,6 +462,139 @@ impl ShardSet {
         hash_table(table, inner.shards.len())
     }
 
+    fn route_record(&self, key: &RecordKey) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let table = TableRef::of(key);
+        route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+            inner
+                .place
+                .get(&table)
+                .copied()
+                .unwrap_or_else(|| hash_table(&table, inner.shards.len()))
+        })
+    }
+
+    pub fn range_placements(&self) -> Vec<RangePlacement> {
+        self.inner.lock().map(|inner| inner.ranges.clone()).unwrap_or_default()
+    }
+
+    pub fn set_range_topology(&self, mut ranges: Vec<RangePlacement>) -> Result<()> {
+        ranges.sort_by(|left, right| left.start.cmp(&right.start));
+        for (index, range) in ranges.iter().enumerate() {
+            if range.shard >= self.shard_count() {
+                return Err(RymeError::InvalidArgument(String::from("range shard")));
+            }
+            if !range.end.is_empty() && range.start >= range.end {
+                return Err(RymeError::InvalidArgument(String::from("range bounds")));
+            }
+            if let Some(next) = ranges.get(index + 1) {
+                if range.end.is_empty() || range.end != next.start {
+                    return Err(RymeError::InvalidArgument(String::from("range gap")));
+                }
+            }
+        }
+        if let Some(first) = ranges.first() {
+            if !first.start.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from("range start")));
+            }
+        }
+        if let Some(last) = ranges.last() {
+            if !last.end.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from("range end")));
+            }
+        }
+
+        let _write =
+            self.commit.write().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let mut inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let old_ranges = inner.ranges.clone();
+        let old_assignments = inner.range_assignments.clone();
+        let mut assignments = inner.range_assignments.clone();
+        for range in &ranges {
+            let shard = assignments.get(&range.id).copied().or_else(|| {
+                old_ranges
+                    .iter()
+                    .find(|old| {
+                        (old.end.is_empty() || range.start < old.end)
+                            && (range.end.is_empty() || old.start < range.end)
+                    })
+                    .map(|old| {
+                        if range.start == old.start {
+                            old.shard
+                        } else {
+                            (old.shard + 1) % inner.shards.len().max(1)
+                        }
+                    })
+            });
+            let shard = shard.unwrap_or(range.shard);
+            assignments.insert(range.id.clone(), shard);
+        }
+        for range in &mut ranges {
+            range.shard = assignments[&range.id];
+        }
+
+        if old_ranges != ranges {
+            Self::rebalance_ranges_locked(&inner, &ranges)?;
+        }
+        inner.ranges = ranges;
+        inner.range_assignments = assignments;
+        if old_assignments != inner.range_assignments {
+            persist_range_assignments(&inner.range_placement_path, &inner.range_assignments)?;
+        }
+        Ok(())
+    }
+
+    fn rebalance_ranges_locked(inner: &ShardInner, ranges: &[RangePlacement]) -> Result<()> {
+        let mut tables = std::collections::BTreeSet::new();
+        for shard in &inner.shards {
+            tables.extend(shard.spaces()?);
+        }
+        let mut moves: BTreeMap<(usize, usize, TableRef), ryme_storage::TableRows> =
+            BTreeMap::new();
+        for (tenant, database, table) in tables {
+            for (source_index, source) in inner.shards.iter().enumerate() {
+                let rows = source.export_table(&tenant, &database, &table)?;
+                for (pk, versions) in rows {
+                    let key = RecordKey::new(&tenant, &database, &table, &pk);
+                    let target = route_range(ranges, &range_key(&key))
+                        .unwrap_or_else(|| hash_table(&TableRef::of(&key), inner.shards.len()));
+                    if target != source_index {
+                        moves
+                            .entry((source_index, target, TableRef::of(&key)))
+                            .or_default()
+                            .push((key.pk, versions));
+                    }
+                }
+            }
+        }
+
+        let mut changed = HashSet::new();
+        for ((source_index, target, table), rows) in moves {
+            let destination = inner
+                .shards
+                .get(target)
+                .ok_or_else(|| RymeError::Unavailable(String::from("range shard")))?;
+            let keys: Vec<RecordKey> = rows
+                .iter()
+                .map(|(pk, _)| RecordKey::new(&table.tenant, &table.database, &table.table, pk))
+                .collect();
+            destination.import_table(&table.tenant, &table.database, &table.table, rows)?;
+
+            let source = inner
+                .shards
+                .get(source_index)
+                .ok_or_else(|| RymeError::Unavailable(String::from("range shard")))?;
+            source.purge_keys(&keys)?;
+            changed.insert(source_index);
+            changed.insert(target);
+        }
+        for index in changed {
+            inner.shards[index].write_snapshot()?;
+        }
+        Ok(())
+    }
+
     pub fn route_table(&self, tenant: &str, database: &str, table: &str) -> usize {
         self.route(&TableRef::new(tenant, database, table))
     }
@@ -435,7 +634,8 @@ impl ShardSet {
         out
     }
 
-    fn touch(&self, txn: &Transaction, table: TableRef) -> usize {
+    fn touch(&self, txn: &Transaction, key: &RecordKey) -> usize {
+        let table = TableRef::of(key);
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if inner.side.len() > 4096 {
@@ -444,8 +644,13 @@ impl ShardSet {
         }
         let (shard, stamp) = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let fallback = hash_table(&table, inner.shards.len());
-            let shard = inner.place.get(&table).copied().unwrap_or(fallback);
+            let shard = route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                inner
+                    .place
+                    .get(&table)
+                    .copied()
+                    .unwrap_or_else(|| hash_table(&table, inner.shards.len()))
+            });
             (shard, inner.shards[shard].inner().latest_commit())
         };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -471,6 +676,8 @@ impl ShardSet {
     }
 
     fn commit_single(&self, txn: Transaction, ctx: ShardCtx, shard: usize) -> Result<u64> {
+        let _read =
+            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         let inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         if Some(shard) != ctx.shard {
@@ -480,17 +687,7 @@ impl ShardSet {
             if inner.paused.contains(table) {
                 return Err(RymeError::Unavailable(String::from("rescheduling")));
             }
-            let placed = inner
-                .place
-                .get(table)
-                .copied()
-                .unwrap_or_else(|| hash_table(table, inner.shards.len()));
-            if placed != shard {
-                return Err(RymeError::Unavailable(String::from("rescheduling")));
-            }
         }
-        let _read =
-            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         let manager = inner
             .shards
             .get(shard)
@@ -502,10 +699,10 @@ impl ShardSet {
     }
 
     fn commit_two_phase(&self, txn: Transaction) -> Result<u64> {
-        let inner =
-            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         let _write =
             self.commit.write().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         let shards = inner.shards.len();
         let mut cohort: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for key in txn.writes().keys().chain(txn.read_keys().iter()) {
@@ -513,8 +710,9 @@ impl ShardSet {
             if inner.paused.contains(&table) {
                 return Err(RymeError::Unavailable(String::from("rescheduling")));
             }
-            let shard =
-                inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards));
+            let shard = route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
+            });
             cohort.insert(shard);
         }
         for table in txn.scanned_tables().iter() {
@@ -522,9 +720,13 @@ impl ShardSet {
             if inner.paused.contains(&table) {
                 return Err(RymeError::Unavailable(String::from("rescheduling")));
             }
-            let shard =
-                inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards));
-            cohort.insert(shard);
+            if inner.ranges.is_empty() {
+                let shard =
+                    inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards));
+                cohort.insert(shard);
+            } else {
+                cohort.extend(0..shards);
+            }
         }
         if cohort.len() < 2 {
             let shard = cohort.iter().next().copied().unwrap_or(0);
@@ -554,7 +756,9 @@ impl ShardSet {
             .keys()
             .map(|key| {
                 let table = TableRef::of(key);
-                inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
+                route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                    inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
+                })
             })
             .collect();
         let commit_ts =
@@ -570,8 +774,13 @@ impl ShardSet {
                 .iter()
                 .filter(|(key, _)| {
                     let table = TableRef::of(key);
-                    inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
-                        == *shard
+                    route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                        inner
+                            .place
+                            .get(&table)
+                            .copied()
+                            .unwrap_or_else(|| hash_table(&table, shards))
+                    }) == *shard
                 })
                 .map(|(key, op)| (key.clone(), op.clone()))
                 .collect();
@@ -589,8 +798,9 @@ impl ShardSet {
             let index = *shard;
             manager.commit_at(&txn, commit_ts, |key| {
                 let table = TableRef::of(key);
-                inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
-                    == index
+                route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                    inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
+                }) == index
             })?;
         }
         Ok(commit_ts)
@@ -604,10 +814,13 @@ impl ShardSet {
         target: Option<usize>,
     ) -> Result<MoveReport> {
         let table_ref = TableRef::new(tenant, database, table);
-        let mut inner =
-            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         let _write =
             self.commit.write().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let mut inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        if !inner.ranges.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("range placement")));
+        }
         let from = inner
             .place
             .get(&table_ref)
@@ -724,35 +937,39 @@ impl TxnBackend for ShardSet {
     }
 
     fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
-        let shard = self.route(&TableRef::of(key));
+        let _read =
+            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let shard = self.route_record(key);
         let manager =
             self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
         manager.get(txn, key)
     }
 
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
-        let shard = self.touch(txn, TableRef::of(&key));
+        let shard = self.touch(txn, &key);
         if let Some(manager) = self.manager_for(shard) {
             manager.put(txn, key, value);
         }
     }
 
     fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
-        let shard = self.touch(txn, TableRef::of(&key));
+        let shard = self.touch(txn, &key);
         if let Some(manager) = self.manager_for(shard) {
             manager.put_with_ttl(txn, key, value, expires_at);
         }
     }
 
     fn delete(&self, txn: &mut Transaction, key: RecordKey) {
-        let shard = self.touch(txn, TableRef::of(&key));
+        let shard = self.touch(txn, &key);
         if let Some(manager) = self.manager_for(shard) {
             manager.delete(txn, key);
         }
     }
 
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
-        let shard = self.route(&TableRef::of(key));
+        let _read =
+            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let shard = self.route_record(key);
         let manager =
             self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
         manager.expires_at(key)
@@ -786,15 +1003,23 @@ impl TxnBackend for ShardSet {
             let mut cohort: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             for key in txn.writes().keys().chain(txn.read_keys().iter()) {
                 let table = TableRef::of(key);
-                let shard =
-                    guard.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards));
+                let shard = route_range(&guard.ranges, &range_key(key)).unwrap_or_else(|| {
+                    guard.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
+                });
                 cohort.insert(shard);
             }
             for table in txn.scanned_tables().iter() {
                 let table = TableRef::new(&table.0, &table.1, &table.2);
-                let shard =
-                    guard.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards));
-                cohort.insert(shard);
+                if guard.ranges.is_empty() {
+                    let shard = guard
+                        .place
+                        .get(&table)
+                        .copied()
+                        .unwrap_or_else(|| hash_table(&table, shards));
+                    cohort.insert(shard);
+                } else {
+                    cohort.extend(0..shards);
+                }
             }
             drop(guard);
             if cohort.len() == 1 {
@@ -813,6 +1038,29 @@ impl TxnBackend for ShardSet {
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let _read =
+            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        if !self
+            .inner
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
+            .ranges
+            .is_empty()
+        {
+            let managers = self
+                .inner
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("shard lock")))?
+                .shards
+                .clone();
+            let mut rows = Vec::new();
+            for manager in managers {
+                rows.extend(manager.scan(txn, tenant, database, table, limit)?);
+            }
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows.truncate(limit);
+            return Ok(rows);
+        }
         let shard = self.route(&TableRef::new(tenant, database, table));
         let manager =
             self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
@@ -828,6 +1076,36 @@ impl TxnBackend for ShardSet {
         start_after: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let _read =
+            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        if !self
+            .inner
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
+            .ranges
+            .is_empty()
+        {
+            let managers = self
+                .inner
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("shard lock")))?
+                .shards
+                .clone();
+            let mut rows = Vec::new();
+            for manager in managers {
+                rows.extend(manager.scan_after(
+                    txn,
+                    tenant,
+                    database,
+                    table,
+                    start_after,
+                    limit,
+                )?);
+            }
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows.truncate(limit);
+            return Ok(rows);
+        }
         let shard = self.route(&TableRef::new(tenant, database, table));
         let manager =
             self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
@@ -1154,6 +1432,139 @@ mod tests {
         let mut txn = backend.begin();
         let key = RecordKey::new("t", "d", "users", b"1");
         assert_eq!(backend.get(&mut txn, &key).unwrap(), Some(b"a".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn range_topology_routes_and_migrates_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-range-shard-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 2, SyncPolicy::Never).unwrap();
+        commit_table(&backend, "t", "d", "users", writes(vec![("a", "one"), ("z", "last")]));
+        backend
+            .set_range_topology(vec![RangePlacement {
+                id: String::from("users-all"),
+                start: Vec::new(),
+                end: Vec::new(),
+                shard: 0,
+            }])
+            .unwrap();
+        backend
+            .set_range_topology(vec![
+                RangePlacement {
+                    id: String::from("users-left"),
+                    start: Vec::new(),
+                    end: b"users\0m".to_vec(),
+                    shard: 0,
+                },
+                RangePlacement {
+                    id: String::from("users-right"),
+                    start: b"users\0m".to_vec(),
+                    end: Vec::new(),
+                    shard: 0,
+                },
+            ])
+            .unwrap();
+        let mut txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"a")).unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
+            Some(b"last".to_vec())
+        );
+        let left = backend.shard_manager(0).unwrap();
+        let right = backend.shard_manager(1).unwrap();
+        let mut left_txn = left.begin();
+        let mut right_txn = right.begin();
+        assert_eq!(
+            left.get(&mut left_txn, &RecordKey::new("t", "d", "users", b"a")).unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            right.get(&mut right_txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
+            Some(b"last".to_vec())
+        );
+        drop(backend);
+
+        let backend = ShardSet::open(&dir, 2, SyncPolicy::Never).unwrap();
+        backend
+            .set_range_topology(vec![
+                RangePlacement {
+                    id: String::from("users-left"),
+                    start: Vec::new(),
+                    end: b"users\0m".to_vec(),
+                    shard: 0,
+                },
+                RangePlacement {
+                    id: String::from("users-right"),
+                    start: b"users\0m".to_vec(),
+                    end: Vec::new(),
+                    shard: 0,
+                },
+            ])
+            .unwrap();
+        let placements = backend.range_placements();
+        assert_eq!(placements[0].shard, 0);
+        assert_eq!(placements[1].shard, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn range_topology_standard_mode_preserves_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-range-standard-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open_with_mode(
+            &dir,
+            2,
+            SyncPolicy::Never,
+            64 * 1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        commit_table(&backend, "t", "d", "users", writes(vec![("a", "one"), ("z", "last")]));
+        backend
+            .set_range_topology(vec![RangePlacement {
+                id: String::from("users-all"),
+                start: Vec::new(),
+                end: Vec::new(),
+                shard: 0,
+            }])
+            .unwrap();
+        backend
+            .set_range_topology(vec![
+                RangePlacement {
+                    id: String::from("users-left"),
+                    start: Vec::new(),
+                    end: b"users\0m".to_vec(),
+                    shard: 0,
+                },
+                RangePlacement {
+                    id: String::from("users-right"),
+                    start: b"users\0m".to_vec(),
+                    end: Vec::new(),
+                    shard: 0,
+                },
+            ])
+            .unwrap();
+        let mut txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"a")).unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
+            Some(b"last".to_vec())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -317,6 +317,23 @@ impl Engine {
         count
     }
 
+    pub fn purge_keys(&mut self, keys: &[RecordKey]) -> usize {
+        let mut removed = 0;
+        for key in keys {
+            if self.inner.remove(key).is_some() {
+                removed += 1;
+            }
+        }
+        self.bytes_held = self
+            .inner
+            .values()
+            .flat_map(|versions| versions.iter())
+            .filter_map(|version| version.value.as_ref())
+            .map(|value| value.len() as u64)
+            .sum();
+        removed
+    }
+
     pub fn spaces(&self) -> Vec<(String, String, String)> {
         let mut spaces = std::collections::BTreeSet::new();
         for key in self.inner.keys() {

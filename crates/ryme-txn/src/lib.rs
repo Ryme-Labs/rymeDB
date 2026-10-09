@@ -810,6 +810,20 @@ impl TxnManager {
         Ok(engine.drop_table(tenant, database, table))
     }
 
+    pub fn purge_keys(&self, keys: &[RecordKey]) -> Result<usize> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let mut engine = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+        Ok(engine.purge_keys(keys))
+    }
+
     pub fn export_table(
         &self,
         tenant: &str,
@@ -1301,6 +1315,25 @@ impl DurableManager {
         }
         self.inner.advance_to(max);
         Ok(max)
+    }
+
+    pub fn purge_keys(&self, keys: &[RecordKey]) -> Result<usize> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
+        if self.mode == StorageMode::Hot {
+            return self.inner.purge_keys(keys);
+        }
+        let mut engine = self.materialized_segments()?;
+        let removed = engine.purge_keys(keys);
+        let max = engine.max_commit_ts();
+        let (_, newest) = self.segments.write(max, &engine)?;
+        for path in self.segments.segment_paths()? {
+            if path != newest {
+                std::fs::remove_file(path)?;
+            }
+        }
+        self.inner.advance_to(max);
+        Ok(removed)
     }
 
     pub fn spaces(&self) -> Result<Vec<(String, String, String)>> {

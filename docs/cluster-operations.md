@@ -153,9 +153,9 @@ map. Merges additionally require adjacency and a shared leader.
 Automatic splitting: every range counts routed writes. REST KV put/delete,
 SQL writes and COPY row counts feed the counters, and so do the wire
 gateways: RESP notes committed staged keys (single commands, `EXEC`
-batches and blocking pops/moves), PG notes successful write statements by
-table, native notes put/delete by key and SQL writes by table, and gRPC
-notes `KvPut`/`KvDelete` by key and SQL writes by table. When
+batches and blocking pops/moves), PG, native, and gRPC note row keys when
+the SQL statement exposes them and use a table-level fallback for predicates.
+When
 `autosplit_writes` is non-zero,
 `POST /v1/ranges/autosplit` splits every range at or above the threshold
 (`?min_writes=` overrides it for one call), and a background task repeats
@@ -171,7 +171,10 @@ skipped. Both settings default to off (`autosplit_writes: 0`), in which case
 write accounting is skipped entirely. Merges stay manual: only an operator
 can fuse ranges.
 
-Scope note: ranges are placement/routing metadata. Table data placement on
-sharded backends moves whole tables via `POST /v1/shards/move`
-(`ShardSet::move_table`, byte-verified); range splits do not relocate rows by
-themselves.
+On a local sharded backend (`shards > 1` without cluster mode), the persisted
+range topology is also the data-plane placement map. Point reads/writes route
+by `table\0primary-key`; a split or merge migrates affected rows between local
+shards before the new topology is persisted, and range assignments survive a
+restart. `POST /v1/shards/move` remains available for whole-table placement.
+Cluster and hybrid backends still use range metadata for routing/load control;
+their cross-node range transfer requires the cluster data-movement protocol.

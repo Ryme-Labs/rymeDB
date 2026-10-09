@@ -355,6 +355,47 @@ async fn ranges_autosplit_fires_on_write_load() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn range_split_keeps_rows_available_on_sharded_backend() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-range-sharded-server-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root, pg, resp, http);
+    config.shards = 2;
+    let _server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, _) = http_request(http, "PUT /v1/kv/t/a", b"one").await;
+    assert_eq!(status, 200);
+    let (status, _) = http_request(http, "PUT /v1/kv/t/z", b"last").await;
+    assert_eq!(status, 200);
+    let (status, body) = http_request(
+        http,
+        "POST /v1/ranges/split",
+        br#"{"id":"range-0","mid":"t\u0000m","left_id":"left","right_id":"right","expected_epoch":0}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http_request(http, "GET /rest/v1/t?key=eq.a", b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(body[0]["value"], "one", "{body}");
+    let (status, body) = http_request(http, "GET /rest/v1/t?key=eq.z", b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(body[0]["value"], "last", "{body}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 async fn resp_command(addr: std::net::SocketAddr, parts: &[&str]) -> String {
     let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut frame = format!("*{}\r\n", parts.len());
