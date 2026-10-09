@@ -606,6 +606,7 @@ async fn cluster_cdc_reaches_every_gateway() {
         http_request(http[leader], "PUT /v1/kv/docs/cluster-cdc", br#"{"value":"replicated"}"#)
             .await;
     assert_eq!(status, 200);
+    let mut sequences: Vec<u64> = Vec::new();
     for mut socket in sockets {
         let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
             .await
@@ -616,10 +617,17 @@ async fn cluster_cdc_reaches_every_gateway() {
             tokio_tungstenite::tungstenite::Message::Text(text) => {
                 assert!(text.contains("\"table\":\"docs\""), "unexpected CDC: {text}");
                 assert!(text.contains("\"sequence\":"), "missing sequence: {text}");
+                let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+                sequences.push(record.get("sequence").and_then(|value| value.as_u64()).unwrap());
             }
             other => panic!("unexpected websocket message: {other:?}"),
         }
     }
+    assert!(!sequences.is_empty());
+    assert!(
+        sequences.windows(2).all(|pair| pair[0] == pair[1]),
+        "gateway cursors diverged: {sequences:?}"
+    );
     for handle in handles {
         handle.shutdown();
     }

@@ -8,6 +8,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Cluster CDC streams now use deterministic commit-derived cursors, so a
+  reconnect through another live gateway resumes from the same sequence
+  watermark instead of using that gateway's local realtime counter.
+
 - PostgreSQL wire `COPY FROM STDIN` now accepts declared SQL column lists and
   typed text fields, including `\\N` nulls and omitted-column defaults, while
   retaining the key/value bulk-ingest path for schemaless tables.

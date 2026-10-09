@@ -1045,7 +1045,7 @@ impl SharedState {
             )?),
             None => Backend::Single(durable.clone()),
         };
-        let realtime = Realtime::new(4096);
+        let realtime = Realtime::new(4096).with_stable_cdc();
         let durable_path = config.data_dir.join("topics.json");
         let durable_snapshot = load_durable_snapshot(&durable_path)?;
         realtime.restore_durable_snapshot(durable_snapshot)?;

@@ -45,9 +45,12 @@ administrative role). Each frame is a `ChangeRecord`
   so RESP-only writes made with zero subscribers are absent from replay.
 - For exact reconnects, use `?from_sequence=<sequence>` from the last
   delivered `ChangeRecord`. This distinguishes multiple writes sharing one
-  commit timestamp and uses the same retained ring for recovery. The JS,
-  The npm/TypeScript SDK exposes this cursor as `fromSequence`; Java and Rust
+  commit timestamp and uses the same retained ring for recovery. The
+  npm/TypeScript SDK exposes this cursor as `fromSequence`; Java and Rust
   clients can pass `from_sequence` directly to the stream endpoint.
+  Server-backed streams use a deterministic commit-derived sequence, so the
+  same committed write has the same cursor on every gateway in a cluster;
+  reconnecting through another gateway does not change the watermark.
 - Streams default to the `main` branch. Set `?branch=<id>` for browser
   WebSocket clients, or send `X-Ryme-Branch: <id>` from clients that can set
   headers. The query parameter and header must agree when both are present.

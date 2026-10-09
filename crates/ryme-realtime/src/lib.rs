@@ -39,6 +39,7 @@ pub const PRESENCE_MAX_MEMBERS: usize = 1000;
 pub const PRESENCE_MAX_TTL_SECS: u64 = 86400;
 const BROADCAST_SHARDS: usize = 32;
 const TABLE_TOPIC_SHARDS: usize = 32;
+const STABLE_CDC_SEQUENCE_STRIDE: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryUpdate {
@@ -61,6 +62,8 @@ pub struct Realtime {
     broadcast_capacity: usize,
     capacity: usize,
     sequence: Arc<AtomicU64>,
+    stable_cdc: bool,
+    cdc_sequences: Arc<Mutex<HashMap<String, (u64, u64)>>>,
 }
 
 #[derive(Debug)]
@@ -158,7 +161,16 @@ impl Realtime {
             broadcast_capacity: capacity,
             capacity,
             sequence: Arc::new(AtomicU64::new(0)),
+            stable_cdc: false,
+            cdc_sequences: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Use commit-derived CDC cursors so every gateway that applies the same
+    /// committed write set exposes the same resume watermark.
+    pub fn with_stable_cdc(mut self) -> Self {
+        self.stable_cdc = true;
+        self
     }
 
     fn next_sequence(&self) -> u64 {
@@ -196,7 +208,7 @@ impl Realtime {
             .ok_or_else(|| RymeError::Internal(String::from("realtime topic shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("realtime topic lock")))?;
-        let sequence = self.reserve_sequence();
+        let sequence = self.next_change_sequence(&key, event.commit_ts);
         let record = ChangeRecord {
             tenant: event.tenant,
             database: event.database,
@@ -219,6 +231,23 @@ impl Realtime {
         }
         log.push_back(record);
         Ok(sequence)
+    }
+
+    fn next_change_sequence(&self, key: &str, commit_ts: u64) -> u64 {
+        if !self.stable_cdc {
+            return self.reserve_sequence();
+        }
+        let Ok(mut sequences) = self.cdc_sequences.lock() else {
+            return self.reserve_sequence();
+        };
+        let ordinal = match sequences.get(key).copied() {
+            Some((last_commit, ordinal)) if last_commit == commit_ts => ordinal.saturating_add(1),
+            _ => 0,
+        };
+        sequences.insert(key.to_string(), (commit_ts, ordinal));
+        commit_ts
+            .saturating_mul(STABLE_CDC_SEQUENCE_STRIDE)
+            .saturating_add(ordinal.saturating_add(1))
     }
 
     pub fn has_subscribers(&self, tenant: &str, database: &str, table: &str) -> bool {
@@ -955,6 +984,38 @@ mod tests {
         let records = realtime.replay("t", "d", "docs", 0, 1024);
         assert_eq!(records.len(), 512);
         assert!(records.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+    }
+
+    #[test]
+    fn stable_cdc_sequences_match_across_gateways() {
+        let left = Realtime::new(64).with_stable_cdc();
+        let right = Realtime::new(64).with_stable_cdc();
+        let event = || NewChange {
+            tenant: String::from("t"),
+            database: String::from("d"),
+            branch: String::from("main"),
+            table: String::from("docs"),
+            op: Operation::Insert,
+            pk: b"one".to_vec(),
+            before: None,
+            after: Some(b"value".to_vec()),
+            commit_ts: 42,
+            tx_id: 42,
+        };
+        let mut left_events = left.subscribe("t", "d", "docs");
+        let mut right_events = right.subscribe("t", "d", "docs");
+        let first = left.publish(event()).unwrap();
+        let second = right.publish(event()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, 42_000_001);
+
+        let next = NewChange { pk: b"two".to_vec(), commit_ts: 42, tx_id: 42, ..event() };
+        left.publish(next.clone()).unwrap();
+        right.publish(next).unwrap();
+        assert_eq!(left_events.try_recv().unwrap().sequence, 42_000_001);
+        assert_eq!(right_events.try_recv().unwrap().sequence, 42_000_001);
+        assert_eq!(left_events.try_recv().unwrap().sequence, 42_000_002);
+        assert_eq!(right_events.try_recv().unwrap().sequence, 42_000_002);
     }
 
     #[test]
