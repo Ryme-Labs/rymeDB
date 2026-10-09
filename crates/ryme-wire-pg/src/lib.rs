@@ -1938,7 +1938,7 @@ where
                         quoted = !quoted;
                         current.push(ch);
                     } else if ch == ',' && !quoted {
-                        values.push(unquote_literal(current.trim()));
+                        values.push(execute_parameter(current.trim()));
                         current = String::new();
                     } else {
                         current.push(ch);
@@ -2077,6 +2077,14 @@ fn unquote_literal(value: &str) -> String {
         return trimmed[1..trimmed.len() - 1].to_string();
     }
     trimmed.to_string()
+}
+
+fn execute_parameter(value: &str) -> String {
+    if value.eq_ignore_ascii_case("NULL") {
+        String::from("\0")
+    } else {
+        unquote_literal(value)
+    }
 }
 
 fn split_select_list(input: &str) -> Vec<String> {
@@ -2325,7 +2333,7 @@ fn parse_bind(payload: &[u8]) -> std::result::Result<(String, String, Vec<String
         let length = read_i32(payload, &mut offset)
             .ok_or_else(|| RymeError::InvalidArgument(String::from("bind length")))?;
         if length < 0 {
-            params.push(String::new());
+            params.push(String::from("\0"));
             continue;
         }
         let length = length as usize;
@@ -2682,6 +2690,19 @@ mod tests {
         assert_eq!(rows[2], (String::from("n"), String::from("42")));
         assert!(session_select("SELECT * FROM users").is_none());
         assert!(session_select("SELECT pg_catalog.version()").is_none());
+    }
+
+    #[test]
+    fn bind_decodes_null_parameters_as_sql_null() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"portal\0statement\0");
+        payload.extend_from_slice(&0i16.to_be_bytes());
+        payload.extend_from_slice(&1i16.to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes());
+        let (_, _, params) = parse_bind(&payload).unwrap();
+        assert_eq!(params, vec![String::from("\0")]);
+        assert_eq!(execute_parameter("NULL"), "\0");
+        assert_eq!(execute_parameter("'NULL'"), "NULL");
     }
 
     #[test]

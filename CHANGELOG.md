@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL prepared parameters now bind only real placeholders outside SQL
+  literals and comments, handle multi-digit references, preserve scalar
+  `NULL`/boolean/numeric values, and escape text safely.
 - Basic PostgreSQL CTEs now rewrite one or more simple `WITH name AS (SELECT *
   FROM table [WHERE ...])` sources for outer selects, aggregates, grouping,
   and `INSERT ... SELECT` statements.

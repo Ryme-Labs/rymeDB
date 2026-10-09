@@ -1328,13 +1328,112 @@ fn parse_returning_fields(tokens: &[String]) -> Result<Vec<ReturningField>> {
 }
 
 pub fn bind(sql: &str, params: &[String]) -> String {
-    let mut out = sql.to_string();
-    for (index, value) in params.iter().enumerate() {
-        let placeholder = format!("${}", index + 1);
-        let literal = format!("'{}'", value.replace('\'', "''"));
-        out = out.replace(&placeholder, &literal);
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(sql.len());
+    let mut index = 0;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while index < chars.len() {
+        let current = chars[index];
+        if line_comment {
+            out.push(current);
+            if current == '\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            out.push(current);
+            if current == '*' && chars.get(index + 1) == Some(&'/') {
+                out.push('/');
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            out.push(current);
+            if current == '\\' && delimiter == '\'' {
+                if let Some(escaped) = chars.get(index + 1) {
+                    out.push(*escaped);
+                    index += 2;
+                    continue;
+                }
+            }
+            if current == delimiter {
+                if chars.get(index + 1) == Some(&delimiter) {
+                    out.push(delimiter);
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if current == '-' && chars.get(index + 1) == Some(&'-') {
+            out.push('-');
+            out.push('-');
+            line_comment = true;
+            index += 2;
+            continue;
+        }
+        if current == '/' && chars.get(index + 1) == Some(&'*') {
+            out.push('/');
+            out.push('*');
+            block_comment = true;
+            index += 2;
+            continue;
+        }
+        if current == '\'' || current == '"' {
+            quote = Some(current);
+            out.push(current);
+            index += 1;
+            continue;
+        }
+        if current == '$' {
+            let mut end = index + 1;
+            while chars.get(end).is_some_and(char::is_ascii_digit) {
+                end += 1;
+            }
+            if end > index + 1 {
+                let placeholder = chars[index + 1..end].iter().collect::<String>();
+                let placeholder = placeholder.parse::<usize>().ok();
+                if let Some(placeholder) = placeholder
+                    .filter(|placeholder| *placeholder > 0)
+                    .and_then(|placeholder| params.get(placeholder - 1))
+                {
+                    out.push_str(&bind_literal(placeholder));
+                } else {
+                    out.extend(chars[index..end].iter());
+                }
+                index = end;
+                continue;
+            }
+        }
+        out.push(current);
+        index += 1;
     }
     out
+}
+
+fn bind_literal(value: &str) -> String {
+    let trimmed = value.trim();
+    if value == "\0" {
+        return String::from("NULL");
+    }
+    if trimmed.eq_ignore_ascii_case("TRUE")
+        || trimmed.eq_ignore_ascii_case("FALSE")
+        || trimmed.parse::<i64>().is_ok()
+        || trimmed.parse::<f64>().is_ok()
+    {
+        return trimmed.to_string();
+    }
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn tokenize(input: &str) -> Vec<String> {
@@ -12929,6 +13028,32 @@ mod tests {
         assert_eq!(
             statement,
             Statement::SelectByKey { table: String::from("users"), pk: b"7".to_vec() }
+        );
+    }
+
+    #[test]
+    fn bind_params_respects_sql_literals_comments_and_parameter_width() {
+        let sql = bind(
+            "SELECT '$1', \"$2\", $1, $10 -- $2\n/* $3 */",
+            &(1..=10).map(|value| value.to_string()).collect::<Vec<_>>(),
+        );
+        assert_eq!(sql, "SELECT '$1', \"$2\", 1, 10 -- $2\n/* $3 */");
+    }
+
+    #[test]
+    fn bind_params_preserves_scalar_types_and_escapes_text() {
+        assert_eq!(
+            bind(
+                "SELECT $1, $2, $3, $4, $5",
+                &[
+                    String::from("42"),
+                    String::from("true"),
+                    String::from("\0"),
+                    String::from("O'Reilly"),
+                    String::from("NULL"),
+                ],
+            ),
+            "SELECT 42, true, NULL, 'O''Reilly', 'NULL'"
         );
     }
 
