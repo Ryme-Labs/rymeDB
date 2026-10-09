@@ -56,6 +56,7 @@ struct SessionTransaction {
     txn: Transaction,
     changes: Vec<TransactionChange>,
     notifications: Vec<PgNotification>,
+    listener_changes: Vec<ListenerChange>,
     failed: bool,
     savepoints: Vec<Savepoint>,
 }
@@ -105,6 +106,7 @@ struct Savepoint {
     checkpoint: TransactionCheckpoint,
     changes_len: usize,
     notifications_len: usize,
+    listener_changes_len: usize,
 }
 
 enum TransactionControl {
@@ -125,6 +127,12 @@ struct PgNotification {
     channel: String,
     payload: String,
     pid: u32,
+}
+
+#[derive(Debug, Clone)]
+enum ListenerChange {
+    Listen(String),
+    Unlisten(Option<String>),
 }
 
 static PG_NOTIFICATIONS: LazyLock<
@@ -901,6 +909,7 @@ where
                     if failed {
                         break;
                     }
+                    let was_listening_empty = listening.is_empty();
                     if let Some(response) = notification_command(
                         trimmed,
                         &limits.tenant,
@@ -910,6 +919,10 @@ where
                         &mut active_transaction,
                     ) {
                         out.extend_from_slice(&response);
+                        if was_listening_empty && !listening.is_empty() {
+                            notifications =
+                                notification_sender(&limits.tenant, &limits.database).subscribe();
+                        }
                     } else if let Some(response) = catalog_query(trimmed, &executor) {
                         out.extend_from_slice(&response);
                     } else if let Some(control) = transaction_control(trimmed, &session) {
@@ -917,10 +930,15 @@ where
                             control,
                             &executor,
                             &mut active_transaction,
+                            &mut listening,
                             &mut committed_notifications,
                         )
                         .await;
                         out.extend_from_slice(&response);
+                        if was_listening_empty && !listening.is_empty() {
+                            notifications =
+                                notification_sender(&limits.tenant, &limits.database).subscribe();
+                        }
                         publish_notifications(
                             &limits.tenant,
                             &limits.database,
@@ -936,11 +954,16 @@ where
                         &session,
                         &limits,
                         &mut active_transaction,
+                        &mut listening,
                         &mut committed_notifications,
                     )
                     .await
                     {
                         out.extend_from_slice(&response);
+                        if was_listening_empty && !listening.is_empty() {
+                            notifications =
+                                notification_sender(&limits.tenant, &limits.database).subscribe();
+                        }
                         publish_notifications(
                             &limits.tenant,
                             &limits.database,
@@ -1116,6 +1139,7 @@ where
             }
             b'E' => {
                 let portal = read_cstring(&payload, &mut 0).unwrap_or_default();
+                let was_listening_empty = listening.is_empty();
                 let mut committed_notifications = Vec::new();
                 let response = match portals.get_mut(&portal) {
                     Some(entry) => match statements.get(&entry.statement) {
@@ -1154,6 +1178,7 @@ where
                                     control,
                                     &executor,
                                     &mut active_transaction,
+                                    &mut listening,
                                     &mut committed_notifications,
                                 )
                                 .await
@@ -1196,6 +1221,10 @@ where
                 } else {
                     response
                 };
+                if was_listening_empty && !listening.is_empty() {
+                    notifications =
+                        notification_sender(&limits.tenant, &limits.database).subscribe();
+                }
                 publish_notifications(
                     &limits.tenant,
                     &limits.database,
@@ -2743,10 +2772,12 @@ where
     B: TxnBackend,
 {
     let mut committed_notifications = Vec::new();
+    let mut listening = HashSet::new();
     handle_transaction_control_with_notifications(
         control,
         executor,
         active,
+        &mut listening,
         &mut committed_notifications,
     )
     .await
@@ -2756,6 +2787,7 @@ async fn handle_transaction_control_with_notifications<B>(
     control: TransactionControl,
     executor: &Arc<Executor<B>>,
     active: &mut Option<SessionTransaction>,
+    listening: &mut HashSet<String>,
     committed_notifications: &mut Vec<PgNotification>,
 ) -> Vec<u8>
 where
@@ -2770,6 +2802,7 @@ where
                     txn: executor.begin_transaction(isolation),
                     changes: Vec::new(),
                     notifications: Vec::new(),
+                    listener_changes: Vec::new(),
                     failed: false,
                     savepoints: Vec::new(),
                 });
@@ -2788,6 +2821,9 @@ where
             }
             match executor.commit_transaction(state.txn, state.changes).await {
                 Ok(_) => {
+                    for change in &state.listener_changes {
+                        apply_listener_change(listening, change);
+                    }
                     committed_notifications.extend(state.notifications);
                     command_complete("COMMIT")
                 }
@@ -2823,6 +2859,7 @@ where
                 checkpoint: state.txn.checkpoint(),
                 changes_len: state.changes.len(),
                 notifications_len: state.notifications.len(),
+                listener_changes_len: state.listener_changes.len(),
             });
             command_complete("SAVEPOINT")
         }
@@ -2865,6 +2902,7 @@ where
             state.txn.restore_checkpoint(&savepoint.checkpoint);
             state.changes.truncate(savepoint.changes_len);
             state.notifications.truncate(savepoint.notifications_len);
+            state.listener_changes.truncate(savepoint.listener_changes_len);
             state.savepoints.truncate(position + 1);
             state.failed = false;
             command_complete("ROLLBACK")
@@ -2975,6 +3013,7 @@ async fn prepared_command<B>(
     session: &HashMap<String, String>,
     limits: &ConnLimits,
     active: &mut Option<SessionTransaction>,
+    listening: &mut HashSet<String>,
     committed_notifications: &mut Vec<PgNotification>,
 ) -> Option<Vec<u8>>
 where
@@ -2986,6 +3025,7 @@ where
                 control,
                 executor,
                 active,
+                listening,
                 committed_notifications,
             )
             .await,
@@ -3096,6 +3136,20 @@ where
             Some(command_complete("DEALLOCATE"))
         }
         _ => None,
+    }
+}
+
+fn apply_listener_change(listening: &mut HashSet<String>, change: &ListenerChange) {
+    match change {
+        ListenerChange::Listen(channel) => {
+            listening.insert(channel.clone());
+        }
+        ListenerChange::Unlisten(Some(channel)) => {
+            listening.remove(channel);
+        }
+        ListenerChange::Unlisten(None) => {
+            listening.clear();
+        }
     }
 }
 
@@ -3271,16 +3325,26 @@ fn notification_command(
         if channel.is_empty() {
             return None;
         }
-        listening.insert(channel);
+        let change = ListenerChange::Listen(channel);
+        if let Some(transaction) = active.as_mut() {
+            transaction.listener_changes.push(change);
+        } else {
+            apply_listener_change(listening, &change);
+        }
         return Some(command_complete("LISTEN"));
     }
     if upper == "UNLISTEN" || upper.starts_with("UNLISTEN ") {
         let channel = normalized.get(8..)?.trim();
-        if channel == "*" {
-            listening.clear();
+        let change = if channel == "*" {
+            ListenerChange::Unlisten(None)
         } else {
             let channel = normalize_notification_name(channel)?;
-            listening.remove(&channel);
+            ListenerChange::Unlisten(Some(channel))
+        };
+        if let Some(transaction) = active.as_mut() {
+            transaction.listener_changes.push(change);
+        } else {
+            apply_listener_change(listening, &change);
         }
         return Some(command_complete("UNLISTEN"));
     }
@@ -4079,6 +4143,7 @@ mod tests {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
             notifications: Vec::new(),
+            listener_changes: Vec::new(),
             failed: false,
             savepoints: Vec::new(),
         });

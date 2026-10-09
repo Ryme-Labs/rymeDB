@@ -71,10 +71,15 @@ async fn listen_notify_delivers_async_notification_response() {
     let mut listener_socket = startup(addr).await;
     let mut sender_socket = startup(addr).await;
 
-    let listen_frames = simple(&mut listener_socket, "LISTEN Chat").await;
-    assert!(listen_frames
+    let listen_rollback = simple(&mut listener_socket, "BEGIN; LISTEN Chat; ROLLBACK").await;
+    assert!(listen_rollback
         .iter()
-        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("LISTEN") }));
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("ROLLBACK") }));
+
+    let before_commit = simple(&mut sender_socket, "NOTIFY chat, 'before commit'").await;
+    assert!(before_commit
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("NOTIFY") }));
 
     let rolled_back =
         simple(&mut sender_socket, "BEGIN; NOTIFY chat, 'rolled back'; ROLLBACK").await;
@@ -84,6 +89,11 @@ async fn listen_notify_delivers_async_notification_response() {
     assert!(tokio::time::timeout(Duration::from_millis(100), read_frame(&mut listener_socket))
         .await
         .is_err());
+
+    let listen_frames = simple(&mut listener_socket, "BEGIN; LISTEN Chat; COMMIT").await;
+    assert!(listen_frames
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("LISTEN") }));
 
     let notify_frames = simple(
         &mut sender_socket,
@@ -104,8 +114,29 @@ async fn listen_notify_delivers_async_notification_response() {
         .await
         .is_err());
 
-    let unlisten_frames = simple(&mut listener_socket, "UNLISTEN chat").await;
+    let unlisten_rollback = simple(&mut listener_socket, "BEGIN; UNLISTEN chat; ROLLBACK").await;
+    assert!(unlisten_rollback
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("ROLLBACK") }));
+    let still_listening = simple(&mut sender_socket, "NOTIFY chat, 'still listening'").await;
+    assert!(still_listening
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("NOTIFY") }));
+    let (tag, body) = read_frame(&mut listener_socket).await;
+    assert_eq!(tag, b'A');
+    let (_, channel, payload) = notification_body(&body);
+    assert_eq!(channel, "chat");
+    assert_eq!(payload, "still listening");
+
+    let unlisten_frames = simple(&mut listener_socket, "BEGIN; UNLISTEN chat; COMMIT").await;
     assert!(unlisten_frames
         .iter()
         .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("UNLISTEN") }));
+    let after_unlisten = simple(&mut sender_socket, "NOTIFY chat, 'not delivered'").await;
+    assert!(after_unlisten
+        .iter()
+        .any(|(tag, body)| { *tag == b'C' && String::from_utf8_lossy(body).contains("NOTIFY") }));
+    assert!(tokio::time::timeout(Duration::from_millis(100), read_frame(&mut listener_socket))
+        .await
+        .is_err());
 }

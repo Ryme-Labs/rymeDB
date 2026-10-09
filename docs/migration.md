@@ -57,9 +57,11 @@ Realtime PostgreSQL clients can use `LISTEN channel`, `UNLISTEN channel` (or
 standard asynchronous `NotificationResponse` frames to listeners on the same
 tenant and database. They are intentionally ephemeral: they are not written to
 the WAL, are lost when a listener disconnects or the process restarts, and a
-transaction's notifications are delivered only after commit (and discarded by
-rollback). Delivery is currently scoped to gateways in the same process; use
-the durable realtime stream for replayable cross-gateway delivery.
+transaction's `NOTIFY` records are delivered only after commit (and discarded
+by rollback). `LISTEN` and `UNLISTEN` registration changes also take effect at
+commit and revert on rollback. Delivery is currently scoped to gateways in the
+same process; use the durable realtime stream for replayable cross-gateway
+delivery.
 
 ## Supabase
 

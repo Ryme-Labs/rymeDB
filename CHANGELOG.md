@@ -2,8 +2,8 @@
 
 - PostgreSQL wire connections now support ephemeral `LISTEN`, `UNLISTEN`, and
   `NOTIFY` delivery with standard asynchronous `NotificationResponse` frames,
-  scoped by tenant and database; transactional notifications publish on commit
-  and are discarded by rollback.
+  scoped by tenant and database; notification delivery and listener changes
+  follow transaction commit and rollback semantics.
 
 All notable changes to rymeDB are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
