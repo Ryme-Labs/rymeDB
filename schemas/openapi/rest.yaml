@@ -1016,7 +1016,7 @@ paths:
             type: integer
       responses:
         '200':
-          description: rows as JSON objects
+          description: rows as JSON objects; Prefer count=exact adds Content-Range
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':

@@ -23,6 +23,8 @@ All notable changes to rymeDB are recorded here. Format follows
   when a logical conflict field matches.
 - REST ordering now supports multiple fields and PostgREST
   `nullsfirst`/`nullslast` modifiers.
+- REST honors PostgREST `Prefer: return=minimal` mutations and emits exact
+  `Content-Range` totals for `Prefer: count=exact` reads.
 
 - PostgREST filtering now advances through ordered storage pages, so matching
   rows beyond the first page are not lost; non-key ordering scans the complete

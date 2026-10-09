@@ -62,7 +62,9 @@ partial updates,
 `DELETE /rest/v1/:table?<field>=eq.<value>` (including the legacy
 `key=eq.<id>` form).
 Filtered reads continue across storage pages, and non-key `order` clauses
-scan the complete filtered result before sorting.
+scan the complete filtered result before sorting. PostgREST `Prefer:
+return=minimal` and `Prefer: count=exact` headers are supported for mutation
+responses and exact read totals.
 
 GraphQL: `POST /graphql` with `{ table(key: "k") }` or `{ table(limit: 100) }`.
 

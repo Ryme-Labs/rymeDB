@@ -9,9 +9,20 @@ async fn bind_listener() -> tokio::net::TcpListener {
 }
 
 async fn http_request(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let (status, body, _) = http_request_headers(addr, head, None, body).await;
+    (status, body)
+}
+
+async fn http_request_headers(
+    addr: std::net::SocketAddr,
+    head: &str,
+    prefer: Option<&str>,
+    body: &[u8],
+) -> (u16, Vec<u8>, String) {
     let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let prefer_header = prefer.map(|value| format!("prefer: {value}\r\n")).unwrap_or_default();
     let request = format!(
-        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {KEY}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {KEY}\r\n{prefer_header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     socket.write_all(request.as_bytes()).await.unwrap();
@@ -39,12 +50,14 @@ async fn http_request(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> (u
         .unwrap_or("0")
         .parse::<u16>()
         .unwrap_or(0);
+    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(raw.len());
+    let headers = String::from_utf8_lossy(&raw[..header_end]).into_owned();
     let body = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|index| raw[index + 4..].to_vec())
         .unwrap_or_default();
-    (status, body)
+    (status, body, headers)
 }
 
 #[tokio::test]
@@ -153,6 +166,15 @@ async fn compat_rest_graphql_copy_explain() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains(r#""id":"p2""#), "{text}");
     assert!(text.contains(r#""id":"p3""#), "{text}");
+    let (status, body, _) = http_request_headers(
+        http,
+        "POST /rest/v1/people",
+        Some("return=minimal"),
+        br#"{"id":"p6","name":"Minimal"}"#,
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert!(body.is_empty());
     let (status, _) = http_request(
         http,
         "POST /rest/v1/people",
@@ -173,6 +195,11 @@ async fn compat_rest_graphql_copy_explain() {
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].get("name").and_then(serde_json::Value::as_str), Some("Updated Ada"));
+    let (status, body, headers) =
+        http_request_headers(http, "GET /rest/v1/people?limit=1", Some("count=exact"), b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(serde_json::from_slice::<Vec<serde_json::Value>>(&body).unwrap().len(), 1);
+    assert!(headers.to_ascii_lowercase().contains("content-range: 0-0/5"), "{headers}");
     let (status, body) =
         http_request(http, "PATCH /rest/v1/people?id=eq.p1", br#"{"status":"away"}"#).await;
     assert_eq!(status, 200);

@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -2747,6 +2747,7 @@ async fn rest_list(
         Err(e) => return error_response(e),
     };
     let raw = raw.as_deref().unwrap_or("");
+    let count_exact = rest_prefer(&headers, "count=exact");
     let target = limit.saturating_add(offset);
     let full_order_scan = rest_order_requires_full_scan(query.order.as_deref());
     let page_limit = if full_order_scan { 256 } else { target.clamp(1, 1000) };
@@ -2759,11 +2760,12 @@ async fn rest_list(
                 Err(e) => return error_response(e),
             };
         filtered.extend(rest_list_filtered(page, raw));
-        if (!full_order_scan && filtered.len() >= target) || next.is_none() {
+        if (!full_order_scan && !count_exact && filtered.len() >= target) || next.is_none() {
             break;
         }
         cursor = next;
     }
+    let total = filtered.len();
     let ordered = order_rows(filtered, query.order.as_deref());
     let paged: Vec<(Vec<u8>, Vec<u8>)> = ordered.into_iter().skip(offset).take(limit).collect();
     let egress: u64 = paged.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
@@ -2779,12 +2781,24 @@ async fn rest_list(
             )
         })
         .collect();
+    let range = if items.is_empty() {
+        format!("*/{total}")
+    } else {
+        format!("{}-{}/{}", offset, offset + items.len() - 1, total)
+    };
     record_meter(&state, Metric::ReadUnit, items.len() as u64);
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);
     state.histogram.record(micros);
     record_span(&state, "rest_list", &[("table", table.as_str())], micros);
-    (StatusCode::OK, Json(items)).into_response()
+    let mut response = (StatusCode::OK, Json(items)).into_response();
+    if count_exact {
+        if let Ok(value) = HeaderValue::from_str(&range) {
+            response.headers_mut().insert("content-range", value);
+        }
+        response.headers_mut().insert("range-unit", HeaderValue::from_static("items"));
+    }
+    response
 }
 
 fn filter_rows_by_query(rows: Vec<(Vec<u8>, Vec<u8>)>, raw: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -3046,6 +3060,15 @@ mod rest_compatibility_tests {
         );
         assert_eq!(filter_rows_by_query(rows, "and=(status.neq.failed,score.gte.4)").len(), 2);
     }
+
+    #[test]
+    fn postgrest_prefer_tokens_are_case_insensitive_and_composable() {
+        let mut headers = HeaderMap::new();
+        headers.insert("prefer", HeaderValue::from_static("return=minimal, count=exact"));
+        assert!(rest_prefer(&headers, "return=minimal"));
+        assert!(rest_prefer(&headers, "count=exact"));
+        assert!(!rest_prefer(&headers, "return=representation"));
+    }
 }
 
 fn url_decode(input: &str) -> String {
@@ -3212,7 +3235,11 @@ async fn rest_insert(
             Err(e) => return error_response(e),
         }
     }
-    (StatusCode::CREATED, Json(inserted)).into_response()
+    if rest_prefer(&headers, "return=minimal") {
+        StatusCode::CREATED.into_response()
+    } else {
+        (StatusCode::CREATED, Json(inserted)).into_response()
+    }
 }
 
 async fn rest_upsert(
@@ -3291,7 +3318,11 @@ async fn rest_upsert(
             Err(e) => return error_response(e),
         }
     }
-    (StatusCode::OK, Json(updated)).into_response()
+    if rest_prefer(&headers, "return=minimal") {
+        StatusCode::OK.into_response()
+    } else {
+        (StatusCode::OK, Json(updated)).into_response()
+    }
 }
 
 async fn rest_delete(
@@ -3340,14 +3371,27 @@ async fn rest_delete(
             Err(e) => return error_response(e),
         }
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "commit": last_commit,
-            "deleted": deleted,
-        })),
-    )
-        .into_response()
+    if rest_prefer(&headers, "return=minimal") {
+        StatusCode::OK.into_response()
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "commit": last_commit,
+                "deleted": deleted,
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn rest_prefer(headers: &HeaderMap, wanted: &str) -> bool {
+    headers
+        .get("prefer")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(',')
+        .any(|preference| preference.trim().eq_ignore_ascii_case(wanted))
 }
 
 fn rest_query_has_filter(raw: &str) -> bool {
