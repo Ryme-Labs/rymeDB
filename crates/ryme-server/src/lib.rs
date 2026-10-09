@@ -1439,9 +1439,13 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/scan/:table", get(scan))
         .route(
             "/rest/v1/:table",
-            get(rest_list).post(rest_insert).patch(rest_upsert).delete(rest_delete),
+            get(rest_list)
+                .post(rest_insert)
+                .patch(rest_upsert)
+                .delete(rest_delete)
+                .options(cors_options),
         )
-        .route("/graphql", post(graphql_exec))
+        .route("/graphql", post(graphql_exec).options(cors_options))
         .route("/v1/metering", get(metering_snapshot))
         .route("/v1/billing/summary", get(billing_summary))
         .route("/v1/billing/invoice", get(billing_invoice))
@@ -1511,7 +1515,40 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/query-stream", get(query_stream))
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_guard))
+        .layer(axum::middleware::from_fn(cors_headers))
         .with_state(state)
+}
+
+async fn cors_options(headers: HeaderMap) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    apply_cors_headers(&mut response, headers.get("origin"));
+    response
+}
+
+async fn cors_headers(request: axum::http::Request<axum::body::Body>, next: Next) -> Response {
+    let origin = request.headers().get("origin").cloned();
+    let mut response = next.run(request).await;
+    apply_cors_headers(&mut response, origin.as_ref());
+    response
+}
+
+fn apply_cors_headers(response: &mut Response, origin: Option<&HeaderValue>) {
+    response.headers_mut().insert(
+        "access-control-allow-origin",
+        origin.cloned().unwrap_or_else(|| HeaderValue::from_static("*")),
+    );
+    response.headers_mut().insert("vary", HeaderValue::from_static("Origin"));
+    response.headers_mut().insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+    );
+    response.headers_mut().insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static(
+            "authorization, content-type, apikey, x-client-info, prefer, x-ryme-branch",
+        ),
+    );
+    response.headers_mut().insert("access-control-max-age", HeaderValue::from_static("600"));
 }
 
 async fn read_only_guard(
@@ -1526,7 +1563,10 @@ async fn read_only_guard(
 }
 
 fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
-    if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+    if method == axum::http::Method::GET
+        || method == axum::http::Method::HEAD
+        || method == axum::http::Method::OPTIONS
+    {
         return false;
     }
     !matches!(

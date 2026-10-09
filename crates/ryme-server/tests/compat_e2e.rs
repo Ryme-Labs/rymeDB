@@ -22,7 +22,7 @@ async fn http_request_headers(
     let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
     let prefer_header = prefer.map(|value| format!("prefer: {value}\r\n")).unwrap_or_default();
     let request = format!(
-        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {KEY}\r\n{prefer_header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\norigin: http://localhost:3000\r\nauthorization: Bearer {KEY}\r\n{prefer_header}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     socket.write_all(request.as_bytes()).await.unwrap();
@@ -90,6 +90,14 @@ async fn compat_rest_graphql_copy_explain() {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, body, headers) =
+        http_request_headers(http, "OPTIONS /rest/v1/people", None, b"").await;
+    assert_eq!(status, 204);
+    assert!(body.is_empty());
+    let headers = headers.to_ascii_lowercase();
+    assert!(headers.contains("access-control-allow-origin: http://localhost:3000"), "{headers}");
+    assert!(headers.contains("access-control-allow-methods:"), "{headers}");
+    assert!(headers.contains("access-control-allow-headers:"), "{headers}");
     let (status, _) = http_request(
         http,
         "POST /v1/sql/copy",

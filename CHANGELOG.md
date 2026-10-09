@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- REST and GraphQL endpoints now answer browser `OPTIONS` preflights and
+  return CORS headers for authenticated npm/browser clients.
+
 - Java, npm, and Rust SDKs now expose matching JSON REST insert/upsert,
   filtered update, and filtered delete helpers.
 
