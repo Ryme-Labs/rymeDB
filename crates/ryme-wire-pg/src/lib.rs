@@ -855,8 +855,8 @@ where
                 }
             },
             b'D' => {
-                let mut offset = 0;
                 let kind = payload.first().copied().unwrap_or(0);
+                let mut offset = 1;
                 let name = read_cstring(&payload, &mut offset).unwrap_or_default();
                 let query = if kind == b'P' {
                     portals.get(&name).and_then(|portal| statements.get(&portal.statement)).cloned()
@@ -864,7 +864,14 @@ where
                     statements.get(&name).cloned()
                 };
                 let response = match query {
-                    Some(query) => describe_query(&query),
+                    Some(query) => {
+                        let mut response = Vec::new();
+                        if kind == b'S' {
+                            response.extend(parameter_description(&query));
+                        }
+                        response.extend(describe_query(&query));
+                        response
+                    }
                     None => row_description(),
                 };
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
@@ -965,6 +972,89 @@ where
             }
         }
     }
+}
+
+fn parameter_description(query: &str) -> Vec<u8> {
+    let count = parameter_count(query).min(i16::MAX as usize) as i16;
+    let mut body = Vec::with_capacity(2 + count as usize * 4);
+    body.extend_from_slice(&count.to_be_bytes());
+    for _ in 0..count {
+        body.extend_from_slice(&0u32.to_be_bytes());
+    }
+    frame(b't', &body)
+}
+
+fn parameter_count(query: &str) -> usize {
+    let chars = query.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut maximum = 0usize;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while index < chars.len() {
+        let current = chars[index];
+        if line_comment {
+            if current == '\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            if current == '*' && chars.get(index + 1) == Some(&'/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if current == '\\' && delimiter == '\'' {
+                index += 2.min(chars.len().saturating_sub(index));
+                continue;
+            }
+            if current == delimiter {
+                if chars.get(index + 1) == Some(&delimiter) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if current == '-' && chars.get(index + 1) == Some(&'-') {
+            line_comment = true;
+            index += 2;
+            continue;
+        }
+        if current == '/' && chars.get(index + 1) == Some(&'*') {
+            block_comment = true;
+            index += 2;
+            continue;
+        }
+        if current == '\'' || current == '"' {
+            quote = Some(current);
+            index += 1;
+            continue;
+        }
+        if current == '$' {
+            let mut end = index + 1;
+            while chars.get(end).is_some_and(char::is_ascii_digit) {
+                end += 1;
+            }
+            if end > index + 1 {
+                if let Ok(number) = chars[index + 1..end].iter().collect::<String>().parse() {
+                    maximum = maximum.max(number);
+                }
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    maximum
 }
 
 fn describe_query(query: &str) -> Vec<u8> {
@@ -2703,6 +2793,14 @@ mod tests {
         assert_eq!(params, vec![String::from("\0")]);
         assert_eq!(execute_parameter("NULL"), "\0");
         assert_eq!(execute_parameter("'NULL'"), "NULL");
+    }
+
+    #[test]
+    fn parameter_description_ignores_quoted_and_commented_placeholders() {
+        assert_eq!(parameter_count("SELECT '$12', \"$13\", $2, $10 -- $20\n/* $30 */"), 10);
+        let description = parameter_description("SELECT $2");
+        assert_eq!(description[0], b't');
+        assert_eq!(i16::from_be_bytes([description[5], description[6]]), 2);
     }
 
     #[test]

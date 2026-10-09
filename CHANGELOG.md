@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL extended-protocol `Describe` now returns parameter metadata for
+  prepared statements and correctly distinguishes statement and portal names.
 - The realtime benchmark opens subscriber WebSockets with bounded concurrency,
   making high-connection capacity runs practical without unbounded client fanout.
 - PostgreSQL `ALTER COLUMN TYPE ... USING column::type` casts are accepted

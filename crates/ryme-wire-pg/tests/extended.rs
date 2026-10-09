@@ -59,6 +59,11 @@ async fn extended_query_flow() {
     parse_body.extend_from_slice(&0i16.to_be_bytes());
     socket.write_all(&frame(b'P', &parse_body)).await.unwrap();
     assert_eq!(read_frame(&mut socket).await.0, b'1');
+    let mut statement_describe = vec![b'S'];
+    statement_describe.extend(cstring("stmt1"));
+    socket.write_all(&frame(b'D', &statement_describe)).await.unwrap();
+    assert_eq!(read_frame(&mut socket).await.0, b't');
+    assert_eq!(read_frame(&mut socket).await.0, b'T');
     let mut bind_body = cstring("portal1");
     bind_body.extend(cstring("stmt1"));
     bind_body.extend_from_slice(&0i16.to_be_bytes());

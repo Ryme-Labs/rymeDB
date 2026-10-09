@@ -124,6 +124,7 @@ simple one or more `WITH name AS (SELECT * FROM source [WHERE ...])` CTEs can
 feed outer selects and `INSERT ... SELECT` statements,
 prepared PostgreSQL parameters are bound outside SQL literals/comments with
 multi-digit placeholder support and scalar type preservation,
+extended-protocol `Describe` returns prepared parameter metadata for drivers,
 `ALTER TABLE ... ALTER COLUMN ... TYPE ... USING column::type` is accepted for
 standard self-column casts,
 declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
