@@ -1033,19 +1033,26 @@ async fn extras_migrate_apply_executes_and_records() {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
+    let setup = serde_json::json!({
+        "id": "m0",
+        "sql": "CREATE SCHEMA IF NOT EXISTS extensions"
+    })
+    .to_string();
+    let (status, setup_body) = http_request(http, "POST /v1/migrate/apply", setup.as_bytes()).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&setup_body));
     let apply =
         serde_json::json!({"id": "m1", "sql": "INSERT INTO docs KEY 'k1' VALUE 'v1'"}).to_string();
     let (status, applied) = http_request(http, "POST /v1/migrate/apply", apply.as_bytes()).await;
     assert_eq!(status, 201);
     let applied = String::from_utf8_lossy(&applied).into_owned();
     assert!(applied.contains("\"migration_id\":\"m1\""), "{applied}");
-    assert!(applied.contains("\"result_schema_version\":1"), "{applied}");
+    assert!(applied.contains("\"result_schema_version\":2"), "{applied}");
     let (status, row) = http_request(http, "GET /v1/kv/docs/k1", b"").await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&row));
     let (status, body) = http_request(http, "GET /v1/migrate/ledger", b"").await;
     assert_eq!(status, 200);
     let text = String::from_utf8_lossy(&body).into_owned();
-    assert!(text.contains("\"version\":1"), "{text}");
+    assert!(text.contains("\"version\":2"), "{text}");
     assert!(text.contains("\"valid\":true"), "{text}");
     assert!(text.contains("\"migration_id\":\"m1\""), "{text}");
     server.abort();
@@ -1072,7 +1079,7 @@ async fn extras_migrate_apply_executes_and_records() {
     assert_eq!(status, 200);
     let text = String::from_utf8_lossy(&body).into_owned();
     assert!(text.contains("\"migration_id\":\"m1\""), "{text}");
-    assert!(text.contains("\"version\":1"), "{text}");
+    assert!(text.contains("\"version\":2"), "{text}");
     let (status, _) = http_request(http, "POST /v1/migrate/apply", apply.as_bytes()).await;
     assert_eq!(status, 409);
     let (status, _) =

@@ -461,7 +461,9 @@ impl Statement {
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            Statement::Insert { .. }
+            Statement::CreateSchema { .. }
+                | Statement::CreateExtension { .. }
+                | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
                 | Statement::InsertRows { .. }
                 | Statement::InsertSelect { .. }
@@ -11867,6 +11869,7 @@ mod tests {
         let schema = parse("CREATE SCHEMA IF NOT EXISTS extensions").unwrap();
         assert!(matches!(schema, Statement::CreateSchema { ref schema, if_not_exists: true }
             if schema == "extensions"));
+        assert!(schema.is_write());
         assert!(matches!(executor.execute(schema).await, Ok(QueryResult::Ok)));
 
         let extension =
@@ -11875,6 +11878,7 @@ mod tests {
             matches!(extension, Statement::CreateExtension { ref name, ref schema, if_not_exists: true }
             if name == "pgcrypto" && schema.as_deref() == Some("extensions"))
         );
+        assert!(extension.is_write());
         assert!(matches!(executor.execute(extension).await, Ok(QueryResult::Ok)));
     }
 
