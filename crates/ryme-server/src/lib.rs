@@ -2992,6 +2992,34 @@ mod rest_compatibility_tests {
             Some("score.desc"),
         );
         assert_eq!(ordered[0].0, b"one");
+        let ordered = order_rows(
+            vec![
+                (b"one".to_vec(), br#"{"group":"a","score":4}"#.to_vec()),
+                (b"two".to_vec(), br#"{"group":"a","score":9}"#.to_vec()),
+                (b"three".to_vec(), br#"{"group":"b","score":1}"#.to_vec()),
+            ],
+            Some("group.asc,score.desc"),
+        );
+        assert_eq!(
+            ordered.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![b"two".to_vec(), b"one".to_vec(), b"three".to_vec()]
+        );
+        let ordered = order_rows(
+            vec![
+                (b"null".to_vec(), br#"{"score":null}"#.to_vec()),
+                (b"value".to_vec(), br#"{"score":2}"#.to_vec()),
+            ],
+            Some("score.asc"),
+        );
+        assert_eq!(ordered[0].0, b"value");
+        let ordered = order_rows(
+            vec![
+                (b"null".to_vec(), br#"{"score":null}"#.to_vec()),
+                (b"value".to_vec(), br#"{"score":2}"#.to_vec()),
+            ],
+            Some("score.desc.nullslast"),
+        );
+        assert_eq!(ordered[0].0, b"value");
     }
 
     #[test]
@@ -3054,31 +3082,66 @@ fn hex_val(byte: u8) -> Option<u8> {
 
 fn order_rows(rows: Vec<(Vec<u8>, Vec<u8>)>, order: Option<&str>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rows = rows;
-    let spec = order.and_then(|value| value.split(',').next()).unwrap_or("key.asc");
-    let mut parts = spec.split('.');
-    let field = parts.next().unwrap_or("key").trim();
-    let descending = parts.next().is_some_and(|direction| direction.eq_ignore_ascii_case("desc"));
+    let specs = rest_order_specs(order);
     rows.sort_by(|left, right| {
         let left_row = rest_row_to_json(&left.0, &left.1);
         let right_row = rest_row_to_json(&right.0, &right.1);
-        let left_value = left_row.get(field).and_then(rest_scalar_text);
-        let right_value = right_row.get(field).and_then(rest_scalar_text);
-        let ordering = rest_compare(left_value.as_deref(), right_value.as_deref());
-        if descending {
-            ordering.reverse()
-        } else {
-            ordering
+        for (field, descending, nulls_first) in &specs {
+            let left_value = left_row.get(*field);
+            let right_value = right_row.get(*field);
+            let left_null = left_value.map_or(true, serde_json::Value::is_null);
+            let right_null = right_value.map_or(true, serde_json::Value::is_null);
+            if left_null != right_null {
+                let nulls_first = nulls_first.unwrap_or(*descending);
+                return if left_null == nulls_first { Ordering::Less } else { Ordering::Greater };
+            }
+            if !left_null {
+                let ordering = rest_compare(
+                    left_value.and_then(rest_scalar_text).as_deref(),
+                    right_value.and_then(rest_scalar_text).as_deref(),
+                );
+                if ordering != Ordering::Equal {
+                    return if *descending { ordering.reverse() } else { ordering };
+                }
+            }
         }
+        left.0.cmp(&right.0)
     });
     rows
 }
 
 fn rest_order_requires_full_scan(order: Option<&str>) -> bool {
-    let spec = order.and_then(|value| value.split(',').next()).unwrap_or("key.asc");
-    let mut parts = spec.split('.');
-    let field = parts.next().unwrap_or("key").trim();
-    let descending = parts.next().is_some_and(|direction| direction.eq_ignore_ascii_case("desc"));
-    field != "key" || descending
+    rest_order_specs(order).iter().any(|(field, descending, _)| *field != "key" || *descending)
+}
+
+fn rest_order_specs(order: Option<&str>) -> Vec<(&str, bool, Option<bool>)> {
+    let Some(order) = order.filter(|value| !value.trim().is_empty()) else {
+        return vec![("key", false, None)];
+    };
+    let specs = order
+        .split(',')
+        .filter_map(|spec| {
+            let mut parts = spec.split('.').map(str::trim).filter(|part| !part.is_empty());
+            let field = parts.next()?;
+            let descending =
+                parts.next().is_some_and(|direction| direction.eq_ignore_ascii_case("desc"));
+            let nulls_first = parts.next().and_then(|nulls| {
+                if nulls.eq_ignore_ascii_case("nullsfirst") {
+                    Some(true)
+                } else if nulls.eq_ignore_ascii_case("nullslast") {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            Some((field, descending, nulls_first))
+        })
+        .collect::<Vec<_>>();
+    if specs.is_empty() {
+        vec![("key", false, None)]
+    } else {
+        specs
+    }
 }
 
 async fn rest_insert(
