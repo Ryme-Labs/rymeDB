@@ -812,8 +812,9 @@ impl SharedState {
             config.node_id.clone(),
             0,
         ));
-        if control.branches.list().is_empty() {
-            control.branches.create_root(
+        if control.branches.list_for(&tenant).is_empty() {
+            control.branches.create_root_for(
+                &tenant,
                 branch.clone(),
                 ryme_branch::Manifest {
                     id: String::from("genesis"),
@@ -4341,7 +4342,25 @@ async fn branch_create(
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     let mut branches = control.branches.clone();
-    match branches.create_child(request.id, &request.parent, request.base_commit_ts) {
+    if branches.get_for(&principal.tenant, &request.parent).is_err() && request.parent == "main" {
+        if let Err(e) = branches.create_root_for(
+            &principal.tenant,
+            String::from("main"),
+            ryme_branch::Manifest {
+                id: format!("genesis-{}", principal.tenant),
+                segments: Vec::new(),
+                wal_start: 0,
+            },
+        ) {
+            return error_response(e);
+        }
+    }
+    match branches.create_child_for(
+        &principal.tenant,
+        request.id,
+        &request.parent,
+        request.base_commit_ts,
+    ) {
         Ok(()) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
@@ -4358,14 +4377,15 @@ async fn branch_get(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
-    }
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
     let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.branches.get(&id) {
+    match control.branches.get_for(&principal.tenant, &id) {
         Ok(branch) => (StatusCode::OK, Json(branch)).into_response(),
         Err(e) => error_response(e),
     }
@@ -4388,7 +4408,7 @@ async fn branch_delete(
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     let mut branches = control.branches.clone();
-    match branches.delete(&id) {
+    match branches.delete_for(&principal.tenant, &id) {
         Ok(garbage) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
@@ -4401,14 +4421,15 @@ async fn branch_delete(
 }
 
 async fn branch_list(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
-    }
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
     let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    (StatusCode::OK, Json(control.list_branches())).into_response()
+    (StatusCode::OK, Json(control.branches.list_for(&principal.tenant))).into_response()
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4438,7 +4459,7 @@ async fn branch_reset(
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     let mut branches = control.branches.clone();
-    match branches.reset(&id, request.base_commit_ts) {
+    match branches.reset_for(&principal.tenant, &id, request.base_commit_ts) {
         Ok(branch) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
@@ -4467,7 +4488,7 @@ async fn branch_promote(
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     let mut branches = control.branches.clone();
-    match branches.promote(&id) {
+    match branches.promote_for(&principal.tenant, &id) {
         Ok(branch) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
@@ -4490,14 +4511,15 @@ async fn branch_diff(
     Path(id): Path<String>,
     Query(query): Query<BranchDiffQuery>,
 ) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
-    }
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
     let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    match control.diff_branches(&id, &query.against) {
+    match control.branches.diff_for(&principal.tenant, &id, &query.against) {
         Ok((only_left, only_right)) => (
             StatusCode::OK,
             Json(serde_json::json!({ "only_left": only_left, "only_right": only_right })),

@@ -6,6 +6,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Branch {
     pub id: String,
+    #[serde(default)]
+    pub tenant: String,
     pub parent_id: Option<String>,
     pub base_commit_ts: u64,
     pub manifest_id: String,
@@ -37,8 +39,25 @@ impl BranchManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
             Err(error) => return Err(error.into()),
         };
-        serde_json::from_slice(&bytes)
-            .map_err(|error| RymeError::Corrupt(format!("branch metadata: {error}")))
+        let mut manager: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| RymeError::Corrupt(format!("branch metadata: {error}")))?;
+        let mut normalized = HashMap::with_capacity(manager.branches.len());
+        for (stored_key, mut branch) in manager.branches.drain() {
+            let tenant = if branch.tenant.is_empty() {
+                String::from("default")
+            } else {
+                branch.tenant.clone()
+            };
+            branch.tenant = tenant.clone();
+            let key = if stored_key.contains('\0') {
+                stored_key
+            } else {
+                scoped_key(&tenant, &branch.id)
+            };
+            normalized.insert(key, branch);
+        }
+        manager.branches = normalized;
+        Ok(manager)
     }
 
     pub fn persist(&self, path: &Path) -> Result<()> {
@@ -54,18 +73,24 @@ impl BranchManager {
     }
 
     pub fn create_root(&mut self, id: String, manifest: Manifest) -> Result<()> {
+        self.create_root_for("default", id, manifest)
+    }
+
+    pub fn create_root_for(&mut self, tenant: &str, id: String, manifest: Manifest) -> Result<()> {
         if id.is_empty() || id.len() > 128 || id.contains('/') || id.contains("..") {
             return Err(RymeError::InvalidArgument(String::from("branch")));
         }
-        if self.branches.contains_key(&id) {
+        let key = scoped_key(tenant, &id);
+        if self.branches.contains_key(&key) {
             return Err(RymeError::Conflict(String::from("branch")));
         }
         self.refs.insert(manifest.id.clone(), 1);
         self.manifests.insert(manifest.id.clone(), manifest.clone());
         self.branches.insert(
-            id.clone(),
+            key,
             Branch {
                 id,
+                tenant: tenant.to_string(),
                 parent_id: None,
                 base_commit_ts: 0,
                 manifest_id: manifest.id,
@@ -76,23 +101,35 @@ impl BranchManager {
     }
 
     pub fn create_child(&mut self, id: String, parent: &str, base_commit_ts: u64) -> Result<()> {
+        self.create_child_for("default", id, parent, base_commit_ts)
+    }
+
+    pub fn create_child_for(
+        &mut self,
+        tenant: &str,
+        id: String,
+        parent: &str,
+        base_commit_ts: u64,
+    ) -> Result<()> {
         if id.is_empty() || id.len() > 128 || id.contains('/') || id.contains("..") {
             return Err(RymeError::InvalidArgument(String::from("branch")));
         }
-        if self.branches.contains_key(&id) {
+        let key = scoped_key(tenant, &id);
+        if self.branches.contains_key(&key) {
             return Err(RymeError::Conflict(String::from("branch")));
         }
         let parent_branch = self
             .branches
-            .get(parent)
+            .get(&scoped_key(tenant, parent))
             .ok_or_else(|| RymeError::NotFound(String::from("parent")))?
             .clone();
         let manifest_id = parent_branch.manifest_id.clone();
         *self.refs.entry(manifest_id.clone()).or_insert(0) += 1;
         self.branches.insert(
-            id.clone(),
+            key,
             Branch {
                 id,
+                tenant: tenant.to_string(),
                 parent_id: Some(parent.to_string()),
                 base_commit_ts,
                 manifest_id,
@@ -103,8 +140,14 @@ impl BranchManager {
     }
 
     pub fn delete(&mut self, id: &str) -> Result<Vec<String>> {
-        let branch =
-            self.branches.remove(id).ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
+        self.delete_for("default", id)
+    }
+
+    pub fn delete_for(&mut self, tenant: &str, id: &str) -> Result<Vec<String>> {
+        let branch = self
+            .branches
+            .remove(&scoped_key(tenant, id))
+            .ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
         let count = self.refs.entry(branch.manifest_id.clone()).or_insert(1);
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -117,10 +160,23 @@ impl BranchManager {
     }
 
     pub fn diff(&self, left: &str, right: &str) -> Result<(Vec<String>, Vec<String>)> {
-        let left_branch =
-            self.branches.get(left).ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
-        let right_branch =
-            self.branches.get(right).ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
+        self.diff_for("default", left, right)
+    }
+
+    pub fn diff_for(
+        &self,
+        tenant: &str,
+        left: &str,
+        right: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let left_branch = self
+            .branches
+            .get(&scoped_key(tenant, left))
+            .ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
+        let right_branch = self
+            .branches
+            .get(&scoped_key(tenant, right))
+            .ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
         let left_manifest = self
             .manifests
             .get(&left_branch.manifest_id)
@@ -137,26 +193,48 @@ impl BranchManager {
     }
 
     pub fn get(&self, id: &str) -> Result<Branch> {
-        self.branches.get(id).cloned().ok_or_else(|| RymeError::NotFound(String::from("branch")))
+        self.get_for("default", id)
+    }
+
+    pub fn get_for(&self, tenant: &str, id: &str) -> Result<Branch> {
+        self.branches
+            .get(&scoped_key(tenant, id))
+            .cloned()
+            .ok_or_else(|| RymeError::NotFound(String::from("branch")))
     }
 
     pub fn list(&self) -> Vec<Branch> {
-        let mut out: Vec<Branch> = self.branches.values().cloned().collect();
+        self.list_for("default")
+    }
+
+    pub fn list_for(&self, tenant: &str) -> Vec<Branch> {
+        let mut out: Vec<Branch> =
+            self.branches.values().filter(|branch| branch.tenant == tenant).cloned().collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
 
     pub fn reset(&mut self, id: &str, base_commit_ts: u64) -> Result<Branch> {
-        let branch =
-            self.branches.get_mut(id).ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
+        self.reset_for("default", id, base_commit_ts)
+    }
+
+    pub fn reset_for(&mut self, tenant: &str, id: &str, base_commit_ts: u64) -> Result<Branch> {
+        let branch = self
+            .branches
+            .get_mut(&scoped_key(tenant, id))
+            .ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
         branch.base_commit_ts = base_commit_ts;
         Ok(branch.clone())
     }
 
     pub fn promote(&mut self, id: &str) -> Result<Branch> {
+        self.promote_for("default", id)
+    }
+
+    pub fn promote_for(&mut self, tenant: &str, id: &str) -> Result<Branch> {
         let child = self
             .branches
-            .get(id)
+            .get(&scoped_key(tenant, id))
             .ok_or_else(|| RymeError::NotFound(String::from("branch")))?
             .clone();
         let parent_id = child
@@ -165,7 +243,7 @@ impl BranchManager {
             .ok_or_else(|| RymeError::InvalidArgument(String::from("root")))?;
         let parent = self
             .branches
-            .get_mut(&parent_id)
+            .get_mut(&scoped_key(tenant, &parent_id))
             .ok_or_else(|| RymeError::NotFound(String::from("parent")))?;
         let old_manifest = parent.manifest_id.clone();
         parent.manifest_id.clone_from(&child.manifest_id);
@@ -190,6 +268,10 @@ impl BranchManager {
         }
         manifest.segments.iter().filter(|s| !live.contains(s.as_str())).cloned().collect()
     }
+}
+
+fn scoped_key(tenant: &str, branch: &str) -> String {
+    format!("{tenant}\0{branch}")
 }
 
 #[cfg(test)]
@@ -278,5 +360,21 @@ mod tests {
         assert_eq!(restored.get("preview").unwrap().base_commit_ts, 7);
         assert!(restored.diff("main", "preview").unwrap().0.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tenant_branch_namespaces_are_isolated() {
+        let mut manager = root_manager();
+        manager
+            .create_root_for(
+                "alpha",
+                String::from("main"),
+                Manifest { id: String::from("alpha-genesis"), segments: Vec::new(), wal_start: 0 },
+            )
+            .unwrap();
+        manager.create_child_for("alpha", String::from("preview"), "main", 4).unwrap();
+        assert!(manager.get_for("beta", "preview").is_err());
+        assert_eq!(manager.list_for("alpha").len(), 2);
+        assert_eq!(manager.list_for("beta").len(), 0);
     }
 }

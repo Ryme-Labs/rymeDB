@@ -159,6 +159,24 @@ async fn tenants_share_no_presence_or_partitions() {
     let (status, _body) = bearer_request(http, &beta, "GET /v1/kv/docs/default", b"").await;
     assert_eq!(status, 404);
 
+    let branch = serde_json::json!({
+        "id": "preview",
+        "parent": "main",
+        "base_commit_ts": 1
+    })
+    .to_string();
+    let (status, _) = bearer_request(http, &alpha, "POST /v1/branches", branch.as_bytes()).await;
+    assert_eq!(status, 200);
+    let (status, _) = bearer_request(http, &beta, "GET /v1/branches/preview", b"").await;
+    assert_eq!(status, 404);
+    let (status, body) = bearer_request(http, &alpha, "GET /v1/branches/preview", b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(body.get("tenant").and_then(|value| value.as_str()), Some("alpha"));
+    let (status, _) = bearer_request(http, &beta, "POST /v1/branches", branch.as_bytes()).await;
+    assert_eq!(status, 200);
+    let (status, _) = bearer_request(http, KEY, "GET /v1/branches/preview", b"").await;
+    assert_eq!(status, 404);
+
     let append = serde_json::json!({"partition": "orders", "key": "k1", "value": "v1"}).to_string();
     let (status, body) =
         bearer_request(http, &alpha, "POST /v1/topics/append", append.as_bytes()).await;
