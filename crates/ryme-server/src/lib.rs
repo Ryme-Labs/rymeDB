@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use ryme_archive::{Archiver, BackupManifest};
 use ryme_auth::{
     ApiKeyStore, CredentialStore, JwtVerifier, OidcConfig, PasskeyRegistry, PolicyEngine,
-    Principal, RefreshTokenStore, Role,
+    Principal, RefreshTokenRecord, RefreshTokenStore, Role,
 };
 use ryme_backup::Checkpoint;
 use ryme_config::{Config, OtelConfig};
@@ -483,6 +483,39 @@ pub struct SharedState {
     tenant: String,
     database: String,
     branch_path: std::path::PathBuf,
+    auth_path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct AuthSnapshot {
+    #[serde(default)]
+    api_keys: HashMap<String, Principal>,
+    #[serde(default)]
+    users: HashMap<String, ryme_auth::StoredUser>,
+    #[serde(default)]
+    refresh_tokens: HashMap<String, RefreshTokenRecord>,
+    #[serde(default)]
+    passkeys: HashMap<String, ryme_auth::PasskeyCredential>,
+}
+
+fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AuthSnapshot::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("auth snapshot: {error}")))
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +763,42 @@ pub struct ClusterReplaceRequest {
 }
 
 impl SharedState {
+    fn persist_auth(&self) -> ryme_error::Result<()> {
+        let snapshot = AuthSnapshot {
+            api_keys: self.keys.snapshot()?,
+            users: self
+                .credentials
+                .lock()
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
+                .snapshot(),
+            refresh_tokens: self.refresh_tokens.snapshot()?,
+            passkeys: self
+                .passkeys
+                .lock()
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
+                .snapshot(),
+        };
+        let bytes = serde_json::to_vec(&snapshot)
+            .map_err(|error| ryme_error::RymeError::Internal(format!("auth snapshot: {error}")))?;
+        if let Some(parent) = self.auth_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self.auth_path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(temporary, &self.auth_path)?;
+        Ok(())
+    }
+
     pub fn build(config: &Config) -> ryme_error::Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
         let wal_dir = config.data_dir.join("wal");
@@ -806,6 +875,8 @@ impl SharedState {
         executor.set_rls_tables(config.rls_tables.clone());
         executor.set_read_only(config.read_only);
         let branch_path = config.data_dir.join("branches.json");
+        let auth_path = config.data_dir.join("auth.json");
+        let auth_snapshot = load_auth_snapshot(&auth_path)?;
         let mut control = ControlPlane::new();
         control.branches = ryme_branch::BranchManager::load(&branch_path)?;
         control.add_range(Range::new(
@@ -827,7 +898,7 @@ impl SharedState {
             )?;
             control.branches.persist(&branch_path)?;
         }
-        let keys = ApiKeyStore::new();
+        let keys = ApiKeyStore::from_snapshot(auth_snapshot.api_keys);
         let api_key =
             std::env::var("RYME_API_KEY").unwrap_or_else(|_| String::from("ryme-dev-key"));
         let mut roles = HashSet::new();
@@ -880,9 +951,9 @@ impl SharedState {
             qos: Arc::new(Mutex::new(QosRegistry::new())),
             dek_ring,
             indexes: Arc::new(Mutex::new(PartitionedIndex::new(config.index_partitions))),
-            credentials: Arc::new(Mutex::new(CredentialStore::new())),
-            refresh_tokens: RefreshTokenStore::new(),
-            passkeys: Arc::new(Mutex::new(PasskeyRegistry::new())),
+            credentials: Arc::new(Mutex::new(CredentialStore::from_snapshot(auth_snapshot.users))),
+            refresh_tokens: RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens),
+            passkeys: Arc::new(Mutex::new(PasskeyRegistry::from_snapshot(auth_snapshot.passkeys))),
             native_listen: config.native_listen,
             grpc_tls_listen: config.grpc_tls_listen,
             grpc_listen: config.grpc_listen,
@@ -920,6 +991,7 @@ impl SharedState {
             tenant,
             database,
             branch_path,
+            auth_path,
         })
     }
 
@@ -3107,9 +3179,12 @@ async fn auth_register(
     })
     .await;
     match registered {
-        Ok(Ok(())) => {
-            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
-        }
+        Ok(Ok(())) => match state.persist_auth() {
+            Ok(()) => {
+                (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
+            }
+            Err(e) => error_response(e),
+        },
         Ok(Err(e)) => error_response(e),
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("task"))),
     }
@@ -3190,16 +3265,19 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     })
     .await;
     match issued {
-        Ok(Ok((key, tenant, refresh_token))) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "key": key,
-                "tenant": tenant,
-                "refresh_token": refresh_token,
-                "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
-            })),
-        )
-            .into_response(),
+        Ok(Ok((key, tenant, refresh_token))) => match state.persist_auth() {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "key": key,
+                    "tenant": tenant,
+                    "refresh_token": refresh_token,
+                    "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
+                })),
+            )
+                .into_response(),
+            Err(e) => error_response(e),
+        },
         Ok(Err(e)) => error_response(e),
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("task"))),
     }
@@ -3231,7 +3309,12 @@ async fn auth_revoke(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if state.keys.remove(&request.key) {
-        (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
+        match state.persist_auth() {
+            Ok(()) => {
+                (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
+            }
+            Err(e) => error_response(e),
+        }
     } else {
         error_response(ryme_error::RymeError::NotFound(String::from("key")))
     }
@@ -3258,14 +3341,18 @@ async fn otp_setup(
     }
     let secret = ryme_auth::random_bytes(20);
     let encoded = ryme_auth::base64_url_encode(&secret);
-    match state.credentials.lock() {
-        Ok(mut store) => match store.set_otp_secret(&request.id, secret) {
+    let updated = match state.credentials.lock() {
+        Ok(mut store) => store.set_otp_secret(&request.id, secret),
+        Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
+    };
+    match updated {
+        Ok(()) => match state.persist_auth() {
             Ok(()) => {
                 (StatusCode::OK, Json(serde_json::json!({ "secret": encoded }))).into_response()
             }
             Err(e) => error_response(e),
         },
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        Err(e) => error_response(e),
     }
 }
 
@@ -3340,16 +3427,18 @@ async fn passkey_register(
             )))
         }
     };
-    match state.passkeys.lock() {
-        Ok(mut registry) => {
-            match registry.register(&request.user, request.credential_id, &public_key) {
-                Ok(()) => {
-                    (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
-                }
-                Err(e) => error_response(e),
+    let registered = match state.passkeys.lock() {
+        Ok(mut registry) => registry.register(&request.user, request.credential_id, &public_key),
+        Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
+    };
+    match registered {
+        Ok(()) => match state.persist_auth() {
+            Ok(()) => {
+                (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
             }
-        }
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+            Err(e) => error_response(e),
+        },
+        Err(e) => error_response(e),
     }
 }
 
@@ -3419,7 +3508,11 @@ async fn passkey_verify(State(state): State<SharedState>, body: axum::body::Byte
         Err(e) => return error_response(e),
     };
     let (key, tenant) = issue_api_key(&keys, &principal);
-    (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant }))).into_response()
+    match state.persist_auth() {
+        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
+            .into_response(),
+        Err(e) => error_response(e),
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3465,8 +3558,13 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     match config.verify_id_token(&request.id_token, now) {
         Ok(principal) => {
             let (key, tenant) = issue_api_key(&state.keys, &principal);
-            (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
-                .into_response()
+            match state.persist_auth() {
+                Ok(()) => {
+                    (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
+                        .into_response()
+                }
+                Err(e) => error_response(e),
+            }
         }
         Err(e) => error_response(e),
     }

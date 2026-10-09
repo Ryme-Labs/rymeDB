@@ -1,8 +1,10 @@
 use ryme_error::{Result, RymeError};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Owner,
     Admin,
@@ -13,7 +15,7 @@ pub enum Role {
     RealtimeSubscriber,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
     pub id: String,
     pub tenant: String,
@@ -153,33 +155,42 @@ impl ApiKeyStore {
 
     pub fn insert(&self, api_key: String, principal: Principal) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.insert(api_key, principal);
+            guard.insert(Self::digest(&api_key), principal);
         }
     }
 
     pub fn remove(&self, api_key: &str) -> bool {
-        self.inner.write().map(|mut guard| guard.remove(api_key).is_some()).unwrap_or(false)
+        self.inner
+            .write()
+            .map(|mut guard| guard.remove(&Self::digest(api_key)).is_some())
+            .unwrap_or(false)
     }
 
     pub fn owner_of(&self, presented: &str) -> Option<Principal> {
         let guard = self.inner.read().ok()?;
-        for (stored, principal) in guard.iter() {
-            if constant_time_equal(stored.as_bytes(), presented.as_bytes()) {
-                return Some(principal.clone());
-            }
-        }
-        None
+        guard.get(&Self::digest(presented)).cloned()
     }
 
     pub fn authenticate(&self, presented: &str) -> Result<Principal> {
         let guard =
             self.inner.read().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        for (stored, principal) in guard.iter() {
-            if constant_time_equal(stored.as_bytes(), presented.as_bytes()) {
-                return Ok(principal.clone());
-            }
-        }
-        Err(RymeError::Unauthorized)
+        guard.get(&Self::digest(presented)).cloned().ok_or(RymeError::Unauthorized)
+    }
+
+    pub fn snapshot(&self) -> Result<HashMap<String, Principal>> {
+        self.inner
+            .read()
+            .map(|guard| guard.clone())
+            .map_err(|_| RymeError::Internal(String::from("auth lock")))
+    }
+
+    pub fn from_snapshot(snapshot: HashMap<String, Principal>) -> Self {
+        Self { inner: Arc::new(RwLock::new(snapshot)) }
+    }
+
+    fn digest(api_key: &str) -> String {
+        use sha2::{Digest, Sha256};
+        base64_url_encode(&Sha256::digest(api_key.as_bytes()))
     }
 }
 
@@ -355,13 +366,13 @@ const MAX_REFRESH_SESSIONS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct RefreshTokenStore {
-    inner: Arc<RwLock<HashMap<String, RefreshSession>>>,
+    inner: Arc<RwLock<HashMap<String, RefreshTokenRecord>>>,
 }
 
-#[derive(Debug, Clone)]
-struct RefreshSession {
-    principal: Principal,
-    expires_at: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshTokenRecord {
+    pub principal: Principal,
+    pub expires_at: u64,
 }
 
 impl RefreshTokenStore {
@@ -380,7 +391,7 @@ impl RefreshTokenStore {
         }
         sessions.insert(
             digest,
-            RefreshSession {
+            RefreshTokenRecord {
                 principal,
                 expires_at: now_secs.saturating_add(REFRESH_TOKEN_TTL_SECS),
             },
@@ -403,7 +414,7 @@ impl RefreshTokenStore {
         let next_digest = Self::digest(&raw);
         sessions.insert(
             next_digest,
-            RefreshSession {
+            RefreshTokenRecord {
                 principal: session.principal.clone(),
                 expires_at: now_secs.saturating_add(REFRESH_TOKEN_TTL_SECS),
             },
@@ -422,6 +433,17 @@ impl RefreshTokenStore {
         self.inner.read().map(|sessions| sessions.len()).unwrap_or(0)
     }
 
+    pub fn snapshot(&self) -> Result<HashMap<String, RefreshTokenRecord>> {
+        self.inner
+            .read()
+            .map(|sessions| sessions.clone())
+            .map_err(|_| RymeError::Internal(String::from("auth lock")))
+    }
+
+    pub fn from_snapshot(snapshot: HashMap<String, RefreshTokenRecord>) -> Self {
+        Self { inner: Arc::new(RwLock::new(snapshot)) }
+    }
+
     fn digest(token: &str) -> String {
         use sha2::{Digest, Sha256};
         base64_url_encode(&Sha256::digest(token.as_bytes()))
@@ -434,7 +456,7 @@ impl Default for RefreshTokenStore {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasswordHash {
     pub salt_b64: String,
     pub hash_b64: String,
@@ -509,7 +531,7 @@ pub struct PasskeyRegistry {
     credentials: HashMap<String, PasskeyCredential>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasskeyCredential {
     pub user: String,
     pub public_key: Vec<u8>,
@@ -587,6 +609,14 @@ impl PasskeyRegistry {
 
     pub fn owner_of(&self, credential_id: &str) -> Option<String> {
         self.credentials.get(credential_id).map(|credential| credential.user.clone())
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, PasskeyCredential> {
+        self.credentials.clone()
+    }
+
+    pub fn from_snapshot(credentials: HashMap<String, PasskeyCredential>) -> Self {
+        Self { challenges: HashMap::new(), credentials }
     }
 
     pub fn verify_assertion(&mut self, assertion: &PasskeyAssertion<'_>) -> Result<()> {
@@ -699,7 +729,7 @@ impl OidcConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredUser {
     pub tenant: String,
     pub roles: HashSet<Role>,
@@ -803,6 +833,14 @@ impl CredentialStore {
 
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, StoredUser> {
+        self.users.clone()
+    }
+
+    pub fn from_snapshot(users: HashMap<String, StoredUser>) -> Self {
+        Self { users }
     }
 }
 

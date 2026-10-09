@@ -152,4 +152,7 @@ receipt. RS256/JWKS discovery is future work; configure one HMAC provider
 per node. `POST /v1/auth/token` returns the existing API key plus an opaque
 30-day refresh token. Send `{"grant_type":"refresh_token",
 "refresh_token":"..."}` to rotate it; each refresh token is single-use,
-stored only as a digest, and replaying a rotated token returns `401`.
+stored only as a digest, and replaying a rotated token returns `401`. User
+password hashes, OTP enrollment, passkey credentials, API-key digests, and
+active refresh sessions are atomically persisted in `data_dir/auth.json`;
+WebAuthn challenges remain intentionally ephemeral.

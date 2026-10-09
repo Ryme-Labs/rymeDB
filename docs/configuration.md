@@ -87,3 +87,9 @@ returns the normal compatibility error for `AUTH`.
 
 Both mechanisms use the protocol’s password exchange; use the TLS listeners
 for non-loopback deployments.
+
+Application-auth state is stored atomically in `data_dir/auth.json`. It contains
+password hashes, OTP/passkey metadata, API-key digests, and refresh-token
+digests; raw API keys, passwords, refresh tokens, and WebAuthn challenges are
+not written to that file. Keep the data directory private and back it up with
+the same controls as the database WAL.

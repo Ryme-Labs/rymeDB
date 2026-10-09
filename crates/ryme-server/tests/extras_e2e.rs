@@ -1589,6 +1589,95 @@ async fn extras_auth_token_issues_usable_keys() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn extras_auth_state_survives_restart() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-extras-auth-restart-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let resp_listener = bind_listener().await;
+    let http_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp = resp_listener.local_addr().unwrap();
+    let http = http_listener.local_addr().unwrap();
+    let config = Config {
+        node_id: String::from("extras-auth-restart"),
+        data_dir: root.clone(),
+        pg_listen: pg,
+        resp_listen: resp,
+        http_listen: http,
+        ..Config::default()
+    };
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, _) = http_request(
+        http,
+        "POST /v1/auth/register",
+        b"{\"id\":\"restart-user\",\"password\":\"correct-horse\"}",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let (status, body) = http_request(
+        http,
+        "POST /v1/auth/token",
+        b"{\"id\":\"restart-user\",\"password\":\"correct-horse\"}",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let token: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let key = token.get("key").and_then(|v| v.as_str()).unwrap().to_string();
+    let refresh = token.get("refresh_token").and_then(|v| v.as_str()).unwrap().to_string();
+    let auth_file = root.join("auth.json");
+    let persisted = std::fs::read_to_string(&auth_file).unwrap();
+    assert!(!persisted.contains("correct-horse"));
+    assert!(!persisted.contains(&key));
+    server.abort();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let pg_listener = bind_listener().await;
+    let resp_listener = bind_listener().await;
+    let http_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp = resp_listener.local_addr().unwrap();
+    let http = http_listener.local_addr().unwrap();
+    let config = Config {
+        node_id: String::from("extras-auth-restart"),
+        data_dir: root.clone(),
+        pg_listen: pg,
+        resp_listen: resp,
+        http_listen: http,
+        ..Config::default()
+    };
+    let restarted = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, _) = bearer_request(http, &key, "GET /v1/ranges", b"").await;
+    assert_eq!(status, 200);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/auth/token",
+        b"{\"id\":\"restart-user\",\"password\":\"correct-horse\"}",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let refresh_body =
+        format!("{{\"grant_type\":\"refresh_token\",\"refresh_token\":\"{refresh}\"}}");
+    let (status, _) = http_request(http, "POST /v1/auth/token", refresh_body.as_bytes()).await;
+    assert_eq!(status, 201);
+    restarted.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn webauthn_assertion(
     secret: &p256::ecdsa::SigningKey,
     rp_id: &str,
