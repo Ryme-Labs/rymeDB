@@ -47,7 +47,9 @@ runs on every boot.
 Realtime WebSocket sessions also consume the authenticated tenant's QoS
 `max_connections` quota. The session is released automatically when the
 socket closes, while the node-level `max_connections` limit still protects
-the HTTP listener itself.
+the HTTP listener itself. Each delivered realtime event also consumes one
+`realtime_msg_per_sec` token and its serialized bytes consume the egress
+bucket; heartbeat and ping/pong control frames are not counted.
 
 ## `cluster`
 

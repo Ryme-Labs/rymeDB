@@ -4081,7 +4081,7 @@ async fn forward_broadcast(
                 match message {
                     Ok(record) => {
                         let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
-                        if !stream_egress(&qos, tenant, text.len() as u64) {
+                        if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
                         if !send_realtime_message(
@@ -6153,9 +6153,13 @@ async fn stream(
     })
 }
 
-fn stream_egress(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64) -> bool {
+fn stream_realtime_event(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64) -> bool {
     match qos.lock() {
-        Ok(mut registry) => registry.admit_egress(tenant, bytes, qos_now_nanos()).is_ok(),
+        Ok(mut registry) => {
+            let now = qos_now_nanos();
+            registry.admit_realtime(tenant, 1, now).is_ok()
+                && registry.admit_egress(tenant, bytes, now).is_ok()
+        }
         Err(_) => false,
     }
 }
@@ -6214,7 +6218,7 @@ async fn forward_changes(
             continue;
         }
         let text = serde_json::to_string(record).unwrap_or_else(|_| String::from("{}"));
-        if !stream_egress(&qos, tenant, text.len() as u64) {
+        if !stream_realtime_event(&qos, tenant, text.len() as u64) {
             return;
         }
         if !send_realtime_message(&mut sender, axum::extract::ws::Message::Text(text)).await {
@@ -6245,7 +6249,7 @@ async fn forward_changes(
                             continue;
                         }
                         let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
-                        if !stream_egress(&qos, tenant, text.len() as u64) {
+                        if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
                         if !send_realtime_message(
@@ -6281,7 +6285,7 @@ async fn forward_changes(
                             }
                             let text = serde_json::to_string(&record)
                                 .unwrap_or_else(|_| String::from("{}"));
-                            if !stream_egress(&qos, tenant, text.len() as u64) {
+                            if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                                 return;
                             }
                             if !send_realtime_message(
@@ -6449,7 +6453,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             "truncated": update.truncated,
                         }))
                         .unwrap_or_else(|_| String::from("{}"));
-                        if !stream_egress(&qos, tenant, text.len() as u64) {
+                        if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
                         if !send_realtime_message(
@@ -6601,7 +6605,7 @@ async fn send_query_snapshot<B: TxnBackend>(
             .collect::<Vec<_>>(),
     });
     let text = snapshot.to_string();
-    if !stream_egress(qos, tenant, text.len() as u64) {
+    if !stream_realtime_event(qos, tenant, text.len() as u64) {
         return commit;
     }
     let _ = send_realtime_message(sender, axum::extract::ws::Message::Text(text)).await;

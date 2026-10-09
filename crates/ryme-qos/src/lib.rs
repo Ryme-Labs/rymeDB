@@ -319,6 +319,27 @@ mod tests {
     }
 
     #[test]
+    fn realtime_messages_throttle() {
+        let mut registry = QosRegistry::new();
+        registry.set_quota(
+            "t",
+            Quota {
+                read_qps: 1000,
+                write_qps: 1000,
+                egress_bytes_per_sec: u64::MAX,
+                realtime_msg_per_sec: 2,
+                max_connections: 10,
+                max_storage_bytes: u64::MAX,
+            },
+            0,
+        );
+        assert!(registry.admit_realtime("t", 1, 0).is_ok());
+        assert!(registry.admit_realtime("t", 1, 0).is_ok());
+        assert!(registry.admit_realtime("t", 1, 0).is_err());
+        assert!(registry.admit_realtime("t", 1, 1_000_000_000).is_ok());
+    }
+
+    #[test]
     fn connections_bounded() {
         let mut registry = QosRegistry::new();
         registry.set_quota(

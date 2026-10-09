@@ -32,6 +32,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - Scheduled backup drills now materialize and clean up a temporary restore
   directory, exercising the real checksum, decryption, and atomic publish path
   instead of only reading and verifying archive objects.
+- Realtime broadcast, change-stream replay, lag recovery, query updates, and
+  snapshots now charge both the tenant message-rate and egress-byte buckets;
+  heartbeat and ping/pong control frames remain exempt.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
