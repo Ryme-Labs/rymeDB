@@ -130,6 +130,8 @@ pub struct ColumnDefinition {
     pub column_default: Option<String>,
     #[serde(default)]
     pub auto_increment: bool,
+    #[serde(default)]
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,24 +633,37 @@ fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
     }
     let items = split_sql_items(&raw[open + 1..close]);
     let mut table_primary = Vec::new();
+    let mut table_unique = Vec::new();
     for item in &items {
         let words: Vec<&str> = item.split_whitespace().collect();
         let table_constraint = words.first().is_some_and(|word| {
-            word.eq_ignore_ascii_case("PRIMARY") || word.eq_ignore_ascii_case("CONSTRAINT")
+            word.eq_ignore_ascii_case("PRIMARY")
+                || word.eq_ignore_ascii_case("UNIQUE")
+                || word.eq_ignore_ascii_case("CONSTRAINT")
         });
-        if !table_constraint || !item.to_ascii_uppercase().contains("PRIMARY KEY") {
+        let upper = item.to_ascii_uppercase();
+        if !table_constraint || (!upper.contains("PRIMARY KEY") && !upper.contains("UNIQUE")) {
             continue;
         }
         let constraint_open = item
             .find('(')
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("primary key columns")))?;
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("constraint columns")))?;
         let constraint_close = matching_paren(item, constraint_open)
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("primary key columns")))?;
-        table_primary.extend(
-            split_sql_items(&item[constraint_open + 1..constraint_close])
-                .into_iter()
-                .map(|column| unquote(column.trim())),
-        );
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("constraint columns")))?;
+        let columns = split_sql_items(&item[constraint_open + 1..constraint_close])
+            .into_iter()
+            .map(|column| unquote(column.trim()))
+            .collect::<Vec<_>>();
+        if upper.contains("PRIMARY KEY") {
+            table_primary.extend(columns);
+        } else {
+            if columns.len() > 1 {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "composite unique constraints are not supported",
+                )));
+            }
+            table_unique.extend(columns);
+        }
     }
     if table_primary.len() > 1 {
         return Err(RymeError::InvalidArgument(String::from(
@@ -706,6 +721,7 @@ fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
                 primary_key: upper.contains("PRIMARY KEY"),
                 column_default,
                 auto_increment,
+                unique: upper.contains("UNIQUE"),
             })
         })
         .collect();
@@ -719,6 +735,14 @@ fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
         };
         column.primary_key = true;
         column.nullable = false;
+    }
+    for unique in table_unique {
+        let Some(column) =
+            columns.iter_mut().find(|column| column.name.eq_ignore_ascii_case(&unique))
+        else {
+            return Err(RymeError::InvalidArgument(format!("unknown unique column {unique}")));
+        };
+        column.unique = true;
     }
     Ok(columns)
 }
@@ -2849,7 +2873,34 @@ where
     fn register_table(&self, table: String, columns: Vec<ColumnDefinition>) {
         if let Ok(mut catalog) = self.catalog.lock() {
             if let std::collections::hash_map::Entry::Vacant(entry) = catalog.entry(table) {
+                let unique_columns: Vec<String> = columns
+                    .iter()
+                    .filter(|column| column.unique)
+                    .map(|column| column.name.clone())
+                    .collect();
+                let table_name = entry.key().clone();
                 entry.insert(columns);
+                if !unique_columns.is_empty() {
+                    if let Ok(mut indexes) = self.indexes.lock() {
+                        let table_indexes = indexes.entry(table_name.clone()).or_default();
+                        for column in unique_columns {
+                            let name = format!("{table_name}_{column}_unique");
+                            if table_indexes.iter().any(|state| state.definition.name == name) {
+                                continue;
+                            }
+                            table_indexes.push(IndexState {
+                                definition: IndexDefinition {
+                                    name,
+                                    table: table_name.clone(),
+                                    field: Field::Value,
+                                    column: Some(column),
+                                    unique: true,
+                                },
+                                entries: BTreeMap::new(),
+                            });
+                        }
+                    }
+                }
                 self.schema_dirty.store(true, Ordering::SeqCst);
             }
         }
@@ -4662,6 +4713,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_unique_column_metadata() {
+        let statement =
+            parse("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        let Statement::CreateTable { columns, .. } = statement else {
+            panic!("expected create table")
+        };
+        assert!(columns[1].unique);
+
+        let statement = parse("CREATE TABLE users (id TEXT, email TEXT, UNIQUE (email))").unwrap();
+        let Statement::CreateTable { columns, .. } = statement else {
+            panic!("expected create table")
+        };
+        assert!(columns[1].unique);
+    }
+
+    #[test]
     fn parses_standard_create_index() {
         assert_eq!(
             parse("CREATE INDEX messages_value_idx ON messages (value)").unwrap(),
@@ -4799,6 +4866,54 @@ mod tests {
         assert!(executor
             .execute(
                 parse("UPDATE profiles SET email = 'ada@example.com' WHERE id = 'p2'").unwrap(),
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn table_unique_constraints_enforce_inline_and_table_forms() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE inline_users (id TEXT PRIMARY KEY, email TEXT UNIQUE)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO inline_users (id, email) VALUES ('1', 'ada@example.com')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(executor
+            .execute(
+                parse("INSERT INTO inline_users (id, email) VALUES ('2', 'ada@example.com')")
+                    .unwrap(),
+            )
+            .await
+            .is_err());
+
+        executor
+            .execute(
+                parse("CREATE TABLE table_users (id TEXT PRIMARY KEY, email TEXT, UNIQUE (email))")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO table_users (id, email) VALUES ('1', 'grace@example.com')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(executor
+            .execute(
+                parse("INSERT INTO table_users (id, email) VALUES ('2', 'grace@example.com')")
+                    .unwrap(),
             )
             .await
             .is_err());

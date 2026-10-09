@@ -47,6 +47,8 @@ All notable changes to rymeDB are recorded here. Format follows
   enforce unique constraints across inserts, updates, and transactions.
 - `CREATE TABLE` now recognizes single-column table-level `PRIMARY KEY`
   constraints and rejects unsupported composite primary keys explicitly.
+- Inline and single-column table-level `UNIQUE` constraints now create durable
+  named indexes and reject duplicate inserts and updates.
 - Branch overlay pagination now reads parent pages from the requested cursor
   and merges only branch-local changes, avoiding a full-table scan on every
   `scan_after` request.
