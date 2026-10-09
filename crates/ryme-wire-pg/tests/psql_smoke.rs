@@ -82,7 +82,7 @@ async fn psql_smoke() {
     assert!(out.contains("returning|two"), "{out}");
     let (ok, out) = psql(
         addr,
-        "CREATE TABLE IF NOT EXISTS public.messages (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payload JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT now()); SELECT table_schema, table_name FROM information_schema.tables WHERE table_name = 'messages'; SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'messages' ORDER BY ordinal_position;",
+        "CREATE SCHEMA IF NOT EXISTS extensions; CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions; CREATE TABLE IF NOT EXISTS public.messages (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), payload JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT now()); SELECT table_schema, table_name FROM information_schema.tables WHERE table_name = 'messages'; SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'messages' ORDER BY ordinal_position;",
     )
     .await;
     assert!(ok, "{out}");

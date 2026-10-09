@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL migration setup now accepts `CREATE SCHEMA IF NOT EXISTS` and
+  `CREATE EXTENSION IF NOT EXISTS ... [WITH SCHEMA ...]` declarations.
 - PostgreSQL aggregates now return protocol-level `NULL` for empty
   `SUM`, `AVG`, `MIN`, and `MAX` results, and scalar aggregate descriptions
   preserve their function labels.

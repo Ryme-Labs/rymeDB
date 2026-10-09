@@ -23,6 +23,18 @@ impl Default for SetOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Statement {
+    CreateSchema {
+        schema: String,
+        #[serde(default)]
+        if_not_exists: bool,
+    },
+    CreateExtension {
+        name: String,
+        #[serde(default)]
+        schema: Option<String>,
+        #[serde(default)]
+        if_not_exists: bool,
+    },
     CreateTable {
         table: String,
         columns: Vec<ColumnDefinition>,
@@ -869,6 +881,7 @@ impl Statement {
             | Self::DeleteWhere { table, .. }
             | Self::DeleteUsing { table, .. }
             | Self::CopyFrom { table, .. } => table,
+            Self::CreateSchema { .. } | Self::CreateExtension { .. } => "",
             Self::DropIndex { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
@@ -1583,6 +1596,53 @@ fn unquote(value: &str) -> String {
 }
 
 fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
+    if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("SCHEMA")) {
+        let mut name_index = 2;
+        let if_not_exists =
+            tokens.get(name_index).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+        if if_not_exists {
+            if !tokens.get(name_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+                || !tokens
+                    .get(name_index + 2)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+            {
+                return Err(RymeError::InvalidArgument(String::from("create schema")));
+            }
+            name_index += 3;
+        }
+        let schema = tokens
+            .get(name_index)
+            .map(|value| unquote(value))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("create schema")))?;
+        return Ok(Statement::CreateSchema { schema, if_not_exists });
+    }
+    if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("EXTENSION")) {
+        let mut name_index = 2;
+        let if_not_exists =
+            tokens.get(name_index).is_some_and(|token| token.eq_ignore_ascii_case("IF"));
+        if if_not_exists {
+            if !tokens.get(name_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+                || !tokens
+                    .get(name_index + 2)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("EXISTS"))
+            {
+                return Err(RymeError::InvalidArgument(String::from("create extension")));
+            }
+            name_index += 3;
+        }
+        let name = tokens
+            .get(name_index)
+            .map(|value| unquote(value))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("create extension")))?;
+        let schema = tokens
+            .iter()
+            .position(|token| token.eq_ignore_ascii_case("SCHEMA"))
+            .and_then(|index| tokens.get(index + 1))
+            .map(|value| unquote(value));
+        return Ok(Statement::CreateExtension { name, schema, if_not_exists });
+    }
     if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("INDEX"))
         || (tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("UNIQUE"))
             && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("INDEX")))
@@ -4597,6 +4657,13 @@ fn parse_explain(input: &str) -> Result<Statement> {
 
 pub fn describe_plan(statement: &Statement) -> String {
     match statement {
+        Statement::CreateSchema { schema, .. } => format!("ddl create_schema({schema})"),
+        Statement::CreateExtension { name, schema, .. } => {
+            format!(
+                "ddl create_extension({name}{})",
+                schema.as_deref().map_or(String::new(), |schema| format!(" in {schema}"))
+            )
+        }
         Statement::CreateTable { table, columns, .. } => {
             format!("ddl create_table({table}) columns {}", columns.len())
         }
@@ -8540,6 +8607,7 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         match &statement {
+            Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {}
             Statement::CreateTable {
                 table,
                 columns,
@@ -8590,6 +8658,9 @@ where
                 let (result, changes) =
                     Box::pin(self.execute_in_transaction_base(txn, *statement)).await?;
                 Ok((apply_distinct(result, offset, limit), changes))
+            }
+            Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
+                Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreateTable { .. } => Ok((QueryResult::Ok, Vec::new())),
             Statement::DropTable { table, if_exists } => {
@@ -9982,6 +10053,7 @@ where
         isolation: Isolation,
     ) -> Result<QueryResult> {
         match &statement {
+            Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {}
             Statement::CreateTable {
                 table,
                 columns,
@@ -10016,7 +10088,9 @@ where
         }
         let schema_statement = matches!(
             &statement,
-            Statement::CreateTable { .. }
+            Statement::CreateSchema { .. }
+                | Statement::CreateExtension { .. }
+                | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
                 | Statement::DropIndex { .. }
                 | Statement::AlterTableDropConstraint { .. }
@@ -10332,6 +10406,9 @@ where
                 let left = self.execute_read_in_transaction(&mut txn, *left)?;
                 let right = self.execute_read_in_transaction(&mut txn, *right)?;
                 merge_set_results(left, right, operation, all)
+            }
+            Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
+                Ok(QueryResult::Ok)
             }
             Statement::CreateTable { .. } => Ok(QueryResult::Ok),
             Statement::DropTable { table, if_exists } => {
@@ -11782,6 +11859,23 @@ mod tests {
             vec![b"a".to_vec(), b"one".to_vec()],
             vec![b"b".to_vec(), b"two".to_vec()]
         ]));
+    }
+
+    #[tokio::test]
+    async fn migration_schema_and_extension_declarations_are_accepted() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let schema = parse("CREATE SCHEMA IF NOT EXISTS extensions").unwrap();
+        assert!(matches!(schema, Statement::CreateSchema { ref schema, if_not_exists: true }
+            if schema == "extensions"));
+        assert!(matches!(executor.execute(schema).await, Ok(QueryResult::Ok)));
+
+        let extension =
+            parse("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA extensions").unwrap();
+        assert!(
+            matches!(extension, Statement::CreateExtension { ref name, ref schema, if_not_exists: true }
+            if name == "pgcrypto" && schema.as_deref() == Some("extensions"))
+        );
+        assert!(matches!(executor.execute(extension).await, Ok(QueryResult::Ok)));
     }
 
     #[tokio::test]
