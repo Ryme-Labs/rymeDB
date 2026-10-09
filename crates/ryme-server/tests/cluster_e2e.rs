@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
 use ryme_config::{Config, RaftPeer};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const KEY: &str = "ryme-cluster-e2e-key-9d4c2b7a1f60";
 
@@ -494,6 +495,86 @@ async fn cluster_broadcast_reaches_every_gateway() {
             other => panic!("unexpected websocket message: {other:?}"),
         }
     }
+    for handle in handles {
+        handle.shutdown();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn cluster_resp_pubsub_reaches_every_gateway() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-cluster-resp-pubsub-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut bound = Vec::new();
+    for _ in 0..3 {
+        bound.push(bind_node().await);
+    }
+    let mut pg = Vec::new();
+    let mut resp = Vec::new();
+    let mut http = Vec::new();
+    let mut raft = Vec::new();
+    for node in &bound {
+        pg.push(node.0.local_addr().unwrap());
+        resp.push(node.1.local_addr().unwrap());
+        http.push(node.2.local_addr().unwrap());
+        raft.push(node.3.local_addr().unwrap());
+    }
+    let mut handles = Vec::new();
+    for (index, (pg_listener, resp_listener, http_listener, raft_listener)) in
+        bound.drain(..).enumerate()
+    {
+        let config =
+            node_config(&root, index, pg[index], resp[index], http[index], raft[index], &raft);
+        handles.push(
+            ryme_server::serve_cluster(
+                config,
+                pg_listener,
+                resp_listener,
+                http_listener,
+                raft_listener,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    let leader = wait_leader(&http, None).await;
+    let subscribe = b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nroom\r\n";
+    let subscription_reply = b"*3\r\n$9\r\nsubscribe\r\n$4\r\nroom\r\n:1\r\n";
+    let message_reply = b"*3\r\n$7\r\nmessage\r\n$4\r\nroom\r\n$2\r\nhi\r\n";
+    let mut subscribers = Vec::new();
+    for address in &resp {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(subscribe).await.unwrap();
+        let mut reply = vec![0u8; subscription_reply.len()];
+        tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, subscription_reply);
+        subscribers.push(socket);
+    }
+
+    let mut publisher = tokio::net::TcpStream::connect(resp[leader]).await.unwrap();
+    publisher.write_all(b"*3\r\n$7\r\nPUBLISH\r\n$4\r\nroom\r\n$2\r\nhi\r\n").await.unwrap();
+    let mut publish_reply = [0u8; 4];
+    publisher.read_exact(&mut publish_reply).await.unwrap();
+    assert_eq!(&publish_reply, b":1\r\n");
+
+    for mut subscriber in subscribers {
+        let mut reply = vec![0u8; message_reply.len()];
+        tokio::time::timeout(Duration::from_secs(5), subscriber.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, message_reply);
+    }
+
     for handle in handles {
         handle.shutdown();
     }
