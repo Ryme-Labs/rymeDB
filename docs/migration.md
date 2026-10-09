@@ -5,7 +5,9 @@
 `POST /v1/migrate/apply` executes one SQL statement and records it in the
 control-plane hash-chained ledger (`{id, sql, author, checksum,
 parent_checksum, schema_version}`); duplicate ids get `409` before anything
-runs twice, and `GET /v1/migrate/ledger` returns entries in apply order
+runs twice. Migration applications are serialized per server process, so
+concurrent requests cannot execute the same id before the ledger is updated.
+`GET /v1/migrate/ledger` returns entries in apply order
 with the schema version and chain validity. Branch metadata is persisted under
 `data_dir/branches.json`, while the migration ledger and backup checkpoints are
 persisted under `data_dir/control.json`; snapshots and archives cover data,

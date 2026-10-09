@@ -8,6 +8,14 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- SQL table and secondary-index metadata now persists atomically in
+  `data_dir/schema.json`, is shared by HTTP and PostgreSQL gateways, restored
+  with rebuilt index entries, isolated for branch executors, and included in
+  archive backups. Migration applications are serialized per server process
+  so concurrent requests cannot execute duplicate or interleaved migrations.
+- SDK distribution is limited to the Java, npm/TypeScript, and Rust clients;
+  the release workflow packages and publishes those three artifacts and the
+  Pages workflow builds their documentation.
 - Transactional MVCC core with OCC, CRC segmented WAL and four durability
   modes (`strict`, `regional-fast`, `local-durable`, `memory`).
 - Raft replication with joint-consensus membership, range sharding,

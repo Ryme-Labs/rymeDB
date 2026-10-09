@@ -447,6 +447,7 @@ pub struct SharedState {
     rls_tables: HashMap<String, String>,
     realtime: Realtime,
     durable_persist_lock: Arc<Mutex<()>>,
+    migration_lock: Arc<tokio::sync::Mutex<()>>,
     keys: ApiKeyStore,
     jwt: Option<JwtVerifier>,
     oidc: Option<OidcConfig>,
@@ -1090,6 +1091,7 @@ impl SharedState {
             rls_tables: config.rls_tables.clone(),
             realtime,
             durable_persist_lock: Arc::new(Mutex::new(())),
+            migration_lock: Arc::new(tokio::sync::Mutex::new(())),
             keys,
             jwt,
             oidc,
@@ -3083,6 +3085,33 @@ async fn migrate_neon(
     }
 }
 
+async fn apply_migration_locked(
+    state: &SharedState,
+    tenant: String,
+    request: MigrateApplyRequest,
+    statement: ryme_sql::Statement,
+    author: String,
+) -> ryme_error::Result<ryme_migrate::LedgerEntry> {
+    let _migration_guard = state.migration_lock.lock().await;
+    let duplicate = match state.control.lock() {
+        Ok(control) => {
+            control.migrations.entries().iter().any(|entry| entry.migration_id == request.id)
+        }
+        Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
+    };
+    if duplicate {
+        return Err(ryme_error::RymeError::Conflict(String::from("migration")));
+    }
+    let executor = state.executor.clone().with_tenant(tenant);
+    executor.execute(statement).await?;
+    let mut control =
+        state.control.lock().map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+    let applied = control.migrations.apply(request.id, &request.sql, author, now_secs())?;
+    drop(control);
+    state.persist_control()?;
+    Ok(applied)
+}
+
 async fn migrate_apply(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -3108,31 +3137,9 @@ async fn migrate_apply(
             "read-only migration",
         )));
     }
-    let author = request.author.unwrap_or_else(|| principal.id.clone());
-    let duplicate = match state.control.lock() {
-        Ok(control) => {
-            control.migrations.entries().iter().any(|entry| entry.migration_id == request.id)
-        }
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
-    if duplicate {
-        return error_response(ryme_error::RymeError::Conflict(String::from("migration")));
-    }
-    let executor = state.executor.clone().with_tenant(principal.tenant.clone());
-    if let Err(e) = executor.execute(statement).await {
-        return error_response(e);
-    }
-    let mut control = match state.control.lock() {
-        Ok(guard) => guard,
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
-    let applied = control.migrations.apply(request.id, &request.sql, author, now_secs());
-    drop(control);
-    match applied {
-        Ok(entry) => match state.persist_control() {
-            Ok(()) => (StatusCode::CREATED, Json(entry)).into_response(),
-            Err(e) => error_response(e),
-        },
+    let author = request.author.clone().unwrap_or_else(|| principal.id.clone());
+    match apply_migration_locked(&state, principal.tenant, request, statement, author).await {
+        Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -6834,6 +6841,61 @@ mod realtime_policy_tests {
         let mode = std::fs::metadata(dir.join("schema.json")).unwrap().permissions();
         #[cfg(unix)]
         assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o077, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn migration_lock_serializes_duplicate_execution() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-migration-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("migration-lock");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        let mut receiver = state.realtime.subscribe_branch("default", "default", "main", "docs");
+        let request = MigrateApplyRequest {
+            id: String::from("race-1"),
+            sql: String::from("UPSERT INTO docs KEY 'k1' VALUE 'v1'"),
+            author: Some(String::from("test")),
+        };
+        let statement = ryme_sql::parse(&request.sql).unwrap();
+        let left = apply_migration_locked(
+            &state,
+            String::from("default"),
+            request.clone(),
+            statement.clone(),
+            String::from("test"),
+        );
+        let right = apply_migration_locked(
+            &state,
+            String::from("default"),
+            request,
+            statement,
+            String::from("test"),
+        );
+        let (left, right) = tokio::join!(left, right);
+        let results = [left, right];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(ryme_error::RymeError::Conflict(_))))
+                .count(),
+            1
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.pk, b"k1");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+            .await
+            .is_err());
+        assert_eq!(state.control.lock().unwrap().migrations.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
