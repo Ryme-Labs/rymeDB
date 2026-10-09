@@ -955,7 +955,7 @@ where
                                 }
                                 out.extend_from_slice(&response);
                             }
-                            Err(_) => match session_select(trimmed) {
+                            Err(_) => match session_select(trimmed, &session) {
                                 Some(rows) => out.extend_from_slice(&encode_session_rows(rows)),
                                 None => {
                                     out.extend_from_slice(&encode_error_code(
@@ -1085,6 +1085,7 @@ where
                                     }
                                     Err(_) => match session_select(
                                         bound.trim_matches(|c| c == '\0' || c == ';' || c == ' '),
+                                        &session,
                                     ) {
                                         Some(rows) => encode_session_rows(rows),
                                         None => encode_error_code("42601", String::from("syntax")),
@@ -1260,7 +1261,7 @@ fn describe_query(query: &str) -> Vec<u8> {
         }
         return frame(b'n', b"");
     }
-    if let Some(columns) = session_select(trimmed) {
+    if let Some(columns) = session_select(trimmed, &HashMap::new()) {
         let names: Vec<String> = columns.into_iter().map(|(name, _)| name).collect();
         return multi_row_description(&names);
     }
@@ -2860,7 +2861,8 @@ where
             }
             let body_at = rest.to_ascii_uppercase().find(" AS ").map(|at| at + 4)?;
             let body = rest[body_at..].trim();
-            if body.is_empty() || parse(body).is_err() {
+            if body.is_empty() || (parse(body).is_err() && session_select(body, session).is_none())
+            {
                 return Some(encode_error_code("42601", format!("unsupported statement: {query}")));
             }
             prepared_cache.remove(&name);
@@ -2930,9 +2932,9 @@ where
                     )
                     .await,
                 ),
-                Err(_) => {
+                Err(_) => session_select(trimmed, session).map(encode_session_rows).or_else(|| {
                     Some(encode_error_code("42601", format!("unsupported statement: {query}")))
-                }
+                }),
             }
         }
         "DEALLOCATE" => {
@@ -2959,22 +2961,54 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
     let head = query.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
     match head.as_str() {
         "SET" => {
-            let rest = query[3..].trim();
-            let mut words = rest.split_whitespace();
-            if words.next().is_some_and(|w| w.eq_ignore_ascii_case("TRANSACTION"))
-                && words.next().is_some_and(|w| w.eq_ignore_ascii_case("ISOLATION"))
-                && words.next().is_some_and(|w| w.eq_ignore_ascii_case("LEVEL"))
+            let rest = query[3..].trim().trim_end_matches(';').trim();
+            let words = rest.split_whitespace().collect::<Vec<_>>();
+            if words.first().is_some_and(|w| w.eq_ignore_ascii_case("SESSION")) {
+                return session_command(
+                    &format!("SET {}", rest["SESSION".len()..].trim()),
+                    session,
+                );
+            }
+            if words.len() >= 4
+                && words[0].eq_ignore_ascii_case("TRANSACTION")
+                && words[1].eq_ignore_ascii_case("ISOLATION")
+                && words[2].eq_ignore_ascii_case("LEVEL")
             {
-                let level = words.next().unwrap_or("").trim_end_matches(';');
+                let level = words[3].trim_end_matches(';');
                 let normalized = match level.to_ascii_lowercase().as_str() {
                     "serializable" => Some("serializable"),
                     "snapshot" => Some("snapshot"),
                     _ => None,
                 }?;
-                if words.next().is_some() {
+                if words.len() != 4 {
                     return None;
                 }
                 session.insert(String::from("transaction_isolation"), String::from(normalized));
+                return Some(command_complete("SET"));
+            }
+            if words.len() >= 3
+                && words[0].eq_ignore_ascii_case("TIME")
+                && words[1].eq_ignore_ascii_case("ZONE")
+            {
+                let value = words[2..].join(" ");
+                if value.is_empty() {
+                    return None;
+                }
+                session.insert(
+                    String::from("timezone"),
+                    unquote_literal(value.trim_start_matches('=').trim()),
+                );
+                return Some(command_complete("SET"));
+            }
+            if words.len() >= 2 && words[0].eq_ignore_ascii_case("NAMES") {
+                let value = words[1..].join(" ");
+                if value.is_empty() {
+                    return None;
+                }
+                session.insert(
+                    String::from("client_encoding"),
+                    unquote_literal(value.trim_start_matches('=').trim()),
+                );
                 return Some(command_complete("SET"));
             }
             let (name, value) = rest
@@ -2998,9 +3032,35 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
             Some(command_complete("SET"))
         }
         "SHOW" => {
-            let name = query[4..].trim();
+            let name = query[4..].trim().trim_end_matches(';').trim();
             if name.is_empty() {
                 return None;
+            }
+            if name.eq_ignore_ascii_case("ALL") {
+                let names = [
+                    "application_name",
+                    "client_encoding",
+                    "datestyle",
+                    "integer_datetimes",
+                    "search_path",
+                    "server_encoding",
+                    "server_version",
+                    "standard_conforming_strings",
+                    "timezone",
+                    "transaction_isolation",
+                ];
+                let mut out =
+                    multi_row_description(&[String::from("name"), String::from("setting")]);
+                for name in names {
+                    let value = session
+                        .get(name)
+                        .cloned()
+                        .or_else(|| session_default(name).map(String::from))
+                        .unwrap_or_default();
+                    out.extend(data_row_values(&[name.as_bytes().to_vec(), value.into_bytes()]));
+                }
+                out.extend(command_complete("SHOW"));
+                return Some(out);
             }
             let value = session
                 .get(&name.to_ascii_lowercase())
@@ -3009,7 +3069,7 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
             Some(session_select_rows(vec![(name.to_string(), value)]))
         }
         "RESET" => {
-            let name = query[5..].trim();
+            let name = query[5..].trim().trim_end_matches(';').trim();
             if name.eq_ignore_ascii_case("ALL") {
                 session.clear();
                 return Some(command_complete("RESET"));
@@ -3137,7 +3197,7 @@ fn strip_casts(expression: &str) -> &str {
     }
 }
 
-fn eval_select_item(item: &str) -> Option<String> {
+fn eval_select_item(item: &str, session: &HashMap<String, String>) -> Option<String> {
     let expression = strip_casts(strip_alias(item));
     if expression.starts_with('\'') && expression.ends_with('\'') && expression.len() >= 2 {
         return Some(expression[1..expression.len() - 1].to_string());
@@ -3146,16 +3206,24 @@ fn eval_select_item(item: &str) -> Option<String> {
         return Some(expression.to_string());
     }
     match expression.to_ascii_lowercase().as_str() {
-        "version()" => Some(String::from("PostgreSQL 16.0 on rymeDB")),
+        "version()" | "pg_catalog.version()" => Some(String::from("PostgreSQL 16.0 on rymeDB")),
         "current_database()" => Some(String::from("default")),
         "current_user" | "current_user()" => Some(String::from("ryme")),
         "current_schema()" => Some(String::from("public")),
         "current_catalog" => Some(String::from("default")),
+        expression if expression.starts_with("current_setting(") && expression.ends_with(')') => {
+            let setting = expression[16..expression.len() - 1].trim();
+            if setting.contains(',') {
+                return None;
+            }
+            let name = unquote_literal(setting).to_ascii_lowercase();
+            session.get(&name).cloned().or_else(|| session_default(&name).map(String::from))
+        }
         _ => None,
     }
 }
 
-fn session_select(query: &str) -> Option<Vec<(String, String)>> {
+fn session_select(query: &str, session: &HashMap<String, String>) -> Option<Vec<(String, String)>> {
     let trimmed = query.trim();
     if !trimmed.to_ascii_uppercase().starts_with("SELECT ") {
         return None;
@@ -3175,7 +3243,7 @@ fn session_select(query: &str) -> Option<Vec<(String, String)>> {
     }
     let mut out = Vec::new();
     for item in items {
-        out.push((column_name(&item), eval_select_item(&item)?));
+        out.push((column_name(&item), eval_select_item(&item, session)?));
     }
     Some(out)
 }
@@ -3812,17 +3880,34 @@ mod tests {
 
     #[test]
     fn select_expressions() {
-        let rows = session_select("SELECT 1").unwrap();
+        let session = HashMap::new();
+        let rows = session_select("SELECT 1", &session).unwrap();
         assert_eq!(rows, vec![(String::from("1"), String::from("1"))]);
-        let rows = session_select("SELECT $1::text AS echo").unwrap_or_else(|| {
-            session_select(&bind("SELECT $1::text AS echo", &[String::from("hi")])).unwrap()
+        let rows = session_select("SELECT $1::text AS echo", &session).unwrap_or_else(|| {
+            session_select(&bind("SELECT $1::text AS echo", &[String::from("hi")]), &session)
+                .unwrap()
         });
         assert_eq!(rows, vec![(String::from("echo"), String::from("hi"))]);
-        let rows = session_select("SELECT version(), current_database(), 42 AS n").unwrap();
+        let rows =
+            session_select("SELECT version(), current_database(), 42 AS n", &session).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2], (String::from("n"), String::from("42")));
-        assert!(session_select("SELECT * FROM users").is_none());
-        assert!(session_select("SELECT pg_catalog.version()").is_none());
+        assert!(session_select("SELECT * FROM users", &session).is_none());
+        let rows = session_select("SELECT pg_catalog.version()", &session).unwrap();
+        assert_eq!(rows[0].1, "PostgreSQL 16.0 on rymeDB");
+    }
+
+    #[test]
+    fn session_settings_match_common_driver_queries() {
+        let mut session = HashMap::new();
+        assert!(session_command("SET TIME ZONE 'America/New_York'", &mut session).is_some());
+        assert_eq!(session.get("timezone"), Some(&String::from("America/New_York")));
+        assert!(session_command("SET NAMES 'UTF8'", &mut session).is_some());
+        assert_eq!(session.get("client_encoding"), Some(&String::from("UTF8")));
+        assert!(session_command("SET SESSION application_name = 'worker'", &mut session).is_some());
+        let rows = session_select("SELECT current_setting('application_name')", &session).unwrap();
+        assert_eq!(rows[0].1, "worker");
+        assert!(session_command("SHOW ALL", &mut session).is_some());
     }
 
     #[test]

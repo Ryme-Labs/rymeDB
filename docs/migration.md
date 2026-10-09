@@ -42,6 +42,11 @@ transaction's conflict-tracking state before continuing.
    timezones, JSON, arrays, `RETURNING`, `ON CONFLICT`, session variables,
    and named transaction savepoints.
 
+Common PostgreSQL driver probes are handled on both simple and extended
+protocol connections: `SELECT pg_catalog.version()`,
+`SELECT current_setting('application_name')`, `SET TIME ZONE`, `SET NAMES`,
+`SHOW ALL`, and prepared forms of scalar session queries.
+
 ## Supabase
 
 REST: `GET /rest/v1/:table?select=&key=eq.<id>&order=key.desc&limit=&offset=`,
