@@ -66,6 +66,7 @@ jobs:
           test -f _site/sdks/js.html
           test -f _site/sdks/rust.html
           test "$(find _site/sdks -maxdepth 1 -type f -name '*.html' | wc -l)" -eq 3
+          test "$(find _site/sdks -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 0
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
