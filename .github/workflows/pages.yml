@@ -12,6 +12,16 @@ on:
       - "sdks/js/**"
       - "sdks/rust/**"
       - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "schemas/openapi/**"
+      - "images/**"
+      - "README.md"
+      - "sdks/java/**"
+      - "sdks/js/**"
+      - "sdks/rust/**"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -47,12 +57,24 @@ jobs:
       - name: Build static site
         run: python3 docs/build-pages.py --out _site
 
+      - name: Verify generated site
+        run: |
+          test -f _site/index.html
+          test -f _site/api/index.html
+          test -f _site/openapi/rest.yaml
+          test -f _site/openapi/rest.json
+          test -f _site/sdks/java.html
+          test -f _site/sdks/js.html
+          test -f _site/sdks/rust.html
+          test "$(find _site/sdks -maxdepth 1 -type f -name '*.html' | wc -l)" -eq 3
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
 
   deploy:
+    if: ${{ github.event_name != 'pull_request' }}
     needs: build
     runs-on: ubuntu-latest
     environment:
