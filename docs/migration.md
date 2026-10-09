@@ -57,7 +57,8 @@ tenant_id) WITH CHECK (auth.uid() = tenant_id)` together with
 `ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY`. The detected tenant
 column and RLS activation state are persisted with the schema and applied to
 SQL reads, writes, and realtime snapshots/updates; more complex policy
-expressions still require manual review. Enabled tables without a matching
+expressions still require manual review. `DROP POLICY IF EXISTS name ON table`
+removes a named policy. Enabled tables without a matching
 policy command follow PostgreSQL default-deny behavior.
 
 Dump analysis: `POST /v1/migrate/supabase` with `{dump}` returns tables and

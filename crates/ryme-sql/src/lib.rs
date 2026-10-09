@@ -44,6 +44,12 @@ pub enum Statement {
         #[serde(default)]
         check: Option<String>,
     },
+    DropPolicy {
+        name: String,
+        table: String,
+        #[serde(default)]
+        if_exists: bool,
+    },
     AlterTableRls {
         table: String,
         #[serde(default)]
@@ -457,6 +463,17 @@ pub struct SchemaSnapshot {
     pub rls_enabled: BTreeSet<String>,
     #[serde(default)]
     pub rls_forced: BTreeSet<String>,
+    #[serde(default)]
+    pub rls_policies: BTreeMap<String, RlsPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RlsPolicy {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+    pub read: bool,
+    pub write: bool,
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -488,6 +505,7 @@ impl Statement {
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
                 | Statement::CreatePolicy { .. }
+                | Statement::DropPolicy { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::Insert { .. }
                 | Statement::InsertRow { .. }
@@ -522,6 +540,18 @@ pub enum QueryResult {
 /// Internal marker used for SQL NULL cells in byte-oriented query results.
 /// Wire encoders translate it to their protocol-level null representation.
 pub const SQL_NULL_SENTINEL: &[u8] = b"\0";
+const RLS_CONFLICT_COLUMN: &str = "\0";
+
+fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, column: &str) {
+    match map.get_mut(table) {
+        None => {
+            map.insert(table.to_string(), column.to_string());
+        }
+        Some(existing) if existing.is_empty() || existing == column => {}
+        Some(existing) if column.is_empty() => existing.clear(),
+        Some(existing) => *existing = String::from(RLS_CONFLICT_COLUMN),
+    }
+}
 
 pub type Row = (Vec<u8>, Vec<u8>);
 
@@ -912,6 +942,7 @@ impl Statement {
             | Self::CopyFrom { table, .. } => table,
             Self::CreateSchema { .. } | Self::CreateExtension { .. } => "",
             Self::CreatePolicy { table, .. } => table,
+            Self::DropPolicy { table, .. } => table,
             Self::DropIndex { name, .. } => name,
             Self::Returning { statement, .. } => statement.table(),
             Self::Explain { inner, .. } => inner.table(),
@@ -1067,6 +1098,24 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
         .get(object_pos)
         .map(|value| unquote(value))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("drop object")))?;
+    if kind.eq_ignore_ascii_case("POLICY") {
+        let on_pos = tokens
+            .iter()
+            .enumerate()
+            .skip(object_pos + 1)
+            .find(|(_, token)| token.eq_ignore_ascii_case("ON"))
+            .map(|(position, _)| position)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("drop policy table")))?;
+        let table = tokens
+            .get(on_pos + 1)
+            .map(|value| {
+                let qualified = unquote(value);
+                qualified.rsplit('.').next().unwrap_or(&qualified).to_string()
+            })
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("drop policy table")))?;
+        return Ok(Statement::DropPolicy { name: object, table, if_exists });
+    }
     if kind.eq_ignore_ascii_case("TABLE") {
         return Ok(Statement::DropTable { table: object, if_exists });
     }
@@ -4795,6 +4844,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::CreatePolicy { name, table, command, .. } => {
             format!("ddl create_policy({name}) on {table} for {command}")
         }
+        Statement::DropPolicy { name, table, .. } => {
+            format!("ddl drop_policy({name}) on {table}")
+        }
         Statement::AlterTableRls { table, enabled, forced } => {
             format!("ddl alter_table({table}) row_security({enabled:?}, {forced:?})")
         }
@@ -5399,6 +5451,7 @@ pub struct Executor<B = TxnManager> {
     rls_write_tables: Arc<RwLock<HashMap<String, String>>>,
     rls_enabled: Arc<RwLock<HashSet<String>>>,
     rls_forced: Arc<RwLock<HashSet<String>>>,
+    rls_policies: Arc<RwLock<HashMap<String, RlsPolicy>>>,
     checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
     foreign_keys: Arc<Mutex<HashMap<String, Vec<ForeignKeyConstraint>>>>,
     constraints: Arc<Mutex<HashMap<String, Vec<ConstraintMetadata>>>>,
@@ -5431,6 +5484,7 @@ impl Executor<TxnManager> {
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
+            rls_policies: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5457,6 +5511,7 @@ impl Executor<TxnManager> {
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
+            rls_policies: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5488,6 +5543,7 @@ where
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
+            rls_policies: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
             constraints: Arc::new(Mutex::new(HashMap::new())),
@@ -5504,6 +5560,19 @@ where
     }
 
     pub fn with_rls_tables(mut self, rls_tables: HashMap<String, String>) -> Self {
+        let policies = rls_tables
+            .iter()
+            .map(|(table, column)| {
+                let policy = RlsPolicy {
+                    name: format!("__config__{table}"),
+                    table: table.clone(),
+                    column: column.clone(),
+                    read: true,
+                    write: true,
+                };
+                (format!("{table}\0{}", policy.name), policy)
+            })
+            .collect();
         self.rls_tables = Arc::new(RwLock::new(rls_tables.clone()));
         self.rls_write_tables = Arc::new(RwLock::new(rls_tables));
         self.rls_enabled = Arc::new(RwLock::new(
@@ -5512,6 +5581,7 @@ where
                 .map(|tables| tables.keys().cloned().collect())
                 .unwrap_or_default(),
         ));
+        self.rls_policies = Arc::new(RwLock::new(policies));
         self
     }
 
@@ -5524,6 +5594,18 @@ where
         }
         if let Ok(mut enabled) = self.rls_enabled.write() {
             enabled.extend(rls_tables.keys().cloned());
+        }
+        if let Ok(mut policies) = self.rls_policies.write() {
+            for (table, column) in rls_tables {
+                let policy = RlsPolicy {
+                    name: format!("__config__{table}"),
+                    table: table.clone(),
+                    column,
+                    read: true,
+                    write: true,
+                };
+                policies.insert(format!("{table}\0{}", policy.name), policy);
+            }
         }
     }
 
@@ -5558,8 +5640,34 @@ where
         Ok(())
     }
 
+    fn rebuild_rls_policy_maps(&self) -> Result<()> {
+        let policies = self
+            .rls_policies
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("RLS policy lock")))?
+            .clone();
+        let mut reads = HashMap::new();
+        let mut writes = HashMap::new();
+        for policy in policies.values() {
+            if policy.read {
+                merge_rls_policy_column(&mut reads, &policy.table, &policy.column);
+            }
+            if policy.write {
+                merge_rls_policy_column(&mut writes, &policy.table, &policy.column);
+            }
+        }
+        *self.rls_tables.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? =
+            reads;
+        *self
+            .rls_write_tables
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("RLS write lock")))? = writes;
+        Ok(())
+    }
+
     fn install_policy(
         &self,
+        name: &str,
         table: &str,
         command: &str,
         using: Option<&str>,
@@ -5589,23 +5697,42 @@ where
         if !matches!(command.as_str(), "ALL" | "SELECT" | "INSERT" | "UPDATE" | "DELETE") {
             return Err(RymeError::InvalidArgument(String::from("unsupported RLS command")));
         }
-        if let Some(column) = tenant_column.or_else(|| allow_all.then(String::new)) {
-            let applies_read = matches!(command.as_str(), "ALL" | "SELECT" | "UPDATE" | "DELETE");
-            let applies_write = matches!(command.as_str(), "ALL" | "INSERT" | "UPDATE" | "DELETE");
-            if applies_read {
-                let mut rls_tables = self
-                    .rls_tables
-                    .write()
-                    .map_err(|_| RymeError::Internal(String::from("RLS lock")))?;
-                rls_tables.insert(table.to_string(), column.clone());
-            }
-            if applies_write {
-                let mut rls_tables = self
-                    .rls_write_tables
-                    .write()
-                    .map_err(|_| RymeError::Internal(String::from("RLS write lock")))?;
-                rls_tables.insert(table.to_string(), column);
-            }
+        let column = tenant_column
+            .or_else(|| allow_all.then(String::new))
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("create policy expression")))?;
+        let policy = RlsPolicy {
+            name: name.to_string(),
+            table: table.to_string(),
+            column,
+            read: matches!(command.as_str(), "ALL" | "SELECT" | "UPDATE" | "DELETE"),
+            write: matches!(command.as_str(), "ALL" | "INSERT" | "UPDATE" | "DELETE"),
+        };
+        let key = format!("{table}\0{name}");
+        let mut policies = self
+            .rls_policies
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("RLS policy lock")))?;
+        if policies.contains_key(&key) {
+            return Err(RymeError::Conflict(format!("policy {name}")));
+        }
+        policies.insert(key, policy);
+        drop(policies);
+        self.rebuild_rls_policy_maps()
+    }
+
+    fn drop_policy(&self, name: &str, table: &str, if_exists: bool) -> Result<()> {
+        let key = format!("{table}\0{name}");
+        let removed = self
+            .rls_policies
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("RLS policy lock")))?
+            .remove(&key)
+            .is_some();
+        if !removed && !if_exists {
+            return Err(RymeError::NotFound(format!("policy {name}")));
+        }
+        if removed {
+            self.rebuild_rls_policy_maps()?;
         }
         Ok(())
     }
@@ -5636,6 +5763,7 @@ where
             rls_write_tables: self.rls_write_tables,
             rls_enabled: self.rls_enabled,
             rls_forced: self.rls_forced,
+            rls_policies: self.rls_policies,
             checks: self.checks,
             foreign_keys: self.foreign_keys,
             constraints: self.constraints,
@@ -5762,6 +5890,13 @@ where
             .read()
             .map(|tables| tables.iter().cloned().collect())
             .unwrap_or_default();
+        let rls_policies = self
+            .rls_policies
+            .read()
+            .map(|policies| {
+                policies.iter().map(|(key, policy)| (key.clone(), policy.clone())).collect()
+            })
+            .unwrap_or_default();
         SchemaSnapshot {
             tables,
             indexes,
@@ -5772,6 +5907,7 @@ where
             rls_write_tables,
             rls_enabled,
             rls_forced,
+            rls_policies,
         }
     }
 
@@ -5805,6 +5941,30 @@ where
             snapshot.rls_enabled.into_iter().collect()
         };
         let rls_forced: HashSet<String> = snapshot.rls_forced.into_iter().collect();
+        let mut legacy_policies = BTreeMap::new();
+        for (table, column) in &snapshot.rls_tables {
+            let policy = RlsPolicy {
+                name: format!("__config__{table}"),
+                table: table.clone(),
+                column: column.clone(),
+                read: true,
+                write: snapshot.rls_write_tables.contains_key(table),
+            };
+            legacy_policies.insert(format!("{table}\0{}", policy.name), policy);
+        }
+        for (table, column) in &snapshot.rls_write_tables {
+            legacy_policies.entry(format!("{table}\0__config__{table}")).or_insert_with(|| {
+                RlsPolicy {
+                    name: format!("__config__{table}"),
+                    table: table.clone(),
+                    column: column.clone(),
+                    read: false,
+                    write: true,
+                }
+            });
+        }
+        let rls_policies =
+            if snapshot.rls_policies.is_empty() { legacy_policies } else { snapshot.rls_policies };
         if let Ok(mut rls_tables) = self.rls_tables.write() {
             *rls_tables = snapshot.rls_tables.into_iter().collect();
         } else {
@@ -5824,6 +5984,11 @@ where
             *tables = rls_forced;
         } else {
             return Err(RymeError::Internal(String::from("RLS force lock")));
+        }
+        if let Ok(mut policies) = self.rls_policies.write() {
+            *policies = rls_policies.into_iter().collect();
+        } else {
+            return Err(RymeError::Internal(String::from("RLS policy lock")));
         }
         if let Ok(mut indexes) = self.indexes.lock() {
             indexes.clear();
@@ -5863,6 +6028,7 @@ where
             rls_write_tables: self.rls_write_tables,
             rls_enabled: self.rls_enabled,
             rls_forced: self.rls_forced,
+            rls_policies: self.rls_policies,
             checks: Arc::new(Mutex::new(checks)),
             foreign_keys: Arc::new(Mutex::new(foreign_keys)),
             constraints: Arc::new(Mutex::new(constraints)),
@@ -8954,6 +9120,7 @@ where
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
             | Statement::CreatePolicy { .. }
+            | Statement::DropPolicy { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -9009,8 +9176,12 @@ where
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
                 Ok((QueryResult::Ok, Vec::new()))
             }
-            Statement::CreatePolicy { table, command, using, check, .. } => {
-                self.install_policy(&table, &command, using.as_deref(), check.as_deref())?;
+            Statement::CreatePolicy { name, table, command, using, check } => {
+                self.install_policy(&name, &table, &command, using.as_deref(), check.as_deref())?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::DropPolicy { name, table, if_exists } => {
+                self.drop_policy(&name, &table, if_exists)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::AlterTableRls { table, enabled, forced } => {
@@ -10411,6 +10582,7 @@ where
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
             | Statement::CreatePolicy { .. }
+            | Statement::DropPolicy { .. }
             | Statement::AlterTableRls { .. } => {}
             Statement::CreateTable {
                 table,
@@ -10449,6 +10621,7 @@ where
             Statement::CreateSchema { .. }
                 | Statement::CreateExtension { .. }
                 | Statement::CreatePolicy { .. }
+                | Statement::DropPolicy { .. }
                 | Statement::AlterTableRls { .. }
                 | Statement::CreateTable { .. }
                 | Statement::DropTable { .. }
@@ -10770,8 +10943,12 @@ where
             Statement::CreateSchema { .. } | Statement::CreateExtension { .. } => {
                 Ok(QueryResult::Ok)
             }
-            Statement::CreatePolicy { table, command, using, check, .. } => {
-                self.install_policy(&table, &command, using.as_deref(), check.as_deref())?;
+            Statement::CreatePolicy { name, table, command, using, check } => {
+                self.install_policy(&name, &table, &command, using.as_deref(), check.as_deref())?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::DropPolicy { name, table, if_exists } => {
+                self.drop_policy(&name, &table, if_exists)?;
                 Ok(QueryResult::Ok)
             }
             Statement::AlterTableRls { table, enabled, forced } => {
@@ -12074,6 +12251,49 @@ mod tests {
             )
             .await;
         assert!(matches!(rejected, Err(RymeError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn sql_drop_policy_removes_named_policy_and_persists_state() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE policy_rows (id TEXT PRIMARY KEY, tenant_id TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO policy_rows (id, tenant_id) VALUES ('one', 'tenant-a')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("CREATE POLICY own_rows ON policy_rows FOR SELECT USING (auth.uid() = tenant_id)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE policy_rows ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        let visible = executor.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
+        assert!(matches!(visible, QueryResult::Rows { ref rows } if rows.len() == 1));
+
+        let drop = parse("DROP POLICY IF EXISTS own_rows ON policy_rows").unwrap();
+        assert!(matches!(drop, Statement::DropPolicy { ref name, ref table, if_exists: true }
+            if name == "own_rows" && table == "policy_rows"));
+        executor.execute(drop).await.unwrap();
+        let hidden = executor.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
+        assert!(matches!(hidden, QueryResult::Rows { ref rows } if rows.is_empty()));
+        let snapshot = executor.schema_snapshot();
+        assert!(!snapshot.rls_policies.keys().any(|key| key.ends_with("\0own_rows")));
+        executor.restore_schema_snapshot(snapshot).unwrap();
+        let hidden = executor.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
+        assert!(matches!(hidden, QueryResult::Rows { ref rows } if rows.is_empty()));
     }
 
     #[tokio::test]

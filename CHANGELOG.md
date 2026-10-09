@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL `DROP POLICY [IF EXISTS] ... ON ...` now removes the named RLS
+  policy and persists the remaining policy state across schema snapshots.
 - Enabled RLS tables now default-deny reads and writes when no applicable
   policy command exists, including `FOR SELECT` policies that must not grant
   insert/update/delete access implicitly.
