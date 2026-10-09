@@ -1,6 +1,7 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::{Component, Path};
 
 pub mod local;
 pub mod s3;
@@ -70,6 +71,12 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+fn safe_relative_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('\\')
+        && Path::new(name).components().all(|component| matches!(component, Component::Normal(_)))
+}
+
 pub struct Archiver<S> {
     store: S,
 }
@@ -129,7 +136,7 @@ impl<S: ObjectStore> Archiver<S> {
         let prefix = format!("backups/{commit_ts:020}-{backup_id}/");
         let mut entries = Vec::new();
         for (name, bytes) in files {
-            if name.contains('/') || name.contains("..") {
+            if !safe_relative_name(&name) {
                 return Err(RymeError::InvalidArgument(String::from("filename")));
             }
             let key = format!("{prefix}{name}");
@@ -196,10 +203,13 @@ impl<S: ObjectStore> Archiver<S> {
             let plain = open(&file.encryption, &bytes)?;
             let name = file
                 .key
-                .rsplit('/')
-                .next()
+                .strip_prefix(&manifest.prefix())
+                .filter(|name| safe_relative_name(name))
                 .ok_or_else(|| RymeError::Corrupt(String::from("filename")))?;
             let dest = dest_dir.join(name);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let tmp = dest.with_extension("tmp");
             std::fs::write(&tmp, &plain)?;
             std::fs::rename(&tmp, &dest)?;
@@ -439,6 +449,49 @@ mod tests {
             Err::<Vec<u8>, RymeError>(RymeError::Unauthorized)
         };
         assert!(archiver.verify_backup(&manifest.manifest_key(), &wrong).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn nested_paths_restore_without_flattening() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-nested-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let archiver = Archiver::new(LocalStore::new(root.clone()));
+        let manifest = archiver
+            .archive_files(
+                "nested",
+                11,
+                vec![(String::from("branch-schemas/tenant/preview.json"), b"schema".to_vec())],
+            )
+            .await
+            .unwrap();
+        archiver.restore_backup(&manifest.manifest_key(), &root.join("out")).await.unwrap();
+        assert_eq!(
+            std::fs::read(root.join("out/branch-schemas/tenant/preview.json")).unwrap(),
+            b"schema"
+        );
+        assert!(!root.join("out/preview.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn archive_rejects_unsafe_relative_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-paths-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let archiver = Archiver::new(LocalStore::new(root.clone()));
+        for name in ["../escape", "nested/../../escape", "/absolute", "nested\\escape"] {
+            let result =
+                archiver.archive_files("unsafe", 1, vec![(String::from(name), Vec::new())]).await;
+            assert!(matches!(result, Err(RymeError::InvalidArgument(_))), "{name}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -44,9 +44,12 @@ Response shape: `{ "commit": <u64>, "files": [<names>] }`. Snapshots are the
 unit that gets shipped to the archive and the unit you copy back for
 single-node disaster recovery.
 
-Archives also include `schema.json`, which stores SQL table and index
-definitions. On restore, the server rebuilds secondary-index entries from the
-committed rows.
+Archives include the SQL and control-plane metadata files: `schema.json`,
+`branches.json`, `control.json`, `topics.json`, and `auth.json`. Branch schema
+snapshots are stored under `branch-schemas/<tenant>/<branch>.json`. Restore
+preserves those relative paths, so branch definitions and branch-only tables
+survive a disaster-recovery restore alongside the committed rows. The server
+rebuilds secondary-index entries from the committed rows.
 
 ## Archive
 

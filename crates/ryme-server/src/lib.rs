@@ -1219,9 +1219,7 @@ impl SharedState {
                 .to_string();
             files.push((snapshot_name, snapshot_bytes));
         }
-        if let Ok(schema) = std::fs::read(self.data_dir.join("schema.json")) {
-            files.push((String::from("schema.json"), schema));
-        }
+        files.extend(archive_metadata_files(&self.data_dir)?);
         let log_dirs: Vec<(String, std::path::PathBuf)> = match &self.backend {
             Backend::Single(_) => vec![(String::from("wal-"), self.wal_dir.clone())],
             Backend::Cluster(_) => vec![(String::from("raft-"), self.data_dir.join("raft"))],
@@ -6719,6 +6717,49 @@ fn wal_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std::path:
     Ok(out)
 }
 
+fn archive_metadata_files(
+    data_dir: &std::path::Path,
+) -> ryme_error::Result<Vec<(String, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for name in ["schema.json", "branches.json", "control.json", "topics.json", "auth.json"] {
+        let path = data_dir.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => files.push((String::from(name), bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let root = data_dir.join("branch-schemas");
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(data_dir)
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("archive path")))?;
+            let name = relative.to_string_lossy().replace('\\', "/");
+            files.push((name, std::fs::read(path)?));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
 async fn snapshot_backend_files(
     state: &SharedState,
 ) -> ryme_error::Result<Vec<(u64, std::path::PathBuf)>> {
@@ -6801,6 +6842,30 @@ fn archive_target(
 #[cfg(test)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn archive_metadata_includes_branch_schema_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-archive-metadata-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("branch-schemas/tenant/preview")).unwrap();
+        std::fs::write(dir.join("schema.json"), b"main-schema").unwrap();
+        std::fs::write(dir.join("branches.json"), b"branches").unwrap();
+        std::fs::write(dir.join("branch-schemas/tenant/preview/schema.json"), b"branch-schema")
+            .unwrap();
+
+        let files = archive_metadata_files(&dir).unwrap();
+        let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["branch-schemas/tenant/preview/schema.json", "branches.json", "schema.json"]
+        );
+        assert_eq!(files[0].1, b"branch-schema".to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn realtime_snapshot_filters_rls_rows_across_pages() {
