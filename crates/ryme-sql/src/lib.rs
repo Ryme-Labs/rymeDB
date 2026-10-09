@@ -29,6 +29,12 @@ pub enum Statement {
         values: Vec<InsertValue>,
         upsert: bool,
     },
+    InsertRows {
+        table: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<InsertValue>>,
+        upsert: bool,
+    },
     Upsert {
         table: String,
         pk: Vec<u8>,
@@ -134,6 +140,7 @@ impl Statement {
             self,
             Statement::Insert { .. }
                 | Statement::InsertRow { .. }
+                | Statement::InsertRows { .. }
                 | Statement::Upsert { .. }
                 | Statement::Update { .. }
                 | Statement::UpdateRow { .. }
@@ -281,6 +288,7 @@ impl Statement {
             | Self::CreateIndex { table, .. }
             | Self::Insert { table, .. }
             | Self::InsertRow { table, .. }
+            | Self::InsertRows { table, .. }
             | Self::Upsert { table, .. }
             | Self::SelectByKey { table, .. }
             | Self::SelectScan { table, .. }
@@ -577,9 +585,13 @@ fn split_assignment(input: &str) -> Option<(&str, &str)> {
 
 fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     let table = table_after(tokens, "INTO")?;
-    if let Some((columns, values)) = parse_standard_insert_row(raw)? {
+    if let Some((columns, rows)) = parse_standard_insert_rows(raw)? {
         let upsert = tokens.iter().any(|token| token.eq_ignore_ascii_case("CONFLICT"));
-        return Ok(Statement::InsertRow { table, columns, values, upsert });
+        if rows.len() == 1 {
+            let values = rows.into_iter().next().unwrap_or_default();
+            return Ok(Statement::InsertRow { table, columns, values, upsert });
+        }
+        return Ok(Statement::InsertRows { table, columns, rows, upsert });
     }
     let (pk, value) = if let Some(values) =
         tokens.iter().position(|token| token.eq_ignore_ascii_case("VALUES"))
@@ -601,7 +613,7 @@ fn parse_insert(tokens: &[String], raw: &str) -> Result<Statement> {
     Ok(Statement::Insert { table, pk, value })
 }
 
-fn parse_standard_insert_row(raw: &str) -> Result<Option<(Vec<String>, Vec<InsertValue>)>> {
+fn parse_standard_insert_rows(raw: &str) -> Result<Option<(Vec<String>, Vec<Vec<InsertValue>>)>> {
     let upper = raw.to_ascii_uppercase();
     let Some(values_keyword) = upper.find("VALUES") else {
         return Ok(None);
@@ -625,23 +637,46 @@ fn parse_standard_insert_row(raw: &str) -> Result<Option<(Vec<String>, Vec<Inser
     }
 
     let values_clause = &raw[values_keyword + "VALUES".len()..];
-    let Some(values_open) = values_clause.find('(') else {
-        return Err(RymeError::InvalidArgument(String::from("insert values")));
-    };
-    let Some(values_close) = matching_paren(values_clause, values_open) else {
-        return Err(RymeError::InvalidArgument(String::from("insert values")));
-    };
-    if values_close <= values_open {
+    let mut rows = Vec::new();
+    let mut cursor = values_clause
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(index, _)| index)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("insert values")))?;
+    loop {
+        if values_clause.as_bytes().get(cursor) != Some(&b'(') {
+            break;
+        }
+        let values_close = matching_paren(values_clause, cursor)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("insert values")))?;
+        if values_close <= cursor {
+            return Err(RymeError::InvalidArgument(String::from("insert values")));
+        }
+        let values = split_sql_items(&values_clause[cursor + 1..values_close])
+            .into_iter()
+            .map(|value| parse_insert_value(value.trim()))
+            .collect::<Result<Vec<_>>>()?;
+        if columns.len() != values.len() {
+            return Err(RymeError::InvalidArgument(String::from("insert column/value count")));
+        }
+        rows.push(values);
+        cursor = values_close + 1;
+        while values_clause.as_bytes().get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if values_clause.as_bytes().get(cursor) == Some(&b',') {
+            cursor += 1;
+            while values_clause.as_bytes().get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    if rows.is_empty() {
         return Err(RymeError::InvalidArgument(String::from("insert values")));
     }
-    let values = split_sql_items(&values_clause[values_open + 1..values_close])
-        .into_iter()
-        .map(|value| parse_insert_value(value.trim()))
-        .collect::<Result<Vec<_>>>()?;
-    if columns.len() != values.len() {
-        return Err(RymeError::InvalidArgument(String::from("insert column/value count")));
-    }
-    Ok(Some((columns, values)))
+    Ok(Some((columns, rows)))
 }
 
 fn matching_paren(input: &str, open: usize) -> Option<usize> {
@@ -1248,6 +1283,13 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::Insert { table, .. } => format!("write insert({table}) point"),
         Statement::InsertRow { table, upsert, .. } => {
             format!("write {}({table}) row", if *upsert { "upsert" } else { "insert" })
+        }
+        Statement::InsertRows { table, rows, upsert, .. } => {
+            format!(
+                "write {}({table}) rows {}",
+                if *upsert { "upsert" } else { "insert" },
+                rows.len()
+            )
         }
         Statement::Upsert { table, .. } => format!("write upsert({table}) point"),
         Statement::SelectByKey { table, .. } => {
@@ -2129,6 +2171,12 @@ where
                 };
                 Box::pin(self.execute_in_transaction_base(txn, statement)).await
             }
+            Statement::InsertRows { table, columns, rows, upsert } => {
+                let changes = self
+                    .execute_insert_rows_in_transaction(txn, table, columns, rows, upsert)
+                    .await?;
+                Ok((QueryResult::Ok, changes))
+            }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -2221,6 +2269,65 @@ where
         }
     }
 
+    async fn execute_insert_rows_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        table: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<InsertValue>>,
+        upsert: bool,
+    ) -> Result<Vec<TransactionChange>> {
+        let mut changes = Vec::new();
+        for values in rows {
+            let (pk, value) = self.materialize_insert_row(&table, columns.clone(), values)?;
+            let statement = if upsert {
+                Statement::Upsert { table: table.clone(), pk, value }
+            } else {
+                Statement::Insert { table: table.clone(), pk, value }
+            };
+            let (_, mut row_changes) =
+                Box::pin(self.execute_in_transaction_base(txn, statement)).await?;
+            changes.append(&mut row_changes);
+        }
+        Ok(changes)
+    }
+
+    async fn execute_returning_rows_in_transaction(
+        &self,
+        txn: &mut Transaction,
+        table: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<InsertValue>>,
+        upsert: bool,
+        fields: &[Field],
+    ) -> Result<(QueryResult, Vec<TransactionChange>)> {
+        let result_columns = fields
+            .iter()
+            .map(|field| match field {
+                Field::Key => String::from("id"),
+                Field::Value => String::from("value"),
+            })
+            .collect();
+        let mut result_rows = Vec::new();
+        let mut changes = Vec::new();
+        for values in rows {
+            let (pk, value) = self.materialize_insert_row(&table, columns.clone(), values)?;
+            let statement = if upsert {
+                Statement::Upsert { table: table.clone(), pk: pk.clone(), value: value.clone() }
+            } else {
+                Statement::Insert { table: table.clone(), pk: pk.clone(), value: value.clone() }
+            };
+            let (_, mut row_changes) =
+                Box::pin(self.execute_in_transaction_base(txn, statement)).await?;
+            changes.append(&mut row_changes);
+            let QueryResult::Returning { rows, .. } = returning_result(fields, pk, value) else {
+                unreachable!("returning result always contains rows");
+            };
+            result_rows.extend(rows);
+        }
+        Ok((QueryResult::Returning { columns: result_columns, rows: result_rows }, changes))
+    }
+
     async fn execute_returning_in_transaction(
         &self,
         txn: &mut Transaction,
@@ -2236,6 +2343,12 @@ where
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_returning_in_transaction(txn, statement, fields)).await
+            }
+            Statement::InsertRows { table, columns, rows, upsert } => {
+                self.execute_returning_rows_in_transaction(
+                    txn, table, columns, rows, upsert, &fields,
+                )
+                .await
             }
             Statement::Insert { table, pk, value } => {
                 let pk_for_result = pk.clone();
@@ -2544,6 +2657,16 @@ where
                 };
                 Box::pin(self.execute_returning(statement, fields, isolation)).await
             }
+            Statement::InsertRows { table, columns, rows, upsert } => {
+                let mut txn = self.manager.begin_with(isolation);
+                let (result, changes) = self
+                    .execute_returning_rows_in_transaction(
+                        &mut txn, table, columns, rows, upsert, &fields,
+                    )
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(result)
+            }
             Statement::Insert { table, pk, value } => {
                 let pk_for_result = pk.clone();
                 let value_for_result = value.clone();
@@ -2620,6 +2743,15 @@ where
                     Statement::Insert { table, pk, value }
                 };
                 Box::pin(self.execute_with_base(statement, isolation)).await
+            }
+            Statement::InsertRows { table, columns, rows, upsert } => {
+                self.reject_if_read_only()?;
+                let mut txn = self.manager.begin_with(isolation);
+                let changes = self
+                    .execute_insert_rows_in_transaction(&mut txn, table, columns, rows, upsert)
+                    .await?;
+                self.commit_transaction(txn, changes).await?;
+                Ok(QueryResult::Ok)
             }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
@@ -3147,6 +3279,38 @@ mod tests {
             .unwrap();
         assert!(matches!(result, QueryResult::Table { ref rows, .. }
             if rows == &vec![vec![b"after".to_vec()]]));
+    }
+
+    #[tokio::test]
+    async fn multi_row_insert_is_atomic() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE batch (id TEXT PRIMARY KEY, payload TEXT NOT NULL)").unwrap(),
+            )
+            .await
+            .unwrap();
+        let statement =
+            parse("INSERT INTO batch (id, payload) VALUES ('a', 'one'), ('b', 'two')").unwrap();
+        assert!(matches!(statement, Statement::InsertRows { ref rows, .. } if rows.len() == 2));
+        executor.execute(statement).await.unwrap();
+
+        let failed = executor
+            .execute(
+                parse("INSERT INTO batch (id, payload) VALUES ('c', 'three'), ('a', 'duplicate')")
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(failed, Err(RymeError::Conflict(_))));
+        let result = executor
+            .execute(parse("SELECT id, payload FROM batch ORDER BY id ASC").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Table { ref rows, .. }
+        if rows == &vec![
+            vec![b"a".to_vec(), b"one".to_vec()],
+            vec![b"b".to_vec(), b"two".to_vec()]
+        ]));
     }
 
     #[tokio::test]
