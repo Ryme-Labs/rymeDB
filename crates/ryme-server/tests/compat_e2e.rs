@@ -214,7 +214,9 @@ async fn compat_rest_graphql_copy_explain() {
         http_request_headers(http, "GET /rest/v1/people?limit=1", Some("count=exact"), b"").await;
     assert_eq!(status, 200);
     assert_eq!(serde_json::from_slice::<Vec<serde_json::Value>>(&body).unwrap().len(), 1);
-    assert!(headers.to_ascii_lowercase().contains("content-range: 0-0/5"), "{headers}");
+    let headers = headers.to_ascii_lowercase();
+    assert!(headers.contains("content-range: 0-0/5"), "{headers}");
+    assert!(headers.contains("access-control-expose-headers: content-range"), "{headers}");
     let (status, body) =
         http_request(http, "PATCH /rest/v1/people?id=eq.p1", br#"{"status":"away"}"#).await;
     assert_eq!(status, 200);

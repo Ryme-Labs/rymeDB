@@ -12,6 +12,8 @@ All notable changes to rymeDB are recorded here. Format follows
   return CORS headers for authenticated npm/browser clients.
 - All HTTP API paths now answer browser preflights, including auth, presence,
   broadcast, vector, topic, and branch endpoints.
+- Browser clients can read REST pagination totals through exposed
+  `Content-Range` and `Range-Unit` headers; `x-api-key` is accepted in preflights.
 
 - Java, npm, and Rust SDKs now expose matching JSON REST insert/upsert,
   filtered update, and filtered delete helpers.

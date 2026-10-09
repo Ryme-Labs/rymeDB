@@ -1550,8 +1550,12 @@ fn apply_cors_headers(response: &mut Response, origin: Option<&HeaderValue>) {
     response.headers_mut().insert(
         "access-control-allow-headers",
         HeaderValue::from_static(
-            "authorization, content-type, apikey, x-client-info, prefer, x-ryme-branch",
+            "authorization, content-type, apikey, x-api-key, x-client-info, prefer, x-ryme-branch",
         ),
+    );
+    response.headers_mut().insert(
+        "access-control-expose-headers",
+        HeaderValue::from_static("content-range, range-unit, content-type"),
     );
     response.headers_mut().insert("access-control-max-age", HeaderValue::from_static("600"));
 }
