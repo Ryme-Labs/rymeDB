@@ -783,6 +783,8 @@ pub struct RestWriteBody {
     pub key: Option<String>,
     pub value: Option<serde_json::Value>,
     pub rows: Option<Vec<CopyRow>>,
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2682,6 +2684,23 @@ fn rest_list_filtered(rows: Vec<(Vec<u8>, Vec<u8>)>, raw: &str) -> Vec<(Vec<u8>,
     filter_rows_by_query(rows, raw)
 }
 
+fn rest_matching_keys(
+    gateway: &Gateway<BranchStorage>,
+    principal: &Principal,
+    table: &str,
+    raw: &str,
+) -> ryme_error::Result<Vec<Vec<u8>>> {
+    let mut cursor = None;
+    let mut keys = Vec::new();
+    loop {
+        let (page, next) = gateway.scan_page(principal, table, cursor.as_deref(), 256)?;
+        keys.extend(rest_list_filtered(page, raw).into_iter().map(|(key, _)| key));
+        let Some(next_cursor) = next else { break };
+        cursor = Some(next_cursor);
+    }
+    Ok(keys)
+}
+
 async fn rest_list(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -3037,9 +3056,71 @@ async fn rest_upsert(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Path(table): Path<String>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    rest_insert(State(state), headers, Path(table), body).await
+    let parsed: RestWriteBody = match json_body(&body) {
+        Ok(body) => body,
+        Err(e) => return error_response(e),
+    };
+    if parsed.fields.is_empty() {
+        return rest_insert(State(state), headers, Path(table), body).await;
+    }
+
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
+    if !principal.can_write() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
+    if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
+        return error_response(e);
+    }
+    let gateway = match branch_gateway(&state, &headers, &principal.tenant) {
+        Ok(gateway) => gateway,
+        Err(e) => return error_response(e),
+    };
+    let raw = raw.unwrap_or_default();
+    let keys = match rest_matching_keys(&gateway, &principal, &table, &raw) {
+        Ok(keys) => keys,
+        Err(e) => return error_response(e),
+    };
+    let mut updated = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(current) = (match gateway.get(&principal, &table, &key) {
+            Ok(current) => current,
+            Err(e) => return error_response(e),
+        }) else {
+            continue;
+        };
+        let Some(mut object) = serde_json::from_slice::<serde_json::Value>(&current)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        else {
+            return error_response(ryme_error::RymeError::InvalidArgument(String::from(
+                "PATCH requires JSON object rows",
+            )));
+        };
+        object.extend(parsed.fields.clone());
+        let value = match serde_json::to_vec(&serde_json::Value::Object(object)) {
+            Ok(value) => value,
+            Err(e) => return error_response(ryme_error::RymeError::InvalidArgument(e.to_string())),
+        };
+        if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
+            return error_response(e);
+        }
+        match gateway.put(&principal, &table, key.clone(), value.clone()).await {
+            Ok(commit) => {
+                record_meter(&state, Metric::WriteUnit, 1);
+                note_range_write(&state, &range_routing_key(&table, &key), 1);
+                updated.push(rest_row_to_json(&key, &value));
+                let _ = commit;
+            }
+            Err(e) => return error_response(e),
+        }
+    }
+    (StatusCode::OK, Json(updated)).into_response()
 }
 
 async fn rest_delete(
@@ -3105,6 +3186,17 @@ fn rest_body_rows(body: &RestWriteBody) -> Vec<(Vec<u8>, Vec<u8>)> {
                 other => other.to_string().into_bytes(),
             };
             vec![(key.into_bytes(), bytes)]
+        }
+        _ if !body.fields.is_empty() => {
+            let key = body
+                .fields
+                .get("key")
+                .or_else(|| body.fields.get("id"))
+                .and_then(serde_json::Value::as_str);
+            let Some(key) = key else { return Vec::new() };
+            let value = serde_json::to_vec(&serde_json::Value::Object(body.fields.clone()))
+                .unwrap_or_default();
+            vec![(key.as_bytes().to_vec(), value)]
         }
         _ => Vec::new(),
     }

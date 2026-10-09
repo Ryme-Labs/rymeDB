@@ -1037,12 +1037,14 @@ paths:
           $ref: '#/components/responses/Forbidden'
     patch:
       tags: [rest]
-      description: Upsert one row or a rows array.
+      description: Upsert key/value rows or partially update JSON object rows selected by PostgREST filters.
       parameters:
         - $ref: '#/components/parameters/TableParam'
       responses:
         '201':
           description: upserted rows
+        '200':
+          description: updated rows
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':

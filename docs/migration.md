@@ -53,6 +53,9 @@ REST: `GET /rest/v1/:table?select=&key=eq.<id>&order=key.desc&limit=&offset=`,
 with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is`, `like`, `ilike`, and
 `not.<operator>` filters plus field projection/aliases,
 `POST /rest/v1/:table` with `{key, value}` or `{rows: [...]}`,
+or a JSON object with an `id`/`key` field,
+`PATCH /rest/v1/:table?<field>=eq.<value>` with a JSON object for filtered
+partial updates,
 `DELETE /rest/v1/:table?key=eq.<id>`.
 Filtered reads continue across storage pages, and non-key `order` clauses
 scan the complete filtered result before sorting.

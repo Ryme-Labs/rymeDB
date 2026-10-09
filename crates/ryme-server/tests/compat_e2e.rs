@@ -139,6 +139,21 @@ async fn compat_rest_graphql_copy_explain() {
         http_request(http, "POST /rest/v1/docs", b"{\"key\":\"k3\",\"value\":\"v3\"}").await;
     assert_eq!(status, 201);
     let (status, body) =
+        http_request(http, "POST /rest/v1/people", br#"{"id":"p1","name":"Ada","status":"ready"}"#)
+            .await;
+    assert_eq!(status, 201);
+    assert!(String::from_utf8_lossy(&body).contains(r#""name":"Ada""#));
+    let (status, body) =
+        http_request(http, "PATCH /rest/v1/people?id=eq.p1", br#"{"status":"away"}"#).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains(r#""status":"away""#));
+    let (status, body) =
+        http_request(http, "GET /rest/v1/people?select=key,name,status&id=eq.p1", b"").await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains(r#""name":"Ada""#), "{text}");
+    assert!(text.contains(r#""status":"away""#), "{text}");
+    let (status, body) =
         http_request(http, "POST /graphql", b"{\"query\":\"{ docs(key: \\\"k1\\\") }\"}").await;
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&body).contains("k1"));

@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- REST writes now accept ordinary JSON objects for Supabase-style inserts and
+  filtered PATCH requests merge partial fields into existing JSON rows.
+
 - PostgREST filtering now advances through ordered storage pages, so matching
   rows beyond the first page are not lost; non-key ordering scans the complete
   filtered result before sorting.
