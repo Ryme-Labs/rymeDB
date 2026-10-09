@@ -363,6 +363,44 @@ async fn supabase_realtime_protocol_joins_heartbeats_and_broadcasts() {
     stream
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::json!({
+                "topic": "realtime:database-changes",
+                "event": "phx_join",
+                "payload": { "config": { "postgres_changes": [{
+                    "event": "INSERT",
+                    "schema": "public",
+                    "table": "messages",
+                    "filter": "value=eq.hello"
+                }] } },
+                "ref": "changes-1",
+                "join_ref": "changes-1"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let changes_joined = next_text(&mut stream).await;
+    assert_eq!(changes_joined["event"], "phx_reply");
+    assert_eq!(changes_joined["payload"]["status"], "ok");
+    assert_eq!(changes_joined["payload"]["response"]["postgres_changes"][0]["table"], "messages");
+    let changes_system = next_text(&mut stream).await;
+    assert_eq!(changes_system["event"], "system");
+    assert_eq!(changes_system["payload"]["extension"], "postgres_changes");
+
+    let (status, _) = http_request(http, "PUT /v1/kv/messages/m1", b"hello").await;
+    assert_eq!(status, 200);
+    let change = next_text(&mut stream).await;
+    assert_eq!(change["event"], "postgres_changes");
+    assert_eq!(change["payload"]["data"]["type"], "INSERT");
+    assert_eq!(change["payload"]["data"]["table"], "messages");
+    assert_eq!(change["payload"]["data"]["record"]["value"], "hello");
+    assert_eq!(
+        change["payload"]["ids"][0],
+        changes_joined["payload"]["response"]["postgres_changes"][0]["id"]
+    );
+
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
                 "topic": "realtime:room",
                 "event": "broadcast",
                 "payload": { "event": "chat", "payload": { "text": "hello" } },

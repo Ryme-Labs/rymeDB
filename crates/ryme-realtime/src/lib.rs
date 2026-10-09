@@ -57,6 +57,7 @@ pub struct QueryUpdate {
 #[derive(Debug, Clone)]
 pub struct Realtime {
     inner: Arc<Mutex<RealtimeInner>>,
+    changes: broadcast::Sender<ChangeRecord>,
     table_topics: Arc<Vec<Mutex<TableTopicShard>>>,
     broadcast_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>>>,
     presence_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>>>,
@@ -158,11 +159,13 @@ pub struct NewChange {
 impl Realtime {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.clamp(16, 100000);
+        let (changes, _) = broadcast::channel(capacity);
         Self {
             inner: Arc::new(Mutex::new(RealtimeInner {
                 presence: HashMap::new(),
                 durable: HashMap::new(),
             })),
+            changes,
             table_topics: Arc::new(
                 (0..TABLE_TOPIC_SHARDS).map(|_| Mutex::new(TableTopicShard::default())).collect(),
             ),
@@ -253,6 +256,7 @@ impl Realtime {
         let sender =
             topics.topics.entry(key.clone()).or_insert_with(|| broadcast::channel(self.capacity).0);
         let _ = sender.send(record.clone());
+        let _ = self.changes.send(record.clone());
         let log = topics.history.entry(key).or_default();
         while log.len() >= self.capacity {
             log.pop_front();
@@ -289,6 +293,9 @@ impl Realtime {
         branch: &str,
         table: &str,
     ) -> bool {
+        if self.changes.receiver_count() > 0 {
+            return true;
+        }
         let key = branch_topic_key(tenant, database, branch, table);
         let shard = self.table_topic_shard(&key);
         self.table_topics
@@ -325,6 +332,12 @@ impl Realtime {
             return receiver;
         };
         topics.topics.entry(key).or_insert_with(|| broadcast::channel(self.capacity).0).subscribe()
+    }
+
+    /// Subscribe to every committed change. Consumers should filter by
+    /// tenant, database, branch, table, and policy before exposing records.
+    pub fn subscribe_all_changes(&self) -> broadcast::Receiver<ChangeRecord> {
+        self.changes.subscribe()
     }
 
     pub fn replay(

@@ -27,6 +27,7 @@ use ryme_sql::{bind, parse, Executor, QueryResult, Statement};
 use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -4886,6 +4887,7 @@ async fn supabase_realtime_stream(
     let realtime = state.realtime.clone();
     let qos = state.qos.clone();
     let tenant = principal.tenant.clone();
+    let database = state.database.clone();
     let sender = principal.id.clone();
     let can_publish = principal.can_publish();
     upgrade.on_upgrade(move |socket| async move {
@@ -4896,6 +4898,7 @@ async fn supabase_realtime_stream(
             realtime,
             qos,
             tenant,
+            database,
             sender,
             can_publish,
             array_protocol,
@@ -4981,6 +4984,32 @@ struct SupabaseFrame {
     payload: serde_json::Value,
 }
 
+static NEXT_SUPABASE_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+struct SupabaseChangeSubscription {
+    id: u64,
+    event: String,
+    schema: String,
+    table: Option<String>,
+    filter: Option<String>,
+    select: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+enum SupabaseRealtimeEvent {
+    Broadcast(String, ryme_realtime::BroadcastMsg),
+    Change(String, SupabaseChangeSubscription, ryme_realtime::ChangeRecord),
+}
+
+#[derive(Debug)]
+struct SupabaseChannelState {
+    broadcast_task: tokio::task::JoinHandle<()>,
+    postgres_tasks: Vec<tokio::task::JoinHandle<()>>,
+    ack: bool,
+    include_self: bool,
+}
+
 fn parse_supabase_frame(value: serde_json::Value) -> Option<(SupabaseFrame, bool)> {
     if let serde_json::Value::Array(values) = value {
         if values.len() != 5 {
@@ -5052,11 +5081,268 @@ fn supabase_reply(
     )
 }
 
+fn supabase_subscription_config(
+    payload: &serde_json::Value,
+) -> Result<Vec<SupabaseChangeSubscription>, String> {
+    let Some(value) = payload.pointer("/config/postgres_changes") else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(String::from("postgres_changes must be an array"));
+    };
+    let mut subscriptions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            return Err(String::from("postgres_changes entry must be an object"));
+        };
+        let event = object
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("*")
+            .to_ascii_uppercase();
+        if !matches!(event.as_str(), "*" | "INSERT" | "UPDATE" | "DELETE") {
+            return Err(String::from("postgres_changes event"));
+        }
+        let schema = object
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("public")
+            .to_string();
+        if !schema.eq_ignore_ascii_case("public") {
+            return Err(String::from("only public schema is supported"));
+        }
+        let table = object
+            .get("table")
+            .and_then(serde_json::Value::as_str)
+            .filter(|table| !table.is_empty())
+            .map(String::from);
+        let filter = object.get("filter").and_then(serde_json::Value::as_str).map(String::from);
+        let select = object.get("select").map(|value| {
+            value
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        let id = NEXT_SUPABASE_SUBSCRIPTION_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        subscriptions.push(SupabaseChangeSubscription { id, event, schema, table, filter, select });
+    }
+    Ok(subscriptions)
+}
+
+fn supabase_json_value(record: &ryme_realtime::ChangeRecord, after: bool) -> serde_json::Value {
+    let raw = if after { record.after.as_deref() } else { record.before.as_deref() };
+    let Some(raw) = raw else { return serde_json::Value::Object(serde_json::Map::new()) };
+    if let Ok(value) = serde_json::from_slice(raw) {
+        return value;
+    }
+    serde_json::json!({
+        "id": String::from_utf8_lossy(&record.pk),
+        "value": String::from_utf8_lossy(raw),
+    })
+}
+
+fn supabase_column_value(
+    record: &ryme_realtime::ChangeRecord,
+    value: &serde_json::Value,
+    column: &str,
+) -> serde_json::Value {
+    if column.eq_ignore_ascii_case("id")
+        || column.eq_ignore_ascii_case("key")
+        || column.eq_ignore_ascii_case("pk")
+    {
+        return serde_json::Value::String(String::from_utf8_lossy(&record.pk).into_owned());
+    }
+    if column.eq_ignore_ascii_case("value") || column.eq_ignore_ascii_case("data") {
+        if let Some(value) = value.as_object().and_then(|object| object.get(column)).cloned() {
+            return value;
+        }
+    }
+    value
+        .as_object()
+        .and_then(|object| {
+            object
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                .map(|(_, value)| value.clone())
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn supabase_filter_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Null => String::from("null"),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn supabase_filter_matches(
+    filter: Option<&str>,
+    record: &ryme_realtime::ChangeRecord,
+    value: &serde_json::Value,
+) -> bool {
+    let Some(filter) = filter else { return true };
+    rest_compound_filters(filter).into_iter().all(|condition| {
+        let Some((column, expression)) = condition.split_once('=') else { return false };
+        let (negated, expression) = expression
+            .strip_prefix("not.")
+            .map_or((false, expression), |expression| (true, expression));
+        let Some((operator, expected)) = expression.split_once('.') else { return false };
+        let actual = supabase_column_value(record, value, column.trim());
+        let actual_text = supabase_filter_text(&actual);
+        let expected = expected.trim();
+        let matches = match operator.to_ascii_lowercase().as_str() {
+            "eq" => actual_text == expected,
+            "neq" => actual_text != expected,
+            "is" => match expected.to_ascii_lowercase().as_str() {
+                "null" => actual.is_null(),
+                "true" => actual == serde_json::Value::Bool(true),
+                "false" => actual == serde_json::Value::Bool(false),
+                _ => false,
+            },
+            "in" => expected
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'))
+                .map(|values| values.split(',').any(|value| value.trim() == actual_text))
+                .unwrap_or(false),
+            "like" | "ilike" => {
+                rest_like(&actual_text, expected, operator.eq_ignore_ascii_case("ilike"))
+            }
+            "match" | "imatch" => {
+                rest_like(&actual_text, expected, operator.eq_ignore_ascii_case("imatch"))
+            }
+            "gt" | "gte" | "lt" | "lte" => {
+                let actual_number = actual_text.parse::<f64>().ok();
+                let expected_number = expected.parse::<f64>().ok();
+                match (actual_number, expected_number, operator.to_ascii_lowercase().as_str()) {
+                    (Some(actual), Some(expected), "gt") => actual > expected,
+                    (Some(actual), Some(expected), "gte") => actual >= expected,
+                    (Some(actual), Some(expected), "lt") => actual < expected,
+                    (Some(actual), Some(expected), "lte") => actual <= expected,
+                    _ => false,
+                }
+            }
+            "isdistinct" => actual_text != expected,
+            _ => false,
+        };
+        if negated {
+            !matches
+        } else {
+            matches
+        }
+    })
+}
+
+fn supabase_project_value(
+    value: serde_json::Value,
+    select: Option<&[String]>,
+) -> serde_json::Value {
+    let Some(select) = select else { return value };
+    let serde_json::Value::Object(object) = value else { return value };
+    let mut projected = serde_json::Map::new();
+    for column in select {
+        if let Some((name, value)) =
+            object.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))
+        {
+            projected.insert(name.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(projected)
+}
+
+fn supabase_column_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "int8",
+        serde_json::Value::Number(_) => "float8",
+        serde_json::Value::Array(_) => "jsonb",
+        serde_json::Value::Object(_) => "jsonb",
+        serde_json::Value::Null | serde_json::Value::String(_) => "text",
+    }
+}
+
+fn supabase_columns(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    value
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .map(|(name, value)| serde_json::json!({ "name": name, "type": supabase_column_type(value) }))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn supabase_change_payload(
+    subscription: &SupabaseChangeSubscription,
+    record: &ryme_realtime::ChangeRecord,
+) -> serde_json::Value {
+    let before =
+        supabase_project_value(supabase_json_value(record, false), subscription.select.as_deref());
+    let after =
+        supabase_project_value(supabase_json_value(record, true), subscription.select.as_deref());
+    let record_value = if matches!(record.op, ryme_realtime::Operation::Delete) {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        after.clone()
+    };
+    let old_record = if matches!(record.op, ryme_realtime::Operation::Insert) {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        before.clone()
+    };
+    let event = match record.op {
+        ryme_realtime::Operation::Insert => "INSERT",
+        ryme_realtime::Operation::Update => "UPDATE",
+        ryme_realtime::Operation::Delete => "DELETE",
+    };
+    serde_json::json!({
+        "ids": [subscription.id],
+        "data": {
+            "schema": subscription.schema,
+            "table": record.table,
+            "commit_timestamp": record.commit_ts.to_string(),
+            "type": event,
+            "columns": supabase_columns(&record_value),
+            "record": record_value,
+            "old_record": old_record,
+            "errors": serde_json::Value::Null,
+        }
+    })
+}
+
+fn supabase_change_matches(
+    subscription: &SupabaseChangeSubscription,
+    record: &ryme_realtime::ChangeRecord,
+) -> bool {
+    let event = match record.op {
+        ryme_realtime::Operation::Insert => "INSERT",
+        ryme_realtime::Operation::Update => "UPDATE",
+        ryme_realtime::Operation::Delete => "DELETE",
+    };
+    if subscription.event != "*" && subscription.event != event {
+        return false;
+    }
+    if subscription.table.as_deref().is_some_and(|table| table != record.table) {
+        return false;
+    }
+    let value = supabase_json_value(record, !matches!(record.op, ryme_realtime::Operation::Delete));
+    supabase_filter_matches(subscription.filter.as_deref(), record, &value)
+}
+
 fn spawn_supabase_broadcast_forwarder(
     realtime: &Realtime,
     tenant: &str,
     topic: &str,
-    events: &tokio::sync::mpsc::Sender<(String, ryme_realtime::BroadcastMsg)>,
+    events: &tokio::sync::mpsc::Sender<SupabaseRealtimeEvent>,
 ) -> tokio::task::JoinHandle<()> {
     let channel = topic.strip_prefix("realtime:").unwrap_or(topic).to_string();
     let mut receiver = realtime.broadcast_subscribe(tenant, &channel);
@@ -5066,10 +5352,59 @@ fn spawn_supabase_broadcast_forwarder(
         loop {
             match receiver.recv().await {
                 Ok(record) => {
-                    if events.try_send((topic.clone(), record)).is_err() {
+                    if events
+                        .try_send(SupabaseRealtimeEvent::Broadcast(topic.clone(), record))
+                        .is_err()
+                    {
                         break;
                     }
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+fn spawn_supabase_change_forwarder(
+    realtime: &Realtime,
+    tenant: &str,
+    database: &str,
+    branch: &str,
+    topic: &str,
+    subscription: SupabaseChangeSubscription,
+    events: &tokio::sync::mpsc::Sender<SupabaseRealtimeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let mut receiver = match subscription.table.as_deref() {
+        Some(table) => realtime.subscribe_branch(tenant, database, branch, table),
+        None => realtime.subscribe_all_changes(),
+    };
+    let tenant = tenant.to_string();
+    let database = database.to_string();
+    let branch = branch.to_string();
+    let topic = topic.to_string();
+    let events = events.clone();
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(record)
+                    if record.tenant == tenant
+                        && record.database == database
+                        && record.branch == branch
+                        && supabase_change_matches(&subscription, &record) =>
+                {
+                    if events
+                        .try_send(SupabaseRealtimeEvent::Change(
+                            topic.clone(),
+                            subscription.clone(),
+                            record,
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
                 | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -5083,17 +5418,16 @@ async fn forward_supabase_realtime(
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
     tenant: String,
+    database: String,
     sender: String,
     can_publish: bool,
     array_protocol: bool,
 ) {
     let (sink, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sink);
-    let (events, mut event_queue) = tokio::sync::mpsc::channel::<(
-        String,
-        ryme_realtime::BroadcastMsg,
-    )>(REALTIME_OUTGOING_QUEUE_CAPACITY);
-    let mut channels: HashMap<String, (tokio::task::JoinHandle<()>, bool, bool)> = HashMap::new();
+    let (events, mut event_queue) =
+        tokio::sync::mpsc::channel::<SupabaseRealtimeEvent>(REALTIME_OUTGOING_QUEUE_CAPACITY);
+    let mut channels: HashMap<String, SupabaseChannelState> = HashMap::new();
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
     heartbeat.tick().await;
     loop {
@@ -5104,35 +5438,57 @@ async fn forward_supabase_realtime(
                 }
             }
             event = event_queue.recv(), if !channels.is_empty() => {
-                let Some((topic, record)) = event else { break };
-                let Some((_, _, include_self)) = channels.get(&topic) else { continue };
-                if !*include_self && record.from == sender {
-                    continue;
-                }
-                let (event_name, payload) = match record.payload {
-                    serde_json::Value::Object(mut payload) => {
-                        let event_name = payload.remove("event")
-                            .and_then(|value| value.as_str().map(String::from))
-                            .unwrap_or_else(|| String::from("message"));
-                        let payload = payload.remove("payload").unwrap_or(serde_json::Value::Object(payload));
-                        (event_name, payload)
+                let Some(event) = event else { break };
+                let (_, text) = match event {
+                    SupabaseRealtimeEvent::Broadcast(topic, record) => {
+                        let Some(channel) = channels.get(&topic) else { continue };
+                        if !channel.include_self && record.from == sender {
+                            continue;
+                        }
+                        let (event_name, payload) = match record.payload {
+                            serde_json::Value::Object(mut payload) => {
+                                let event_name = payload.remove("event")
+                                    .and_then(|value| value.as_str().map(String::from))
+                                    .unwrap_or_else(|| String::from("message"));
+                                let payload = payload.remove("payload").unwrap_or(serde_json::Value::Object(payload));
+                                (event_name, payload)
+                            }
+                            payload => (String::from("message"), payload),
+                        };
+                        let text = encode_supabase_frame(
+                            &SupabaseFrame {
+                                join_ref: None,
+                                reference: None,
+                                topic: topic.clone(),
+                                event: String::from("broadcast"),
+                                payload: serde_json::json!({
+                                    "event": event_name,
+                                    "payload": payload,
+                                    "type": "broadcast",
+                                }),
+                            },
+                            array_protocol,
+                        );
+                        (topic, text)
                     }
-                    payload => (String::from("message"), payload),
+                    SupabaseRealtimeEvent::Change(topic, subscription, record) => {
+                        let Some(channel) = channels.get(&topic) else { continue };
+                        if channel.postgres_tasks.is_empty() {
+                            continue;
+                        }
+                        let text = encode_supabase_frame(
+                            &SupabaseFrame {
+                                join_ref: None,
+                                reference: None,
+                                topic: topic.clone(),
+                                event: String::from("postgres_changes"),
+                                payload: supabase_change_payload(&subscription, &record),
+                            },
+                            array_protocol,
+                        );
+                        (topic, text)
+                    }
                 };
-                let text = encode_supabase_frame(
-                    &SupabaseFrame {
-                        join_ref: None,
-                        reference: None,
-                        topic,
-                        event: String::from("broadcast"),
-                        payload: serde_json::json!({
-                            "event": event_name,
-                            "payload": payload,
-                            "type": "broadcast",
-                        }),
-                    },
-                    array_protocol,
-                );
                 if !stream_realtime_event(&qos, &tenant, text.len() as u64)
                     || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
                     break;
@@ -5163,21 +5519,87 @@ async fn forward_supabase_realtime(
                             if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
                             continue;
                         }
-                        if let Some((task, _, _)) = channels.remove(&frame.topic) {
-                            task.abort();
+                        if let Some(channel) = channels.remove(&frame.topic) {
+                            channel.broadcast_task.abort();
+                            for task in channel.postgres_tasks {
+                                task.abort();
+                            }
                         }
                         let ack = frame.payload.pointer("/config/broadcast/ack")
                             .and_then(serde_json::Value::as_bool).unwrap_or(false);
                         let include_self = frame.payload.pointer("/config/broadcast/self")
                             .and_then(serde_json::Value::as_bool).unwrap_or(false);
                         let task = spawn_supabase_broadcast_forwarder(&realtime, &tenant, &frame.topic, &events);
-                        channels.insert(frame.topic.clone(), (task, ack, include_self));
-                        let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
+                        let subscriptions = match supabase_subscription_config(&frame.payload) {
+                            Ok(subscriptions) => subscriptions,
+                            Err(reason) => {
+                                task.abort();
+                                let reply = supabase_reply(
+                                    &frame,
+                                    "error",
+                                    serde_json::json!({ "reason": reason }),
+                                    array_protocol,
+                                );
+                                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                                continue;
+                            }
+                        };
+                        let postgres_tasks = subscriptions
+                            .iter()
+                            .cloned()
+                            .map(|subscription| {
+                                spawn_supabase_change_forwarder(
+                                    &realtime,
+                                    &tenant,
+                                    &database,
+                                    "main",
+                                    &frame.topic,
+                                    subscription,
+                                    &events,
+                                )
+                            })
+                            .collect();
+                        channels.insert(frame.topic.clone(), SupabaseChannelState {
+                            broadcast_task: task,
+                            postgres_tasks,
+                            ack,
+                            include_self,
+                        });
+                        let response = serde_json::json!({
+                            "postgres_changes": subscriptions.iter().map(|subscription| serde_json::json!({
+                                "id": subscription.id,
+                                "event": subscription.event,
+                                "schema": subscription.schema,
+                                "table": subscription.table,
+                            })).collect::<Vec<_>>()
+                        });
+                        let reply = supabase_reply(&frame, "ok", response, array_protocol);
                         if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                        if !subscriptions.is_empty() {
+                            let system = encode_supabase_frame(
+                                &SupabaseFrame {
+                                    join_ref: None,
+                                    reference: None,
+                                    topic: frame.topic.clone(),
+                                    event: String::from("system"),
+                                    payload: serde_json::json!({
+                                        "message": "Subscribed to PostgreSQL",
+                                        "status": "ok",
+                                        "extension": "postgres_changes",
+                                        "channel": "main",
+                                    }),
+                                },
+                                array_protocol,
+                            );
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(system)) { break; }
+                        }
                     }
                     "phx_leave" => {
-                        if let Some((task, _, _)) = channels.remove(&frame.topic) {
-                            task.abort();
+                        if let Some(channel) = channels.remove(&frame.topic) {
+                            channel.broadcast_task.abort();
+                            for task in channel.postgres_tasks {
+                                task.abort();
+                            }
                         }
                         let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
                         if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
@@ -5206,7 +5628,7 @@ async fn forward_supabase_realtime(
                             channel.to_string(),
                             serde_json::json!({ "event": event_name, "payload": payload }),
                         ).await;
-                        if channels.get(&frame.topic).is_some_and(|(_, ack, _)| *ack) {
+                        if channels.get(&frame.topic).is_some_and(|channel| channel.ack) {
                             let (status, response) = match published {
                                 Ok(sequence) => ("ok", serde_json::json!({ "sequence": sequence })),
                                 Err(error) => ("error", serde_json::json!({ "reason": error.to_string() })),
@@ -5220,8 +5642,11 @@ async fn forward_supabase_realtime(
             }
         }
     }
-    for (task, _, _) in channels.into_values() {
-        task.abort();
+    for channel in channels.into_values() {
+        channel.broadcast_task.abort();
+        for task in channel.postgres_tasks {
+            task.abort();
+        }
     }
 }
 

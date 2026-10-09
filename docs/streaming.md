@@ -121,14 +121,31 @@ behavior as the other realtime endpoints.
 ## Supabase Realtime protocol compatibility
 
 `/realtime/v1/websocket?apikey=<key>&vsn=1.0.0` accepts the Phoenix-style
-Supabase Realtime channel protocol for broadcast workloads. Join a topic such
-as `realtime:room` with `phx_join`, send `broadcast` events, leave with
-`phx_leave`, and answer connection heartbeats on the `phoenix` topic. The
-server sends `phx_reply` acknowledgements when requested by the join
-configuration and forwards broadcast frames to every joined tenant-scoped
-channel. `vsn=2.0.0` uses the array frame form; the default `1.0.0` uses JSON
-objects. Database-change and presence events remain available through the
-native endpoints above while this compatibility surface is expanded.
+Supabase Realtime channel protocol. Join a topic such as `realtime:room` with
+`phx_join`, send `broadcast` events, leave with `phx_leave`, and answer
+connection heartbeats on the `phoenix` topic. The server sends `phx_reply`
+acknowledgements and tenant-scoped broadcast frames. `vsn=2.0.0` uses the
+array frame form; the default `1.0.0` uses JSON objects.
+
+Join payloads can also include Supabase `postgres_changes` subscriptions:
+
+```json
+{
+  "config": {
+    "postgres_changes": [
+      {"event":"INSERT", "schema":"public", "table":"messages", "filter":"room_id=eq.42"}
+    ]
+  }
+}
+```
+
+Committed table changes are delivered as `postgres_changes` frames with
+subscription IDs, `record`/`old_record`, columns, and event metadata. `*`,
+`INSERT`, `UPDATE`, and `DELETE` subscriptions are supported, along with
+common `eq`, `neq`, comparison, `in`, `like`/`ilike`, `is`, and negated
+filters. RLS is evaluated before a change is exposed. Presence remains
+available through the native endpoint above while the compatibility surface
+continues to expand.
 
 In cluster mode, presence joins and leaves must reach the current Raft leader.
 The leader fans each mutation over the live gateway mesh, and all gateways use
