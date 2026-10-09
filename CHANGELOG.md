@@ -8,6 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- PostgreSQL `pg_catalog.pg_proc` and `pg_catalog.pg_trigger` now expose
+  persisted function and trigger metadata for ORM and migration introspection.
 - Common PostgreSQL `CREATE OR REPLACE FUNCTION` and `CREATE TRIGGER` schema
   declarations are now persisted with snapshots. `BEFORE` row triggers that
   assign `NEW.<column>` from `now()`, `CURRENT_TIMESTAMP`, or

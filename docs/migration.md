@@ -63,6 +63,8 @@ policy command follow PostgreSQL default-deny behavior.
 Policy metadata is available through `pg_catalog.pg_policies`, including the
 policy name, command, `USING`, and `WITH CHECK` expressions used by migration
 verification and ORM introspection.
+Persisted function and trigger metadata is also available through
+`pg_catalog.pg_proc` and `pg_catalog.pg_trigger`.
 Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
 persisted in schema snapshots. `BEFORE` row triggers that assign
 `NEW.column = now()` (or the equivalent current-timestamp expressions) are
@@ -162,7 +164,7 @@ common `CREATE OR REPLACE FUNCTION` and `CREATE TRIGGER` declarations with
 timestamp assignments to `NEW` rows,
 and `DROP TRIGGER IF EXISTS name ON table`,
 with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
-(`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, `pg_index`, and `pg_policies`),
+(`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, `pg_index`, `pg_policies`, `pg_proc`, and `pg_trigger`),
 and indexed equality lookup,
 `SELECT * FROM t KEY 'k'`, `SELECT * FROM t LIMIT n`, `UPDATE`, `DELETE`,
 predicate mutations such as `UPDATE t SET status = 'ready' WHERE id = '...'`

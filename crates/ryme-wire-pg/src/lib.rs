@@ -1110,6 +1110,10 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
             "indexes"
         } else if upper.contains("PG_CATALOG.PG_POLICIES") || upper.contains("PG_POLICIES") {
             "policies"
+        } else if upper.contains("PG_CATALOG.PG_PROC") || upper.contains("PG_PROC") {
+            "functions"
+        } else if upper.contains("PG_CATALOG.PG_TRIGGER") || upper.contains("PG_TRIGGER") {
+            "triggers"
         } else if upper.contains("PG_CATALOG.PG_NAMESPACE") {
             "namespaces"
         } else if upper.contains("PG_CATALOG.PG_CLASS") {
@@ -1129,6 +1133,8 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
         "tables" => vec![String::from("table_name")],
         "indexes" => vec![String::from("indexname")],
         "policies" => vec![String::from("policyname")],
+        "functions" => vec![String::from("proname")],
+        "triggers" => vec![String::from("tgname")],
         "namespaces" => vec![String::from("nspname")],
         "classes" => vec![String::from("relname")],
         "types" => vec![String::from("typname")],
@@ -1160,6 +1166,27 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("cmd"),
                 String::from("qual"),
                 String::from("with_check"),
+            ],
+            "functions" => vec![
+                String::from("oid"),
+                String::from("proname"),
+                String::from("pronamespace"),
+                String::from("proowner"),
+                String::from("prolang"),
+                String::from("prokind"),
+                String::from("prorettype"),
+                String::from("pronargs"),
+                String::from("prosrc"),
+                String::from("probin"),
+            ],
+            "triggers" => vec![
+                String::from("oid"),
+                String::from("tgrelid"),
+                String::from("tgname"),
+                String::from("tgfoid"),
+                String::from("tgtype"),
+                String::from("tgenabled"),
+                String::from("tgisinternal"),
             ],
             "namespaces" => vec![
                 String::from("oid"),
@@ -1537,6 +1564,90 @@ where
                             || SQL_NULL_SENTINEL.to_vec(),
                             |value| value.as_bytes().to_vec(),
                         ),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_PROC") || upper.contains("PG_PROC") {
+        let predicates =
+            upper.find(" WHERE ").map(|index| &query[index + " WHERE ".len()..]).unwrap_or(query);
+        let name_filter = sql_literal_after(predicates, "PRONAME");
+        let rows: Vec<Vec<Vec<u8>>> = executor
+            .schema_snapshot()
+            .functions
+            .into_values()
+            .filter(|function| name_filter.as_ref().is_none_or(|want| want == &function.name))
+            .map(|function| {
+                let oid = catalog_oid(&format!("function:{}", function.name));
+                let language = catalog_oid(&format!("language:{}", function.language));
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => oid.to_string().into_bytes(),
+                        "proname" => function.name.as_bytes().to_vec(),
+                        "pronamespace" => b"2200".to_vec(),
+                        "proowner" => b"10".to_vec(),
+                        "prolang" => language.to_string().into_bytes(),
+                        "prokind" => b"f".to_vec(),
+                        "prorettype" => b"2279".to_vec(),
+                        "pronargs" => b"0".to_vec(),
+                        "prosrc" => function.body.as_bytes().to_vec(),
+                        "probin" => Vec::new(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+
+    if upper.contains("PG_CATALOG.PG_TRIGGER") || upper.contains("PG_TRIGGER") {
+        let predicates =
+            upper.find(" WHERE ").map(|index| &query[index + " WHERE ".len()..]).unwrap_or(query);
+        let name_filter = sql_literal_after(predicates, "TGNAME");
+        let table_filter = sql_literal_after(predicates, "TGRELID");
+        let rows: Vec<Vec<Vec<u8>>> = executor
+            .schema_snapshot()
+            .triggers
+            .into_values()
+            .filter(|trigger| name_filter.as_ref().is_none_or(|want| want == &trigger.name))
+            .filter(|trigger| {
+                table_filter.as_ref().is_none_or(|want| {
+                    let relation = catalog_relation_oid(&trigger.table).to_string();
+                    want == &trigger.table || want == &relation
+                })
+            })
+            .map(|trigger| {
+                let oid = catalog_oid(&format!("trigger:{}\0{}", trigger.table, trigger.name));
+                let relation_oid = catalog_relation_oid(&trigger.table);
+                let function_oid = catalog_oid(&format!("function:{}", trigger.function));
+                let mut trigger_type = 1u32;
+                if trigger.timing.eq_ignore_ascii_case("BEFORE") {
+                    trigger_type |= 2;
+                }
+                for event in &trigger.events {
+                    trigger_type |= match event.as_str() {
+                        "INSERT" => 4,
+                        "DELETE" => 8,
+                        "UPDATE" => 16,
+                        "TRUNCATE" => 32,
+                        _ => 0,
+                    };
+                }
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "oid" => oid.to_string().into_bytes(),
+                        "tgrelid" => relation_oid.to_string().into_bytes(),
+                        "tgname" => trigger.name.as_bytes().to_vec(),
+                        "tgfoid" => function_oid.to_string().into_bytes(),
+                        "tgtype" => trigger_type.to_string().into_bytes(),
+                        "tgenabled" => b"O".to_vec(),
+                        "tgisinternal" => b"f".to_vec(),
                         _ => Vec::new(),
                     })
                     .collect()
@@ -2821,7 +2932,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ryme_sql::{RlsPolicy, SchemaSnapshot};
+    use ryme_sql::{FunctionDefinition, RlsPolicy, SchemaSnapshot, TriggerDefinition};
 
     #[test]
     fn split_statements_respects_quotes() {
@@ -2970,6 +3081,53 @@ mod tests {
         assert!(response.windows(b"SELECT".len()).any(|window| window == b"SELECT"));
         let null = (-1i32).to_be_bytes();
         assert!(response.windows(null.len()).any(|window| window == null));
+    }
+
+    #[test]
+    fn catalogs_expose_persisted_functions_and_triggers() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.functions.insert(
+            String::from("set_updated_at"),
+            FunctionDefinition {
+                name: String::from("set_updated_at"),
+                body: String::from("BEGIN NEW.updated_at = now(); RETURN NEW; END;"),
+                language: String::from("plpgsql"),
+            },
+        );
+        snapshot.triggers.insert(
+            String::from("profiles\0set_updated_at"),
+            TriggerDefinition {
+                name: String::from("set_updated_at"),
+                table: String::from("profiles"),
+                timing: String::from("BEFORE"),
+                events: vec![String::from("UPDATE")],
+                function: String::from("set_updated_at"),
+            },
+        );
+        executor.restore_schema_snapshot(snapshot).unwrap();
+
+        let functions = catalog_query(
+            "SELECT proname, prosrc FROM pg_catalog.pg_proc WHERE proname = 'set_updated_at'",
+            &executor,
+        )
+        .unwrap();
+        assert!(functions
+            .windows(b"set_updated_at".len())
+            .any(|window| window == b"set_updated_at"));
+        assert!(functions
+            .windows(b"NEW.updated_at = now()".len())
+            .any(|window| window == b"NEW.updated_at = now()"));
+
+        let triggers = catalog_query(
+            "SELECT tgname, tgtype FROM pg_catalog.pg_trigger WHERE tgname = 'set_updated_at'",
+            &executor,
+        )
+        .unwrap();
+        assert!(triggers
+            .windows(b"set_updated_at".len())
+            .any(|window| window == b"set_updated_at"));
+        assert!(triggers.windows(b"19".len()).any(|window| window == b"19"));
     }
 
     #[test]
