@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +54,91 @@ impl RealtimeSubscription {
             .close(None)
             .await
             .map_err(|error| ClientError::WebSocket(error.to_string()))
+    }
+}
+
+/// A table subscription that reconnects and resumes from the last received sequence.
+pub struct ResumableRealtimeSubscription {
+    client: RymeClient,
+    table: String,
+    branch: Option<String>,
+    from: Option<u64>,
+    cursor: Option<u64>,
+    stream: Option<RealtimeSubscription>,
+    reconnect_delay: Duration,
+    closed: bool,
+}
+
+impl ResumableRealtimeSubscription {
+    const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+    const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+    const MAX_RECONNECT_ATTEMPTS: usize = 8;
+
+    /// Receive the next change, reconnecting with an exact sequence cursor if needed.
+    pub async fn recv(&mut self) -> Result<Option<String>, ClientError> {
+        let mut attempts = 0;
+        loop {
+            if self.closed {
+                return Ok(None);
+            }
+            let result = match self.stream.as_mut() {
+                Some(stream) => stream.recv().await,
+                None => Err(ClientError::WebSocket(String::from("subscription is closed"))),
+            };
+            match result {
+                Ok(Some(text)) => {
+                    self.update_cursor(&text);
+                    return Ok(Some(text));
+                }
+                Ok(None) | Err(_) => {}
+            }
+            self.stream.take();
+            if self.closed {
+                return Ok(None);
+            }
+            attempts += 1;
+            if attempts > Self::MAX_RECONNECT_ATTEMPTS {
+                return Err(ClientError::WebSocket(String::from("realtime stream closed")));
+            }
+            tokio::time::sleep(self.reconnect_delay).await;
+            if self.closed {
+                return Ok(None);
+            }
+            match self
+                .client
+                .subscribe_table(&self.table, self.branch.as_deref(), self.from, self.cursor)
+                .await
+            {
+                Ok(stream) => {
+                    self.stream = Some(stream);
+                    self.reconnect_delay = Self::INITIAL_RECONNECT_DELAY;
+                    attempts = 0;
+                }
+                Err(error) => {
+                    if attempts >= Self::MAX_RECONNECT_ATTEMPTS {
+                        return Err(error);
+                    }
+                    self.reconnect_delay =
+                        (self.reconnect_delay * 2).min(Self::MAX_RECONNECT_DELAY);
+                }
+            }
+        }
+    }
+
+    fn update_cursor(&mut self, text: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return };
+        let Some(sequence) = value.get("sequence").and_then(serde_json::Value::as_u64) else {
+            return;
+        };
+        self.cursor = Some(self.cursor.map_or(sequence, |current| current.max(sequence)));
+    }
+
+    pub async fn close(mut self) -> Result<(), ClientError> {
+        self.closed = true;
+        match self.stream.take() {
+            Some(stream) => stream.close().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -150,6 +236,27 @@ impl RymeClient {
             params.push((String::from("from_sequence"), sequence.to_string()));
         }
         self.subscribe("/v1/stream", params).await
+    }
+
+    /// Open a table stream that automatically resumes after a disconnect.
+    pub async fn subscribe_table_resumable(
+        &self,
+        table: &str,
+        branch: Option<&str>,
+        from: Option<u64>,
+        from_sequence: Option<u64>,
+    ) -> Result<ResumableRealtimeSubscription, ClientError> {
+        let stream = self.subscribe_table(table, branch, from, from_sequence).await?;
+        Ok(ResumableRealtimeSubscription {
+            client: self.clone(),
+            table: table.to_string(),
+            branch: branch.map(str::to_string),
+            from,
+            cursor: from_sequence,
+            stream: Some(stream),
+            reconnect_delay: ResumableRealtimeSubscription::INITIAL_RECONNECT_DELAY,
+            closed: false,
+        })
     }
 
     pub async fn subscribe_broadcast(
@@ -902,6 +1009,23 @@ mod tests {
             .unwrap();
         assert_eq!(url.scheme(), "wss");
         assert_eq!(url.as_str(), "wss://db.example.test/v1/stream?table=room+messages&from_sequence=7&api_key=key%2F1");
+    }
+
+    #[test]
+    fn resumable_subscription_keeps_the_highest_sequence() {
+        let mut subscription = ResumableRealtimeSubscription {
+            client: RymeClient::new(String::from("http://db.example.test"), String::new()),
+            table: String::from("docs"),
+            branch: None,
+            from: None,
+            cursor: Some(4),
+            stream: None,
+            reconnect_delay: ResumableRealtimeSubscription::INITIAL_RECONNECT_DELAY,
+            closed: false,
+        };
+        subscription.update_cursor(r#"{"sequence":9}"#);
+        subscription.update_cursor(r#"{"sequence":3}"#);
+        assert_eq!(subscription.cursor, Some(9));
     }
 
     #[tokio::test]

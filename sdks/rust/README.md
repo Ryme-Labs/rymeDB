@@ -27,5 +27,9 @@ while let Some(frame) = stream.recv().await? {
 }
 ```
 
+For automatic reconnects with exact sequence-based replay, use
+`subscribe_table_resumable`. Its `recv` method keeps retrying with bounded
+backoff until the subscription is closed or the retry limit is reached.
+
 `subscribe_query` and `subscribe_broadcast` are also available. HTTP and
 WebSocket URLs automatically switch from `http`/`https` to `ws`/`wss`.

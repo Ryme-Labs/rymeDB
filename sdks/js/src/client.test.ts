@@ -317,6 +317,31 @@ describe("RymeHttpClient", () => {
     close();
   });
 
+  it("resumes table streams from the latest sequence after disconnect", async () => {
+    const first = `{"tenant":"t","database":"d","branch":"main","table":"docs","op":"INSERT","pk":[49],"before":null,"after":[50],"commit_ts":7,"tx_id":7,"sequence":1}`;
+    const second = `{"tenant":"t","database":"d","branch":"main","table":"docs","op":"INSERT","pk":[51],"before":null,"after":[52],"commit_ts":8,"tx_id":8,"sequence":2}`;
+    const { server, requests, close } = wsStub([first], {
+      closeAfterFrames: true,
+      reconnectFrames: [second],
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const received: ChangeRecordLike[] = [];
+    const sub = subscribeTable(
+      `http://127.0.0.1:${port}`,
+      "docs",
+      (record) => received.push(record),
+      { reconnectDelayMs: 10 },
+    );
+    await sub.ready;
+    await waitFor(() => received.length === 2);
+    sub.close();
+    assert.equal(requests[0], "/v1/stream?table=docs");
+    assert.equal(requests[1], "/v1/stream?table=docs&from_sequence=1");
+    assert.equal(received[1]?.sequence, 2);
+    close();
+  });
+
   it("streams query snapshots and updates over websocket", async () => {
     const frames = [
       `{"type":"snapshot","commit":7,"rows":[{"pk":"k1","value":"one"}]}`,
@@ -345,9 +370,17 @@ describe("RymeHttpClient", () => {
   });
 });
 
-function wsStub(frames: string[]) {
+interface ChangeRecordLike {
+  sequence: number;
+}
+
+function wsStub(
+  frames: string[],
+  options: { closeAfterFrames?: boolean; reconnectFrames?: string[] } = {},
+) {
   const requests: string[] = [];
   const sockets = new Set<Socket>();
+  let connection = 0;
   const server = createTcpServer((socket: Socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -372,11 +405,13 @@ function wsStub(frames: string[]) {
           `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
       );
       upgraded = true;
-      for (const frame of frames) {
+      const outgoing = connection++ === 0 ? frames : (options.reconnectFrames ?? frames);
+      for (const frame of outgoing) {
         const payload = Buffer.from(frame, "utf8");
         const header = Buffer.from([0x81, payload.length]);
         socket.write(Buffer.concat([header, payload]));
       }
+      if (options.closeAfterFrames) setImmediate(() => socket.end());
     });
   });
   return {

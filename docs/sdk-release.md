@@ -32,3 +32,6 @@ manual run can set the `publish` input when a tag is not being pushed.
 
 The Pages builder and release workflow fail if `sdks/` contains anything other
 than `java`, `js` (npm), and `rust`, keeping the supported SDK surface explicit.
+
+The realtime SDK guides are generated into the Pages site from those three
+README files, including the sequence-based reconnect APIs for table streams.

@@ -40,8 +40,9 @@ Notes:
 - `subscribeQuery(base, table, onMessage, { limit?, branch?, apiKey? })` tails
   `/v1/query-stream`: first a `snapshot` message, then `update` messages.
 - `subscribeTable(base, table, onMessage, { apiKey?, branch?, from? })` tails
-  `/v1/stream`; pass the last seen `commit_ts` as `from` to replay missed
-  changes, then continue live.
+  `/v1/stream`; subscriptions reconnect by default and resume from the latest
+  received `sequence`. Set `reconnect: false` for one-shot behavior or tune
+  the bounded retry delay with `reconnectDelayMs`.
 - `subscribeBroadcast(base, channel, onMessage, { apiKey? })` tails
   `/v1/broadcast/<channel>` for ephemeral channel messages.
 - `slowLog(limit?, table?)` and `traces(limit?, name?, table?)` narrow the

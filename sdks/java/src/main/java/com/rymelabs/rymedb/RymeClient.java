@@ -14,7 +14,14 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -25,6 +32,13 @@ import java.util.stream.Collectors;
  * SDK. The client uses {@link HttpClient} and is safe to reuse across threads.
  */
 public final class RymeClient {
+    private static final ScheduledExecutorService REALTIME_RECONNECTOR =
+            Executors.newScheduledThreadPool(1, runnable -> {
+                Thread thread = new Thread(runnable, "rymedb-realtime-reconnect");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private static final Pattern SEQUENCE_FIELD = Pattern.compile("\\\"sequence\\\"\\s*:\\s*(\\d+)");
     private final String base;
     private final String apiKey;
     private final HttpClient http;
@@ -363,6 +377,18 @@ public final class RymeClient {
         return subscribe("/v1/stream", params, onMessage);
     }
 
+    /** Subscribe to a table and resume from the last sequence after a disconnect. */
+    public CompletableFuture<RealtimeSubscription> subscribeTableResumable(
+            String table, Consumer<String> onMessage) {
+        return subscribeTableResumable(table, null, null, null, onMessage);
+    }
+
+    /** Subscribe to a table with branch/replay options and automatic sequence-based reconnects. */
+    public CompletableFuture<RealtimeSubscription> subscribeTableResumable(
+            String table, String branch, Long from, Long fromSequence, Consumer<String> onMessage) {
+        return new RealtimeSubscription(table, branch, from, fromSequence, onMessage).start();
+    }
+
     /** Subscribe to ephemeral broadcast frames for one channel. */
     public CompletableFuture<WebSocket> subscribeBroadcast(String channel, Consumer<String> onMessage) {
         return subscribe("/v1/broadcast/" + segment(channel), List.of(), onMessage);
@@ -408,6 +434,135 @@ public final class RymeClient {
                 webSocket.abort();
             }
         });
+    }
+
+    /** A reconnecting table subscription. Call {@link #close()} to stop retries. */
+    public final class RealtimeSubscription implements AutoCloseable {
+        private final String table;
+        private final String branch;
+        private final Long from;
+        private final Consumer<String> onMessage;
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private final AtomicBoolean reconnectScheduled = new AtomicBoolean();
+        private final AtomicBoolean everConnected = new AtomicBoolean();
+        private final AtomicLong generation = new AtomicLong();
+        private final CompletableFuture<RealtimeSubscription> ready = new CompletableFuture<>();
+        private volatile Long cursor;
+        private volatile WebSocket current;
+        private volatile long reconnectDelayMillis = 250;
+
+        private RealtimeSubscription(String table, String branch, Long from, Long fromSequence,
+                                     Consumer<String> onMessage) {
+            this.table = Objects.requireNonNull(table, "table");
+            this.branch = branch;
+            this.from = from;
+            this.cursor = fromSequence;
+            this.onMessage = Objects.requireNonNull(onMessage, "onMessage");
+        }
+
+        private CompletableFuture<RealtimeSubscription> start() {
+            connect();
+            return ready;
+        }
+
+        private List<String> params() {
+            List<String> params = new ArrayList<>();
+            params.add("table=" + encode(table));
+            if (branch != null) params.add("branch=" + encode(branch));
+            Long currentCursor = cursor;
+            if (currentCursor != null) {
+                params.add("from_sequence=" + currentCursor);
+            } else if (from != null) {
+                params.add("from=" + from);
+            }
+            if (!apiKey.isEmpty()) params.add("api_key=" + encode(apiKey));
+            return params;
+        }
+
+        private void connect() {
+            if (closed.get()) return;
+            long connection = generation.incrementAndGet();
+            String suffix = "?" + String.join("&", params());
+            http.newWebSocketBuilder().buildAsync(websocketUri("/v1/stream" + suffix),
+                    new WebSocket.Listener() {
+                        private final StringBuilder frame = new StringBuilder();
+
+                        @Override
+                        public void onOpen(WebSocket webSocket) {
+                            current = webSocket;
+                            everConnected.set(true);
+                            reconnectDelayMillis = 250;
+                            webSocket.request(1);
+                        }
+
+                        @Override
+                        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data,
+                                                          boolean last) {
+                            frame.append(data);
+                            if (last) {
+                                String text = frame.toString();
+                                frame.setLength(0);
+                                updateCursor(text);
+                                onMessage.accept(text);
+                            }
+                            webSocket.request(1);
+                            return CompletableFuture.completedFuture(null);
+                        }
+
+                        @Override
+                        public void onError(WebSocket webSocket, Throwable error) {
+                            if (generation.get() == connection) scheduleReconnect(connection);
+                        }
+
+                        @Override
+                        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode,
+                                                           String reason) {
+                            if (generation.get() == connection) scheduleReconnect(connection);
+                            return CompletableFuture.completedFuture(null);
+                        }
+                    }).whenComplete((webSocket, error) -> {
+                        if (error != null) {
+                            if (!everConnected.get()) {
+                                ready.completeExceptionally(error);
+                            } else if (generation.get() == connection) {
+                                scheduleReconnect(connection);
+                            }
+                        } else if (!ready.isDone()) {
+                            ready.complete(this);
+                        }
+                    });
+        }
+
+        private void updateCursor(String text) {
+            Matcher matcher = SEQUENCE_FIELD.matcher(text);
+            if (!matcher.find()) return;
+            try {
+                long sequence = Long.parseLong(matcher.group(1));
+                Long currentCursor = cursor;
+                if (currentCursor == null || sequence > currentCursor) cursor = sequence;
+            } catch (NumberFormatException ignored) {
+                // The server emits unsigned 64-bit cursors; an out-of-range value is not resumable.
+            }
+        }
+
+        private void scheduleReconnect(long connection) {
+            if (closed.get() || generation.get() != connection || !everConnected.get()) return;
+            if (!reconnectScheduled.compareAndSet(false, true)) return;
+            long delay = reconnectDelayMillis;
+            reconnectDelayMillis = Math.min(reconnectDelayMillis * 2, 5_000);
+            REALTIME_RECONNECTOR.schedule(() -> {
+                reconnectScheduled.set(false);
+                connect();
+            }, delay, TimeUnit.MILLISECONDS);
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true)) return;
+            generation.incrementAndGet();
+            WebSocket webSocket = current;
+            if (webSocket != null) webSocket.abort();
+        }
     }
 
     public String requestJson(String method, String path, String body) {

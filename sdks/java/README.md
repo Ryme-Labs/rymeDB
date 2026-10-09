@@ -32,3 +32,8 @@ subscription.sendClose(WebSocket.NORMAL_CLOSURE, "done");
 `subscribeTable` accepts `from` and `fromSequence` replay cursors. The same
 client also exposes `subscribeQuery` and `subscribeBroadcast`; callbacks
 receive complete JSON text frames.
+
+For a table subscription that reconnects automatically and advances its
+sequence cursor, use `subscribeTableResumable`. The returned
+`RealtimeSubscription` implements `AutoCloseable` and stops retrying when
+`close()` is called.

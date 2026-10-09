@@ -671,6 +671,8 @@ export interface SubscribeOptions {
   limit?: number;
   from?: number;
   fromSequence?: number;
+  reconnect?: boolean;
+  reconnectDelayMs?: number;
 }
 
 export interface Subscription {
@@ -684,12 +686,20 @@ export function subscribeTable(
   onMessage: (record: ChangeRecord) => void,
   options?: SubscribeOptions,
 ): Subscription {
-  let query = `/v1/stream?table=${encodeURIComponent(table)}`;
-  if (options?.branch !== undefined) query += `&branch=${encodeURIComponent(options.branch)}`;
-  if (options?.from !== undefined) query += `&from=${options.from}`;
-  if (options?.fromSequence !== undefined) query += `&from_sequence=${options.fromSequence}`;
-  return openSocket(base, query, options, (data) => {
-    onMessage(JSON.parse(data) as ChangeRecord);
+  let cursor = options?.fromSequence;
+  const query = () => {
+    let path = `/v1/stream?table=${encodeURIComponent(table)}`;
+    if (options?.branch !== undefined) path += `&branch=${encodeURIComponent(options.branch)}`;
+    if (options?.from !== undefined) path += `&from=${options.from}`;
+    if (cursor !== undefined) path += `&from_sequence=${cursor}`;
+    return path;
+  };
+  return openSocket(base, query, { ...options, reconnect: options?.reconnect ?? true }, (data) => {
+    const record = JSON.parse(data) as ChangeRecord;
+    if (typeof record.sequence === "number" && Number.isSafeInteger(record.sequence)) {
+      cursor = Math.max(cursor ?? 0, record.sequence);
+    }
+    onMessage(record);
   });
 }
 
@@ -721,26 +731,72 @@ export function subscribeQuery(
 
 function openSocket(
   base: string,
-  path: string,
+  path: string | (() => string),
   options: SubscribeOptions | undefined,
   onText: (data: string) => void,
 ): Subscription {
   const key = options?.apiKey ?? process.env["RYME_API_KEY"] ?? "";
-  const sep = path.includes("?") ? "&" : "?";
-  const url = base.replace(/\/$/, "").replace(/^http/, "ws") + path + (key ? `${sep}api_key=${encodeURIComponent(key)}` : "");
-  const socket = new WebSocket(url);
+  const reconnect = options?.reconnect ?? false;
+  const delay = Math.max(10, Math.min(options?.reconnectDelayMs ?? 250, 60_000));
+  const makeUrl = () => {
+    const currentPath = typeof path === "function" ? path() : path;
+    const sep = currentPath.includes("?") ? "&" : "?";
+    return base.replace(/\/$/, "").replace(/^http/, "ws") + currentPath +
+      (key ? `${sep}api_key=${encodeURIComponent(key)}` : "");
+  };
+  let socket: WebSocket | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
+  let connected = false;
+  let generation = 0;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => {
-    socket.addEventListener("open", () => resolve(), { once: true });
-    socket.addEventListener("error", () => reject(new Error(`rymeDB ws ${path} failed`)), {
-      once: true,
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+
+  const scheduleReconnect = () => {
+    if (closed || !reconnect || timer !== undefined) return;
+    timer = setTimeout(() => {
+      timer = undefined;
+      connect();
+    }, delay);
+  };
+
+  const connect = () => {
+    if (closed) return;
+    const currentGeneration = ++generation;
+    const current = new WebSocket(makeUrl());
+    socket = current;
+    current.addEventListener("open", () => {
+      if (currentGeneration !== generation) return;
+      connected = true;
+      resolveReady();
+    }, { once: true });
+    current.addEventListener("error", () => {
+      if (currentGeneration !== generation) return;
+      if (!connected) rejectReady(new Error("rymeDB websocket connection failed"));
+      scheduleReconnect();
     });
-  });
-  socket.addEventListener("message", (event) => {
-    onText(String(event.data));
-  });
+    current.addEventListener("close", () => {
+      if (currentGeneration !== generation) return;
+      scheduleReconnect();
+    });
+    current.addEventListener("message", (event) => {
+      if (currentGeneration === generation) onText(String(event.data));
+    });
+  };
+
+  connect();
   return {
     ready,
-    close: () => socket.close(),
+    close: () => {
+      closed = true;
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      socket?.close();
+    },
   };
 }
 
