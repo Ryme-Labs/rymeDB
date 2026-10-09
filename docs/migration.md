@@ -87,6 +87,7 @@ rows written directly in the branch overlay.
 `CREATE TABLE` (including `IF NOT EXISTS`, column types, single-column and composite
 `PRIMARY KEY` constraints, single-column and composite `UNIQUE` constraints,
 `CHECK`, `FOREIGN KEY ... REFERENCES`, `NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
+`ALTER TABLE ... ADD CONSTRAINT` for `UNIQUE`, `CHECK`, and `FOREIGN KEY ... REFERENCES`,
 `DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability changes
 (including `IF [NOT] EXISTS` where supported), plus
 `DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, and `DROP INDEX [IF EXISTS]`,

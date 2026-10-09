@@ -57,6 +57,10 @@ pub enum Statement {
         column: String,
         alteration: ColumnAlteration,
     },
+    AlterTableAddConstraint {
+        table: String,
+        constraint: TableConstraint,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -198,6 +202,25 @@ pub enum ColumnAlteration {
     DropDefault,
     SetNotNull,
     DropNotNull,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TableConstraint {
+    Unique {
+        #[serde(default)]
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Check {
+        #[serde(default)]
+        name: Option<String>,
+        expression: String,
+    },
+    ForeignKey {
+        #[serde(default)]
+        name: Option<String>,
+        constraint: ForeignKeyConstraint,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,6 +663,7 @@ impl Statement {
             | Self::DropTable { table, .. }
             | Self::TruncateTable { table, .. }
             | Self::AlterTableAddColumn { table, .. }
+            | Self::AlterTableAddConstraint { table, .. }
             | Self::AlterTableDropColumn { table, .. }
             | Self::AlterTableRenameColumn { table, .. }
             | Self::AlterTableColumn { table, .. }
@@ -919,6 +943,14 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .skip(3)
         .find_map(|(position, token)| token.eq_ignore_ascii_case("ADD").then_some(position))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table add")))?;
+    let add_offset = raw
+        .to_ascii_uppercase()
+        .find("ADD")
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table add")))?;
+    let mut definition = raw[add_offset + 3..].trim().trim_end_matches(';').trim().to_string();
+    if let Some(constraint) = parse_alter_table_constraint(&definition)? {
+        return Ok(Statement::AlterTableAddConstraint { table, constraint });
+    }
     let initial_column_pos =
         if tokens.get(add_pos + 1).is_some_and(|token| token.eq_ignore_ascii_case("COLUMN")) {
             add_pos + 2
@@ -937,11 +969,6 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
     let column_name = tokens
         .get(column_pos)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
-    let add_offset = raw
-        .to_ascii_uppercase()
-        .find("ADD")
-        .ok_or_else(|| RymeError::InvalidArgument(String::from("alter table add")))?;
-    let mut definition = raw[add_offset + 3..].trim().trim_end_matches(';').trim().to_string();
     if definition.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("COLUMN")) {
         definition = definition[6..].trim().to_string();
     }
@@ -958,6 +985,68 @@ fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
         .filter(|column| column.name.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("alter column")))?;
     Ok(Statement::AlterTableAddColumn { table, column, if_not_exists })
+}
+
+fn parse_alter_table_constraint(definition: &str) -> Result<Option<TableConstraint>> {
+    let tokens = tokenize(definition);
+    let (name, kind_token) =
+        if tokens.first().is_some_and(|token| token.eq_ignore_ascii_case("CONSTRAINT")) {
+            let name = tokens
+                .get(1)
+                .map(|token| unquote(token))
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("constraint name")))?;
+            (Some(name), tokens.get(2).cloned().unwrap_or_default())
+        } else {
+            (None, tokens.first().cloned().unwrap_or_default())
+        };
+    if kind_token.eq_ignore_ascii_case("CHECK") {
+        let upper = definition.to_ascii_uppercase();
+        let check = upper
+            .find("CHECK")
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("check constraint")))?;
+        let open = definition[check + 5..]
+            .find('(')
+            .map(|offset| check + 5 + offset)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("check constraint")))?;
+        let close = matching_paren(definition, open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("check constraint")))?;
+        let expression = definition[open + 1..close].trim().to_string();
+        if expression.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("check constraint")));
+        }
+        return Ok(Some(TableConstraint::Check { name, expression }));
+    }
+    if kind_token.eq_ignore_ascii_case("UNIQUE") {
+        let upper = definition.to_ascii_uppercase();
+        let unique = upper
+            .find("UNIQUE")
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("unique constraint")))?;
+        let open = definition[unique + 6..]
+            .find('(')
+            .map(|offset| unique + 6 + offset)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("unique constraint")))?;
+        let close = matching_paren(definition, open)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("unique constraint")))?;
+        let columns = split_sql_items(&definition[open + 1..close])
+            .into_iter()
+            .map(|column| unquote(column.trim()))
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("unique constraint")));
+        }
+        return Ok(Some(TableConstraint::Unique { name, columns }));
+    }
+    if kind_token.eq_ignore_ascii_case("FOREIGN") {
+        let foreign = definition
+            .to_ascii_uppercase()
+            .find("FOREIGN")
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("foreign key constraint")))?;
+        let constraint = parse_foreign_key(&definition[foreign..])?
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("foreign key constraint")))?;
+        return Ok(Some(TableConstraint::ForeignKey { name, constraint }));
+    }
+    Ok(None)
 }
 
 fn parse_returning_fields(tokens: &[String]) -> Result<Vec<ReturningField>> {
@@ -2744,6 +2833,9 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::AlterTableAddColumn { table, column, .. } => {
             format!("ddl alter_table({table}) add_column({})", column.name)
         }
+        Statement::AlterTableAddConstraint { table, constraint } => {
+            format!("ddl alter_table({table}) add_constraint({constraint:?})")
+        }
         Statement::AlterTableDropColumn { table, column, .. } => {
             format!("ddl alter_table({table}) drop_column({column})")
         }
@@ -4494,6 +4586,75 @@ where
         }
     }
 
+    fn normalize_foreign_key(
+        &self,
+        table: &str,
+        mut constraint: ForeignKeyConstraint,
+    ) -> Result<ForeignKeyConstraint> {
+        let table_columns = self.catalog_columns(table);
+        if constraint.columns.is_empty()
+            || constraint.columns.iter().any(|column| {
+                !table_columns.iter().any(|definition| definition.name.eq_ignore_ascii_case(column))
+            })
+        {
+            return Err(RymeError::InvalidArgument(String::from("unknown foreign key column")));
+        }
+        constraint.referenced_table =
+            self.canonical_table_name(&constraint.referenced_table).ok_or_else(|| {
+                RymeError::InvalidArgument(format!(
+                    "unknown referenced table {}",
+                    constraint.referenced_table
+                ))
+            })?;
+        let referenced_definitions = self.catalog_columns(&constraint.referenced_table);
+        if constraint.referenced_columns.is_empty() {
+            constraint.referenced_columns = referenced_definitions
+                .iter()
+                .filter(|definition| definition.primary_key)
+                .map(|definition| definition.name.clone())
+                .collect();
+        }
+        if constraint.referenced_columns.len() != constraint.columns.len()
+            || constraint.referenced_columns.iter().any(|column| {
+                !referenced_definitions
+                    .iter()
+                    .any(|definition| definition.name.eq_ignore_ascii_case(column))
+            })
+        {
+            return Err(RymeError::InvalidArgument(String::from("unknown referenced column")));
+        }
+        let references_primary =
+            referenced_columns_are_primary(&constraint.referenced_columns, &referenced_definitions);
+        let references_unique_column = constraint.referenced_columns.len() == 1
+            && referenced_definitions.iter().any(|definition| {
+                definition.name.eq_ignore_ascii_case(&constraint.referenced_columns[0])
+                    && definition.unique
+            });
+        let references_unique_index =
+            self.catalog_indexes(&constraint.referenced_table).iter().any(|index| {
+                if !index.unique {
+                    return false;
+                }
+                if constraint.referenced_columns.len() == 1 && index.columns.is_empty() {
+                    return index.column.as_deref().is_some_and(|indexed| {
+                        indexed.eq_ignore_ascii_case(&constraint.referenced_columns[0])
+                    });
+                }
+                index.columns.len() == constraint.referenced_columns.len()
+                    && index
+                        .columns
+                        .iter()
+                        .zip(&constraint.referenced_columns)
+                        .all(|(indexed, referenced)| indexed.eq_ignore_ascii_case(referenced))
+            });
+        if !references_primary && !references_unique_column && !references_unique_index {
+            return Err(RymeError::InvalidArgument(String::from(
+                "referenced columns are not unique",
+            )));
+        }
+        Ok(constraint)
+    }
+
     fn create_table(
         &self,
         table: String,
@@ -4522,85 +4683,10 @@ where
                 .insert(table.clone(), checks);
         }
         if !foreign_keys.is_empty() {
-            let normalized = (|| -> Result<Vec<ForeignKeyConstraint>> {
-                let mut normalized = Vec::with_capacity(foreign_keys.len());
-                for mut constraint in foreign_keys {
-                    if constraint.columns.is_empty()
-                        || constraint.columns.iter().any(|column| {
-                            !self
-                                .catalog_columns(&table)
-                                .iter()
-                                .any(|definition| definition.name.eq_ignore_ascii_case(column))
-                        })
-                    {
-                        return Err(RymeError::InvalidArgument(String::from(
-                            "unknown foreign key column",
-                        )));
-                    }
-                    constraint.referenced_table = self
-                        .canonical_table_name(&constraint.referenced_table)
-                        .ok_or_else(|| {
-                            RymeError::InvalidArgument(format!(
-                                "unknown referenced table {}",
-                                constraint.referenced_table
-                            ))
-                        })?;
-                    let referenced_definitions = self.catalog_columns(&constraint.referenced_table);
-                    if constraint.referenced_columns.is_empty() {
-                        constraint.referenced_columns = referenced_definitions
-                            .iter()
-                            .filter(|definition| definition.primary_key)
-                            .map(|definition| definition.name.clone())
-                            .collect();
-                    }
-                    if constraint.referenced_columns.len() != constraint.columns.len()
-                        || constraint.referenced_columns.iter().any(|column| {
-                            !referenced_definitions
-                                .iter()
-                                .any(|definition| definition.name.eq_ignore_ascii_case(column))
-                        })
-                    {
-                        return Err(RymeError::InvalidArgument(String::from(
-                            "unknown referenced column",
-                        )));
-                    }
-                    let references_primary = referenced_columns_are_primary(
-                        &constraint.referenced_columns,
-                        &referenced_definitions,
-                    );
-                    let references_unique_column = constraint.referenced_columns.len() == 1
-                        && referenced_definitions.iter().any(|definition| {
-                            definition.name.eq_ignore_ascii_case(&constraint.referenced_columns[0])
-                                && definition.unique
-                        });
-                    let references_unique_index =
-                        self.catalog_indexes(&constraint.referenced_table).iter().any(|index| {
-                            if !index.unique {
-                                return false;
-                            }
-                            if constraint.referenced_columns.len() == 1 && index.columns.is_empty()
-                            {
-                                return index.column.as_deref().is_some_and(|indexed| {
-                                    indexed.eq_ignore_ascii_case(&constraint.referenced_columns[0])
-                                });
-                            }
-                            index.columns.len() == constraint.referenced_columns.len()
-                                && index.columns.iter().zip(&constraint.referenced_columns).all(
-                                    |(indexed, referenced)| {
-                                        indexed.eq_ignore_ascii_case(referenced)
-                                    },
-                                )
-                        });
-                    if !references_primary && !references_unique_column && !references_unique_index
-                    {
-                        return Err(RymeError::InvalidArgument(String::from(
-                            "referenced columns are not unique",
-                        )));
-                    }
-                    normalized.push(constraint);
-                }
-                Ok(normalized)
-            })();
+            let normalized = foreign_keys
+                .into_iter()
+                .map(|constraint| self.normalize_foreign_key(&table, constraint))
+                .collect::<Result<Vec<_>>>();
             let normalized = match normalized {
                 Ok(normalized) => normalized,
                 Err(error) => {
@@ -4640,6 +4726,128 @@ where
             )?;
         }
         Ok(())
+    }
+
+    fn add_unique_constraint(
+        &self,
+        table: String,
+        name: Option<String>,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        let table = self
+            .canonical_table_name(&table)
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        if columns.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("unique constraint")));
+        }
+        let index_name = name.unwrap_or_else(|| format!("{}_{}_unique", table, columns.join("_")));
+        let (field, column, index_columns) = if columns.len() == 1 {
+            (Field::Value, Some(columns[0].clone()), Vec::new())
+        } else {
+            (Field::Value, None, columns)
+        };
+        self.create_index(
+            IndexDefinition {
+                name: index_name,
+                table,
+                field,
+                column,
+                columns: index_columns,
+                unique: true,
+            },
+            false,
+        )
+    }
+
+    fn add_check_constraint(&self, table: String, expression: String) -> Result<()> {
+        let table = self
+            .canonical_table_name(&table)
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        if expression.trim().is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("check constraint")));
+        }
+        parse_filter(&tokenize(&expression))?;
+        {
+            self.checks
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("check constraint lock")))?
+                .entry(table.clone())
+                .or_default()
+                .push(expression.clone());
+        }
+        let result = self
+            .scan_all_rows(&table)?
+            .into_iter()
+            .try_for_each(|(pk, value)| self.enforce_checks(&table, &pk, &value));
+        if let Err(error) = result {
+            if let Ok(mut checks) = self.checks.lock() {
+                if let Some(expressions) = checks.get_mut(&table) {
+                    if expressions.last().is_some_and(|last| last == &expression) {
+                        expressions.pop();
+                    }
+                    if expressions.is_empty() {
+                        checks.remove(&table);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn add_foreign_key_constraint(
+        &self,
+        table: String,
+        constraint: ForeignKeyConstraint,
+    ) -> Result<()> {
+        let table = self
+            .canonical_table_name(&table)
+            .ok_or_else(|| RymeError::NotFound(String::from("table")))?;
+        let constraint = self.normalize_foreign_key(&table, constraint)?;
+        {
+            self.foreign_keys
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+                .entry(table.clone())
+                .or_default()
+                .push(constraint.clone());
+        }
+        let mut txn = self.begin_with(self.isolation);
+        let result = self
+            .scan_all_rows_in_transaction(&mut txn, &table)?
+            .into_iter()
+            .try_for_each(|(pk, value)| self.enforce_foreign_keys(&mut txn, &table, &pk, &value));
+        if let Err(error) = result {
+            if let Ok(mut foreign_keys) = self.foreign_keys.lock() {
+                if let Some(constraints) = foreign_keys.get_mut(&table) {
+                    if constraints.last().is_some_and(|last| last == &constraint) {
+                        constraints.pop();
+                    }
+                    if constraints.is_empty() {
+                        foreign_keys.remove(&table);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn add_table_constraint(&self, table: String, constraint: TableConstraint) -> Result<()> {
+        self.reject_if_read_only()?;
+        match constraint {
+            TableConstraint::Unique { name, columns } => {
+                self.add_unique_constraint(table, name, columns)
+            }
+            TableConstraint::Check { name: _, expression } => {
+                self.add_check_constraint(table, expression)
+            }
+            TableConstraint::ForeignKey { name: _, constraint } => {
+                self.add_foreign_key_constraint(table, constraint)
+            }
+        }
     }
 
     async fn drop_table(&self, table: String, if_exists: bool) -> Result<()> {
@@ -5313,6 +5521,7 @@ where
             Statement::DropIndex { .. } => {}
             Statement::TruncateTable { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
+            Statement::AlterTableAddConstraint { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
             Statement::AlterTableRenameColumn { .. } => {}
             Statement::AlterTableColumn { .. } => {}
@@ -5350,6 +5559,10 @@ where
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
                 self.alter_table_add_column(table, column, if_not_exists).await?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterTableAddConstraint { table, constraint } => {
+                self.add_table_constraint(table, constraint).await?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::AlterTableDropColumn { table, column, if_exists } => {
@@ -5967,6 +6180,7 @@ where
             Statement::DropIndex { .. } => {}
             Statement::TruncateTable { .. } => {}
             Statement::AlterTableAddColumn { .. } => {}
+            Statement::AlterTableAddConstraint { .. } => {}
             Statement::AlterTableDropColumn { .. } => {}
             Statement::AlterTableRenameColumn { .. } => {}
             Statement::AlterTableColumn { .. } => {}
@@ -5980,6 +6194,7 @@ where
                 | Statement::DropTable { .. }
                 | Statement::DropIndex { .. }
                 | Statement::AlterTableAddColumn { .. }
+                | Statement::AlterTableAddConstraint { .. }
                 | Statement::AlterTableDropColumn { .. }
                 | Statement::AlterTableRenameColumn { .. }
                 | Statement::AlterTableColumn { .. }
@@ -6113,6 +6328,10 @@ where
             }
             Statement::AlterTableAddColumn { table, column, if_not_exists } => {
                 self.alter_table_add_column(table, column, if_not_exists).await?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterTableAddConstraint { table, constraint } => {
+                self.add_table_constraint(table, constraint).await?;
                 Ok(QueryResult::Ok)
             }
             Statement::AlterTableDropColumn { table, column, if_exists } => {
@@ -7441,6 +7660,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_alter_table_constraints() {
+        assert!(matches!(
+            parse("ALTER TABLE messages ADD CONSTRAINT messages_user_fk FOREIGN KEY (user_id) REFERENCES users (id)").unwrap(),
+            Statement::AlterTableAddConstraint {
+                constraint: TableConstraint::ForeignKey { name: Some(name), .. },
+                ..
+            } if name == "messages_user_fk"
+        ));
+        assert!(matches!(
+            parse("ALTER TABLE messages ADD CONSTRAINT messages_room_unique UNIQUE (room_id)").unwrap(),
+            Statement::AlterTableAddConstraint {
+                constraint: TableConstraint::Unique { name: Some(name), columns },
+                ..
+            } if name == "messages_room_unique" && columns == vec![String::from("room_id")]
+        ));
+        assert!(matches!(
+            parse("ALTER TABLE messages ADD CHECK (length > 0)").unwrap(),
+            Statement::AlterTableAddConstraint {
+                constraint: TableConstraint::Check { expression, .. },
+                ..
+            } if expression == "length > 0"
+        ));
+    }
+
     #[tokio::test]
     async fn index_ddl_enforces_existence_and_can_remove_index_metadata() {
         let executor = Executor::new(String::from("t"), String::from("d"));
@@ -7701,6 +7945,78 @@ mod tests {
             )
             .await;
         assert!(invalid.is_err());
+    }
+
+    #[tokio::test]
+    async fn alter_table_constraints_validate_existing_and_future_rows() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE users (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT, room_id TEXT, length INTEGER)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor.execute(parse("INSERT INTO users (id) VALUES ('u1')").unwrap()).await.unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, user_id, room_id, length) VALUES ('m1', 'u1', 'room-a', 5)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "ALTER TABLE messages ADD CONSTRAINT messages_user_fk FOREIGN KEY (user_id) REFERENCES users (id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("ALTER TABLE messages ADD CONSTRAINT messages_room_unique UNIQUE (room_id)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("ALTER TABLE messages ADD CONSTRAINT messages_length CHECK (length > 0)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let missing_parent = executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, user_id, room_id, length) VALUES ('m2', 'missing', 'room-b', 5)",
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(missing_parent.is_err());
+        let duplicate_room = executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, user_id, room_id, length) VALUES ('m2', 'u1', 'room-a', 5)",
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(duplicate_room.is_err());
+        let invalid_check = executor
+            .execute(parse("UPDATE messages SET length = 0 WHERE id = 'm1'").unwrap())
+            .await;
+        assert!(invalid_check.is_err());
+        assert_eq!(executor.schema_snapshot().foreign_keys.len(), 1);
+        assert_eq!(executor.schema_snapshot().checks["messages"].len(), 1);
     }
 
     #[tokio::test]
