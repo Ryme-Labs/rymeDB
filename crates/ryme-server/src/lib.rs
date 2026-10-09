@@ -558,6 +558,26 @@ fn load_durable_snapshot(
     Ok(snapshot.topics)
 }
 
+fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::SchemaSnapshot> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ryme_sql::SchemaSnapshot::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("schema snapshot: {error}")))
+}
+
 fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSnapshot> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -992,8 +1012,12 @@ impl SharedState {
             storage.clone(),
         );
         gateway.set_read_only(config.read_only);
+        let schema_path = config.data_dir.join("schema.json");
+        let schema_snapshot = load_schema_snapshot(&schema_path)?;
         let mut executor = Executor::with_backend(tenant.clone(), database.clone(), storage)
             .with_realtime(realtime.clone());
+        executor.restore_schema_snapshot(schema_snapshot)?;
+        executor.set_schema_path(schema_path);
         executor.set_rls_tables(config.rls_tables.clone());
         executor.set_read_only(config.read_only);
         let branch_path = config.data_dir.join("branches.json");
@@ -1186,6 +1210,9 @@ impl SharedState {
                 .ok_or_else(|| ryme_error::RymeError::Internal(String::from("snapshot name")))?
                 .to_string();
             files.push((snapshot_name, snapshot_bytes));
+        }
+        if let Ok(schema) = std::fs::read(self.data_dir.join("schema.json")) {
+            files.push((String::from("schema.json"), schema));
         }
         let log_dirs: Vec<(String, std::path::PathBuf)> = match &self.backend {
             Backend::Single(_) => vec![(String::from("wal-"), self.wal_dir.clone())],
@@ -1590,9 +1617,7 @@ fn spawn_gateways(
     http_listener: TcpListener,
     extra: OptionalListeners,
 ) -> GatewayTasks {
-    let mut pg_executor =
-        Executor::with_backend(state.tenant.clone(), state.database.clone(), state.backend.clone())
-            .with_realtime(state.realtime.clone());
+    let mut pg_executor = state.executor.clone().with_tenant(state.tenant.clone());
     pg_executor.set_rls_tables(state.rls_tables.clone());
     pg_executor.set_read_only(state.read_only);
     let range_hook: ryme_router::RangeLoadHook = if autosplit_writes > 0 {
@@ -2446,7 +2471,7 @@ fn branch_executor(
                 base_commit_ts,
                 storage_epoch,
             );
-            Ok(executor.with_backend_manager(manager).with_branch(branch))
+            Ok(executor.with_isolated_schema(manager).with_branch(branch))
         }
         None => Ok(executor),
     }
@@ -6774,5 +6799,41 @@ mod realtime_policy_tests {
             sequence: 1,
         };
         assert!(!realtime_change_allowed(&policies, "tenant-a", "main", &record));
+    }
+
+    #[tokio::test]
+    async fn sql_schema_snapshot_survives_state_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-schema-restart-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("schema-restart");
+        config.data_dir = dir.clone();
+
+        let state = SharedState::build(&config).unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .executor
+            .execute(ryme_sql::parse("CREATE INDEX messages_body_idx ON messages (body)").unwrap())
+            .await
+            .unwrap();
+        drop(state);
+
+        let restarted = SharedState::build(&config).unwrap();
+        assert_eq!(restarted.executor.catalog_tables(), vec![String::from("messages")]);
+        assert_eq!(restarted.executor.catalog_indexes("messages").len(), 1);
+        let mode = std::fs::metadata(dir.join("schema.json")).unwrap().permissions();
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o077, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,6 +4,8 @@ use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +134,14 @@ pub struct IndexDefinition {
     pub table: String,
     pub field: Field,
     pub unique: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaSnapshot {
+    #[serde(default)]
+    pub tables: BTreeMap<String, Vec<ColumnDefinition>>,
+    #[serde(default)]
+    pub indexes: Vec<IndexDefinition>,
 }
 
 impl Statement {
@@ -1491,6 +1501,9 @@ pub struct Executor<B = TxnManager> {
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
     rls_tables: Arc<HashMap<String, String>>,
+    schema_path: Arc<Mutex<Option<PathBuf>>>,
+    schema_persist_lock: Arc<Mutex<()>>,
+    schema_dirty: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1513,6 +1526,9 @@ impl Executor<TxnManager> {
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
+            schema_path: Arc::new(Mutex::new(None)),
+            schema_persist_lock: Arc::new(Mutex::new(())),
+            schema_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1529,6 +1545,9 @@ impl Executor<TxnManager> {
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
+            schema_path: Arc::new(Mutex::new(None)),
+            schema_persist_lock: Arc::new(Mutex::new(())),
+            schema_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1550,6 +1569,9 @@ where
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_tables: Arc::new(HashMap::new()),
+            schema_path: Arc::new(Mutex::new(None)),
+            schema_persist_lock: Arc::new(Mutex::new(())),
+            schema_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1590,6 +1612,9 @@ where
             catalog: self.catalog,
             indexes: self.indexes,
             rls_tables: self.rls_tables,
+            schema_path: self.schema_path,
+            schema_persist_lock: self.schema_persist_lock,
+            schema_dirty: self.schema_dirty,
         }
     }
 
@@ -1626,6 +1651,80 @@ where
 
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
+    }
+
+    pub fn set_schema_path(&mut self, path: PathBuf) {
+        if let Ok(mut stored) = self.schema_path.lock() {
+            *stored = Some(path);
+        }
+    }
+
+    pub fn schema_snapshot(&self) -> SchemaSnapshot {
+        let tables = self
+            .catalog
+            .lock()
+            .map(|catalog| {
+                catalog.iter().map(|(table, columns)| (table.clone(), columns.clone())).collect()
+            })
+            .unwrap_or_default();
+        let mut indexes = self
+            .indexes
+            .lock()
+            .map(|catalog| {
+                catalog
+                    .values()
+                    .flat_map(|states| states.iter().map(|state| state.definition.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        indexes.sort_by(|left, right| {
+            left.table.cmp(&right.table).then_with(|| left.name.cmp(&right.name))
+        });
+        SchemaSnapshot { tables, indexes }
+    }
+
+    pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
+        {
+            let mut catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("catalog lock")))?;
+            *catalog = snapshot.tables.into_iter().collect();
+        }
+        if let Ok(mut indexes) = self.indexes.lock() {
+            indexes.clear();
+        } else {
+            return Err(RymeError::Internal(String::from("index lock")));
+        }
+        for definition in snapshot.indexes {
+            self.create_index(definition)?;
+        }
+        self.schema_dirty.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn with_isolated_schema<C>(self, manager: C) -> Executor<C>
+    where
+        C: TxnBackend,
+    {
+        let catalog = self.catalog.lock().map(|catalog| catalog.clone()).unwrap_or_default();
+        let indexes = self.indexes.lock().map(|indexes| indexes.clone()).unwrap_or_default();
+        Executor {
+            tenant: self.tenant,
+            database: self.database,
+            branch: self.branch,
+            manager,
+            read_ts: None,
+            realtime: self.realtime,
+            read_only: self.read_only,
+            isolation: self.isolation,
+            catalog: Arc::new(Mutex::new(catalog)),
+            indexes: Arc::new(Mutex::new(indexes)),
+            rls_tables: self.rls_tables,
+            schema_path: Arc::new(Mutex::new(None)),
+            schema_persist_lock: Arc::new(Mutex::new(())),
+            schema_dirty: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn set_isolation(&mut self, isolation: Isolation) {
@@ -2051,6 +2150,7 @@ where
             return Ok(());
         }
         table_indexes.push(IndexState { definition, entries });
+        self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2153,12 +2253,54 @@ where
 
     fn register_table(&self, table: String, columns: Vec<ColumnDefinition>) {
         if let Ok(mut catalog) = self.catalog.lock() {
-            catalog.entry(table).or_insert(columns);
+            if let std::collections::hash_map::Entry::Vacant(entry) = catalog.entry(table) {
+                entry.insert(columns);
+                self.schema_dirty.store(true, Ordering::SeqCst);
+            }
         }
     }
 
     fn ensure_table(&self, table: &str) {
         self.register_table(table.to_string(), Vec::new());
+    }
+
+    fn persist_schema_if_configured(&self) -> Result<()> {
+        if !self.schema_dirty.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let path = self
+            .schema_path
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("schema path lock")))?
+            .clone();
+        let Some(path) = path else { return Ok(()) };
+        let _guard = self
+            .schema_persist_lock
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("schema persist lock")))?;
+        if !self.schema_dirty.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(&self.schema_snapshot())
+            .map_err(|error| RymeError::Internal(format!("schema snapshot: {error}")))?;
+        let temporary = path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(temporary, path)?;
+        self.schema_dirty.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     fn reject_if_read_only(&self) -> Result<()> {
@@ -2545,6 +2687,7 @@ where
             self.apply_index_change(&change);
             self.emit(&change.table, change.pk, change.op, change.before, change.after, commit_ts)?;
         }
+        self.persist_schema_if_configured()?;
         Ok(commit_ts)
     }
 
@@ -2777,12 +2920,18 @@ where
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
         }
-        match statement {
+        let schema_statement =
+            matches!(&statement, Statement::CreateTable { .. } | Statement::CreateIndex { .. });
+        let result = match statement {
             Statement::Returning { statement, fields } => {
                 self.execute_returning(*statement, fields, isolation).await
             }
             statement => self.execute_with_base(statement, isolation).await,
+        };
+        if result.is_ok() && schema_statement {
+            self.persist_schema_if_configured()?;
         }
+        result
     }
 
     async fn execute_returning(
@@ -3645,6 +3794,58 @@ mod tests {
         executor.execute(statement).await.unwrap();
         assert_eq!(executor.catalog_tables(), vec![String::from("public.messages")]);
         assert_eq!(executor.catalog_columns("public.messages"), columns);
+    }
+
+    #[tokio::test]
+    async fn schema_snapshot_restores_catalog_and_indexes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-schema-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("schema.json");
+        let manager = TxnManager::new();
+        let mut executor =
+            Executor::with_manager(String::from("t"), String::from("d"), manager.clone());
+        executor.set_schema_path(path.clone());
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (id, body) VALUES ('m1', 'hello')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX messages_body_idx ON messages (body)").unwrap())
+            .await
+            .unwrap();
+        let snapshot: SchemaSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(snapshot.tables.len(), 1);
+        assert_eq!(snapshot.indexes.len(), 1);
+
+        let restored = Executor::with_manager(String::from("t"), String::from("d"), manager);
+        restored.restore_schema_snapshot(snapshot).unwrap();
+        assert_eq!(restored.catalog_tables(), vec![String::from("messages")]);
+        assert_eq!(restored.catalog_indexes("messages").len(), 1);
+        let result =
+            restored.execute(parse("SELECT * FROM messages KEY 'm1'").unwrap()).await.unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Row { pk, value }
+                if pk == b"m1".to_vec()
+                    && serde_json::from_slice::<serde_json::Value>(&value)
+                        .ok()
+                        .and_then(|row| row.get("body").and_then(serde_json::Value::as_str).map(String::from))
+                        == Some(String::from("hello"))
+        ));
+
+        let isolated = restored.clone().with_isolated_schema(TxnManager::new());
+        isolated.execute(parse("CREATE TABLE branch_only").unwrap()).await.unwrap();
+        assert!(!restored.catalog_tables().contains(&String::from("branch_only")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

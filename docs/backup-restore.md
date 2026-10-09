@@ -44,6 +44,10 @@ Response shape: `{ "commit": <u64>, "files": [<names>] }`. Snapshots are the
 unit that gets shipped to the archive and the unit you copy back for
 single-node disaster recovery.
 
+Archives also include `schema.json`, which stores SQL table and index
+definitions. On restore, the server rebuilds secondary-index entries from the
+committed rows.
+
 ## Archive
 
 With an archive target configured (`archive.local_dir` or the S3
