@@ -197,14 +197,17 @@ placement.
 
 `POST /v1/ranges/transfer` is the controlled next step for a pure cluster. It
 installs the complete bounded MVCC snapshot—including version chains and
-tombstones—on the target member, reconciles stale visible keys, verifies the target at the source commit timestamp, and then
-bumps the range epoch and records the target as the logical range leader (for
-example, `raft-2`). The operation is leader-only and requires the expected
-epoch. Because the current cluster log still materializes replicated writes on
-all members, this changes placement metadata and prepares the target data copy;
-it does not yet delete the source replica or claim full shared-nothing storage
-scale. That filtering step requires the per-range data apply path described in
-the roadmap.
+tombstones—on the target member, reconciles stale visible keys, verifies the
+target at the source commit timestamp, and then bumps the range epoch and
+records the target as the logical range leader (for example, `raft-2`). The
+operation is leader-only and requires the expected epoch. Once that metadata is
+committed, main-branch KV point reads use the range owner and fetch from the
+target over the authenticated mesh, including RLS checks at the serving
+gateway. Other protocols and scans still use the existing transaction backend.
+Because the current cluster log still materializes replicated writes on all
+members, this does not yet delete the source replica or claim full
+shared-nothing storage scale; owner-aware data-apply filtering and complete
+transaction routing remain separate work.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

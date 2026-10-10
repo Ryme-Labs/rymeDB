@@ -69,6 +69,14 @@ pub(crate) enum Rpc {
     RangeInstallResponse {
         rows: u64,
     },
+    RangeReadRequest {
+        key: RecordKey,
+        read_ts: u64,
+    },
+    RangeReadResponse {
+        value: Option<Vec<u8>>,
+        expires_at: Option<u64>,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -110,6 +118,14 @@ pub struct RangeSnapshot {
     pub applied_commit: u64,
     pub rows: Vec<RangeSnapshotRow>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeOwner {
+    pub start: Vec<u8>,
+    pub end: Vec<u8>,
+    pub owner: usize,
+    pub epoch: u64,
 }
 
 async fn write_frame<S>(socket: &mut S, rpc: &Rpc) -> Result<()>
@@ -494,6 +510,7 @@ pub struct Node {
     realtime_hook: MetadataHookSlot,
     presence_hook: MetadataHookSlot,
     topic_hook: MetadataHookSlot,
+    range_owners: std::sync::RwLock<Vec<RangeOwner>>,
 }
 
 impl Node {
@@ -647,6 +664,7 @@ impl Node {
             realtime_hook: MetadataHookSlot::default(),
             presence_hook: MetadataHookSlot::default(),
             topic_hook: MetadataHookSlot::default(),
+            range_owners: std::sync::RwLock::new(Vec::new()),
         });
         Ok(node)
     }
@@ -1310,6 +1328,10 @@ impl Node {
                 let rows = self.install_range_snapshot(&snapshot)?;
                 Ok(Rpc::RangeInstallResponse { rows })
             }
+            Rpc::RangeReadRequest { key, read_ts } => {
+                let (value, expires_at) = self.read_range_value(&key, read_ts)?;
+                Ok(Rpc::RangeReadResponse { value, expires_at })
+            }
             Rpc::AppendRequest {
                 term,
                 leader: _,
@@ -1383,7 +1405,8 @@ impl Node {
             | Rpc::RealtimeResponse { .. }
             | Rpc::PresenceResponse { .. }
             | Rpc::RangeSnapshotResponse { .. }
-            | Rpc::RangeInstallResponse { .. } => {
+            | Rpc::RangeInstallResponse { .. }
+            | Rpc::RangeReadResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
         }
@@ -1986,6 +2009,51 @@ impl Node {
         match pool.roundtrip(&Rpc::RangeInstallRequest { snapshot }).await? {
             Rpc::RangeInstallResponse { rows } => Ok(rows),
             _ => Err(RymeError::Corrupt(String::from("range install rpc"))),
+        }
+    }
+
+    pub fn set_range_owners(&self, mut owners: Vec<RangeOwner>) {
+        owners.sort_by(|left, right| left.start.cmp(&right.start));
+        if let Ok(mut current) = self.range_owners.write() {
+            *current = owners;
+        }
+    }
+
+    pub fn range_owner(&self, routing_key: &[u8]) -> Option<(usize, u64)> {
+        let owners = self.range_owners.read().ok()?;
+        owners
+            .iter()
+            .find(|range| {
+                routing_key >= range.start.as_slice()
+                    && (range.end.is_empty() || routing_key < range.end.as_slice())
+            })
+            .map(|range| (range.owner, range.epoch))
+    }
+
+    pub fn read_range_value(
+        &self,
+        key: &RecordKey,
+        read_ts: u64,
+    ) -> Result<(Option<Vec<u8>>, Option<u64>)> {
+        let mut txn = self.manager.begin();
+        if read_ts != 0 {
+            txn.restamp(read_ts);
+        }
+        let value = self.manager.get(&mut txn, key)?;
+        let expires_at = value.as_ref().and_then(|_| self.manager.expires_at(key).ok().flatten());
+        Ok((value, expires_at))
+    }
+
+    pub async fn fetch_range_value(
+        &self,
+        peer: usize,
+        key: RecordKey,
+        read_ts: u64,
+    ) -> Result<(Option<Vec<u8>>, Option<u64>)> {
+        let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
+        match pool.roundtrip(&Rpc::RangeReadRequest { key, read_ts }).await? {
+            Rpc::RangeReadResponse { value, expires_at } => Ok((value, expires_at)),
+            _ => Err(RymeError::Corrupt(String::from("range read rpc"))),
         }
     }
 

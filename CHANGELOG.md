@@ -10,6 +10,10 @@
   range-local apply filtering is implemented.
 - Range transfer snapshots now preserve MVCC version chains and tombstones,
   rather than copying only the currently visible value.
+- Main-branch KV point reads now honor transferred `raft-{id}` range ownership
+  and fetch owned values from the target member over the cluster mesh, while
+  retaining the existing transaction path for writes, scans, and other
+  protocols.
 
 - Query streams now support PostgREST-style filters, projections, and ordering.
   Filtered queries resnapshot from committed table changes while unfiltered

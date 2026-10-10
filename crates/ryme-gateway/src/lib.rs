@@ -152,6 +152,16 @@ where
         }
     }
 
+    pub fn visible_value(
+        &self,
+        principal: &Principal,
+        table: &str,
+        value: &[u8],
+    ) -> Result<bool> {
+        self.policies.predicate(principal, table)?;
+        self.policies.row_allowed(principal, table, value)
+    }
+
     pub async fn put(
         &self,
         principal: &Principal,

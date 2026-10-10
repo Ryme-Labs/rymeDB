@@ -1,4 +1,4 @@
-use ryme_raft::net::{ClusterBackend, Node};
+use ryme_raft::net::{ClusterBackend, Node, RangeOwner};
 use ryme_storage::RecordKey;
 use ryme_txn::TxnBackend;
 use std::collections::BTreeMap;
@@ -97,6 +97,17 @@ async fn backend_replicates_and_fails_over() {
     assert_eq!(snapshot.rows[0].value, b"v1".to_vec());
     assert_eq!(snapshot.rows[0].versions.len(), 1);
     assert_eq!(nodes[first].install_range_snapshot_on(target, snapshot).await.unwrap(), 1);
+    nodes[first].set_range_owners(vec![RangeOwner {
+        start: b"s\0".to_vec(),
+        end: Vec::new(),
+        owner: target,
+        epoch: 1,
+    }]);
+    assert_eq!(nodes[first].range_owner(b"s\0k"), Some((target, 1)));
+    let (owner_value, owner_expiry) =
+        nodes[first].fetch_range_value(target, key("k"), 0).await.unwrap();
+    assert_eq!(owner_value, Some(b"v1".to_vec()));
+    assert_eq!(owner_expiry, Some(0));
     nodes[first].shutdown(std::mem::take(&mut tasks[first]));
     tokio::time::sleep(Duration::from_millis(300)).await;
     let second = wait_leader(&nodes, Some(first)).await;
@@ -149,5 +160,22 @@ fn range_snapshot_copies_mvcc_history_and_tombstones() {
     target.install_range_snapshot(&snapshot).unwrap();
     assert_eq!(target.snapshot_range(&[], &[], 0, 16).unwrap(), snapshot);
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn range_owner_respects_half_open_bounds() {
+    let root = std::env::temp_dir().join(format!("ryme-range-owner-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let node = Node::open(0, Vec::new(), Vec::new(), &root).unwrap();
+    node.set_range_owners(vec![
+        RangeOwner { start: b"a".to_vec(), end: b"m".to_vec(), owner: 1, epoch: 4 },
+        RangeOwner { start: b"m".to_vec(), end: Vec::new(), owner: 2, epoch: 5 },
+    ]);
+    assert_eq!(node.range_owner(b"a"), Some((1, 4)));
+    assert_eq!(node.range_owner(b"l"), Some((1, 4)));
+    assert_eq!(node.range_owner(b"m"), Some((2, 5)));
+    assert_eq!(node.range_owner(b"z"), Some((2, 5)));
+    assert_eq!(node.range_owner(b"0"), None);
     let _ = std::fs::remove_dir_all(&root);
 }

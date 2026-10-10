@@ -28,7 +28,7 @@ pub struct TableVersion {
 
 pub type TableRows = Vec<(Vec<u8>, Vec<TableVersion>)>;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RecordKey {
     pub tenant: String,
     pub database: String,

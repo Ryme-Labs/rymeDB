@@ -19,7 +19,7 @@ use ryme_index::PartitionedIndex;
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{Histogram, LatencyWindow, SlowEntry, SlowLog, TraceCollector, TraceSpan};
 use ryme_qos::{QosRegistry, Tier};
-use ryme_raft::net::{ClusterBackend, Node};
+use ryme_raft::net::{ClusterBackend, Node, RangeOwner};
 use ryme_realtime::Realtime;
 use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
@@ -6758,7 +6758,7 @@ async fn kv_get(
     Path((table, key)): Path<(String, String)>,
 ) -> Response {
     let start = SystemTime::now();
-    let result = inner_kv_get(&state, &headers, &table, key.as_bytes());
+    let result = inner_kv_get(&state, &headers, &table, key.as_bytes()).await;
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);
     state.histogram.record(micros);
@@ -6767,7 +6767,12 @@ async fn kv_get(
     result
 }
 
-fn inner_kv_get(state: &SharedState, headers: &HeaderMap, table: &str, key: &[u8]) -> Response {
+async fn inner_kv_get(
+    state: &SharedState,
+    headers: &HeaderMap,
+    table: &str,
+    key: &[u8],
+) -> Response {
     let principal = match state.principal(headers) {
         Ok(principal) => principal,
         Err(e) => return error_response(e),
@@ -6779,6 +6784,42 @@ fn inner_kv_get(state: &SharedState, headers: &HeaderMap, table: &str, key: &[u8
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
+    if branch_snapshot(state, headers, &principal.tenant).ok().flatten().is_none() {
+        if let Some(node) = state.raft_node() {
+            let routing = range_routing_key(table, key);
+            if let Some((owner, _epoch)) = node.range_owner(&routing) {
+                if owner != node.node_id() {
+                    let record = ryme_storage::RecordKey::new(
+                        &principal.tenant,
+                        &state.database,
+                        table,
+                        key,
+                    );
+                    let (value, _expires_at) = match node.fetch_range_value(owner, record, 0).await {
+                        Ok(result) => result,
+                        Err(error) => return error_response(error),
+                    };
+                    return match value {
+                        Some(value) => match gateway.visible_value(&principal, table, &value) {
+                            Ok(true) => {
+                                if let Err(e) = admit_egress(state, &principal.tenant, value.len() as u64) {
+                                    error_response(e)
+                                } else {
+                                    let masked = gateway.masked(table, value);
+                                    (StatusCode::OK, masked).into_response()
+                                }
+                            }
+                            Ok(false) => {
+                                error_response(ryme_error::RymeError::NotFound(String::from("row")))
+                            }
+                            Err(error) => error_response(error),
+                        },
+                        None => error_response(ryme_error::RymeError::NotFound(String::from("row"))),
+                    };
+                }
+            }
+        }
+    }
     match gateway.get(&principal, table, key) {
         Ok(Some(value)) => {
             if let Err(e) = admit_egress(state, &principal.tenant, value.len() as u64) {
@@ -8117,10 +8158,31 @@ fn install_cluster_range_replication(
     state: &SharedState,
     node: &std::sync::Arc<Node>,
 ) -> ryme_error::Result<()> {
+    let ranges = state
+        .control
+        .lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?
+        .ranges();
+    node.set_range_owners(range_owners(&ranges));
     let state = state.clone();
     let hook: ryme_raft::net::MetadataHook =
         Arc::new(move |payload| apply_replicated_ranges(&state, payload));
     node.set_metadata_hook(hook)
+}
+
+fn range_owners(ranges: &[Range]) -> Vec<RangeOwner> {
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let owner = range.leader.strip_prefix("raft-")?.parse().ok()?;
+            Some(RangeOwner {
+                start: range.start.clone(),
+                end: range.end.clone(),
+                owner,
+                epoch: range.epoch,
+            })
+        })
+        .collect()
 }
 
 fn install_cluster_data_replication(
@@ -8276,6 +8338,9 @@ fn apply_replicated_ranges(state: &SharedState, payload: &[u8]) -> ryme_error::R
         let _ = control.restore_ranges(previous.clone());
         let _ = sync_range_topology(state, &previous);
         return Err(error);
+    }
+    if let Some(node) = state.raft_node() {
+        node.set_range_owners(range_owners(&ranges));
     }
     Ok(())
 }
