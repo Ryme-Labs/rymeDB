@@ -47,10 +47,11 @@ frames as raw JSON so applications can use their existing JSON library:
 ```java
 var channel = client.subscribeSupabaseChannel(
     "room",
-    new RymeClient.SupabaseChannelOptions(true, false,
+    new RymeClient.SupabaseChannelOptions(true, false, "ada",
         List.of(new RymeClient.SupabasePostgresChange("INSERT", "public", "messages", null, null))),
     System.out::println).join();
 channel.sendBroadcast("typing", "{\"user\":\"ada\"}").join();
+channel.track("{\"status\":\"online\"}").join();
 channel.close();
 ```
 

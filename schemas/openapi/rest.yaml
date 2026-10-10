@@ -595,7 +595,7 @@ paths:
   /realtime/v1/websocket:
     get:
       tags: [streams]
-      description: "Supabase Realtime-compatible Phoenix WebSocket for broadcast and committed postgres_changes subscriptions. Supports v1 JSON objects and v2 JSON arrays, phx_join, phx_leave, heartbeat, broadcast, postgres_changes, and system events."
+      description: "Supabase Realtime-compatible Phoenix WebSocket for broadcast, presence, and committed postgres_changes subscriptions. Supports v1 JSON objects and v2 JSON arrays, phx_join, phx_leave, heartbeat, broadcast, presence track/untrack, presence_state, presence_diff, postgres_changes, and system events."
       parameters:
         - name: apikey
           in: query

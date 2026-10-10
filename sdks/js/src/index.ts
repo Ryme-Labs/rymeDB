@@ -730,6 +730,10 @@ export interface SupabaseChannelOptions {
     ack?: boolean;
     self?: boolean;
   };
+  presence?: {
+    enabled?: boolean;
+    key?: string;
+  };
   postgresChanges?: SupabasePostgresChangeConfig[];
   protocolVersion?: "1.0.0" | "2.0.0";
 }
@@ -758,16 +762,34 @@ export interface SupabasePostgresChangePayload {
   data: SupabasePostgresChangeData;
 }
 
+export interface SupabasePresenceMeta {
+  phx_ref: string;
+  [key: string]: unknown;
+}
+
+export interface SupabasePresenceState {
+  [key: string]: { metas: SupabasePresenceMeta[] };
+}
+
+export interface SupabasePresenceDiff {
+  joins: SupabasePresenceState;
+  leaves: SupabasePresenceState;
+}
+
 export interface SupabaseChannelHandlers {
   onMessage?: (frame: SupabaseChannelFrame) => void;
   onBroadcast?: (payload: { event: string; payload: unknown; type?: string }, frame: SupabaseChannelFrame) => void;
   onPostgresChange?: (payload: SupabasePostgresChangePayload, frame: SupabaseChannelFrame) => void;
+  onPresenceState?: (payload: SupabasePresenceState, frame: SupabaseChannelFrame) => void;
+  onPresenceDiff?: (payload: SupabasePresenceDiff, frame: SupabaseChannelFrame) => void;
   onSystem?: (payload: unknown, frame: SupabaseChannelFrame) => void;
 }
 
 export interface SupabaseChannel {
   ready: Promise<void>;
   sendBroadcast(event: string, payload: unknown): Promise<void>;
+  track(state: unknown): Promise<void>;
+  untrack(): Promise<void>;
   leave(): Promise<void>;
   close(): void;
 }
@@ -826,6 +848,14 @@ export function subscribeSupabaseChannel(
       ack: options.broadcast?.ack ?? false,
       self: options.broadcast?.self ?? false,
     },
+    ...(options.presence === undefined
+      ? {}
+      : {
+          presence: {
+            enabled: options.presence.enabled ?? true,
+            ...(options.presence.key === undefined ? {} : { key: options.presence.key }),
+          },
+        }),
     ...(options.postgresChanges === undefined
       ? {}
       : {
@@ -868,6 +898,10 @@ export function subscribeSupabaseChannel(
       handlers.onBroadcast?.(incoming.payload, incoming);
     } else if (incoming.event === "postgres_changes" && isSupabasePostgresChange(incoming.payload)) {
       handlers.onPostgresChange?.(incoming.payload, incoming);
+    } else if (incoming.event === "presence_state" && isSupabasePresenceState(incoming.payload)) {
+      handlers.onPresenceState?.(incoming.payload, incoming);
+    } else if (incoming.event === "presence_diff" && isSupabasePresenceDiff(incoming.payload)) {
+      handlers.onPresenceDiff?.(incoming.payload, incoming);
     } else if (incoming.event === "system") {
       handlers.onSystem?.(incoming.payload, incoming);
     }
@@ -889,6 +923,14 @@ export function subscribeSupabaseChannel(
     sendBroadcast: (event, payload) => {
       if (!joined) return ready.then(() => send(frame("broadcast", { event, payload }, String(nextRef++)))).then(() => undefined);
       return send(frame("broadcast", { event, payload }, String(nextRef++)));
+    },
+    track: (state) => {
+      const sendTrack = () => send(frame("presence", { type: "presence", event: "track", payload: state }, String(nextRef++)));
+      return joined ? sendTrack() : ready.then(sendTrack);
+    },
+    untrack: () => {
+      const sendUntrack = () => send(frame("presence", { type: "presence", event: "untrack", payload: {} }, String(nextRef++)));
+      return joined ? sendUntrack() : ready.then(sendUntrack);
     },
     leave: () => {
       if (closed) return Promise.resolve();
@@ -945,6 +987,16 @@ function isSupabaseBroadcast(value: unknown): value is { event: string; payload:
 function isSupabasePostgresChange(value: unknown): value is SupabasePostgresChangePayload {
   return Boolean(value && typeof value === "object" && Array.isArray((value as { ids?: unknown }).ids)
     && (value as { data?: unknown }).data !== undefined);
+}
+
+function isSupabasePresenceState(value: unknown): value is SupabasePresenceState {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isSupabasePresenceDiff(value: unknown): value is SupabasePresenceDiff {
+  return Boolean(value && typeof value === "object"
+    && isSupabasePresenceState((value as { joins?: unknown }).joins)
+    && isSupabasePresenceState((value as { leaves?: unknown }).leaves));
 }
 
 export function subscribeTable(

@@ -139,13 +139,27 @@ Join payloads can also include Supabase `postgres_changes` subscriptions:
 }
 ```
 
+Presence can be enabled on the same channel with an optional stable key:
+
+```json
+{
+  "config": { "presence": { "enabled": true, "key": "user-ada" } }
+}
+```
+
+After the join reply, the server sends `presence_state`. Clients can send a
+`presence` frame with `event: "track"` or `event: "untrack"`; updates are
+broadcast as Supabase `presence_diff` frames with `joins` and `leaves` maps.
+Presence keys default to a connection-unique server-generated key, and the
+tracked state is removed when the channel leaves or the websocket closes.
+
 Committed table changes are delivered as `postgres_changes` frames with
 subscription IDs, `record`/`old_record`, columns, and event metadata. `*`,
 `INSERT`, `UPDATE`, and `DELETE` subscriptions are supported, along with
 common `eq`, `neq`, comparison, `in`, `like`/`ilike`, `is`, and negated
-filters. RLS is evaluated before a change is exposed. Presence remains
-available through the native endpoint above while the compatibility surface
-continues to expand.
+filters. RLS is evaluated before a change is exposed. Presence and broadcast
+messages remain tenant-scoped and use the same bounded websocket queue and QoS
+accounting as the native realtime endpoints.
 
 In cluster mode, presence joins and leaves must reach the current Raft leader.
 The leader fans each mutation over the live gateway mesh, and all gateways use

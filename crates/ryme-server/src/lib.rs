@@ -4985,6 +4985,7 @@ struct SupabaseFrame {
 }
 
 static NEXT_SUPABASE_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SUPABASE_PRESENCE_KEY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 struct SupabaseChangeSubscription {
@@ -5000,12 +5001,16 @@ struct SupabaseChangeSubscription {
 enum SupabaseRealtimeEvent {
     Broadcast(String, ryme_realtime::BroadcastMsg),
     Change(String, SupabaseChangeSubscription, ryme_realtime::ChangeRecord),
+    Presence(String, ryme_realtime::PresenceEvent),
 }
 
 #[derive(Debug)]
 struct SupabaseChannelState {
     broadcast_task: tokio::task::JoinHandle<()>,
     postgres_tasks: Vec<tokio::task::JoinHandle<()>>,
+    presence_task: Option<tokio::task::JoinHandle<()>>,
+    presence_key: Option<String>,
+    presence_seen_sequence: u64,
     ack: bool,
     include_self: bool,
 }
@@ -5133,6 +5138,79 @@ fn supabase_subscription_config(
         subscriptions.push(SupabaseChangeSubscription { id, event, schema, table, filter, select });
     }
     Ok(subscriptions)
+}
+
+fn supabase_presence_config(
+    payload: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some(value) = payload.pointer("/config/presence") else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(String::from("presence must be an object"));
+    };
+    if object.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Ok(None);
+    }
+    let key = object
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("ryme-{}", NEXT_SUPABASE_PRESENCE_KEY.fetch_add(1, AtomicOrdering::Relaxed)));
+    if key.len() > 256 {
+        return Err(String::from("presence key"));
+    }
+    Ok(Some(key))
+}
+
+fn supabase_presence_meta(
+    member: &ryme_realtime::PresenceMember,
+    phx_ref: String,
+) -> serde_json::Value {
+    let mut meta = match member.state.clone() {
+        serde_json::Value::Object(object) => object,
+        state => {
+            let mut object = serde_json::Map::new();
+            object.insert(String::from("state"), state);
+            object
+        }
+    };
+    meta.insert(String::from("phx_ref"), serde_json::Value::String(phx_ref));
+    serde_json::Value::Object(meta)
+}
+
+fn supabase_presence_state(
+    members: &[ryme_realtime::PresenceMember],
+) -> serde_json::Value {
+    let mut state = serde_json::Map::new();
+    for member in members {
+        state.insert(
+            member.member.clone(),
+            serde_json::json!({
+                "metas": [supabase_presence_meta(member, format!("ryme-{}", member.expires_unix))]
+            }),
+        );
+    }
+    serde_json::Value::Object(state)
+}
+
+fn supabase_presence_diff(event: &ryme_realtime::PresenceEvent) -> serde_json::Value {
+    let mut joins = serde_json::Map::new();
+    let mut leaves = serde_json::Map::new();
+    let member = ryme_realtime::PresenceMember {
+        member: event.member.clone(),
+        state: event.state.clone(),
+        expires_unix: event.expires_unix,
+    };
+    let target = if event.kind == "leave" { &mut leaves } else { &mut joins };
+    target.insert(
+        event.member.clone(),
+        serde_json::json!({
+            "metas": [supabase_presence_meta(&member, format!("ryme-{}", event.sequence))]
+        }),
+    );
+    serde_json::json!({ "joins": joins, "leaves": leaves })
 }
 
 fn supabase_json_value(record: &ryme_realtime::ChangeRecord, after: bool) -> serde_json::Value {
@@ -5366,6 +5444,99 @@ fn spawn_supabase_broadcast_forwarder(
     })
 }
 
+fn spawn_supabase_presence_forwarder(
+    realtime: &Realtime,
+    tenant: &str,
+    topic: &str,
+    events: &tokio::sync::mpsc::Sender<SupabaseRealtimeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let channel = topic.strip_prefix("realtime:").unwrap_or(topic).to_string();
+    let mut receiver = realtime.presence_subscribe(tenant, &channel);
+    let topic = topic.to_string();
+    let events = events.clone();
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if events
+                        .try_send(SupabaseRealtimeEvent::Presence(topic.clone(), event))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+async fn supabase_presence_join(
+    state: &SharedState,
+    tenant: &str,
+    channel: &str,
+    member: String,
+    presence_state: serde_json::Value,
+) -> ryme_error::Result<usize> {
+    let now = ryme_txn::now_unix();
+    if let Some(node) = state.raft_node() {
+        if !node.is_leader().await {
+            return Err(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let event = ClusterPresence::Join {
+            tenant: tenant.to_string(),
+            channel: channel.to_string(),
+            member,
+            state: presence_state,
+            expires_unix: now.saturating_add(ryme_realtime::PRESENCE_MAX_TTL_SECS),
+            now_unix: now,
+        };
+        let payload = serde_json::to_vec(&event)
+            .map_err(|error| ryme_error::RymeError::Internal(error.to_string()))?;
+        node.fanout_presence(payload).await?;
+        Ok(state.realtime.presence_list(tenant, channel, now).len())
+    } else {
+        state.realtime.presence_join(
+            tenant,
+            channel,
+            member,
+            presence_state,
+            ryme_realtime::PRESENCE_MAX_TTL_SECS,
+            now,
+        )
+    }
+}
+
+async fn supabase_presence_leave(
+    state: &SharedState,
+    tenant: &str,
+    channel: &str,
+    member: &str,
+) -> ryme_error::Result<bool> {
+    if let Some(node) = state.raft_node() {
+        if !node.is_leader().await {
+            return Err(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let event = ClusterPresence::Leave {
+            tenant: tenant.to_string(),
+            channel: channel.to_string(),
+            member: member.to_string(),
+        };
+        let payload = serde_json::to_vec(&event)
+            .map_err(|error| ryme_error::RymeError::Internal(error.to_string()))?;
+        let existed = state
+            .realtime
+            .presence_list(tenant, channel, ryme_txn::now_unix())
+            .iter()
+            .any(|current| current.member == member);
+        node.fanout_presence(payload).await?;
+        Ok(existed)
+    } else {
+        state.realtime.presence_leave(tenant, channel, member)
+    }
+}
+
 fn spawn_supabase_change_forwarder(
     realtime: &Realtime,
     tenant: &str,
@@ -5488,6 +5659,26 @@ async fn forward_supabase_realtime(
                         );
                         (topic, text)
                     }
+                    SupabaseRealtimeEvent::Presence(topic, event) => {
+                        let Some(channel) = channels.get_mut(&topic) else { continue };
+                        if channel.presence_task.is_none()
+                            || event.sequence <= channel.presence_seen_sequence
+                        {
+                            continue;
+                        }
+                        channel.presence_seen_sequence = event.sequence;
+                        let text = encode_supabase_frame(
+                            &SupabaseFrame {
+                                join_ref: None,
+                                reference: None,
+                                topic: topic.clone(),
+                                event: String::from("presence_diff"),
+                                payload: supabase_presence_diff(&event),
+                            },
+                            array_protocol,
+                        );
+                        (topic, text)
+                    }
                 };
                 if !stream_realtime_event(&qos, &tenant, text.len() as u64)
                     || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
@@ -5524,6 +5715,18 @@ async fn forward_supabase_realtime(
                             for task in channel.postgres_tasks {
                                 task.abort();
                             }
+                            if let Some(presence_key) = channel.presence_key {
+                                let _ = supabase_presence_leave(
+                                    &state,
+                                    &tenant,
+                                    frame.topic.strip_prefix("realtime:").unwrap_or(&frame.topic),
+                                    &presence_key,
+                                )
+                                .await;
+                            }
+                            if let Some(task) = channel.presence_task {
+                                task.abort();
+                            }
                         }
                         let ack = frame.payload.pointer("/config/broadcast/ack")
                             .and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -5544,6 +5747,23 @@ async fn forward_supabase_realtime(
                                 continue;
                             }
                         };
+                        let presence_key = match supabase_presence_config(&frame.payload) {
+                            Ok(key) => key,
+                            Err(reason) => {
+                                task.abort();
+                                let reply = supabase_reply(
+                                    &frame,
+                                    "error",
+                                    serde_json::json!({ "reason": reason }),
+                                    array_protocol,
+                                );
+                                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                                continue;
+                            }
+                        };
+                        let presence_task = presence_key.as_ref().map(|_| {
+                            spawn_supabase_presence_forwarder(&realtime, &tenant, &frame.topic, &events)
+                        });
                         let postgres_tasks = subscriptions
                             .iter()
                             .cloned()
@@ -5562,6 +5782,9 @@ async fn forward_supabase_realtime(
                         channels.insert(frame.topic.clone(), SupabaseChannelState {
                             broadcast_task: task,
                             postgres_tasks,
+                            presence_task,
+                            presence_key: presence_key.clone(),
+                            presence_seen_sequence: 0,
                             ack,
                             include_self,
                         });
@@ -5575,6 +5798,33 @@ async fn forward_supabase_realtime(
                         });
                         let reply = supabase_reply(&frame, "ok", response, array_protocol);
                         if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                        if presence_key.is_some() {
+                            let channel_name = frame
+                                .topic
+                                .strip_prefix("realtime:")
+                                .unwrap_or(&frame.topic);
+                            let (members, sequence) =
+                                realtime.presence_snapshot(&tenant, channel_name, ryme_txn::now_unix());
+                            if let Some(channel) = channels.get_mut(&frame.topic) {
+                                channel.presence_seen_sequence = sequence;
+                            }
+                            let presence_state = encode_supabase_frame(
+                                &SupabaseFrame {
+                                    join_ref: None,
+                                    reference: None,
+                                    topic: frame.topic.clone(),
+                                    event: String::from("presence_state"),
+                                    payload: supabase_presence_state(&members),
+                                },
+                                array_protocol,
+                            );
+                            if !queue_realtime_message(
+                                &outgoing,
+                                axum::extract::ws::Message::Text(presence_state),
+                            ) {
+                                break;
+                            }
+                        }
                         if !subscriptions.is_empty() {
                             let system = encode_supabase_frame(
                                 &SupabaseFrame {
@@ -5599,6 +5849,18 @@ async fn forward_supabase_realtime(
                             channel.broadcast_task.abort();
                             for task in channel.postgres_tasks {
                                 task.abort();
+                            }
+                            if let Some(task) = channel.presence_task {
+                                task.abort();
+                            }
+                            if let Some(presence_key) = channel.presence_key {
+                                let _ = supabase_presence_leave(
+                                    &state,
+                                    &tenant,
+                                    frame.topic.strip_prefix("realtime:").unwrap_or(&frame.topic),
+                                    &presence_key,
+                                )
+                                .await;
                             }
                         }
                         let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
@@ -5637,15 +5899,91 @@ async fn forward_supabase_realtime(
                             if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
                         }
                     }
+                    "presence" => {
+                        let presence_key = channels
+                            .get(&frame.topic)
+                            .and_then(|channel| channel.presence_key.clone());
+                        let presence_event = frame
+                            .payload
+                            .get("event")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let channel_name = frame
+                            .topic
+                            .strip_prefix("realtime:")
+                            .unwrap_or(&frame.topic);
+                        let result = if !can_publish {
+                            Err(ryme_error::RymeError::Forbidden)
+                        } else if presence_key.is_none() {
+                            Err(ryme_error::RymeError::InvalidArgument(String::from(
+                                "presence is not enabled",
+                            )))
+                        } else {
+                            match presence_event {
+                                "track" => {
+                                    let state_value = frame
+                                        .payload
+                                        .get("payload")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let size = serde_json::to_vec(&state_value)
+                                        .map(|value| value.len())
+                                        .unwrap_or(usize::MAX);
+                                    if size > 4096 {
+                                        Err(ryme_error::RymeError::InvalidArgument(String::from(
+                                            "presence payload",
+                                        )))
+                                    } else {
+                                        supabase_presence_join(
+                                            &state,
+                                            &tenant,
+                                            channel_name,
+                                            presence_key.unwrap_or_default(),
+                                            state_value,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                    }
+                                }
+                                "untrack" => supabase_presence_leave(
+                                    &state,
+                                    &tenant,
+                                    channel_name,
+                                    &presence_key.unwrap_or_default(),
+                                )
+                                .await
+                                .map(|_| ()),
+                                _ => Err(ryme_error::RymeError::InvalidArgument(String::from(
+                                    "presence event",
+                                ))),
+                            }
+                        };
+                        let (status, response) = match result {
+                            Ok(()) => ("ok", serde_json::json!({})),
+                            Err(error) => (
+                                "error",
+                                serde_json::json!({ "reason": error.to_string() }),
+                            ),
+                        };
+                        let reply = supabase_reply(&frame, status, response, array_protocol);
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                    }
                     _ => {}
                 }
             }
         }
     }
-    for channel in channels.into_values() {
+    for (topic, channel) in channels {
         channel.broadcast_task.abort();
         for task in channel.postgres_tasks {
             task.abort();
+        }
+        if let Some(task) = channel.presence_task {
+            task.abort();
+        }
+        if let Some(presence_key) = channel.presence_key {
+            let channel_name = topic.strip_prefix("realtime:").unwrap_or(&topic);
+            let _ = supabase_presence_leave(&state, &tenant, channel_name, &presence_key).await;
         }
     }
 }

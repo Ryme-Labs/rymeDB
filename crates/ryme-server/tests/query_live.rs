@@ -421,6 +421,70 @@ async fn supabase_realtime_protocol_joins_heartbeats_and_broadcasts() {
     assert_eq!(ack["event"], "phx_reply");
     assert_eq!(ack["payload"]["status"], "ok");
 
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "topic": "realtime:presence-room",
+                "event": "phx_join",
+                "payload": { "config": { "presence": { "enabled": true, "key": "ada" } } },
+                "ref": "presence-1",
+                "join_ref": "presence-1"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let presence_joined = next_text(&mut stream).await;
+    assert_eq!(presence_joined["event"], "phx_reply");
+    assert_eq!(presence_joined["payload"]["status"], "ok");
+    let presence_state = next_text(&mut stream).await;
+    assert_eq!(presence_state["event"], "presence_state");
+    assert!(presence_state["payload"].as_object().unwrap().is_empty());
+
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "topic": "realtime:presence-room",
+                "event": "presence",
+                "payload": {
+                    "type": "presence",
+                    "event": "track",
+                    "payload": { "status": "online", "room": "lobby" }
+                },
+                "ref": "presence-2",
+                "join_ref": "presence-1"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let track_ack = next_text(&mut stream).await;
+    assert_eq!(track_ack["event"], "phx_reply");
+    assert_eq!(track_ack["payload"]["status"], "ok");
+    let presence_diff = next_text(&mut stream).await;
+    assert_eq!(presence_diff["event"], "presence_diff");
+    assert_eq!(presence_diff["payload"]["joins"]["ada"]["metas"][0]["status"], "online");
+
+    stream
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "topic": "realtime:presence-room",
+                "event": "presence",
+                "payload": { "type": "presence", "event": "untrack", "payload": {} },
+                "ref": "presence-3",
+                "join_ref": "presence-1"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let untrack_ack = next_text(&mut stream).await;
+    assert_eq!(untrack_ack["event"], "phx_reply");
+    assert_eq!(untrack_ack["payload"]["status"], "ok");
+    let leave_diff = next_text(&mut stream).await;
+    assert_eq!(leave_diff["event"], "presence_diff");
+    assert!(leave_diff["payload"]["leaves"]["ada"].is_object());
+
     stream.close(None).await.unwrap();
     let v2_url = format!("ws://{http}/realtime/v1/websocket?apikey={KEY}&vsn=2.0.0");
     let (mut v2, response) = tokio_tungstenite::connect_async(v2_url).await.unwrap();

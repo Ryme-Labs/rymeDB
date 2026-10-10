@@ -21,6 +21,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Supabase Realtime channels now support presence configuration, connection
+  keys, `presence_state`, `presence_diff`, `track`, and `untrack` frames in
+  addition to broadcast and `postgres_changes` events. Java, npm, and Rust SDK
+  channel helpers expose presence tracking and callbacks.
 - REST and GraphQL endpoints now answer browser `OPTIONS` preflights and
   return CORS headers for authenticated npm/browser clients.
 - All HTTP API paths now answer browser preflights, including auth, presence,

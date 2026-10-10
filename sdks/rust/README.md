@@ -45,10 +45,12 @@ let mut channel = client
     .subscribe_supabase_channel("room", SupabaseChannelOptions {
         broadcast_ack: true,
         broadcast_self: false,
+        presence_key: Some("ada".into()),
         postgres_changes: vec![SupabasePostgresChange::new(Some("messages".into()))],
     })
     .await?;
 channel.send_broadcast("typing", serde_json::json!({"user": "ada"})).await?;
+channel.track(serde_json::json!({"status": "online"})).await?;
 while let Some(frame) = channel.recv().await? {
     println!("{frame}");
 }

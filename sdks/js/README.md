@@ -72,9 +72,11 @@ const channel = subscribeSupabaseChannel("https://db.example.com", "room", {
 }, {
   apiKey: "ryme_key",
   broadcast: { ack: true, self: false },
+  presence: { key: "ada" },
   postgresChanges: [{ event: "INSERT", schema: "public", table: "messages" }],
 });
 await channel.ready;
 await channel.sendBroadcast("typing", { user: "ada" });
+await channel.track({ status: "online" });
 await channel.leave();
 ```

@@ -92,6 +92,7 @@ impl SupabasePostgresChange {
 pub struct SupabaseChannelOptions {
     pub broadcast_ack: bool,
     pub broadcast_self: bool,
+    pub presence_key: Option<String>,
     pub postgres_changes: Vec<SupabasePostgresChange>,
 }
 
@@ -120,6 +121,34 @@ impl SupabaseChannel {
                 "topic": self.topic,
                 "event": "broadcast",
                 "payload": { "event": event, "payload": payload },
+                "ref": reference,
+                "join_ref": self.join_ref,
+            }))
+            .await
+    }
+
+    /// Track a JSON presence state after the channel has been joined.
+    pub async fn track(&mut self, state: serde_json::Value) -> Result<(), ClientError> {
+        let reference = self.next_reference();
+        self.stream
+            .send_json(serde_json::json!({
+                "topic": self.topic,
+                "event": "presence",
+                "payload": { "type": "presence", "event": "track", "payload": state },
+                "ref": reference,
+                "join_ref": self.join_ref,
+            }))
+            .await
+    }
+
+    /// Stop tracking this channel's configured presence key.
+    pub async fn untrack(&mut self) -> Result<(), ClientError> {
+        let reference = self.next_reference();
+        self.stream
+            .send_json(serde_json::json!({
+                "topic": self.topic,
+                "event": "presence",
+                "payload": { "type": "presence", "event": "untrack", "payload": {} },
                 "ref": reference,
                 "join_ref": self.join_ref,
             }))
@@ -520,19 +549,21 @@ impl RymeClient {
             format!("realtime:{channel}")
         };
         let join_ref = String::from("1");
+        let mut config = serde_json::json!({
+            "broadcast": {
+                "ack": options.broadcast_ack,
+                "self": options.broadcast_self,
+            },
+            "postgres_changes": options.postgres_changes,
+        });
+        if let Some(key) = options.presence_key {
+            config["presence"] = serde_json::json!({ "enabled": true, "key": key });
+        }
         stream
             .send_json(serde_json::json!({
                 "topic": topic,
                 "event": "phx_join",
-                "payload": {
-                    "config": {
-                        "broadcast": {
-                            "ack": options.broadcast_ack,
-                            "self": options.broadcast_self,
-                        },
-                        "postgres_changes": options.postgres_changes,
-                    }
-                },
+                "payload": { "config": config },
                 "ref": join_ref,
                 "join_ref": join_ref,
             }))

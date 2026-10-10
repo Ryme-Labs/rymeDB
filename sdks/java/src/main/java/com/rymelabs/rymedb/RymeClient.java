@@ -410,13 +410,19 @@ public final class RymeClient {
 
     /** Join options for a Supabase-compatible realtime channel. */
     public record SupabaseChannelOptions(boolean broadcastAck, boolean broadcastSelf,
+                                         String presenceKey,
                                          List<SupabasePostgresChange> postgresChanges) {
         public SupabaseChannelOptions {
             postgresChanges = postgresChanges == null ? List.of() : List.copyOf(postgresChanges);
         }
 
+        public SupabaseChannelOptions(boolean broadcastAck, boolean broadcastSelf,
+                                      List<SupabasePostgresChange> postgresChanges) {
+            this(broadcastAck, broadcastSelf, null, postgresChanges);
+        }
+
         public static SupabaseChannelOptions defaults() {
-            return new SupabaseChannelOptions(false, false, List.of());
+            return new SupabaseChannelOptions(false, false, null, List.of());
         }
     }
 
@@ -591,6 +597,10 @@ public final class RymeClient {
             StringBuilder config = new StringBuilder("{\"broadcast\":{\"ack\":")
                     .append(options.broadcastAck()).append(",\"self\":")
                     .append(options.broadcastSelf()).append("}");
+            if (options.presenceKey() != null) {
+                config.append(",\"presence\":{\"enabled\":true,\"key\":")
+                        .append(json(options.presenceKey())).append('}');
+            }
             if (!options.postgresChanges().isEmpty()) {
                 config.append(",\"postgres_changes\":[");
                 for (int index = 0; index < options.postgresChanges().size(); index++) {
@@ -628,6 +638,27 @@ public final class RymeClient {
                         + nextRef.getAndIncrement() + "\",\"join_ref\":\"" + joinRef + "\"}";
                 return webSocket.sendText(frame, true).thenApply(ignoredResult -> null);
             });
+        }
+
+        /** Track a JSON presence state after the channel has joined. */
+        public CompletableFuture<Void> track(String stateJson) {
+            return ready.thenCompose(ignored -> sendPresence("track", stateJson));
+        }
+
+        /** Stop tracking this channel's configured presence key. */
+        public CompletableFuture<Void> untrack() {
+            return ready.thenCompose(ignored -> sendPresence("untrack", "{}"));
+        }
+
+        private CompletableFuture<Void> sendPresence(String event, String payloadJson) {
+            WebSocket webSocket = socket;
+            if (webSocket == null || closed) {
+                return CompletableFuture.failedFuture(new IllegalStateException("Supabase channel is closed"));
+            }
+            String frame = "{\"topic\":" + json(topic) + ",\"event\":\"presence\",\"payload\":{\"type\":\"presence\",\"event\":\""
+                    + json(event) + ",\"payload\":" + payloadJson + "},\"ref\":\""
+                    + nextRef.getAndIncrement() + "\",\"join_ref\":\"" + joinRef + "\"}";
+            return webSocket.sendText(frame, true).thenApply(ignored -> null);
         }
 
         /** Leave the channel and complete after the close frame has been sent. */
