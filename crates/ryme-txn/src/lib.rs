@@ -1,6 +1,7 @@
 use ryme_error::{Result, RymeError};
 use ryme_storage::{Engine, RecordKey, SegmentCacheStats, SegmentEntry, SegmentStore, StorageMode};
 use ryme_wal::Wal;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,7 +45,7 @@ struct TxnInner {
     commit: Mutex<()>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteOp {
     pub value: Option<Vec<u8>>,
     pub expires_at: u64,
@@ -79,7 +80,7 @@ impl Drop for TxnPin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Isolation {
     Serializable,
     Snapshot,
@@ -96,6 +97,16 @@ pub struct Transaction {
     isolation: Isolation,
     #[allow(dead_code)]
     pin: Arc<TxnPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionState {
+    pub read_ts: u64,
+    pub writes: Vec<(RecordKey, WriteOp)>,
+    pub read_set: Vec<RecordKey>,
+    pub observed: Vec<(RecordKey, bool)>,
+    pub scanned: Vec<(String, String, String)>,
+    pub isolation: Isolation,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +127,17 @@ impl Transaction {
             read_set: self.read_set.clone(),
             observed: self.observed.clone(),
             scanned: self.scanned.clone(),
+            isolation: self.isolation,
+        }
+    }
+
+    pub fn state(&self) -> TransactionState {
+        TransactionState {
+            read_ts: self.read_ts,
+            writes: self.writes.iter().map(|(key, op)| (key.clone(), op.clone())).collect(),
+            read_set: self.read_set.iter().cloned().collect(),
+            observed: self.observed.iter().map(|(key, value)| (key.clone(), *value)).collect(),
+            scanned: self.scanned.iter().cloned().collect(),
             isolation: self.isolation,
         }
     }
@@ -355,6 +377,23 @@ impl TxnManager {
             observed: BTreeMap::new(),
             scanned: BTreeSet::new(),
             isolation: Isolation::Serializable,
+            pin: Arc::new(TxnPin { id }),
+        }
+    }
+
+    pub fn from_state(&self, state: TransactionState) -> Transaction {
+        let id = TXN_ID.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut active) = ACTIVE.lock() {
+            active.insert(id, state.read_ts);
+        }
+        Transaction {
+            id,
+            read_ts: state.read_ts,
+            writes: state.writes.into_iter().collect(),
+            read_set: state.read_set.into_iter().collect(),
+            observed: state.observed.into_iter().collect(),
+            scanned: state.scanned.into_iter().collect(),
+            isolation: state.isolation,
             pin: Arc::new(TxnPin { id }),
         }
     }
@@ -1926,6 +1965,26 @@ mod tests {
         let mut probe = manager.begin();
         assert_eq!(manager.get(&mut probe, &first).unwrap(), Some(b"one".to_vec()));
         assert_eq!(manager.get(&mut probe, &second).unwrap(), None);
+    }
+
+    #[test]
+    fn transaction_state_roundtrip_preserves_validation_metadata() {
+        let manager = TxnManager::new();
+        let watched = RecordKey::new("t", "d", "state", b"watched");
+        let written = RecordKey::new("t", "d", "state", b"written");
+        let mut seed = manager.begin();
+        manager.put(&mut seed, watched.clone(), b"v1".to_vec());
+        manager.commit(seed).unwrap();
+
+        let mut txn = manager.begin();
+        assert_eq!(manager.get(&mut txn, &watched).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(manager.scan(&mut txn, "t", "d", "state", 10).unwrap().len(), 1);
+        manager.put(&mut txn, written, b"value".to_vec());
+        txn.set_isolation(Isolation::Snapshot);
+        let state = txn.state();
+        let restored = manager.from_state(state.clone());
+
+        assert_eq!(restored.state(), state);
     }
 
     #[test]

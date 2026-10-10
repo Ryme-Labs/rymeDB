@@ -1990,6 +1990,7 @@ dependencies = [
  "ryme-error",
  "ryme-storage",
  "ryme-wal",
+ "serde",
 ]
 
 [[package]]

@@ -94,6 +94,13 @@ pub(crate) enum Rpc {
     ProposeWriteResponse {
         commit_ts: u64,
     },
+    ProposeTransaction {
+        payload: Vec<u8>,
+    },
+    ProposeTransactionResponse {
+        commit_ts: Option<u64>,
+        error: Option<RpcError>,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -107,6 +114,53 @@ pub(crate) enum Rpc {
         ok: bool,
         match_index: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RpcError {
+    kind: String,
+    message: Option<String>,
+}
+
+impl From<RymeError> for RpcError {
+    fn from(error: RymeError) -> Self {
+        let (kind, message) = match error {
+            RymeError::InvalidArgument(message) => ("invalid_argument", Some(message)),
+            RymeError::NotFound(message) => ("not_found", Some(message)),
+            RymeError::Conflict(message) => ("conflict", Some(message)),
+            RymeError::Unauthorized => ("unauthorized", None),
+            RymeError::Forbidden => ("forbidden", None),
+            RymeError::Overload(message) => ("overload", Some(message)),
+            RymeError::Io(message) => ("io", Some(message)),
+            RymeError::Corrupt(message) => ("corrupt", Some(message)),
+            RymeError::Unavailable(message) => ("unavailable", Some(message)),
+            RymeError::ReadOnly(message) => ("read_only", Some(message)),
+            RymeError::Timeout => ("timeout", None),
+            RymeError::Internal(message) => ("internal", Some(message)),
+        };
+        Self { kind: kind.to_string(), message }
+    }
+}
+
+impl From<RpcError> for RymeError {
+    fn from(error: RpcError) -> Self {
+        let message = error.message.unwrap_or_default();
+        match error.kind.as_str() {
+            "invalid_argument" => Self::InvalidArgument(message),
+            "not_found" => Self::NotFound(message),
+            "conflict" => Self::Conflict(message),
+            "unauthorized" => Self::Unauthorized,
+            "forbidden" => Self::Forbidden,
+            "overload" => Self::Overload(message),
+            "io" => Self::Io(message),
+            "corrupt" => Self::Corrupt(message),
+            "unavailable" => Self::Unavailable(message),
+            "read_only" => Self::ReadOnly(message),
+            "timeout" => Self::Timeout,
+            "internal" => Self::Internal(message),
+            _ => Self::Internal(format!("remote rpc error: {}", error.kind)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1359,6 +1413,21 @@ impl Node {
                 let commit_ts = self.forward_write_to_leader(writes).await?;
                 Ok(Rpc::ProposeWriteResponse { commit_ts })
             }
+            Rpc::ProposeTransaction { payload } => {
+                let state: ryme_txn::TransactionState = serde_json::from_slice(&payload)
+                    .map_err(|error| RymeError::Corrupt(format!("transaction: {error}")))?;
+                let txn = self.manager.from_state(state);
+                match self.forward_transaction_to_leader(txn).await {
+                    Ok(commit_ts) => Ok(Rpc::ProposeTransactionResponse {
+                        commit_ts: Some(commit_ts),
+                        error: None,
+                    }),
+                    Err(error) => Ok(Rpc::ProposeTransactionResponse {
+                        commit_ts: None,
+                        error: Some(error.into()),
+                    }),
+                }
+            }
             Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows, tenant, database } => {
                 let snapshot = self.snapshot_range_for(
                     &start,
@@ -1457,6 +1526,9 @@ impl Node {
             Rpc::ProposeWriteResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
+            Rpc::ProposeTransactionResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
         }
     }
 
@@ -1503,6 +1575,33 @@ impl Node {
         }
     }
 
+    async fn forward_transaction_to_leader(
+        self: &Arc<Self>,
+        txn: ryme_txn::Transaction,
+    ) -> Result<u64> {
+        let Some(leader) = self.known_leader().await else {
+            return Err(RymeError::Unavailable(String::from("leader unknown")));
+        };
+        if leader == self.id {
+            return self.commit_txn(txn).await;
+        }
+        let pool = self
+            .pool_for(leader)
+            .ok_or_else(|| RymeError::Unavailable(String::from("leader unavailable")))?;
+        let payload = serde_json::to_vec(&txn.state())
+            .map_err(|error| RymeError::Internal(format!("transaction: {error}")))?;
+        match pool.roundtrip(&Rpc::ProposeTransaction { payload }).await? {
+            Rpc::ProposeTransactionResponse { commit_ts: Some(commit_ts), error: None } => {
+                Ok(commit_ts)
+            }
+            Rpc::ProposeTransactionResponse { error: Some(error), .. } => Err(error.into()),
+            Rpc::ProposeTransactionResponse { .. } => {
+                Err(RymeError::Corrupt(String::from("transaction forward response")))
+            }
+            _ => Err(RymeError::Corrupt(String::from("transaction forward rpc"))),
+        }
+    }
+
     pub async fn propose_write_on(
         self: &Arc<Self>,
         owner: usize,
@@ -1535,6 +1634,13 @@ impl Node {
             return Err(RymeError::InvalidArgument(String::from("writes")));
         }
         self.forward_write_to_leader(writes).await
+    }
+
+    pub async fn commit_transaction_to_leader(
+        self: &Arc<Self>,
+        txn: ryme_txn::Transaction,
+    ) -> Result<u64> {
+        self.forward_transaction_to_leader(txn).await
     }
 
     pub async fn propose_metadata(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
@@ -2370,7 +2476,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             match routed {
                 Some((Some(owner), writes)) => node.propose_write_on(owner, writes).await,
                 Some((None, writes)) => node.propose_write_to_leader(writes).await,
-                None => node.commit_txn(txn).await,
+                None => node.commit_transaction_to_leader(txn).await,
             }
         }
     }

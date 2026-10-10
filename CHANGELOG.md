@@ -1,5 +1,11 @@
 # Changelog
 
+- Cluster transactions now forward their read timestamp, read set, observed
+  keys, scans, writes, and isolation mode through the mesh, preserving OCC
+  validation when a gateway starts on a follower. Transaction-forwarding
+  conflicts now return structured errors instead of closing the mesh stream;
+  owner-aware reads inside an explicit follower transaction and per-range 2PC
+  remain future work.
 - Write-only transactions spanning multiple configured ranges now forward to
   the current Raft leader and commit atomically through the existing global
   log. This is not yet a per-range 2PC coordinator; read-dependent

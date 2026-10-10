@@ -341,6 +341,73 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn follower_transaction_forwarding_preserves_read_conflicts() {
+    let root =
+        std::env::temp_dir().join(format!("ryme-txn-route-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut listeners = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for id in 0..3 {
+        let peers: Vec<String> = addrs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| *i != id)
+            .map(|(_, address)| address.to_string())
+            .collect();
+        let peer_ids: Vec<usize> = (0..3).filter(|i| *i != id).collect();
+        let node = Node::open(id, peers, peer_ids, &root.join(format!("n{id}"))).unwrap();
+        tasks.push(node.spawn(listeners.remove(0)));
+        nodes.push(node);
+    }
+    let backends: Vec<ClusterBackend> = nodes.iter().cloned().map(ClusterBackend::new).collect();
+    let leader = wait_leader(&nodes, None).await;
+    let client = (leader + 1) % nodes.len();
+
+    let mut seed = backends[leader].begin();
+    backends[leader].put(&mut seed, key("watched"), b"v1".to_vec());
+    backends[leader].commit(seed).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut probe = backends[client].begin();
+        if backends[client].get(&mut probe, &key("watched")).unwrap()
+            == Some(b"v1".to_vec())
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "seed did not reach follower");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut stale = backends[client].begin();
+    assert_eq!(
+        backends[client].get(&mut stale, &key("watched")).unwrap(),
+        Some(b"v1".to_vec())
+    );
+
+    let mut update = backends[leader].begin();
+    backends[leader].put(&mut update, key("watched"), b"v2".to_vec());
+    backends[leader].commit(update).await.unwrap();
+
+    backends[client].put(&mut stale, key("other"), b"value".to_vec());
+    let result = backends[client].commit(stale).await;
+    assert!(matches!(result, Err(ryme_error::RymeError::Conflict(_))));
+
+    for (node, task) in nodes.iter().zip(tasks) {
+        node.shutdown(task);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

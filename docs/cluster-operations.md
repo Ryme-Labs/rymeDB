@@ -216,7 +216,11 @@ scale. Single-owner write-only transactions now route through the configured
 owner and then the current Raft leader; read-dependent, multi-owner, and
 write-only multi-owner transactions use the current global log for atomic
 forwarding. This is not yet per-range 2PC, and read-dependent cross-range
-transaction routing remains separate work.
+transaction routing remains separate work. Transactions that include a read
+set now forward their snapshot and OCC metadata to the current leader, so a
+follower-started transaction can be validated against intervening commits.
+Reads made locally on an owner-filtered follower still do not fetch missing
+range data, so this is not yet complete owner-aware transaction routing.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to
