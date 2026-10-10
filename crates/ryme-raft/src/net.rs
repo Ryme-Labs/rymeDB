@@ -1527,6 +1527,16 @@ impl Node {
         }
     }
 
+    pub async fn propose_write_to_leader(
+        self: &Arc<Self>,
+        writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+    ) -> Result<u64> {
+        if writes.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("writes")));
+        }
+        self.forward_write_to_leader(writes).await
+    }
+
     pub async fn propose_metadata(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
         let encoded = crate::encode_metadata(&payload)?;
         let index = self.propose_frame(encoded).await?;
@@ -2328,12 +2338,16 @@ impl ryme_txn::TxnBackend for ClusterBackend {
         txn: ryme_txn::Transaction,
     ) -> impl std::future::Future<Output = Result<u64>> + Send {
         let node = self.node.clone();
-        let routed = if txn.read_keys().is_empty() && txn.scanned_tables().is_empty() {
+        let routed = if txn.read_keys().is_empty()
+            && txn.scanned_tables().is_empty()
+            && !txn.writes().is_empty()
+        {
             let owners = node.range_owners();
-            let owner = if owners.is_empty() {
+            if owners.is_empty() {
                 None
             } else {
-                txn.writes()
+                let owner = txn
+                    .writes()
                     .keys()
                     .map(|key| node.range_owner_key(key))
                     .try_fold(None, |current, next| match (current, next) {
@@ -2343,14 +2357,19 @@ impl ryme_txn::TxnBackend for ClusterBackend {
                     })
                     .ok()
                     .flatten()
-            };
-            owner.map(|owner| (owner, txn.writes().clone()))
+                    .map_or_else(
+                        || Some((None, txn.writes().clone())),
+                        |owner| Some((Some(owner), txn.writes().clone())),
+                    );
+                owner
+            }
         } else {
             None
         };
         async move {
             match routed {
-                Some((owner, writes)) => node.propose_write_on(owner, writes).await,
+                Some((Some(owner), writes)) => node.propose_write_on(owner, writes).await,
+                Some((None, writes)) => node.propose_write_to_leader(writes).await,
                 None => node.commit_txn(txn).await,
             }
         }

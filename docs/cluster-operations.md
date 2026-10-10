@@ -214,7 +214,9 @@ global conflict metadata; leaders and recovery still keep the complete state.
 This does not yet delete source replicas or claim full shared-nothing storage
 scale. Single-owner write-only transactions now route through the configured
 owner and then the current Raft leader; read-dependent, multi-owner, and
-complete cross-range transaction routing remain separate work.
+write-only multi-owner transactions use the current global log for atomic
+forwarding. This is not yet per-range 2PC, and read-dependent cross-range
+transaction routing remains separate work.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

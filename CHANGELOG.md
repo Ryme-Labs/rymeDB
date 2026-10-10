@@ -1,5 +1,9 @@
 # Changelog
 
+- Write-only transactions spanning multiple configured ranges now forward to
+  the current Raft leader and commit atomically through the existing global
+  log. This is not yet a per-range 2PC coordinator; read-dependent
+  cross-range transactions retain the existing path.
 - Single-owner, write-only cluster transactions now route through the
   configured range owner and forward to the current Raft leader when needed.
   Read-dependent, multi-owner, and cross-range transactions retain the
