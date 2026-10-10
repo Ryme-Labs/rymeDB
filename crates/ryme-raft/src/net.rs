@@ -1,7 +1,7 @@
 use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
 use ryme_storage::{RecordKey, TableVersion};
-use ryme_txn::{decode_writes, TxnManager};
+use ryme_txn::{decode_writes, now_unix, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -91,6 +91,14 @@ pub struct RangeSnapshotRow {
     pub table: String,
     pub pk: Vec<u8>,
     pub value: Vec<u8>,
+    pub expires_at: u64,
+    pub versions: Vec<RangeSnapshotVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeSnapshotVersion {
+    pub commit_ts: u64,
+    pub value: Option<Vec<u8>>,
     pub expires_at: u64,
 }
 
@@ -1816,51 +1824,59 @@ impl Node {
         }
         let max_rows = max_rows.clamp(1, 100_000);
         let snapshot_ts = if read_ts == 0 { self.manager.latest_commit() } else { read_ts };
-        let mut txn = self.manager.begin();
-        txn.restamp(snapshot_ts);
         let mut rows = Vec::new();
         let mut truncated = false;
         for (tenant, database, table) in self.manager.spaces()? {
-            let mut cursor = Vec::new();
-            loop {
-                let page =
-                    self.manager.scan_after(&mut txn, &tenant, &database, &table, &cursor, 1024)?;
-                if page.is_empty() {
-                    break;
+            for (pk, table_versions) in self.manager.export_table(&tenant, &database, &table)? {
+                let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
+                routing.extend_from_slice(table.as_bytes());
+                routing.push(0);
+                routing.extend_from_slice(&pk);
+                if routing.as_slice() < start || (!end.is_empty() && routing.as_slice() >= end) {
+                    continue;
                 }
-                let page_len = page.len();
-                let last_pk = page.last().map(|(pk, _)| pk.clone()).unwrap_or_default();
-                for (pk, value) in page {
-                    let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
-                    routing.extend_from_slice(table.as_bytes());
-                    routing.push(0);
-                    routing.extend_from_slice(&pk);
-                    if routing.as_slice() < start || (!end.is_empty() && routing.as_slice() >= end)
+                let versions: Vec<RangeSnapshotVersion> = table_versions
+                    .into_iter()
+                    .filter(|version| version.commit_ts <= snapshot_ts)
+                    .map(|version| RangeSnapshotVersion {
+                        commit_ts: version.commit_ts,
+                        value: version.value,
+                        expires_at: version.expires_at,
+                    })
+                    .collect();
+                if versions.is_empty() {
+                    continue;
+                }
+                let mut value = Vec::new();
+                let mut expires_at = 0;
+                for version in &versions {
+                    if version.value.is_some()
+                        && (version.expires_at == 0 || version.expires_at > now_unix())
                     {
-                        continue;
-                    }
-                    let expires_at = self
-                        .manager
-                        .expires_at(&RecordKey::new(&tenant, &database, &table, &pk))?
-                        .unwrap_or(0);
-                    rows.push(RangeSnapshotRow {
-                        tenant: tenant.clone(),
-                        database: database.clone(),
-                        table: table.clone(),
-                        pk,
-                        value,
-                        expires_at,
-                    });
-                    if rows.len() > max_rows {
-                        truncated = true;
-                        rows.truncate(max_rows);
-                        break;
+                        value = version.value.clone().unwrap_or_default();
+                        expires_at = version.expires_at;
+                    } else {
+                        value.clear();
+                        expires_at = 0;
                     }
                 }
-                if truncated || last_pk.is_empty() || page_len < 1024 {
+                rows.push(RangeSnapshotRow {
+                    tenant: tenant.clone(),
+                    database: database.clone(),
+                    table: table.clone(),
+                    pk,
+                    value,
+                    expires_at,
+                    versions,
+                });
+                if rows.len() > max_rows {
+                    truncated = true;
+                    rows.truncate(max_rows);
                     break;
                 }
-                cursor = last_pk;
+            }
+            if truncated {
+                break;
             }
         }
         rows.sort_by(|left, right| {
@@ -1944,17 +1960,20 @@ impl Node {
                 .or_default()
                 .push((
                     row.pk.clone(),
-                    vec![TableVersion {
-                        commit_ts: snapshot.snapshot_ts,
-                        value: Some(row.value.clone()),
-                        expires_at: row.expires_at,
-                    }],
+                    row.versions
+                        .iter()
+                        .map(|version| TableVersion {
+                            commit_ts: version.commit_ts,
+                            value: version.value.clone(),
+                            expires_at: version.expires_at,
+                        })
+                        .collect(),
                 ));
         }
         for ((tenant, database, table), rows) in tables {
             self.manager.import_table(&tenant, &database, &table, rows)?;
         }
-        self.manager.advance_to(snapshot.snapshot_ts);
+        self.manager.advance_to(snapshot.snapshot_ts.saturating_sub(1));
         Ok(snapshot.rows.len() as u64)
     }
 

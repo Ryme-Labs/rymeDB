@@ -196,8 +196,8 @@ non-replicated tier, while replicated tables continue to follow the Raft-backed
 placement.
 
 `POST /v1/ranges/transfer` is the controlled next step for a pure cluster. It
-installs the complete bounded snapshot on the target member, reconciles stale
-visible keys, verifies the target at the source commit timestamp, and then
+installs the complete bounded MVCC snapshot—including version chains and
+tombstones—on the target member, reconciles stale visible keys, verifies the target at the source commit timestamp, and then
 bumps the range epoch and records the target as the logical range leader (for
 example, `raft-2`). The operation is leader-only and requires the expected
 epoch. Because the current cluster log still materializes replicated writes on

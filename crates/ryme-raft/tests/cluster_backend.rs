@@ -95,6 +95,7 @@ async fn backend_replicates_and_fails_over() {
     assert_eq!(snapshot.rows[0].table, "s");
     assert_eq!(snapshot.rows[0].pk, b"k".to_vec());
     assert_eq!(snapshot.rows[0].value, b"v1".to_vec());
+    assert_eq!(snapshot.rows[0].versions.len(), 1);
     assert_eq!(nodes[first].install_range_snapshot_on(target, snapshot).await.unwrap(), 1);
     nodes[first].shutdown(std::mem::take(&mut tasks[first]));
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -119,4 +120,34 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+#[test]
+fn range_snapshot_copies_mvcc_history_and_tombstones() {
+    let root = std::env::temp_dir().join(format!(
+        "ryme-range-mvcc-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let source = Node::open(0, Vec::new(), Vec::new(), &root.join("source")).unwrap();
+    let target = Node::open(1, Vec::new(), Vec::new(), &root.join("target")).unwrap();
+    let key = key("history");
+    for value in [b"v0".to_vec(), b"v1".to_vec()] {
+        let mut txn = source.manager().begin();
+        source.manager().put(&mut txn, key.clone(), value);
+        source.manager().commit(txn).unwrap();
+    }
+    let mut txn = source.manager().begin();
+    source.manager().delete(&mut txn, key.clone());
+    source.manager().commit(txn).unwrap();
+
+    let snapshot = source.snapshot_range(&[], &[], 0, 16).unwrap();
+    assert_eq!(snapshot.rows.len(), 1);
+    assert!(snapshot.rows[0].value.is_empty());
+    assert_eq!(snapshot.rows[0].versions.len(), 3);
+    target.install_range_snapshot(&snapshot).unwrap();
+    assert_eq!(target.snapshot_range(&[], &[], 0, 16).unwrap(), snapshot);
+
+    let _ = std::fs::remove_dir_all(&root);
 }

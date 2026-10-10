@@ -8,6 +8,8 @@
   target receives and verifies a bounded snapshot before Raft commits an
   epoch-bumped logical owner change. Source replicas remain intact until
   range-local apply filtering is implemented.
+- Range transfer snapshots now preserve MVCC version chains and tombstones,
+  rather than copying only the currently visible value.
 
 - Query streams now support PostgREST-style filters, projections, and ordering.
   Filtered queries resnapshot from committed table changes while unfiltered
