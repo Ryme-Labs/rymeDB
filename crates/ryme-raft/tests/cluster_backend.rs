@@ -201,6 +201,73 @@ async fn configured_range_owner_limits_follower_materialization() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn single_owner_write_from_follower_routes_through_mesh() {
+    let root =
+        std::env::temp_dir().join(format!("ryme-write-route-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut listeners = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for id in 0..3 {
+        let peers: Vec<String> = addrs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| *i != id)
+            .map(|(_, address)| address.to_string())
+            .collect();
+        let peer_ids: Vec<usize> = (0..3).filter(|i| *i != id).collect();
+        let node = Node::open(id, peers, peer_ids, &root.join(format!("n{id}"))).unwrap();
+        tasks.push(node.spawn(listeners.remove(0)));
+        nodes.push(node);
+    }
+    let backends: Vec<ClusterBackend> = nodes.iter().cloned().map(ClusterBackend::new).collect();
+    let leader = wait_leader(&nodes, None).await;
+    let owner = (leader + 1) % nodes.len();
+    let client = (leader + 2) % nodes.len();
+    let mut start = b"s".to_vec();
+    start.push(0);
+    let placement = RangeOwner { start, end: Vec::new(), owner, epoch: 1 };
+    for node in &nodes {
+        node.set_range_owners(vec![placement.clone()]);
+    }
+
+    let mut seed = backends[leader].begin();
+    backends[leader].put(&mut seed, key("seed"), b"seed".to_vec());
+    backends[leader].commit(seed).await.unwrap();
+
+    let mut txn = backends[client].begin();
+    backends[client].put(&mut txn, key("routed"), b"from-follower".to_vec());
+    backends[client].commit(txn).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let owner_value = nodes[owner].read_latest(&key("routed")).await.unwrap();
+        if owner_value == Some(b"from-follower".to_vec()) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "routed write did not reach owner");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        nodes[leader].read_latest(&key("routed")).await.unwrap(),
+        Some(b"from-follower".to_vec())
+    );
+    assert_eq!(nodes[client].read_latest(&key("routed")).await.unwrap(), None);
+
+    for (node, task) in nodes.iter().zip(tasks) {
+        node.shutdown(task);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

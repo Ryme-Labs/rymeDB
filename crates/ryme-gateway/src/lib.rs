@@ -264,6 +264,20 @@ where
         txn
     }
 
+    async fn read_for_write(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        key: &RecordKey,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(reader) = self.remote_reader.as_ref() else {
+            return self.manager.get(txn, key);
+        };
+        match reader.read(key.clone()).await? {
+            RemoteRead::Local => self.manager.get(txn, key),
+            RemoteRead::Value { value, .. } => Ok(value),
+        }
+    }
+
     fn reject_if_read_only(&self) -> Result<()> {
         if self.read_only {
             return Err(RymeError::ReadOnly(String::from("read-only follower")));
@@ -338,7 +352,7 @@ where
         self.policies.check_write_row(principal, table, &value)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.begin();
-        let before = self.manager.get(&mut txn, &key)?;
+        let before = self.read_for_write(&mut txn, &key).await?;
         match expires_at {
             Some(ts) => self.manager.put_with_ttl(&mut txn, key, value.clone(), ts),
             None => self.manager.put(&mut txn, key, value.clone()),
@@ -372,7 +386,7 @@ where
         self.policies.check_write(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.begin();
-        let Some(current) = self.manager.get(&mut txn, &key)? else {
+        let Some(current) = self.read_for_write(&mut txn, &key).await? else {
             return Ok(false);
         };
         if !self.policies.row_allowed(principal, table, &current)? {
@@ -442,7 +456,7 @@ where
         self.policies.check_write(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.begin();
-        let Some(current) = self.manager.get(&mut txn, &key)? else {
+        let Some(current) = self.read_for_write(&mut txn, &key).await? else {
             return Err(RymeError::NotFound(String::from("row")));
         };
         if !self.policies.row_allowed(principal, table, &current)? {

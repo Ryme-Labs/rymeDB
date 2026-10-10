@@ -1,5 +1,10 @@
 # Changelog
 
+- Single-owner, write-only cluster transactions now route through the
+  configured range owner and forward to the current Raft leader when needed.
+  Read-dependent, multi-owner, and cross-range transactions retain the
+  existing transactional path until a distributed transaction coordinator is
+  available.
 - Configured range maps now make live follower applies materialize only local
   range keys while retaining all committed keys for conflict detection. The
   global leader and recovery path still keep the complete state, and write

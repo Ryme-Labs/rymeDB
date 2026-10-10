@@ -1,7 +1,7 @@
 use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
 use ryme_storage::{RecordKey, TableVersion};
-use ryme_txn::{decode_writes, now_unix, TxnManager};
+use ryme_txn::{decode_writes, encode_writes, now_unix, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -87,6 +87,12 @@ pub(crate) enum Rpc {
     },
     RangeReadBatchResponse {
         values: Vec<(Option<Vec<u8>>, Option<u64>)>,
+    },
+    ProposeWrite {
+        payload: Vec<u8>,
+    },
+    ProposeWriteResponse {
+        commit_ts: u64,
     },
     AppendRequest {
         term: u64,
@@ -424,6 +430,7 @@ struct Inner {
     observed_epoch: u64,
     campaign_now: bool,
     leader_contact_ms: u64,
+    leader_id: Option<usize>,
 }
 
 impl Inner {
@@ -657,6 +664,7 @@ impl Node {
                 observed_epoch: 0,
                 campaign_now: false,
                 leader_contact_ms: 0,
+                leader_id: None,
             })),
             manager,
             write_lock: Arc::new(Mutex::new(())),
@@ -865,6 +873,7 @@ impl Node {
             inner.term += 1;
             inner.role = Role::Candidate;
             inner.voted_for = Some(self.id);
+            inner.leader_id = None;
             let _ = inner.persist_meta();
             let (last_term, last_index) = inner.last_position();
             (inner.term, last_term, last_index)
@@ -884,6 +893,7 @@ impl Node {
                     inner.term = peer_term;
                     inner.role = Role::Follower;
                     inner.voted_for = None;
+                    inner.leader_id = None;
                     let _ = inner.persist_meta();
                     return;
                 }
@@ -900,6 +910,7 @@ impl Node {
         let win_joint = inner.joint.as_ref().map(|joint| votes_win(&votes, joint)).unwrap_or(true);
         if win_current && win_joint {
             inner.role = Role::Leader;
+            inner.leader_id = Some(self.id);
             let last = inner.last_index();
             inner.next_index.clear();
             inner.acks.clear();
@@ -918,6 +929,7 @@ impl Node {
             }
         } else {
             inner.role = Role::Follower;
+            inner.leader_id = None;
         }
     }
 
@@ -952,6 +964,7 @@ impl Node {
                             inner.term = peer_term;
                             inner.role = Role::Follower;
                             inner.voted_for = None;
+                            inner.leader_id = None;
                             let _ = inner.persist_meta();
                         }
                         return false;
@@ -1239,7 +1252,7 @@ impl Node {
         self.reconcile_pools(&members);
     }
 
-    async fn serve_connection<S>(&self, mut socket: S) -> Result<()>
+    async fn serve_connection<S>(self: &Arc<Self>, mut socket: S) -> Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -1265,7 +1278,7 @@ impl Node {
         }
     }
 
-    async fn handle_rpc(&self, rpc: Rpc) -> Result<Rpc> {
+    async fn handle_rpc(self: &Arc<Self>, rpc: Rpc) -> Result<Rpc> {
         match rpc {
             Rpc::VoteRequest { term, candidate, last_term, last_index } => {
                 let mut inner = self.inner.lock().await;
@@ -1320,6 +1333,7 @@ impl Node {
                     let _ = inner.persist_meta();
                 }
                 inner.role = Role::Follower;
+                inner.leader_id = None;
                 inner.campaign_now = true;
                 Ok(Rpc::TransferResponse { term: inner.term, accepted: true })
             }
@@ -1336,6 +1350,14 @@ impl Node {
                 }
                 self.apply_presence(payload)?;
                 Ok(Rpc::PresenceResponse { ok: true })
+            }
+            Rpc::ProposeWrite { payload } => {
+                let writes = decode_writes(&payload)?;
+                if writes.is_empty() {
+                    return Err(RymeError::InvalidArgument(String::from("writes")));
+                }
+                let commit_ts = self.forward_write_to_leader(writes).await?;
+                Ok(Rpc::ProposeWriteResponse { commit_ts })
             }
             Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows, tenant, database } => {
                 let snapshot = self.snapshot_range_for(
@@ -1360,14 +1382,7 @@ impl Node {
                 let values = self.read_range_values(&keys, read_ts)?;
                 Ok(Rpc::RangeReadBatchResponse { values })
             }
-            Rpc::AppendRequest {
-                term,
-                leader: _,
-                prev_index,
-                prev_term,
-                entries,
-                leader_commit,
-            } => {
+            Rpc::AppendRequest { term, leader, prev_index, prev_term, entries, leader_commit } => {
                 let (result, applied_now) = {
                     let mut inner = self.inner.lock().await;
                     if term < inner.term {
@@ -1386,6 +1401,7 @@ impl Node {
                             inner.voted_for = None;
                         }
                         inner.role = Role::Follower;
+                        inner.leader_id = Some(leader);
                         inner.bump_reset();
                         inner.leader_contact_ms = now_ms();
                         let outcome = append_to_log(
@@ -1438,6 +1454,9 @@ impl Node {
             | Rpc::RangeReadBatchResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
+            Rpc::ProposeWriteResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
         }
     }
 
@@ -1453,6 +1472,59 @@ impl Node {
             }
         }
         self.commit_txn(txn).await
+    }
+
+    async fn known_leader(&self) -> Option<usize> {
+        let inner = self.inner.lock().await;
+        if inner.role == Role::Leader {
+            Some(self.id)
+        } else {
+            inner.leader_id
+        }
+    }
+
+    async fn forward_write_to_leader(
+        self: &Arc<Self>,
+        writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+    ) -> Result<u64> {
+        let Some(leader) = self.known_leader().await else {
+            return Err(RymeError::Unavailable(String::from("leader unknown")));
+        };
+        if leader == self.id {
+            return self.propose_write(writes).await;
+        }
+        let pool = self
+            .pool_for(leader)
+            .ok_or_else(|| RymeError::Unavailable(String::from("leader unavailable")))?;
+        let payload = encode_writes(&writes)?;
+        match pool.roundtrip(&Rpc::ProposeWrite { payload }).await? {
+            Rpc::ProposeWriteResponse { commit_ts } => Ok(commit_ts),
+            _ => Err(RymeError::Corrupt(String::from("write forward rpc"))),
+        }
+    }
+
+    pub async fn propose_write_on(
+        self: &Arc<Self>,
+        owner: usize,
+        writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+    ) -> Result<u64> {
+        if writes.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("writes")));
+        }
+        if self.is_leader().await {
+            return self.propose_write(writes).await;
+        }
+        if owner == self.id {
+            return self.forward_write_to_leader(writes).await;
+        }
+        let pool = self
+            .pool_for(owner)
+            .ok_or_else(|| RymeError::Unavailable(String::from("range owner unavailable")))?;
+        let payload = encode_writes(&writes)?;
+        match pool.roundtrip(&Rpc::ProposeWrite { payload }).await? {
+            Rpc::ProposeWriteResponse { commit_ts } => Ok(commit_ts),
+            _ => Err(RymeError::Corrupt(String::from("range write rpc"))),
+        }
     }
 
     pub async fn propose_metadata(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
@@ -2119,12 +2191,16 @@ impl Node {
             .map(|range| (range.owner, range.epoch))
     }
 
-    pub fn owns_range_key(&self, key: &RecordKey) -> bool {
+    pub fn range_owner_key(&self, key: &RecordKey) -> Option<usize> {
         let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
         routing.extend_from_slice(key.table.as_bytes());
         routing.push(0);
         routing.extend_from_slice(&key.pk);
-        self.range_owner(&routing).map(|(owner, _)| owner == self.id).unwrap_or(true)
+        self.range_owner(&routing).map(|(owner, _)| owner)
+    }
+
+    pub fn owns_range_key(&self, key: &RecordKey) -> bool {
+        self.range_owner_key(key).map(|owner| owner == self.id).unwrap_or(true)
     }
 
     pub fn read_range_value(
@@ -2252,7 +2328,32 @@ impl ryme_txn::TxnBackend for ClusterBackend {
         txn: ryme_txn::Transaction,
     ) -> impl std::future::Future<Output = Result<u64>> + Send {
         let node = self.node.clone();
-        async move { node.commit_txn(txn).await }
+        let routed = if txn.read_keys().is_empty() && txn.scanned_tables().is_empty() {
+            let owners = node.range_owners();
+            let owner = if owners.is_empty() {
+                None
+            } else {
+                txn.writes()
+                    .keys()
+                    .map(|key| node.range_owner_key(key))
+                    .try_fold(None, |current, next| match (current, next) {
+                        (None, Some(owner)) => Ok(Some(owner)),
+                        (Some(existing), Some(owner)) if existing == owner => Ok(current),
+                        _ => Err(()),
+                    })
+                    .ok()
+                    .flatten()
+            };
+            owner.map(|owner| (owner, txn.writes().clone()))
+        } else {
+            None
+        };
+        async move {
+            match routed {
+                Some((owner, writes)) => node.propose_write_on(owner, writes).await,
+                None => node.commit_txn(txn).await,
+            }
+        }
     }
 
     fn scan(
