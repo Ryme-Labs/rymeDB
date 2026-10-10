@@ -703,6 +703,9 @@ export interface SubscribeOptions {
   apiKey?: string;
   branch?: string;
   limit?: number;
+  select?: string;
+  order?: string;
+  filters?: Record<string, string>;
   from?: number;
   fromSequence?: number;
   reconnect?: boolean;
@@ -1076,6 +1079,12 @@ export function subscribeQuery(
   let query = `/v1/query-stream?table=${encodeURIComponent(table)}`;
   if (options?.branch !== undefined) query += `&branch=${encodeURIComponent(options.branch)}`;
   if (options?.limit !== undefined) query += `&limit=${options.limit}`;
+  if (options?.select !== undefined) query += `&select=${encodeURIComponent(options.select)}`;
+  if (options?.order !== undefined) query += `&order=${encodeURIComponent(options.order)}`;
+  for (const [field, expression] of Object.entries(options?.filters ?? {}).sort(([left], [right]) =>
+    left.localeCompare(right))) {
+    query += `&${encodeURIComponent(field)}=${encodeURIComponent(expression)}`;
+  }
   return openSocket(base, query, options, (data) => {
     onMessage(JSON.parse(data) as QueryMessage);
   });

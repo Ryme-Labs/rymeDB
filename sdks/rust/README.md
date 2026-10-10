@@ -31,8 +31,10 @@ For automatic reconnects with exact sequence-based replay, use
 `subscribe_table_resumable`. Its `recv` method keeps retrying with bounded
 backoff until the subscription is closed or the retry limit is reached.
 
-`subscribe_query`, `subscribe_broadcast`, and `subscribe_presence` are also
-available. `presence_join_with_state` accepts JSON state and an optional TTL;
+`subscribe_query`, `subscribe_query_with_options`, `subscribe_broadcast`, and
+`subscribe_presence` are also available. The query options method accepts
+PostgREST-style `select`, `order`, and field filters while keeping the result
+reactive. `presence_join_with_state` accepts JSON state and an optional TTL;
 `presence_leave` and `presence_list` complete the presence controls. Presence
 streams begin with a state snapshot followed by live join/leave events. HTTP and
 WebSocket URLs automatically switch from `http`/`https` to `ws`/`wss`.

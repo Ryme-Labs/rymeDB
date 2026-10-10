@@ -38,7 +38,8 @@ client also exposes `subscribeQuery`, `subscribeBroadcast`, and
 `subscribePresence`; presence subscriptions begin with a snapshot and then
 deliver join/leave frames. `presenceJoin` also accepts raw JSON state and an
 optional TTL for presence refreshes. Callbacks receive complete JSON text
-frames.
+frames. The extended `subscribeQuery` overload accepts `select`, `order`, and
+PostgREST-style field filters for reactive filtered queries.
 
 For Supabase-compatible channels, use `subscribeSupabaseChannel`. It supports
 the broadcast and `postgres_changes` join configuration while keeping callback

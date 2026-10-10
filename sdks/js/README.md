@@ -37,8 +37,11 @@ Notes:
   `status` and `body`.
 - `kvGet` returns the raw value bytes as text. Parse JSON yourself when your
   values are JSON.
-- `subscribeQuery(base, table, onMessage, { limit?, branch?, apiKey? })` tails
-  `/v1/query-stream`: first a `snapshot` message, then `update` messages.
+- `subscribeQuery(base, table, onMessage, { limit?, branch?, select?, order?,
+  filters?, apiKey? })` tails `/v1/query-stream`: first a `snapshot` message,
+  then `update` messages. Filtered, projected, or ordered queries are
+  resnapshotted from the committed table change stream so the result stays
+  current instead of exposing unrelated rows.
 - `subscribeTable(base, table, onMessage, { apiKey?, branch?, from? })` tails
   `/v1/stream`; subscriptions reconnect by default and resume from the latest
   received `sequence`. Set `reconnect: false` for one-shot behavior or tune

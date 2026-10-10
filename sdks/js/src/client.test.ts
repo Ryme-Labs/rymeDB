@@ -406,12 +406,15 @@ describe("RymeHttpClient", () => {
       (message) => {
         received.push(message);
       },
-      { limit: 100 },
+      { limit: 100, select: "key,body", order: "body.asc", filters: { room: "eq.lobby" } },
     );
     await sub.ready;
     await waitFor(() => received.length === 2);
     sub.close();
-    assert.equal(requests[0], "/v1/query-stream?table=docs&limit=100");
+    assert.equal(
+      requests[0],
+      "/v1/query-stream?table=docs&limit=100&select=key%2Cbody&order=body.asc&room=eq.lobby",
+    );
     assert.equal(received[0]?.type, "snapshot");
     assert.equal(received[1]?.type, "update");
     assert.equal(received[1]?.commit, 8);

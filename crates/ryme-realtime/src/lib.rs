@@ -409,6 +409,28 @@ impl Realtime {
         log.iter().filter(|record| record.sequence > after_sequence).take(limit).cloned().collect()
     }
 
+    pub fn latest_change_commit_branch(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+    ) -> u64 {
+        let key = branch_topic_key(tenant, database, branch, table);
+        let shard = self.table_topic_shard(&key);
+        self.table_topics
+            .get(shard)
+            .and_then(|topics| topics.lock().ok())
+            .and_then(|topics| {
+                topics
+                    .history
+                    .get(&key)
+                    .and_then(|history| history.back())
+                    .map(|record| record.commit_ts)
+            })
+            .unwrap_or(0)
+    }
+
     pub fn history_capacity(&self) -> usize {
         self.capacity
     }

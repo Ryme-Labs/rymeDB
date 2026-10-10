@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -487,10 +488,25 @@ public final class RymeClient {
     /** Subscribe to a live query snapshot/update stream. */
     public CompletableFuture<WebSocket> subscribeQuery(String table, String branch, Integer limit,
                                                         Consumer<String> onMessage) {
+        return subscribeQuery(table, branch, limit, null, null, Map.of(), onMessage);
+    }
+
+    /** Subscribe to a filtered, projected, or ordered reactive query. */
+    public CompletableFuture<WebSocket> subscribeQuery(String table, String branch, Integer limit,
+                                                        String select, String order,
+                                                        Map<String, String> filters,
+                                                        Consumer<String> onMessage) {
         List<String> params = new ArrayList<>();
         params.add("table=" + encode(table));
         if (branch != null) params.add("branch=" + encode(branch));
         if (limit != null) params.add("limit=" + limit);
+        if (select != null) params.add("select=" + encode(select));
+        if (order != null) params.add("order=" + encode(order));
+        if (filters != null) {
+            filters.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .forEach(entry -> params.add(encode(entry.getKey()) + "=" + encode(entry.getValue())));
+        }
         return subscribe("/v1/query-stream", params, onMessage);
     }
 

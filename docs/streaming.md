@@ -86,6 +86,15 @@ If the consumer lags, the server re-sends a fresh full snapshot instead of
 dropping data, so a query-stream consumer resynchronizes automatically —
 unlike the raw change feed.
 
+Query streams can use the same PostgREST-style query controls as REST:
+`select=key,body`, `order=created_at.desc`, and field filters such as
+`room_id=eq.lobby`, `status=in.(queued,running)`, or
+`or=(status.eq.ready,status.eq.queued)`. The filtered/projected/ordered mode
+tracks committed table changes and emits a fresh current result on each change;
+it never forwards rows that fail the query predicate. Projected rows retain
+the compatibility `pk` and raw `value` fields alongside selected JSON fields.
+The unqualified `table` stream keeps the lower-overhead table update path.
+
 Query streams use the same branch selection rules as change feeds. A branch
 snapshot reads the branch's copy-on-write view, and later updates come only
 from that branch; omitting `branch` selects `main`.

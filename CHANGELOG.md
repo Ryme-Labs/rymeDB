@@ -1,5 +1,9 @@
 # Changelog
 
+- Query streams now support PostgREST-style filters, projections, and ordering.
+  Filtered queries resnapshot from committed table changes while unfiltered
+  streams retain the low-overhead table update path; all three SDKs expose the
+  query options.
 - RESP3 negotiation now accepts `HELLO 3`, emits the RESP3 hello map and null
   type, and uses push frames for Pub/Sub subscriptions and deliveries.
 - RESP Pub/Sub now uses the realtime broadcast bus when configured, allowing

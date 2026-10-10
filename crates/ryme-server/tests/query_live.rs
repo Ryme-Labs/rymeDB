@@ -176,6 +176,31 @@ async fn live_query_snapshot_update_reconnect() {
     assert!(!pks.contains(&String::from("k1")));
     assert!(pks.contains(&String::from("k2")));
     second.close(None).await.unwrap();
+
+    let (status, _) =
+        http_request(http, "PUT /v1/kv/messages/a", br#"{"room":"lobby","body":"z"}"#).await;
+    assert_eq!(status, 200);
+    let (status, _) =
+        http_request(http, "PUT /v1/kv/messages/b", br#"{"room":"other","body":"x"}"#).await;
+    assert_eq!(status, 200);
+    let filtered_url = format!(
+        "ws://{http}/v1/query-stream?table=messages&room=eq.lobby&select=key,body&order=body.asc&api_key={KEY}"
+    );
+    let (mut filtered, _) = tokio_tungstenite::connect_async(filtered_url).await.unwrap();
+    let snapshot = next_text(&mut filtered).await;
+    assert_eq!(snapshot["type"], "snapshot");
+    assert_eq!(row_pks(&snapshot), vec![String::from("a")], "{snapshot}");
+    assert_eq!(snapshot["rows"][0]["body"], "z");
+    assert!(snapshot["rows"][0].get("room").is_none());
+
+    let (status, _) =
+        http_request(http, "PUT /v1/kv/messages/c", br#"{"room":"lobby","body":"a"}"#).await;
+    assert_eq!(status, 200);
+    let update = next_text(&mut filtered).await;
+    assert_eq!(update["type"], "update");
+    assert_eq!(row_pks(&update), vec![String::from("c"), String::from("a")]);
+    assert_eq!(update["rows"][0]["body"], "a");
+    filtered.close(None).await.unwrap();
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }

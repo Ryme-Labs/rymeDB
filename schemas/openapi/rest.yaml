@@ -1770,6 +1770,10 @@ paths:
   /v1/query-stream:
     get:
       tags: [streams]
+      description: >-
+        Opens a live query stream. In addition to table, limit, and branch,
+        PostgREST-style select/order controls and field filter query
+        parameters such as status=eq.ready are supported.
       parameters:
         - name: table
           in: query
@@ -1780,6 +1784,20 @@ paths:
           in: query
           schema:
             type: integer
+        - name: branch
+          in: query
+          schema:
+            type: string
+        - name: select
+          in: query
+          schema:
+            type: string
+          description: comma-separated JSON fields to project in reactive query rows
+        - name: order
+          in: query
+          schema:
+            type: string
+          description: PostgREST-style order expression, for example created_at.desc
         - name: api_key
           in: query
           schema:

@@ -753,6 +753,33 @@ pub struct QueryStreamQuery {
     pub limit: Option<usize>,
     pub api_key: Option<String>,
     pub branch: Option<String>,
+    pub select: Option<String>,
+    pub order: Option<String>,
+    #[serde(flatten)]
+    pub filters: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReactiveQuerySpec {
+    filters: Vec<(String, String)>,
+    select: Option<String>,
+    order: Option<String>,
+}
+
+impl ReactiveQuerySpec {
+    fn from_query(query: &QueryStreamQuery) -> Self {
+        let mut filters = query
+            .filters
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        filters.sort_by(|left, right| left.0.cmp(&right.0));
+        Self { filters, select: query.select.clone(), order: query.order.clone() }
+    }
+
+    fn is_reactive(&self) -> bool {
+        !self.filters.is_empty() || self.select.is_some() || self.order.is_some()
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2904,6 +2931,13 @@ fn filter_rows_by_query(rows: Vec<(Vec<u8>, Vec<u8>)>, raw: &str) -> Vec<(Vec<u8
             }
         })
         .collect();
+    filter_rows_by_params(rows, &filters)
+}
+
+fn filter_rows_by_params(
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    filters: &[(String, String)],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     if filters.is_empty() {
         return rows;
     }
@@ -8938,6 +8972,7 @@ async fn query_stream(
     let tenant = principal.tenant.clone();
     let database = state.database.clone();
     let table = query.table.clone();
+    let query_spec = ReactiveQuerySpec::from_query(&query);
     let qos = state.qos.clone();
     let rls_executor =
         state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
@@ -8955,6 +8990,7 @@ async fn query_stream(
             &branch,
             limit,
             branch_commit,
+            query_spec,
         )
         .await;
     })
@@ -8973,7 +9009,26 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
     branch: &str,
     limit: usize,
     initial_commit: u64,
+    query_spec: ReactiveQuerySpec,
 ) {
+    if query_spec.is_reactive() {
+        forward_reactive_query(
+            socket,
+            backend,
+            realtime,
+            qos,
+            rls_executor,
+            tenant,
+            database,
+            table,
+            branch,
+            limit,
+            initial_commit,
+            query_spec,
+        )
+        .await;
+        return;
+    }
     let mut receiver = realtime.query_subscribe_branch(tenant, database, branch, table, limit);
     let (sender, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sender);
@@ -9051,6 +9106,122 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             branch,
                             limit,
                             current_commit,
+                        );
+                        if !queued {
+                            break;
+                        }
+                        snapshot_commit = commit;
+                    }
+                    Err(_) => break,
+                }
+            }
+            next = incoming.next() => {
+                match next {
+                    Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
+                        if !queue_realtime_message(
+                            &outgoing,
+                            axum::extract::ws::Message::Pong(payload),
+                        ) {
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
+    socket: axum::extract::ws::WebSocket,
+    backend: B,
+    realtime: Realtime,
+    qos: Arc<Mutex<QosRegistry>>,
+    rls_executor: Executor<BranchStorage>,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    branch: &str,
+    limit: usize,
+    initial_commit: u64,
+    spec: ReactiveQuerySpec,
+) {
+    let mut receiver = realtime.subscribe_branch(tenant, database, branch, table);
+    let (sender, mut incoming) = socket.split();
+    let outgoing = start_realtime_writer(sender);
+    let (mut snapshot_commit, snapshot_queued) = send_reactive_query_snapshot(
+        &outgoing,
+        &backend,
+        &qos,
+        &rls_executor,
+        tenant,
+        database,
+        table,
+        branch,
+        limit,
+        initial_commit,
+        &spec,
+        "snapshot",
+    );
+    if !snapshot_queued {
+        return;
+    }
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if !queue_realtime_message(
+                    &outgoing,
+                    axum::extract::ws::Message::Ping(Vec::new()),
+                ) {
+                    break;
+                }
+            }
+            message = receiver.recv() => {
+                match message {
+                    Ok(change) => {
+                        if change.commit_ts <= snapshot_commit {
+                            continue;
+                        }
+                        let (commit, queued) = send_reactive_query_snapshot(
+                            &outgoing,
+                            &backend,
+                            &qos,
+                            &rls_executor,
+                            tenant,
+                            database,
+                            table,
+                            branch,
+                            limit,
+                            change.commit_ts,
+                            &spec,
+                            "update",
+                        );
+                        if !queued {
+                            break;
+                        }
+                        snapshot_commit = commit;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let current_commit = initial_commit.max(
+                            realtime.latest_change_commit_branch(tenant, database, branch, table),
+                        );
+                        let (commit, queued) = send_reactive_query_snapshot(
+                            &outgoing,
+                            &backend,
+                            &qos,
+                            &rls_executor,
+                            tenant,
+                            database,
+                            table,
+                            branch,
+                            limit,
+                            current_commit,
+                            &spec,
+                            "snapshot",
                         );
                         if !queued {
                             break;
@@ -9175,36 +9346,47 @@ fn scan_realtime_rows_with_executor<B: TxnBackend>(
     database: &str,
     table: &str,
     limit: usize,
+    read_ts: Option<u64>,
+    filters: &[(String, String)],
+    order: Option<&str>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     if limit == 0 {
         return Vec::new();
     }
     let mut txn = backend.begin();
+    if let Some(read_ts) = read_ts {
+        txn.restamp(read_ts);
+    }
     let mut visible = Vec::with_capacity(limit);
     let mut start_after = None;
+    let full_order_scan = rest_order_requires_full_scan(order);
+    let page_limit = if full_order_scan { 256 } else { limit };
     loop {
         let page = match start_after.as_deref() {
             Some(start_after) => backend
-                .scan_after(&mut txn, tenant, database, table, start_after, limit)
+                .scan_after(&mut txn, tenant, database, table, start_after, page_limit)
                 .unwrap_or_default(),
-            None => backend.scan(&mut txn, tenant, database, table, limit).unwrap_or_default(),
+            None => backend.scan(&mut txn, tenant, database, table, page_limit).unwrap_or_default(),
         };
         if page.is_empty() {
             break;
         }
         let page_len = page.len();
         start_after = page.last().map(|(pk, _)| pk.clone());
-        visible.extend(
-            page.into_iter().filter(|(_, value)| rls_executor.row_allowed_by_rls(table, value)),
-        );
-        if visible.len() >= limit {
-            visible.truncate(limit);
+        let page = page
+            .into_iter()
+            .filter(|(_, value)| rls_executor.row_allowed_by_rls(table, value))
+            .collect::<Vec<_>>();
+        visible.extend(filter_rows_by_params(page, filters));
+        if !full_order_scan && visible.len() >= limit {
             break;
         }
-        if page_len < limit {
+        if page_len < page_limit {
             break;
         }
     }
+    let mut visible = order_rows(visible, order);
+    visible.truncate(limit);
     visible
 }
 
@@ -9220,8 +9402,17 @@ fn send_query_snapshot<B: TxnBackend>(
     limit: usize,
     commit: u64,
 ) -> (u64, bool) {
-    let rows =
-        scan_realtime_rows_with_executor(backend, rls_executor, tenant, database, table, limit);
+    let rows = scan_realtime_rows_with_executor(
+        backend,
+        rls_executor,
+        tenant,
+        database,
+        table,
+        limit,
+        None,
+        &[],
+        None,
+    );
     let snapshot = serde_json::json!({
         "type": "snapshot",
         "commit": commit,
@@ -9235,6 +9426,62 @@ fn send_query_snapshot<B: TxnBackend>(
             .collect::<Vec<_>>(),
     });
     let text = snapshot.to_string();
+    if !stream_realtime_event(qos, tenant, text.len() as u64) {
+        return (commit, false);
+    }
+    (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text)))
+}
+
+fn send_reactive_query_snapshot<B: TxnBackend>(
+    outgoing: &RealtimeOutgoing,
+    backend: &B,
+    qos: &Arc<Mutex<QosRegistry>>,
+    rls_executor: &Executor<BranchStorage>,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    branch: &str,
+    limit: usize,
+    commit: u64,
+    spec: &ReactiveQuerySpec,
+    kind: &str,
+) -> (u64, bool) {
+    let rows = scan_realtime_rows_with_executor(
+        backend,
+        rls_executor,
+        tenant,
+        database,
+        table,
+        limit,
+        Some(commit),
+        &spec.filters,
+        spec.order.as_deref(),
+    );
+    let payload_rows = rows
+        .into_iter()
+        .map(|(pk, value)| {
+            let mut row = rest_project_row(rest_row_to_json(&pk, &value), spec.select.as_deref());
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    String::from("pk"),
+                    serde_json::Value::String(String::from_utf8_lossy(&pk).to_string()),
+                );
+                object.insert(
+                    String::from("value"),
+                    serde_json::Value::String(String::from_utf8_lossy(&value).to_string()),
+                );
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let text = serde_json::json!({
+        "type": kind,
+        "commit": commit,
+        "branch": branch,
+        "rows": payload_rows,
+        "truncated": false,
+    })
+    .to_string();
     if !stream_realtime_event(qos, tenant, text.len() as u64) {
         return (commit, false);
     }

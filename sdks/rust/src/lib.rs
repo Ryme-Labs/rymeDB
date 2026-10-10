@@ -522,6 +522,18 @@ impl RymeClient {
         branch: Option<&str>,
         limit: Option<usize>,
     ) -> Result<RealtimeSubscription, ClientError> {
+        self.subscribe_query_with_options(table, branch, limit, None, None, &[]).await
+    }
+
+    pub async fn subscribe_query_with_options(
+        &self,
+        table: &str,
+        branch: Option<&str>,
+        limit: Option<usize>,
+        select: Option<&str>,
+        order: Option<&str>,
+        filters: &[(String, String)],
+    ) -> Result<RealtimeSubscription, ClientError> {
         let mut params = vec![(String::from("table"), table.to_string())];
         if let Some(branch) = branch {
             params.push((String::from("branch"), branch.to_string()));
@@ -529,6 +541,15 @@ impl RymeClient {
         if let Some(limit) = limit {
             params.push((String::from("limit"), limit.to_string()));
         }
+        if let Some(select) = select {
+            params.push((String::from("select"), select.to_string()));
+        }
+        if let Some(order) = order {
+            params.push((String::from("order"), order.to_string()));
+        }
+        let mut filters = filters.to_vec();
+        filters.sort_by(|left, right| left.0.cmp(&right.0));
+        params.extend(filters);
         self.subscribe("/v1/query-stream", params).await
     }
 
