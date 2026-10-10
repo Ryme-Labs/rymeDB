@@ -224,8 +224,10 @@ fetch missing rows from their configured range owner and add the result to the
 same transaction read set. Filtered scans, joins that depend on remote rows,
 and read-only aggregate queries now fan out bounded range pages, merge them by
 primary key, and preserve the transaction snapshot. Scan-based UPDATE/DELETE,
-schema-dependent views, and per-range 2PC remain separate work, so this is not
-yet complete owner-aware transaction routing.
+UPDATE FROM, DELETE USING, and INSERT SELECT now use those pages before
+staging their writes. Constraint cascades that require additional remote
+reads, schema-dependent views, and per-range 2PC remain separate work, so this
+is not yet complete owner-aware transaction routing.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

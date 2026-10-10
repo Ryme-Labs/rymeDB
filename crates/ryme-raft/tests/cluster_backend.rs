@@ -371,6 +371,27 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
         (b"z".to_vec(), b"right".to_vec()),
     ]));
 
+    let mut update_txn = executor.begin_transaction(Isolation::Serializable);
+    let (_, changes) = executor
+        .execute_in_transaction(
+            &mut update_txn,
+            ryme_sql::parse("UPDATE s SET value = 'changed' WHERE id = 'z'").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changes.len(), 1);
+    executor.commit_transaction(update_txn, changes).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if nodes[upper_owner].read_latest(&key("z")).await.unwrap()
+            == Some(b"changed".to_vec())
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "remote update did not converge");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     for (node, task) in nodes.iter().zip(tasks) {
         node.shutdown(task);
     }

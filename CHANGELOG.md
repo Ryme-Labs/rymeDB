@@ -1,5 +1,9 @@
 # Changelog
 
+- Scan-based SQL transaction mutations now consume owner-routed pages before
+  staging UPDATE, DELETE, UPDATE FROM, DELETE USING, and INSERT SELECT
+  changes. The existing global leader commit path still provides atomic
+  forwarding; remote constraint cascades and per-range 2PC remain future work.
 - Read-only SQL transaction scans now fan out bounded range pages to configured
   owners, merge them by primary key, preserve snapshot timestamps, and merge
   staged writes before filtering and ordering. This covers SELECT, aggregate,

@@ -8753,8 +8753,8 @@ where
         source_filter: Vec<Predicate>,
     ) -> Result<Vec<TransactionChange>> {
         self.reject_if_read_only()?;
-        let targets = self.scan_rows(txn, &table, &filter, usize::MAX)?;
-        let sources = self.scan_rows(txn, &source_table, &source_filter, usize::MAX)?;
+        let targets = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
+        let sources = self.scan_rows_async(txn, &source_table, &source_filter, usize::MAX).await?;
         let mut changes = Vec::new();
         for (pk, before) in targets {
             self.enforce_rls(&table, &before)?;
@@ -8786,7 +8786,8 @@ where
             if new_pk != pk
                 && self
                     .manager
-                    .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &new_pk))?
+                    .get_async(txn, &RecordKey::new(&self.tenant, &self.database, &table, &new_pk))
+                    .await?
                     .is_some()
             {
                 return Err(RymeError::Conflict(String::from("primary key exists")));
@@ -8831,8 +8832,8 @@ where
         source_filter: Vec<Predicate>,
     ) -> Result<Vec<TransactionChange>> {
         self.reject_if_read_only()?;
-        let targets = self.scan_rows(txn, &table, &filter, usize::MAX)?;
-        let sources = self.scan_rows(txn, &source_table, &source_filter, usize::MAX)?;
+        let targets = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
+        let sources = self.scan_rows_async(txn, &source_table, &source_filter, usize::MAX).await?;
         let mut changes = Vec::new();
         for (pk, value) in targets {
             self.enforce_rls(&table, &value)?;
@@ -11479,7 +11480,7 @@ where
             }
             Statement::UpdateWhere { table, assignments, filter } => {
                 self.reject_if_read_only()?;
-                let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
+                let rows = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, before) in rows {
                     self.enforce_rls(&table, &before)?;
@@ -11642,7 +11643,7 @@ where
             }
             Statement::DeleteWhere { table, filter } => {
                 self.reject_if_read_only()?;
-                let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
+                let rows = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, before) in rows {
                     self.enforce_rls(&table, &before)?;
@@ -12015,7 +12016,7 @@ where
         if source_columns.len() != target_columns.len() {
             return Err(RymeError::InvalidArgument(String::from("INSERT SELECT column count")));
         }
-        let rows = self.scan_rows(txn, &source_table, &filter, usize::MAX)?;
+        let rows = self.scan_rows_async(txn, &source_table, &filter, usize::MAX).await?;
         let values = rows
             .into_iter()
             .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
