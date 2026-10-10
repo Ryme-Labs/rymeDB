@@ -111,10 +111,15 @@ async fn owner_reader_serves_remote_gets() {
     let gateway = ryme_wire_resp::RespGateway::new(String::from("t"), String::from("d"))
         .with_remote_reader(ryme_wire_resp::RemoteReader::new(|key| async move {
             assert_eq!(key.table, "_kv");
-            assert_eq!(key.pk, b"remote".to_vec());
+            let value = match key.pk.as_slice() {
+                b"remote" => Some(b"owner-value".to_vec()),
+                b"other" => Some(b"other-value".to_vec()),
+                b"missing" => None,
+                _ => None,
+            };
             Ok(ryme_wire_resp::RemoteRead::Value {
-                value: Some(b"owner-value".to_vec()),
-                expires_at: None,
+                value,
+                expires_at: Some(ryme_txn::now_unix() + 60),
             })
         }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -123,6 +128,16 @@ async fn owner_reader_serves_remote_gets() {
         let _ = gateway.serve(listener).await;
     });
     assert_eq!(command(addr, &["GET", "remote"]).await, "$11\r\nowner-value");
+    assert_eq!(
+        command(addr, &["MGET", "remote", "other", "missing"]).await,
+        "*3\r\n$11\r\nowner-value\r\n$11\r\nother-value\r\n$-1"
+    );
+    assert_eq!(command(addr, &["EXISTS", "remote", "missing"]).await, ":1");
+    assert_eq!(command(addr, &["TYPE", "remote"]).await, "+string");
+    let ttl: i64 = command(addr, &["TTL", "remote"]).await[1..].parse().unwrap();
+    assert!((1..=60).contains(&ttl));
+    let pttl: i64 = command(addr, &["PTTL", "remote"]).await[1..].parse().unwrap();
+    assert!((1_000..=60_000).contains(&pttl));
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use mlua::{HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Value as LuaValue, VmState};
 use ryme_error::{Result, RymeError};
 pub use ryme_gateway::{RemoteRead, RemoteReader};
@@ -1522,17 +1523,102 @@ where
     }
 
     async fn remote_read_reply(&self, command: &RespCommand) -> Option<Vec<u8>> {
-        if command.name != "GET" || command.args.len() != 1 {
-            return None;
-        }
         let reader = self.remote_reader.as_ref()?;
-        let key = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
-        match reader.read(key).await {
-            Ok(RemoteRead::Local) => None,
-            Ok(RemoteRead::Value { value, .. }) => {
-                Some(value.map_or_else(encode_null, |value| encode_bulk(&value)))
+        match command.name.as_str() {
+            "GET" if command.args.len() == 1 => {
+                let key = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+                match reader.read(key).await {
+                    Ok(RemoteRead::Local) => None,
+                    Ok(RemoteRead::Value { value, .. }) => {
+                        Some(value.map_or_else(encode_null, |value| encode_bulk(&value)))
+                    }
+                    Err(error) => Some(encode_error(error.to_string())),
+                }
             }
-            Err(error) => Some(encode_error(error.to_string())),
+            "MGET" if !command.args.is_empty() => {
+                let results = join_all(command.args.iter().map(|key| {
+                    reader.read(RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
+                }))
+                .await;
+                let mut local = self.manager.begin();
+                let mut saw_remote = false;
+                let mut values = Vec::with_capacity(results.len());
+                for (key, result) in command.args.iter().zip(results) {
+                    match result {
+                        Ok(RemoteRead::Local) => values.push(
+                            match self.manager.get(
+                                &mut local,
+                                &RecordKey::new(&self.tenant, &self.database, KV_TABLE, key),
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => return Some(encode_error(error.to_string())),
+                            },
+                        ),
+                        Ok(RemoteRead::Value { value, .. }) => {
+                            saw_remote = true;
+                            values.push(value);
+                        }
+                        Err(error) => return Some(encode_error(error.to_string())),
+                    }
+                }
+                if saw_remote {
+                    Some(encode_array(values))
+                } else {
+                    None
+                }
+            }
+            "EXISTS" if !command.args.is_empty() => {
+                let results = join_all(command.args.iter().map(|key| {
+                    reader.read(RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
+                }))
+                .await;
+                let mut local = self.manager.begin();
+                let mut saw_remote = false;
+                let mut found = 0i64;
+                for (key, result) in command.args.iter().zip(results) {
+                    match result {
+                        Ok(RemoteRead::Local) => {
+                            match self.manager.get(
+                                &mut local,
+                                &RecordKey::new(&self.tenant, &self.database, KV_TABLE, key),
+                            ) {
+                                Ok(Some(_)) => found += 1,
+                                Ok(None) => {}
+                                Err(error) => return Some(encode_error(error.to_string())),
+                            }
+                        }
+                        Ok(RemoteRead::Value { value, .. }) => {
+                            saw_remote = true;
+                            if value.is_some() {
+                                found += 1;
+                            }
+                        }
+                        Err(error) => return Some(encode_error(error.to_string())),
+                    }
+                }
+                saw_remote.then(|| encode_integer(found))
+            }
+            "TYPE" if command.args.len() == 1 => {
+                let key = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+                match reader.read(key).await {
+                    Ok(RemoteRead::Local) => None,
+                    Ok(RemoteRead::Value { value, .. }) => {
+                        Some(encode_simple(if value.is_some() { "string" } else { "none" }))
+                    }
+                    Err(error) => Some(encode_error(error.to_string())),
+                }
+            }
+            "TTL" | "PTTL" if command.args.len() == 1 => {
+                let key = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+                match reader.read(key).await {
+                    Ok(RemoteRead::Local) => None,
+                    Ok(RemoteRead::Value { value, expires_at }) => Some(encode_integer(
+                        remote_ttl(value.is_some(), expires_at, command.name == "PTTL"),
+                    )),
+                    Err(error) => Some(encode_error(error.to_string())),
+                }
+            }
+            _ => None,
         }
     }
 
@@ -5614,6 +5700,26 @@ fn encode_array(items: Vec<Option<Vec<u8>>>) -> Vec<u8> {
         }
     }
     out
+}
+
+fn remote_ttl(present: bool, expires_at: Option<u64>, millis: bool) -> i64 {
+    let ttl = match (present, expires_at) {
+        (false, _) | (true, None) => -2,
+        (true, Some(0)) => -1,
+        (true, Some(ts)) => {
+            let now = ryme_txn::now_unix();
+            if ts <= now {
+                -2
+            } else {
+                (ts - now) as i64
+            }
+        }
+    };
+    if millis && ttl >= 0 {
+        ttl.saturating_mul(1000)
+    } else {
+        ttl
+    }
 }
 
 // Command handlers share one compact RESP2 encoder.  RESP2 scalar replies are
