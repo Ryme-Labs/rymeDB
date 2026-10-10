@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -91,9 +92,11 @@ pub(crate) enum Rpc {
     },
     ProposeWrite {
         payload: Vec<u8>,
+        route_generation: Option<u64>,
     },
     ProposeWriteResponse {
-        commit_ts: u64,
+        commit_ts: Option<u64>,
+        error: Option<RpcError>,
     },
     ProposeTransaction {
         payload: Vec<u8>,
@@ -613,6 +616,7 @@ pub struct Node {
     presence_hook: MetadataHookSlot,
     topic_hook: MetadataHookSlot,
     range_owners: std::sync::RwLock<Vec<RangeOwner>>,
+    range_generation: AtomicU64,
 }
 
 impl Node {
@@ -768,6 +772,7 @@ impl Node {
             presence_hook: MetadataHookSlot::default(),
             topic_hook: MetadataHookSlot::default(),
             range_owners: std::sync::RwLock::new(Vec::new()),
+            range_generation: AtomicU64::new(0),
         });
         Ok(node)
     }
@@ -1435,13 +1440,19 @@ impl Node {
                 self.apply_presence(payload)?;
                 Ok(Rpc::PresenceResponse { ok: true })
             }
-            Rpc::ProposeWrite { payload } => {
+            Rpc::ProposeWrite { payload, route_generation } => {
                 let writes = decode_writes(&payload)?;
                 if writes.is_empty() {
                     return Err(RymeError::InvalidArgument(String::from("writes")));
                 }
-                let commit_ts = self.forward_write_to_leader(writes).await?;
-                Ok(Rpc::ProposeWriteResponse { commit_ts })
+                match self.forward_write_to_leader(writes, route_generation).await {
+                    Ok(commit_ts) => {
+                        Ok(Rpc::ProposeWriteResponse { commit_ts: Some(commit_ts), error: None })
+                    }
+                    Err(error) => {
+                        Ok(Rpc::ProposeWriteResponse { commit_ts: None, error: Some(error.into()) })
+                    }
+                }
             }
             Rpc::ProposeTransaction { payload } => {
                 let state: ryme_txn::TransactionState = serde_json::from_slice(&payload)
@@ -1566,7 +1577,18 @@ impl Node {
         self: &Arc<Self>,
         writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
     ) -> Result<u64> {
+        self.propose_write_with_generation(writes, None).await
+    }
+
+    async fn propose_write_with_generation(
+        self: &Arc<Self>,
+        writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+        route_generation: Option<u64>,
+    ) -> Result<u64> {
         let mut txn = self.manager.begin();
+        if let Some(generation) = route_generation {
+            txn.set_route_generation(generation);
+        }
         for (key, op) in writes {
             match op.value {
                 Some(bytes) => self.manager.put_with_ttl(&mut txn, key, bytes, op.expires_at),
@@ -1588,19 +1610,21 @@ impl Node {
     async fn forward_write_to_leader(
         self: &Arc<Self>,
         writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+        route_generation: Option<u64>,
     ) -> Result<u64> {
         let Some(leader) = self.known_leader().await else {
             return Err(RymeError::Unavailable(String::from("leader unknown")));
         };
         if leader == self.id {
-            return self.propose_write(writes).await;
+            return self.propose_write_with_generation(writes, route_generation).await;
         }
         let pool = self
             .pool_for(leader)
             .ok_or_else(|| RymeError::Unavailable(String::from("leader unavailable")))?;
         let payload = encode_writes(&writes)?;
-        match pool.roundtrip(&Rpc::ProposeWrite { payload }).await? {
-            Rpc::ProposeWriteResponse { commit_ts } => Ok(commit_ts),
+        match pool.roundtrip(&Rpc::ProposeWrite { payload, route_generation }).await? {
+            Rpc::ProposeWriteResponse { commit_ts: Some(commit_ts), error: None } => Ok(commit_ts),
+            Rpc::ProposeWriteResponse { error: Some(error), .. } => Err(error.into()),
             _ => Err(RymeError::Corrupt(String::from("write forward rpc"))),
         }
     }
@@ -1636,22 +1660,24 @@ impl Node {
         self: &Arc<Self>,
         owner: usize,
         writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+        route_generation: Option<u64>,
     ) -> Result<u64> {
         if writes.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("writes")));
         }
         if self.is_leader().await {
-            return self.propose_write(writes).await;
+            return self.propose_write_with_generation(writes, route_generation).await;
         }
         if owner == self.id {
-            return self.forward_write_to_leader(writes).await;
+            return self.forward_write_to_leader(writes, route_generation).await;
         }
         let pool = self
             .pool_for(owner)
             .ok_or_else(|| RymeError::Unavailable(String::from("range owner unavailable")))?;
         let payload = encode_writes(&writes)?;
-        match pool.roundtrip(&Rpc::ProposeWrite { payload }).await? {
-            Rpc::ProposeWriteResponse { commit_ts } => Ok(commit_ts),
+        match pool.roundtrip(&Rpc::ProposeWrite { payload, route_generation }).await? {
+            Rpc::ProposeWriteResponse { commit_ts: Some(commit_ts), error: None } => Ok(commit_ts),
+            Rpc::ProposeWriteResponse { error: Some(error), .. } => Err(error.into()),
             _ => Err(RymeError::Corrupt(String::from("range write rpc"))),
         }
     }
@@ -1659,11 +1685,12 @@ impl Node {
     pub async fn propose_write_to_leader(
         self: &Arc<Self>,
         writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+        route_generation: Option<u64>,
     ) -> Result<u64> {
         if writes.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("writes")));
         }
-        self.forward_write_to_leader(writes).await
+        self.forward_write_to_leader(writes, route_generation).await
     }
 
     pub async fn commit_transaction_to_leader(
@@ -1734,6 +1761,12 @@ impl Node {
     }
 
     pub async fn commit_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
+        if let Some(expected) = txn.route_generation() {
+            let current = self.range_generation();
+            if current != expected {
+                return Err(RymeError::Conflict(String::from("range topology changed")));
+            }
+        }
         self.manager
             .commit_with(txn, |commit_ts, encoded| async move {
                 self.replicate_frame(commit_ts, encoded).await.map(|_| ())
@@ -2399,8 +2432,16 @@ impl Node {
     pub fn set_range_owners(&self, mut owners: Vec<RangeOwner>) {
         owners.sort_by(|left, right| left.start.cmp(&right.start));
         if let Ok(mut current) = self.range_owners.write() {
+            if *current == owners {
+                return;
+            }
             *current = owners;
+            self.range_generation.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    pub fn range_generation(&self) -> u64 {
+        self.range_generation.load(Ordering::SeqCst)
     }
 
     pub fn range_owners(&self) -> Vec<RangeOwner> {
@@ -2551,7 +2592,9 @@ impl ClusterBackend {
 
 impl ryme_txn::TxnBackend for ClusterBackend {
     fn begin(&self) -> ryme_txn::Transaction {
-        self.node.manager().begin()
+        let mut txn = self.node.manager().begin();
+        txn.set_route_generation(self.node.range_generation());
+        txn
     }
 
     fn get(&self, txn: &mut ryme_txn::Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
@@ -2651,6 +2694,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
         txn: ryme_txn::Transaction,
     ) -> impl std::future::Future<Output = Result<u64>> + Send {
         let node = self.node.clone();
+        let route_generation = txn.route_generation();
         let routed = if txn.read_keys().is_empty()
             && txn.scanned_tables().is_empty()
             && !txn.writes().is_empty()
@@ -2681,8 +2725,12 @@ impl ryme_txn::TxnBackend for ClusterBackend {
         };
         async move {
             match routed {
-                Some((Some(owner), writes)) => node.propose_write_on(owner, writes).await,
-                Some((None, writes)) => node.propose_write_to_leader(writes).await,
+                Some((Some(owner), writes)) => {
+                    node.propose_write_on(owner, writes, route_generation).await
+                }
+                Some((None, writes)) => {
+                    node.propose_write_to_leader(writes, route_generation).await
+                }
                 None => node.commit_transaction_to_leader(txn).await,
             }
         }

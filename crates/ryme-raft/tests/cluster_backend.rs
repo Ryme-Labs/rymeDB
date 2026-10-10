@@ -343,17 +343,21 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
     assert_eq!(nodes[client].read_latest(&key("z")).await.unwrap(), None);
 
     let mut routed_scan = backends[client].begin();
-    let first_page = backends[client]
-        .scan_async(&mut routed_scan, "t", "d", "s", 2)
-        .await
-        .unwrap();
-    assert_eq!(first_page, vec![(b"a".to_vec(), b"left".to_vec()), (b"seed".to_vec(), b"seed".to_vec())]);
+    let first_page = backends[client].scan_async(&mut routed_scan, "t", "d", "s", 2).await.unwrap();
+    assert_eq!(
+        first_page,
+        vec![(b"a".to_vec(), b"left".to_vec()), (b"seed".to_vec(), b"seed".to_vec())]
+    );
     let second_page = backends[client]
         .scan_after_async(&mut routed_scan, "t", "d", "s", b"seed", 2)
         .await
         .unwrap();
     assert_eq!(second_page, vec![(b"z".to_vec(), b"right".to_vec())]);
-    assert!(routed_scan.scanned_tables().contains(&(String::from("t"), String::from("d"), String::from("s"))));
+    assert!(routed_scan.scanned_tables().contains(&(
+        String::from("t"),
+        String::from("d"),
+        String::from("s")
+    )));
 
     let executor = ryme_sql::Executor::with_backend(
         String::from("t"),
@@ -362,7 +366,10 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
     );
     let mut sql_txn = executor.begin_transaction(Isolation::Serializable);
     let (result, _) = executor
-        .execute_in_transaction(&mut sql_txn, ryme_sql::parse("SELECT * FROM s ORDER BY id").unwrap())
+        .execute_in_transaction(
+            &mut sql_txn,
+            ryme_sql::parse("SELECT * FROM s ORDER BY id").unwrap(),
+        )
         .await
         .unwrap();
     assert!(matches!(result, ryme_sql::QueryResult::Rows { rows } if rows == vec![
@@ -383,14 +390,28 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
     executor.commit_transaction(update_txn, changes).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if nodes[upper_owner].read_latest(&key("z")).await.unwrap()
-            == Some(b"changed".to_vec())
-        {
+        if nodes[upper_owner].read_latest(&key("z")).await.unwrap() == Some(b"changed".to_vec()) {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "remote update did not converge");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    let mut stale = backends[client].begin();
+    backends[client].put(&mut stale, key("stale"), b"must-not-commit".to_vec());
+    let moved = placement
+        .iter()
+        .cloned()
+        .map(|mut range| {
+            range.epoch = 2;
+            range
+        })
+        .collect::<Vec<_>>();
+    for node in &nodes {
+        node.set_range_owners(moved.clone());
+    }
+    let error = backends[client].commit(stale).await.unwrap_err();
+    assert_eq!(error, ryme_error::RymeError::Conflict(String::from("range topology changed")));
 
     for (node, task) in nodes.iter().zip(tasks) {
         node.shutdown(task);
@@ -436,9 +457,7 @@ async fn follower_transaction_forwarding_preserves_read_conflicts() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let mut probe = backends[client].begin();
-        if backends[client].get(&mut probe, &key("watched")).unwrap()
-            == Some(b"v1".to_vec())
-        {
+        if backends[client].get(&mut probe, &key("watched")).unwrap() == Some(b"v1".to_vec()) {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "seed did not reach follower");
@@ -446,10 +465,7 @@ async fn follower_transaction_forwarding_preserves_read_conflicts() {
     }
 
     let mut stale = backends[client].begin();
-    assert_eq!(
-        backends[client].get(&mut stale, &key("watched")).unwrap(),
-        Some(b"v1".to_vec())
-    );
+    assert_eq!(backends[client].get(&mut stale, &key("watched")).unwrap(), Some(b"v1".to_vec()));
 
     let mut update = backends[leader].begin();
     backends[leader].put(&mut update, key("watched"), b"v2".to_vec());
@@ -474,11 +490,8 @@ fn now_ms() -> u128 {
 
 #[test]
 fn range_snapshot_copies_mvcc_history_and_tombstones() {
-    let root = std::env::temp_dir().join(format!(
-        "ryme-range-mvcc-{}-{}",
-        std::process::id(),
-        now_ms()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("ryme-range-mvcc-{}-{}", std::process::id(), now_ms()));
     let _ = std::fs::remove_dir_all(&root);
     let source = Node::open(0, Vec::new(), Vec::new(), &root.join("source")).unwrap();
     let target = Node::open(1, Vec::new(), Vec::new(), &root.join("target")).unwrap();
@@ -504,7 +517,8 @@ fn range_snapshot_copies_mvcc_history_and_tombstones() {
 
 #[test]
 fn range_owner_respects_half_open_bounds() {
-    let root = std::env::temp_dir().join(format!("ryme-range-owner-{}-{}", std::process::id(), now_ms()));
+    let root =
+        std::env::temp_dir().join(format!("ryme-range-owner-{}-{}", std::process::id(), now_ms()));
     let _ = std::fs::remove_dir_all(&root);
     let node = Node::open(0, Vec::new(), Vec::new(), &root).unwrap();
     node.set_range_owners(vec![

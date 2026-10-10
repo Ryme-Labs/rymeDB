@@ -1,5 +1,10 @@
 # Changelog
 
+- Cluster transactions now carry the range-topology generation they began
+  against. Range-map changes invalidate stale commits, including write-only
+  owner forwarding, and the mesh returns a typed conflict instead of dropping
+  the connection. This prevents a transaction from committing against an
+  ownership map different from the one used for its reads.
 - Scan-based SQL transaction mutations now consume owner-routed pages before
   staging UPDATE, DELETE, UPDATE FROM, DELETE USING, and INSERT SELECT
   changes. The existing global leader commit path still provides atomic

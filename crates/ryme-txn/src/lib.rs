@@ -97,6 +97,7 @@ pub struct Transaction {
     observed: BTreeMap<RecordKey, bool>,
     scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
+    route_generation: Option<u64>,
     #[allow(dead_code)]
     pin: Arc<TxnPin>,
 }
@@ -109,6 +110,8 @@ pub struct TransactionState {
     pub observed: Vec<(RecordKey, bool)>,
     pub scanned: Vec<(String, String, String)>,
     pub isolation: Isolation,
+    #[serde(default)]
+    pub route_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +122,7 @@ pub struct TransactionCheckpoint {
     observed: BTreeMap<RecordKey, bool>,
     scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
+    route_generation: Option<u64>,
 }
 
 impl Transaction {
@@ -130,6 +134,7 @@ impl Transaction {
             observed: self.observed.clone(),
             scanned: self.scanned.clone(),
             isolation: self.isolation,
+            route_generation: self.route_generation,
         }
     }
 
@@ -141,6 +146,7 @@ impl Transaction {
             observed: self.observed.iter().map(|(key, value)| (key.clone(), *value)).collect(),
             scanned: self.scanned.iter().cloned().collect(),
             isolation: self.isolation,
+            route_generation: self.route_generation,
         }
     }
 
@@ -151,6 +157,7 @@ impl Transaction {
         self.observed.clone_from(&checkpoint.observed);
         self.scanned.clone_from(&checkpoint.scanned);
         self.isolation = checkpoint.isolation;
+        self.route_generation = checkpoint.route_generation;
         if let Ok(mut active) = ACTIVE.lock() {
             active.insert(self.id, self.read_ts);
         }
@@ -165,6 +172,14 @@ impl Transaction {
 
     pub fn set_isolation(&mut self, isolation: Isolation) {
         self.isolation = isolation;
+    }
+
+    pub fn set_route_generation(&mut self, generation: u64) {
+        self.route_generation = Some(generation);
+    }
+
+    pub fn route_generation(&self) -> Option<u64> {
+        self.route_generation
     }
 
     pub fn writes(&self) -> &BTreeMap<RecordKey, WriteOp> {
@@ -416,6 +431,7 @@ impl TxnManager {
             observed: BTreeMap::new(),
             scanned: BTreeSet::new(),
             isolation: Isolation::Serializable,
+            route_generation: None,
             pin: Arc::new(TxnPin { id }),
         }
     }
@@ -433,6 +449,7 @@ impl TxnManager {
             observed: state.observed.into_iter().collect(),
             scanned: state.scanned.into_iter().collect(),
             isolation: state.isolation,
+            route_generation: state.route_generation,
             pin: Arc::new(TxnPin { id }),
         }
     }

@@ -219,6 +219,11 @@ forwarding. This is not yet per-range 2PC, and read-dependent cross-range
 transaction routing remains separate work. Transactions that include a read
 set now forward their snapshot and OCC metadata to the current leader, so a
 follower-started transaction can be validated against intervening commits.
+Cluster transactions also carry the range-topology generation observed at
+begin. Changing the configured range map invalidates an older transaction at
+commit, including write-only owner forwarding; the mesh returns a typed
+`conflict: range topology changed` response so callers can retry against the
+new placement.
 Point reads and point mutations in the PostgreSQL transaction path can now
 fetch missing rows from their configured range owner and add the result to the
 same transaction read set. Filtered scans, joins that depend on remote rows,
