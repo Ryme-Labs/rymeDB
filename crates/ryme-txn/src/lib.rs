@@ -517,6 +517,42 @@ impl TxnManager {
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        self.replay_locked(commit_ts, writes, None)
+    }
+
+    /// Replays a committed transaction while materializing only the keys owned
+    /// by this replica. Conflict metadata still records every key in the
+    /// transaction so a later transaction cannot miss a remote write.
+    ///
+    /// This is deliberately separate from `replay_at`: callers must opt into
+    /// ownership-aware storage application explicitly until routing, snapshot
+    /// transfer, and realtime delivery all use the same ownership decision.
+    pub fn replay_at_filtered(
+        &self,
+        commit_ts: u64,
+        writes: &BTreeMap<RecordKey, WriteOp>,
+        keep: impl Fn(&RecordKey) -> bool,
+    ) -> Result<()> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let local_writes: BTreeMap<RecordKey, WriteOp> = writes
+            .iter()
+            .filter(|(key, _)| keep(key))
+            .map(|(key, op)| (key.clone(), op.clone()))
+            .collect();
+        let committed_keys: Vec<RecordKey> = writes.keys().cloned().collect();
+        self.replay_locked(commit_ts, &local_writes, Some(&committed_keys))
+    }
+
+    fn replay_locked(
+        &self,
+        commit_ts: u64,
+        writes: &BTreeMap<RecordKey, WriteOp>,
+        committed_keys: Option<&[RecordKey]>,
+    ) -> Result<()> {
         let mut engine = self
             .inner
             .engine
@@ -546,7 +582,19 @@ impl TxnManager {
                 .committed
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-            committed.insert(commit_ts, fresh.keys().cloned().collect());
+            let keys = committed_keys
+                .map(|keys| keys.to_vec())
+                .unwrap_or_else(|| fresh.keys().cloned().collect());
+            committed.insert(commit_ts, keys);
+        } else if let Some(keys) = committed_keys {
+            if !keys.is_empty() {
+                let mut committed = self
+                    .inner
+                    .committed
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+                committed.insert(commit_ts, keys.to_vec());
+            }
         }
         self.inner.clock.fetch_max(commit_ts + 1, Ordering::SeqCst);
         self.inner.applied.fetch_max(commit_ts + 1, Ordering::SeqCst);
@@ -2116,6 +2164,28 @@ mod tests {
         let mut expected = BTreeMap::new();
         expected.insert(RecordKey::new("t", "d", "s", b"k"), WriteOp::put(b"v".to_vec()));
         assert_eq!(back, expected);
+    }
+
+    #[test]
+    fn filtered_replay_keeps_remote_conflicts_without_local_rows() {
+        let manager = TxnManager::new();
+        let local = RecordKey::new("t", "d", "owned", b"local");
+        let remote = RecordKey::new("t", "d", "owned", b"remote");
+        let later = RecordKey::new("t", "d", "owned", b"later");
+        let mut writes = BTreeMap::new();
+        writes.insert(local.clone(), WriteOp::put(b"local-value".to_vec()));
+        writes.insert(remote.clone(), WriteOp::put(b"remote-value".to_vec()));
+
+        let mut stale = manager.begin();
+        manager.replay_at_filtered(10, &writes, |key| key == &local).unwrap();
+
+        let mut fresh = manager.begin();
+        assert_eq!(manager.get(&mut fresh, &local).unwrap(), Some(b"local-value".to_vec()));
+        assert_eq!(manager.get(&mut fresh, &remote).unwrap(), None);
+
+        assert_eq!(manager.get(&mut stale, &remote).unwrap(), None);
+        manager.put(&mut stale, later, b"later-value".to_vec());
+        assert!(matches!(manager.commit(stale), Err(RymeError::Conflict(_))));
     }
 
     #[test]
