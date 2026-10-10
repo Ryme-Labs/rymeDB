@@ -36,11 +36,17 @@ async fn read_frame(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
                 }
                 pending.push(top - 1);
             }
-            '*' => {
+            '*' | '>' => {
                 let count: i64 = head[1..].trim().parse().unwrap_or(0);
                 pending.push(top - 1);
                 pending.push(count.max(0));
             }
+            '%' => {
+                let count: i64 = head[1..].trim().parse().unwrap_or(0);
+                pending.push(top - 1);
+                pending.push(count.saturating_mul(2).max(0));
+            }
+            '_' => pending.push(top - 1),
             _ => pending.push(top - 1),
         }
     }
@@ -94,14 +100,41 @@ async fn hello_negotiates_resp2() {
 }
 
 #[tokio::test]
-async fn hello_rejects_resp3_and_auth() {
+async fn hello_negotiates_resp3_and_auth() {
     let addr = serve().await;
-    let reply = command(addr, &["HELLO", "3"]).await;
-    assert!(reply.contains("NOPROTO"), "{reply}");
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket.write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n").await.unwrap();
+    let reply =
+        tokio::time::timeout(Duration::from_secs(5), read_frame(&mut socket)).await.unwrap();
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("%7\r\n"), "{reply}");
+    assert!(reply.contains("+proto\r\n:3\r\n"), "{reply}");
+    socket.write_all(b"*2\r\n$6\r\nCLIENT\r\n$7\r\nGETNAME\r\n").await.unwrap();
+    let null_reply =
+        tokio::time::timeout(Duration::from_secs(5), read_frame(&mut socket)).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&null_reply), "_\r\n");
     let reply = command(addr, &["HELLO", "2", "AUTH", "u", "p"]).await;
     assert!(reply.contains("no password is set"), "{reply}");
     let reply = command(addr, &["AUTH", "secret"]).await;
     assert!(reply.contains("no password is set"), "{reply}");
+}
+
+#[tokio::test]
+async fn resp3_pubsub_uses_push_frames() {
+    let addr = serve().await;
+    let mut subscriber = tokio::net::TcpStream::connect(addr).await.unwrap();
+    subscriber.write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n").await.unwrap();
+    let _ =
+        tokio::time::timeout(Duration::from_secs(5), read_frame(&mut subscriber)).await.unwrap();
+    subscriber.write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nchat\r\n").await.unwrap();
+    let subscribed =
+        tokio::time::timeout(Duration::from_secs(5), read_frame(&mut subscriber)).await.unwrap();
+    assert!(String::from_utf8_lossy(&subscribed).starts_with(">3\r\n"));
+
+    assert_eq!(command(addr, &["PUBLISH", "chat", "hello"]).await, ":1");
+    let message =
+        tokio::time::timeout(Duration::from_secs(5), read_frame(&mut subscriber)).await.unwrap();
+    assert!(String::from_utf8_lossy(&message).starts_with(">3\r\n"));
 }
 
 #[tokio::test]

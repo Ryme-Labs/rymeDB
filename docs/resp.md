@@ -117,12 +117,11 @@ These return `unknown command` rather than a wrong answer.
 
 ## Connection management
 
-`HELLO 2` negotiates down to RESP2 with a server map (`server`, `version`,
-`proto`, `id`, `mode`, `role`, `modules`); bare `HELLO` behaves the same.
-`HELLO 3` is refused with `NOPROTO` because every reply on the wire is
-RESP2 — accepting it would corrupt RESP3 parsers, so clients fall back
-correctly (verified: `redis-py` 8 connects with `protocol=2`, and its
-default RESP3 handshake fails fast at `HELLO 3` instead of desyncing).
+`HELLO 2` negotiates RESP2 with the server map (`server`, `version`, `proto`,
+`id`, `mode`, `role`, `modules`); bare `HELLO` behaves the same. `HELLO 3`
+negotiates RESP3 and returns the same fields as a map. RESP3 keeps the command
+engine shared with RESP2, translates null replies to the RESP3 null type, and
+uses push frames for Pub/Sub deliveries and subscription acknowledgements.
 `CLIENT SETNAME`/`GETNAME` are per-connection state, `CLIENT ID` is a
 server-wide counter, `CLIENT SETINFO` is accepted, `ECHO` round-trips, and
 `AUTH` answers `Client sent AUTH, but no password is set` exactly like a

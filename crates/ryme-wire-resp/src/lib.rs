@@ -62,6 +62,7 @@ struct ClientState {
     name: Option<Vec<u8>>,
     id: u64,
     authenticated: bool,
+    resp3: bool,
     subscriptions: std::collections::BTreeSet<Vec<u8>>,
     patterns: std::collections::BTreeSet<Vec<u8>>,
     pubsub: Option<PubSubBus>,
@@ -448,6 +449,7 @@ where
             name: None,
             id: self.next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             authenticated: self.authenticator.is_none(),
+            resp3: false,
             subscriptions: std::collections::BTreeSet::new(),
             patterns: std::collections::BTreeSet::new(),
             pubsub: Some(self.pubsub.clone()),
@@ -484,10 +486,12 @@ where
 
     fn hello(&mut self, command: &RespCommand, client: &mut ClientState) -> Vec<u8> {
         let mut index = 0;
+        let mut protocol = 2;
         if let Some(version) = command.args.first() {
-            if version.as_slice() != b"2" {
+            if version.as_slice() != b"2" && version.as_slice() != b"3" {
                 return encode_error(String::from("NOPROTO unsupported protocol version"));
             }
+            protocol = if version.as_slice() == b"3" { 3 } else { 2 };
             index = 1;
         }
         while index < command.args.len() {
@@ -515,10 +519,29 @@ where
         if !client.authenticated {
             return encode_error(String::from("NOAUTH Authentication required"));
         }
-        Self::encode_hello(client.id)
+        client.resp3 = protocol == 3;
+        Self::encode_hello(client.id, client.resp3)
     }
 
-    fn encode_hello(id: u64) -> Vec<u8> {
+    fn encode_hello(id: u64, resp3: bool) -> Vec<u8> {
+        if resp3 {
+            let mut out = b"%7\r\n".to_vec();
+            out.extend_from_slice(b"+server\r\n$6\r\nrymedb\r\n");
+            out.extend_from_slice(
+                format!(
+                    "+version\r\n${}\r\n{}\r\n",
+                    env!("CARGO_PKG_VERSION").len(),
+                    env!("CARGO_PKG_VERSION")
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(b"+proto\r\n:3\r\n");
+            out.extend_from_slice(format!("+id\r\n:{id}\r\n").as_bytes());
+            out.extend_from_slice(b"+mode\r\n$10\r\nstandalone\r\n");
+            out.extend_from_slice(b"+role\r\n$6\r\nmaster\r\n");
+            out.extend_from_slice(b"+modules\r\n*0\r\n");
+            return out;
+        }
         let mut out = b"*14\r\n".to_vec();
         for part in [
             "server",
@@ -1037,6 +1060,11 @@ where
                                 encode_bulk(&message.channel),
                                 encode_bulk(&message.payload),
                             ]);
+                            let reply = if client.resp3 {
+                                resp3_push(&reply).unwrap_or(reply)
+                            } else {
+                                reply
+                            };
                             writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
                         }
                         for pattern in &client.patterns {
@@ -1047,6 +1075,11 @@ where
                                     encode_bulk(&message.channel),
                                     encode_bulk(&message.payload),
                                 ]);
+                                let reply = if client.resp3 {
+                                    resp3_push(&reply).unwrap_or(reply)
+                                } else {
+                                    reply
+                                };
                                 writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
                             }
                         }
@@ -1067,7 +1100,20 @@ where
                     writer.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     replies.clear();
                 }
+                let is_pubsub_command = matches!(
+                    command.name.as_str(),
+                    "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE"
+                );
                 let reply = service.dispatch_conn(command, &mut multi, &mut client).await;
+                let reply = if client.resp3 {
+                    if is_pubsub_command {
+                        resp3_pubsub_replies(&reply).unwrap_or(reply)
+                    } else {
+                        resp3_replies(&reply).unwrap_or(reply)
+                    }
+                } else {
+                    reply
+                };
                 let reply = match service.admit_response(reply.len() as u64) {
                     Some(denied) => denied,
                     None => reply,
@@ -5534,6 +5580,93 @@ fn encode_array(items: Vec<Option<Vec<u8>>>) -> Vec<u8> {
         }
     }
     out
+}
+
+// Command handlers share one compact RESP2 encoder.  RESP2 scalar replies are
+// valid RESP3 values too, so protocol negotiation only needs to translate the
+// two incompatible null forms and preserve nested containers.  Keeping this
+// conversion at the connection boundary avoids a second encoder in every
+// command path.
+fn resp3_replies(input: &[u8]) -> std::result::Result<Vec<u8>, ()> {
+    let mut offset = 0;
+    let mut output = Vec::with_capacity(input.len());
+    while offset < input.len() {
+        resp3_one(input, &mut offset, &mut output)?;
+    }
+    Ok(output)
+}
+
+fn resp3_one(
+    input: &[u8],
+    offset: &mut usize,
+    output: &mut Vec<u8>,
+) -> std::result::Result<(), ()> {
+    let kind = *input.get(*offset).ok_or(())?;
+    let start = *offset;
+    *offset += 1;
+    let line_end = find_crlf(&input[*offset..]).ok_or(())? + *offset;
+    let line = &input[*offset..line_end];
+    *offset = line_end + 2;
+    match kind {
+        b'+' | b'-' | b':' => output.extend_from_slice(&input[start..*offset]),
+        b'$' => {
+            let length =
+                std::str::from_utf8(line).map_err(|_| ())?.parse::<i64>().map_err(|_| ())?;
+            if length < 0 {
+                output.extend_from_slice(b"_\r\n");
+            } else {
+                let length = usize::try_from(length).map_err(|_| ())?;
+                let end = (*offset).checked_add(length).ok_or(())?;
+                if end > input.len() || input.len() - end < 2 || &input[end..end + 2] != b"\r\n" {
+                    return Err(());
+                }
+                output.extend_from_slice(&input[start..end + 2]);
+                *offset = end + 2;
+            }
+        }
+        b'*' | b'%' | b'>' => {
+            let count =
+                std::str::from_utf8(line).map_err(|_| ())?.parse::<i64>().map_err(|_| ())?;
+            if count < 0 {
+                output.extend_from_slice(b"_\r\n");
+                return Ok(());
+            }
+            output.push(kind);
+            output.extend_from_slice(count.to_string().as_bytes());
+            output.extend_from_slice(b"\r\n");
+            let items = if kind == b'%' { count.checked_mul(2).ok_or(())? } else { count };
+            for _ in 0..usize::try_from(items).map_err(|_| ())? {
+                resp3_one(input, offset, output)?;
+            }
+        }
+        _ => return Err(()),
+    }
+    Ok(())
+}
+
+fn resp3_push(input: &[u8]) -> std::result::Result<Vec<u8>, ()> {
+    let mut output = resp3_replies(input)?;
+    if output.first() == Some(&b'*') {
+        output[0] = b'>';
+        Ok(output)
+    } else {
+        Err(())
+    }
+}
+
+fn resp3_pubsub_replies(input: &[u8]) -> std::result::Result<Vec<u8>, ()> {
+    let mut offset = 0;
+    let mut output = Vec::with_capacity(input.len());
+    while offset < input.len() {
+        let mut reply = Vec::new();
+        resp3_one(input, &mut offset, &mut reply)?;
+        if reply.first() != Some(&b'*') {
+            return Err(());
+        }
+        reply[0] = b'>';
+        output.extend_from_slice(&reply);
+    }
+    Ok(output)
 }
 
 fn int_arg(raw: &[u8]) -> std::result::Result<i64, String> {

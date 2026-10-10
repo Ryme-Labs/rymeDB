@@ -1,5 +1,7 @@
 # Changelog
 
+- RESP3 negotiation now accepts `HELLO 3`, emits the RESP3 hello map and null
+  type, and uses push frames for Pub/Sub subscriptions and deliveries.
 - RESP Pub/Sub now uses the realtime broadcast bus when configured, allowing
   subscribers on separate gateways and Raft peers to receive `PUBLISH`
   messages while keeping the process-local fast path for standalone gateways.
