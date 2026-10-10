@@ -434,16 +434,17 @@ where
             self.record_timing("get", &request.table, start.elapsed().as_micros() as u64);
             return response;
         }
-        let response = match self.gateway.get(principal, &request.table, request.pk.as_bytes()) {
-            Ok(Some(value)) => {
-                let masked = self.gateway.masked(&request.table, value);
-                let mut response = Response::ok();
-                response.value = Some(String::from_utf8_lossy(&masked).to_string());
-                response
-            }
-            Ok(None) => Response::err(String::from("not found")),
-            Err(e) => Response::err(e.to_string()),
-        };
+        let response =
+            match self.gateway.get_async(principal, &request.table, request.pk.as_bytes()).await {
+                Ok(Some(value)) => {
+                    let masked = self.gateway.masked(&request.table, value);
+                    let mut response = Response::ok();
+                    response.value = Some(String::from_utf8_lossy(&masked).to_string());
+                    response
+                }
+                Ok(None) => Response::err(String::from("not found")),
+                Err(e) => Response::err(e.to_string()),
+            };
         self.observe(principal, false);
         self.record_timing("get", &request.table, start.elapsed().as_micros() as u64);
         response

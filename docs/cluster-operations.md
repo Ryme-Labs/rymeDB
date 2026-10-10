@@ -201,9 +201,10 @@ tombstones—on the target member, reconciles stale visible keys, verifies the
 target at the source commit timestamp, and then bumps the range epoch and
 records the target as the logical range leader (for example, `raft-2`). The
 operation is leader-only and requires the expected epoch. Once that metadata is
-committed, main-branch KV point reads use the range owner and fetch from the
-target over the authenticated mesh, including RLS checks at the serving
-gateway. Other protocols and scans still use the existing transaction backend.
+committed, main-branch KV point reads through the HTTP, native, and gRPC
+gateways use the range owner and fetch from the target over the authenticated
+mesh, including RLS checks at the serving gateway. RESP, PostgreSQL, and scans
+still use the existing transaction backend.
 Because the current cluster log still materializes replicated writes on all
 members, this does not yet delete the source replica or claim full
 shared-nothing storage scale; owner-aware data-apply filtering and complete

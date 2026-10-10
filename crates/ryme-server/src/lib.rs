@@ -14,7 +14,7 @@ use ryme_backup::Checkpoint;
 use ryme_config::{Config, OtelConfig};
 use ryme_control::ControlPlane;
 use ryme_crypto::{EnvKms, KeyRing, KmsProvider, WrappedDek};
-use ryme_gateway::Gateway;
+use ryme_gateway::{Gateway, RemoteRead, RemoteReader};
 use ryme_index::PartitionedIndex;
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{Histogram, LatencyWindow, SlowEntry, SlowLog, TraceCollector, TraceSpan};
@@ -1123,6 +1123,31 @@ impl SharedState {
             realtime.clone(),
             storage.clone(),
         );
+        let range_reader_node = match &backend {
+            Backend::Cluster(cluster) => Some(cluster.node().clone()),
+            Backend::Hybrid(hybrid) => Some(hybrid.raft().node().clone()),
+            Backend::Single(_) | Backend::Sharded(_) => None,
+        };
+        if let Some(range_reader_node) = range_reader_node {
+            let remote_reader = RemoteReader::new(move |key| {
+                let node = range_reader_node.clone();
+                async move {
+                    let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
+                    routing.extend_from_slice(key.table.as_bytes());
+                    routing.push(0);
+                    routing.extend_from_slice(&key.pk);
+                    let Some((owner, _epoch)) = node.range_owner(&routing) else {
+                        return Ok(RemoteRead::Local);
+                    };
+                    if owner == node.node_id() {
+                        return Ok(RemoteRead::Local);
+                    }
+                    let (value, expires_at) = node.fetch_range_value(owner, key, 0).await?;
+                    Ok(RemoteRead::Value { value, expires_at })
+                }
+            });
+            gateway = gateway.with_remote_reader(remote_reader);
+        }
         gateway.set_read_only(config.read_only);
         let schema_path = config.data_dir.join("schema.json");
         let schema_snapshot = load_schema_snapshot(&schema_path)?;
@@ -6784,43 +6809,16 @@ async fn inner_kv_get(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    if branch_snapshot(state, headers, &principal.tenant).ok().flatten().is_none() {
-        if let Some(node) = state.raft_node() {
-            let routing = range_routing_key(table, key);
-            if let Some((owner, _epoch)) = node.range_owner(&routing) {
-                if owner != node.node_id() {
-                    let record = ryme_storage::RecordKey::new(
-                        &principal.tenant,
-                        &state.database,
-                        table,
-                        key,
-                    );
-                    let (value, _expires_at) = match node.fetch_range_value(owner, record, 0).await {
-                        Ok(result) => result,
-                        Err(error) => return error_response(error),
-                    };
-                    return match value {
-                        Some(value) => match gateway.visible_value(&principal, table, &value) {
-                            Ok(true) => {
-                                if let Err(e) = admit_egress(state, &principal.tenant, value.len() as u64) {
-                                    error_response(e)
-                                } else {
-                                    let masked = gateway.masked(table, value);
-                                    (StatusCode::OK, masked).into_response()
-                                }
-                            }
-                            Ok(false) => {
-                                error_response(ryme_error::RymeError::NotFound(String::from("row")))
-                            }
-                            Err(error) => error_response(error),
-                        },
-                        None => error_response(ryme_error::RymeError::NotFound(String::from("row"))),
-                    };
-                }
-            }
-        }
-    }
-    match gateway.get(&principal, table, key) {
+    let main_branch = match branch_snapshot(state, headers, &principal.tenant) {
+        Ok(snapshot) => snapshot.is_none(),
+        Err(error) => return error_response(error),
+    };
+    let value = if main_branch {
+        gateway.get_async(&principal, table, key).await
+    } else {
+        gateway.get(&principal, table, key)
+    };
+    match value {
         Ok(Some(value)) => {
             if let Err(e) = admit_egress(state, &principal.tenant, value.len() as u64) {
                 return error_response(e);
@@ -6929,7 +6927,16 @@ async fn kv_ttl(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    match gateway.ttl_of(&principal, &table, key.as_bytes()) {
+    let main_branch = match branch_snapshot(&state, &headers, &principal.tenant) {
+        Ok(snapshot) => snapshot.is_none(),
+        Err(error) => return error_response(error),
+    };
+    let ttl = if main_branch {
+        gateway.ttl_of_async(&principal, &table, key.as_bytes()).await
+    } else {
+        gateway.ttl_of(&principal, &table, key.as_bytes())
+    };
+    match ttl {
         Ok(ryme_gateway::Ttl::Missing) => {
             error_response(ryme_error::RymeError::NotFound(String::from("row")))
         }

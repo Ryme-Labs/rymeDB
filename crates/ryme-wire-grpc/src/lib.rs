@@ -336,7 +336,7 @@ where
             return Err(Status::invalid_argument("table/pk required"));
         }
         self.admit_read(&principal).map_err(status_of)?;
-        let reply = match self.gateway.get(&principal, &inner.table, &inner.pk) {
+        let reply = match self.gateway.get_async(&principal, &inner.table, &inner.pk).await {
             Ok(Some(value)) => {
                 let masked = self.gateway.masked(&inner.table, value);
                 proto::KvGetReply { ok: true, error: String::new(), value: masked, found: true }

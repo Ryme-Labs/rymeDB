@@ -3,6 +3,8 @@ use ryme_error::{Result, RymeError};
 use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_storage::RecordKey;
 use ryme_txn::{TxnBackend, TxnManager};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub const MAX_KEY_BYTES: usize = 1024;
@@ -16,6 +18,39 @@ pub enum Ttl {
 }
 
 #[derive(Debug, Clone)]
+pub enum RemoteRead {
+    Local,
+    Value { value: Option<Vec<u8>>, expires_at: Option<u64> },
+}
+
+#[derive(Clone)]
+pub struct RemoteReader(
+    Arc<
+        dyn Fn(RecordKey) -> Pin<Box<dyn Future<Output = Result<RemoteRead>> + Send>> + Send + Sync,
+    >,
+);
+
+impl std::fmt::Debug for RemoteReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemoteReader(..)")
+    }
+}
+
+impl RemoteReader {
+    pub fn new<F, Fut>(reader: F) -> Self
+    where
+        F: Fn(RecordKey) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RemoteRead>> + Send + 'static,
+    {
+        Self(Arc::new(move |key| Box::pin(reader(key))))
+    }
+
+    async fn read(&self, key: RecordKey) -> Result<RemoteRead> {
+        (self.0)(key).await
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Gateway<B = TxnManager> {
     manager: B,
     realtime: Realtime,
@@ -25,6 +60,7 @@ pub struct Gateway<B = TxnManager> {
     branch: String,
     read_ts: Option<u64>,
     read_only: bool,
+    remote_reader: Option<RemoteReader>,
 }
 
 impl Gateway<TxnManager> {
@@ -44,6 +80,7 @@ impl Gateway<TxnManager> {
             branch,
             read_ts: None,
             read_only: false,
+            remote_reader: None,
         }
     }
 
@@ -64,6 +101,7 @@ impl Gateway<TxnManager> {
             branch,
             read_ts: None,
             read_only: false,
+            remote_reader: None,
         }
     }
 }
@@ -89,6 +127,7 @@ where
             branch,
             read_ts: None,
             read_only: false,
+            remote_reader: None,
         }
     }
 
@@ -120,7 +159,13 @@ where
             branch: self.branch,
             read_ts: None,
             read_only: self.read_only,
+            remote_reader: self.remote_reader,
         }
+    }
+
+    pub fn with_remote_reader(mut self, reader: RemoteReader) -> Self {
+        self.remote_reader = Some(reader);
+        self
     }
 
     fn begin(&self) -> ryme_txn::Transaction {
@@ -152,14 +197,26 @@ where
         }
     }
 
-    pub fn visible_value(
+    pub async fn get_async(
         &self,
         principal: &Principal,
         table: &str,
-        value: &[u8],
-    ) -> Result<bool> {
+        pk: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(reader) = self.remote_reader.as_ref() else {
+            return self.get(principal, table, pk);
+        };
         self.policies.predicate(principal, table)?;
-        self.policies.row_allowed(principal, table, value)
+        let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
+        match reader.read(key).await? {
+            RemoteRead::Local => self.get(principal, table, pk),
+            RemoteRead::Value { value, .. } => match value {
+                Some(value) if self.policies.row_allowed(principal, table, &value)? => {
+                    Ok(Some(value))
+                }
+                _ => Ok(None),
+            },
+        }
     }
 
     pub async fn put(
@@ -266,6 +323,27 @@ where
                     Ok(Ttl::Missing)
                 } else {
                     Ok(Ttl::Seconds(ts - now))
+                }
+            }
+        }
+    }
+
+    pub async fn ttl_of_async(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Ttl> {
+        let Some(reader) = self.remote_reader.as_ref() else {
+            return self.ttl_of(principal, table, pk);
+        };
+        self.policies.predicate(principal, table)?;
+        let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
+        match reader.read(key).await? {
+            RemoteRead::Local => self.ttl_of(principal, table, pk),
+            RemoteRead::Value { value, expires_at } => {
+                if value.is_none() {
+                    return Ok(Ttl::Missing);
+                }
+                match expires_at.unwrap_or(0) {
+                    0 => Ok(Ttl::Persistent),
+                    expires_at if expires_at <= ryme_txn::now_unix() => Ok(Ttl::Missing),
+                    expires_at => Ok(Ttl::Seconds(expires_at - ryme_txn::now_unix())),
                 }
             }
         }
@@ -477,6 +555,24 @@ mod tests {
             .put(&principal, "docs", b"k".to_vec(), vec![b'v'; MAX_VALUE_BYTES + 1])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn async_reads_use_remote_owner_and_keep_ttl_semantics() {
+        let gateway = gateway().with_remote_reader(RemoteReader::new(|key| async move {
+            assert_eq!(key.table, "docs");
+            assert_eq!(key.pk, b"k".to_vec());
+            Ok(RemoteRead::Value {
+                value: Some(b"v".to_vec()),
+                expires_at: Some(ryme_txn::now_unix() + 60),
+            })
+        }));
+        let principal = owner();
+        assert_eq!(gateway.get_async(&principal, "docs", b"k").await.unwrap(), Some(b"v".to_vec()));
+        assert!(matches!(
+            gateway.ttl_of_async(&principal, "docs", b"k").await.unwrap(),
+            Ttl::Seconds(seconds) if seconds > 0 && seconds <= 60
+        ));
     }
 
     #[tokio::test]
