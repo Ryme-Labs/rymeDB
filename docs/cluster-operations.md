@@ -208,10 +208,11 @@ PostgreSQL autocommit primary-key selects use the same owner path; PostgreSQL
 transactions, PostgreSQL scans, and transactional RESP commands still use the
 existing transaction backend so their MVCC snapshots are unchanged. Ordered
 scans through HTTP, native, gRPC, GraphQL, and PostgREST fan out to owners and
-merge bounded pages by primary key. Because the current cluster log still
-materializes replicated writes on all members, this does not yet delete the
-source replica or claim full shared-nothing storage scale; owner-aware
-data-apply filtering, write routing, and complete transaction routing remain
+merge bounded pages by primary key. Followers with a complete range map now
+materialize live committed writes only for their local owners while retaining
+global conflict metadata; leaders and recovery still keep the complete state.
+This does not yet delete source replicas or claim full shared-nothing storage
+scale. Write routing, source cleanup, and complete transaction routing remain
 separate work.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`

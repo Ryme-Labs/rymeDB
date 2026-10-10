@@ -1,10 +1,9 @@
 # Changelog
 
-- Added an explicit ownership-aware transaction replay primitive that can
-  materialize only local range keys while retaining all committed keys for
-  conflict detection. The existing cluster apply path remains unchanged until
-  write routing, snapshot transfer, and realtime delivery share the same
-  ownership decision.
+- Configured range maps now make live follower applies materialize only local
+  range keys while retaining all committed keys for conflict detection. The
+  global leader and recovery path still keep the complete state, and write
+  routing, source cleanup, and complete transaction routing remain future work.
 - Cluster range placement now has an epoch-fenced `/v1/ranges/verify` safety
   gate. The leader compares a consistent range snapshot with another Raft
   member before future data transfer work, reporting row/byte counts and

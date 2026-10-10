@@ -1115,7 +1115,13 @@ impl Node {
                 ApplyPayload::Data { commit_ts, writes } => {
                     let encoded_writes = writes.clone();
                     let writes = decode_writes(&writes)?;
-                    self.manager.replay_at(commit_ts, &writes)?;
+                    if self.range_owners().is_empty() {
+                        self.manager.replay_at(commit_ts, &writes)?;
+                    } else {
+                        self.manager.replay_at_filtered(commit_ts, &writes, |key| {
+                            self.owns_range_key(key)
+                        })?;
+                    }
                     if self.inner.lock().await.role != Role::Leader {
                         self.apply_data_hook(crate::encode_applied(commit_ts, &encoded_writes))?;
                     }
@@ -2111,6 +2117,14 @@ impl Node {
                     && (range.end.is_empty() || routing_key < range.end.as_slice())
             })
             .map(|range| (range.owner, range.epoch))
+    }
+
+    pub fn owns_range_key(&self, key: &RecordKey) -> bool {
+        let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
+        routing.extend_from_slice(key.table.as_bytes());
+        routing.push(0);
+        routing.extend_from_slice(&key.pk);
+        self.range_owner(&routing).map(|(owner, _)| owner == self.id).unwrap_or(true)
     }
 
     pub fn read_range_value(
