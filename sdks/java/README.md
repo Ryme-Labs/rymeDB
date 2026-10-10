@@ -40,6 +40,20 @@ deliver join/leave frames. `presenceJoin` also accepts raw JSON state and an
 optional TTL for presence refreshes. Callbacks receive complete JSON text
 frames.
 
+For Supabase-compatible channels, use `subscribeSupabaseChannel`. It supports
+the broadcast and `postgres_changes` join configuration while keeping callback
+frames as raw JSON so applications can use their existing JSON library:
+
+```java
+var channel = client.subscribeSupabaseChannel(
+    "room",
+    new RymeClient.SupabaseChannelOptions(true, false,
+        List.of(new RymeClient.SupabasePostgresChange("INSERT", "public", "messages", null, null))),
+    System.out::println).join();
+channel.sendBroadcast("typing", "{\"user\":\"ada\"}").join();
+channel.close();
+```
+
 For a table subscription that reconnects automatically and advances its
 sequence cursor, use `subscribeTableResumable`. The returned
 `RealtimeSubscription` implements `AutoCloseable` and stops retrying when

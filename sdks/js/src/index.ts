@@ -714,6 +714,239 @@ export interface Subscription {
   close(): void;
 }
 
+export type SupabaseChangeEvent = "*" | "INSERT" | "UPDATE" | "DELETE";
+
+export interface SupabasePostgresChangeConfig {
+  event?: SupabaseChangeEvent;
+  schema?: string;
+  table?: string;
+  filter?: string;
+  select?: string[];
+}
+
+export interface SupabaseChannelOptions {
+  apiKey?: string;
+  broadcast?: {
+    ack?: boolean;
+    self?: boolean;
+  };
+  postgresChanges?: SupabasePostgresChangeConfig[];
+  protocolVersion?: "1.0.0" | "2.0.0";
+}
+
+export interface SupabaseChannelFrame {
+  join_ref?: string | null;
+  ref?: string | null;
+  topic: string;
+  event: string;
+  payload: unknown;
+}
+
+export interface SupabasePostgresChangeData {
+  schema: string;
+  table: string;
+  commit_timestamp: string;
+  type: "INSERT" | "UPDATE" | "DELETE";
+  columns: Array<{ name: string; type: string }>;
+  record: Record<string, unknown>;
+  old_record: Record<string, unknown>;
+  errors: unknown;
+}
+
+export interface SupabasePostgresChangePayload {
+  ids: number[];
+  data: SupabasePostgresChangeData;
+}
+
+export interface SupabaseChannelHandlers {
+  onMessage?: (frame: SupabaseChannelFrame) => void;
+  onBroadcast?: (payload: { event: string; payload: unknown; type?: string }, frame: SupabaseChannelFrame) => void;
+  onPostgresChange?: (payload: SupabasePostgresChangePayload, frame: SupabaseChannelFrame) => void;
+  onSystem?: (payload: unknown, frame: SupabaseChannelFrame) => void;
+}
+
+export interface SupabaseChannel {
+  ready: Promise<void>;
+  sendBroadcast(event: string, payload: unknown): Promise<void>;
+  leave(): Promise<void>;
+  close(): void;
+}
+
+export function subscribeSupabaseChannel(
+  base: string,
+  channel: string,
+  handlers: SupabaseChannelHandlers = {},
+  options: SupabaseChannelOptions = {},
+): SupabaseChannel {
+  const key = options.apiKey ?? process.env["RYME_API_KEY"] ?? "";
+  const version = options.protocolVersion ?? "1.0.0";
+  const topic = channel.startsWith("realtime:") ? channel : `realtime:${channel}`;
+  const joinRef = "1";
+  let nextRef = 2;
+  let socket: WebSocket | undefined;
+  let closed = false;
+  let joined = false;
+  let readyDone = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+
+  const frame = (event: string, payload: unknown, reference?: string): SupabaseChannelFrame => ({
+    join_ref: joinRef,
+    ref: reference ?? null,
+    topic,
+    event,
+    payload,
+  });
+
+  const encodeFrame = (value: SupabaseChannelFrame): string => {
+    if (version === "2.0.0") {
+      return JSON.stringify([value.join_ref ?? null, value.ref ?? null, value.topic, value.event, value.payload]);
+    }
+    return JSON.stringify(value);
+  };
+
+  const send = (value: SupabaseChannelFrame): Promise<void> => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("rymeDB Supabase channel is not connected"));
+    }
+    try {
+      socket.send(encodeFrame(value));
+      return Promise.resolve();
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  };
+
+  const joinConfig = {
+    broadcast: {
+      ack: options.broadcast?.ack ?? false,
+      self: options.broadcast?.self ?? false,
+    },
+    ...(options.postgresChanges === undefined
+      ? {}
+      : {
+          postgres_changes: options.postgresChanges.map((change) => ({
+            event: change.event ?? "*",
+            schema: change.schema ?? "public",
+            ...(change.table === undefined ? {} : { table: change.table }),
+            ...(change.filter === undefined ? {} : { filter: change.filter }),
+            ...(change.select === undefined ? {} : { select: change.select }),
+          })),
+        }),
+  };
+
+  const url = new URL(`${base.replace(/\/$/, "")}\/realtime/v1/websocket`);
+  url.searchParams.set("vsn", version);
+  if (key) url.searchParams.set("apikey", key);
+  const current = new WebSocket(url.toString().replace(/^http/, "ws"));
+  socket = current;
+  current.addEventListener("open", () => {
+    void send(frame("phx_join", { config: joinConfig }, joinRef));
+  }, { once: true });
+  current.addEventListener("error", () => {
+    if (!readyDone) {
+      readyDone = true;
+      rejectReady(new Error("rymeDB Supabase channel connection failed"));
+    }
+  });
+  current.addEventListener("close", () => {
+    if (!readyDone && !closed) {
+      readyDone = true;
+      rejectReady(new Error("rymeDB Supabase channel closed before join"));
+    }
+  });
+  current.addEventListener("message", (event) => {
+    const parsed = parseSupabaseFrame(String(event.data));
+    if (!parsed) return;
+    const { frame: incoming } = parsed;
+    handlers.onMessage?.(incoming);
+    if (incoming.event === "broadcast" && isSupabaseBroadcast(incoming.payload)) {
+      handlers.onBroadcast?.(incoming.payload, incoming);
+    } else if (incoming.event === "postgres_changes" && isSupabasePostgresChange(incoming.payload)) {
+      handlers.onPostgresChange?.(incoming.payload, incoming);
+    } else if (incoming.event === "system") {
+      handlers.onSystem?.(incoming.payload, incoming);
+    }
+    if (incoming.event === "phx_reply" && incoming.ref === joinRef) {
+      const status = (incoming.payload as { status?: unknown } | null)?.status;
+      if (status === "ok") {
+        joined = true;
+        readyDone = true;
+        resolveReady();
+      } else {
+        readyDone = true;
+        rejectReady(new Error("rymeDB Supabase channel join failed"));
+      }
+    }
+  });
+
+  return {
+    ready,
+    sendBroadcast: (event, payload) => {
+      if (!joined) return ready.then(() => send(frame("broadcast", { event, payload }, String(nextRef++)))).then(() => undefined);
+      return send(frame("broadcast", { event, payload }, String(nextRef++)));
+    },
+    leave: () => {
+      if (closed) return Promise.resolve();
+      closed = true;
+      return send(frame("phx_leave", {}, String(nextRef++))).finally(() => current.close());
+    },
+    close: () => {
+      closed = true;
+      current.close();
+    },
+  };
+}
+
+function parseSupabaseFrame(text: string): { frame: SupabaseChannelFrame; array: boolean } | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (Array.isArray(value) && value.length === 5 && typeof value[2] === "string" && typeof value[3] === "string") {
+      return {
+        array: true,
+        frame: {
+          join_ref: typeof value[0] === "string" ? value[0] : null,
+          ref: typeof value[1] === "string" ? value[1] : null,
+          topic: value[2],
+          event: value[3],
+          payload: value[4],
+        },
+      };
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const object = value as Record<string, unknown>;
+      if (typeof object.topic === "string" && typeof object.event === "string") {
+        return {
+          array: false,
+          frame: {
+            join_ref: typeof object.join_ref === "string" ? object.join_ref : null,
+            ref: typeof object.ref === "string" ? object.ref : null,
+            topic: object.topic,
+            event: object.event,
+            payload: object.payload,
+          },
+        };
+      }
+    }
+  } catch {
+    // Ignore malformed frames and keep the channel alive.
+  }
+  return null;
+}
+
+function isSupabaseBroadcast(value: unknown): value is { event: string; payload: unknown; type?: string } {
+  return Boolean(value && typeof value === "object" && typeof (value as { event?: unknown }).event === "string");
+}
+
+function isSupabasePostgresChange(value: unknown): value is SupabasePostgresChangePayload {
+  return Boolean(value && typeof value === "object" && Array.isArray((value as { ids?: unknown }).ids)
+    && (value as { data?: unknown }).data !== undefined);
+}
+
 export function subscribeTable(
   base: string,
   table: string,

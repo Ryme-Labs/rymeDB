@@ -37,6 +37,22 @@ available. `presence_join_with_state` accepts JSON state and an optional TTL;
 streams begin with a state snapshot followed by live join/leave events. HTTP and
 WebSocket URLs automatically switch from `http`/`https` to `ws`/`wss`.
 
+Supabase-compatible channels use `subscribe_supabase_channel` and support
+broadcast plus `postgres_changes` subscriptions:
+
+```rust,no_run
+let mut channel = client
+    .subscribe_supabase_channel("room", SupabaseChannelOptions {
+        broadcast_ack: true,
+        broadcast_self: false,
+        postgres_changes: vec![SupabasePostgresChange::new(Some("messages".into()))],
+    })
+    .await?;
+channel.send_broadcast("typing", serde_json::json!({"user": "ada"})).await?;
+while let Some(frame) = channel.recv().await? {
+    println!("{frame}");
+}
+
 Supabase-style REST CRUD is available through `rest_insert`, `rest_upsert`,
 `rest_update`, and `rest_delete_where`, using `serde_json::Value` request
 bodies and PostgREST query strings.

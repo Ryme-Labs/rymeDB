@@ -394,6 +394,44 @@ public final class RymeClient {
                 + ",\"key\":" + json(key) + ",\"value\":" + json(value) + "}");
     }
 
+    /** Supabase Realtime postgres_changes subscription configuration. */
+    public record SupabasePostgresChange(String event, String schema, String table,
+                                         String filter, List<String> select) {
+        public SupabasePostgresChange {
+            event = event == null ? "*" : event;
+            schema = schema == null ? "public" : schema;
+            select = select == null ? null : List.copyOf(select);
+        }
+
+        public SupabasePostgresChange(String table) {
+            this("*", "public", table, null, null);
+        }
+    }
+
+    /** Join options for a Supabase-compatible realtime channel. */
+    public record SupabaseChannelOptions(boolean broadcastAck, boolean broadcastSelf,
+                                         List<SupabasePostgresChange> postgresChanges) {
+        public SupabaseChannelOptions {
+            postgresChanges = postgresChanges == null ? List.of() : List.copyOf(postgresChanges);
+        }
+
+        public static SupabaseChannelOptions defaults() {
+            return new SupabaseChannelOptions(false, false, List.of());
+        }
+    }
+
+    /** Open a Supabase-compatible channel with raw JSON callbacks. */
+    public CompletableFuture<SupabaseChannel> subscribeSupabaseChannel(
+            String channel, Consumer<String> onMessage) {
+        return subscribeSupabaseChannel(channel, SupabaseChannelOptions.defaults(), onMessage);
+    }
+
+    /** Open a Supabase-compatible channel with broadcast and postgres_changes options. */
+    public CompletableFuture<SupabaseChannel> subscribeSupabaseChannel(
+            String channel, SupabaseChannelOptions options, Consumer<String> onMessage) {
+        return new SupabaseChannel(channel, options, onMessage).start();
+    }
+
     /** Subscribe to committed table changes. Each complete text frame is passed to {@code onMessage}. */
     public CompletableFuture<WebSocket> subscribeTable(String table, Consumer<String> onMessage) {
         return subscribeTable(table, null, null, null, onMessage);
@@ -480,6 +518,135 @@ public final class RymeClient {
                 webSocket.abort();
             }
         });
+    }
+
+    /** A Supabase-compatible channel. Call {@link #close()} when the channel is no longer needed. */
+    public final class SupabaseChannel implements AutoCloseable {
+        private final String topic;
+        private final SupabaseChannelOptions options;
+        private final Consumer<String> onMessage;
+        private final CompletableFuture<SupabaseChannel> ready = new CompletableFuture<>();
+        private final AtomicLong nextRef = new AtomicLong(2);
+        private final String joinRef = "1";
+        private volatile WebSocket socket;
+        private volatile boolean closed;
+
+        private SupabaseChannel(String channel, SupabaseChannelOptions options, Consumer<String> onMessage) {
+            String value = Objects.requireNonNull(channel, "channel");
+            this.topic = value.startsWith("realtime:") ? value : "realtime:" + value;
+            this.options = Objects.requireNonNull(options, "options");
+            this.onMessage = Objects.requireNonNull(onMessage, "onMessage");
+        }
+
+        private CompletableFuture<SupabaseChannel> start() {
+            String path = "/realtime/v1/websocket?vsn=1.0.0";
+            if (!apiKey.isEmpty()) path += "&apikey=" + encode(apiKey);
+            http.newWebSocketBuilder().buildAsync(websocketUri(path), new WebSocket.Listener() {
+                private final StringBuilder frame = new StringBuilder();
+
+                @Override
+                public void onOpen(WebSocket webSocket) {
+                    socket = webSocket;
+                    webSocket.sendText(joinFrame(), true);
+                    webSocket.request(1);
+                }
+
+                @Override
+                public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+                    frame.append(data);
+                    if (last) {
+                        String text = frame.toString();
+                        frame.setLength(0);
+                        onMessage.accept(text);
+                        if (isJoinReply(text)) {
+                            ready.complete(SupabaseChannel.this);
+                        } else if (isJoinError(text)) {
+                            ready.completeExceptionally(new IllegalStateException("Supabase channel join failed"));
+                        }
+                    }
+                    webSocket.request(1);
+                    return CompletableFuture.completedFuture(null);
+                }
+
+                @Override
+                public void onError(WebSocket webSocket, Throwable error) {
+                    if (!ready.isDone()) ready.completeExceptionally(error);
+                    webSocket.abort();
+                }
+
+                @Override
+                public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+                    if (!ready.isDone() && !closed) {
+                        ready.completeExceptionally(new IllegalStateException("Supabase channel closed before join"));
+                    }
+                    return CompletableFuture.completedFuture(null);
+                }
+            }).whenComplete((webSocket, error) -> {
+                if (error != null && !ready.isDone()) ready.completeExceptionally(error);
+            });
+            return ready;
+        }
+
+        private String joinFrame() {
+            StringBuilder config = new StringBuilder("{\"broadcast\":{\"ack\":")
+                    .append(options.broadcastAck()).append(",\"self\":")
+                    .append(options.broadcastSelf()).append("}");
+            if (!options.postgresChanges().isEmpty()) {
+                config.append(",\"postgres_changes\":[");
+                for (int index = 0; index < options.postgresChanges().size(); index++) {
+                    if (index > 0) config.append(',');
+                    config.append(postgresChangeJson(options.postgresChanges().get(index)));
+                }
+                config.append(']');
+            }
+            config.append('}');
+            return "{\"topic\":" + json(topic) + ",\"event\":\"phx_join\",\"payload\":{\"config\":"
+                    + config + "},\"ref\":\"" + joinRef + "\",\"join_ref\":\"" + joinRef + "\"}";
+        }
+
+        private boolean isJoinReply(String text) {
+            return text.contains("\"event\":\"phx_reply\"")
+                    && text.contains("\"ref\":\"" + joinRef + "\"")
+                    && text.contains("\"status\":\"ok\"");
+        }
+
+        private boolean isJoinError(String text) {
+            return text.contains("\"event\":\"phx_reply\"")
+                    && text.contains("\"ref\":\"" + joinRef + "\"")
+                    && text.contains("\"status\":\"error\"");
+        }
+
+        /** Send a Supabase broadcast event after the join has completed. */
+        public CompletableFuture<Void> sendBroadcast(String event, String payloadJson) {
+            return ready.thenCompose(ignored -> {
+                WebSocket webSocket = socket;
+                if (webSocket == null || closed) {
+                    return CompletableFuture.failedFuture(new IllegalStateException("Supabase channel is closed"));
+                }
+                String frame = "{\"topic\":" + json(topic) + ",\"event\":\"broadcast\",\"payload\":{\"event\":\""
+                        + json(event) + ",\"payload\":" + payloadJson + "},\"ref\":\""
+                        + nextRef.getAndIncrement() + "\",\"join_ref\":\"" + joinRef + "\"}";
+                return webSocket.sendText(frame, true).thenApply(ignoredResult -> null);
+            });
+        }
+
+        /** Leave the channel and complete after the close frame has been sent. */
+        public CompletableFuture<Void> leave() {
+            WebSocket webSocket = socket;
+            closed = true;
+            if (webSocket == null) return CompletableFuture.completedFuture(null);
+            String frame = "{\"topic\":" + json(topic) + ",\"event\":\"phx_leave\",\"payload\":{},\"ref\":\""
+                    + nextRef.getAndIncrement() + "\",\"join_ref\":\"" + joinRef + "\"}";
+            return webSocket.sendText(frame, true).thenCompose(ignored -> webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "leave"))
+                    .thenApply(ignored -> null);
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            WebSocket webSocket = socket;
+            if (webSocket != null) webSocket.abort();
+        }
     }
 
     /** A reconnecting table subscription. Call {@link #close()} to stop retries. */
@@ -677,6 +844,23 @@ public final class RymeClient {
                 .replace("\n", "\\n")
                 .replace("\r", "\\r")
                 .replace("\t", "\\t") + "\"";
+    }
+
+    private static String postgresChangeJson(SupabasePostgresChange change) {
+        StringBuilder json = new StringBuilder("{\"event\":")
+                .append(json(change.event())).append(",\"schema\":")
+                .append(json(change.schema()));
+        if (change.table() != null) json.append(",\"table\":").append(json(change.table()));
+        if (change.filter() != null) json.append(",\"filter\":").append(json(change.filter()));
+        if (change.select() != null) {
+            json.append(",\"select\":[");
+            for (int index = 0; index < change.select().size(); index++) {
+                if (index > 0) json.append(',');
+                json.append(json(change.select().get(index)));
+            }
+            json.append(']');
+        }
+        return json.append('}').toString();
     }
 
     private static String nullableJson(String value) {

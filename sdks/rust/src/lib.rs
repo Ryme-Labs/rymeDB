@@ -55,6 +55,101 @@ impl RealtimeSubscription {
             .await
             .map_err(|error| ClientError::WebSocket(error.to_string()))
     }
+
+    async fn send_json(&mut self, value: serde_json::Value) -> Result<(), ClientError> {
+        self.stream
+            .send(Message::Text(value.to_string()))
+            .await
+            .map_err(|error| ClientError::WebSocket(error.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupabasePostgresChange {
+    pub event: String,
+    pub schema: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select: Option<Vec<String>>,
+}
+
+impl SupabasePostgresChange {
+    pub fn new(table: Option<String>) -> Self {
+        Self {
+            event: String::from("*"),
+            schema: String::from("public"),
+            table,
+            filter: None,
+            select: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SupabaseChannelOptions {
+    pub broadcast_ack: bool,
+    pub broadcast_self: bool,
+    pub postgres_changes: Vec<SupabasePostgresChange>,
+}
+
+/// A Supabase-compatible realtime channel using the Phoenix wire protocol.
+pub struct SupabaseChannel {
+    stream: RealtimeSubscription,
+    topic: String,
+    join_ref: String,
+    next_ref: u64,
+}
+
+impl SupabaseChannel {
+    pub async fn recv(&mut self) -> Result<Option<String>, ClientError> {
+        self.stream.recv().await
+    }
+
+    /// Send a broadcast event after the channel has been joined.
+    pub async fn send_broadcast(
+        &mut self,
+        event: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), ClientError> {
+        let reference = self.next_reference();
+        self.stream
+            .send_json(serde_json::json!({
+                "topic": self.topic,
+                "event": "broadcast",
+                "payload": { "event": event, "payload": payload },
+                "ref": reference,
+                "join_ref": self.join_ref,
+            }))
+            .await
+    }
+
+    /// Leave the channel using the protocol's phx_leave event.
+    pub async fn leave(mut self) -> Result<(), ClientError> {
+        let reference = self.next_reference();
+        self.stream
+            .send_json(serde_json::json!({
+                "topic": self.topic,
+                "event": "phx_leave",
+                "payload": {},
+                "ref": reference,
+                "join_ref": self.join_ref,
+            }))
+            .await?;
+        self.stream.close().await
+    }
+
+    pub async fn close(self) -> Result<(), ClientError> {
+        self.stream.close().await
+    }
+
+    fn next_reference(&mut self) -> String {
+        let reference = self.next_ref.to_string();
+        self.next_ref = self.next_ref.saturating_add(1);
+        reference
+    }
 }
 
 /// A table subscription that reconnects and resumes from the last received sequence.
@@ -406,6 +501,43 @@ impl RymeClient {
             params.push((String::from("limit"), limit.to_string()));
         }
         self.subscribe("/v1/query-stream", params).await
+    }
+
+    /// Open a Supabase-compatible channel and send its phx_join frame.
+    pub async fn subscribe_supabase_channel(
+        &self,
+        channel: &str,
+        options: SupabaseChannelOptions,
+    ) -> Result<SupabaseChannel, ClientError> {
+        let mut params = vec![(String::from("vsn"), String::from("1.0.0"))];
+        if !self.api_key.is_empty() {
+            params.push((String::from("apikey"), self.api_key.clone()));
+        }
+        let mut stream = self.subscribe("/realtime/v1/websocket", params).await?;
+        let topic = if channel.starts_with("realtime:") {
+            channel.to_string()
+        } else {
+            format!("realtime:{channel}")
+        };
+        let join_ref = String::from("1");
+        stream
+            .send_json(serde_json::json!({
+                "topic": topic,
+                "event": "phx_join",
+                "payload": {
+                    "config": {
+                        "broadcast": {
+                            "ack": options.broadcast_ack,
+                            "self": options.broadcast_self,
+                        },
+                        "postgres_changes": options.postgres_changes,
+                    }
+                },
+                "ref": join_ref,
+                "join_ref": join_ref,
+            }))
+            .await?;
+        Ok(SupabaseChannel { stream, topic, join_ref, next_ref: 2 })
     }
 
     pub async fn kv_get(&self, table: &str, key: &str) -> Result<Vec<u8>, ClientError> {

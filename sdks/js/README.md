@@ -48,6 +48,8 @@ Notes:
 - `subscribePresence(base, channel, onMessage, { apiKey? })` receives an
   initial snapshot followed by join/leave events and reconnects with a fresh
   snapshot when needed.
+- `subscribeSupabaseChannel(base, channel, handlers, options)` speaks the
+  Supabase Realtime protocol for broadcast and `postgres_changes` events.
 - `slowLog(limit?, table?)` and `traces(limit?, name?, table?)` narrow the
   observability feeds; `rangeAutosplit` and `rangeLoads` cover placement
   load.
@@ -62,3 +64,17 @@ both streams. Tests: `pnpm build && pnpm test`.
 Supabase-style REST CRUD is available through `restInsert`, `restUpsert`,
 `restUpdate`, `restDelete`, and `restDeleteWhere`; insert bodies may be JSON
 objects or arrays, and update/delete methods accept PostgREST query strings.
+
+```ts
+const channel = subscribeSupabaseChannel("https://db.example.com", "room", {
+  onBroadcast: ({ event, payload }) => console.log(event, payload),
+  onPostgresChange: (change) => console.log(change.data.record),
+}, {
+  apiKey: "ryme_key",
+  broadcast: { ack: true, self: false },
+  postgresChanges: [{ event: "INSERT", schema: "public", table: "messages" }],
+});
+await channel.ready;
+await channel.sendBroadcast("typing", { user: "ada" });
+await channel.leave();
+```
