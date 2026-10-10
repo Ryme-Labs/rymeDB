@@ -195,6 +195,13 @@ async fn configured_range_owner_limits_follower_materialization() {
     }
     assert_eq!(nodes[leader].read_latest(&key("owned")).await.unwrap(), Some(b"value".to_vec()));
 
+    let mut routed_read = backends[non_owner].begin();
+    assert_eq!(
+        backends[non_owner].get_async(&mut routed_read, &key("owned")).await.unwrap(),
+        Some(b"value".to_vec())
+    );
+    assert!(routed_read.read_keys().contains(&key("owned")));
+
     for (node, task) in nodes.iter().zip(tasks) {
         node.shutdown(task);
     }

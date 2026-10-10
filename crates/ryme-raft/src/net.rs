@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2415,6 +2416,28 @@ impl ryme_txn::TxnBackend for ClusterBackend {
 
     fn get(&self, txn: &mut ryme_txn::Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
         self.node.manager().get(txn, key)
+    }
+
+    fn get_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        key: &'a RecordKey,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>>> + Send + 'a>> {
+        let node = self.node.clone();
+        Box::pin(async move {
+            let Some(owner) = node.range_owner_key(key) else {
+                return node.manager().get(txn, key);
+            };
+            if owner == node.node_id() {
+                return node.manager().get(txn, key);
+            }
+            if txn.writes().contains_key(key) {
+                return node.manager().get(txn, key);
+            }
+            let (value, _) = node.fetch_range_value(owner, key.clone(), txn.read_ts).await?;
+            txn.record_read(key.clone(), value.is_some());
+            Ok(value)
+        })
     }
 
     fn put(&self, txn: &mut ryme_txn::Transaction, key: RecordKey, value: Vec<u8>) {

@@ -219,8 +219,11 @@ forwarding. This is not yet per-range 2PC, and read-dependent cross-range
 transaction routing remains separate work. Transactions that include a read
 set now forward their snapshot and OCC metadata to the current leader, so a
 follower-started transaction can be validated against intervening commits.
-Reads made locally on an owner-filtered follower still do not fetch missing
-range data, so this is not yet complete owner-aware transaction routing.
+Point reads and point mutations in the PostgreSQL transaction path can now
+fetch missing rows from their configured range owner and add the result to the
+same transaction read set. Filtered scans, joins that depend on remote rows,
+and per-range 2PC remain separate work, so this is not yet complete
+owner-aware transaction routing.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

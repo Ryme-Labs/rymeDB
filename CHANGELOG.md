@@ -1,5 +1,10 @@
 # Changelog
 
+- Cluster transaction point reads now use an asynchronous owner-aware path.
+  PostgreSQL transaction primary-key reads and point mutations can fetch a
+  missing row from its configured range owner while preserving the local
+  transaction snapshot and read set. Filtered scans and per-range 2PC remain
+  separate work.
 - Cluster transactions now forward their read timestamp, read set, observed
   keys, scans, writes, and isolation mode through the mesh, preserving OCC
   validation when a gateway starts on a follower. Transaction-forwarding

@@ -3,7 +3,9 @@ use ryme_storage::{Engine, RecordKey, SegmentCacheStats, SegmentEntry, SegmentSt
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
@@ -177,6 +179,11 @@ impl Transaction {
         self.observed.get(key).copied()
     }
 
+    pub fn record_read(&mut self, key: RecordKey, existed: bool) {
+        self.read_set.insert(key.clone());
+        self.observed.entry(key).or_insert(existed);
+    }
+
     pub fn scanned_tables(&self) -> &BTreeSet<(String, String, String)> {
         &self.scanned
     }
@@ -209,6 +216,13 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
         txn
     }
     fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>>;
+    fn get_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        key: &'a RecordKey,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + Send + 'a>> {
+        Box::pin(async move { self.get(txn, key) })
+    }
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>);
     fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64);
     fn delete(&self, txn: &mut Transaction, key: RecordKey);

@@ -80,6 +80,21 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
+    fn get_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        key: &'a ryme_storage::RecordKey,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ryme_error::Result<Option<Vec<u8>>>> + Send + 'a>,
+    > {
+        match self {
+            Self::Single(manager) => manager.get_async(txn, key),
+            Self::Cluster(backend) => backend.get_async(txn, key),
+            Self::Sharded(shards) => shards.get_async(txn, key),
+            Self::Hybrid(hybrid) => hybrid.get_async(txn, key),
+        }
+    }
+
     fn put(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey, value: Vec<u8>) {
         match self {
             Self::Single(manager) => manager.put(txn, key, value),

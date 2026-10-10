@@ -11295,7 +11295,7 @@ where
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys(txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(txn, &key)?;
+                let before = self.manager.get_async(txn, &key).await?;
                 if before.is_some() {
                     return Err(RymeError::Conflict(String::from("exists")));
                 }
@@ -11320,7 +11320,7 @@ where
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys(txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                if self.manager.get(txn, &key)?.is_some() {
+                if self.manager.get_async(txn, &key).await?.is_some() {
                     return Ok((QueryResult::Ok, Vec::new()));
                 }
                 if let Err(error) = self.check_unique(&table, &pk, &value) {
@@ -11371,7 +11371,7 @@ where
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys(txn, &table, &pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(txn, &key)?;
+                let before = self.manager.get_async(txn, &key).await?;
                 if let Some(before) = before.as_deref() {
                     self.enforce_rls(&table, before)?;
                 }
@@ -11403,7 +11403,8 @@ where
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let current = self
                     .manager
-                    .get(txn, &key)?
+                    .get_async(txn, &key)
+                    .await?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
                 let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
                 Box::pin(
@@ -11428,10 +11429,11 @@ where
                     if new_pk != pk
                         && self
                             .manager
-                            .get(
+                            .get_async(
                                 txn,
                                 &RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
-                            )?
+                            )
+                            .await?
                             .is_some()
                     {
                         return Err(RymeError::Conflict(String::from("primary key exists")));
@@ -11497,7 +11499,7 @@ where
                 self.enforce_checks(&table, &new_pk, &value)?;
                 self.enforce_foreign_keys(txn, &table, &new_pk, &value)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(txn, &key)?;
+                let before = self.manager.get_async(txn, &key).await?;
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
@@ -11506,7 +11508,11 @@ where
                 if new_pk != pk
                     && self
                         .manager
-                        .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &new_pk))?
+                        .get_async(
+                            txn,
+                            &RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
+                        )
+                        .await?
                         .is_some()
                 {
                     return Err(RymeError::Conflict(String::from("primary key exists")));
@@ -11544,7 +11550,7 @@ where
             Statement::Delete { table, pk } => {
                 self.reject_if_read_only()?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(txn, &key)?;
+                let before = self.manager.get_async(txn, &key).await?;
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
@@ -11617,7 +11623,9 @@ where
                     .await?;
                 Ok((QueryResult::Ok, changes))
             }
-            statement => Ok((self.execute_read_in_transaction(txn, statement)?, Vec::new())),
+            statement => {
+                Ok((self.execute_read_in_transaction_async(txn, statement).await?, Vec::new()))
+            }
         }
     }
 
@@ -12246,7 +12254,8 @@ where
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let current = self
                     .manager
-                    .get(txn, &key)?
+                    .get_async(txn, &key)
+                    .await?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
                 let value = self.materialize_update_row(&table, &pk, assignments, &current)?;
                 let (_, changes) = self
@@ -12312,7 +12321,8 @@ where
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let value = self
                     .manager
-                    .get(txn, &key)?
+                    .get_async(txn, &key)
+                    .await?
                     .ok_or_else(|| RymeError::NotFound(String::from("row")))?;
                 let (_, changes) = self
                     .execute_in_transaction_base(txn, Statement::Delete { table, pk: pk.clone() })
@@ -12408,6 +12418,66 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn execute_read_in_transaction_async(
+        &self,
+        txn: &mut Transaction,
+        statement: Statement,
+    ) -> Result<QueryResult> {
+        match statement {
+            Statement::SelectByKey { table, pk } => {
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                match self.manager.get_async(txn, &key).await? {
+                    Some(value) if self.rls_allows(&table, &value) => {
+                        Ok(QueryResult::Row { pk, value })
+                    }
+                    None | Some(_) => Ok(QueryResult::Rows { rows: Vec::new() }),
+                }
+            }
+            Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter }
+                if filter.len() == 1
+                    && filter[0].column.is_none()
+                    && filter[0].field == Field::Key
+                    && filter[0].op == Cmp::Eq
+                    && self.view_definition(&table)?.is_none() =>
+            {
+                let pk = filter[0].operand.clone();
+                let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
+                let rows = self
+                    .manager
+                    .get_async(txn, &key)
+                    .await?
+                    .filter(|value| self.rls_allows(&table, value))
+                    .map(|value| vec![(pk, value)])
+                    .unwrap_or_default();
+                let mut rows: Vec<Row> = rows
+                    .into_iter()
+                    .filter(|(pk, value)| {
+                        filter.iter().all(|predicate| predicate.matches(pk, value))
+                    })
+                    .collect();
+                rows.sort_by(|left, right| compare_order(&order, left, right));
+                let rows = rows
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
+                    .collect();
+                let output_columns = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        aliases
+                            .get(index)
+                            .and_then(|alias| alias.clone())
+                            .unwrap_or_else(|| column.clone())
+                    })
+                    .collect();
+                Ok(QueryResult::Table { columns: output_columns, rows })
+            }
+            statement => self.execute_read_in_transaction(txn, statement),
+        }
     }
 
     fn execute_read_in_transaction(
