@@ -214,6 +214,18 @@ impl Router {
         );
         Ok(())
     }
+
+    pub fn move_leader(&mut self, id: &str, leader: String) -> Result<Range> {
+        let mut range = self.remove(id)?;
+        if range.leader == leader {
+            self.insert(range.clone());
+            return Err(RymeError::InvalidArgument(String::from("leader")));
+        }
+        range.leader = leader;
+        range.epoch = range.epoch.saturating_add(1);
+        self.insert(range.clone());
+        Ok(range)
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +304,16 @@ mod tests {
             load: fresh_load(),
         });
         assert!(router.merge("a", "c", String::from("d")).is_err());
+    }
+
+    #[test]
+    fn move_leader_bumps_epoch_without_changing_bounds() {
+        let mut router = seeded();
+        let moved = router.move_leader("r0", String::from("raft-1")).unwrap();
+        assert_eq!(moved.leader, "raft-1");
+        assert_eq!(moved.epoch, 1);
+        assert!(moved.start.is_empty() && moved.end.is_empty());
+        assert!(router.move_leader("r0", String::from("raft-1")).is_err());
     }
 
     #[test]

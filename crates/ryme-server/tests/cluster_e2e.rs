@@ -420,6 +420,8 @@ async fn cluster_range_split_replicates_metadata() {
         );
     }
     let leader = wait_leader(&http, None).await;
+    let (status, _) = http_request(http[leader], "PUT /v1/kv/docs/a", br#"{"n":1}"#).await;
+    assert_eq!(status, 200);
     let body = br#"{"id":"range-0","mid":"t","left_id":"range-left","right_id":"range-right","expected_epoch":0}"#;
     let (status, _) = http_request(http[leader], "POST /v1/ranges/split", body).await;
     assert_eq!(status, 200);
@@ -435,6 +437,19 @@ async fn cluster_range_split_replicates_metadata() {
     let response = String::from_utf8_lossy(&response);
     assert!(response.contains("\"matching\":true"), "range verification failed: {response}");
     assert!(response.contains("\"ready_for_transfer\":true"));
+    let transfer = format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":1}}");
+    let (status, response) =
+        http_request(http[leader], "POST /v1/ranges/transfer", transfer.as_bytes()).await;
+    assert_eq!(status, 200);
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.contains("\"verified\":true"), "range transfer failed: {response}");
+    assert!(response.contains("\"leader\":\"raft-"));
+    let verify_after =
+        format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":2}}");
+    let (status, response) =
+        http_request(http[leader], "POST /v1/ranges/verify", verify_after.as_bytes()).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&response).contains("\"matching\":true"));
     for handle in handles {
         handle.shutdown();
     }

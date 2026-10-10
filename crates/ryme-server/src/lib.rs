@@ -905,6 +905,14 @@ pub struct VerifyRangeRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct TransferRangeRequest {
+    pub id: String,
+    pub target: usize,
+    pub expected_epoch: u64,
+    pub max_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct RangeLookup {
     pub key: Option<String>,
 }
@@ -1566,6 +1574,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/ranges/merge", post(range_merge))
         .route("/v1/ranges/autosplit", post(range_autosplit))
         .route("/v1/ranges/verify", post(range_verify))
+        .route("/v1/ranges/transfer", post(range_transfer))
         .route("/v1/cluster/members", get(cluster_members).post(cluster_add_member))
         .route("/v1/cluster/members/:id", delete(cluster_remove_member))
         .route("/v1/cluster/transfer", post(cluster_transfer))
@@ -8657,6 +8666,140 @@ async fn range_verify(
             "target_truncated": target.truncated,
             "matching": matching,
             "ready_for_transfer": matching,
+        })),
+    )
+        .into_response()
+}
+
+async fn range_transfer(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
+    if !principal.can_admin() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
+    let request: TransferRangeRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::InvalidArgument(String::from("body")))
+        }
+    };
+    if !state.backend.is_cluster() {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("cluster")));
+    }
+    let Some(node) = state.raft_node() else {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("cluster")));
+    };
+    if !node.is_leader().await {
+        return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+    }
+    if request.target == node.node_id() {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("target")));
+    }
+    let range = {
+        let control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        let range = match control.router_get(&request.id) {
+            Ok(range) => range,
+            Err(error) => return error_response(error),
+        };
+        if range.epoch != request.expected_epoch {
+            return error_response(ryme_error::RymeError::Conflict(format!(
+                "range epoch {}",
+                range.epoch
+            )));
+        }
+        range
+    };
+    let members = node.current_config().await;
+    if !members.iter().any(|member| member.id == request.target) {
+        return error_response(ryme_error::RymeError::NotFound(String::from("peer")));
+    }
+    let max_rows = request.max_rows.unwrap_or(100_000).clamp(1, 100_000);
+    let read_ts = node.manager().latest_commit();
+    let snapshot = match node.snapshot_range(&range.start, &range.end, read_ts, max_rows) {
+        Ok(snapshot) if !snapshot.truncated => snapshot,
+        Ok(_) => {
+            return error_response(ryme_error::RymeError::Overload(String::from("range snapshot")))
+        }
+        Err(error) => return error_response(error),
+    };
+    let rows = if let Err(error) =
+        node.install_range_snapshot_on(request.target, snapshot.clone()).await
+    {
+        return error_response(error);
+    } else {
+        snapshot.rows.len()
+    };
+    let verified = match node
+        .fetch_range_snapshot(
+            request.target,
+            range.start.clone(),
+            range.end.clone(),
+            snapshot.snapshot_ts,
+            max_rows,
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error_response(error),
+    };
+    if verified.truncated
+        || verified.applied_commit < snapshot.snapshot_ts
+        || verified.rows != snapshot.rows
+    {
+        return error_response(ryme_error::RymeError::Conflict(String::from(
+            "range transfer verification",
+        )));
+    }
+    let previous = {
+        let mut control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        let previous = control.ranges();
+        let leader = format!("raft-{}", request.target);
+        let updated_range = match control.move_range(&request.id, leader, request.expected_epoch) {
+            Ok(range) => range,
+            Err(error) => return error_response(error),
+        };
+        let updated = control.ranges();
+        if let Err(error) = sync_range_topology(&state, &updated) {
+            let _ = control.restore_ranges(previous.clone());
+            return error_response(error);
+        }
+        (previous, updated, updated_range)
+    };
+    if let Err(error) =
+        commit_cluster_ranges(&state, &node, previous.0.clone(), previous.1.clone()).await
+    {
+        if let Ok(mut control) = state.control.lock() {
+            let _ = control.restore_ranges(previous.0.clone());
+        }
+        let _ = sync_range_topology(&state, &previous.0);
+        return error_response(error);
+    }
+    let moved = previous.2;
+    let bytes: u64 =
+        snapshot.rows.iter().map(|row| row.pk.len() as u64 + row.value.len() as u64).sum();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "range": moved.id,
+            "epoch": moved.epoch,
+            "leader": moved.leader,
+            "target": request.target,
+            "rows": rows,
+            "bytes": bytes,
+            "snapshot_ts": snapshot.snapshot_ts,
+            "verified": true,
         })),
     )
         .into_response()

@@ -4,6 +4,10 @@
   gate. The leader compares a consistent range snapshot with another Raft
   member before future data transfer work, reporting row/byte counts and
   mismatch state without changing ownership.
+- Cluster ranges can now be transferred with `/v1/ranges/transfer`: the
+  target receives and verifies a bounded snapshot before Raft commits an
+  epoch-bumped logical owner change. Source replicas remain intact until
+  range-local apply filtering is implemented.
 
 - Query streams now support PostgREST-style filters, projections, and ordering.
   Filtered queries resnapshot from committed table changes while unfiltered

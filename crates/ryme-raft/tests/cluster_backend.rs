@@ -95,6 +95,7 @@ async fn backend_replicates_and_fails_over() {
     assert_eq!(snapshot.rows[0].table, "s");
     assert_eq!(snapshot.rows[0].pk, b"k".to_vec());
     assert_eq!(snapshot.rows[0].value, b"v1".to_vec());
+    assert_eq!(nodes[first].install_range_snapshot_on(target, snapshot).await.unwrap(), 1);
     nodes[first].shutdown(std::mem::take(&mut tasks[first]));
     tokio::time::sleep(Duration::from_millis(300)).await;
     let second = wait_leader(&nodes, Some(first)).await;

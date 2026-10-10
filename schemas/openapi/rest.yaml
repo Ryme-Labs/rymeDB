@@ -1679,6 +1679,43 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+  /v1/ranges/transfer:
+    post:
+      tags: [ranges]
+      description: "Install a consistent range snapshot on a Raft member, verify it at the same commit timestamp, and move the logical range leader with an epoch bump. Current replicated copies remain until range-local storage filtering is enabled."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferRangeRequest'
+      responses:
+        '200':
+          description: verified range transfer report
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [range, epoch, leader, target, rows, bytes, verified]
+                properties:
+                  range: { type: string }
+                  epoch: { type: integer }
+                  leader: { type: string }
+                  target: { type: integer }
+                  rows: { type: integer }
+                  bytes: { type: integer }
+                  snapshot_ts: { type: integer }
+                  verified: { type: boolean }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
   /v1/cluster/members:
     get:
       tags: [cluster]
@@ -2421,6 +2458,21 @@ components:
         target:
           type: integer
           description: Raft member id to compare against
+        expected_epoch:
+          type: integer
+        max_rows:
+          type: integer
+          minimum: 1
+          maximum: 100000
+    TransferRangeRequest:
+      type: object
+      required: [id, target, expected_epoch]
+      properties:
+        id:
+          type: string
+        target:
+          type: integer
+          description: Raft member id that will receive the range snapshot
         expected_epoch:
           type: integer
         max_rows:

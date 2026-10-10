@@ -156,6 +156,17 @@ impl ControlPlane {
         self.router.merge(left_id, right_id, merged_id)
     }
 
+    pub fn move_range(&mut self, id: &str, leader: String, expected_epoch: u64) -> Result<Range> {
+        let current = self.router.get(id)?;
+        if current.epoch != expected_epoch {
+            return Err(RymeError::Conflict(format!(
+                "stale epoch for range {id}: expected {expected_epoch}, current {}",
+                current.epoch
+            )));
+        }
+        self.router.move_leader(id, leader)
+    }
+
     pub fn range_loads(&self) -> Vec<ryme_router::RangeLoad> {
         self.router.loads()
     }

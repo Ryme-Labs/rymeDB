@@ -1,6 +1,6 @@
 use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
-use ryme_storage::RecordKey;
+use ryme_storage::{RecordKey, TableVersion};
 use ryme_txn::{decode_writes, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -63,6 +63,12 @@ pub(crate) enum Rpc {
     RangeSnapshotResponse {
         snapshot: RangeSnapshot,
     },
+    RangeInstallRequest {
+        snapshot: RangeSnapshot,
+    },
+    RangeInstallResponse {
+        rows: u64,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -90,6 +96,8 @@ pub struct RangeSnapshotRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RangeSnapshot {
+    pub start: Vec<u8>,
+    pub end: Vec<u8>,
     pub snapshot_ts: u64,
     pub applied_commit: u64,
     pub rows: Vec<RangeSnapshotRow>,
@@ -1290,6 +1298,10 @@ impl Node {
                 let snapshot = self.snapshot_range(&start, &end, read_ts, max_rows as usize)?;
                 Ok(Rpc::RangeSnapshotResponse { snapshot })
             }
+            Rpc::RangeInstallRequest { snapshot } => {
+                let rows = self.install_range_snapshot(&snapshot)?;
+                Ok(Rpc::RangeInstallResponse { rows })
+            }
             Rpc::AppendRequest {
                 term,
                 leader: _,
@@ -1362,7 +1374,8 @@ impl Node {
             | Rpc::TransferResponse { .. }
             | Rpc::RealtimeResponse { .. }
             | Rpc::PresenceResponse { .. }
-            | Rpc::RangeSnapshotResponse { .. } => {
+            | Rpc::RangeSnapshotResponse { .. }
+            | Rpc::RangeInstallResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
         }
@@ -1859,6 +1872,8 @@ impl Node {
                 .then_with(|| left.database.cmp(&right.database))
         });
         Ok(RangeSnapshot {
+            start: start.to_vec(),
+            end: end.to_vec(),
             snapshot_ts,
             applied_commit: self.manager.latest_commit(),
             rows,
@@ -1880,6 +1895,78 @@ impl Node {
         match pool.roundtrip(&Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows }).await? {
             Rpc::RangeSnapshotResponse { snapshot } => Ok(snapshot),
             _ => Err(RymeError::Corrupt(String::from("range snapshot rpc"))),
+        }
+    }
+
+    pub fn install_range_snapshot(&self, snapshot: &RangeSnapshot) -> Result<u64> {
+        if snapshot.truncated {
+            return Err(RymeError::Overload(String::from("range snapshot")));
+        }
+        if !snapshot.end.is_empty() && snapshot.start >= snapshot.end {
+            return Err(RymeError::InvalidArgument(String::from("range")));
+        }
+        if self.manager.latest_commit() > snapshot.snapshot_ts {
+            return Err(RymeError::Unavailable(String::from("target ahead")));
+        }
+        let existing =
+            self.snapshot_range(&snapshot.start, &snapshot.end, snapshot.snapshot_ts, 100_000)?;
+        if existing.truncated {
+            return Err(RymeError::Overload(String::from("target range")));
+        }
+        let wanted: std::collections::HashSet<(String, String, String, Vec<u8>)> = snapshot
+            .rows
+            .iter()
+            .map(|row| {
+                (row.tenant.clone(), row.database.clone(), row.table.clone(), row.pk.clone())
+            })
+            .collect();
+        let purge: Vec<RecordKey> = existing
+            .rows
+            .iter()
+            .filter(|row| {
+                !wanted.contains(&(
+                    row.tenant.clone(),
+                    row.database.clone(),
+                    row.table.clone(),
+                    row.pk.clone(),
+                ))
+            })
+            .map(|row| RecordKey::new(&row.tenant, &row.database, &row.table, &row.pk))
+            .collect();
+        if !purge.is_empty() {
+            self.manager.purge_keys(&purge)?;
+        }
+        let mut tables: BTreeMap<(String, String, String), Vec<(Vec<u8>, Vec<TableVersion>)>> =
+            BTreeMap::new();
+        for row in &snapshot.rows {
+            tables
+                .entry((row.tenant.clone(), row.database.clone(), row.table.clone()))
+                .or_default()
+                .push((
+                    row.pk.clone(),
+                    vec![TableVersion {
+                        commit_ts: snapshot.snapshot_ts,
+                        value: Some(row.value.clone()),
+                        expires_at: row.expires_at,
+                    }],
+                ));
+        }
+        for ((tenant, database, table), rows) in tables {
+            self.manager.import_table(&tenant, &database, &table, rows)?;
+        }
+        self.manager.advance_to(snapshot.snapshot_ts);
+        Ok(snapshot.rows.len() as u64)
+    }
+
+    pub async fn install_range_snapshot_on(
+        &self,
+        peer: usize,
+        snapshot: RangeSnapshot,
+    ) -> Result<u64> {
+        let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
+        match pool.roundtrip(&Rpc::RangeInstallRequest { snapshot }).await? {
+            Rpc::RangeInstallResponse { rows } => Ok(rows),
+            _ => Err(RymeError::Corrupt(String::from("range install rpc"))),
         }
     }
 
