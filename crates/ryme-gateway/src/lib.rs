@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use ryme_auth::{PolicyEngine, Principal};
 use ryme_error::{Result, RymeError};
 use ryme_realtime::{NewChange, Operation, Realtime};
@@ -23,12 +24,20 @@ pub enum RemoteRead {
     Value { value: Option<Vec<u8>>, expires_at: Option<u64> },
 }
 
+type RemoteReadFn = Arc<
+    dyn Fn(RecordKey) -> Pin<Box<dyn Future<Output = Result<RemoteRead>> + Send>> + Send + Sync,
+>;
+type RemoteReadManyFn = Arc<
+    dyn Fn(Vec<RecordKey>) -> Pin<Box<dyn Future<Output = Result<Vec<RemoteRead>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
-pub struct RemoteReader(
-    Arc<
-        dyn Fn(RecordKey) -> Pin<Box<dyn Future<Output = Result<RemoteRead>> + Send>> + Send + Sync,
-    >,
-);
+pub struct RemoteReader {
+    single: RemoteReadFn,
+    batch: Option<RemoteReadManyFn>,
+}
 
 impl std::fmt::Debug for RemoteReader {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,11 +51,27 @@ impl RemoteReader {
         F: Fn(RecordKey) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RemoteRead>> + Send + 'static,
     {
-        Self(Arc::new(move |key| Box::pin(reader(key))))
+        Self { single: Arc::new(move |key| Box::pin(reader(key))), batch: None }
+    }
+
+    pub fn with_batch_reader<F, Fut>(mut self, reader: F) -> Self
+    where
+        F: Fn(Vec<RecordKey>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<RemoteRead>>> + Send + 'static,
+    {
+        self.batch = Some(Arc::new(move |keys| Box::pin(reader(keys))));
+        self
     }
 
     pub async fn read(&self, key: RecordKey) -> Result<RemoteRead> {
-        (self.0)(key).await
+        (self.single)(key).await
+    }
+
+    pub async fn read_many(&self, keys: Vec<RecordKey>) -> Result<Vec<RemoteRead>> {
+        if let Some(batch) = self.batch.as_ref() {
+            return batch(keys).await;
+        }
+        join_all(keys.into_iter().map(|key| self.read(key))).await.into_iter().collect()
     }
 }
 
@@ -572,6 +597,33 @@ mod tests {
         assert!(matches!(
             gateway.ttl_of_async(&principal, "docs", b"k").await.unwrap(),
             Ttl::Seconds(seconds) if seconds > 0 && seconds <= 60
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_reader_uses_batch_transport_when_available() {
+        let reader = RemoteReader::new(|_| async {
+            Err::<RemoteRead, _>(RymeError::Internal(String::from("single path")))
+        })
+        .with_batch_reader(|keys| async move {
+            Ok(keys
+                .into_iter()
+                .map(|key| RemoteRead::Value { value: Some(key.pk), expires_at: Some(0) })
+                .collect())
+        });
+        let values = reader
+            .read_many(vec![
+                RecordKey::new("t", "d", "docs", b"a"),
+                RecordKey::new("t", "d", "docs", b"b"),
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &values[..],
+            [
+                RemoteRead::Value { value: Some(first), .. },
+                RemoteRead::Value { value: Some(second), .. }
+            ] if first == b"a" && second == b"b"
         ));
     }
 

@@ -1,4 +1,3 @@
-use futures_util::future::join_all;
 use mlua::{HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Value as LuaValue, VmState};
 use ryme_error::{Result, RymeError};
 pub use ryme_gateway::{RemoteRead, RemoteReader};
@@ -1536,16 +1535,26 @@ where
                 }
             }
             "MGET" if !command.args.is_empty() => {
-                let results = join_all(command.args.iter().map(|key| {
-                    reader.read(RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
-                }))
-                .await;
+                let results = match reader
+                    .read_many(
+                        command
+                            .args
+                            .iter()
+                            .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
+                            .collect(),
+                    )
+                    .await
+                {
+                    Ok(results) if results.len() == command.args.len() => results,
+                    Ok(_) => return Some(encode_error(String::from("owner read count"))),
+                    Err(error) => return Some(encode_error(error.to_string())),
+                };
                 let mut local = self.manager.begin();
                 let mut saw_remote = false;
                 let mut values = Vec::with_capacity(results.len());
                 for (key, result) in command.args.iter().zip(results) {
                     match result {
-                        Ok(RemoteRead::Local) => values.push(
+                        RemoteRead::Local => values.push(
                             match self.manager.get(
                                 &mut local,
                                 &RecordKey::new(&self.tenant, &self.database, KV_TABLE, key),
@@ -1554,11 +1563,10 @@ where
                                 Err(error) => return Some(encode_error(error.to_string())),
                             },
                         ),
-                        Ok(RemoteRead::Value { value, .. }) => {
+                        RemoteRead::Value { value, .. } => {
                             saw_remote = true;
                             values.push(value);
                         }
-                        Err(error) => return Some(encode_error(error.to_string())),
                     }
                 }
                 if saw_remote {
@@ -1568,16 +1576,26 @@ where
                 }
             }
             "EXISTS" if !command.args.is_empty() => {
-                let results = join_all(command.args.iter().map(|key| {
-                    reader.read(RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
-                }))
-                .await;
+                let results = match reader
+                    .read_many(
+                        command
+                            .args
+                            .iter()
+                            .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
+                            .collect(),
+                    )
+                    .await
+                {
+                    Ok(results) if results.len() == command.args.len() => results,
+                    Ok(_) => return Some(encode_error(String::from("owner read count"))),
+                    Err(error) => return Some(encode_error(error.to_string())),
+                };
                 let mut local = self.manager.begin();
                 let mut saw_remote = false;
                 let mut found = 0i64;
                 for (key, result) in command.args.iter().zip(results) {
                     match result {
-                        Ok(RemoteRead::Local) => {
+                        RemoteRead::Local => {
                             match self.manager.get(
                                 &mut local,
                                 &RecordKey::new(&self.tenant, &self.database, KV_TABLE, key),
@@ -1587,13 +1605,12 @@ where
                                 Err(error) => return Some(encode_error(error.to_string())),
                             }
                         }
-                        Ok(RemoteRead::Value { value, .. }) => {
+                        RemoteRead::Value { value, .. } => {
                             saw_remote = true;
                             if value.is_some() {
                                 found += 1;
                             }
                         }
-                        Err(error) => return Some(encode_error(error.to_string())),
                     }
                 }
                 saw_remote.then(|| encode_integer(found))

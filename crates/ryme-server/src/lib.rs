@@ -1131,8 +1131,10 @@ impl SharedState {
         };
         let mut remote_reader = None;
         if let Some(range_reader_node) = range_reader_node {
+            let single_node = range_reader_node.clone();
+            let batch_node = range_reader_node.clone();
             let reader = RemoteReader::new(move |key| {
-                let node = range_reader_node.clone();
+                let node = single_node.clone();
                 async move {
                     let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
                     routing.extend_from_slice(key.table.as_bytes());
@@ -1146,6 +1148,47 @@ impl SharedState {
                     }
                     let (value, expires_at) = node.fetch_range_value(owner, key, 0).await?;
                     Ok(RemoteRead::Value { value, expires_at })
+                }
+            })
+            .with_batch_reader(move |keys| {
+                let node = batch_node.clone();
+                async move {
+                    let mut values = vec![RemoteRead::Local; keys.len()];
+                    let mut grouped: BTreeMap<usize, Vec<(usize, ryme_storage::RecordKey)>> =
+                        BTreeMap::new();
+                    for (index, key) in keys.into_iter().enumerate() {
+                        let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
+                        routing.extend_from_slice(key.table.as_bytes());
+                        routing.push(0);
+                        routing.extend_from_slice(&key.pk);
+                        let Some((owner, _epoch)) = node.range_owner(&routing) else {
+                            continue;
+                        };
+                        if owner != node.node_id() {
+                            grouped.entry(owner).or_default().push((index, key));
+                        }
+                    }
+                    let requests = grouped.into_iter().map(|(owner, entries)| {
+                        let node = node.clone();
+                        async move {
+                            let request_keys =
+                                entries.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+                            let values = node.fetch_range_values(owner, request_keys, 0).await?;
+                            if values.len() != entries.len() {
+                                return Err(ryme_error::RymeError::Corrupt(String::from(
+                                    "range read batch count",
+                                )));
+                            }
+                            Ok::<_, ryme_error::RymeError>((entries, values))
+                        }
+                    });
+                    for request in futures_util::future::join_all(requests).await {
+                        let (entries, fetched) = request?;
+                        for ((index, _), (value, expires_at)) in entries.into_iter().zip(fetched) {
+                            values[index] = RemoteRead::Value { value, expires_at };
+                        }
+                    }
+                    Ok(values)
                 }
             });
             gateway = gateway.with_remote_reader(reader.clone());

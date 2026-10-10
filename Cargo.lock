@@ -1799,6 +1799,7 @@ dependencies = [
 name = "ryme-gateway"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "ryme-auth",
  "ryme-error",
  "ryme-realtime",
@@ -2072,7 +2073,6 @@ name = "ryme-wire-resp"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "futures-util",
  "mlua",
  "ryme-error",
  "ryme-gateway",

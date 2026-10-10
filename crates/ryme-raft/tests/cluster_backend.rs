@@ -108,6 +108,9 @@ async fn backend_replicates_and_fails_over() {
         nodes[first].fetch_range_value(target, key("k"), 0).await.unwrap();
     assert_eq!(owner_value, Some(b"v1".to_vec()));
     assert_eq!(owner_expiry, Some(0));
+    let owner_values =
+        nodes[first].fetch_range_values(target, vec![key("k"), key("missing")], 0).await.unwrap();
+    assert_eq!(owner_values, vec![(Some(b"v1".to_vec()), Some(0)), (None, None)]);
     nodes[first].shutdown(std::mem::take(&mut tasks[first]));
     tokio::time::sleep(Duration::from_millis(300)).await;
     let second = wait_leader(&nodes, Some(first)).await;

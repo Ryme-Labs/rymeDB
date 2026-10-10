@@ -11,5 +11,6 @@ ryme-storage = { workspace = true }
 ryme-auth = { workspace = true }
 ryme-realtime = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

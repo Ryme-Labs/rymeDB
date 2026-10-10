@@ -77,6 +77,13 @@ pub(crate) enum Rpc {
         value: Option<Vec<u8>>,
         expires_at: Option<u64>,
     },
+    RangeReadBatchRequest {
+        keys: Vec<RecordKey>,
+        read_ts: u64,
+    },
+    RangeReadBatchResponse {
+        values: Vec<(Option<Vec<u8>>, Option<u64>)>,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -1332,6 +1339,10 @@ impl Node {
                 let (value, expires_at) = self.read_range_value(&key, read_ts)?;
                 Ok(Rpc::RangeReadResponse { value, expires_at })
             }
+            Rpc::RangeReadBatchRequest { keys, read_ts } => {
+                let values = self.read_range_values(&keys, read_ts)?;
+                Ok(Rpc::RangeReadBatchResponse { values })
+            }
             Rpc::AppendRequest {
                 term,
                 leader: _,
@@ -1406,7 +1417,8 @@ impl Node {
             | Rpc::PresenceResponse { .. }
             | Rpc::RangeSnapshotResponse { .. }
             | Rpc::RangeInstallResponse { .. }
-            | Rpc::RangeReadResponse { .. } => {
+            | Rpc::RangeReadResponse { .. }
+            | Rpc::RangeReadBatchResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
         }
@@ -2054,6 +2066,36 @@ impl Node {
         match pool.roundtrip(&Rpc::RangeReadRequest { key, read_ts }).await? {
             Rpc::RangeReadResponse { value, expires_at } => Ok((value, expires_at)),
             _ => Err(RymeError::Corrupt(String::from("range read rpc"))),
+        }
+    }
+
+    pub fn read_range_values(
+        &self,
+        keys: &[RecordKey],
+        read_ts: u64,
+    ) -> Result<Vec<(Option<Vec<u8>>, Option<u64>)>> {
+        if keys.len() > 1_024 {
+            return Err(RymeError::Overload(String::from("range read batch")));
+        }
+        keys.iter().map(|key| self.read_range_value(key, read_ts)).collect()
+    }
+
+    pub async fn fetch_range_values(
+        &self,
+        peer: usize,
+        keys: Vec<RecordKey>,
+        read_ts: u64,
+    ) -> Result<Vec<(Option<Vec<u8>>, Option<u64>)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if keys.len() > 1_024 {
+            return Err(RymeError::Overload(String::from("range read batch")));
+        }
+        let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
+        match pool.roundtrip(&Rpc::RangeReadBatchRequest { keys, read_ts }).await? {
+            Rpc::RangeReadBatchResponse { values } => Ok(values),
+            _ => Err(RymeError::Corrupt(String::from("range read batch rpc"))),
         }
     }
 
