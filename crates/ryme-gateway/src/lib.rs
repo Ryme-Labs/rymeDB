@@ -24,11 +24,33 @@ pub enum RemoteRead {
     Value { value: Option<Vec<u8>>, expires_at: Option<u64> },
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteScanPage {
+    pub rows: Vec<(Vec<u8>, Vec<u8>)>,
+    pub next: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RemoteScan {
+    Local,
+    Page(RemoteScanPage),
+}
+
 type RemoteReadFn = Arc<
     dyn Fn(RecordKey) -> Pin<Box<dyn Future<Output = Result<RemoteRead>> + Send>> + Send + Sync,
 >;
 type RemoteReadManyFn = Arc<
     dyn Fn(Vec<RecordKey>) -> Pin<Box<dyn Future<Output = Result<Vec<RemoteRead>>> + Send>>
+        + Send
+        + Sync,
+>;
+type RemoteScanFn = Arc<
+    dyn Fn(
+            String,
+            Option<Vec<u8>>,
+            usize,
+            u64,
+        ) -> Pin<Box<dyn Future<Output = Result<RemoteScan>> + Send>>
         + Send
         + Sync,
 >;
@@ -75,6 +97,37 @@ impl RemoteReader {
     }
 }
 
+#[derive(Clone)]
+pub struct RemoteScanner(RemoteScanFn);
+
+impl std::fmt::Debug for RemoteScanner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemoteScanner(..)")
+    }
+}
+
+impl RemoteScanner {
+    pub fn new<F, Fut>(scanner: F) -> Self
+    where
+        F: Fn(String, Option<Vec<u8>>, usize, u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RemoteScan>> + Send + 'static,
+    {
+        Self(Arc::new(move |table, start_after, limit, read_ts| {
+            Box::pin(scanner(table, start_after, limit, read_ts))
+        }))
+    }
+
+    pub async fn scan(
+        &self,
+        table: String,
+        start_after: Option<Vec<u8>>,
+        limit: usize,
+        read_ts: u64,
+    ) -> Result<RemoteScan> {
+        (self.0)(table, start_after, limit, read_ts).await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Gateway<B = TxnManager> {
     manager: B,
@@ -86,6 +139,7 @@ pub struct Gateway<B = TxnManager> {
     read_ts: Option<u64>,
     read_only: bool,
     remote_reader: Option<RemoteReader>,
+    remote_scanner: Option<RemoteScanner>,
 }
 
 impl Gateway<TxnManager> {
@@ -106,6 +160,7 @@ impl Gateway<TxnManager> {
             read_ts: None,
             read_only: false,
             remote_reader: None,
+            remote_scanner: None,
         }
     }
 
@@ -127,6 +182,7 @@ impl Gateway<TxnManager> {
             read_ts: None,
             read_only: false,
             remote_reader: None,
+            remote_scanner: None,
         }
     }
 }
@@ -153,6 +209,7 @@ where
             read_ts: None,
             read_only: false,
             remote_reader: None,
+            remote_scanner: None,
         }
     }
 
@@ -185,11 +242,17 @@ where
             read_ts: None,
             read_only: self.read_only,
             remote_reader: self.remote_reader,
+            remote_scanner: self.remote_scanner,
         }
     }
 
     pub fn with_remote_reader(mut self, reader: RemoteReader) -> Self {
         self.remote_reader = Some(reader);
+        self
+    }
+
+    pub fn with_remote_scanner(mut self, scanner: RemoteScanner) -> Self {
+        self.remote_scanner = Some(scanner);
         self
     }
 
@@ -461,6 +524,47 @@ where
         Ok(visible)
     }
 
+    pub async fn scan_async(
+        &self,
+        principal: &Principal,
+        table: &str,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(scanner) =
+            self.remote_scanner.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
+        else {
+            return self.scan(principal, table, limit);
+        };
+        self.policies.predicate(principal, table)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut visible = Vec::with_capacity(limit);
+        let mut start_after = None;
+        loop {
+            let page = match scanner
+                .scan(table.to_string(), start_after.clone(), limit, self.read_ts.unwrap_or(0))
+                .await?
+            {
+                RemoteScan::Local => return self.scan(principal, table, limit),
+                RemoteScan::Page(page) => page,
+            };
+            for (pk, value) in page.rows {
+                if !self.policies.has_table_policy(table)
+                    || self.policies.row_allowed(principal, table, &value)?
+                {
+                    visible.push((pk, value));
+                    if visible.len() == limit {
+                        return Ok(visible);
+                    }
+                }
+            }
+            let Some(next) = page.next else { break };
+            start_after = Some(next);
+        }
+        Ok(visible)
+    }
+
     /// Read one ordered storage page and return the internal cursor needed for
     /// the next page. The cursor is never exposed to callers as a data value;
     /// it only lets higher-level APIs keep filtering past rows that did not
@@ -501,6 +605,49 @@ where
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((visible, next))
+    }
+
+    pub async fn scan_page_async(
+        &self,
+        principal: &Principal,
+        table: &str,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>)> {
+        let Some(scanner) =
+            self.remote_scanner.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
+        else {
+            return self.scan_page(principal, table, start_after, limit);
+        };
+        self.policies.predicate(principal, table)?;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let page = match scanner
+            .scan(
+                table.to_string(),
+                start_after.map(ToOwned::to_owned),
+                limit,
+                self.read_ts.unwrap_or(0),
+            )
+            .await?
+        {
+            RemoteScan::Local => return self.scan_page(principal, table, start_after, limit),
+            RemoteScan::Page(page) => page,
+        };
+        if !self.policies.has_table_policy(table) {
+            return Ok((page.rows, page.next));
+        }
+        let visible = page
+            .rows
+            .into_iter()
+            .filter_map(|(pk, value)| match self.policies.row_allowed(principal, table, &value) {
+                Ok(true) => Some(Ok((pk, value))),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((visible, page.next))
     }
 
     pub fn manager_clone(&self) -> B
@@ -625,6 +772,37 @@ mod tests {
                 RemoteRead::Value { value: Some(second), .. }
             ] if first == b"a" && second == b"b"
         ));
+    }
+
+    #[tokio::test]
+    async fn async_scan_uses_remote_pages_and_cursors() {
+        let gateway = gateway().with_remote_scanner(RemoteScanner::new(
+            |table, start_after, limit, _read_ts| async move {
+                assert_eq!(table, "docs");
+                assert_eq!(limit, 3);
+                let page = if start_after.is_none() {
+                    RemoteScanPage {
+                        rows: vec![
+                            (b"a".to_vec(), b"one".to_vec()),
+                            (b"b".to_vec(), b"two".to_vec()),
+                        ],
+                        next: Some(b"b".to_vec()),
+                    }
+                } else {
+                    RemoteScanPage { rows: vec![(b"c".to_vec(), b"three".to_vec())], next: None }
+                };
+                Ok(RemoteScan::Page(page))
+            },
+        ));
+        let rows = gateway.scan_async(&owner(), "docs", 3).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (b"a".to_vec(), b"one".to_vec()),
+                (b"b".to_vec(), b"two".to_vec()),
+                (b"c".to_vec(), b"three".to_vec()),
+            ]
+        );
     }
 
     #[tokio::test]

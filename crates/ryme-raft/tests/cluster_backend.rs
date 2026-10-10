@@ -96,6 +96,19 @@ async fn backend_replicates_and_fails_over() {
     assert_eq!(snapshot.rows[0].pk, b"k".to_vec());
     assert_eq!(snapshot.rows[0].value, b"v1".to_vec());
     assert_eq!(snapshot.rows[0].versions.len(), 1);
+    let filtered_snapshot = nodes[first]
+        .fetch_range_snapshot_for(
+            target,
+            Vec::new(),
+            Vec::new(),
+            0,
+            16,
+            String::from("t"),
+            String::from("d"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered_snapshot.rows.len(), 1);
     assert_eq!(nodes[first].install_range_snapshot_on(target, snapshot).await.unwrap(), 1);
     nodes[first].set_range_owners(vec![RangeOwner {
         start: b"s\0".to_vec(),

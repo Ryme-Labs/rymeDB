@@ -14,7 +14,7 @@ use ryme_backup::Checkpoint;
 use ryme_config::{Config, OtelConfig};
 use ryme_control::ControlPlane;
 use ryme_crypto::{EnvKms, KeyRing, KmsProvider, WrappedDek};
-use ryme_gateway::{Gateway, RemoteRead, RemoteReader};
+use ryme_gateway::{Gateway, RemoteRead, RemoteReader, RemoteScan, RemoteScanPage, RemoteScanner};
 use ryme_index::PartitionedIndex;
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{Histogram, LatencyWindow, SlowEntry, SlowLog, TraceCollector, TraceSpan};
@@ -1193,6 +1193,27 @@ impl SharedState {
             });
             gateway = gateway.with_remote_reader(reader.clone());
             remote_reader = Some(reader);
+            let scan_node = range_reader_node.clone();
+            let scan_tenant = tenant.clone();
+            let scan_database = database.clone();
+            let scanner = RemoteScanner::new(move |table, start_after, limit, read_ts| {
+                let node = scan_node.clone();
+                let tenant = scan_tenant.clone();
+                let database = scan_database.clone();
+                async move {
+                    remote_scan_range_page(
+                        node,
+                        tenant,
+                        database,
+                        table,
+                        start_after,
+                        limit,
+                        read_ts,
+                    )
+                    .await
+                }
+            });
+            gateway = gateway.with_remote_scanner(scanner.clone());
         }
         gateway.set_read_only(config.read_only);
         let schema_path = config.data_dir.join("schema.json");
@@ -2969,11 +2990,13 @@ async fn rest_list(
     let mut cursor = None;
     let mut filtered = Vec::new();
     loop {
-        let (page, next) =
-            match gateway.scan_page(&principal, &table, cursor.as_deref(), page_limit) {
-                Ok(page) => page,
-                Err(e) => return error_response(e),
-            };
+        let (page, next) = match gateway
+            .scan_page_async(&principal, &table, cursor.as_deref(), page_limit)
+            .await
+        {
+            Ok(page) => page,
+            Err(e) => return error_response(e),
+        };
         filtered.extend(rest_list_filtered(page, raw));
         if (!full_order_scan && !count_exact && filtered.len() >= target) || next.is_none() {
             break;
@@ -3729,7 +3752,7 @@ async fn execute_graphql(
         }
     } else {
         let limit = parse_graphql_limit(query).unwrap_or(100).min(1000);
-        let rows = gateway.scan(principal, &table, limit)?;
+        let rows = gateway.scan_async(principal, &table, limit).await?;
         let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
         admit_egress(state, &principal.tenant, egress)?;
         let items: Vec<serde_json::Value> = rows
@@ -7231,7 +7254,7 @@ async fn scan(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    match gateway.scan(&principal, &table, limit) {
+    match gateway.scan_async(&principal, &table, limit).await {
         Ok(rows) => {
             let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
             if let Err(e) = admit_egress(&state, &principal.tenant, egress) {
@@ -8246,6 +8269,154 @@ fn range_owners(ranges: &[Range]) -> Vec<RangeOwner> {
             })
         })
         .collect()
+}
+
+fn table_routing_bounds(table: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut start = table.as_bytes().to_vec();
+    start.push(0);
+    let mut end = start.clone();
+    if let Some(last) = end.last_mut() {
+        *last = last.saturating_add(1);
+    }
+    (start, end)
+}
+
+fn max_routing_bound(left: &[u8], right: &[u8]) -> Vec<u8> {
+    if left >= right {
+        left.to_vec()
+    } else {
+        right.to_vec()
+    }
+}
+
+fn min_routing_bound(left: &[u8], right: &[u8]) -> Vec<u8> {
+    if left <= right {
+        left.to_vec()
+    } else {
+        right.to_vec()
+    }
+}
+
+fn snapshot_live_value(
+    row: &ryme_raft::net::RangeSnapshotRow,
+    snapshot_ts: u64,
+) -> Option<Vec<u8>> {
+    let version = row
+        .versions
+        .iter()
+        .filter(|version| version.commit_ts <= snapshot_ts)
+        .max_by_key(|version| version.commit_ts)?;
+    match (&version.value, version.expires_at) {
+        (Some(value), expires_at) if expires_at == 0 || expires_at > ryme_txn::now_unix() => {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
+async fn remote_scan_range_page(
+    node: Arc<Node>,
+    tenant: String,
+    database: String,
+    table: String,
+    start_after: Option<Vec<u8>>,
+    limit: usize,
+    read_ts: u64,
+) -> ryme_error::Result<RemoteScan> {
+    if limit == 0 {
+        return Ok(RemoteScan::Page(RemoteScanPage { rows: Vec::new(), next: None }));
+    }
+    let owners = node.range_owners();
+    if owners.is_empty() {
+        return Ok(RemoteScan::Local);
+    }
+    let (table_start, table_end) = table_routing_bounds(&table);
+    let cursor = start_after.as_ref().map(|pk| {
+        let mut routing = table_start.clone();
+        routing.extend_from_slice(pk);
+        // A routing key is a byte string, so appending a zero byte moves the
+        // lower bound past the exact key while retaining keys with it as a prefix.
+        routing.push(0);
+        routing
+    });
+    let scan_start = cursor
+        .as_deref()
+        .map(|cursor| max_routing_bound(&table_start, cursor))
+        .unwrap_or_else(|| table_start.clone());
+    let mut requests = Vec::new();
+    for range in owners {
+        let upper = if range.end.is_empty() {
+            table_end.clone()
+        } else {
+            min_routing_bound(&range.end, &table_end)
+        };
+        let lower = max_routing_bound(&range.start, &scan_start);
+        if lower >= upper {
+            continue;
+        }
+        let node = node.clone();
+        let tenant = tenant.clone();
+        let database = database.clone();
+        requests.push(async move {
+            let snapshot = if range.owner == node.node_id() {
+                node.snapshot_range_for(
+                    &lower,
+                    &upper,
+                    read_ts,
+                    limit,
+                    Some(&tenant),
+                    Some(&database),
+                )?
+            } else {
+                node.fetch_range_snapshot_for(
+                    range.owner,
+                    lower,
+                    upper,
+                    read_ts,
+                    limit,
+                    tenant,
+                    database,
+                )
+                .await?
+            };
+            Ok::<_, ryme_error::RymeError>(snapshot)
+        });
+    }
+    if requests.is_empty() {
+        return Ok(RemoteScan::Local);
+    }
+    let mut raw_rows = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
+    let mut truncated = false;
+    for snapshot in futures_util::future::join_all(requests).await {
+        let snapshot = snapshot?;
+        truncated |= snapshot.truncated;
+        for row in snapshot.rows {
+            if row.table == table
+                && row.tenant == tenant
+                && row.database == database
+                && !start_after.as_deref().is_some_and(|after| row.pk.as_slice() <= after)
+            {
+                raw_rows.insert(row.pk.clone(), snapshot_live_value(&row, snapshot.snapshot_ts));
+            }
+        }
+    }
+    let mut rows = Vec::with_capacity(limit);
+    let mut next = None;
+    for (index, (pk, value)) in raw_rows.iter().enumerate() {
+        if let Some(value) = value {
+            rows.push((pk.clone(), value.clone()));
+        }
+        if rows.len() == limit {
+            if index + 1 < raw_rows.len() || truncated {
+                next = Some(pk.clone());
+            }
+            break;
+        }
+    }
+    if rows.len() < limit && truncated {
+        next = raw_rows.keys().next_back().cloned();
+    }
+    Ok(RemoteScan::Page(RemoteScanPage { rows, next }))
 }
 
 fn install_cluster_data_replication(
@@ -10349,6 +10520,70 @@ fn archive_target(
 #[cfg(test)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owner_scan_pages_filter_tenant_and_preserve_cursor() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-owner-scan-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let mut txn = node.manager().begin();
+        node.manager().put(
+            &mut txn,
+            ryme_storage::RecordKey::new("default", "default", "docs", b"a"),
+            b"one".to_vec(),
+        );
+        node.manager().put(
+            &mut txn,
+            ryme_storage::RecordKey::new("default", "default", "docs", b"b"),
+            b"two".to_vec(),
+        );
+        node.manager().put(
+            &mut txn,
+            ryme_storage::RecordKey::new("other", "default", "docs", b"x"),
+            b"hidden".to_vec(),
+        );
+        node.manager().commit(txn).unwrap();
+        node.set_range_owners(vec![RangeOwner {
+            start: b"docs\0".to_vec(),
+            end: b"docs\x01".to_vec(),
+            owner: 0,
+            epoch: 1,
+        }]);
+
+        let first = remote_scan_range_page(
+            node.clone(),
+            String::from("default"),
+            String::from("default"),
+            String::from("docs"),
+            None,
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+        let RemoteScan::Page(first) = first else { panic!("expected owner page") };
+        assert_eq!(first.rows, vec![(b"a".to_vec(), b"one".to_vec())]);
+        assert_eq!(first.next, Some(b"a".to_vec()));
+
+        let second = remote_scan_range_page(
+            node,
+            String::from("default"),
+            String::from("default"),
+            String::from("docs"),
+            first.next,
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+        let RemoteScan::Page(second) = second else { panic!("expected owner page") };
+        assert_eq!(second.rows, vec![(b"b".to_vec(), b"two".to_vec())]);
+        assert_eq!(second.next, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn realtime_outgoing_queue_rejects_slow_consumers() {

@@ -59,6 +59,10 @@ pub(crate) enum Rpc {
         end: Vec<u8>,
         read_ts: u64,
         max_rows: u32,
+        #[serde(default)]
+        tenant: Option<String>,
+        #[serde(default)]
+        database: Option<String>,
     },
     RangeSnapshotResponse {
         snapshot: RangeSnapshot,
@@ -1327,8 +1331,15 @@ impl Node {
                 self.apply_presence(payload)?;
                 Ok(Rpc::PresenceResponse { ok: true })
             }
-            Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows } => {
-                let snapshot = self.snapshot_range(&start, &end, read_ts, max_rows as usize)?;
+            Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows, tenant, database } => {
+                let snapshot = self.snapshot_range_for(
+                    &start,
+                    &end,
+                    read_ts,
+                    max_rows as usize,
+                    tenant.as_deref(),
+                    database.as_deref(),
+                )?;
                 Ok(Rpc::RangeSnapshotResponse { snapshot })
             }
             Rpc::RangeInstallRequest { snapshot } => {
@@ -1854,6 +1865,18 @@ impl Node {
         read_ts: u64,
         max_rows: usize,
     ) -> Result<RangeSnapshot> {
+        self.snapshot_range_for(start, end, read_ts, max_rows, None, None)
+    }
+
+    pub fn snapshot_range_for(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        read_ts: u64,
+        max_rows: usize,
+        tenant_filter: Option<&str>,
+        database_filter: Option<&str>,
+    ) -> Result<RangeSnapshot> {
         if start >= end && !end.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("range")));
         }
@@ -1862,6 +1885,11 @@ impl Node {
         let mut rows = Vec::new();
         let mut truncated = false;
         for (tenant, database, table) in self.manager.spaces()? {
+            if tenant_filter.is_some_and(|wanted| wanted != tenant)
+                || database_filter.is_some_and(|wanted| wanted != database)
+            {
+                continue;
+            }
             for (pk, table_versions) in self.manager.export_table(&tenant, &database, &table)? {
                 let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
                 routing.extend_from_slice(table.as_bytes());
@@ -1943,7 +1971,46 @@ impl Node {
         let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
         let max_rows = u32::try_from(max_rows.min(100_000))
             .map_err(|_| RymeError::InvalidArgument(String::from("max_rows")))?;
-        match pool.roundtrip(&Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows }).await? {
+        match pool
+            .roundtrip(&Rpc::RangeSnapshotRequest {
+                start,
+                end,
+                read_ts,
+                max_rows,
+                tenant: None,
+                database: None,
+            })
+            .await?
+        {
+            Rpc::RangeSnapshotResponse { snapshot } => Ok(snapshot),
+            _ => Err(RymeError::Corrupt(String::from("range snapshot rpc"))),
+        }
+    }
+
+    pub async fn fetch_range_snapshot_for(
+        &self,
+        peer: usize,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        read_ts: u64,
+        max_rows: usize,
+        tenant: String,
+        database: String,
+    ) -> Result<RangeSnapshot> {
+        let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
+        let max_rows = u32::try_from(max_rows.min(100_000))
+            .map_err(|_| RymeError::InvalidArgument(String::from("max_rows")))?;
+        match pool
+            .roundtrip(&Rpc::RangeSnapshotRequest {
+                start,
+                end,
+                read_ts,
+                max_rows,
+                tenant: Some(tenant),
+                database: Some(database),
+            })
+            .await?
+        {
             Rpc::RangeSnapshotResponse { snapshot } => Ok(snapshot),
             _ => Err(RymeError::Corrupt(String::from("range snapshot rpc"))),
         }
@@ -2029,6 +2096,10 @@ impl Node {
         if let Ok(mut current) = self.range_owners.write() {
             *current = owners;
         }
+    }
+
+    pub fn range_owners(&self) -> Vec<RangeOwner> {
+        self.range_owners.read().map(|owners| owners.clone()).unwrap_or_default()
     }
 
     pub fn range_owner(&self, routing_key: &[u8]) -> Option<(usize, u64)> {

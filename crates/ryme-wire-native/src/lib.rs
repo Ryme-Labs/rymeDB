@@ -532,7 +532,7 @@ where
             return response;
         }
         let limit = request.limit.clamp(1, 1000).max(1);
-        let response = match self.gateway.scan(principal, &request.table, limit) {
+        let response = match self.gateway.scan_async(principal, &request.table, limit).await {
             Ok(rows) => {
                 let mut response = Response::ok();
                 response.rows = Some(

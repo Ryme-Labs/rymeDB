@@ -205,12 +205,14 @@ committed, main-branch point reads through the HTTP, native, gRPC, and RESP
 gateways use the range owner and fetch from the target over the authenticated
 mesh, including RLS checks at the serving gateway where applicable.
 PostgreSQL autocommit primary-key selects use the same owner path; PostgreSQL
-transactions, scans, and transactional RESP commands still use the existing
-transaction backend so their MVCC snapshots are unchanged.
-Because the current cluster log still materializes replicated writes on all
-members, this does not yet delete the source replica or claim full
-shared-nothing storage scale; owner-aware data-apply filtering and complete
-transaction routing remain separate work.
+transactions, PostgreSQL scans, and transactional RESP commands still use the
+existing transaction backend so their MVCC snapshots are unchanged. Ordered
+scans through HTTP, native, gRPC, GraphQL, and PostgREST fan out to owners and
+merge bounded pages by primary key. Because the current cluster log still
+materializes replicated writes on all members, this does not yet delete the
+source replica or claim full shared-nothing storage scale; owner-aware
+data-apply filtering, write routing, and complete transaction routing remain
+separate work.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

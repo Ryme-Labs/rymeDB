@@ -15,6 +15,10 @@
   values from the target member over the cluster mesh. PostgreSQL routing is
   limited to autocommit primary-key selects so transaction snapshots remain
   unchanged.
+- Main-branch ordered scans through HTTP, native, gRPC, GraphQL, and PostgREST
+  now fan out to configured range owners, merge bounded pages by primary key,
+  and preserve tenant filtering and cursors across owner boundaries. Branches
+  and deployments without range topology retain the local scan path.
 
 - Query streams now support PostgREST-style filters, projections, and ordering.
   Filtered queries resnapshot from committed table changes while unfiltered

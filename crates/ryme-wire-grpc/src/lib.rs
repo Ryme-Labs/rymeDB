@@ -449,7 +449,7 @@ where
         }
         self.admit_read(&principal).map_err(status_of)?;
         let limit = (inner.limit as usize).clamp(1, 1000).max(1);
-        let reply = match self.gateway.scan(&principal, &inner.table, limit) {
+        let reply = match self.gateway.scan_async(&principal, &inner.table, limit).await {
             Ok(rows) => proto::ScanReply {
                 ok: true,
                 error: String::new(),
