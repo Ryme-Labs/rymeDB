@@ -1856,6 +1856,7 @@ name = "ryme-raft"
 version = "0.1.0"
 dependencies = [
  "ryme-error",
+ "ryme-sql",
  "ryme-storage",
  "ryme-tls",
  "ryme-txn",

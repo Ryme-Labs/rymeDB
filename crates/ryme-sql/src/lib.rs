@@ -9233,6 +9233,71 @@ where
         }
     }
 
+    async fn scan_rows_async(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        filter: &[Predicate],
+        limit: usize,
+    ) -> Result<Vec<Row>> {
+        if let Some(view) = self.view_definition(table)? {
+            let mut rows = query_result_rows(self.execute_read_in_transaction(txn, view.query)?);
+            rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
+            rows.truncate(limit);
+            return Ok(rows);
+        }
+        if limit == 0 {
+            let _ = self.manager.scan_async(txn, &self.tenant, &self.database, table, 0).await?;
+            return Ok(Vec::new());
+        }
+        const PAGE: usize = 1024;
+        let mut base = BTreeMap::new();
+        let mut after = None;
+        loop {
+            let page = match after.as_deref() {
+                Some(after) => {
+                    self.manager
+                        .scan_after_async(txn, &self.tenant, &self.database, table, after, PAGE)
+                        .await?
+                }
+                None => {
+                    self.manager.scan_async(txn, &self.tenant, &self.database, table, PAGE).await?
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            let last = page.last().map(|(pk, _)| pk.clone());
+            base.extend(page);
+            if page_len < PAGE {
+                break;
+            }
+            after = last;
+        }
+        for (key, write) in txn.writes() {
+            if key.tenant != self.tenant || key.database != self.database || key.table != table {
+                continue;
+            }
+            match write.value.as_ref() {
+                Some(value) if write.expires_at == 0 || write.expires_at > ryme_txn::now_unix() => {
+                    base.insert(key.pk.clone(), value.clone());
+                }
+                _ => {
+                    base.remove(&key.pk);
+                }
+            }
+        }
+        Ok(base
+            .into_iter()
+            .filter(|(pk, value)| {
+                self.rls_allows(table, value)
+                    && filter.iter().all(|predicate| predicate.matches(pk, value))
+            })
+            .take(limit)
+            .collect())
+    }
+
     fn scan_rows(
         &self,
         txn: &mut Transaction,
@@ -12475,6 +12540,69 @@ where
                     })
                     .collect();
                 Ok(QueryResult::Table { columns: output_columns, rows })
+            }
+            Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter } => {
+                let cap = if filter.is_empty() && offset == 0 && order == Order::default() {
+                    limit.clamp(1, 10000)
+                } else {
+                    10000
+                };
+                let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
+                let mut rows: Vec<Row> = rows
+                    .into_iter()
+                    .filter(|(pk, value)| {
+                        filter.iter().all(|predicate| predicate.matches(pk, value))
+                    })
+                    .collect();
+                rows.sort_by(|left, right| compare_order(&order, left, right));
+                let rows = rows
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
+                    .collect();
+                let output_columns = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        aliases
+                            .get(index)
+                            .and_then(|alias| alias.clone())
+                            .unwrap_or_else(|| column.clone())
+                    })
+                    .collect();
+                Ok(QueryResult::Table { columns: output_columns, rows })
+            }
+            Statement::SelectScan { table, limit, offset, order, filter } => {
+                let plain = filter.is_empty() && offset == 0 && order == Order::default();
+                let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
+                let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
+                let mut rows: Vec<Row> = rows
+                    .into_iter()
+                    .filter(|(pk, value)| {
+                        filter.iter().all(|predicate| predicate.matches(pk, value))
+                    })
+                    .collect();
+                rows.sort_by(|left, right| compare_order(&order, left, right));
+                Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
+            }
+            Statement::Aggregate { table, func, field, column, filter } => {
+                let rows = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
+                let rows: Vec<Row> = rows
+                    .into_iter()
+                    .filter(|(pk, value)| {
+                        filter.iter().all(|predicate| predicate.matches(pk, value))
+                    })
+                    .collect();
+                Ok(QueryResult::Scalar {
+                    label: func.label().to_string(),
+                    value: aggregate_target_rows(&rows, func, field, column.as_deref()),
+                })
+            }
+            Statement::Join { left, right, join_type, limit, offset, order, filter } => {
+                let left_rows = self.scan_rows_async(txn, &left, &[], usize::MAX).await?;
+                let right_rows = self.scan_rows_async(txn, &right, &[], usize::MAX).await?;
+                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit))
             }
             statement => self.execute_read_in_transaction(txn, statement),
         }

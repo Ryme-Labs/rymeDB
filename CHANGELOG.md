@@ -1,5 +1,10 @@
 # Changelog
 
+- Read-only SQL transaction scans now fan out bounded range pages to configured
+  owners, merge them by primary key, preserve snapshot timestamps, and merge
+  staged writes before filtering and ordering. This covers SELECT, aggregate,
+  and join read paths; scan-based mutations and per-range 2PC remain future
+  work.
 - Cluster transaction point reads now use an asynchronous owner-aware path.
   PostgreSQL transaction primary-key reads and point mutations can fetch a
   missing row from its configured range owner while preserving the local

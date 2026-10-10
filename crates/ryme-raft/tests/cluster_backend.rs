@@ -1,6 +1,6 @@
 use ryme_raft::net::{ClusterBackend, Node, RangeOwner};
 use ryme_storage::RecordKey;
-use ryme_txn::TxnBackend;
+use ryme_txn::{Isolation, TxnBackend};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -341,6 +341,35 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
     }
     assert_eq!(nodes[client].read_latest(&key("a")).await.unwrap(), None);
     assert_eq!(nodes[client].read_latest(&key("z")).await.unwrap(), None);
+
+    let mut routed_scan = backends[client].begin();
+    let first_page = backends[client]
+        .scan_async(&mut routed_scan, "t", "d", "s", 2)
+        .await
+        .unwrap();
+    assert_eq!(first_page, vec![(b"a".to_vec(), b"left".to_vec()), (b"seed".to_vec(), b"seed".to_vec())]);
+    let second_page = backends[client]
+        .scan_after_async(&mut routed_scan, "t", "d", "s", b"seed", 2)
+        .await
+        .unwrap();
+    assert_eq!(second_page, vec![(b"z".to_vec(), b"right".to_vec())]);
+    assert!(routed_scan.scanned_tables().contains(&(String::from("t"), String::from("d"), String::from("s"))));
+
+    let executor = ryme_sql::Executor::with_backend(
+        String::from("t"),
+        String::from("d"),
+        backends[client].clone(),
+    );
+    let mut sql_txn = executor.begin_transaction(Isolation::Serializable);
+    let (result, _) = executor
+        .execute_in_transaction(&mut sql_txn, ryme_sql::parse("SELECT * FROM s ORDER BY id").unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(result, ryme_sql::QueryResult::Rows { rows } if rows == vec![
+        (b"a".to_vec(), b"left".to_vec()),
+        (b"seed".to_vec(), b"seed".to_vec()),
+        (b"z".to_vec(), b"right".to_vec()),
+    ]));
 
     for (node, task) in nodes.iter().zip(tasks) {
         node.shutdown(task);

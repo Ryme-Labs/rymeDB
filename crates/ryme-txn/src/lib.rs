@@ -184,6 +184,10 @@ impl Transaction {
         self.observed.entry(key).or_insert(existed);
     }
 
+    pub fn record_scan(&mut self, tenant: &str, database: &str, table: &str) {
+        self.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+    }
+
     pub fn scanned_tables(&self) -> &BTreeSet<(String, String, String)> {
         &self.scanned
     }
@@ -222,6 +226,27 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
         key: &'a RecordKey,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + Send + 'a>> {
         Box::pin(async move { self.get(txn, key) })
+    }
+    fn scan_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>> {
+        Box::pin(async move { self.scan(txn, tenant, database, table, limit) })
+    }
+    fn scan_after_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        start_after: &'a [u8],
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>> {
+        Box::pin(async move { self.scan_after(txn, tenant, database, table, start_after, limit) })
     }
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>);
     fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64);

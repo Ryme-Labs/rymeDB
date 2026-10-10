@@ -200,6 +200,35 @@ pub struct RangeOwner {
     pub epoch: u64,
 }
 
+fn next_prefix(prefix: &[u8]) -> Vec<u8> {
+    let mut next = prefix.to_vec();
+    for index in (0..next.len()).rev() {
+        if next[index] < u8::MAX {
+            next[index] += 1;
+            next.truncate(index + 1);
+            return next;
+        }
+    }
+    Vec::new()
+}
+
+fn snapshot_live_value(row: &RangeSnapshotRow, snapshot_ts: u64) -> Option<Vec<u8>> {
+    let mut value = None;
+    for version in &row.versions {
+        if version.commit_ts > snapshot_ts {
+            continue;
+        }
+        value = if version.value.is_some()
+            && (version.expires_at == 0 || version.expires_at > now_unix())
+        {
+            version.value.clone()
+        } else {
+            None
+        };
+    }
+    value
+}
+
 async fn write_frame<S>(socket: &mut S, rpc: &Rpc) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -2155,6 +2184,87 @@ impl Node {
         })
     }
 
+    pub async fn scan_range_page(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start_after: Option<&[u8]>,
+        read_ts: u64,
+        limit: usize,
+    ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let table_start = {
+            let mut prefix = table.as_bytes().to_vec();
+            prefix.push(0);
+            prefix
+        };
+        let table_end = next_prefix(&table_start);
+        let ranges = self.range_owners();
+        let mut spans = Vec::new();
+        for range in ranges {
+            let lower = if range.start.as_slice() > table_start.as_slice() {
+                range.start
+            } else {
+                table_start.clone()
+            };
+            let upper = if range.end.is_empty() {
+                table_end.clone()
+            } else if range.end.as_slice() < table_end.as_slice() {
+                range.end
+            } else {
+                table_end.clone()
+            };
+            if lower < upper {
+                spans.push((range.owner, lower, upper));
+            }
+        }
+        if spans.is_empty() {
+            return Ok(None);
+        }
+
+        let max_rows = limit.min(100_000);
+        let mut rows = BTreeMap::new();
+        for (owner, lower, upper) in spans {
+            let snapshot = if owner == self.id {
+                self.snapshot_range_for(
+                    &lower,
+                    &upper,
+                    read_ts,
+                    max_rows,
+                    Some(tenant),
+                    Some(database),
+                )?
+            } else {
+                self.fetch_range_snapshot_for(
+                    owner,
+                    lower,
+                    upper,
+                    read_ts,
+                    max_rows,
+                    tenant.to_string(),
+                    database.to_string(),
+                )
+                .await?
+            };
+            for row in snapshot.rows {
+                if row.table != table
+                    || row.tenant != tenant
+                    || row.database != database
+                    || start_after.is_some_and(|after| row.pk.as_slice() <= after)
+                {
+                    continue;
+                }
+                if let Some(value) = snapshot_live_value(&row, snapshot.snapshot_ts) {
+                    rows.insert(row.pk, value);
+                }
+            }
+        }
+        Ok(Some(rows.into_iter().take(limit).collect()))
+    }
+
     pub async fn fetch_range_snapshot(
         &self,
         peer: usize,
@@ -2390,6 +2500,36 @@ impl Node {
     }
 }
 
+fn merge_scan_page(
+    txn: &ryme_txn::Transaction,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    start_after: Option<&[u8]>,
+    limit: usize,
+    page: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows: BTreeMap<Vec<u8>, Vec<u8>> = page.into_iter().collect();
+    for (key, write) in txn.writes() {
+        if key.tenant != tenant
+            || key.database != database
+            || key.table != table
+            || start_after.is_some_and(|after| key.pk.as_slice() <= after)
+        {
+            continue;
+        }
+        match write.value.as_ref() {
+            Some(value) if write.expires_at == 0 || write.expires_at > now_unix() => {
+                rows.insert(key.pk.clone(), value.clone());
+            }
+            _ => {
+                rows.remove(&key.pk);
+            }
+        }
+    }
+    rows.into_iter().take(limit).collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterBackend {
     node: Arc<Node>,
@@ -2437,6 +2577,50 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             let (value, _) = node.fetch_range_value(owner, key.clone(), txn.read_ts).await?;
             txn.record_read(key.clone(), value.is_some());
             Ok(value)
+        })
+    }
+
+    fn scan_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        limit: usize,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>>
+    {
+        let node = self.node.clone();
+        Box::pin(async move {
+            let page =
+                node.scan_range_page(tenant, database, table, None, txn.read_ts, limit).await?;
+            let Some(page) = page else {
+                return node.manager().scan(txn, tenant, database, table, limit);
+            };
+            txn.record_scan(tenant, database, table);
+            Ok(merge_scan_page(txn, tenant, database, table, None, limit, page))
+        })
+    }
+
+    fn scan_after_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        start_after: &'a [u8],
+        limit: usize,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>>
+    {
+        let node = self.node.clone();
+        Box::pin(async move {
+            let page = node
+                .scan_range_page(tenant, database, table, Some(start_after), txn.read_ts, limit)
+                .await?;
+            let Some(page) = page else {
+                return node.manager().scan_after(txn, tenant, database, table, start_after, limit);
+            };
+            txn.record_scan(tenant, database, table);
+            Ok(merge_scan_page(txn, tenant, database, table, Some(start_after), limit, page))
         })
     }
 

@@ -168,6 +168,24 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
+    fn scan_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+    > {
+        match self {
+            Self::Single(manager) => manager.scan_async(txn, tenant, database, table, limit),
+            Self::Cluster(backend) => backend.scan_async(txn, tenant, database, table, limit),
+            Self::Sharded(shards) => shards.scan_async(txn, tenant, database, table, limit),
+            Self::Hybrid(hybrid) => hybrid.scan_async(txn, tenant, database, table, limit),
+        }
+    }
+
     fn scan_after(
         &self,
         txn: &mut ryme_txn::Transaction,
@@ -189,6 +207,33 @@ impl ryme_txn::TxnBackend for Backend {
             }
             Self::Hybrid(hybrid) => {
                 hybrid.scan_after(txn, tenant, database, table, start_after, limit)
+            }
+        }
+    }
+
+    fn scan_after_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        start_after: &'a [u8],
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+    > {
+        match self {
+            Self::Single(manager) => {
+                manager.scan_after_async(txn, tenant, database, table, start_after, limit)
+            }
+            Self::Cluster(backend) => {
+                backend.scan_after_async(txn, tenant, database, table, start_after, limit)
+            }
+            Self::Sharded(shards) => {
+                shards.scan_after_async(txn, tenant, database, table, start_after, limit)
+            }
+            Self::Hybrid(hybrid) => {
+                hybrid.scan_after_async(txn, tenant, database, table, start_after, limit)
             }
         }
     }
