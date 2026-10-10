@@ -1,5 +1,6 @@
 use mlua::{HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Value as LuaValue, VmState};
 use ryme_error::{Result, RymeError};
+pub use ryme_gateway::{RemoteRead, RemoteReader};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{
     Histogram, LatencyWindow, SlowEntry, SlowLog, TraceCollector, TraceSpan, SLOW_THRESHOLD_MICROS,
@@ -41,6 +42,7 @@ pub struct RespGateway<B = TxnManager> {
     scripts: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     next_client_id: Arc<AtomicU64>,
     read_only: bool,
+    remote_reader: Option<RemoteReader>,
 }
 
 impl<B: std::fmt::Debug> std::fmt::Debug for RespGateway<B> {
@@ -237,6 +239,7 @@ impl RespGateway<TxnManager> {
             scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
+            remote_reader: None,
         }
     }
 
@@ -260,6 +263,7 @@ impl RespGateway<TxnManager> {
             scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
+            remote_reader: None,
         }
     }
 }
@@ -288,11 +292,17 @@ where
             scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
+            remote_reader: None,
         }
     }
 
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    pub fn with_remote_reader(mut self, reader: RemoteReader) -> Self {
+        self.remote_reader = Some(reader);
         self
     }
 
@@ -1467,6 +1477,15 @@ where
         let start = std::time::Instant::now();
         let fingerprint = command.name.clone();
         let bytes = Self::command_bytes(&command);
+        if let Some(reply) = self.remote_read_reply(&command).await {
+            if let Some(denied) = self.admit(false, bytes) {
+                self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+                return denied;
+            }
+            self.observe(false);
+            self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+            return reply;
+        }
         let mut txn = self.manager.begin();
         let reply = self.dispatch_in(&mut txn, command);
         let write = !txn.writes().is_empty();
@@ -1499,6 +1518,21 @@ where
                 self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
                 reply
             }
+        }
+    }
+
+    async fn remote_read_reply(&self, command: &RespCommand) -> Option<Vec<u8>> {
+        if command.name != "GET" || command.args.len() != 1 {
+            return None;
+        }
+        let reader = self.remote_reader.as_ref()?;
+        let key = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+        match reader.read(key).await {
+            Ok(RemoteRead::Local) => None,
+            Ok(RemoteRead::Value { value, .. }) => {
+                Some(value.map_or_else(encode_null, |value| encode_bulk(&value)))
+            }
+            Err(error) => Some(encode_error(error.to_string())),
         }
     }
 

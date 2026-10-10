@@ -443,6 +443,7 @@ pub struct SharedState {
     backend: Backend,
     durable: DurableManager,
     gateway: Gateway<BranchStorage>,
+    remote_reader: Option<RemoteReader>,
     executor: Executor<BranchStorage>,
     rls_tables: HashMap<String, String>,
     realtime: Realtime,
@@ -1128,8 +1129,9 @@ impl SharedState {
             Backend::Hybrid(hybrid) => Some(hybrid.raft().node().clone()),
             Backend::Single(_) | Backend::Sharded(_) => None,
         };
+        let mut remote_reader = None;
         if let Some(range_reader_node) = range_reader_node {
-            let remote_reader = RemoteReader::new(move |key| {
+            let reader = RemoteReader::new(move |key| {
                 let node = range_reader_node.clone();
                 async move {
                     let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
@@ -1146,7 +1148,8 @@ impl SharedState {
                     Ok(RemoteRead::Value { value, expires_at })
                 }
             });
-            gateway = gateway.with_remote_reader(remote_reader);
+            gateway = gateway.with_remote_reader(reader.clone());
+            remote_reader = Some(reader);
         }
         gateway.set_read_only(config.read_only);
         let schema_path = config.data_dir.join("schema.json");
@@ -1283,6 +1286,7 @@ impl SharedState {
             backend,
             durable,
             gateway,
+            remote_reader,
             executor,
             rls_tables: config.rls_tables.clone(),
             realtime,
@@ -1917,6 +1921,9 @@ fn spawn_gateways(
         state.database.clone(),
         state.backend.clone(),
     );
+    if let Some(reader) = state.remote_reader.clone() {
+        resp = resp.with_remote_reader(reader);
+    }
     let resp_node = state.raft_node();
     if let Some(authenticator) = resp_authenticator(&state) {
         resp = resp.with_authenticator(move |user, password| authenticator(user, password));
@@ -2017,6 +2024,9 @@ fn spawn_gateways(
             resp_tls_state.database.clone(),
             resp_tls_state.backend.clone(),
         );
+        if let Some(reader) = resp_tls_state.remote_reader.clone() {
+            gateway = gateway.with_remote_reader(reader);
+        }
         if let Some(authenticator) = resp_authenticator(&resp_tls_state) {
             gateway =
                 gateway.with_authenticator(move |user, password| authenticator(user, password));

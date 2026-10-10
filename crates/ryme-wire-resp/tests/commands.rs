@@ -107,6 +107,25 @@ async fn counters_roundtrip() {
 }
 
 #[tokio::test]
+async fn owner_reader_serves_remote_gets() {
+    let gateway = ryme_wire_resp::RespGateway::new(String::from("t"), String::from("d"))
+        .with_remote_reader(ryme_wire_resp::RemoteReader::new(|key| async move {
+            assert_eq!(key.table, "_kv");
+            assert_eq!(key.pk, b"remote".to_vec());
+            Ok(ryme_wire_resp::RemoteRead::Value {
+                value: Some(b"owner-value".to_vec()),
+                expires_at: None,
+            })
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+    assert_eq!(command(addr, &["GET", "remote"]).await, "$11\r\nowner-value");
+}
+
+#[tokio::test]
 async fn set_get_returns_the_previous_value_atomically() {
     let addr = serve().await;
     assert_eq!(command(addr, &["SET", "cache:key", "v1", "GET"]).await, "$-1");

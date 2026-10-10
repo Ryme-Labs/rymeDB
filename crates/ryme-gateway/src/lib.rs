@@ -45,7 +45,7 @@ impl RemoteReader {
         Self(Arc::new(move |key| Box::pin(reader(key))))
     }
 
-    async fn read(&self, key: RecordKey) -> Result<RemoteRead> {
+    pub async fn read(&self, key: RecordKey) -> Result<RemoteRead> {
         (self.0)(key).await
     }
 }

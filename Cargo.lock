@@ -2072,6 +2072,7 @@ dependencies = [
  "bytes",
  "mlua",
  "ryme-error",
+ "ryme-gateway",
  "ryme-metering",
  "ryme-observe",
  "ryme-qos",

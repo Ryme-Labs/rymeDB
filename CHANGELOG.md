@@ -11,9 +11,9 @@
 - Range transfer snapshots now preserve MVCC version chains and tombstones,
   rather than copying only the currently visible value.
 - Main-branch KV point reads now honor transferred `raft-{id}` range ownership
-  across HTTP, native, and gRPC gateways, fetching owned values from the target
-  member over the cluster mesh while retaining the existing transaction path
-  for writes and scans.
+  across HTTP, native, gRPC, and RESP gateways, fetching owned values from the
+  target member over the cluster mesh while retaining the existing transaction
+  path for writes and scans.
 
 - Query streams now support PostgREST-style filters, projections, and ordering.
   Filtered queries resnapshot from committed table changes while unfiltered
