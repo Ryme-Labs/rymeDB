@@ -54,6 +54,15 @@ pub(crate) enum Rpc {
     PresenceResponse {
         ok: bool,
     },
+    RangeSnapshotRequest {
+        start: Vec<u8>,
+        end: Vec<u8>,
+        read_ts: u64,
+        max_rows: u32,
+    },
+    RangeSnapshotResponse {
+        snapshot: RangeSnapshot,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -67,6 +76,24 @@ pub(crate) enum Rpc {
         ok: bool,
         match_index: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeSnapshotRow {
+    pub tenant: String,
+    pub database: String,
+    pub table: String,
+    pub pk: Vec<u8>,
+    pub value: Vec<u8>,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeSnapshot {
+    pub snapshot_ts: u64,
+    pub applied_commit: u64,
+    pub rows: Vec<RangeSnapshotRow>,
+    pub truncated: bool,
 }
 
 async fn write_frame<S>(socket: &mut S, rpc: &Rpc) -> Result<()>
@@ -1259,6 +1286,10 @@ impl Node {
                 self.apply_presence(payload)?;
                 Ok(Rpc::PresenceResponse { ok: true })
             }
+            Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows } => {
+                let snapshot = self.snapshot_range(&start, &end, read_ts, max_rows as usize)?;
+                Ok(Rpc::RangeSnapshotResponse { snapshot })
+            }
             Rpc::AppendRequest {
                 term,
                 leader: _,
@@ -1330,7 +1361,8 @@ impl Node {
             | Rpc::PreVoteResponse { .. }
             | Rpc::TransferResponse { .. }
             | Rpc::RealtimeResponse { .. }
-            | Rpc::PresenceResponse { .. } => {
+            | Rpc::PresenceResponse { .. }
+            | Rpc::RangeSnapshotResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
         }
@@ -1757,6 +1789,98 @@ impl Node {
     pub async fn read_latest(&self, key: &RecordKey) -> Result<Option<Vec<u8>>> {
         let mut txn = self.manager.begin();
         self.manager.get(&mut txn, key)
+    }
+
+    pub fn snapshot_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        read_ts: u64,
+        max_rows: usize,
+    ) -> Result<RangeSnapshot> {
+        if start >= end && !end.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("range")));
+        }
+        let max_rows = max_rows.clamp(1, 100_000);
+        let snapshot_ts = if read_ts == 0 { self.manager.latest_commit() } else { read_ts };
+        let mut txn = self.manager.begin();
+        txn.restamp(snapshot_ts);
+        let mut rows = Vec::new();
+        let mut truncated = false;
+        for (tenant, database, table) in self.manager.spaces()? {
+            let mut cursor = Vec::new();
+            loop {
+                let page =
+                    self.manager.scan_after(&mut txn, &tenant, &database, &table, &cursor, 1024)?;
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                let last_pk = page.last().map(|(pk, _)| pk.clone()).unwrap_or_default();
+                for (pk, value) in page {
+                    let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
+                    routing.extend_from_slice(table.as_bytes());
+                    routing.push(0);
+                    routing.extend_from_slice(&pk);
+                    if routing.as_slice() < start || (!end.is_empty() && routing.as_slice() >= end)
+                    {
+                        continue;
+                    }
+                    let expires_at = self
+                        .manager
+                        .expires_at(&RecordKey::new(&tenant, &database, &table, &pk))?
+                        .unwrap_or(0);
+                    rows.push(RangeSnapshotRow {
+                        tenant: tenant.clone(),
+                        database: database.clone(),
+                        table: table.clone(),
+                        pk,
+                        value,
+                        expires_at,
+                    });
+                    if rows.len() > max_rows {
+                        truncated = true;
+                        rows.truncate(max_rows);
+                        break;
+                    }
+                }
+                if truncated || last_pk.is_empty() || page_len < 1024 {
+                    break;
+                }
+                cursor = last_pk;
+            }
+        }
+        rows.sort_by(|left, right| {
+            left.table
+                .as_bytes()
+                .cmp(right.table.as_bytes())
+                .then_with(|| left.pk.cmp(&right.pk))
+                .then_with(|| left.tenant.cmp(&right.tenant))
+                .then_with(|| left.database.cmp(&right.database))
+        });
+        Ok(RangeSnapshot {
+            snapshot_ts,
+            applied_commit: self.manager.latest_commit(),
+            rows,
+            truncated,
+        })
+    }
+
+    pub async fn fetch_range_snapshot(
+        &self,
+        peer: usize,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        read_ts: u64,
+        max_rows: usize,
+    ) -> Result<RangeSnapshot> {
+        let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
+        let max_rows = u32::try_from(max_rows.min(100_000))
+            .map_err(|_| RymeError::InvalidArgument(String::from("max_rows")))?;
+        match pool.roundtrip(&Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows }).await? {
+            Rpc::RangeSnapshotResponse { snapshot } => Ok(snapshot),
+            _ => Err(RymeError::Corrupt(String::from("range snapshot rpc"))),
+        }
     }
 
     pub fn manager(&self) -> &TxnManager {

@@ -185,7 +185,13 @@ merge, and autosplit requests must reach the current leader and are only
 acknowledged after the metadata entry reaches quorum; followers apply the same
 range map before serving the updated range. This keeps routing metadata
 consistent across nodes, but it does not yet move range-owned data between
-nodes. Hybrid backends apply the same local range placement to their
+nodes. The leader now exposes `POST /v1/ranges/verify` as the first migration
+safety gate: it takes a consistent key-range snapshot from the requested Raft
+member, compares it with the leader at the supplied `expected_epoch`, and
+returns row/byte counts plus `matching` and `ready_for_transfer`. The endpoint
+is read-only; it never changes ownership, and a placement change during the
+check returns `409` so a future transfer cannot copy against a stale range
+epoch. Hybrid backends apply the same local range placement to their
 non-replicated tier, while replicated tables continue to follow the Raft-backed
 placement.
 

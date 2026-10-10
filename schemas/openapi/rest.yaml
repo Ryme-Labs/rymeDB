@@ -1635,6 +1635,50 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+  /v1/ranges/verify:
+    post:
+      tags: [ranges]
+      description: "Compare a range snapshot on the current Raft leader with a member at an expected placement epoch. This is the consistency gate used before a future range transfer; it does not change ownership or data."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRangeRequest'
+      responses:
+        '200':
+          description: source/target row and byte counts plus matching status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [range, epoch, source, target, matching, ready_for_transfer]
+                properties:
+                  range: { type: string }
+                  epoch: { type: integer }
+                  source: { type: integer }
+                  target: { type: integer }
+                  snapshot_ts: { type: integer }
+                  source_commit: { type: integer }
+                  target_commit: { type: integer }
+                  source_rows: { type: integer }
+                  target_rows: { type: integer }
+                  source_bytes: { type: integer }
+                  target_bytes: { type: integer }
+                  source_truncated: { type: boolean }
+                  target_truncated: { type: boolean }
+                  matching: { type: boolean }
+                  ready_for_transfer: { type: boolean }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
   /v1/cluster/members:
     get:
       tags: [cluster]
@@ -2368,6 +2412,21 @@ components:
           type: integer
         expected_right_epoch:
           type: integer
+    VerifyRangeRequest:
+      type: object
+      required: [id, target, expected_epoch]
+      properties:
+        id:
+          type: string
+        target:
+          type: integer
+          description: Raft member id to compare against
+        expected_epoch:
+          type: integer
+        max_rows:
+          type: integer
+          minimum: 1
+          maximum: 100000
     PlacementRange:
       type: object
       required: [id, start, end, leader, epoch]

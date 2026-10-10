@@ -424,6 +424,17 @@ async fn cluster_range_split_replicates_metadata() {
     let (status, _) = http_request(http[leader], "POST /v1/ranges/split", body).await;
     assert_eq!(status, 200);
     wait_ranges(&http).await;
+    let target = (leader + 1) % http.len();
+    let stale = format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":0}}");
+    let (status, _) = http_request(http[leader], "POST /v1/ranges/verify", stale.as_bytes()).await;
+    assert_eq!(status, 409);
+    let verify = format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":1}}");
+    let (status, response) =
+        http_request(http[leader], "POST /v1/ranges/verify", verify.as_bytes()).await;
+    assert_eq!(status, 200);
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.contains("\"matching\":true"), "range verification failed: {response}");
+    assert!(response.contains("\"ready_for_transfer\":true"));
     for handle in handles {
         handle.shutdown();
     }

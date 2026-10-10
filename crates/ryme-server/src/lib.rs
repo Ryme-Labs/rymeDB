@@ -897,6 +897,14 @@ pub struct MergeRangesRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct VerifyRangeRequest {
+    pub id: String,
+    pub target: usize,
+    pub expected_epoch: u64,
+    pub max_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct RangeLookup {
     pub key: Option<String>,
 }
@@ -1557,6 +1565,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/ranges/split", post(range_split))
         .route("/v1/ranges/merge", post(range_merge))
         .route("/v1/ranges/autosplit", post(range_autosplit))
+        .route("/v1/ranges/verify", post(range_verify))
         .route("/v1/cluster/members", get(cluster_members).post(cluster_add_member))
         .route("/v1/cluster/members/:id", delete(cluster_remove_member))
         .route("/v1/cluster/transfer", post(cluster_transfer))
@@ -8533,6 +8542,124 @@ async fn range_autosplit(
         }
     }
     (StatusCode::OK, Json(serde_json::json!({ "split": created }))).into_response()
+}
+
+async fn range_verify(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
+    if !principal.can_admin() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
+    let request: VerifyRangeRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::InvalidArgument(String::from("body")))
+        }
+    };
+    if !state.backend.is_cluster() {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("cluster")));
+    }
+    let Some(node) = state.raft_node() else {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("cluster")));
+    };
+    if !node.is_leader().await {
+        return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+    }
+    let range = {
+        let control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        let range = match control.router_get(&request.id) {
+            Ok(range) => range,
+            Err(error) => return error_response(error),
+        };
+        if range.epoch != request.expected_epoch {
+            return error_response(ryme_error::RymeError::Conflict(format!(
+                "range epoch {}",
+                range.epoch
+            )));
+        }
+        range
+    };
+    let members = node.current_config().await;
+    if !members.iter().any(|member| member.id == request.target) {
+        return error_response(ryme_error::RymeError::NotFound(String::from("peer")));
+    }
+    let max_rows = request.max_rows.unwrap_or(100_000).clamp(1, 100_000);
+    let read_ts = node.manager().latest_commit();
+    let source = match node.snapshot_range(&range.start, &range.end, read_ts, max_rows) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error_response(error),
+    };
+    let target = if request.target == node.node_id() {
+        source.clone()
+    } else {
+        match node
+            .fetch_range_snapshot(
+                request.target,
+                range.start.clone(),
+                range.end.clone(),
+                read_ts,
+                max_rows,
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_response(error),
+        }
+    };
+    {
+        let control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        match control.router_get(&request.id) {
+            Ok(current) if current.epoch == request.expected_epoch => {}
+            Ok(current) => {
+                return error_response(ryme_error::RymeError::Conflict(format!(
+                    "range epoch {}",
+                    current.epoch
+                )))
+            }
+            Err(error) => return error_response(error),
+        }
+    }
+    let source_bytes: u64 =
+        source.rows.iter().map(|row| row.value.len() as u64 + row.pk.len() as u64).sum();
+    let target_bytes: u64 =
+        target.rows.iter().map(|row| row.value.len() as u64 + row.pk.len() as u64).sum();
+    let matching = !source.truncated
+        && !target.truncated
+        && target.applied_commit >= source.snapshot_ts
+        && source.rows == target.rows;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "range": range.id,
+            "epoch": range.epoch,
+            "source": node.node_id(),
+            "target": request.target,
+            "snapshot_ts": source.snapshot_ts,
+            "source_commit": source.applied_commit,
+            "target_commit": target.applied_commit,
+            "source_rows": source.rows.len(),
+            "target_rows": target.rows.len(),
+            "source_bytes": source_bytes,
+            "target_bytes": target_bytes,
+            "source_truncated": source.truncated,
+            "target_truncated": target.truncated,
+            "matching": matching,
+            "ready_for_transfer": matching,
+        })),
+    )
+        .into_response()
 }
 
 async fn cluster_members(State(state): State<SharedState>, headers: HeaderMap) -> Response {

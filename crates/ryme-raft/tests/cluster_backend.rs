@@ -87,6 +87,14 @@ async fn backend_replicates_and_fails_over() {
     }
     backends[first].commit(txn).await.unwrap();
     wait_value(&backends, "k", "v1").await;
+    let target = (first + 1) % nodes.len();
+    let snapshot =
+        nodes[first].fetch_range_snapshot(target, Vec::new(), Vec::new(), 0, 16).await.unwrap();
+    assert!(!snapshot.truncated);
+    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.rows[0].table, "s");
+    assert_eq!(snapshot.rows[0].pk, b"k".to_vec());
+    assert_eq!(snapshot.rows[0].value, b"v1".to_vec());
     nodes[first].shutdown(std::mem::take(&mut tasks[first]));
     tokio::time::sleep(Duration::from_millis(300)).await;
     let second = wait_leader(&nodes, Some(first)).await;

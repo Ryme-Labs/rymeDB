@@ -1,5 +1,10 @@
 # Changelog
 
+- Cluster range placement now has an epoch-fenced `/v1/ranges/verify` safety
+  gate. The leader compares a consistent range snapshot with another Raft
+  member before future data transfer work, reporting row/byte counts and
+  mismatch state without changing ownership.
+
 - Query streams now support PostgREST-style filters, projections, and ordering.
   Filtered queries resnapshot from committed table changes while unfiltered
   streams retain the low-overhead table update path; all three SDKs expose the
