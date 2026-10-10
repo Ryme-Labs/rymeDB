@@ -1903,6 +1903,9 @@ fn spawn_gateways(
         Some(acceptor) => ryme_wire_pg::PgGateway::with_backend_tls(pg_executor, acceptor),
         None => ryme_wire_pg::PgGateway::with_backend_executor(pg_executor),
     };
+    if let Some(reader) = state.remote_reader.clone() {
+        pg = pg.with_remote_reader(reader);
+    }
     if let Ok(expected_password) = std::env::var("RYME_PG_PASSWORD") {
         let keys = state.keys.clone();
         let jwt = state.jwt.clone();

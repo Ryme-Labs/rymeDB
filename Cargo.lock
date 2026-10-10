@@ -2055,11 +2055,13 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "ryme-error",
+ "ryme-gateway",
  "ryme-metering",
  "ryme-observe",
  "ryme-qos",
  "ryme-router",
  "ryme-sql",
+ "ryme-storage",
  "ryme-txn",
  "ryme-wire-native",
  "tokio",

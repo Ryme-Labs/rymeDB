@@ -10,10 +10,11 @@
   range-local apply filtering is implemented.
 - Range transfer snapshots now preserve MVCC version chains and tombstones,
   rather than copying only the currently visible value.
-- Main-branch KV point reads now honor transferred `raft-{id}` range ownership
-  across HTTP, native, gRPC, and RESP gateways, fetching owned values from the
-  target member over the cluster mesh while retaining the existing transaction
-  path for writes and scans.
+- Main-branch point reads now honor transferred `raft-{id}` range ownership
+  across HTTP, native, gRPC, RESP, and PostgreSQL gateways, fetching owned
+  values from the target member over the cluster mesh. PostgreSQL routing is
+  limited to autocommit primary-key selects so transaction snapshots remain
+  unchanged.
 
 - Query streams now support PostgREST-style filters, projections, and ordering.
   Filtered queries resnapshot from committed table changes while unfiltered

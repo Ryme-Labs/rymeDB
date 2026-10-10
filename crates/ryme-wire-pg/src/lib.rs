@@ -1,4 +1,5 @@
 use ryme_error::{Result, RymeError};
+pub use ryme_gateway::{RemoteRead, RemoteReader};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{
     query_fingerprint, Histogram, LatencyWindow, SlowEntry, SlowLog, TraceCollector, TraceSpan,
@@ -33,6 +34,7 @@ pub struct PgGateway<B = TxnManager> {
     slow_log: Option<SlowLog>,
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
+    remote_reader: Option<RemoteReader>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +195,7 @@ struct ConnLimits {
     slow_log: Option<SlowLog>,
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
+    remote_reader: Option<RemoteReader>,
 }
 
 impl ConnLimits {
@@ -297,6 +300,7 @@ impl PgGateway<TxnManager> {
             slow_log: None,
             traces: None,
             range_hook: RangeLoadHook::default(),
+            remote_reader: None,
         }
     }
 
@@ -314,6 +318,7 @@ impl PgGateway<TxnManager> {
             slow_log: None,
             traces: None,
             range_hook: RangeLoadHook::default(),
+            remote_reader: None,
         }
     }
 
@@ -341,6 +346,7 @@ where
             slow_log: None,
             traces: None,
             range_hook: RangeLoadHook::default(),
+            remote_reader: None,
         }
     }
 
@@ -361,11 +367,17 @@ where
             slow_log: None,
             traces: None,
             range_hook: RangeLoadHook::default(),
+            remote_reader: None,
         }
     }
 
     pub fn with_qos(mut self, qos: Arc<Mutex<QosRegistry>>) -> Self {
         self.qos = Some(qos);
+        self
+    }
+
+    pub fn with_remote_reader(mut self, reader: RemoteReader) -> Self {
+        self.remote_reader = Some(reader);
         self
     }
 
@@ -415,6 +427,7 @@ where
             slow_log: self.slow_log.clone(),
             traces: self.traces.clone(),
             range_hook: self.range_hook.clone(),
+            remote_reader: self.remote_reader.clone(),
         }
     }
 
@@ -2941,6 +2954,41 @@ where
         if limits.range_hook.is_armed() { statement_range_keys(&statement) } else { None };
     let fingerprint = limits.slow_log.as_ref().map(|_| query_fingerprint(&table));
     let start = std::time::Instant::now();
+    if active.is_none() {
+        if let Statement::SelectByKey { table, pk } = &statement {
+            if let Some(reader) = limits.remote_reader.as_ref() {
+                let key = ryme_storage::RecordKey::new(&limits.tenant, &limits.database, table, pk);
+                match reader.read(key).await {
+                    Ok(RemoteRead::Value { value, .. }) => {
+                        let result = match value {
+                            Some(value) if executor.row_allowed_by_rls(table, &value) => {
+                                QueryResult::Row { pk: pk.clone(), value }
+                            }
+                            _ => QueryResult::Rows { rows: Vec::new() },
+                        };
+                        observe_statement(limits, false);
+                        record_timing(
+                            limits,
+                            fingerprint,
+                            table.clone(),
+                            start.elapsed().as_micros() as u64,
+                        );
+                        return encode_result(result);
+                    }
+                    Ok(RemoteRead::Local) => {}
+                    Err(error) => {
+                        record_timing(
+                            limits,
+                            fingerprint,
+                            table.clone(),
+                            start.elapsed().as_micros() as u64,
+                        );
+                        return encode_error_code(error_code(&error), error.to_string());
+                    }
+                }
+            }
+        }
+    }
     if let Some(transaction) = active.as_mut() {
         match executor.execute_in_transaction(&mut transaction.txn, statement).await {
             Ok((result, changes)) => {
