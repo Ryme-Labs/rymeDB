@@ -4,6 +4,8 @@
   `http_max_body_bytes`, with validation from 1 byte through 64 MiB.
 - JWT auth now accepts case-insensitive roles, Supabase-style scalar `role`
   claims, `app_metadata.roles`, and `tenant_id` tenant claims.
+- JWT validation now enforces future `nbf` and `iat` claims with the verifier's
+  configured clock-skew leeway.
 - Hybrid PITR now restores the replicated tier through Raft and the current
   node's local shard set, with the response identifying the local replay scope.
 - Added a hosted CI workflow that checks formatting for core packages, runs

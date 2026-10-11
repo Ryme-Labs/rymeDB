@@ -334,6 +334,15 @@ impl JwtVerifier {
         if exp.saturating_add(self.leeway_secs) < now_secs {
             return Err(RymeError::Unauthorized);
         }
+        for claim in ["nbf", "iat"] {
+            if claims
+                .get(claim)
+                .and_then(|value| value.as_u64())
+                .is_some_and(|value| value > now_secs.saturating_add(self.leeway_secs))
+            {
+                return Err(RymeError::Unauthorized);
+            }
+        }
         if let Some(issuer) = self.issuer.as_ref() {
             let got = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
             if !constant_time_equal(got.as_bytes(), issuer.as_bytes()) {
@@ -994,6 +1003,33 @@ mod tests {
     fn jwt_reject_bad_signature() {
         let verifier = JwtVerifier::new(b"test-secret".to_vec());
         assert!(verifier.principal_from_token("a.b.c", 1000).is_err());
+    }
+
+    #[test]
+    fn jwt_enforces_not_before_and_issued_at() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let token = |claim: &str, value: u64| {
+            let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+            let payload = base64_url_encode(
+                serde_json::to_string(&serde_json::json!({
+                    "sub": "ada",
+                    "exp": 2000000000u64,
+                    claim: value,
+                }))
+                .unwrap()
+                .as_bytes(),
+            );
+            let input = format!("{header}.{payload}");
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"temporal-secret").unwrap();
+            mac.update(input.as_bytes());
+            format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
+        };
+        let verifier = JwtVerifier::new(b"temporal-secret".to_vec());
+        assert!(verifier.principal_from_token(&token("nbf", 1061), 1000).is_err());
+        assert!(verifier.principal_from_token(&token("nbf", 1060), 1000).is_ok());
+        assert!(verifier.principal_from_token(&token("iat", 1061), 1000).is_err());
     }
 
     #[test]

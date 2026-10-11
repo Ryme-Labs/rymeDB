@@ -108,7 +108,8 @@ JWT principals accept both rymeDB claims (`tenant`, `roles`) and common
 Supabase-style claims: `tenant_id`, scalar `role` values such as `anon`,
 `authenticated`, and `service_role`, plus `app_metadata.roles`. Role names are
 case-insensitive; `anon` maps to read-only access, `authenticated` to read/write
-access, and `service_role` to the owner role.
+access, and `service_role` to the owner role. Expiration, not-before, and
+future issued-at timestamps use the verifier's configured clock-skew leeway.
 The `/v1/auth/oidc/token` exchange can use the same mounted file, or an
 explicit `RYME_OIDC_JWKS_FILE`/`RYME_OIDC_JWKS_URL` and optional
 `RYME_OIDC_JWK_KID`; its OIDC issuer and audience are taken from
