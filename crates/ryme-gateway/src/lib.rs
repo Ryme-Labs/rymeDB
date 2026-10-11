@@ -650,8 +650,8 @@ where
         self.policies.masked_value(table, &value)
     }
 
-    pub fn set_mask(&self, table: String, fields: Vec<String>) {
-        self.policies.mask_fields(table, fields);
+    pub fn set_mask(&self, table: String, fields: Vec<String>) -> Result<()> {
+        self.policies.mask_fields(table, fields)
     }
 
     pub fn scan(

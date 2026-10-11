@@ -71,6 +71,11 @@ pub struct PolicyEngine {
     masked_fields: std::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
+pub const MAX_MASKED_TABLES: usize = 10_000;
+pub const MAX_MASKED_FIELDS: usize = 128;
+pub const MAX_MASKED_FIELD_BYTES: usize = 256;
+pub const MAX_POLICY_TABLE_BYTES: usize = 256;
+
 impl PolicyEngine {
     pub fn new() -> Self {
         Self {
@@ -87,10 +92,32 @@ impl PolicyEngine {
         self.table_policies.contains_key(table)
     }
 
-    pub fn mask_fields(&self, table: String, fields: Vec<String>) {
-        if let Ok(mut guard) = self.masked_fields.write() {
-            guard.insert(table, fields);
+    pub fn mask_fields(&self, table: String, mut fields: Vec<String>) -> Result<()> {
+        if table.is_empty() || table.len() > MAX_POLICY_TABLE_BYTES || table.contains('\0') {
+            return Err(RymeError::InvalidArgument(String::from("table")));
         }
+        if fields.len() > MAX_MASKED_FIELDS
+            || fields.iter().any(|field| {
+                field.is_empty() || field.len() > MAX_MASKED_FIELD_BYTES || field.contains('\0')
+            })
+        {
+            return Err(RymeError::InvalidArgument(String::from("fields")));
+        }
+        fields.sort_unstable();
+        fields.dedup();
+        let mut guard = self
+            .masked_fields
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("masked fields lock")))?;
+        if fields.is_empty() {
+            guard.remove(&table);
+            return Ok(());
+        }
+        if !guard.contains_key(&table) && guard.len() >= MAX_MASKED_TABLES {
+            return Err(RymeError::Overload(String::from("masked tables")));
+        }
+        guard.insert(table, fields);
+        Ok(())
     }
 
     pub fn masked_value(&self, table: &str, value: &[u8]) -> Vec<u8> {
@@ -1523,13 +1550,31 @@ mod tests {
     #[test]
     fn mask_redacts_fields() {
         let engine = PolicyEngine::new();
-        engine.mask_fields(String::from("users"), vec![String::from("ssn")]);
+        engine.mask_fields(String::from("users"), vec![String::from("ssn")]).unwrap();
         let masked = engine.masked_value("users", b"{\"name\":\"ada\",\"ssn\":\"123\"}");
         let text = String::from_utf8(masked).unwrap();
         assert!(text.contains("***"));
         assert!(!text.contains("123"));
         let plain = engine.masked_value("other", b"{\"ssn\":\"123\"}");
         assert_eq!(plain, b"{\"ssn\":\"123\"}".to_vec());
+    }
+
+    #[test]
+    fn mask_configuration_is_bounded_and_clearable() {
+        let engine = PolicyEngine::new();
+        assert!(engine.mask_fields(String::new(), Vec::new()).is_err());
+        assert!(engine
+            .mask_fields(String::from("users"), vec!["f".repeat(MAX_MASKED_FIELD_BYTES + 1)])
+            .is_err());
+        assert!(engine
+            .mask_fields(
+                String::from("users"),
+                (0..=MAX_MASKED_FIELDS).map(|index| format!("field-{index}")).collect(),
+            )
+            .is_err());
+        engine.mask_fields(String::from("users"), vec![String::from("ssn")]).unwrap();
+        engine.mask_fields(String::from("users"), Vec::new()).unwrap();
+        assert_eq!(engine.masked_value("users", br#"{"ssn":"123"}"#), br#"{"ssn":"123"}"#);
     }
 
     #[test]

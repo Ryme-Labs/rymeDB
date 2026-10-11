@@ -5696,10 +5696,9 @@ async fn mask_set(
     if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if request.table.is_empty() {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("table")));
+    if let Err(error) = state.gateway.set_mask(request.table, request.fields) {
+        return error_response(error);
     }
-    state.gateway.set_mask(request.table, request.fields);
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
@@ -12618,7 +12617,7 @@ mod realtime_policy_tests {
             PolicyEngine::new(),
             Realtime::new(16),
         );
-        gateway.set_mask(String::from("users"), vec![String::from("ssn")]);
+        gateway.set_mask(String::from("users"), vec![String::from("ssn")]).unwrap();
         let record = ryme_realtime::ChangeRecord {
             tenant: String::from("tenant-a"),
             database: String::from("default"),
