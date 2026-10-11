@@ -1455,6 +1455,14 @@ async fn extras_auth_privilege_boundaries() {
     let (status, _) = bearer_request(
         http,
         &app_key,
+        "POST /v1/auth/passkey/challenge",
+        b"{\"user\":\"boss\"}",
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _) = bearer_request(
+        http,
+        &app_key,
         "POST /v1/auth/register",
         b"{\"id\":\"sneaky\",\"password\":\"correct-horse\",\"roles\":[\"owner\"]}",
     )

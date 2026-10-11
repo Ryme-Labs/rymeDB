@@ -4729,11 +4729,15 @@ async fn passkey_challenge(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
-    }
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(error) => return error_response(error),
+    };
     if request.user.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
+    }
+    if !principal.can_admin() && principal.id != request.user {
+        return error_response(ryme_error::RymeError::Forbidden);
     }
     match state.passkeys.lock() {
         Ok(mut registry) => match registry.challenge(&request.user) {
