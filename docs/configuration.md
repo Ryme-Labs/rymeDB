@@ -109,7 +109,9 @@ membership changes are made through the leader; see [cluster operations](cluster
 ```
 
 For S3-compatible storage, set `s3_endpoint`, `s3_bucket`, `s3_region`, and
-optionally `s3_path_style`. Configure `archive_replica` for a second target.
+optionally `s3_path_style`. HTTPS is required by default; set
+`s3_allow_insecure_http` only for an intentionally isolated local/private
+development endpoint. Configure `archive_replica` for a second target.
 The OTLP endpoint is optional; `/metrics`, `/metrics/prometheus`,
 `/v1/observe/slow`, and `/v1/traces` remain available locally without an OTLP
 collector. These platform-wide operational routes require a configured

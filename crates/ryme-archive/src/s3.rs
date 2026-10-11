@@ -8,6 +8,7 @@ pub struct S3Config {
     pub access_key: String,
     pub secret_key: String,
     pub path_style: bool,
+    pub allow_insecure_http: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,7 @@ impl S3Store {
         if config.access_key.is_empty() || config.secret_key.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("s3 credentials")));
         }
+        validate_endpoint(&config.endpoint, config.allow_insecure_http)?;
         let client = reqwest::Client::new();
         Ok(Self { config, client })
     }
@@ -138,6 +140,24 @@ impl S3Store {
         let body = response.bytes().await.map_err(|e| RymeError::Io(e.to_string()))?;
         let text = String::from_utf8_lossy(&body).into_owned();
         Ok((extract_keys(&text), extract_token(&text)))
+    }
+}
+
+fn validate_endpoint(endpoint: &str, allow_insecure_http: bool) -> Result<()> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|_| RymeError::InvalidArgument(String::from("s3 endpoint")))?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(RymeError::InvalidArgument(String::from("s3 endpoint")));
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if allow_insecure_http => Ok(()),
+        _ => Err(RymeError::InvalidArgument(String::from("s3 endpoint must use https"))),
     }
 }
 
@@ -474,6 +494,31 @@ mod tests {
         }
     }
 
+    fn test_s3_config(endpoint: &str, allow_insecure_http: bool) -> S3Config {
+        S3Config {
+            endpoint: endpoint.to_string(),
+            bucket: String::from("test-bucket"),
+            region: String::from("test-1"),
+            access_key: String::from("ak"),
+            secret_key: String::from("sk"),
+            path_style: true,
+            allow_insecure_http,
+        }
+    }
+
+    #[test]
+    fn endpoint_requires_https_without_explicit_opt_in() {
+        assert!(S3Store::new(test_s3_config("http://127.0.0.1:9000", false)).is_err());
+        assert!(S3Store::new(test_s3_config("http://127.0.0.1:9000", true)).is_ok());
+        assert!(S3Store::new(test_s3_config("https://s3.example.com", false)).is_ok());
+    }
+
+    #[test]
+    fn endpoint_rejects_embedded_credentials_and_query() {
+        assert!(S3Store::new(test_s3_config("https://ak:sk@s3.example.com", false)).is_err());
+        assert!(S3Store::new(test_s3_config("https://s3.example.com?bucket=other", false)).is_err());
+    }
+
     #[tokio::test]
     async fn s3_roundtrip_against_fake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -481,15 +526,7 @@ mod tests {
         let state = FakeS3 { files: Default::default(), seen_auth: Default::default() };
         let seen = state.seen_auth.clone();
         tokio::spawn(run_fake_s3(listener, state));
-        let store = S3Store::new(S3Config {
-            endpoint: format!("http://{addr}"),
-            bucket: String::from("test-bucket"),
-            region: String::from("test-1"),
-            access_key: String::from("ak"),
-            secret_key: String::from("sk"),
-            path_style: true,
-        })
-        .unwrap();
+        let store = S3Store::new(test_s3_config(&format!("http://{addr}"), true)).unwrap();
         store.put("backups/a", b"hello".to_vec()).await.unwrap();
         assert_eq!(store.get("backups/a").await.unwrap(), b"hello");
         assert_eq!(store.list("backups/").await.unwrap(), vec![String::from("backups/a")]);

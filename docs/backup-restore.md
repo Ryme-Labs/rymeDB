@@ -39,7 +39,9 @@ retention must keep the relevant snapshot and WAL segments available.
 
 An S3 target needs endpoint, bucket, and region. `keep` controls archived
 manifests; `snapshot_keep` controls local snapshots and therefore the local
-PITR window. Long-term recovery requires archived copies.
+PITR window. HTTPS is required by default; use `s3_allow_insecure_http` only
+for an intentionally isolated local/private development endpoint. Long-term
+recovery requires archived copies.
 
 ## Operate a backup
 

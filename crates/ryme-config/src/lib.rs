@@ -142,6 +142,8 @@ pub struct ArchiveConfig {
     pub s3_region: Option<String>,
     #[serde(default)]
     pub s3_path_style: bool,
+    #[serde(default)]
+    pub s3_allow_insecure_http: bool,
     #[serde(default = "default_archive_interval")]
     pub interval_secs: u64,
     #[serde(default = "default_verify_interval")]
@@ -202,6 +204,7 @@ impl Default for ArchiveConfig {
             s3_bucket: None,
             s3_region: None,
             s3_path_style: false,
+            s3_allow_insecure_http: false,
             interval_secs: default_archive_interval(),
             verify_interval_secs: default_verify_interval(),
             keep: default_archive_keep(),

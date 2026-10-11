@@ -11992,6 +11992,7 @@ fn archive_target(
                     access_key,
                     secret_key,
                     path_style: config.s3_path_style,
+                    allow_insecure_http: config.s3_allow_insecure_http,
                 },
             )?)))
         }
