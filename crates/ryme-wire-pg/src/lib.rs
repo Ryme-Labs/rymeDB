@@ -2513,11 +2513,11 @@ where
                     return Vec::new();
                 }
                 let relation_oid = catalog_relation_oid(&table);
-                executor
+                let definitions = executor.catalog_columns(&table);
+                let mut indexes = executor
                     .catalog_indexes(&table)
                     .into_iter()
                     .map(|index| {
-                        let definitions = executor.catalog_columns(&table);
                         let ordinals = if index.columns.is_empty() {
                             index
                                 .column
@@ -2541,20 +2541,42 @@ where
                                 .map(|ordinal| ordinal + 1)
                                 .collect::<Vec<_>>()
                         };
-                        let index_oid = catalog_index_oid(&index.name);
+                        (index.name, index.unique, false, ordinals)
+                    })
+                    .collect::<Vec<_>>();
+                let primary_ordinals = definitions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ordinal, definition)| {
+                        definition.primary_key.then_some(ordinal + 1)
+                    })
+                    .collect::<Vec<_>>();
+                if !primary_ordinals.is_empty() {
+                    indexes.push((format!("constraint:{table}"), true, true, primary_ordinals));
+                }
+                indexes
+                    .into_iter()
+                    .map(|(name, unique, primary, ordinals)| {
+                        let index_oid = catalog_index_oid(&name);
                         columns
                             .iter()
                             .map(|column| match column.as_str() {
                                 "indexrelid" => index_oid.to_string().into_bytes(),
                                 "indrelid" => relation_oid.to_string().into_bytes(),
                                 "indisunique" => {
-                                    if index.unique {
+                                    if unique {
                                         b"t".to_vec()
                                     } else {
                                         b"f".to_vec()
                                     }
                                 }
-                                "indisprimary" => b"f".to_vec(),
+                                "indisprimary" => {
+                                    if primary {
+                                        b"t".to_vec()
+                                    } else {
+                                        b"f".to_vec()
+                                    }
+                                }
                                 "indnatts" | "indnkeyatts" => {
                                     ordinals.len().to_string().into_bytes()
                                 }
