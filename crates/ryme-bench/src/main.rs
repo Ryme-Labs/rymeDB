@@ -50,6 +50,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Sql {
+        #[arg(long, default_value = "127.0.0.1:5433")]
+        addr: String,
+        #[arg(long, default_value = "postgres")]
+        user: String,
+        #[arg(long, default_value = "postgres")]
+        database: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long, default_value_t = 10000)]
+        ops: usize,
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+        #[arg(long, default_value = "mixed")]
+        workload: String,
+        #[arg(long)]
+        json: bool,
+    },
     Realtime {
         #[arg(long, default_value = "127.0.0.1:3000")]
         addr: String,
@@ -101,6 +119,19 @@ async fn main() {
                 hotspot_percent,
                 workload,
                 pipeline,
+                json,
+            })
+            .await;
+        }
+        Some(Command::Sql { addr, user, database, password, ops, concurrency, workload, json }) => {
+            sql_bench(SqlBench {
+                addr,
+                user,
+                database,
+                password: password.or_else(|| std::env::var("PGPASSWORD").ok()),
+                ops,
+                concurrency,
+                workload,
                 json,
             })
             .await;
@@ -560,6 +591,229 @@ struct RespBench {
     workload: String,
     pipeline: usize,
     json: bool,
+}
+
+struct SqlBench {
+    addr: String,
+    user: String,
+    database: String,
+    password: Option<String>,
+    ops: usize,
+    concurrency: usize,
+    workload: String,
+    json: bool,
+}
+
+struct SqlTask {
+    addr: String,
+    user: String,
+    database: String,
+    password: Option<String>,
+    ops: usize,
+    worker: usize,
+    workload: String,
+    ready_gate: Arc<tokio::sync::Barrier>,
+    start_gate: Arc<tokio::sync::Barrier>,
+}
+
+async fn pg_message(stream: &mut tokio::net::TcpStream) -> Result<(u8, Vec<u8>), String> {
+    let mut kind = [0u8; 1];
+    stream.read_exact(&mut kind).await.map_err(|error| error.to_string())?;
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).await.map_err(|error| error.to_string())?;
+    let length = u32::from_be_bytes(length) as usize;
+    if !(4..=16 * 1024 * 1024).contains(&length) {
+        return Err(String::from("invalid PostgreSQL message length"));
+    }
+    let mut body = vec![0u8; length - 4];
+    stream.read_exact(&mut body).await.map_err(|error| error.to_string())?;
+    Ok((kind[0], body))
+}
+
+async fn pg_connect(
+    addr: &str,
+    user: &str,
+    database: &str,
+    password: Option<&str>,
+) -> Result<tokio::net::TcpStream, String> {
+    let mut stream =
+        tokio::net::TcpStream::connect(addr).await.map_err(|error| error.to_string())?;
+    stream.set_nodelay(true).map_err(|error| error.to_string())?;
+    let mut startup = Vec::new();
+    startup.extend_from_slice(&196_608u32.to_be_bytes());
+    startup.extend_from_slice(b"user\0");
+    startup.extend_from_slice(user.as_bytes());
+    startup.push(0);
+    startup.extend_from_slice(b"database\0");
+    startup.extend_from_slice(database.as_bytes());
+    startup.push(0);
+    startup.extend_from_slice(b"application_name\0ryme-bench\0\0");
+    let length = u32::try_from(startup.len() + 4).map_err(|_| String::from("startup too large"))?;
+    let mut frame = length.to_be_bytes().to_vec();
+    frame.extend_from_slice(&startup);
+    stream.write_all(&frame).await.map_err(|error| error.to_string())?;
+    loop {
+        let (kind, body) = pg_message(&mut stream).await?;
+        match kind {
+            b'R' if body.len() >= 4 && u32::from_be_bytes(body[..4].try_into().unwrap()) == 0 => {}
+            b'R' if body.len() >= 4 && u32::from_be_bytes(body[..4].try_into().unwrap()) == 3 => {
+                let password =
+                    password.ok_or_else(|| String::from("PostgreSQL password required"))?;
+                let length = u32::try_from(password.len() + 5)
+                    .map_err(|_| String::from("password too large"))?;
+                stream.write_all(&[b'p']).await.map_err(|error| error.to_string())?;
+                stream.write_all(&length.to_be_bytes()).await.map_err(|error| error.to_string())?;
+                stream.write_all(password.as_bytes()).await.map_err(|error| error.to_string())?;
+                stream.write_all(&[0]).await.map_err(|error| error.to_string())?;
+            }
+            b'R' => return Err(String::from("PostgreSQL server requested authentication")),
+            b'E' => return Err(String::from("PostgreSQL startup failed")),
+            b'Z' => return Ok(stream),
+            _ => {}
+        }
+    }
+}
+
+async fn pg_query(stream: &mut tokio::net::TcpStream, query: &str) -> Result<(), String> {
+    let query = query.as_bytes();
+    let length = u32::try_from(query.len() + 5).map_err(|_| String::from("query too large"))?;
+    stream.write_all(&[b'Q']).await.map_err(|error| error.to_string())?;
+    stream.write_all(&length.to_be_bytes()).await.map_err(|error| error.to_string())?;
+    stream.write_all(query).await.map_err(|error| error.to_string())?;
+    stream.write_all(&[0]).await.map_err(|error| error.to_string())?;
+    let mut failed = None;
+    loop {
+        let (kind, _) = pg_message(stream).await?;
+        match kind {
+            b'E' => failed = Some(String::from("PostgreSQL query failed")),
+            b'Z' => return failed.map_or(Ok(()), Err),
+            _ => {}
+        }
+    }
+}
+
+async fn run_sql_worker(task: SqlTask) -> (Vec<u64>, u64) {
+    let mut stream =
+        match pg_connect(&task.addr, &task.user, &task.database, task.password.as_deref()).await {
+            Ok(stream) => Some(stream),
+            Err(_) => None,
+        };
+    let setup_ok = if let Some(stream) = stream.as_mut() {
+        pg_query(
+            stream,
+            "CREATE TABLE IF NOT EXISTS ryme_bench_sql (id TEXT PRIMARY KEY, payload TEXT)",
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    task.ready_gate.wait().await;
+    task.start_gate.wait().await;
+    let Some(mut stream) = stream else {
+        return (Vec::new(), task.ops as u64);
+    };
+    if !setup_ok {
+        return (Vec::new(), task.ops as u64);
+    }
+    let mut latencies = Vec::with_capacity(task.ops);
+    let mut errors = 0u64;
+    for index in 0..task.ops {
+        let key = format!("k-{}", index as u64 * 2_654_435_761 + task.worker as u64);
+        let query = match task.workload.as_str() {
+            "select" => format!("SELECT payload FROM ryme_bench_sql WHERE id = '{key}'"),
+            "insert" => format!(
+                "INSERT INTO ryme_bench_sql (id, payload) VALUES ('{key}', 'payload') ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload"
+            ),
+            _ if index.is_multiple_of(2) => {
+                format!("SELECT payload FROM ryme_bench_sql WHERE id = '{key}'")
+            }
+            _ => format!(
+                "INSERT INTO ryme_bench_sql (id, payload) VALUES ('{key}', 'payload') ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload"
+            ),
+        };
+        let started = Instant::now();
+        if pg_query(&mut stream, &query).await.is_ok() {
+            latencies.push(started.elapsed().as_micros() as u64);
+        } else {
+            errors = errors.saturating_add(1);
+        }
+    }
+    (latencies, errors)
+}
+
+async fn sql_bench(config: SqlBench) {
+    let workers = config.concurrency.max(1);
+    let ready_gate = Arc::new(tokio::sync::Barrier::new(workers + 1));
+    let start_gate = Arc::new(tokio::sync::Barrier::new(workers + 1));
+    let mut handles = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        handles.push(tokio::spawn(run_sql_worker(SqlTask {
+            addr: config.addr.clone(),
+            user: config.user.clone(),
+            database: config.database.clone(),
+            password: config.password.clone(),
+            ops: worker_ops(config.ops, workers, worker),
+            worker,
+            workload: config.workload.clone(),
+            ready_gate: ready_gate.clone(),
+            start_gate: start_gate.clone(),
+        })));
+    }
+    ready_gate.wait().await;
+    let started = Instant::now();
+    start_gate.wait().await;
+    let mut samples = Vec::new();
+    let mut errors = 0u64;
+    for handle in handles {
+        let (mut worker_samples, worker_errors) = handle.await.unwrap();
+        samples.append(&mut worker_samples);
+        errors = errors.saturating_add(worker_errors);
+    }
+    let seconds = started.elapsed().as_secs_f64().max(0.000001);
+    samples.sort_unstable();
+    let count = samples.len();
+    let percentile = |p: f64| -> u64 {
+        if count == 0 {
+            return 0;
+        }
+        samples[((p / 100.0) * count as f64).floor() as usize % count]
+    };
+    let output = serde_json::json!({
+        "target": config.addr,
+        "protocol": "postgres-simple-query",
+        "database": config.database,
+        "workload": config.workload,
+        "machine": machine_metadata(),
+        "requested_ops": config.ops,
+        "successful_ops": count,
+        "failed_ops": errors,
+        "seconds": (seconds * 1000.0).round() / 1000.0,
+        "qps": (count as f64 / seconds).round() as u64,
+        "p50_us": percentile(50.0),
+        "p90_us": percentile(90.0),
+        "p95_us": percentile(95.0),
+        "p99_us": percentile(99.0),
+        "p999_us": percentile(99.9),
+        "max_us": samples.last().copied().unwrap_or(0),
+        "latency_histogram_us": latency_histogram(&samples),
+    });
+    if config.json {
+        println!("{output}");
+    } else {
+        println!(
+            "target={} protocol=postgres-simple-query workload={} requested_ops={} successful_ops={} failed_ops={} qps={:.0} p50={}us p99={}us max={}us",
+            output["target"].as_str().unwrap_or(""),
+            output["workload"].as_str().unwrap_or(""),
+            config.ops,
+            count,
+            errors,
+            count as f64 / seconds,
+            percentile(50.0),
+            percentile(99.0),
+            samples.last().copied().unwrap_or(0),
+        );
+    }
 }
 
 struct TaskConfig {

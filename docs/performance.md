@@ -48,6 +48,23 @@ Source files: `bench/results/bench-get-p1.json`, `bench-set-p1.json`,
 
 ## Compound transactions (2026-10-02, loopback TCP, release binaries)
 
+The PostgreSQL-wire SQL harness uses the native startup and simple-query
+protocol, creates an idempotent benchmark table, and can be pointed at any
+PostgreSQL-compatible endpoint:
+
+```text
+ryme-bench sql --addr 127.0.0.1:5433 --user postgres --database postgres \
+  --workload mixed --ops 10000 --concurrency 8 --json
+```
+
+Use `--password` or `PGPASSWORD` when the PostgreSQL endpoint requires
+cleartext startup authentication.
+
+Run the same command against PostgreSQL, Neon-compatible compute, and rymeDB.
+The result identifies the protocol and includes the same percentile and
+histogram fields as the RESP harness; report durability, schema/index state,
+hardware, and whether the endpoint is local or remote with every comparison.
+
 Workload `tx` (`ryme-bench resp --workload tx`): one `MULTI` block of
 `SET` 128-byte value + `INCRBY` counter + `GET`, committed as a single
 transaction; 20k blocks, 8 workers, per-worker keys (no cross-worker
