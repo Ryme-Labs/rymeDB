@@ -2251,8 +2251,7 @@ impl DurableManager {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let policy = self.policy;
-        let writes = txn.writes().clone();
-        let result = self.inner.commit_durable_with(txn, |commit_ts, payload, _| {
+        let result = self.inner.commit_durable_with(txn, |commit_ts, payload, writes| {
             let mut wal =
                 self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
             wal.append(commit_ts, payload)?;
@@ -2261,7 +2260,7 @@ impl DurableManager {
             }
             self.segments.write_delta_with_sync(
                 commit_ts,
-                &segment_entries(commit_ts, &writes),
+                &segment_entries(commit_ts, writes),
                 policy == SyncPolicy::Always,
             )?;
             Ok(())
