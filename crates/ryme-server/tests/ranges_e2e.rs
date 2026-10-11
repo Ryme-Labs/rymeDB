@@ -221,6 +221,10 @@ async fn ranges_reject_non_admin_topology() {
     assert_eq!(status, 403);
     let (status, _) = bearer_request(http, &app_key, "POST /v1/ranges/autosplit", b"").await;
     assert_eq!(status, 403);
+    let (status, _) = bearer_request(http, &app_key, "GET /v1/ranges", b"").await;
+    assert_eq!(status, 403);
+    let (status, _) = bearer_request(http, &app_key, "GET /v1/ranges/loads", b"").await;
+    assert_eq!(status, 403);
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }

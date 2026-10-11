@@ -232,7 +232,11 @@ async fn auth_routes_commands_to_the_authenticated_tenant() {
     )
     .with_authenticator(|user, password| {
         if user == "alice" && password == "secret" {
-            Ok(String::from("alpha"))
+            Ok(ryme_auth::Principal {
+                id: String::from("alice"),
+                tenant: String::from("alpha"),
+                roles: [ryme_auth::Role::Owner].into_iter().collect(),
+            })
         } else {
             Err(ryme_error::RymeError::Unauthorized)
         }
@@ -271,7 +275,11 @@ async fn auth_rejects_invalid_passwords() {
     let gateway = ryme_wire_resp::RespGateway::new(String::from("default"), String::from("d"))
         .with_authenticator(|_, password| {
             (password == "secret")
-                .then(|| String::from("default"))
+                .then(|| ryme_auth::Principal {
+                    id: String::from("alice"),
+                    tenant: String::from("default"),
+                    roles: [ryme_auth::Role::Owner].into_iter().collect(),
+                })
                 .ok_or(ryme_error::RymeError::Unauthorized)
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -281,4 +289,28 @@ async fn auth_rejects_invalid_passwords() {
     });
     let reply = command(addr, &["AUTH", "wrong"]).await;
     assert!(reply.contains("WRONGPASS"), "{reply}");
+}
+
+#[tokio::test]
+async fn read_only_authentication_rejects_writes() {
+    let gateway = ryme_wire_resp::RespGateway::new(String::from("default"), String::from("d"))
+        .with_authenticator(|_, password| {
+            (password == "secret")
+                .then(|| ryme_auth::Principal {
+                    id: String::from("reader"),
+                    tenant: String::from("default"),
+                    roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
+                })
+                .ok_or(ryme_error::RymeError::Unauthorized)
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket.write_all(b"*3\r\n$4\r\nAUTH\r\n$5\r\nalice\r\n$6\r\nsecret\r\n").await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&read_frame(&mut socket).await), "+OK\r\n");
+    socket.write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n").await.unwrap();
+    assert!(String::from_utf8_lossy(&read_frame(&mut socket).await).contains("NOPERM"));
 }

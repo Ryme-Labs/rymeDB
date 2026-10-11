@@ -406,9 +406,6 @@ fn claim_roles(claims: &serde_json::Value) -> HashSet<Role> {
     if let Some(value) = claims.get("app_metadata").and_then(|metadata| metadata.get("roles")) {
         add(value);
     }
-    if roles.is_empty() {
-        roles.insert(Role::ReadWrite);
-    }
     roles
 }
 
@@ -1051,6 +1048,31 @@ mod tests {
         mac.update(input.as_bytes());
         let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
         assert!(JwtVerifier::new(b"secret".to_vec()).principal_from_token(&token, 1000).is_err());
+    }
+
+    #[test]
+    fn jwt_without_a_recognized_role_has_no_write_capability() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+        let payload = base64_url_encode(
+            serde_json::to_string(&serde_json::json!({
+                "sub": "unassigned",
+                "tenant": "t",
+                "exp": 2000000000u64,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        let input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"role-secret").unwrap();
+        mac.update(input.as_bytes());
+        let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
+        let principal = JwtVerifier::new(b"role-secret".to_vec())
+            .principal_from_token(&token, 1000)
+            .unwrap();
+        assert!(!principal.can_read());
+        assert!(!principal.can_write());
     }
 
     #[test]

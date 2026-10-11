@@ -1685,6 +1685,15 @@ impl SharedState {
     }
 }
 
+fn require_admin(state: &SharedState, headers: &HeaderMap) -> ryme_error::Result<Principal> {
+    let principal = state.principal(headers)?;
+    if principal.can_admin() {
+        Ok(principal)
+    } else {
+        Err(ryme_error::RymeError::Forbidden)
+    }
+}
+
 pub fn router(state: SharedState) -> axum::Router {
     let body_limit = usize::try_from(state.http_max_body_bytes).unwrap_or(usize::MAX);
     axum::Router::new()
@@ -2723,8 +2732,8 @@ async fn slow_log(
     headers: HeaderMap,
     Query(query): Query<SlowQuery>,
 ) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     (
         StatusCode::OK,
@@ -2742,8 +2751,8 @@ async fn traces(
     headers: HeaderMap,
     Query(query): Query<TraceQuery>,
 ) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let spans = match state.traces.lock() {
         Ok(traces) => traces.recent_filtered(
@@ -4035,8 +4044,8 @@ async fn sql_explain(
 }
 
 async fn metering_snapshot(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let snapshot = match state.metering.lock() {
         Ok(registry) => registry.snapshot(),
@@ -4060,8 +4069,8 @@ async fn metering_snapshot(State(state): State<SharedState>, headers: HeaderMap)
 }
 
 async fn billing_summary(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let bills = match state.metering.lock() {
         Ok(registry) => registry.billing_summary(),
@@ -4313,8 +4322,8 @@ pub struct QosTierRequest {
 }
 
 async fn qos_snapshot(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let snapshot = match state.qos.lock() {
         Ok(qos) => qos.snapshot(),
@@ -7116,8 +7125,8 @@ async fn text_delete(
 }
 
 async fn index_stats(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let indexes = state.indexes.read().await;
     (
@@ -8012,7 +8021,7 @@ async fn checkpoint_create(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
+    if !principal.can_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let commit = state.backend.latest_commit();
@@ -8036,8 +8045,8 @@ async fn checkpoint_create(
 }
 
 async fn checkpoint_latest(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let control = match state.control.lock() {
         Ok(guard) => guard,
@@ -8054,8 +8063,8 @@ async fn checkpoint_pitr(
     headers: HeaderMap,
     Query(query): Query<PitrQuery>,
 ) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let control = match state.control.lock() {
         Ok(guard) => guard,
@@ -8072,7 +8081,7 @@ async fn snapshot_create(State(state): State<SharedState>, headers: HeaderMap) -
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
+    if !principal.can_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     match snapshot_backend_files(&state).await {
@@ -8208,8 +8217,8 @@ async fn backup_archive(
 }
 
 async fn backup_archives(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let Some(target) = state.archive.clone() else {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("archive")));
@@ -8383,7 +8392,7 @@ async fn backup_verify(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
+    if !principal.can_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(target) = state.archive.clone() else {
@@ -8417,8 +8426,8 @@ async fn backup_verify(
 }
 
 async fn drill_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let report = state.last_drill.lock().ok().and_then(|guard| guard.clone());
     match report {
@@ -8428,8 +8437,8 @@ async fn drill_status(State(state): State<SharedState>, headers: HeaderMap) -> R
 }
 
 async fn shard_layout(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     match &state.backend {
         Backend::Sharded(shards) => {
@@ -8542,8 +8551,8 @@ async fn range_list(
     headers: HeaderMap,
     Query(lookup): Query<RangeLookup>,
 ) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let control = match state.control.lock() {
         Ok(guard) => guard,
@@ -8948,8 +8957,8 @@ async fn commit_cluster_ranges(
 }
 
 async fn range_loads(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let control = match state.control.lock() {
         Ok(guard) => guard,
@@ -9516,8 +9525,8 @@ async fn range_transfer(
 }
 
 async fn cluster_members(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
     }
     let Some(node) = require_raft(&state) else {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("cluster")));
@@ -10807,7 +10816,7 @@ fn wire_tenant(
     jwt: Option<&JwtVerifier>,
     default_tenant: &str,
     password: &str,
-) -> ryme_error::Result<String> {
+) -> ryme_error::Result<Principal> {
     let expected = expected_password.as_bytes();
     let presented = password.as_bytes();
     let password_matches = expected.len() == presented.len()
@@ -10817,14 +10826,24 @@ fn wire_tenant(
             .fold(0u8, |difference, (left, right)| difference | (left ^ right))
             == 0;
     if password_matches {
-        return Ok(default_tenant.to_string());
+        return Ok(Principal {
+            id: String::from("wire-password"),
+            tenant: default_tenant.to_string(),
+            roles: [Role::Owner].into_iter().collect(),
+        });
     }
     if let Ok(principal) = keys.authenticate(password) {
-        return Ok(principal.tenant);
+        if principal.can_read() {
+            return Ok(principal);
+        }
+        return Err(ryme_error::RymeError::Unauthorized);
     }
     if let Some(verifier) = jwt {
         if let Ok(principal) = verifier.principal_from_token(password, now_secs()) {
-            return Ok(principal.tenant);
+            if principal.can_read() {
+                return Ok(principal);
+            }
+            return Err(ryme_error::RymeError::Unauthorized);
         }
     }
     Err(ryme_error::RymeError::Unauthorized)

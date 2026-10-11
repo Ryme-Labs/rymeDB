@@ -1,4 +1,5 @@
 use mlua::{HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Value as LuaValue, VmState};
+use ryme_auth::Principal;
 use ryme_error::{Result, RymeError};
 pub use ryme_gateway::{RemoteRead, RemoteReader};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
@@ -21,7 +22,7 @@ use tokio::sync::broadcast;
 const KV_TABLE: &str = "_kv";
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 
-pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
+pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct RespGateway<B = TxnManager> {
@@ -43,6 +44,9 @@ pub struct RespGateway<B = TxnManager> {
     scripts: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     next_client_id: Arc<AtomicU64>,
     read_only: bool,
+    read_allowed: bool,
+    write_allowed: bool,
+    publish_allowed: bool,
     remote_reader: Option<RemoteReader>,
 }
 
@@ -240,6 +244,9 @@ impl RespGateway<TxnManager> {
             scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
+            read_allowed: true,
+            write_allowed: true,
+            publish_allowed: true,
             remote_reader: None,
         }
     }
@@ -264,6 +271,9 @@ impl RespGateway<TxnManager> {
             scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
+            read_allowed: true,
+            write_allowed: true,
+            publish_allowed: true,
             remote_reader: None,
         }
     }
@@ -293,6 +303,9 @@ where
             scripts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_client_id: Arc::new(AtomicU64::new(1)),
             read_only: false,
+            read_allowed: true,
+            write_allowed: true,
+            publish_allowed: true,
             remote_reader: None,
         }
     }
@@ -309,7 +322,7 @@ where
 
     pub fn with_authenticator<F>(mut self, authenticator: F) -> Self
     where
-        F: Fn(&str, &str) -> Result<String> + Send + Sync + 'static,
+        F: Fn(&str, &str) -> Result<Principal> + Send + Sync + 'static,
     {
         self.authenticator = Some(Arc::new(authenticator));
         self
@@ -427,6 +440,9 @@ where
     }
 
     fn readonly_deny(&self, write: bool) -> Option<Vec<u8>> {
+        if write && !self.write_allowed {
+            return Some(encode_error(String::from("NOPERM permission denied")));
+        }
         if write && self.read_only {
             return Some(encode_error(String::from(
                 "READONLY You can't write against a read only replica",
@@ -484,8 +500,11 @@ where
             Err(_) => return encode_error(String::from("WRONGPASS invalid password")),
         };
         match authenticator(user, password) {
-            Ok(tenant) if !tenant.is_empty() => {
-                self.tenant = tenant;
+            Ok(principal) if !principal.tenant.is_empty() => {
+                self.tenant = principal.tenant;
+                self.read_allowed = principal.can_read();
+                self.write_allowed = principal.can_write();
+                self.publish_allowed = principal.can_publish();
                 client.authenticated = true;
                 encode_simple("OK")
             }
@@ -1159,6 +1178,15 @@ where
     ) -> Vec<u8> {
         if !client.authenticated && !matches!(command.name.as_str(), "AUTH" | "HELLO" | "PING") {
             return encode_error(String::from("NOAUTH Authentication required"));
+        }
+        if client.authenticated
+            && !self.read_allowed
+            && !matches!(command.name.as_str(), "AUTH" | "HELLO" | "PING" | "PUBLISH")
+        {
+            return encode_error(String::from("NOPERM permission denied"));
+        }
+        if command.name == "PUBLISH" && !self.publish_allowed {
+            return encode_error(String::from("NOPERM permission denied"));
         }
         match command.name.as_str() {
             "HELLO" => {

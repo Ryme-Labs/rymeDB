@@ -47,7 +47,8 @@ JWTs accept rymeDB claims (`tenant`, `roles`) and common Supabase claims
 
 The exact policy is still enforced by the server's configured principal and
 table rules. A valid token is not automatically permission to administer the
-cluster.
+cluster. Tokens without a recognized data-access role authenticate without
+read or write capability.
 
 ## JWT settings
 

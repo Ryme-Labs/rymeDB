@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ryme-auth = { workspace = true }
 ryme-error = { workspace = true }
 ryme-gateway = { workspace = true }
 ryme-router = { workspace = true }

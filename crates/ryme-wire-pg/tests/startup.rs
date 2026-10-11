@@ -123,7 +123,11 @@ async fn password_authenticates_and_routes_the_session_tenant() {
     let gateway =
         ryme_wire_pg::PgGateway::with_executor(executor).with_authenticator(|user, password| {
             if user == "alice" && password == "secret" {
-                Ok(String::from("alpha"))
+                Ok(ryme_auth::Principal {
+                    id: String::from("alice"),
+                    tenant: String::from("alpha"),
+                    roles: [ryme_auth::Role::Owner].into_iter().collect(),
+                })
             } else {
                 Err(ryme_error::RymeError::Unauthorized)
             }
@@ -171,7 +175,11 @@ async fn password_authentication_rejects_invalid_credentials() {
     let gateway = ryme_wire_pg::PgGateway::new(String::from("default"), String::from("d"))
         .with_authenticator(|_, password| {
             (password == "secret")
-                .then(|| String::from("default"))
+                .then(|| ryme_auth::Principal {
+                    id: String::from("alice"),
+                    tenant: String::from("default"),
+                    roles: [ryme_auth::Role::Owner].into_iter().collect(),
+                })
                 .ok_or(ryme_error::RymeError::Unauthorized)
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -189,4 +197,48 @@ async fn password_authentication_rejects_invalid_credentials() {
     let (tag, body) = read_frame(&mut socket).await;
     assert_eq!(tag, b'E');
     assert!(String::from_utf8_lossy(&body).contains("28P01"));
+}
+
+#[tokio::test]
+async fn read_only_authentication_rejects_writes() {
+    let gateway = ryme_wire_pg::PgGateway::new(String::from("default"), String::from("d"))
+        .with_authenticator(|_, password| {
+            (password == "secret")
+                .then(|| ryme_auth::Principal {
+                    id: String::from("reader"),
+                    tenant: String::from("default"),
+                    roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
+                })
+                .ok_or(ryme_error::RymeError::Unauthorized)
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket.write_all(&startup_packet("reader", "postgres")).await.unwrap();
+    let (tag, body) = read_frame(&mut socket).await;
+    assert_eq!(tag, b'R');
+    assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), 3);
+    socket.write_all(&password_packet("secret")).await.unwrap();
+    loop {
+        let (tag, _) = read_frame(&mut socket).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+    socket.write_all(&frame(b'Q', b"INSERT INTO docs KEY 'k1' VALUE 'v1'\0")).await.unwrap();
+    let mut error = Vec::new();
+    loop {
+        let (tag, body) = read_frame(&mut socket).await;
+        if tag == b'E' {
+            error = body;
+        }
+        if tag == b'Z' {
+            break;
+        }
+    }
+    assert!(String::from_utf8_lossy(&error).contains("permission denied"));
 }

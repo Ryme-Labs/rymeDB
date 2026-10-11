@@ -2059,6 +2059,7 @@ name = "ryme-wire-pg"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ryme-auth",
  "ryme-error",
  "ryme-gateway",
  "ryme-metering",
@@ -2078,6 +2079,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "mlua",
+ "ryme-auth",
  "ryme-error",
  "ryme-gateway",
  "ryme-metering",

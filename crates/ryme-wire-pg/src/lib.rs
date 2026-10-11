@@ -1,4 +1,5 @@
 use ryme_error::{Result, RymeError};
+use ryme_auth::Principal;
 pub use ryme_gateway::{RemoteRead, RemoteReader};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{
@@ -20,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
-pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
+pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
 
 pub struct PgGateway<B = TxnManager> {
     executor: Arc<Executor<B>>,
@@ -196,6 +197,8 @@ fn cancel_backend(pid: u32, secret: u32) {
 struct ConnLimits {
     tenant: String,
     database: String,
+    read_allowed: bool,
+    write_allowed: bool,
     qos: Option<Arc<Mutex<QosRegistry>>>,
     metering: Option<Arc<Mutex<MeterRegistry>>>,
     latency: Option<LatencyWindow>,
@@ -227,6 +230,12 @@ fn qos_now_nanos() -> u64 {
 }
 
 fn admit_statement(limits: &ConnLimits, statement: &Statement, bytes: u64) -> Option<Vec<u8>> {
+    if !limits.read_allowed {
+        return Some(encode_error_code("42501", String::from("permission denied")));
+    }
+    if statement.is_write() && !limits.write_allowed {
+        return Some(encode_error_code("42501", String::from("permission denied")));
+    }
     let qos = limits.qos.as_ref()?;
     let now = qos_now_nanos();
     let admitted = match qos.lock() {
@@ -392,7 +401,7 @@ where
 
     pub fn with_authenticator<F>(mut self, authenticator: F) -> Self
     where
-        F: Fn(&str, &str) -> Result<String> + Send + Sync + 'static,
+        F: Fn(&str, &str) -> Result<Principal> + Send + Sync + 'static,
     {
         self.authenticator = Some(Arc::new(authenticator));
         self
@@ -429,6 +438,8 @@ where
         ConnLimits {
             tenant: self.tenant.clone(),
             database: self.database.clone(),
+            read_allowed: true,
+            write_allowed: true,
             qos: self.qos.clone(),
             metering: self.metering.clone(),
             latency: self.latency.clone(),
@@ -675,8 +686,8 @@ where
             return Err(error);
         }
     };
-    let tenant = match authenticator(&startup.user, &password) {
-        Ok(tenant) if !tenant.is_empty() => tenant,
+    let principal = match authenticator(&startup.user, &password) {
+        Ok(principal) if !principal.tenant.is_empty() && principal.can_read() => principal,
         Ok(_) | Err(_) => {
             socket
                 .write_all(&encode_error_code("28P01", String::from("authentication failed")))
@@ -685,8 +696,12 @@ where
             return Err(RymeError::Unauthorized);
         }
     };
+    let tenant = principal.tenant.clone();
     let executor = Arc::new((*executor).clone().with_tenant(tenant.clone()));
-    Ok((executor, limits.with_tenant(tenant)))
+    let mut limits = limits.with_tenant(tenant);
+    limits.read_allowed = principal.can_read();
+    limits.write_allowed = principal.can_write();
+    Ok((executor, limits))
 }
 
 async fn read_client_message<S>(socket: &mut S) -> Result<(u8, Vec<u8>)>
