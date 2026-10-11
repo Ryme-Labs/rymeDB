@@ -204,8 +204,11 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 22.14.0
           registry-url: https://registry.npmjs.org
+
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.5.1
 
       - name: Download tested npm package
         uses: actions/download-artifact@v4
@@ -214,8 +217,6 @@ jobs:
           path: ${{ runner.temp }}/npm
 
       - name: Publish npm package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           shopt -s nullglob
           packages=("$RUNNER_TEMP/npm/"*.tgz)
