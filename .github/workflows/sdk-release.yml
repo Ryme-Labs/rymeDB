@@ -142,7 +142,21 @@ jobs:
           fi
           major="${current%%.*}"
           [[ "$major" =~ ^[0-9]+$ ]]
-          version="$((major + 1)).0.0"
+          candidate_major=$((major + 1))
+          while :; do
+            version="${candidate_major}.0.0"
+            npm_version="$(npm view "@rymelabs/rymedb@$version" version --json 2>/dev/null \
+              | jq -r 'if type == "string" then . else empty end' || true)"
+            crate_version="$(curl --retry 3 --retry-all-errors -fsSL \
+              -H 'User-Agent: rymeDB (https://github.com/Ryme-Labs/rymeDB)' \
+              "https://crates.io/api/v1/crates/rymedb-client/$version" 2>/dev/null \
+              | jq -r '.version.num // empty' || true)"
+            if [[ -z "$npm_version" && -z "$crate_version" ]]; then
+              break
+            fi
+            echo "SDK version $version is already present (npm=$npm_version crates.io=$crate_version); trying the next major"
+            candidate_major=$((candidate_major + 1))
+          done
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "SDK release version: $version (after $current)"
 
@@ -235,7 +249,7 @@ jobs:
       - name: Test and package release crate
         run: |
           cargo test --manifest-path sdks/rust/Cargo.toml --locked
-          cargo package --manifest-path sdks/rust/Cargo.toml --locked
+          cargo package --manifest-path sdks/rust/Cargo.toml --locked --allow-dirty
 
       - name: Upload Cargo release artifact
         uses: actions/upload-artifact@v4
@@ -264,7 +278,7 @@ jobs:
             fi
             echo "rymedb-client@$RELEASE_VERSION already published with matching checksum; skipping"
           else
-            cargo publish --manifest-path sdks/rust/Cargo.toml --locked --no-verify
+            cargo publish --manifest-path sdks/rust/Cargo.toml --locked --no-verify --allow-dirty
           fi
 
   release:
