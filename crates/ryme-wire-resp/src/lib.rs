@@ -185,7 +185,7 @@ impl PubSubBus {
                 match receiver.recv().await {
                     Ok(message) => {
                         let Ok(message) =
-                            serde_json::from_value::<ClusterPubSubMessage>(message.payload)
+                            serde_json::from_value::<ClusterPubSubMessage>(message.payload.clone())
                         else {
                             continue;
                         };

@@ -50,7 +50,7 @@ type DurableTopicShard = Mutex<HashMap<String, broadcast::Sender<DurableMsg>>>;
 
 #[derive(Debug)]
 struct BroadcastTopic {
-    sender: broadcast::Sender<BroadcastMsg>,
+    sender: broadcast::Sender<Arc<BroadcastMsg>>,
     publish_lock: Mutex<()>,
 }
 
@@ -986,7 +986,7 @@ impl Realtime {
             json_cache: Arc::new(OnceLock::new()),
             fanout_quota_pre_admitted: false,
         };
-        let _ = topic.sender.send(message);
+        let _ = topic.sender.send(Arc::new(message));
         Ok(sequence)
     }
 
@@ -1018,7 +1018,7 @@ impl Realtime {
         };
         let receiver_count = topic.sender.receiver_count();
         admit(receiver_count, message.json_len() as u64)?;
-        let _ = topic.sender.send(message);
+        let _ = topic.sender.send(Arc::new(message));
         Ok(sequence)
     }
 
@@ -1048,7 +1048,7 @@ impl Realtime {
             json_cache: Arc::new(OnceLock::new()),
             fanout_quota_pre_admitted: false,
         };
-        let _ = topic.sender.send(message);
+        let _ = topic.sender.send(Arc::new(message));
         Ok(sequence)
     }
 
@@ -1056,11 +1056,11 @@ impl Realtime {
         &self,
         tenant: &str,
         channel: &str,
-    ) -> broadcast::Receiver<BroadcastMsg> {
+    ) -> broadcast::Receiver<Arc<BroadcastMsg>> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
         let Ok(topic) = self.broadcast_topic(shard, key) else {
-            let (_, receiver) = broadcast::channel(16);
+            let (_, receiver) = broadcast::channel::<Arc<BroadcastMsg>>(16);
             return receiver;
         };
         topic.sender.subscribe()
@@ -1674,6 +1674,26 @@ mod tests {
             assert_eq!(msg.channel, "lobby");
             assert_eq!(msg.commit_ts, 3);
         }
+    }
+
+    #[test]
+    fn broadcast_fanout_shares_one_immutable_event() {
+        let realtime = Realtime::new(64);
+        let mut first = realtime.broadcast_subscribe("t", "lobby");
+        let mut second = realtime.broadcast_subscribe("t", "lobby");
+        realtime
+            .broadcast(
+                "t",
+                "lobby",
+                String::from("ada"),
+                serde_json::json!({"large": ["payload", 1, 2, 3]}),
+                3,
+            )
+            .unwrap();
+
+        let first = first.try_recv().unwrap();
+        let second = second.try_recv().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

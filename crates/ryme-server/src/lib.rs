@@ -5335,7 +5335,7 @@ struct SupabaseChangeSubscription {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum SupabaseRealtimeEvent {
-    Broadcast(String, ryme_realtime::BroadcastMsg),
+    Broadcast(String, Arc<ryme_realtime::BroadcastMsg>),
     Change(String, SupabaseChangeSubscription, ryme_realtime::ChangeRecord),
     Presence(String, ryme_realtime::PresenceEvent),
 }
@@ -5957,7 +5957,7 @@ async fn forward_supabase_realtime(
                         }
                         let event_pre_admitted = record.fanout_quota_pre_admitted();
                         let pre_admitted_bytes = record.json_len();
-                        let (event_name, payload) = match record.payload {
+                        let (event_name, payload) = match record.payload.clone() {
                             serde_json::Value::Object(mut payload) => {
                                 let event_name = payload.remove("event")
                                     .and_then(|value| value.as_str().map(String::from))
