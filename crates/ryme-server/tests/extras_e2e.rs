@@ -680,6 +680,19 @@ async fn extras_vector_text_search() {
     assert_eq!(status, 200);
     let text = String::from_utf8_lossy(&body).into_owned();
     assert!(text.find("\"a\"").unwrap() < text.find("\"b\"").unwrap(), "{text}");
+    let mut concurrent_searches = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        concurrent_searches.spawn(http_request(
+            http,
+            "POST /v1/vector/search",
+            b"{\"table\":\"emb\",\"vector\":[0.9,0.1],\"top_k\":2}",
+        ));
+    }
+    while let Some(result) = concurrent_searches.join_next().await {
+        let (status, body) = result.unwrap();
+        assert_eq!(status, 200);
+        assert!(String::from_utf8_lossy(&body).contains("\"a\""));
+    }
     let (status, _) = http_request(
         http,
         "POST /v1/vector/upsert",

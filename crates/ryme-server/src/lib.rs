@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 pub async fn bind_retry(addr: std::net::SocketAddr) -> ryme_error::Result<TcpListener> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -521,7 +522,7 @@ pub struct SharedState {
     metering: Arc<Mutex<MeterRegistry>>,
     qos: Arc<Mutex<QosRegistry>>,
     dek_ring: Arc<Mutex<KeyRing>>,
-    indexes: Arc<Mutex<PartitionedIndex>>,
+    indexes: Arc<RwLock<PartitionedIndex>>,
     http_max_body_bytes: u64,
     credentials: Arc<Mutex<CredentialStore>>,
     refresh_tokens: RefreshTokenStore,
@@ -1469,7 +1470,7 @@ impl SharedState {
             metering: Arc::new(Mutex::new(MeterRegistry::new())),
             qos: Arc::new(Mutex::new(QosRegistry::new())),
             dek_ring,
-            indexes: Arc::new(Mutex::new(PartitionedIndex::new(config.index_partitions))),
+            indexes: Arc::new(RwLock::new(PartitionedIndex::new(config.index_partitions))),
             http_max_body_bytes: config.http_max_body_bytes,
             credentials: Arc::new(Mutex::new(CredentialStore::from_snapshot(auth_snapshot.users))),
             refresh_tokens: RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens),
@@ -6845,15 +6846,15 @@ async fn vector_upsert(
         return error_response(e);
     }
     let space = index_space(&state, &request.table);
-    match state.indexes.lock() {
-        Ok(mut indexes) => match indexes.vector_upsert(&space, request.id, request.vector) {
+    {
+        let mut indexes = state.indexes.write().await;
+        match indexes.vector_upsert(&space, request.id, request.vector) {
             Ok(()) => {
                 record_meter(&state, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
             }
             Err(e) => error_response(e),
-        },
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        }
     }
 }
 
@@ -6877,14 +6878,10 @@ async fn vector_search(
         return error_response(e);
     }
     let space = index_space(&state, &request.table);
-    match state.indexes.lock() {
-        Ok(indexes) => {
-            match indexes.vector_search(&space, &request.vector, request.top_k.unwrap_or(10)) {
-                Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
-                Err(e) => error_response(e),
-            }
-        }
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+    let indexes = state.indexes.read().await;
+    match indexes.vector_search(&space, &request.vector, request.top_k.unwrap_or(10)) {
+        Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+        Err(e) => error_response(e),
     }
 }
 
@@ -6916,19 +6913,15 @@ async fn vector_ann_search(
         return error_response(e);
     }
     let space = index_space(&state, &request.table);
-    match state.indexes.lock() {
-        Ok(indexes) => {
-            match indexes.ann_search(
-                &space,
-                &request.vector,
-                request.top_k.unwrap_or(10),
-                request.ef.unwrap_or(64),
-            ) {
-                Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
-                Err(e) => error_response(e),
-            }
-        }
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+    let indexes = state.indexes.read().await;
+    match indexes.ann_search(
+        &space,
+        &request.vector,
+        request.top_k.unwrap_or(10),
+        request.ef.unwrap_or(64),
+    ) {
+        Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+        Err(e) => error_response(e),
     }
 }
 
@@ -6945,13 +6938,9 @@ async fn vector_delete(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let space = index_space(&state, &table);
-    match state.indexes.lock() {
-        Ok(mut indexes) => {
-            let removed = indexes.vector_remove(&space, &id);
-            (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
-        }
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    }
+    let mut indexes = state.indexes.write().await;
+    let removed = indexes.vector_remove(&space, &id);
+    (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
 }
 
 async fn text_index(
@@ -6977,15 +6966,15 @@ async fn text_index(
         return error_response(e);
     }
     let space = index_space(&state, &request.table);
-    match state.indexes.lock() {
-        Ok(mut indexes) => match indexes.text_index(&space, request.id, &request.text) {
+    {
+        let mut indexes = state.indexes.write().await;
+        match indexes.text_index(&space, request.id, &request.text) {
             Ok(terms) => {
                 record_meter(&state, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "terms": terms }))).into_response()
             }
             Err(e) => error_response(e),
-        },
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        }
     }
 }
 
@@ -7009,13 +6998,9 @@ async fn text_search(
         return error_response(e);
     }
     let space = index_space(&state, &request.table);
-    match state.indexes.lock() {
-        Ok(indexes) => {
-            let hits = indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10));
-            (StatusCode::OK, Json(hits)).into_response()
-        }
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    }
+    let indexes = state.indexes.read().await;
+    let hits = indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10));
+    (StatusCode::OK, Json(hits)).into_response()
 }
 
 async fn text_delete(
@@ -7031,30 +7016,24 @@ async fn text_delete(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let space = index_space(&state, &table);
-    match state.indexes.lock() {
-        Ok(mut indexes) => {
-            let removed = indexes.text_remove(&space, &id);
-            (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
-        }
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    }
+    let mut indexes = state.indexes.write().await;
+    let removed = indexes.text_remove(&space, &id);
+    (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
 }
 
 async fn index_stats(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     if state.principal(&headers).is_err() {
         return error_response(ryme_error::RymeError::Unauthorized);
     }
-    match state.indexes.lock() {
-        Ok(indexes) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "partitions": indexes.len(),
-                "spaces": indexes.spaces(),
-            })),
-        )
-            .into_response(),
-        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    }
+    let indexes = state.indexes.read().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "partitions": indexes.len(),
+            "spaces": indexes.spaces(),
+        })),
+    )
+        .into_response()
 }
 
 async fn kv_get(
