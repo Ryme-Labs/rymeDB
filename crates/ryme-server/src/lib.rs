@@ -810,6 +810,8 @@ struct DurableSnapshot {
     topics: Vec<ryme_realtime::DurableTopicSnapshot>,
 }
 
+const DURABLE_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BranchPromotionPhase {
@@ -859,11 +861,19 @@ const BRANCH_METADATA_JOURNAL_MAX_BYTES: usize = 128 * 1024 * 1024;
 fn load_durable_snapshot(
     path: &std::path::Path,
 ) -> ryme_error::Result<Vec<ryme_realtime::DurableTopicSnapshot>> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > DURABLE_SNAPSHOT_MAX_BYTES as u64 {
+            return Err(ryme_error::RymeError::Overload(String::from("durable snapshot")));
+        }
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
+    if bytes.len() > DURABLE_SNAPSHOT_MAX_BYTES {
+        return Err(ryme_error::RymeError::Overload(String::from("durable snapshot")));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1670,6 +1680,9 @@ impl SharedState {
         let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
             ryme_error::RymeError::Internal(format!("durable snapshot: {error}"))
         })?;
+        if bytes.len() > DURABLE_SNAPSHOT_MAX_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("durable snapshot")));
+        }
         if let Some(parent) = self.durable_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -12922,6 +12935,23 @@ mod realtime_policy_tests {
         assert!(matches!(
             load_auth_snapshot(&path),
             Err(ryme_error::RymeError::Overload(message)) if message == "auth snapshot"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn durable_snapshot_rejects_oversized_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-durable-snapshot-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((DURABLE_SNAPSHOT_MAX_BYTES + 1) as u64).unwrap();
+
+        assert!(matches!(
+            load_durable_snapshot(&path),
+            Err(ryme_error::RymeError::Overload(message)) if message == "durable snapshot"
         ));
         let _ = std::fs::remove_file(path);
     }
