@@ -1,5 +1,9 @@
 # Changelog
 
+- Single-range write-only transactions now commit through the current range
+  leader's quorum log and advance the range commit index directly. The global
+  Raft log remains responsible for read-dependent and cross-range transactions,
+  while range-local writes no longer add a second global data-log round trip.
 - Range WAL recovery now replays only entries at or below the persisted range
   commit index. Replicated-but-uncommitted suffixes remain available for
   conflict repair without becoming visible after a crash and restart.

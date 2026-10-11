@@ -236,8 +236,9 @@ global Raft membership. The range leader announcement is learned by followers
 through range heartbeats; global placement changes still remain epoch-fenced
 control-plane operations.
 This does not yet delete source replicas or claim full shared-nothing storage
-scale. Single-owner write-only transactions now route through the configured
-owner and then the current Raft leader; read-dependent, multi-owner, and
+scale. Single-owner write-only transactions now route directly to the current
+range leader, replicate through that range's quorum log, validate/apply locally,
+and then advance the range commit index. Read-dependent, multi-owner, and
 write-only multi-owner transactions use the current global log for atomic
 forwarding. This is not yet independent per-range Raft 2PC, and read-dependent cross-range
 transaction routing remains separate work. Transactions that include a read

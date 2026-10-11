@@ -144,6 +144,16 @@ pub(crate) enum Rpc {
         committed: bool,
         error: Option<RpcError>,
     },
+    RangeProposeWrite {
+        group_id: String,
+        payload: Vec<u8>,
+        #[serde(default)]
+        route_generation: Option<u64>,
+    },
+    RangeProposeWriteResponse {
+        commit_ts: Option<u64>,
+        error: Option<RpcError>,
+    },
     RangeAppend {
         group_id: String,
         index: u64,
@@ -722,6 +732,7 @@ pub struct Node {
     range_owners: std::sync::RwLock<Vec<RangeOwner>>,
     range_leaders: std::sync::RwLock<BTreeMap<String, usize>>,
     range_generation: AtomicU64,
+    txn_commit_lock: Arc<Mutex<()>>,
     prepared: std::sync::Mutex<BTreeMap<u128, PreparedIntent>>,
     intent_wal: std::sync::Mutex<Wal>,
     range_logs: std::sync::Mutex<BTreeMap<String, u64>>,
@@ -951,6 +962,7 @@ impl Node {
             range_owners: std::sync::RwLock::new(Vec::new()),
             range_leaders: std::sync::RwLock::new(BTreeMap::new()),
             range_generation: AtomicU64::new(0),
+            txn_commit_lock: Arc::new(Mutex::new(())),
             prepared: std::sync::Mutex::new(prepared),
             intent_wal: std::sync::Mutex::new(intent_wal),
             range_logs: std::sync::Mutex::new(range_logs),
@@ -2034,11 +2046,24 @@ impl Node {
                 Ok(Rpc::RangeVoteResponse { term, granted })
             }
             Rpc::RangeCommit { group_id, commit_ts, writes } => {
+                let _commit = self.txn_commit_lock.lock().await;
                 match self.commit_range_group(&group_id, commit_ts, &writes).await {
                     Ok(()) => Ok(Rpc::RangeCommitResponse { committed: true, error: None }),
                     Err(error) => {
                         Ok(Rpc::RangeCommitResponse { committed: false, error: Some(error.into()) })
                     }
+                }
+            }
+            Rpc::RangeProposeWrite { group_id, payload, route_generation } => {
+                match self.commit_range_write(&group_id, &payload, route_generation).await {
+                    Ok(commit_ts) => Ok(Rpc::RangeProposeWriteResponse {
+                        commit_ts: Some(commit_ts),
+                        error: None,
+                    }),
+                    Err(error) => Ok(Rpc::RangeProposeWriteResponse {
+                        commit_ts: None,
+                        error: Some(error.into()),
+                    }),
                 }
             }
             Rpc::RangeAppend {
@@ -2195,6 +2220,9 @@ impl Node {
             Rpc::RangeCommitResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
+            Rpc::RangeProposeWriteResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
             Rpc::RangeAppendResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
@@ -2293,6 +2321,11 @@ impl Node {
         if writes.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("writes")));
         }
+        if let Some((group_id, range_owner)) = self.range_group_for_writes(&writes) {
+            return self
+                .propose_range_write(range_owner, &group_id, writes, route_generation)
+                .await;
+        }
         if self.is_leader().await {
             return self.propose_write_with_generation(writes, route_generation).await;
         }
@@ -2316,6 +2349,52 @@ impl Node {
         txn: ryme_txn::Transaction,
     ) -> Result<u64> {
         self.forward_transaction_to_leader(txn).await
+    }
+
+    fn range_group_for_writes(
+        &self,
+        writes: &BTreeMap<RecordKey, ryme_txn::WriteOp>,
+    ) -> Option<(String, usize)> {
+        let mut group = None;
+        for key in writes.keys() {
+            let range = self.range_for_record(key)?;
+            match &group {
+                None => group = Some((range.id, range.owner)),
+                Some((group_id, owner)) if *group_id == range.id && *owner == range.owner => {}
+                Some(_) => return None,
+            }
+        }
+        group
+    }
+
+    async fn propose_range_write(
+        self: &Arc<Self>,
+        owner: usize,
+        group_id: &str,
+        writes: BTreeMap<RecordKey, ryme_txn::WriteOp>,
+        route_generation: Option<u64>,
+    ) -> Result<u64> {
+        let payload = encode_writes(&writes)?;
+        if owner == self.id {
+            return self.commit_range_write(group_id, &payload, route_generation).await;
+        }
+        let pool = self
+            .pool_for(owner)
+            .ok_or_else(|| RymeError::Unavailable(String::from("range leader unavailable")))?;
+        match pool
+            .roundtrip(&Rpc::RangeProposeWrite {
+                group_id: group_id.to_string(),
+                payload,
+                route_generation,
+            })
+            .await?
+        {
+            Rpc::RangeProposeWriteResponse { commit_ts: Some(commit_ts), error: None } => {
+                Ok(commit_ts)
+            }
+            Rpc::RangeProposeWriteResponse { error: Some(error), .. } => Err(error.into()),
+            _ => Err(RymeError::Corrupt(String::from("range write rpc"))),
+        }
     }
 
     pub async fn propose_metadata(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
@@ -2804,12 +2883,12 @@ impl Node {
             .map(|range| self.with_current_range_leader(range))
     }
 
-    async fn replicate_range_group(
+    async fn replicate_range_entry(
         self: &Arc<Self>,
         group_id: &str,
         commit_ts: u64,
         encoded_writes: &[u8],
-    ) -> Result<()> {
+    ) -> Result<(u64, u64, Vec<usize>)> {
         let range = self
             .range_owner_by_id(group_id)
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
@@ -2837,8 +2916,19 @@ impl Node {
             }
         }
         if acknowledgements < replicas.len() / 2 + 1 {
+            let _ = self.abort_range_entry(group_id, index, &replicas).await;
             return Err(RymeError::Unavailable(String::from("range quorum")));
         }
+        Ok((index, term, acknowledged))
+    }
+
+    async fn commit_range_entry(
+        self: &Arc<Self>,
+        group_id: &str,
+        index: u64,
+        term: u64,
+        acknowledged: &[usize],
+    ) -> Result<()> {
         {
             let mut groups = self
                 .range_groups
@@ -2851,10 +2941,52 @@ impl Node {
         }
         self.apply_range_committed(group_id, index)?;
         self.persist_range_meta()?;
-        for replica in acknowledged.into_iter().filter(|replica| *replica != self.id) {
+        for replica in acknowledged.iter().copied().filter(|replica| *replica != self.id) {
             let _ = self.sync_range_replica(group_id, replica, term, index, term, index).await;
         }
         Ok(())
+    }
+
+    async fn abort_range_entry(
+        self: &Arc<Self>,
+        group_id: &str,
+        index: u64,
+        replicas: &[usize],
+    ) -> Result<()> {
+        let keep_through = index.saturating_sub(1);
+        self.truncate_range_suffix(group_id, keep_through)?;
+        let last_term = if keep_through == 0 { 0 } else { self.range_last_term(group_id) };
+        let commit_index = self
+            .range_groups
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?
+            .get(group_id)
+            .map(|state| state.commit_index)
+            .unwrap_or(0);
+        for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
+            let _ = self
+                .sync_range_replica(
+                    group_id,
+                    replica,
+                    self.range_term(group_id),
+                    keep_through,
+                    last_term,
+                    commit_index,
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn replicate_range_group(
+        self: &Arc<Self>,
+        group_id: &str,
+        commit_ts: u64,
+        encoded_writes: &[u8],
+    ) -> Result<()> {
+        let (index, term, acknowledged) =
+            self.replicate_range_entry(group_id, commit_ts, encoded_writes).await?;
+        self.commit_range_entry(group_id, index, term, &acknowledged).await
     }
 
     async fn commit_range_group(
@@ -2864,6 +2996,54 @@ impl Node {
         encoded_writes: &[u8],
     ) -> Result<()> {
         self.replicate_range_group(group_id, commit_ts, encoded_writes).await
+    }
+
+    async fn commit_range_write(
+        self: &Arc<Self>,
+        group_id: &str,
+        encoded_writes: &[u8],
+        route_generation: Option<u64>,
+    ) -> Result<u64> {
+        if let Some(expected) = route_generation {
+            if self.range_generation() != expected {
+                return Err(RymeError::Conflict(String::from("range topology changed")));
+            }
+        }
+        let range = self
+            .range_owner_by_id(group_id)
+            .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
+        if range.owner != self.id {
+            return Err(RymeError::Unavailable(String::from("not range leader")));
+        }
+        let writes = decode_writes(encoded_writes)?;
+        if writes.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("writes")));
+        }
+        let _commit = self.txn_commit_lock.lock().await;
+        let mut txn = self.manager.begin();
+        if let Some(generation) = route_generation {
+            txn.set_route_generation(generation);
+        }
+        for (key, op) in &writes {
+            match &op.value {
+                Some(value) => {
+                    self.manager.put_with_ttl(&mut txn, key.clone(), value.clone(), op.expires_at)
+                }
+                None => self.manager.delete(&mut txn, key.clone()),
+            }
+        }
+        let commit_ts = self.manager.reserve(&txn)?;
+        let (index, term, acknowledged) =
+            match self.replicate_range_entry(group_id, commit_ts, encoded_writes).await {
+                Ok(result) => result,
+                Err(error) => return Err(error),
+            };
+        if let Err(error) = self.manager.commit_filtered_at(&txn, commit_ts, |_| true) {
+            let _ = self.abort_range_entry(group_id, index, &range.replicas).await;
+            return Err(error);
+        }
+        self.commit_range_entry(group_id, index, term, &acknowledged).await?;
+        Ok(commit_ts)
     }
 
     async fn append_range_on(
@@ -3079,6 +3259,7 @@ impl Node {
                 return Err(RymeError::Conflict(String::from("range topology changed")));
             }
         }
+        let _commit = self.txn_commit_lock.lock().await;
         if self.transaction_participants(&txn).len() > 1 {
             return self.commit_distributed_txn(txn).await;
         }

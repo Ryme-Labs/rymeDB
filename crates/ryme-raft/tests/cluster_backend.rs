@@ -387,7 +387,7 @@ async fn configured_range_owner_limits_follower_materialization() {
 }
 
 #[tokio::test]
-async fn single_owner_write_from_follower_routes_through_mesh() {
+async fn single_owner_write_from_follower_uses_range_quorum() {
     let root =
         std::env::temp_dir().join(format!("ryme-write-route-{}-{}", std::process::id(), now_ms()));
     let _ = std::fs::remove_dir_all(&root);
@@ -434,6 +434,7 @@ async fn single_owner_write_from_follower_routes_through_mesh() {
     let mut seed = backends[leader].begin();
     backends[leader].put(&mut seed, key("seed"), b"seed".to_vec());
     backends[leader].commit(seed).await.unwrap();
+    let global_commit_before_range_write = nodes[leader].commit_index().await;
 
     let mut txn = backends[client].begin();
     backends[client].put(&mut txn, key("routed"), b"from-follower".to_vec());
@@ -452,6 +453,7 @@ async fn single_owner_write_from_follower_routes_through_mesh() {
         nodes[leader].read_latest(&key("routed")).await.unwrap(),
         Some(b"from-follower".to_vec())
     );
+    assert_eq!(nodes[leader].commit_index().await, global_commit_before_range_write);
     assert_eq!(nodes[client].read_latest(&key("routed")).await.unwrap(), None);
 
     for (node, task) in nodes.iter().zip(tasks) {
