@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
 
-type EncodedFrameSlot = OnceLock<(String, Arc<str>)>;
+type EncodedFrameSlot = tokio::sync::OnceCell<(String, Arc<str>)>;
 type EncodedFrameCache = Arc<[EncodedFrameSlot; 2]>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,7 +162,7 @@ impl BroadcastMsg {
     /// Reuse a protocol-specific frame for subscribers receiving the same
     /// broadcast. The cache is capped at two variants to keep per-message
     /// memory bounded (normally one topic in each of two wire formats).
-    pub fn cached_text_frame(
+    pub async fn cached_text_frame(
         &self,
         topic: &str,
         protocol: u8,
@@ -175,15 +175,19 @@ impl BroadcastMsg {
             return if cached_topic == topic { Arc::clone(frame) } else { Arc::from(encode()) };
         }
 
-        let frame: Arc<str> = Arc::from(encode());
-        if cache.set((topic.to_owned(), Arc::clone(&frame))).is_err() {
-            if let Some((cached_topic, cached_frame)) = cache.get() {
-                if cached_topic == topic {
-                    return Arc::clone(cached_frame);
-                }
-            }
+        let mut encode = Some(encode);
+        let (cached_topic, frame) = cache
+            .get_or_init(|| async {
+                let frame: Arc<str> =
+                    Arc::from(encode.take().expect("frame cache initializer runs once")());
+                (topic.to_owned(), frame)
+            })
+            .await;
+        if cached_topic == topic {
+            Arc::clone(frame)
+        } else {
+            Arc::from(encode.take().expect("frame cache initialized for another topic")())
         }
-        frame
     }
 }
 
@@ -1016,7 +1020,7 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
-            encoded_frames: Arc::new(std::array::from_fn(|_| OnceLock::new())),
+            encoded_frames: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
             fanout_quota_pre_admitted: false,
         };
         let _ = topic.sender.send(Arc::new(message));
@@ -1047,7 +1051,7 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
-            encoded_frames: Arc::new(std::array::from_fn(|_| OnceLock::new())),
+            encoded_frames: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
             fanout_quota_pre_admitted: true,
         };
         let receiver_count = topic.sender.receiver_count();
@@ -1080,7 +1084,7 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
-            encoded_frames: Arc::new(std::array::from_fn(|_| OnceLock::new())),
+            encoded_frames: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
             fanout_quota_pre_admitted: false,
         };
         let _ = topic.sender.send(Arc::new(message));
@@ -1731,8 +1735,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
     }
 
-    #[test]
-    fn broadcast_reuses_bounded_protocol_frames() {
+    #[tokio::test]
+    async fn broadcast_reuses_bounded_protocol_frames() {
         let realtime = Realtime::new(64);
         let mut receiver = realtime.broadcast_subscribe("t", "lobby");
         realtime
@@ -1741,30 +1745,42 @@ mod tests {
         let message = receiver.try_recv().unwrap();
         let encodes = std::sync::atomic::AtomicUsize::new(0);
 
-        let first = message.cached_text_frame("room:lobby", 0, || {
-            encodes.fetch_add(1, Ordering::Relaxed);
-            String::from("encoded")
-        });
-        let second = message.cached_text_frame("room:lobby", 0, || {
-            encodes.fetch_add(1, Ordering::Relaxed);
-            String::from("unexpected re-encode")
-        });
-        let array_frame = message.cached_text_frame("room:lobby", 1, || {
-            encodes.fetch_add(1, Ordering::Relaxed);
-            String::from("array encoded")
-        });
-        let repeated_array_frame = message.cached_text_frame("room:lobby", 1, || {
-            encodes.fetch_add(1, Ordering::Relaxed);
-            String::from("unexpected array re-encode")
-        });
-        let other_topic_frame = message.cached_text_frame("other:lobby", 0, || {
-            encodes.fetch_add(1, Ordering::Relaxed);
-            String::from("other topic")
-        });
-        let repeated_other_topic = message.cached_text_frame("other:lobby", 0, || {
-            encodes.fetch_add(1, Ordering::Relaxed);
-            String::from("other topic again")
-        });
+        let first = message
+            .cached_text_frame("room:lobby", 0, || {
+                encodes.fetch_add(1, Ordering::Relaxed);
+                String::from("encoded")
+            })
+            .await;
+        let second = message
+            .cached_text_frame("room:lobby", 0, || {
+                encodes.fetch_add(1, Ordering::Relaxed);
+                String::from("unexpected re-encode")
+            })
+            .await;
+        let array_frame = message
+            .cached_text_frame("room:lobby", 1, || {
+                encodes.fetch_add(1, Ordering::Relaxed);
+                String::from("array encoded")
+            })
+            .await;
+        let repeated_array_frame = message
+            .cached_text_frame("room:lobby", 1, || {
+                encodes.fetch_add(1, Ordering::Relaxed);
+                String::from("unexpected array re-encode")
+            })
+            .await;
+        let other_topic_frame = message
+            .cached_text_frame("other:lobby", 0, || {
+                encodes.fetch_add(1, Ordering::Relaxed);
+                String::from("other topic")
+            })
+            .await;
+        let repeated_other_topic = message
+            .cached_text_frame("other:lobby", 0, || {
+                encodes.fetch_add(1, Ordering::Relaxed);
+                String::from("other topic again")
+            })
+            .await;
 
         assert_eq!(first.as_ref(), "encoded");
         assert!(Arc::ptr_eq(&first, &second));
@@ -1773,6 +1789,44 @@ mod tests {
         assert_eq!(other_topic_frame.as_ref(), "other topic");
         assert_eq!(repeated_other_topic.as_ref(), "other topic again");
         assert_eq!(encodes.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn broadcast_fanout_encodes_a_cold_frame_once() {
+        const SUBSCRIBERS: usize = 32;
+
+        let realtime = Realtime::new(64);
+        let mut receiver = realtime.broadcast_subscribe("t", "lobby");
+        realtime
+            .broadcast("t", "lobby", String::from("ada"), serde_json::json!({"x": 1}), 3)
+            .unwrap();
+        let message = receiver.try_recv().unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(SUBSCRIBERS));
+        let encodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(SUBSCRIBERS);
+
+        for _ in 0..SUBSCRIBERS {
+            let message = Arc::clone(&message);
+            let start = Arc::clone(&start);
+            let encodes = Arc::clone(&encodes);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                message
+                    .cached_text_frame("room:lobby", 0, || {
+                        encodes.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        String::from("encoded")
+                    })
+                    .await
+            }));
+        }
+
+        let mut frames = Vec::with_capacity(SUBSCRIBERS);
+        for task in tasks {
+            frames.push(task.await.unwrap());
+        }
+        assert_eq!(encodes.load(Ordering::Relaxed), 1);
+        assert!(frames.iter().all(|frame| Arc::ptr_eq(frame, &frames[0])));
     }
 
     #[test]

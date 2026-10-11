@@ -6073,6 +6073,7 @@ async fn forward_supabase_realtime(
                                     array_protocol,
                                 )
                             })
+                            .await
                             .to_string();
                         (text, event_pre_admitted, pre_admitted_bytes)
                     }
