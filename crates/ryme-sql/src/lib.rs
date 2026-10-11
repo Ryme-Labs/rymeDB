@@ -8031,6 +8031,24 @@ where
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
+        let previous = self.schema_snapshot();
+        let was_dirty = self.schema_dirty.load(Ordering::SeqCst);
+        match self.restore_schema_snapshot_inner(snapshot) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let rollback = self.restore_schema_snapshot_inner(previous);
+                self.schema_dirty.store(was_dirty, Ordering::SeqCst);
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(RymeError::Internal(format!(
+                        "schema restore failed: {error}; rollback failed: {rollback_error}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn restore_schema_snapshot_inner(&self, snapshot: SchemaSnapshot) -> Result<()> {
         validate_role_catalog(&snapshot.roles)?;
         let functions = snapshot.functions;
         let triggers = snapshot.triggers;
@@ -16754,6 +16772,39 @@ mod tests {
         isolated.execute(parse("CREATE TABLE branch_only").unwrap()).await.unwrap();
         assert!(!restored.catalog_tables().contains(&String::from("branch_only")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_schema_snapshot_restore_rolls_back_all_changes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE docs (id TEXT PRIMARY KEY, value TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO docs (id, value) VALUES ('one', 'same'), ('two', 'same')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before = executor.schema_snapshot();
+        let mut invalid = before.clone();
+        invalid.indexes.push(IndexDefinition {
+            name: String::from("docs_value_unique"),
+            table: String::from("docs"),
+            field: Field::Value,
+            column: Some(String::from("value")),
+            columns: Vec::new(),
+            unique: true,
+        });
+
+        assert!(matches!(
+            executor.restore_schema_snapshot(invalid),
+            Err(RymeError::Conflict(message)) if message.contains("unique index")
+        ));
+        assert_eq!(executor.schema_snapshot(), before);
+        assert!(executor.catalog_indexes("docs").is_empty());
     }
 
     #[tokio::test]
