@@ -219,6 +219,9 @@ impl BranchManager {
             .get(&scoped_key(tenant, parent))
             .ok_or_else(|| RymeError::NotFound(String::from("parent")))?
             .clone();
+        if parent_branch.parent_id.is_some() {
+            return Err(RymeError::InvalidArgument(String::from("nested branch parent")));
+        }
         let storage_epoch = self.allocate_storage_epoch()?;
         let manifest_id = parent_branch.manifest_id.clone();
         *self.refs.entry(manifest_id.clone()).or_insert(0) += 1;
@@ -823,6 +826,16 @@ mod tests {
         assert!(manager.create_child(String::from("a/b"), "main", 1).is_err());
         assert!(manager.create_child(String::from("a..b"), "main", 1).is_err());
         assert!(manager.create_child("a".repeat(128), "main", 1).is_ok());
+    }
+
+    #[test]
+    fn nested_branch_parents_are_rejected() {
+        let mut manager = root_manager();
+        manager.create_child(String::from("preview"), "main", 1).unwrap();
+        assert!(matches!(
+            manager.create_child(String::from("nested"), "preview", 2),
+            Err(RymeError::InvalidArgument(_))
+        ));
     }
 
     #[test]
