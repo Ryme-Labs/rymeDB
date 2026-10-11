@@ -29,6 +29,11 @@ pub struct Wal {
 
 impl Wal {
     pub fn open(dir: &Path, segment_size_bytes: u64) -> Result<Self> {
+        if segment_size_bytes == 0 {
+            return Err(RymeError::InvalidArgument(String::from(
+                "wal segment size must be positive",
+            )));
+        }
         std::fs::create_dir_all(dir)?;
         recover_rewrite(dir)?;
         let active_id = latest_segment_id(dir)?;
@@ -57,14 +62,11 @@ impl Wal {
                 "wal append failed; reopen the wal before writing again",
             )));
         }
-        if payload.len() > u32::MAX as usize {
-            return Err(RymeError::InvalidArgument(String::from("payload too large")));
-        }
         let lsn = self.next_lsn;
         let next_lsn = lsn
             .checked_add(1)
             .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))?;
-        let frame = encode_frame(lsn, commit_ts, payload);
+        let frame = encode_frame(lsn, commit_ts, payload)?;
         if self.active_len.saturating_add(frame.len() as u64) > self.segment_size_bytes {
             if let Err(error) = self.rotate() {
                 self.poisoned = true;
@@ -186,6 +188,9 @@ impl Wal {
             })
             .unwrap_or(Ok(0))?;
         let temporary = self.dir.join(REWRITE_DIR);
+        for record in records {
+            validate_payload_len(record.payload.len())?;
+        }
         if temporary.exists() {
             std::fs::remove_dir_all(&temporary)?;
         }
@@ -194,7 +199,7 @@ impl Wal {
         let mut path = temporary.join(segment_name(id));
         let mut file = File::create(&path)?;
         for record in records {
-            let frame = encode_frame(record.lsn, record.commit_ts, &record.payload);
+            let frame = encode_frame(record.lsn, record.commit_ts, &record.payload)?;
             let current_len = file.metadata()?.len();
             if current_len > 0 && current_len + frame.len() as u64 > self.segment_size_bytes {
                 file.sync_data()?;
@@ -403,7 +408,8 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
         .unwrap_or(Ok(0))
 }
 
-fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Vec<u8> {
+fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Result<Vec<u8>> {
+    validate_payload_len(payload.len())?;
     let mut buf = BytesMut::with_capacity(20 + payload.len());
     buf.put_u32(WAL_MAGIC);
     buf.put_u16(WAL_VERSION);
@@ -414,7 +420,14 @@ fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Vec<u8> {
     buf.put_slice(payload);
     let crc = crc32fast::hash(&buf);
     buf.put_u32(crc);
-    buf.freeze().to_vec()
+    Ok(buf.freeze().to_vec())
+}
+
+fn validate_payload_len(payload_len: usize) -> Result<()> {
+    if payload_len > u32::MAX as usize {
+        return Err(RymeError::InvalidArgument(String::from("payload too large")));
+    }
+    Ok(())
 }
 
 fn decode_frame(input: &[u8]) -> Result<Option<(WalRecord, usize)>> {
@@ -469,6 +482,26 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_zero_segment_size() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-zero-segment-size-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(Wal::open(&dir, 0), Err(RymeError::InvalidArgument(_))));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn payload_length_matches_wire_format() {
+        assert!(validate_payload_len(u32::MAX as usize).is_ok());
+        if let Some(oversized) = (u32::MAX as usize).checked_add(1) {
+            assert!(matches!(validate_payload_len(oversized), Err(RymeError::InvalidArgument(_))));
+        }
+    }
+
+    #[test]
     fn corruption_detected() {
         let dir = std::env::temp_dir().join(format!(
             "ryme-wal-corrupt-{}-{}",
@@ -500,8 +533,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut raw = encode_frame(2, 2, b"later");
-        raw.extend_from_slice(&encode_frame(1, 1, b"earlier"));
+        let mut raw = encode_frame(2, 2, b"later").unwrap();
+        raw.extend_from_slice(&encode_frame(1, 1, b"earlier").unwrap());
         std::fs::write(dir.join(segment_name(0)), raw).unwrap();
 
         assert!(matches!(Wal::read_all(&dir), Err(RymeError::Corrupt(_))));
@@ -518,8 +551,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(segment_name(0)), encode_frame(2, 2, b"later")).unwrap();
-        std::fs::write(dir.join(segment_name(1)), encode_frame(1, 1, b"earlier")).unwrap();
+        std::fs::write(dir.join(segment_name(0)), encode_frame(2, 2, b"later").unwrap()).unwrap();
+        std::fs::write(dir.join(segment_name(1)), encode_frame(1, 1, b"earlier").unwrap()).unwrap();
 
         assert!(matches!(Wal::open(&dir, 1024), Err(RymeError::Corrupt(_))));
         let _ = std::fs::remove_dir_all(&dir);
@@ -716,8 +749,11 @@ mod tests {
             [WalRecord { lsn: 0, commit_ts: 99, payload: b"new-generation".to_vec() }];
         let staging = dir.join(REWRITE_DIR);
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join(segment_name(0)), encode_frame(0, 99, b"new-generation"))
-            .unwrap();
+        std::fs::write(
+            staging.join(segment_name(0)),
+            encode_frame(0, 99, b"new-generation").unwrap(),
+        )
+        .unwrap();
         sync_directory(&staging).unwrap();
         create_rewrite_marker(&dir).unwrap();
         // Simulate a crash after old segments were removed but before the stage
