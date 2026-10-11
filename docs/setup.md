@@ -17,11 +17,6 @@ Install Docker with BuildKit, then pull the published image:
 docker pull ghcr.io/ryme-labs/rymedb:latest
 ```
 
-If GHCR returns `unauthorized`, the package may be private. An organization
-admin must make it public for anonymous pulls, or you can authenticate with a
-GitHub classic token that has `read:packages`. When using `sudo docker`, log in
-with `sudo` as well; root and your regular user keep separate Docker credentials.
-
 Create a persistent volume and start a single node:
 
 ```bash
