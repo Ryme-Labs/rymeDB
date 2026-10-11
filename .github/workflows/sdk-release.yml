@@ -145,17 +145,33 @@ jobs:
           candidate_major=$((major + 1))
           while :; do
             version="${candidate_major}.0.0"
-            if npm_response="$(npm view "@rymelabs/rymedb@$version" version --json 2>/dev/null)"; then
-              npm_version="$(jq -er 'if type == "string" then . else empty end' <<< "$npm_response")" || {
-                echo "npm returned an invalid response while checking @rymelabs/rymedb@$version"
-                exit 1
-              }
-            elif jq -e '.error.code == "E404"' <<< "$npm_response" >/dev/null 2>&1; then
-              npm_version=""
-            else
+            npm_response="$RUNNER_TEMP/npm-$version.json"
+            if ! npm_status="$(curl --retry 3 --retry-all-errors -sS \
+              -H 'Accept: application/json' \
+              --output "$npm_response" --write-out '%{http_code}' \
+              "https://registry.npmjs.org/@rymelabs%2frymedb/$version")"; then
               echo "npm version lookup failed for @rymelabs/rymedb@$version"
               exit 1
             fi
+            case "$npm_status" in
+              200)
+                npm_version="$(jq -er '.version // empty' "$npm_response")" || {
+                  echo "npm returned an invalid response while checking @rymelabs/rymedb@$version"
+                  exit 1
+                }
+                [[ "$npm_version" == "$version" ]] || {
+                  echo "npm returned an unexpected version while checking @rymelabs/rymedb@$version"
+                  exit 1
+                }
+                ;;
+              404)
+                npm_version=""
+                ;;
+              *)
+                echo "npm registry returned HTTP $npm_status while checking @rymelabs/rymedb@$version"
+                exit 1
+                ;;
+            esac
 
             crate_response="$RUNNER_TEMP/crates-io-$version.json"
             if ! crate_status="$(curl --retry 3 --retry-all-errors -sS \
