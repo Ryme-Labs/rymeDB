@@ -1,5 +1,8 @@
 # Changelog
 
+- PostgreSQL sessions now enforce `statement_timeout` for queries and row
+  mutations, return SQLSTATE `57014` on expiry, parse common duration units,
+  and expose the setting through `SHOW`/`SHOW ALL`.
 - PostgreSQL explicit transactions now restore schema changes on rollback and
   coordinate schema-only DDL through the clustered Raft metadata hook at commit;
   mixed schema-and-row transactions are rejected until one atomic protocol can

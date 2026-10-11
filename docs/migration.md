@@ -129,6 +129,12 @@ applied to subsequently created tables, views, and sequences, including
 schema-scoped defaults and `FOR ROLE` owner selectors.
 The declarations are available through `pg_catalog.pg_default_acl` with
 PostgreSQL-style role OIDs, namespace OIDs, object-type codes, and ACL text.
+
+The PostgreSQL wire gateway also honors the common `statement_timeout` session
+setting for queries and row mutations. Values may be expressed in milliseconds
+or with `ms`, `s`, `min`, or `h` units; timed-out statements return SQLSTATE
+`57014`. Clustered schema DDL is excluded from the timeout wrapper so a
+cancelled request cannot leave Raft metadata coordination half-applied.
 Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
 persisted in schema snapshots. `BEFORE` row triggers that assign
 `NEW.column = now()` (or the equivalent current-timestamp expressions) are

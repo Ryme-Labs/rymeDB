@@ -2683,8 +2683,40 @@ fn session_default(name: &str) -> Option<&'static str> {
         "is_superuser" => Some("off"),
         "max_identifier_length" => Some("63"),
         "search_path" => Some("public"),
+        "statement_timeout" => Some("0"),
         _ => None,
     }
+}
+
+fn parse_timeout_millis(value: &str) -> Option<u64> {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "0" {
+        return Some(0);
+    }
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("min") {
+        (number, 60_000u64)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000u64)
+    } else if let Some(number) = value.strip_suffix("ms") {
+        (number, 1u64)
+    } else if let Some(number) = value.strip_suffix("us") {
+        let micros = number.parse::<u64>().ok()?;
+        return Some(micros.div_ceil(1_000).max(1));
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000u64)
+    } else {
+        (value.as_str(), 1u64)
+    };
+    number.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+fn session_timeout(session: &HashMap<String, String>) -> Option<std::time::Duration> {
+    let millis = session
+        .get("statement_timeout")
+        .map(String::as_str)
+        .or_else(|| session_default("statement_timeout"))
+        .and_then(parse_timeout_millis)?;
+    (millis > 0).then(|| std::time::Duration::from_millis(millis))
 }
 
 fn session_isolation(session: &HashMap<String, String>) -> Isolation {
@@ -2937,6 +2969,40 @@ where
 }
 
 async fn execute_statement_for_session<B>(
+    executor: &Arc<Executor<B>>,
+    limits: &ConnLimits,
+    statement: Statement,
+    bytes: u64,
+    session: &HashMap<String, String>,
+    active: &mut Option<SessionTransaction>,
+) -> Vec<u8>
+where
+    B: TxnBackend,
+{
+    let timeout = session_timeout(session);
+    if statement.is_schema_change() || timeout.is_none() {
+        return execute_statement_for_session_inner(
+            executor, limits, statement, bytes, session, active,
+        )
+        .await;
+    }
+    match tokio::time::timeout(
+        timeout.expect("statement timeout is present"),
+        execute_statement_for_session_inner(executor, limits, statement, bytes, session, active),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            if let Some(transaction) = active.as_mut() {
+                transaction.failed = true;
+            }
+            encode_error_code("57014", String::from("canceling statement due to statement timeout"))
+        }
+    }
+}
+
+async fn execute_statement_for_session_inner<B>(
     executor: &Arc<Executor<B>>,
     limits: &ConnLimits,
     statement: Statement,
@@ -3300,7 +3366,13 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
             if name.is_empty() || value.is_empty() {
                 return None;
             }
-            session.insert(name.to_ascii_lowercase(), unquote_literal(value));
+            let value = unquote_literal(value);
+            if name.eq_ignore_ascii_case("statement_timeout")
+                && parse_timeout_millis(&value).is_none()
+            {
+                return None;
+            }
+            session.insert(name.to_ascii_lowercase(), value);
             Some(command_complete("SET"))
         }
         "SHOW" => {
@@ -3325,6 +3397,7 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
                     "max_identifier_length",
                     "timezone",
                     "transaction_isolation",
+                    "statement_timeout",
                 ];
                 let mut out =
                     multi_row_description(&[String::from("name"), String::from("setting")]);
@@ -4151,6 +4224,25 @@ mod tests {
         assert!(session.is_empty());
         assert!(session_command("SET", &mut session).is_none());
         assert!(session_command("SHOW", &mut session).is_none());
+    }
+
+    #[test]
+    fn statement_timeout_accepts_postgres_duration_units() {
+        assert_eq!(parse_timeout_millis("0"), Some(0));
+        assert_eq!(parse_timeout_millis("25"), Some(25));
+        assert_eq!(parse_timeout_millis("2ms"), Some(2));
+        assert_eq!(parse_timeout_millis("3s"), Some(3_000));
+        assert_eq!(parse_timeout_millis("2min"), Some(120_000));
+        assert_eq!(parse_timeout_millis("1h"), Some(3_600_000));
+        assert_eq!(parse_timeout_millis("500us"), Some(1));
+        assert_eq!(parse_timeout_millis("not-a-duration"), None);
+
+        let mut session = HashMap::new();
+        assert!(session_command("SET statement_timeout = '3s'", &mut session).is_some());
+        assert_eq!(session_timeout(&session), Some(std::time::Duration::from_secs(3)));
+        assert!(session_command("SET statement_timeout = 'invalid'", &mut session).is_none());
+        assert!(session_command("RESET statement_timeout", &mut session).is_some());
+        assert!(session_timeout(&session).is_none());
     }
 
     #[test]
