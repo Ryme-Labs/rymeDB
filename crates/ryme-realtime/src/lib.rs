@@ -49,6 +49,8 @@ const TABLE_TOPIC_SHARDS: usize = 32;
 const PRESENCE_SHARDS: usize = 32;
 const STABLE_CDC_SEQUENCE_STRIDE: u64 = 1_000_000;
 const BROADCAST_BUFFER_CAPACITY: usize = 16_384;
+const MAX_CHANGE_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TABLE_HISTORY_BYTES: usize = 256 * 1024 * 1024;
 pub const DURABLE_PARTITION_MAX_BYTES: usize = 256;
 pub const DURABLE_KEY_MAX_BYTES: usize = 1024;
 pub const DURABLE_VALUE_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -165,6 +167,7 @@ pub struct Realtime {
     presence_sequence: Arc<AtomicU64>,
     presence_member_count: Arc<AtomicUsize>,
     presence_state_bytes: Arc<AtomicUsize>,
+    history_bytes: Arc<AtomicUsize>,
     stable_cdc: bool,
     cdc_sequences: Arc<Mutex<HashMap<String, (u64, u64)>>>,
 }
@@ -329,6 +332,37 @@ pub struct NewChange {
     pub tx_id: u64,
 }
 
+fn change_record_bytes(record: &ChangeRecord) -> usize {
+    change_record_bytes_parts(
+        &record.tenant,
+        &record.database,
+        &record.branch,
+        &record.table,
+        &record.pk,
+        record.before.as_deref(),
+        record.after.as_deref(),
+    )
+}
+
+fn change_record_bytes_parts(
+    tenant: &str,
+    database: &str,
+    branch: &str,
+    table: &str,
+    pk: &[u8],
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> usize {
+    96usize
+        .saturating_add(tenant.len())
+        .saturating_add(database.len())
+        .saturating_add(branch.len())
+        .saturating_add(table.len())
+        .saturating_add(pk.len())
+        .saturating_add(before.map_or(0, |value| value.len()))
+        .saturating_add(after.map_or(0, |value| value.len()))
+}
+
 impl Realtime {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.clamp(16, 100000);
@@ -361,6 +395,7 @@ impl Realtime {
             presence_sequence: Arc::new(AtomicU64::new(0)),
             presence_member_count: Arc::new(AtomicUsize::new(0)),
             presence_state_bytes: Arc::new(AtomicUsize::new(0)),
+            history_bytes: Arc::new(AtomicUsize::new(0)),
             stable_cdc: false,
             cdc_sequences: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -487,6 +522,18 @@ impl Realtime {
     }
 
     pub fn publish(&self, event: NewChange) -> Result<u64> {
+        let record_bytes = change_record_bytes_parts(
+            &event.tenant,
+            &event.database,
+            &event.branch,
+            &event.table,
+            &event.pk,
+            event.before.as_deref(),
+            event.after.as_deref(),
+        );
+        if record_bytes > MAX_CHANGE_RECORD_BYTES {
+            return Err(RymeError::Overload(String::from("realtime change")));
+        }
         let key = branch_topic_key(&event.tenant, &event.database, &event.branch, &event.table);
         let shard = self.table_topic_shard(&key);
         let mut topics = self
@@ -518,12 +565,53 @@ impl Realtime {
         if self.changes.receiver_count() > 0 {
             let _ = self.changes.send(record.clone());
         }
-        let log = topics.history.entry(key).or_default();
-        while log.len() >= self.capacity {
-            log.pop_front();
-        }
-        log.push_back(record);
+        self.retain_history(&mut topics, key, record, record_bytes);
         Ok(sequence)
+    }
+
+    fn retain_history(
+        &self,
+        topics: &mut TableTopicShard,
+        key: String,
+        record: ChangeRecord,
+        record_bytes: usize,
+    ) {
+        let remove_empty = {
+            let log = topics.history.entry(key.clone()).or_default();
+            while log.len() >= self.capacity {
+                if let Some(evicted) = log.pop_front() {
+                    self.release_history_bytes(change_record_bytes(&evicted));
+                }
+            }
+            while self.history_bytes.load(Ordering::Acquire).saturating_add(record_bytes)
+                > MAX_TABLE_HISTORY_BYTES
+            {
+                let Some(evicted) = log.pop_front() else { break };
+                self.release_history_bytes(change_record_bytes(&evicted));
+            }
+            let reserved =
+                self.history_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(record_bytes)
+                        .filter(|next| *next <= MAX_TABLE_HISTORY_BYTES)
+                });
+            if reserved.is_ok() {
+                log.push_back(record);
+                false
+            } else {
+                log.is_empty()
+            }
+        };
+        if remove_empty {
+            topics.history.remove(&key);
+            self.release_table_topic_if_empty(topics, &key);
+        }
+    }
+
+    fn release_history_bytes(&self, bytes: usize) {
+        let _ = self.history_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(bytes))
+        });
     }
 
     fn next_change_sequence(&self, key: &str, commit_ts: u64) -> u64 {
@@ -1077,7 +1165,10 @@ impl Realtime {
                     if topics.topics.remove(&key).is_some() {
                         removed += 1;
                     }
-                    if topics.history.remove(&key).is_some() {
+                    if let Some(history) = topics.history.remove(&key) {
+                        for record in &history {
+                            self.release_history_bytes(change_record_bytes(record));
+                        }
                         removed += 1;
                     }
                     if topics.queries.remove(&key).is_some() {
@@ -1875,6 +1966,28 @@ mod tests {
     }
 
     #[test]
+    fn oversized_change_is_rejected_before_topic_admission() {
+        let realtime = Realtime::new(64);
+        let result = realtime.publish(NewChange {
+            tenant: String::from("t"),
+            database: String::from("d"),
+            branch: String::from("main"),
+            table: String::from("docs"),
+            op: Operation::Insert,
+            pk: b"key".to_vec(),
+            before: None,
+            after: Some(vec![0; MAX_CHANGE_RECORD_BYTES + 1]),
+            commit_ts: 1,
+            tx_id: 1,
+        });
+        assert!(
+            matches!(result, Err(RymeError::Overload(message)) if message == "realtime change")
+        );
+        assert_eq!(realtime.history_bytes.load(Ordering::Acquire), 0);
+        assert!(realtime.table_topics.iter().all(|shard| shard.lock().unwrap().history.is_empty()));
+    }
+
+    #[test]
     fn concurrent_publish_keeps_topic_sequence_order() {
         let realtime = Realtime::new(1024);
         let workers: Vec<_> = (0..8)
@@ -2260,7 +2373,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(realtime.replay("t", "d", "history-only", 0, 10).len(), 1);
+        assert!(realtime.history_bytes.load(Ordering::Acquire) > 0);
         assert_eq!(realtime.prune_idle(), 1);
+        assert_eq!(realtime.history_bytes.load(Ordering::Acquire), 0);
         assert!(realtime.replay("t", "d", "history-only", 0, 10).is_empty());
         assert_eq!(realtime.prune_idle(), 0);
     }
