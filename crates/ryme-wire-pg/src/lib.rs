@@ -708,7 +708,7 @@ where
     let mut limits = limits.with_tenant(tenant);
     limits.read_allowed = principal.can_read();
     limits.write_allowed = principal.can_write();
-    limits.admin_allowed = principal.can_admin();
+    limits.admin_allowed = principal.can_platform_admin();
     Ok((executor, limits, role))
 }
 

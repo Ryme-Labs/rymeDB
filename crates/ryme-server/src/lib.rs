@@ -4440,7 +4440,7 @@ async fn migrate_apply(
         Ok(statement) => statement,
         Err(e) => return error_response(e),
     };
-    if statement.requires_admin() && !principal.can_admin() {
+    if statement.requires_admin() && !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if !statement.is_write() {
@@ -7653,7 +7653,7 @@ async fn sql_exec(
         Ok(statement) => statement,
         Err(e) => return error_response(e),
     };
-    if statement.requires_admin() && !principal.can_admin() {
+    if statement.requires_admin() && !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if statement.is_write() && !principal.can_write() {

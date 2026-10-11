@@ -157,6 +157,23 @@ async fn password_authenticates_and_routes_the_session_tenant() {
         }
     }
     assert!(authenticated);
+
+    socket
+        .write_all(&frame(b'Q', b"CREATE TABLE public.global_schema (id TEXT PRIMARY KEY)\0"))
+        .await
+        .unwrap();
+    let mut schema_error = Vec::new();
+    loop {
+        let (tag, body) = read_frame(&mut socket).await;
+        if tag == b'E' {
+            schema_error = body;
+        }
+        if tag == b'Z' {
+            break;
+        }
+    }
+    assert!(String::from_utf8_lossy(&schema_error).contains("42501"));
+
     socket.write_all(&frame(b'Q', b"INSERT INTO docs KEY 'k1' VALUE 'v1'\0")).await.unwrap();
     loop {
         let (tag, _) = read_frame(&mut socket).await;
