@@ -216,7 +216,8 @@ jobs:
           packages=("$RUNNER_TEMP/npm/"*.tgz)
           test "${#packages[@]}" -eq 1
           expected="sha512-$(openssl dgst -sha512 -binary "${packages[0]}" | openssl base64 -A)"
-          published="$(npm view "@rymelabs/rymedb@$RELEASE_VERSION" dist.integrity --json 2>/dev/null | tr -d '\"\r\n' || true)"
+          published="$(npm view "@rymelabs/rymedb@$RELEASE_VERSION" dist.integrity --json 2>/dev/null \
+            | jq -r 'if type == "string" then . else empty end' || true)"
           if [[ -n "$published" && "$published" != "undefined" && "$published" != "null" ]]; then
             if [[ "$published" != "$expected" ]]; then
               echo "@rymelabs/rymedb@$RELEASE_VERSION already exists with different contents"
