@@ -9604,8 +9604,7 @@ fn stream_realtime_event(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64
     match qos.lock() {
         Ok(mut registry) => {
             let now = qos_now_nanos();
-            registry.admit_realtime(tenant, 1, now).is_ok()
-                && registry.admit_egress(tenant, bytes, now).is_ok()
+            registry.admit_realtime_delivery(tenant, bytes, now).is_ok()
         }
         Err(_) => false,
     }

@@ -211,6 +211,22 @@ impl QosRegistry {
         }
     }
 
+    pub fn admit_realtime_delivery(
+        &mut self,
+        tenant: &str,
+        bytes: u64,
+        now_nanos: u64,
+    ) -> Result<()> {
+        let state = self.state_mut(tenant, now_nanos);
+        if !state.realtime_bucket.take(1.0, now_nanos) {
+            return Err(RymeError::Overload(String::from("realtime quota")));
+        }
+        if !state.egress_bucket.take(bytes as f64, now_nanos) {
+            return Err(RymeError::Overload(String::from("egress quota")));
+        }
+        Ok(())
+    }
+
     pub fn connection_open(&mut self, tenant: &str, now_nanos: u64) -> Result<()> {
         let state = self.state_mut(tenant, now_nanos);
         if state.active_connections >= state.quota.max_connections {
@@ -337,6 +353,28 @@ mod tests {
         assert!(registry.admit_realtime("t", 1, 0).is_ok());
         assert!(registry.admit_realtime("t", 1, 0).is_err());
         assert!(registry.admit_realtime("t", 1, 1_000_000_000).is_ok());
+    }
+
+    #[test]
+    fn realtime_delivery_checks_message_and_egress_buckets_together() {
+        let mut registry = QosRegistry::new();
+        registry.set_quota(
+            "t",
+            Quota {
+                read_qps: 1000,
+                write_qps: 1000,
+                egress_bytes_per_sec: 100,
+                realtime_msg_per_sec: 2,
+                max_connections: 10,
+                max_storage_bytes: u64::MAX,
+            },
+            0,
+        );
+
+        assert!(registry.admit_realtime_delivery("t", 60, 0).is_ok());
+        assert!(registry.admit_realtime_delivery("t", 60, 0).is_err());
+        assert!(registry.admit_realtime_delivery("t", 1, 0).is_err());
+        assert!(registry.admit_realtime_delivery("t", 60, 1_000_000_000).is_ok());
     }
 
     #[test]
