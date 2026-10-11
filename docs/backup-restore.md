@@ -48,6 +48,13 @@ Response shape: `{ "commit": <u64>, "files": [<names>] }`. Snapshots are the
 unit that gets shipped to the archive and the unit you copy back for
 single-node disaster recovery.
 
+For a cluster with active range ownership, snapshot creation reads every
+current range owner at one commit timestamp and combines the returned MVCC
+versions into one archive snapshot. It rejects a lagging owner, truncated
+range response, or invalid coverage instead of producing a partial backup.
+Legacy non-`raft-*` ranges are read locally until their ownership is moved
+into the range Raft groups.
+
 Durable managers append an immutable checksummed delta `.sst` segment under
 `<wal-dir>/segments` for each committed write, and write a full sorted base
 segment for each snapshot. Segments carry a sparse key index plus Bloom filter

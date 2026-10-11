@@ -459,6 +459,9 @@ async fn cluster_range_split_replicates_metadata() {
     assert!(response.contains("\"verified\":true"), "range transfer failed: {response}");
     assert!(response.contains("\"leader\":\"raft-"));
     assert!(response.contains("\"source_cleanup\":true"), "source cleanup deferred: {response}");
+    let (status, response) = http_request(http[leader], "POST /v1/snapshots", b"").await;
+    assert_eq!(status, 200, "range snapshot response: {}", String::from_utf8_lossy(&response));
+    assert!(String::from_utf8_lossy(&response).contains("snap-"));
     let (status, response) =
         http_request(http[leader], "POST /v1/backups/restore?target=1", b"").await;
     assert_eq!(status, 503, "range restore response: {}", String::from_utf8_lossy(&response));

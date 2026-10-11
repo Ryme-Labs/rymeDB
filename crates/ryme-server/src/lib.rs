@@ -10633,7 +10633,18 @@ async fn snapshot_backend_files(
     match &state.backend {
         Backend::Single(manager) => Ok(vec![manager.write_snapshot()?]),
         Backend::Cluster(backend) => {
-            Ok(vec![snapshot_manager(backend.node().manager(), &state.data_dir.join("snapshots"))?])
+            let node = backend.node();
+            let owners = node.range_owners();
+            if owners.is_empty() {
+                Ok(vec![snapshot_manager(node.manager(), &state.data_dir.join("snapshots"))?])
+            } else {
+                let snapshot = snapshot_cluster_ranges(node, &owners).await?;
+                Ok(vec![snapshot_engine(
+                    snapshot.0,
+                    snapshot.1,
+                    &state.data_dir.join("snapshots"),
+                )?])
+            }
         }
         Backend::Sharded(shards) => {
             let mut out = Vec::new();
@@ -10679,6 +10690,86 @@ fn snapshot_manager(
     std::fs::rename(&tmp, &path)?;
     std::fs::write(dir.join("latest"), path.file_name().and_then(|n| n.to_str()).unwrap_or(""))?;
     Ok((max, path))
+}
+
+async fn snapshot_cluster_ranges(
+    node: &std::sync::Arc<Node>,
+    owners: &[RangeOwner],
+) -> ryme_error::Result<(ryme_storage::Engine, u64)> {
+    let mut ordered = owners.to_vec();
+    ordered.sort_by(|left, right| left.start.cmp(&right.start));
+    let mut next_start = Vec::new();
+    let mut segments = Vec::new();
+    for range in &ordered {
+        if range.start < next_start {
+            return Err(ryme_error::RymeError::Unavailable(String::from(
+                "range snapshot coverage",
+            )));
+        }
+        if range.start > next_start {
+            segments.push((next_start.clone(), range.start.clone(), None));
+        }
+        segments.push((range.start.clone(), range.end.clone(), Some(range.owner)));
+        next_start = range.end.clone();
+    }
+    if !next_start.is_empty() {
+        segments.push((next_start, Vec::new(), None));
+    }
+
+    let read_ts = node.manager().latest_commit().saturating_sub(1);
+    let mut engine = ryme_storage::Engine::default();
+    for (start, end, owner) in segments {
+        let snapshot = match owner {
+            None => node.snapshot_range(&start, &end, read_ts, 100_000)?,
+            Some(owner) if owner == node.node_id() => {
+                node.snapshot_range(&start, &end, read_ts, 100_000)?
+            }
+            Some(owner) => {
+                node.fetch_range_snapshot(owner, start.clone(), end.clone(), read_ts, 100_000)
+                    .await?
+            }
+        };
+        if snapshot.truncated {
+            return Err(ryme_error::RymeError::Overload(String::from("range snapshot")));
+        }
+        if snapshot.snapshot_ts != read_ts || snapshot.applied_commit < read_ts {
+            return Err(ryme_error::RymeError::Unavailable(String::from(
+                "range owner is behind snapshot",
+            )));
+        }
+        for row in snapshot.rows {
+            let key = ryme_storage::RecordKey::new(
+                &row.tenant,
+                &row.database,
+                &row.table,
+                &row.pk,
+            );
+            for version in row.versions {
+                engine.apply_with_expiry(
+                    key.clone(),
+                    version.commit_ts,
+                    version.value,
+                    version.expires_at,
+                )?;
+            }
+        }
+    }
+    Ok((engine, read_ts))
+}
+
+fn snapshot_engine(
+    engine: ryme_storage::Engine,
+    commit: u64,
+    dir: &std::path::Path,
+) -> ryme_error::Result<(u64, std::path::PathBuf)> {
+    std::fs::create_dir_all(dir)?;
+    let raw = engine.encode_snapshot()?;
+    let path = dir.join(format!("snap-{commit:020}.rsnap"));
+    let tmp = dir.join("snap.tmp");
+    std::fs::write(&tmp, &raw)?;
+    std::fs::rename(&tmp, &path)?;
+    std::fs::write(dir.join("latest"), path.file_name().and_then(|n| n.to_str()).unwrap_or(""))?;
+    Ok((commit, path))
 }
 
 fn archive_target(
