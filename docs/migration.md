@@ -41,6 +41,11 @@ rymedb-cli migrate apply 001-schema "$(cat schema.sql)" --author migration-bot
 rymedb-cli migrate ledger
 ```
 
+Run schema migrations with a platform superuser credential. The main SQL
+catalog is shared across tenant namespaces, so tenant owner/admin credentials
+are intentionally rejected for DDL, role, and privilege statements until
+tenant-scoped catalogs exist.
+
 Split a dump into compatible migration units when one large statement makes
 review or rollback difficult. Duplicate migration ids are rejected by the
 branch-scoped hash chain.

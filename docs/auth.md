@@ -106,6 +106,11 @@ without a matching policy follows default-deny behavior. Inspect policy
 metadata through `pg_catalog.pg_policies`. Complex policy expressions need a
 manual compatibility review.
 
+SQL schema, role, and privilege changes operate on the shared database
+catalog and require a platform `superuser`/`service_role` credential. Tenant
+`owner` and `admin` principals remain tenant-local: they can manage their
+tenant's data and users, but cannot change global DDL or SQL grants.
+
 ## Security baseline
 
 - Bind development listeners to loopback.

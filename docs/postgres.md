@@ -4,6 +4,11 @@ Connect a normal PostgreSQL client to the PostgreSQL wire listener. The
 default is `127.0.0.1:5433`; the database name and user are accepted for
 driver compatibility while tenant/auth behavior is controlled by the server.
 
+Authenticated application and tenant owner/admin sessions cannot use the
+startup `user` value to become `postgres`. Global schema, role, and privilege
+statements require a platform superuser; data statements remain subject to
+the authenticated tenant and SQL/RLS policy.
+
 ```bash
 psql 'postgresql://postgres@127.0.0.1:5433/postgres'
 PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
