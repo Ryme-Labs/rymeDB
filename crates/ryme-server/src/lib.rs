@@ -179,7 +179,11 @@ impl ryme_txn::TxnBackend for Backend {
         table: &'a str,
         limit: usize,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>>
+                + Send
+                + 'a,
+        >,
     > {
         match self {
             Self::Single(manager) => manager.scan_async(txn, tenant, database, table, limit),
@@ -223,7 +227,11 @@ impl ryme_txn::TxnBackend for Backend {
         start_after: &'a [u8],
         limit: usize,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>>
+                + Send
+                + 'a,
+        >,
     > {
         match self {
             Self::Single(manager) => {
@@ -1399,11 +1407,10 @@ impl SharedState {
                             "schema changes require the raft leader",
                         )));
                     }
-                    let payload = serde_json::to_vec(&ClusterMetadata::Schema(next)).map_err(
-                        |error| {
+                    let payload =
+                        serde_json::to_vec(&ClusterMetadata::Schema(next)).map_err(|error| {
                             ryme_error::RymeError::Internal(format!("schema metadata: {error}"))
-                        },
-                    )?;
+                        })?;
                     node.propose_metadata(payload).await.map(|_| ())
                 })
             });
@@ -3858,10 +3865,7 @@ async fn rest_delete(
         if rest_prefer(&headers, "return=minimal") {
             return StatusCode::OK.into_response();
         }
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "commit": 0u64, "deleted": 0u64 })),
-        )
+        return (StatusCode::OK, Json(serde_json::json!({ "commit": 0u64, "deleted": 0u64 })))
             .into_response();
     }
     for key in &keys {
@@ -5597,11 +5601,8 @@ impl Serialize for SupabaseBroadcastDataRef<'_> {
         match self {
             Self::Value(value) => value.serialize(serializer),
             Self::ObjectWithoutEvent(object) => {
-                let entry_count = if object.contains_key("event") {
-                    object.len() - 1
-                } else {
-                    object.len()
-                };
+                let entry_count =
+                    if object.contains_key("event") { object.len() - 1 } else { object.len() };
                 let mut map = serializer.serialize_map(Some(entry_count))?;
                 for (key, value) in *object {
                     if key != "event" {
@@ -5670,10 +5671,8 @@ fn encode_supabase_broadcast_frame(
 ) -> String {
     let (event, data) = match payload {
         serde_json::Value::Object(object) => {
-            let event = object
-                .get("event")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("message");
+            let event =
+                object.get("event").and_then(serde_json::Value::as_str).unwrap_or("message");
             let data = match object.get("payload") {
                 Some(payload) => SupabaseBroadcastDataRef::Value(payload),
                 None => SupabaseBroadcastDataRef::ObjectWithoutEvent(object),
@@ -5762,9 +5761,7 @@ fn supabase_subscription_config(
     Ok(subscriptions)
 }
 
-fn supabase_presence_config(
-    payload: &serde_json::Value,
-) -> Result<Option<String>, String> {
+fn supabase_presence_config(payload: &serde_json::Value) -> Result<Option<String>, String> {
     let Some(value) = payload.pointer("/config/presence") else {
         return Ok(None);
     };
@@ -5779,7 +5776,9 @@ fn supabase_presence_config(
         .and_then(serde_json::Value::as_str)
         .filter(|key| !key.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| format!("ryme-{}", NEXT_SUPABASE_PRESENCE_KEY.fetch_add(1, AtomicOrdering::Relaxed)));
+        .unwrap_or_else(|| {
+            format!("ryme-{}", NEXT_SUPABASE_PRESENCE_KEY.fetch_add(1, AtomicOrdering::Relaxed))
+        });
     if key.len() > 256 {
         return Err(String::from("presence key"));
     }
@@ -5802,9 +5801,7 @@ fn supabase_presence_meta(
     serde_json::Value::Object(meta)
 }
 
-fn supabase_presence_state(
-    members: &[ryme_realtime::PresenceMember],
-) -> serde_json::Value {
+fn supabase_presence_state(members: &[ryme_realtime::PresenceMember]) -> serde_json::Value {
     let mut state = serde_json::Map::new();
     for member in members {
         state.insert(
@@ -9559,9 +9556,7 @@ async fn range_transfer(
         range
     };
     let source_node = range.leader.strip_prefix("raft-").and_then(|id| id.parse::<usize>().ok());
-    if request.target == node.node_id()
-        || range.leader == format!("raft-{}", request.target)
-    {
+    if request.target == node.node_id() || range.leader == format!("raft-{}", request.target) {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("target")));
     }
     let members = node.current_config().await;
@@ -9644,11 +9639,8 @@ async fn range_transfer(
         .iter()
         .filter_map(|replica| replica.strip_prefix("raft-")?.parse().ok())
         .collect();
-    let cleanup_peers: Vec<usize> = members
-        .iter()
-        .map(|member| member.id)
-        .filter(|peer| !retained.contains(peer))
-        .collect();
+    let cleanup_peers: Vec<usize> =
+        members.iter().map(|member| member.id).filter(|peer| !retained.contains(peer)).collect();
     let mut source_cleanup = true;
     let mut source_rows_purged = 0u64;
     for peer in cleanup_peers {
@@ -11266,6 +11258,56 @@ async fn snapshot_backend_files(
     }
 }
 
+#[cfg(unix)]
+fn sync_snapshot_directory(path: &std::path::Path) -> ryme_error::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_snapshot_directory(_path: &std::path::Path) -> ryme_error::Result<()> {
+    Ok(())
+}
+
+static NEXT_SNAPSHOT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+fn write_server_snapshot(
+    dir: &std::path::Path,
+    commit: u64,
+    raw: &[u8],
+) -> ryme_error::Result<std::path::PathBuf> {
+    let name = format!("snap-{commit:020}.rsnap");
+    let path = dir.join(&name);
+    let temporary = dir.join(format!(
+        ".{name}.{}.tmp",
+        NEXT_SNAPSHOT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+    ));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(raw)?;
+        file.sync_data()?;
+    }
+    std::fs::rename(temporary, &path)?;
+    sync_snapshot_directory(dir)?;
+    Ok(path)
+}
+
+fn publish_server_snapshot_pointer(dir: &std::path::Path, name: &str) -> ryme_error::Result<()> {
+    let temporary = dir.join(format!(
+        ".latest.{}.tmp",
+        NEXT_SNAPSHOT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+    ));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(name.as_bytes())?;
+        file.sync_data()?;
+    }
+    std::fs::rename(temporary, dir.join("latest"))?;
+    sync_snapshot_directory(dir)
+}
+
 fn snapshot_manager(
     manager: &TxnManager,
     dir: &std::path::Path,
@@ -11274,11 +11316,12 @@ fn snapshot_manager(
     let raw = manager.encode_snapshot()?;
     let snapshot = ryme_storage::Engine::decode_snapshot(&raw)?;
     let max = snapshot.max_commit_ts();
-    let path = dir.join(format!("snap-{max:020}.rsnap"));
-    let tmp = dir.join("snap.tmp");
-    std::fs::write(&tmp, &raw)?;
-    std::fs::rename(&tmp, &path)?;
-    std::fs::write(dir.join("latest"), path.file_name().and_then(|n| n.to_str()).unwrap_or(""))?;
+    let path = write_server_snapshot(dir, max, &raw)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ryme_error::RymeError::Internal(String::from("snapshot name")))?;
+    publish_server_snapshot_pointer(dir, name)?;
     Ok((max, path))
 }
 
@@ -11328,12 +11371,7 @@ async fn snapshot_cluster_ranges(
             )));
         }
         for row in snapshot.rows {
-            let key = ryme_storage::RecordKey::new(
-                &row.tenant,
-                &row.database,
-                &row.table,
-                &row.pk,
-            );
+            let key = ryme_storage::RecordKey::new(&row.tenant, &row.database, &row.table, &row.pk);
             for version in row.versions {
                 engine.apply_with_expiry(
                     key.clone(),
@@ -11354,11 +11392,12 @@ fn snapshot_engine(
 ) -> ryme_error::Result<(u64, std::path::PathBuf)> {
     std::fs::create_dir_all(dir)?;
     let raw = engine.encode_snapshot()?;
-    let path = dir.join(format!("snap-{commit:020}.rsnap"));
-    let tmp = dir.join("snap.tmp");
-    std::fs::write(&tmp, &raw)?;
-    std::fs::rename(&tmp, &path)?;
-    std::fs::write(dir.join("latest"), path.file_name().and_then(|n| n.to_str()).unwrap_or(""))?;
+    let path = write_server_snapshot(dir, commit, &raw)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ryme_error::RymeError::Internal(String::from("snapshot name")))?;
+    publish_server_snapshot_pointer(dir, name)?;
     Ok((commit, path))
 }
 
