@@ -24,6 +24,13 @@ pub struct Principal {
 }
 
 impl Principal {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.is_empty() || self.id.len() > MAX_PRINCIPAL_ID_LEN {
+            return Err(RymeError::InvalidArgument(String::from("principal id")));
+        }
+        validate_tenant(&self.tenant)
+    }
+
     pub fn can_platform_admin(&self) -> bool {
         self.roles.contains(&Role::Superuser)
     }
@@ -203,6 +210,7 @@ impl ApiKeyStore {
     }
 
     pub fn insert(&self, api_key: String, principal: Principal) -> Result<()> {
+        principal.validate()?;
         let digest = Self::digest(&api_key);
         let mut guard =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
@@ -241,6 +249,9 @@ impl ApiKeyStore {
     pub fn from_snapshot(snapshot: HashMap<String, Principal>) -> Result<Self> {
         if snapshot.len() > MAX_API_KEYS {
             return Err(RymeError::Corrupt(String::from("api key snapshot")));
+        }
+        if snapshot.values().any(|principal| principal.validate().is_err()) {
+            return Err(RymeError::Corrupt(String::from("api key principal")));
         }
         Ok(Self { inner: Arc::new(RwLock::new(snapshot)) })
     }
@@ -292,6 +303,13 @@ pub struct JwtVerifier {
 const MAX_JWT_TOKEN_LEN: usize = 16 * 1024;
 const MAX_PRINCIPAL_ID_LEN: usize = 256;
 const MAX_TENANT_LEN: usize = 256;
+
+fn validate_tenant(tenant: &str) -> Result<()> {
+    if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN {
+        return Err(RymeError::InvalidArgument(String::from("tenant")));
+    }
+    Ok(())
+}
 
 impl JwtVerifier {
     pub fn new(secret: Vec<u8>) -> Self {
@@ -534,6 +552,7 @@ impl RefreshTokenStore {
     }
 
     pub fn issue(&self, principal: Principal, now_secs: u64) -> Result<String> {
+        principal.validate()?;
         let raw = base64_url_encode(&random_bytes(32));
         let digest = Self::digest(&raw);
         let mut sessions =
@@ -609,6 +628,9 @@ impl RefreshTokenStore {
     pub fn from_snapshot(snapshot: HashMap<String, RefreshTokenRecord>) -> Result<Self> {
         if snapshot.len() > MAX_REFRESH_SESSIONS {
             return Err(RymeError::Corrupt(String::from("refresh token snapshot")));
+        }
+        if snapshot.values().any(|record| record.principal.validate().is_err()) {
+            return Err(RymeError::Corrupt(String::from("refresh token principal")));
         }
         Ok(Self { inner: Arc::new(RwLock::new(snapshot)) })
     }
@@ -1006,6 +1028,7 @@ impl CredentialStore {
         {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
+        validate_tenant(&tenant)?;
         if self.users.contains_key(&id) {
             return Err(RymeError::Conflict(String::from("user")));
         }
@@ -1095,6 +1118,11 @@ impl CredentialStore {
         if users.len() > MAX_USERS {
             return Err(RymeError::Corrupt(String::from("user snapshot")));
         }
+        if users.keys().any(|id| id.is_empty() || id.len() > MAX_USER_LEN)
+            || users.values().any(|user| validate_tenant(&user.tenant).is_err())
+        {
+            return Err(RymeError::Corrupt(String::from("user snapshot")));
+        }
         Ok(Self { users })
     }
 }
@@ -1122,6 +1150,30 @@ mod tests {
         assert!(store.remove("secret-key"));
         assert!(store.authenticate("secret-key").is_err());
         assert!(store.owner_of("secret-key").is_none());
+    }
+
+    #[test]
+    fn auth_stores_reject_invalid_principal_tenants() {
+        let principal =
+            Principal { id: String::from("u"), tenant: String::new(), roles: HashSet::new() };
+        assert!(principal.validate().is_err());
+        assert!(ApiKeyStore::new().insert(String::from("key"), principal.clone()).is_err());
+        assert!(RefreshTokenStore::new().issue(principal, 100).is_err());
+
+        let mut users = HashMap::new();
+        users.insert(
+            String::from("u"),
+            StoredUser {
+                tenant: String::new(),
+                roles: HashSet::new(),
+                password: None,
+                otp_secret: None,
+            },
+        );
+        assert!(matches!(
+            CredentialStore::from_snapshot(users),
+            Err(RymeError::Corrupt(message)) if message == "user snapshot"
+        ));
     }
 
     #[test]
@@ -1750,6 +1802,22 @@ mod tests {
         assert!(store.verify_otp("ada", "000000", 1_700_000_000).is_err());
         assert!(store.otp_enrolled("ada"));
         assert!(!store.otp_enrolled("ghost"));
+    }
+
+    #[test]
+    fn credential_registration_requires_bounded_tenant() {
+        let mut store = CredentialStore::new();
+        assert!(store
+            .register_password(String::from("ada"), String::new(), "correct-horse", HashSet::new())
+            .is_err());
+        assert!(store
+            .register_password(
+                String::from("ada"),
+                "t".repeat(MAX_TENANT_LEN + 1),
+                "correct-horse",
+                HashSet::new(),
+            )
+            .is_err());
     }
 
     #[test]
