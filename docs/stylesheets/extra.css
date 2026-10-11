@@ -33,6 +33,15 @@
   margin-top: 2em;
 }
 
+.docs-banner {
+  display: block;
+  width: 100%;
+  max-height: 18rem;
+  margin: 1.5rem 0 2rem;
+  border-radius: 0.75rem;
+  object-fit: cover;
+}
+
 .md-content table:not([class]) {
   display: table;
   width: 100%;
@@ -40,6 +49,14 @@
 
 .md-content table:not([class]) th {
   background: color-mix(in srgb, var(--md-primary-fg-color) 10%, transparent);
+}
+
+.md-typeset .highlight {
+  overflow-x: auto;
+}
+
+.md-typeset .highlight code {
+  white-space: pre;
 }
 
 .api-reference {

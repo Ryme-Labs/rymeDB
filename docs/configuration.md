@@ -77,50 +77,49 @@ bucket; heartbeat and ping/pong control frames are not counted.
 
 ## Auth
 
-The server seeds one API key from `RYME_API_KEY`, defaulting to
-`ryme-dev-key` when unset. Send it as `Authorization: Bearer <key>` or the
-`x-api-key` header (streams also accept `?api_key=`). JWT verification applies
-when configured; otherwise an unknown Bearer token is `401`. Mutating
-endpoints additionally require a write-capable principal (`403` without it).
+Authentication is selected by the credential presented by the client. Keep
+the data directory private and use TLS for non-loopback deployments.
 
-Set `RYME_PG_PASSWORD` to enable PostgreSQL wire authentication. Clients use
-the normal PostgreSQL `user` and `password` startup fields; the configured
-password selects the default tenant, while an API key or JWT supplied as the
-password selects its authenticated tenant. When unset, the embedded wire
-gateway retains trust-mode behavior for local development.
+### HTTP, REST, and WebSocket
 
-Set `RYME_RESP_PASSWORD` to enable RESP `AUTH` and the same tenant selection
-behavior. Without it, RESP remains in trust mode for local development and
-returns the normal compatibility error for `AUTH`.
+| Setting or credential | Default | Behavior |
+| --- | --- | --- |
+| `RYME_API_KEY` | `ryme-dev-key` | Seeds the local API key. Send it as `Authorization: Bearer <key>` or `x-api-key`; streams also accept `?api_key=`. |
+| Unknown bearer token | — | Returns `401` when JWT verification is not configured or the token is invalid. |
+| Mutating request | — | Requires a write-capable principal; otherwise returns `403`. |
 
-Both mechanisms use the protocol’s password exchange; use the TLS listeners
-for non-loopback deployments.
+### PostgreSQL and RESP
 
-For OIDC/JWT verification, set `RYME_JWT_SECRET` for HS256 or set
-`RYME_JWT_JWKS_FILE` to a JSON JWKS file containing RSA signing keys for
-RS256. The verifier selects a matching `kid` from the token, which permits key
-rotation; `RYME_JWT_JWK_KID` can restrict the mounted set to one key. Set
-`RYME_JWT_ISSUER` and `RYME_JWT_AUDIENCE` together to enforce those claims.
-Use `RYME_JWT_JWKS_URL` instead when the provider exposes a reachable JWKS
-endpoint; the file setting takes precedence and the URL is fetched with a
-10-second timeout during startup.
-JWT principals accept both rymeDB claims (`tenant`, `roles`) and common
-Supabase-style claims: `tenant_id`, scalar `role` values such as `anon`,
-`authenticated`, and `service_role`, plus `app_metadata.roles`. Role names are
-case-insensitive; `anon` maps to read-only access, `authenticated` to read/write
-access, and `service_role` to the owner role. Expiration, not-before, and
-future issued-at timestamps use the verifier's configured clock-skew leeway.
-The `/v1/auth/oidc/token` exchange can use the same mounted file, or an
-explicit `RYME_OIDC_JWKS_FILE`/`RYME_OIDC_JWKS_URL` and optional
-`RYME_OIDC_JWK_KID`; its OIDC issuer and audience are taken from
-`RYME_OIDC_ISSUER` and `RYME_OIDC_AUDIENCE`.
+| Environment variable | Protocol | Behavior when set | Behavior when unset |
+| --- | --- | --- | --- |
+| `RYME_PG_PASSWORD` | PostgreSQL wire | Enables password authentication. The configured password selects the default tenant; an API key or JWT used as the password selects its tenant. | Trust mode for local development. |
+| `RYME_RESP_PASSWORD` | RESP | Enables `AUTH` with the same tenant selection rules. | Trust mode; `AUTH` returns the compatibility error. |
 
-Application-auth state is stored atomically in `data_dir/auth.json`. It contains
-password hashes, OTP/passkey metadata, API-key digests, and refresh-token
-digests; raw API keys, passwords, refresh tokens, and WebAuthn challenges are
-not written to that file. Keep the data directory private and back it up with
-the same controls as the database WAL.
+Both protocols use their normal password exchange. Configure the TLS listener
+before exposing either protocol outside the local host.
 
-SQL table and index metadata is stored atomically in `data_dir/schema.json`.
-The server rebuilds secondary-index entries from committed rows during startup;
-the file contains definitions only, not application data.
+### JWT and OIDC
+
+| Setting | Purpose |
+| --- | --- |
+| `RYME_JWT_SECRET` | Verify HS256 tokens. |
+| `RYME_JWT_JWKS_FILE` | Verify RS256 tokens from a mounted JSON JWKS file. The file takes precedence over the URL. |
+| `RYME_JWT_JWKS_URL` | Fetch a reachable JWKS endpoint during startup with a 10-second timeout. |
+| `RYME_JWT_JWK_KID` | Restrict verification to one mounted key id. |
+| `RYME_JWT_ISSUER` + `RYME_JWT_AUDIENCE` | Enforce the matching token claims when both are set. |
+| `RYME_OIDC_JWKS_FILE` / `RYME_OIDC_JWKS_URL` | Override the JWKS source used by `/v1/auth/oidc/token`. |
+| `RYME_OIDC_JWK_KID`, `RYME_OIDC_ISSUER`, `RYME_OIDC_AUDIENCE` | Restrict the OIDC key and validate its issuer and audience. |
+
+JWT principals accept rymeDB claims (`tenant`, `roles`) and common Supabase
+claims (`tenant_id`, `role`, and `app_metadata.roles`). Role names are
+case-insensitive: `anon` is read-only, `authenticated` is read/write, and
+`service_role` is the owner role. Expiration, not-before, and future issued-at
+checks use the configured clock-skew leeway.
+
+### On-disk auth state
+
+`data_dir/auth.json` is written atomically and stores password hashes,
+OTP/passkey metadata, API-key digests, and refresh-token digests. Raw secrets,
+refresh tokens, and WebAuthn challenges are never written there. SQL table and
+index definitions are stored separately in `data_dir/schema.json`; secondary
+indexes are rebuilt from committed rows at startup.

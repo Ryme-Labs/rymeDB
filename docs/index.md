@@ -8,6 +8,8 @@ MVCC transactions, branch-local schemas, durable realtime streams,
 PostgreSQL-compatible access, REST, WebSockets, authentication, and
 horizontal range placement.
 
+<img class="docs-banner" src="images/rymedb-banner.png" alt="rymeDB">
+
 ## Start quickly
 
 Run a local server from the repository:

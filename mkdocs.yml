@@ -8,6 +8,8 @@ edit_uri: edit/main/docs/
 theme:
   name: material
   language: en
+  logo: images/rymedb-transparent.png
+  favicon: images/rymedb-transparent.png
   features:
     - navigation.instant
     - navigation.tracking
