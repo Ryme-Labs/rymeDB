@@ -1089,6 +1089,15 @@ impl TxnManager {
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        if !self
+            .inner
+            .pending
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("pending commits")))?
+            .contains_key(&commit_ts)
+        {
+            return Err(RymeError::Conflict(String::from("commit invalidated")));
+        }
         self.check_locked(&txn, commit_ts)?;
         match self.apply_locked(commit_ts, &txn.writes) {
             Ok(()) => Ok(commit_ts),
@@ -1527,6 +1536,11 @@ impl TxnManager {
                 .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
             committed.clear();
         }
+        self.inner
+            .pending
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("pending commits")))?
+            .clear();
         let visible_ts = max.saturating_add(1);
         self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
         self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
@@ -1563,6 +1577,11 @@ impl TxnManager {
             .committed
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?
+            .clear();
+        self.inner
+            .pending
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("pending commits")))?
             .clear();
         let visible_ts = max.saturating_add(1);
         self.inner.clock.store(visible_ts, Ordering::SeqCst);
@@ -2819,6 +2838,38 @@ mod tests {
         let mut retry = manager.begin();
         manager.put(&mut retry, key_b, b"retry".to_vec());
         assert!(manager.commit(retry).is_ok());
+    }
+
+    #[tokio::test]
+    async fn restore_invalidates_pending_replicated_commit() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "restore", b"k");
+        let snapshot = manager.encode_snapshot().unwrap();
+        let mut txn = manager.begin();
+        manager.put(&mut txn, key.clone(), b"must-not-return".to_vec());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .commit_with(txn, move |_, _| async move {
+                        started_tx
+                            .send(())
+                            .map_err(|_| RymeError::Internal(String::from("start")))?;
+                        release_rx.await.map_err(|_| RymeError::Internal(String::from("release")))
+                    })
+                    .await
+            }
+        });
+        started_rx.await.unwrap();
+        manager.restore_snapshot(&snapshot).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(matches!(task.await.unwrap(), Err(RymeError::Conflict(_))));
+
+        let mut probe = manager.begin();
+        assert_eq!(manager.get(&mut probe, &key).unwrap(), None);
     }
 
     #[test]
