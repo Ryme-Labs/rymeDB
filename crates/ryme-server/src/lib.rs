@@ -3197,6 +3197,15 @@ fn branch_executor(
     }
 }
 
+fn branch_executor_for_principal(
+    state: &SharedState,
+    headers: &HeaderMap,
+    principal: &Principal,
+) -> ryme_error::Result<Executor<BranchStorage>> {
+    branch_executor(state, headers, &principal.tenant)
+        .map(|executor| executor.with_role(principal.sql_role().to_string()))
+}
+
 fn range_routing_key(table: &str, key: &[u8]) -> Vec<u8> {
     let mut routing = Vec::with_capacity(table.len() + key.len() + 1);
     routing.extend_from_slice(table.as_bytes());
@@ -4190,7 +4199,7 @@ async fn sql_copy(
         .into_iter()
         .map(|row| (row.key.into_bytes(), row.value.into_bytes()))
         .collect();
-    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+    let executor = match branch_executor_for_principal(&state, &headers, &principal) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -4240,7 +4249,7 @@ async fn sql_explain(
         Some(params) => bind(&request.sql, &params),
         None => request.sql,
     };
-    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+    let executor = match branch_executor_for_principal(&state, &headers, &principal) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -4444,7 +4453,7 @@ async fn migrate_apply(
         Ok(None) => String::from("main"),
         Err(e) => return error_response(e),
     };
-    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+    let executor = match branch_executor_for_principal(&state, &headers, &principal) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -7660,7 +7669,7 @@ async fn sql_exec(
     let table_name = statement.table().to_string();
     let write_statement = statement.is_write();
     let range_keys = if write_statement { sql_range_keys(&statement) } else { None };
-    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+    let executor = match branch_executor_for_principal(&state, &headers, &principal) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -11643,6 +11652,9 @@ mod realtime_policy_tests {
             "GRANT SELECT ON TABLE messages TO app_reader",
             "REVOKE SELECT ON TABLE messages FROM app_reader",
             "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_reader",
+            "CREATE TABLE public.messages (id TEXT PRIMARY KEY)",
+            "CREATE INDEX messages_id_idx ON public.messages (id)",
+            "ALTER TABLE public.messages ADD COLUMN body TEXT",
         ] {
             assert!(ryme_sql::parse(sql).unwrap().requires_admin(), "{sql}");
         }

@@ -42,6 +42,18 @@ impl Principal {
             || self.roles.contains(&Role::Admin)
     }
 
+    pub fn sql_role(&self) -> &'static str {
+        if self.can_admin() {
+            "postgres"
+        } else if self.can_write() {
+            "authenticated"
+        } else if self.roles.contains(&Role::ReadOnly) {
+            "anon"
+        } else {
+            "realtime_subscriber"
+        }
+    }
+
     pub fn can_read(&self) -> bool {
         self.can_write()
             || self.roles.contains(&Role::ReadOnly)

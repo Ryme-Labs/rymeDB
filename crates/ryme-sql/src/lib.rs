@@ -939,7 +939,7 @@ impl Statement {
             | Self::Distinct { statement, .. }
             | Self::Explain { inner: statement, .. } => statement.requires_admin(),
             Self::Union { left, right, .. } => left.requires_admin() || right.requires_admin(),
-            _ => false,
+            _ => self.is_schema_change(),
         }
     }
 

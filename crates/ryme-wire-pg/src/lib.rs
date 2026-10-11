@@ -702,7 +702,7 @@ where
         }
     };
     let tenant = principal.tenant.clone();
-    let role = sql_role_for_principal(&principal);
+    let role = principal.sql_role().to_string();
     let executor =
         Arc::new((*executor).clone().with_tenant(tenant.clone()).with_role(role.clone()));
     let mut limits = limits.with_tenant(tenant);
@@ -710,18 +710,6 @@ where
     limits.write_allowed = principal.can_write();
     limits.admin_allowed = principal.can_admin();
     Ok((executor, limits, role))
-}
-
-fn sql_role_for_principal(principal: &Principal) -> String {
-    if principal.can_admin() {
-        String::from("postgres")
-    } else if principal.can_write() {
-        String::from("authenticated")
-    } else if principal.roles.contains(&Role::ReadOnly) {
-        String::from("anon")
-    } else {
-        String::from("realtime_subscriber")
-    }
 }
 
 async fn read_client_message<S>(socket: &mut S) -> Result<(u8, Vec<u8>)>
@@ -4564,21 +4552,21 @@ mod tests {
             tenant: String::from("tenant"),
             roles: [Role::ReadWrite].into_iter().collect(),
         };
-        assert_eq!(sql_role_for_principal(&read_write), "authenticated");
+        assert_eq!(read_write.sql_role(), "authenticated");
 
         let read_only = Principal {
             id: String::from("postgres"),
             tenant: String::from("tenant"),
             roles: [Role::ReadOnly].into_iter().collect(),
         };
-        assert_eq!(sql_role_for_principal(&read_only), "anon");
+        assert_eq!(read_only.sql_role(), "anon");
 
         let admin = Principal {
             id: String::from("untrusted-id"),
             tenant: String::from("tenant"),
             roles: [Role::Admin].into_iter().collect(),
         };
-        assert_eq!(sql_role_for_principal(&admin), "postgres");
+        assert_eq!(admin.sql_role(), "postgres");
     }
 
     #[test]
