@@ -1279,8 +1279,32 @@ impl SharedState {
         gateway.set_read_only(config.read_only);
         let schema_path = config.data_dir.join("schema.json");
         let schema_snapshot = load_schema_snapshot(&schema_path)?;
+        let schema_node = match &backend {
+            Backend::Cluster(cluster) => Some(cluster.node().clone()),
+            Backend::Hybrid(hybrid) => Some(hybrid.raft().node().clone()),
+            Backend::Single(_) | Backend::Sharded(_) => None,
+        };
         let mut executor = Executor::with_backend(tenant.clone(), database.clone(), storage)
             .with_realtime(realtime.clone());
+        if let Some(node) = schema_node {
+            let hook: ryme_sql::SchemaHook = Arc::new(move |_previous, next| {
+                let node = node.clone();
+                Box::pin(async move {
+                    if !node.is_leader().await {
+                        return Err(ryme_error::RymeError::Unavailable(String::from(
+                            "schema changes require the raft leader",
+                        )));
+                    }
+                    let payload = serde_json::to_vec(&ClusterMetadata::Schema(next)).map_err(
+                        |error| {
+                            ryme_error::RymeError::Internal(format!("schema metadata: {error}"))
+                        },
+                    )?;
+                    node.propose_metadata(payload).await.map(|_| ())
+                })
+            });
+            executor = executor.with_schema_hook(hook);
+        }
         executor.restore_schema_snapshot(schema_snapshot)?;
         executor.set_schema_path(schema_path);
         executor.set_rls_tables(config.rls_tables.clone());
@@ -8360,6 +8384,12 @@ async fn range_list(
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "payload")]
+enum ClusterMetadata {
+    Schema(ryme_sql::SchemaSnapshot),
+}
+
 fn install_cluster_range_replication(
     state: &SharedState,
     node: &std::sync::Arc<Node>,
@@ -8372,7 +8402,7 @@ fn install_cluster_range_replication(
     node.set_range_owners(range_owners(&ranges));
     let state = state.clone();
     let hook: ryme_raft::net::MetadataHook =
-        Arc::new(move |payload| apply_replicated_ranges(&state, payload));
+        Arc::new(move |payload| apply_cluster_metadata(&state, payload));
     node.set_metadata_hook(hook)
 }
 
@@ -8684,6 +8714,20 @@ fn apply_replicated_topic(state: &SharedState, payload: &[u8]) -> ryme_error::Re
             event.retention,
         )
         .and_then(|_| state.persist_durable_topics())
+}
+
+fn apply_cluster_metadata(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
+    if serde_json::from_slice::<Vec<Range>>(payload).is_ok() {
+        return apply_replicated_ranges(state, payload);
+    }
+    let event: ClusterMetadata = serde_json::from_slice(payload)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("cluster metadata: {error}")))?;
+    match event {
+        ClusterMetadata::Schema(snapshot) => {
+            state.executor.restore_schema_snapshot(snapshot.clone())?;
+            ryme_sql::persist_schema_snapshot(&state.data_dir.join("schema.json"), &snapshot)
+        }
+    }
 }
 
 fn apply_replicated_ranges(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {

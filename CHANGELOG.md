@@ -1,5 +1,8 @@
 # Changelog
 
+- Main-branch autocommit schema changes in clustered deployments now coordinate
+  through tagged Raft metadata, with local schema rollback if quorum coordination
+  fails. Branch schemas remain isolated.
 - HTTP and HTTPS request-body limits are now configurable through
   `http_max_body_bytes`, with validation from 1 byte through 64 MiB.
 - JWT auth now accepts case-insensitive roles, Supabase-style scalar `role`

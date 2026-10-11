@@ -4,7 +4,9 @@ use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -795,6 +797,12 @@ pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result
     Ok(())
 }
 
+pub type SchemaHook = Arc<
+    dyn Fn(SchemaSnapshot, SchemaSnapshot) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 impl Statement {
     pub fn is_write(&self) -> bool {
         if let Statement::Explain { inner, analyze, .. } = self {
@@ -844,6 +852,49 @@ impl Statement {
                 operation: SequenceOperation::Nextval | SequenceOperation::Setval,
                 ..
             }
+        )
+    }
+
+    pub fn is_schema_change(&self) -> bool {
+        if let Statement::Returning { statement, .. } = self {
+            return statement.is_schema_change();
+        }
+        if let Statement::Explain { inner, analyze, .. } = self {
+            return *analyze && inner.is_schema_change();
+        }
+        matches!(
+            self,
+            Statement::CreateSchema { .. }
+                | Statement::CreateExtension { .. }
+                | Statement::CreateSequence { .. }
+                | Statement::CreateFunction { .. }
+                | Statement::CreateView { .. }
+                | Statement::CreateMaterializedView { .. }
+                | Statement::CreateTrigger { .. }
+                | Statement::CreatePolicy { .. }
+                | Statement::DropPolicy { .. }
+                | Statement::AlterTableRls { .. }
+                | Statement::CreateTable { .. }
+                | Statement::DropTable { .. }
+                | Statement::DropIndex { .. }
+                | Statement::DropTrigger { .. }
+                | Statement::DropView { .. }
+                | Statement::DropMaterializedView { .. }
+                | Statement::RefreshMaterializedView { .. }
+                | Statement::DropSequence { .. }
+                | Statement::AlterSequence { .. }
+                | Statement::CreateRole { .. }
+                | Statement::DropRole { .. }
+                | Statement::PrivilegeChange { .. }
+                | Statement::DefaultPrivilegeChange { .. }
+                | Statement::TruncateTable { .. }
+                | Statement::AlterTableDropConstraint { .. }
+                | Statement::AlterTableAddColumn { .. }
+                | Statement::AlterTableAddConstraint { .. }
+                | Statement::AlterTableDropColumn { .. }
+                | Statement::AlterTableRenameColumn { .. }
+                | Statement::AlterTableColumn { .. }
+                | Statement::CreateIndex { .. }
         )
     }
 }
@@ -6667,7 +6718,7 @@ fn returning_field_value(field: &ReturningField, pk: &[u8], value: &[u8]) -> Vec
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Executor<B = TxnManager> {
     tenant: String,
     database: String,
@@ -6697,7 +6748,24 @@ pub struct Executor<B = TxnManager> {
     schema_path: Arc<Mutex<Option<PathBuf>>>,
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
+    schema_hook: Option<SchemaHook>,
     sequence_next: Arc<Mutex<BTreeMap<String, u64>>>,
+}
+
+impl<B: std::fmt::Debug> std::fmt::Debug for Executor<B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Executor")
+            .field("tenant", &self.tenant)
+            .field("database", &self.database)
+            .field("branch", &self.branch)
+            .field("manager", &self.manager)
+            .field("read_ts", &self.read_ts)
+            .field("read_only", &self.read_only)
+            .field("isolation", &self.isolation)
+            .field("schema_hook_configured", &self.schema_hook.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6737,6 +6805,7 @@ impl Executor<TxnManager> {
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -6771,6 +6840,7 @@ impl Executor<TxnManager> {
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -6810,12 +6880,18 @@ where
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
     pub fn with_realtime(mut self, realtime: Realtime) -> Self {
         self.realtime = Some(realtime);
+        self
+    }
+
+    pub fn with_schema_hook(mut self, hook: SchemaHook) -> Self {
+        self.schema_hook = Some(hook);
         self
     }
 
@@ -7539,6 +7615,7 @@ where
             schema_path: self.schema_path,
             schema_persist_lock: self.schema_persist_lock,
             schema_dirty: self.schema_dirty,
+            schema_hook: self.schema_hook,
             sequence_next: self.sequence_next,
         }
     }
@@ -7914,6 +7991,7 @@ where
             schema_path: Arc::new(Mutex::new(None)),
             schema_persist_lock: Arc::new(Mutex::new(())),
             schema_dirty: Arc::new(AtomicBool::new(false)),
+            schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -13155,6 +13233,8 @@ where
         statement: Statement,
         isolation: Isolation,
     ) -> Result<QueryResult> {
+        let schema_statement = statement.is_schema_change();
+        let previous_schema = schema_statement.then(|| self.schema_snapshot());
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
@@ -13209,39 +13289,6 @@ where
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
         }
-        let schema_statement = matches!(
-            &statement,
-            Statement::CreateSchema { .. }
-                | Statement::CreateExtension { .. }
-                | Statement::CreateSequence { .. }
-                | Statement::CreateRole { .. }
-                | Statement::CreateFunction { .. }
-                | Statement::CreateView { .. }
-                | Statement::CreateMaterializedView { .. }
-                | Statement::CreateTrigger { .. }
-                | Statement::CreatePolicy { .. }
-                | Statement::DropPolicy { .. }
-                | Statement::DropTrigger { .. }
-                | Statement::DropView { .. }
-                | Statement::DropMaterializedView { .. }
-                | Statement::RefreshMaterializedView { .. }
-                | Statement::DropSequence { .. }
-                | Statement::AlterSequence { .. }
-                | Statement::DropRole { .. }
-                | Statement::PrivilegeChange { .. }
-                | Statement::DefaultPrivilegeChange { .. }
-                | Statement::AlterTableRls { .. }
-                | Statement::CreateTable { .. }
-                | Statement::DropTable { .. }
-                | Statement::DropIndex { .. }
-                | Statement::AlterTableDropConstraint { .. }
-                | Statement::AlterTableAddColumn { .. }
-                | Statement::AlterTableAddConstraint { .. }
-                | Statement::AlterTableDropColumn { .. }
-                | Statement::AlterTableRenameColumn { .. }
-                | Statement::AlterTableColumn { .. }
-                | Statement::CreateIndex { .. }
-        );
         let sequence_state_statement = matches!(
             &statement,
             Statement::SequenceValue {
@@ -13255,6 +13302,18 @@ where
             }
             statement => self.execute_with_base(statement, isolation).await,
         };
+        if result.is_ok() && schema_statement {
+            if let (Some(hook), Some(previous)) = (self.schema_hook.clone(), previous_schema) {
+                let next = self.schema_snapshot();
+                if next != previous {
+                    if let Err(error) = hook(previous.clone(), next).await {
+                        self.restore_schema_snapshot(previous)?;
+                        self.persist_schema_if_configured()?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
         if result.is_ok() && (schema_statement || sequence_state_statement) {
             self.persist_schema_if_configured()?;
         }
@@ -14328,6 +14387,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn schema_hook_coordinates_autocommit_ddl_and_rolls_back_on_failure() {
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let captured = snapshots.clone();
+        let executor = Executor::new(String::from("tenant"), String::from("database"))
+            .with_schema_hook(Arc::new(move |before, after| {
+                let captured = captured.clone();
+                Box::pin(async move {
+                    assert_ne!(before, after);
+                    captured.lock().unwrap().push(after);
+                    Ok(())
+                })
+            }));
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(snapshots.lock().unwrap().len(), 1);
+        assert_eq!(executor.catalog_tables(), vec![String::from("messages")]);
+
+        let failing = Executor::new(String::from("tenant"), String::from("database"))
+            .with_schema_hook(Arc::new(|_, _| {
+                Box::pin(async { Err(RymeError::Unavailable(String::from("schema quorum"))) })
+            }));
+        assert!(matches!(
+            failing
+                .execute(parse("CREATE TABLE rejected (id TEXT PRIMARY KEY)").unwrap())
+                .await,
+            Err(RymeError::Unavailable(message)) if message == "schema quorum"
+        ));
+        assert!(failing.catalog_tables().is_empty());
+    }
+
+    #[test]
+    fn explain_without_analyze_does_not_coordinate_schema_ddl() {
+        assert!(!parse("EXPLAIN CREATE TABLE messages (id TEXT PRIMARY KEY)")
+            .unwrap()
+            .is_schema_change());
+        assert!(parse("EXPLAIN ANALYZE CREATE TABLE messages (id TEXT PRIMARY KEY)")
+            .unwrap()
+            .is_schema_change());
+    }
 
     #[test]
     fn write_classification() {

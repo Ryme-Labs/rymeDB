@@ -313,9 +313,14 @@ UPDATE FROM, DELETE USING, and INSERT SELECT now use those pages before
 staging their writes. Foreign-key checks and cascading delete/update actions
 now use the same owner-routed point-read and scan paths, stage all dependent
 changes in the transaction, and commit through the existing distributed
-coordinator. Schema-dependent views and cross-range schema-change
-coordination remain separate work, so this is not yet complete owner-aware
-transaction routing.
+coordinator. Schema-dependent views remain separate work. Main-branch
+autocommit schema changes now use a tagged global-Raft metadata entry: the
+leader must coordinate the new schema snapshot through quorum before the
+request succeeds, and every follower restores and persists that same snapshot
+before applying later requests. A failed proposal restores the leader's
+previous schema locally. Branch executors clear this hook and keep branch DDL
+local. Explicit SQL transaction DDL still requires transaction-level schema
+coordination and is not covered by this autocommit path.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to
