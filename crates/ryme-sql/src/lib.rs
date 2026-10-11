@@ -10001,6 +10001,31 @@ where
         Some(state.entries.get(&self.tenant)?.get(&key)?.iter().cloned().collect())
     }
 
+    fn indexed_candidates_for_value(
+        &self,
+        table: &str,
+        definition: &IndexDefinition,
+        indexed: &[u8],
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        self.ensure_index_entries_for_tenant(table)?;
+        let indexes =
+            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+        let Some(state) = indexes
+            .get(table)
+            .and_then(|states| states.iter().find(|state| state.definition.name == definition.name))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            state
+                .entries
+                .get(&self.tenant)
+                .and_then(|entries| entries.get(indexed))
+                .map(|pks| pks.iter().cloned().collect())
+                .unwrap_or_default(),
+        ))
+    }
+
     fn ensure_index_entries_for_tenant(&self, table: &str) -> Result<()> {
         let needs_rebuild = self
             .indexes
@@ -12785,6 +12810,66 @@ where
         value: &[u8],
         target_columns: &[String],
     ) -> Result<Option<Row>> {
+        if !target_columns.is_empty() {
+            let unique_index = self.catalog_indexes(table).into_iter().find(|index| {
+                if !index.unique {
+                    return false;
+                }
+                let indexed = if index.columns.is_empty() {
+                    index.column.iter().collect::<Vec<_>>()
+                } else {
+                    index.columns.iter().collect::<Vec<_>>()
+                };
+                indexed.len() == target_columns.len()
+                    && indexed
+                        .iter()
+                        .zip(target_columns)
+                        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+            });
+            if let Some(unique_index) = unique_index {
+                if let Some(incoming_index) = index_value(&unique_index, pk, value) {
+                    if let Some(candidates) = self.indexed_candidates_for_value(
+                        table,
+                        &unique_index,
+                        &incoming_index,
+                    )? {
+                        txn.record_constraint_scan(&self.tenant, &self.database, table);
+                        let mut candidate_pks = candidates;
+                        candidate_pks.extend(
+                            txn.writes()
+                                .iter()
+                                .filter(|(key, write)| {
+                                    key.tenant == self.tenant
+                                        && key.database == self.database
+                                        && key.table == table
+                                        && write.value.as_ref().is_some_and(|after| {
+                                            index_value(&unique_index, &key.pk, after)
+                                                .is_some_and(|indexed| indexed == incoming_index)
+                                        })
+                                })
+                                .map(|(key, _)| key.pk.clone()),
+                        );
+                        candidate_pks.sort();
+                        candidate_pks.dedup();
+                        for existing_pk in candidate_pks {
+                            let key =
+                                RecordKey::new(&self.tenant, &self.database, table, &existing_pk);
+                            if let Some(existing_value) = self.manager.get(txn, &key)? {
+                                if self.conflict_target_matches(
+                                    table,
+                                    target_columns,
+                                    value,
+                                    &existing_value,
+                                )? {
+                                    return Ok(Some((existing_pk, existing_value)));
+                                }
+                            }
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
+        }
         let rows = self.scan_all_rows_in_transaction(txn, table)?;
         if target_columns.is_empty() {
             if let Some(existing) = rows.iter().find(|(existing_pk, _)| existing_pk == pk) {
