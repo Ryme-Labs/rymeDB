@@ -600,6 +600,34 @@ where
         self.base.get(&mut parent_txn, key)
     }
 
+    fn get_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        key: &'a ryme_storage::RecordKey,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>>> + Send + 'a>>
+    {
+        if !self.overlay {
+            return self.base.get_async(txn, key);
+        }
+        let local = self.local_key(key);
+        let base = self.base.clone();
+        let base_commit_ts = self.base_commit_ts;
+        Box::pin(async move {
+            if let Some(write) = txn.writes().get(&local) {
+                return Ok(write.value.as_deref().and_then(Self::decode).flatten());
+            }
+            if let Some(value) = base.get_async(txn, &local).await? {
+                return Ok(Self::decode(&value).flatten());
+            }
+            if base.expires_at_at(&local, txn.read_ts)?.is_some() {
+                return Ok(None);
+            }
+            let mut parent_txn = base.begin();
+            parent_txn.restamp(base_commit_ts);
+            base.get_async(&mut parent_txn, key).await
+        })
+    }
+
     fn put(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey, value: Vec<u8>) {
         if self.overlay {
             self.base.put(txn, self.local_key(&key), Self::encode(Some(&value)));
@@ -971,6 +999,33 @@ mod tests {
 
         let mut base_read = base.begin();
         assert_eq!(base.get(&mut base_read, &parent_key).unwrap(), Some(b"from-parent".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn async_branch_reads_preserve_overlay_and_parent_snapshot() {
+        let base = ryme_txn::TxnManager::new();
+        let parent_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"parent");
+        let mut parent_txn = base.begin();
+        base.put(&mut parent_txn, parent_key.clone(), b"from-parent".to_vec());
+        let parent_commit = base.commit(parent_txn).unwrap();
+        let branch = BranchBackend::new(
+            base.clone(),
+            String::from("default"),
+            String::from("preview"),
+            parent_commit,
+            0,
+        );
+        let mut branch_txn = branch.begin();
+        branch.put(&mut branch_txn, parent_key.clone(), b"from-branch".to_vec());
+        base.commit(branch_txn).unwrap();
+
+        let mut reader = branch.begin();
+        assert_eq!(
+            branch.get_async(&mut reader, &parent_key).await.unwrap(),
+            Some(b"from-branch".to_vec())
+        );
+        let missing_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"missing");
+        assert_eq!(branch.get_async(&mut reader, &missing_key).await.unwrap(), None);
     }
 
     #[test]
