@@ -15518,6 +15518,7 @@ where
 
     pub fn explain(&self, sql: &str) -> Result<String> {
         let statement = parse(sql)?;
+        self.enforce_statement_privileges(&statement)?;
         match statement {
             Statement::Explain { plan, .. } => Ok(plan),
             other => Ok(describe_plan(&other)),
@@ -19902,6 +19903,25 @@ mod tests {
         assert!(matches!(analyzed, Statement::Explain { analyze: true, .. }));
         assert!(!analyzed.is_write());
         assert!(parse("explain analyze insert into docs key 'k' value 'v'").unwrap().is_write());
+    }
+
+    #[tokio::test]
+    async fn explain_requires_table_privileges() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE private_rows (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+        executor.execute(parse("CREATE ROLE app_reader LOGIN").unwrap()).await.unwrap();
+
+        let reader = executor.clone().with_role(String::from("app_reader"));
+        assert!(matches!(
+            reader.explain("SELECT * FROM private_rows"),
+            Err(RymeError::Forbidden)
+        ));
+
+        executor
+            .execute(parse("GRANT SELECT ON TABLE private_rows TO app_reader").unwrap())
+            .await
+            .unwrap();
+        assert!(reader.explain("SELECT * FROM private_rows").is_ok());
     }
 
     #[tokio::test]
