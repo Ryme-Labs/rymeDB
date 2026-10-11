@@ -2839,6 +2839,18 @@ fn admit_realtime(state: &SharedState, tenant: &str, messages: u64) -> ryme_erro
     }
 }
 
+fn admit_realtime_fanout(
+    state: &SharedState,
+    tenant: &str,
+    messages: u64,
+    egress_bytes: u64,
+) -> ryme_error::Result<()> {
+    match state.qos.lock() {
+        Ok(mut qos) => qos.admit_realtime_fanout(tenant, messages, egress_bytes, qos_now_nanos()),
+        Err(_) => Err(ryme_error::RymeError::Internal(String::from("qos lock"))),
+    }
+}
+
 struct RealtimeConnectionGuard {
     qos: Arc<Mutex<QosRegistry>>,
     tenant: String,
@@ -5221,9 +5233,9 @@ async fn publish_broadcast(
     channel: String,
     payload: serde_json::Value,
 ) -> ryme_error::Result<u64> {
-    admit_realtime(state, tenant, 1)?;
     let commit = state.backend.latest_commit();
     if let Some(node) = state.raft_node() {
+        admit_realtime(state, tenant, 1)?;
         if !node.is_leader().await {
             return Err(ryme_error::RymeError::Unavailable(String::from("not leader")));
         }
@@ -5241,7 +5253,22 @@ async fn publish_broadcast(
         node.fanout_realtime(encoded).await?;
         return Ok(sequence);
     }
-    state.realtime.broadcast(tenant, &channel, from, payload, commit)
+    state.realtime.broadcast_with_admission(
+        tenant,
+        &channel,
+        from,
+        payload,
+        commit,
+        |subscribers, event_bytes| {
+            let deliveries = subscribers as u64;
+            admit_realtime_fanout(
+                state,
+                tenant,
+                deliveries.saturating_add(1),
+                event_bytes.saturating_mul(deliveries),
+            )
+        },
+    )
 }
 
 async fn broadcast_post(
@@ -5921,12 +5948,14 @@ async fn forward_supabase_realtime(
             }
             event = event_queue.recv(), if !channels.is_empty() => {
                 let Some(event) = event else { break };
-                let (_, text) = match event {
+                let (text, event_pre_admitted, pre_admitted_bytes) = match event {
                     SupabaseRealtimeEvent::Broadcast(topic, record) => {
                         let Some(channel) = channels.get(&topic) else { continue };
                         if !channel.include_self && record.from == sender {
                             continue;
                         }
+                        let event_pre_admitted = record.fanout_quota_pre_admitted();
+                        let pre_admitted_bytes = record.json_len();
                         let (event_name, payload) = match record.payload {
                             serde_json::Value::Object(mut payload) => {
                                 let event_name = payload.remove("event")
@@ -5951,7 +5980,7 @@ async fn forward_supabase_realtime(
                             },
                             array_protocol,
                         );
-                        (topic, text)
+                        (text, event_pre_admitted, pre_admitted_bytes)
                     }
                     SupabaseRealtimeEvent::Change(topic, subscription, record) => {
                         let Some(channel) = channels.get(&topic) else { continue };
@@ -5968,7 +5997,7 @@ async fn forward_supabase_realtime(
                             },
                             array_protocol,
                         );
-                        (topic, text)
+                        (text, false, 0)
                     }
                     SupabaseRealtimeEvent::Presence(topic, event) => {
                         let Some(channel) = channels.get_mut(&topic) else { continue };
@@ -5988,10 +6017,16 @@ async fn forward_supabase_realtime(
                             },
                             array_protocol,
                         );
-                        (topic, text)
+                        (text, false, 0)
                     }
                 };
-                if !stream_realtime_event(&qos, &tenant, text.len() as u64)
+                let admitted = if event_pre_admitted {
+                    let additional_bytes = text.len().saturating_sub(pre_admitted_bytes) as u64;
+                    stream_realtime_egress(&qos, &tenant, additional_bytes)
+                } else {
+                    stream_realtime_event(&qos, &tenant, text.len() as u64)
+                };
+                if !admitted
                     || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
                     break;
                 }
@@ -6358,7 +6393,9 @@ async fn forward_broadcast(
                 match message {
                     Ok(record) => {
                         let text = record.json_text();
-                        if !stream_realtime_event(&qos, tenant, text.len() as u64) {
+                        if !record.fanout_quota_pre_admitted()
+                            && !stream_realtime_event(&qos, tenant, text.len() as u64)
+                        {
                             break;
                         }
                         if !queue_realtime_message_wait(
@@ -9606,6 +9643,13 @@ fn stream_realtime_event(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64
             let now = qos_now_nanos();
             registry.admit_realtime_delivery(tenant, bytes, now).is_ok()
         }
+        Err(_) => false,
+    }
+}
+
+fn stream_realtime_egress(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u64) -> bool {
+    match qos.lock() {
+        Ok(mut registry) => registry.admit_egress(tenant, bytes, qos_now_nanos()).is_ok(),
         Err(_) => false,
     }
 }

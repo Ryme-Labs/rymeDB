@@ -389,6 +389,83 @@ async fn live_broadcast_stream_receives_posts() {
 }
 
 #[tokio::test]
+async fn broadcast_quota_rejects_before_fanout_without_dropping_subscribers() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root =
+        std::env::temp_dir().join(format!("ryme-cast-quota-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut streams = Vec::new();
+    for _ in 0..20 {
+        let url = format!("ws://{http}/v1/broadcast/quota-lobby?api_key={KEY}");
+        let (stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+        assert_eq!(response.status(), 101);
+        streams.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let publish_url = format!("http://{http}/v1/broadcast");
+    let statuses = futures_util::stream::iter(0..1000usize)
+        .map(|index| {
+            let client = client.clone();
+            let publish_url = publish_url.clone();
+            async move {
+                client
+                    .post(publish_url)
+                    .bearer_auth(KEY)
+                    .json(&serde_json::json!({
+                        "channel": "quota-lobby",
+                        "payload": { "index": index }
+                    }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        })
+        .buffer_unordered(64)
+        .collect::<Vec<_>>()
+        .await;
+    let accepted = statuses.iter().filter(|status| **status == 200).count();
+    assert!(accepted > 0 && accepted < statuses.len());
+    assert!(statuses.iter().all(|status| *status == 200 || *status == 429));
+
+    let readers = streams.into_iter().map(|mut stream| async move {
+        for _ in 0..accepted {
+            let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(message, tokio_tungstenite::tungstenite::Message::Text(_)));
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(50), stream.next()).await.is_err());
+        accepted
+    });
+    let deliveries = futures_util::future::join_all(readers).await;
+    assert!(deliveries.iter().all(|count| *count == accepted));
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn supabase_realtime_protocol_joins_heartbeats_and_broadcasts() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root = std::env::temp_dir().join(format!(

@@ -122,6 +122,8 @@ pub struct BroadcastMsg {
     pub sequence: u64,
     #[serde(skip)]
     json_cache: Arc<OnceLock<String>>,
+    #[serde(skip)]
+    fanout_quota_pre_admitted: bool,
 }
 
 impl BroadcastMsg {
@@ -133,6 +135,16 @@ impl BroadcastMsg {
         self.json_cache
             .get_or_init(|| serde_json::to_string(self).unwrap_or_else(|_| String::from("{}")))
             .clone()
+    }
+
+    pub fn json_len(&self) -> usize {
+        self.json_cache
+            .get_or_init(|| serde_json::to_string(self).unwrap_or_else(|_| String::from("{}")))
+            .len()
+    }
+
+    pub fn fanout_quota_pre_admitted(&self) -> bool {
+        self.fanout_quota_pre_admitted
     }
 }
 
@@ -945,7 +957,43 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
+            fanout_quota_pre_admitted: false,
         };
+        let _ = sender.send(message);
+        Ok(sequence)
+    }
+
+    pub fn broadcast_with_admission(
+        &self,
+        tenant: &str,
+        channel: &str,
+        from: String,
+        payload: serde_json::Value,
+        commit_ts: u64,
+        admit: impl FnOnce(usize, u64) -> Result<()>,
+    ) -> Result<u64> {
+        let key = scope_key(tenant, channel);
+        let shard = self.broadcast_shard(&key);
+        let mut topics = self
+            .broadcast_topics
+            .get(shard)
+            .expect("broadcast shard")
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+        let sender =
+            topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
+        let sequence = self.next_sequence();
+        let message = BroadcastMsg {
+            channel: channel.to_string(),
+            from,
+            payload,
+            commit_ts,
+            sequence,
+            json_cache: Arc::new(OnceLock::new()),
+            fanout_quota_pre_admitted: true,
+        };
+        let receiver_count = sender.receiver_count();
+        admit(receiver_count, message.json_len() as u64)?;
         let _ = sender.send(message);
         Ok(sequence)
     }
@@ -977,6 +1025,7 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
+            fanout_quota_pre_admitted: false,
         };
         let _ = sender.send(message);
         Ok(sequence)
@@ -1528,6 +1577,39 @@ mod tests {
             assert_eq!(msg.channel, "lobby");
             assert_eq!(msg.commit_ts, 3);
         }
+    }
+
+    #[test]
+    fn broadcast_with_admission_charges_actual_fanout_before_sending() {
+        let realtime = Realtime::new(64);
+        let mut receiver = realtime.broadcast_subscribe("t", "lobby");
+        let mut admitted = None;
+        realtime
+            .broadcast_with_admission(
+                "t",
+                "lobby",
+                String::from("ada"),
+                serde_json::json!({"hello": true}),
+                3,
+                |subscribers, bytes| {
+                    admitted = Some((subscribers, bytes));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let message = receiver.try_recv().unwrap();
+        assert_eq!(admitted, Some((1, message.json_len() as u64)));
+
+        let error = realtime.broadcast_with_admission(
+            "t",
+            "lobby",
+            String::from("ada"),
+            serde_json::Value::Null,
+            4,
+            |_, _| Err(ryme_error::RymeError::Overload(String::from("test quota"))),
+        );
+        assert!(error.is_err());
+        assert!(matches!(receiver.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 
     #[test]

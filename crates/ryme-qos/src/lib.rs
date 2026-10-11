@@ -202,6 +202,27 @@ impl QosRegistry {
         }
     }
 
+    pub fn admit_realtime_fanout(
+        &mut self,
+        tenant: &str,
+        messages: u64,
+        egress_bytes: u64,
+        now_nanos: u64,
+    ) -> Result<()> {
+        let state = self.state_mut(tenant, now_nanos);
+        let mut realtime_bucket = state.realtime_bucket.clone();
+        if !realtime_bucket.take(messages as f64, now_nanos) {
+            return Err(RymeError::Overload(String::from("realtime quota")));
+        }
+        let mut egress_bucket = state.egress_bucket.clone();
+        if !egress_bucket.take(egress_bytes as f64, now_nanos) {
+            return Err(RymeError::Overload(String::from("egress quota")));
+        }
+        state.realtime_bucket = realtime_bucket;
+        state.egress_bucket = egress_bucket;
+        Ok(())
+    }
+
     pub fn admit_egress(&mut self, tenant: &str, bytes: u64, now_nanos: u64) -> Result<()> {
         let state = self.state_mut(tenant, now_nanos);
         if state.egress_bucket.take(bytes as f64, now_nanos) {
@@ -375,6 +396,27 @@ mod tests {
         assert!(registry.admit_realtime_delivery("t", 60, 0).is_err());
         assert!(registry.admit_realtime_delivery("t", 1, 0).is_err());
         assert!(registry.admit_realtime_delivery("t", 60, 1_000_000_000).is_ok());
+    }
+
+    #[test]
+    fn rejected_fanout_does_not_consume_only_one_quota_bucket() {
+        let mut registry = QosRegistry::new();
+        registry.set_quota(
+            "t",
+            Quota {
+                read_qps: 1000,
+                write_qps: 1000,
+                egress_bytes_per_sec: 10,
+                realtime_msg_per_sec: 3,
+                max_connections: 10,
+                max_storage_bytes: u64::MAX,
+            },
+            0,
+        );
+
+        assert!(registry.admit_realtime_fanout("t", 2, 11, 0).is_err());
+        assert!(registry.admit_realtime("t", 3, 0).is_ok());
+        assert!(registry.admit_realtime_fanout("t", 1, 11, 0).is_err());
     }
 
     #[test]
