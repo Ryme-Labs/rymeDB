@@ -93,26 +93,17 @@ fn active_registries() -> Vec<Arc<ActiveRegistry>> {
     live
 }
 
-static COMMIT_WAITERS: LazyLock<Mutex<Vec<std::sync::mpsc::SyncSender<u64>>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static COMMIT_NOTIFICATIONS: LazyLock<tokio::sync::watch::Sender<u64>> = LazyLock::new(|| {
+    let (sender, _) = tokio::sync::watch::channel(0);
+    sender
+});
 
-pub fn subscribe_commits() -> std::sync::mpsc::Receiver<u64> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(16);
-    if let Ok(mut waiters) = COMMIT_WAITERS.lock() {
-        waiters.push(sender);
-    }
-    receiver
+pub fn subscribe_commits() -> tokio::sync::watch::Receiver<u64> {
+    COMMIT_NOTIFICATIONS.subscribe()
 }
 
 fn publish_commit(commit_ts: u64) {
-    if let Ok(mut waiters) = COMMIT_WAITERS.lock() {
-        waiters.retain(|waiter| {
-            !matches!(
-                waiter.try_send(commit_ts),
-                Err(std::sync::mpsc::TrySendError::Disconnected(_))
-            )
-        });
-    }
+    COMMIT_NOTIFICATIONS.send_replace(commit_ts);
 }
 
 #[derive(Debug, Clone)]

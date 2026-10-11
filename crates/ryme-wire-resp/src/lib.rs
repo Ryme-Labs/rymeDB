@@ -1277,18 +1277,17 @@ where
     }
 
     async fn wait_for_commit(
-        waiter: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<u64>>>,
+        waiter: &mut tokio::sync::watch::Receiver<u64>,
         remaining: Option<std::time::Duration>,
     ) {
-        let waiter = waiter.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let guard = waiter.lock().ok()?;
-            match remaining {
-                Some(limit) => guard.recv_timeout(limit).ok(),
-                None => guard.recv().ok(),
+        match remaining {
+            Some(limit) => {
+                let _ = tokio::time::timeout(limit, waiter.changed()).await;
             }
-        })
-        .await;
+            None => {
+                let _ = waiter.changed().await;
+            }
+        }
     }
 
     fn blocking_timeout(
@@ -1320,7 +1319,7 @@ where
             Err(e) => return encode_error(e),
         };
         let keys = &args[..args.len() - 1];
-        let waiter = std::sync::Arc::new(std::sync::Mutex::new(ryme_txn::subscribe_commits()));
+        let mut waiter = ryme_txn::subscribe_commits();
         loop {
             let mut txn = self.manager.begin();
             let mut hit: Option<(Vec<u8>, String)> = None;
@@ -1383,7 +1382,7 @@ where
             }
             let remaining =
                 deadline.map(|end| end.saturating_duration_since(std::time::Instant::now()));
-            Self::wait_for_commit(&waiter, remaining).await;
+            Self::wait_for_commit(&mut waiter, remaining).await;
         }
     }
 
@@ -1405,7 +1404,7 @@ where
             Ok(deadline) => deadline,
             Err(e) => return encode_error(e),
         };
-        let waiter = std::sync::Arc::new(std::sync::Mutex::new(ryme_txn::subscribe_commits()));
+        let mut waiter = ryme_txn::subscribe_commits();
         loop {
             let mut txn = self.manager.begin();
             match self.read_list(&mut txn, &args[0]) {
@@ -1460,7 +1459,7 @@ where
             }
             let remaining =
                 deadline.map(|end| end.saturating_duration_since(std::time::Instant::now()));
-            Self::wait_for_commit(&waiter, remaining).await;
+            Self::wait_for_commit(&mut waiter, remaining).await;
         }
     }
 
@@ -3406,7 +3405,7 @@ where
         } else {
             Some(std::time::Instant::now() + std::time::Duration::from_millis(block_ms))
         };
-        let waiter = std::sync::Arc::new(std::sync::Mutex::new(ryme_txn::subscribe_commits()));
+        let mut waiter = ryme_txn::subscribe_commits();
         loop {
             let mut txn = self.manager.begin();
             let rest = args.get(keys_at..).unwrap_or(&[]);
@@ -3421,7 +3420,7 @@ where
             }
             let remaining =
                 deadline.map(|end| end.saturating_duration_since(std::time::Instant::now()));
-            Self::wait_for_commit(&waiter, remaining).await;
+            Self::wait_for_commit(&mut waiter, remaining).await;
         }
     }
 
@@ -4148,7 +4147,7 @@ where
         } else {
             Some(std::time::Instant::now() + std::time::Duration::from_millis(block_ms))
         };
-        let waiter = std::sync::Arc::new(std::sync::Mutex::new(ryme_txn::subscribe_commits()));
+        let mut waiter = ryme_txn::subscribe_commits();
         loop {
             let mut txn = self.manager.begin();
             let rest = args.get(keys_at..).unwrap_or(&[]);
@@ -4180,7 +4179,7 @@ where
             }
             let remaining =
                 deadline.map(|end| end.saturating_duration_since(std::time::Instant::now()));
-            Self::wait_for_commit(&waiter, remaining).await;
+            Self::wait_for_commit(&mut waiter, remaining).await;
         }
     }
 
