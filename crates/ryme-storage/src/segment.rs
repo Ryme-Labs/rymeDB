@@ -11,6 +11,17 @@ const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentKind {
     Snapshot = 0,
@@ -462,8 +473,22 @@ impl SegmentStore {
         std::fs::rename(&temporary, &path)?;
         let latest = self.dir.join("latest");
         let latest_tmp = self.dir.join("latest.tmp");
-        std::fs::write(&latest_tmp, path.file_name().and_then(|name| name.to_str()).unwrap_or(""))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| RymeError::Internal(String::from("segment name")))?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&latest_tmp)?;
+            file.write_all(name.as_bytes())?;
+            if sync {
+                file.sync_data()?;
+            }
+        }
         std::fs::rename(latest_tmp, latest)?;
+        if sync {
+            sync_directory(&self.dir)?;
+        }
         Ok((segment.meta.clone(), path))
     }
 
@@ -926,6 +951,22 @@ mod tests {
         let segment = reopened.latest().unwrap().unwrap();
         assert_eq!(segment.meta().max_commit_ts, 42);
         assert_eq!(segment.get(&key, 42, 0).unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_store_rejects_invalid_latest_pointer() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-pointer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        std::fs::write(dir.join("latest"), b"../outside.sst").unwrap();
+        assert!(
+            matches!(store.latest(), Err(RymeError::Corrupt(message)) if message == "segment pointer")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

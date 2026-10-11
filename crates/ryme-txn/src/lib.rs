@@ -10,6 +10,58 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn snapshot_file_name(commit_ts: u64) -> String {
+    format!("snap-{commit_ts:020}.rsnap")
+}
+
+fn snapshot_commit(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("snap-")?.strip_suffix(".rsnap")?;
+    (rest.len() == 20 && rest.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| rest.parse().ok())
+        .flatten()
+}
+
+fn publish_snapshot_pointer(dir: &Path, name: &str) -> Result<()> {
+    if snapshot_commit(name).is_none() {
+        return Err(RymeError::Internal(String::from("snapshot name")));
+    }
+    let temporary = dir.join("latest.tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(name.as_bytes())?;
+        file.sync_data()?;
+    }
+    std::fs::rename(temporary, dir.join("latest"))?;
+    sync_directory(dir)
+}
+
+fn write_snapshot_file(dir: &Path, commit_ts: u64, raw: &[u8]) -> Result<std::path::PathBuf> {
+    let name = snapshot_file_name(commit_ts);
+    let path = dir.join(&name);
+    let temporary = dir.join(format!(".{name}.tmp"));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(raw)?;
+        file.sync_data()?;
+    }
+    std::fs::rename(temporary, &path)?;
+    sync_directory(dir)?;
+    Ok(path)
+}
+
 #[derive(Debug, Default)]
 struct ActiveRegistry {
     transactions: Mutex<ActiveTransactions>,
@@ -1842,18 +1894,12 @@ impl DurableManager {
         self.segments.write(max, &snapshot)?;
         let dir = self.snapshot_dir();
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("snap-{max:020}.rsnap"));
-        let mut file = std::fs::File::create(&path)?;
-        use std::io::Write;
-        file.write_all(&raw)?;
-        file.sync_data()?;
-        drop(file);
-        let latest = dir.join("latest");
+        let path = write_snapshot_file(&dir, max, &raw)?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| RymeError::Internal(String::from("snapshot name")))?;
-        std::fs::write(&latest, name)?;
+        publish_snapshot_pointer(&dir, name)?;
         Ok((max, path))
     }
 
@@ -1866,7 +1912,14 @@ impl DurableManager {
         };
         let name = String::from_utf8(name)
             .map_err(|_| RymeError::Corrupt(String::from("snapshot pointer")))?;
-        let path = self.snapshot_dir().join(name.trim());
+        let name = name.trim();
+        if snapshot_commit(name).is_none() {
+            return Err(RymeError::Corrupt(String::from("snapshot pointer")));
+        }
+        let path = self.snapshot_dir().join(name);
+        if !path.is_file() {
+            return Err(RymeError::Corrupt(String::from("snapshot pointer")));
+        }
         let raw = std::fs::read(&path)?;
         Ok(Some(self.inner.restore_snapshot(&raw)?))
     }
@@ -2060,13 +2113,7 @@ impl DurableManager {
     fn publish_restored_snapshot(&self, commit_ts: u64, target: u64, raw: &[u8]) -> Result<()> {
         let dir = self.snapshot_dir();
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("snap-{commit_ts:020}.rsnap"));
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(raw)?;
-            file.sync_data()?;
-        }
+        let path = write_snapshot_file(&dir, commit_ts, raw)?;
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let candidate = entry.path();
@@ -2082,7 +2129,11 @@ impl DurableManager {
                 std::fs::remove_file(candidate)?;
             }
         }
-        std::fs::write(dir.join("latest"), path.file_name().unwrap().to_string_lossy().as_bytes())?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| RymeError::Internal(String::from("snapshot name")))?;
+        publish_snapshot_pointer(&dir, name)?;
         Ok(())
     }
 
@@ -2097,13 +2148,7 @@ impl DurableManager {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let Some(rest) = name.strip_prefix("snap-").and_then(|n| n.strip_suffix(".rsnap"))
-            else {
-                continue;
-            };
-            let Ok(commit) = rest.parse::<u64>() else {
-                continue;
-            };
+            let Some(commit) = snapshot_commit(name) else { continue };
             if commit <= target && best.as_ref().map(|(c, _)| commit > *c).unwrap_or(true) {
                 best = Some((commit, path));
             }
@@ -2971,6 +3016,23 @@ mod tests {
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"1".to_vec()));
         assert_eq!(reopened.get(&mut probe, &after).unwrap(), Some(b"2".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_snapshot_pointer_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-snapshot-pointer-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("snapshots")).unwrap();
+        std::fs::write(dir.join("snapshots/latest"), b"../outside.rsnap").unwrap();
+        assert!(matches!(
+            DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always),
+            Err(RymeError::Corrupt(message)) if message == "snapshot pointer"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
