@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
 
+type EncodedFrameSlot = OnceLock<(String, Arc<str>)>;
+type EncodedFrameCache = Arc<[EncodedFrameSlot; 2]>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeRecord {
     pub tenant: String,
@@ -130,7 +133,7 @@ pub struct BroadcastMsg {
     #[serde(skip)]
     json_cache: Arc<OnceLock<String>>,
     #[serde(skip)]
-    encoded_frames: Arc<[OnceLock<(String, Arc<str>)>; 2]>,
+    encoded_frames: EncodedFrameCache,
     #[serde(skip)]
     fanout_quota_pre_admitted: bool,
 }
