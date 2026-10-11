@@ -12,7 +12,7 @@ use ryme_router::RangeLoadHook;
 use ryme_storage::RecordKey;
 use ryme_txn::{Transaction, TxnBackend, TxnManager};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -69,6 +69,7 @@ struct ClientState {
     name: Option<Vec<u8>>,
     id: u64,
     authenticated: bool,
+    tenant: String,
     resp3: bool,
     subscriptions: std::collections::BTreeSet<Vec<u8>>,
     patterns: std::collections::BTreeSet<Vec<u8>>,
@@ -77,6 +78,7 @@ struct ClientState {
 
 #[derive(Debug, Clone)]
 struct PubSubMessage {
+    tenant: String,
     channel: Vec<u8>,
     payload: Vec<u8>,
 }
@@ -100,9 +102,9 @@ struct ClusterPubSubBroadcast {
 #[derive(Debug, Clone)]
 struct PubSubBus {
     sender: broadcast::Sender<PubSubMessage>,
-    counts: Arc<Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
-    pattern_counts: Arc<Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
-    cluster_started: Arc<AtomicBool>,
+    counts: Arc<Mutex<std::collections::HashMap<(String, Vec<u8>), usize>>>,
+    pattern_counts: Arc<Mutex<std::collections::HashMap<(String, Vec<u8>), usize>>>,
+    cluster_started: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 fn new_pubsub() -> PubSubBus {
@@ -110,7 +112,7 @@ fn new_pubsub() -> PubSubBus {
         sender: broadcast::channel(4096).0,
         counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
         pattern_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        cluster_started: Arc::new(AtomicBool::new(false)),
+        cluster_started: Arc::new(Mutex::new(std::collections::HashSet::new())),
     }
 }
 
@@ -119,49 +121,55 @@ impl PubSubBus {
         self.sender.subscribe()
     }
 
-    fn add(&self, channel: &[u8]) {
+    fn add(&self, tenant: &str, channel: &[u8]) {
         if let Ok(mut counts) = self.counts.lock() {
-            *counts.entry(channel.to_vec()).or_default() += 1;
+            *counts.entry((tenant.to_string(), channel.to_vec())).or_default() += 1;
         }
     }
 
-    fn remove(&self, channel: &[u8]) {
+    fn remove(&self, tenant: &str, channel: &[u8]) {
         if let Ok(mut counts) = self.counts.lock() {
-            if let Some(count) = counts.get_mut(channel) {
+            let key = (tenant.to_string(), channel.to_vec());
+            if let Some(count) = counts.get_mut(&key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    counts.remove(channel);
+                    counts.remove(&key);
                 }
             }
         }
     }
 
-    fn add_pattern(&self, pattern: &[u8]) {
+    fn add_pattern(&self, tenant: &str, pattern: &[u8]) {
         if let Ok(mut counts) = self.pattern_counts.lock() {
-            *counts.entry(pattern.to_vec()).or_default() += 1;
+            *counts.entry((tenant.to_string(), pattern.to_vec())).or_default() += 1;
         }
     }
 
-    fn remove_pattern(&self, pattern: &[u8]) {
+    fn remove_pattern(&self, tenant: &str, pattern: &[u8]) {
         if let Ok(mut counts) = self.pattern_counts.lock() {
-            if let Some(count) = counts.get_mut(pattern) {
+            let key = (tenant.to_string(), pattern.to_vec());
+            if let Some(count) = counts.get_mut(&key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    counts.remove(pattern);
+                    counts.remove(&key);
                 }
             }
         }
     }
 
-    fn publish(&self, channel: Vec<u8>, payload: Vec<u8>) -> usize {
-        let delivered = self.delivered_count(&channel);
-        let _ = self.sender.send(PubSubMessage { channel, payload });
+    fn publish(&self, tenant: &str, channel: Vec<u8>, payload: Vec<u8>) -> usize {
+        let delivered = self.delivered_count(tenant, &channel);
+        let _ = self.sender.send(PubSubMessage { tenant: tenant.to_string(), channel, payload });
         delivered
     }
 
-    fn delivered_count(&self, channel: &[u8]) -> usize {
-        let exact =
-            self.counts.lock().ok().and_then(|counts| counts.get(channel).copied()).unwrap_or(0);
+    fn delivered_count(&self, tenant: &str, channel: &[u8]) -> usize {
+        let exact = self
+            .counts
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(&(tenant.to_string(), channel.to_vec())).copied())
+            .unwrap_or(0);
         let patterned = self
             .pattern_counts
             .lock()
@@ -169,7 +177,9 @@ impl PubSubBus {
             .map(|counts| {
                 counts
                     .iter()
-                    .filter(|(pattern, _)| glob_match(pattern, channel))
+                    .filter(|((pattern_tenant, pattern), _)| {
+                        pattern_tenant == tenant && glob_match(pattern, channel)
+                    })
                     .map(|(_, count)| *count)
                     .sum::<usize>()
             })
@@ -178,9 +188,13 @@ impl PubSubBus {
     }
 
     fn start_cluster_bridge(&self, realtime: Realtime, tenant: String, database: String) {
-        if self.cluster_started.swap(true, Ordering::AcqRel) {
+        let Ok(mut started) = self.cluster_started.lock() else {
+            return;
+        };
+        if !started.insert(tenant.clone()) {
             return;
         }
+        drop(started);
         let topic = resp_pubsub_topic(&database);
         let mut receiver = realtime.broadcast_subscribe(&tenant, &topic);
         let sender = self.sender.clone();
@@ -194,6 +208,7 @@ impl PubSubBus {
                             continue;
                         };
                         let _ = sender.send(PubSubMessage {
+                            tenant: tenant.clone(),
                             channel: message.channel,
                             payload: message.payload,
                         });
@@ -214,10 +229,10 @@ impl Drop for ClientState {
     fn drop(&mut self) {
         if let Some(pubsub) = &self.pubsub {
             for channel in &self.subscriptions {
-                pubsub.remove(channel);
+                pubsub.remove(&self.tenant, channel);
             }
             for pattern in &self.patterns {
-                pubsub.remove_pattern(pattern);
+                pubsub.remove_pattern(&self.tenant, pattern);
             }
         }
     }
@@ -476,6 +491,7 @@ where
             name: None,
             id: self.next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             authenticated: self.authenticator.is_none(),
+            tenant: self.tenant.clone(),
             resp3: false,
             subscriptions: std::collections::BTreeSet::new(),
             patterns: std::collections::BTreeSet::new(),
@@ -501,7 +517,16 @@ where
         };
         match authenticator(user, password) {
             Ok(principal) if !principal.tenant.is_empty() => {
+                for channel in &client.subscriptions {
+                    self.pubsub.remove(&client.tenant, channel);
+                }
+                for pattern in &client.patterns {
+                    self.pubsub.remove_pattern(&client.tenant, pattern);
+                }
+                client.subscriptions.clear();
+                client.patterns.clear();
                 self.tenant = principal.tenant;
+                client.tenant = self.tenant.clone();
                 self.read_allowed = principal.can_read();
                 self.write_allowed = principal.can_write();
                 self.publish_allowed = principal.can_publish();
@@ -647,7 +672,7 @@ where
         let mut replies = Vec::with_capacity(channels.len());
         for channel in channels {
             if client.subscriptions.insert(channel.clone()) {
-                self.pubsub.add(channel);
+                self.pubsub.add(&client.tenant, channel);
             }
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"subscribe"),
@@ -674,7 +699,7 @@ where
         let mut replies = Vec::with_capacity(channels.len());
         for channel in channels {
             if client.subscriptions.remove(&channel) {
-                self.pubsub.remove(&channel);
+                self.pubsub.remove(&client.tenant, &channel);
             }
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"unsubscribe"),
@@ -692,7 +717,7 @@ where
         let mut replies = Vec::with_capacity(patterns.len());
         for pattern in patterns {
             if client.patterns.insert(pattern.clone()) {
-                self.pubsub.add_pattern(pattern);
+                self.pubsub.add_pattern(&client.tenant, pattern);
             }
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"psubscribe"),
@@ -719,7 +744,7 @@ where
         let mut replies = Vec::with_capacity(patterns.len());
         for pattern in patterns {
             if client.patterns.remove(&pattern) {
-                self.pubsub.remove_pattern(&pattern);
+                self.pubsub.remove_pattern(&client.tenant, &pattern);
             }
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"punsubscribe"),
@@ -742,7 +767,10 @@ where
                 let mut reply = Vec::with_capacity((args.len().saturating_sub(1)) * 2);
                 for channel in &args[1..] {
                     reply.push(encode_bulk(channel));
-                    reply.push(encode_integer(counts.get(channel).copied().unwrap_or(0) as i64));
+                    reply.push(encode_integer(
+                        counts.get(&(self.tenant.clone(), channel.clone())).copied().unwrap_or(0)
+                            as i64,
+                    ));
                 }
                 encode_raw_array(reply)
             }
@@ -752,7 +780,13 @@ where
                     .pattern_counts
                     .lock()
                     .ok()
-                    .map(|counts| counts.values().sum::<usize>())
+                    .map(|counts| {
+                        counts
+                            .iter()
+                            .filter(|((tenant, _), _)| tenant == &self.tenant)
+                            .map(|(_, count)| *count)
+                            .sum::<usize>()
+                    })
                     .unwrap_or(0);
                 encode_integer(count as i64)
             }
@@ -764,8 +798,10 @@ where
                 encode_raw_array(
                     counts
                         .iter()
-                        .filter(|(channel, count)| **count > 0 && glob_match(pattern, channel))
-                        .map(|(channel, _)| encode_bulk(channel))
+                        .filter(|((tenant, channel), count)| {
+                            tenant == &self.tenant && **count > 0 && glob_match(pattern, channel)
+                        })
+                        .map(|((_, channel), _)| encode_bulk(channel))
                         .collect(),
                 )
             }
@@ -1074,7 +1110,9 @@ where
                     if !client.subscriptions.is_empty() || !client.patterns.is_empty() =>
                 {
                     if let Ok(message) = message {
-                        if client.subscriptions.contains(&message.channel) {
+                        if message.tenant == client.tenant
+                            && client.subscriptions.contains(&message.channel)
+                        {
                             let reply = encode_raw_array(vec![
                                 encode_bulk(b"message"),
                                 encode_bulk(&message.channel),
@@ -1088,7 +1126,9 @@ where
                             writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
                         }
                         for pattern in &client.patterns {
-                            if glob_match(pattern, &message.channel) {
+                            if message.tenant == client.tenant
+                                && glob_match(pattern, &message.channel)
+                            {
                                 let reply = encode_raw_array(vec![
                                     encode_bulk(b"pmessage"),
                                     encode_bulk(pattern),
@@ -1658,9 +1698,9 @@ where
     }
 
     fn publish_pubsub(&self, channel: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
-        let delivered = self.pubsub.delivered_count(&channel);
+        let delivered = self.pubsub.delivered_count(&self.tenant, &channel);
         let Some(realtime) = self.realtime.clone() else {
-            return encode_integer(self.pubsub.publish(channel, payload) as i64);
+            return encode_integer(self.pubsub.publish(&self.tenant, channel, payload) as i64);
         };
         self.start_realtime_pubsub();
         let message = match serde_json::to_value(ClusterPubSubMessage { channel, payload }) {
