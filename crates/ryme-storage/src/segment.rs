@@ -360,19 +360,32 @@ impl SegmentStore {
 
     pub fn write(&self, id: u64, engine: &Engine) -> Result<(SegmentMeta, PathBuf)> {
         let segment = ImmutableSegment::from_engine(id, engine);
-        self.write_segment(segment)
+        self.write_segment(segment, true)
     }
 
     pub fn write_delta(&self, id: u64, entries: &[SegmentEntry]) -> Result<SegmentMeta> {
+        self.write_delta_with_sync(id, entries, true)
+    }
+
+    pub fn write_delta_with_sync(
+        &self,
+        id: u64,
+        entries: &[SegmentEntry],
+        sync: bool,
+    ) -> Result<SegmentMeta> {
         if entries.is_empty() {
             return Ok(SegmentMeta { id, max_commit_ts: 0, entries: 0, bytes: 0 });
         }
         let segment = ImmutableSegment::from_entries(id, entries)?;
-        let (meta, _) = self.write_segment(segment)?;
+        let (meta, _) = self.write_segment(segment, sync)?;
         Ok(meta)
     }
 
-    fn write_segment(&self, segment: ImmutableSegment) -> Result<(SegmentMeta, PathBuf)> {
+    fn write_segment(
+        &self,
+        segment: ImmutableSegment,
+        sync: bool,
+    ) -> Result<(SegmentMeta, PathBuf)> {
         let id = segment.meta.id;
         if let Ok(mut cache) = self.cache.lock() {
             cache.remove(id);
@@ -385,7 +398,9 @@ impl SegmentStore {
             use std::io::Write;
             let mut file = std::fs::File::create(&temporary)?;
             file.write_all(&encoded)?;
-            file.sync_data()?;
+            if sync {
+                file.sync_data()?;
+            }
         }
         std::fs::rename(&temporary, &path)?;
         let latest = self.dir.join("latest");
