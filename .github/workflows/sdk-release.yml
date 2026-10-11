@@ -109,7 +109,7 @@ jobs:
         run: cargo test --manifest-path sdks/rust/Cargo.toml --locked
 
       - name: Package crate
-        run: cargo package --manifest-path sdks/rust/Cargo.toml --locked
+        run: cargo package --manifest-path sdks/rust/Cargo.toml --locked --allow-dirty
 
       - name: Upload Cargo artifact
         uses: actions/upload-artifact@v4
