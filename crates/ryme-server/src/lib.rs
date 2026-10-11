@@ -2539,6 +2539,7 @@ fn spawn_gateways(
             native_state.keys.clone(),
             native_state.qos.clone(),
         )
+        .with_sql_executor(native_state.executor.clone())
         .with_metering(native_state.metering.clone())
         .with_observe(
             native_state.latency.clone(),
@@ -2582,6 +2583,7 @@ fn spawn_gateways(
             tls_state.keys.clone(),
             tls_state.qos.clone(),
         )
+        .with_sql_executor(tls_state.executor.clone())
         .with_metering(tls_state.metering.clone())
         .with_observe(
             tls_state.latency.clone(),
@@ -2626,6 +2628,7 @@ fn spawn_gateways(
             grpc_tls_state.keys.clone(),
             grpc_tls_state.qos.clone(),
         )
+        .with_sql_executor(grpc_tls_state.executor.clone())
         .with_metering(grpc_tls_state.metering.clone())
         .with_observe(
             grpc_tls_state.latency.clone(),
@@ -2746,6 +2749,7 @@ fn spawn_gateways(
             grpc_state.keys.clone(),
             grpc_state.qos.clone(),
         )
+        .with_sql_executor(grpc_state.executor.clone())
         .with_metering(grpc_state.metering.clone())
         .with_observe(
             grpc_state.latency.clone(),

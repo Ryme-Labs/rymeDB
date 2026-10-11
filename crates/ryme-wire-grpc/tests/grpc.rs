@@ -129,6 +129,61 @@ async fn grpc_sql_and_auth() {
 }
 
 #[tokio::test]
+async fn grpc_sql_uses_configured_rls_executor() {
+    use ryme_storage::RecordKey;
+    use ryme_txn::TxnBackend;
+    let gateway = Gateway::new(
+        String::from("t"),
+        String::from("d"),
+        String::from("main"),
+        PolicyEngine::new(),
+        Realtime::new(16),
+    );
+    let manager = gateway.manager_clone();
+    let executor = ryme_sql::Executor::with_backend(
+        String::from("t"),
+        String::from("d"),
+        manager.clone(),
+    )
+    .with_rls_tables(std::collections::HashMap::from([(
+        String::from("docs"),
+        String::from("tenant_id"),
+    )]));
+    executor
+        .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
+        .await
+        .unwrap();
+    let mut txn = manager.begin();
+    manager.put(
+        &mut txn,
+        RecordKey::new("t", "d", "docs", b"visible"),
+        br#"{"tenant_id":"t","body":"ok"}"#.to_vec(),
+    );
+    manager.put(
+        &mut txn,
+        RecordKey::new("t", "d", "docs", b"hidden"),
+        br#"{"tenant_id":"other","body":"secret"}"#.to_vec(),
+    );
+    manager.commit(txn).unwrap();
+
+    let keys = ApiKeyStore::new();
+    let mut roles = HashSet::new();
+    roles.insert(Role::Owner);
+    keys.insert(
+        String::from("k"),
+        Principal { id: String::from("u"), tenant: String::from("t"), roles },
+    );
+    let grpc = GrpcGateway::with_gateway(gateway, keys).with_sql_executor(executor);
+    let response = grpc
+        .sql(authed(proto::SqlRequest { sql: String::from("SELECT * FROM docs") }, "k"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.ok, "{}", response.error);
+    assert_eq!(response.rows.len(), 1);
+}
+
+#[tokio::test]
 async fn grpc_limited_roundtrip() {
     let gateway = Gateway::new(
         String::from("t"),

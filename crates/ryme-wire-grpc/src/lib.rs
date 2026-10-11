@@ -21,6 +21,7 @@ pub const VERSION: &str = "ryme-grpc/1";
 #[derive(Debug, Clone)]
 pub struct GrpcGateway<B = ryme_txn::TxnManager> {
     gateway: Gateway<B>,
+    sql_executor: Option<Arc<ryme_sql::Executor<B>>>,
     keys: ApiKeyStore,
     qos: Arc<Mutex<QosRegistry>>,
     metering: Option<Arc<Mutex<MeterRegistry>>>,
@@ -38,6 +39,7 @@ where
     pub fn with_gateway(gateway: Gateway<B>, keys: ApiKeyStore) -> Self {
         Self {
             gateway,
+            sql_executor: None,
             keys,
             qos: Arc::new(Mutex::new(QosRegistry::new())),
             metering: None,
@@ -52,6 +54,7 @@ where
     pub fn with_qos(gateway: Gateway<B>, keys: ApiKeyStore, qos: Arc<Mutex<QosRegistry>>) -> Self {
         Self {
             gateway,
+            sql_executor: None,
             keys,
             qos,
             metering: None,
@@ -65,6 +68,11 @@ where
 
     pub fn with_metering(mut self, metering: Arc<Mutex<MeterRegistry>>) -> Self {
         self.metering = Some(metering);
+        self
+    }
+
+    pub fn with_sql_executor(mut self, executor: ryme_sql::Executor<B>) -> Self {
+        self.sql_executor = Some(Arc::new(executor));
         self
     }
 
@@ -499,12 +507,20 @@ where
             None
         };
         let fingerprint = self.slow_log.as_ref().map(|_| query_fingerprint(&inner.sql));
-        let mut executor = ryme_sql::Executor::with_backend(
-            principal.tenant.clone(),
-            String::from("default"),
-            self.gateway.manager_clone(),
-        )
-        .with_realtime(self.gateway.realtime());
+        let mut executor = self
+            .sql_executor
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| {
+                ryme_sql::Executor::with_backend(
+                    principal.tenant.clone(),
+                    String::from("default"),
+                    self.gateway.manager_clone(),
+                )
+                .with_realtime(self.gateway.realtime())
+            })
+            .with_tenant(principal.tenant.clone())
+            .with_role(principal.sql_role().to_string());
         if self.gateway.is_read_only() {
             executor.set_read_only(true);
         }

@@ -121,6 +121,7 @@ pub fn decode_frame(buffer: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
 #[derive(Debug, Clone)]
 pub struct NativeGateway<B = ryme_txn::TxnManager> {
     gateway: Gateway<B>,
+    sql_executor: Option<Arc<ryme_sql::Executor<B>>>,
     keys: ApiKeyStore,
     qos: Arc<Mutex<QosRegistry>>,
     metering: Option<Arc<Mutex<MeterRegistry>>>,
@@ -138,6 +139,7 @@ where
     pub fn with_gateway(gateway: Gateway<B>, keys: ApiKeyStore) -> Self {
         Self {
             gateway,
+            sql_executor: None,
             keys,
             qos: Arc::new(Mutex::new(QosRegistry::new())),
             metering: None,
@@ -152,6 +154,7 @@ where
     pub fn with_qos(gateway: Gateway<B>, keys: ApiKeyStore, qos: Arc<Mutex<QosRegistry>>) -> Self {
         Self {
             gateway,
+            sql_executor: None,
             keys,
             qos,
             metering: None,
@@ -165,6 +168,11 @@ where
 
     pub fn with_metering(mut self, metering: Arc<Mutex<MeterRegistry>>) -> Self {
         self.metering = Some(metering);
+        self
+    }
+
+    pub fn with_sql_executor(mut self, executor: ryme_sql::Executor<B>) -> Self {
+        self.sql_executor = Some(Arc::new(executor));
         self
     }
 
@@ -586,12 +594,20 @@ where
             None
         };
         let fingerprint = self.slow_log.as_ref().map(|_| query_fingerprint(&request.sql));
-        let mut executor = ryme_sql::Executor::with_backend(
-            principal.tenant.clone(),
-            String::from("default"),
-            self.gateway.manager_clone(),
-        )
-        .with_realtime(self.gateway.realtime());
+        let mut executor = self
+            .sql_executor
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| {
+                ryme_sql::Executor::with_backend(
+                    principal.tenant.clone(),
+                    String::from("default"),
+                    self.gateway.manager_clone(),
+                )
+                .with_realtime(self.gateway.realtime())
+            })
+            .with_tenant(principal.tenant.clone())
+            .with_role(principal.sql_role().to_string());
         if self.gateway.is_read_only() {
             executor.set_read_only(true);
         }
@@ -813,6 +829,67 @@ mod tests {
         let get_response = native.dispatch(&get).await;
         assert!(get_response.ok);
         assert_eq!(get_response.value, Some(String::from("1")));
+    }
+
+    #[tokio::test]
+    async fn native_sql_uses_configured_rls_executor() {
+        use std::collections::{HashMap, HashSet};
+        use ryme_storage::RecordKey;
+        use ryme_txn::TxnBackend;
+
+        let gateway = Gateway::new(
+            String::from("t"),
+            String::from("d"),
+            String::from("main"),
+            ryme_auth::PolicyEngine::new(),
+            ryme_realtime::Realtime::new(16),
+        );
+        let manager = gateway.manager_clone();
+        let executor = ryme_sql::Executor::with_backend(
+            String::from("t"),
+            String::from("d"),
+            manager.clone(),
+        )
+        .with_rls_tables(HashMap::from([(String::from("docs"), String::from("tenant_id"))]));
+        executor
+            .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        let mut txn = manager.begin();
+        manager.put(
+            &mut txn,
+            RecordKey::new("t", "d", "docs", b"visible"),
+            br#"{"tenant_id":"t","body":"ok"}"#.to_vec(),
+        );
+        manager.put(
+            &mut txn,
+            RecordKey::new("t", "d", "docs", b"hidden"),
+            br#"{"tenant_id":"other","body":"secret"}"#.to_vec(),
+        );
+        manager.commit(txn).unwrap();
+
+        let keys = ApiKeyStore::new();
+        let mut roles = HashSet::new();
+        roles.insert(ryme_auth::Role::Owner);
+        keys.insert(
+            String::from("k"),
+            Principal { id: String::from("u"), tenant: String::from("t"), roles },
+        );
+        let native = NativeGateway::with_gateway(gateway, keys).with_sql_executor(executor);
+        let request = serde_json::to_vec(&Request {
+            key: String::from("k"),
+            op: String::from("sql"),
+            table: String::new(),
+            pk: String::new(),
+            value: String::new(),
+            sql: String::from("SELECT * FROM docs"),
+            limit: 0,
+            ttl_secs: 0,
+        })
+        .unwrap();
+        let response = native.dispatch(&request).await;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.rows.as_ref().map(Vec::len), Some(1));
     }
 
     #[tokio::test]
