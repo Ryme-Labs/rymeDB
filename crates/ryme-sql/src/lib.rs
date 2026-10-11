@@ -10021,16 +10021,9 @@ where
                     .collect());
             }
         }
-        let rls_enabled = self
-            .rls_enabled
-            .read()
-            .ok()
-            .is_some_and(|tables| tables.contains(table));
+        let rls_enabled = self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table));
         if txn.writes().is_empty() && filter.is_empty() && !rls_enabled {
-            return self
-                .manager
-                .scan_async(txn, &self.tenant, &self.database, table, limit)
-                .await;
+            return self.manager.scan_async(txn, &self.tenant, &self.database, table, limit).await;
         }
         if txn.writes().is_empty() && !filter.is_empty() {
             const PAGE: usize = 1024;
@@ -10038,10 +10031,11 @@ where
             let mut after = None;
             loop {
                 let page = match after.as_deref() {
-                    Some(after) => self
-                        .manager
-                        .scan_after_async(txn, &self.tenant, &self.database, table, after, PAGE)
-                        .await?,
+                    Some(after) => {
+                        self.manager
+                            .scan_after_async(txn, &self.tenant, &self.database, table, after, PAGE)
+                            .await?
+                    }
                     None => {
                         self.manager
                             .scan_async(txn, &self.tenant, &self.database, table, PAGE)
