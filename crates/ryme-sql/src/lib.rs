@@ -8297,13 +8297,7 @@ where
         if self.role_is_superuser() {
             return Ok(());
         }
-        if matches!(
-            statement,
-            Statement::CreateRole { .. }
-                | Statement::DropRole { .. }
-                | Statement::PrivilegeChange { .. }
-                | Statement::DefaultPrivilegeChange { .. }
-        ) {
+        if statement.is_schema_change() {
             return Err(RymeError::Forbidden);
         }
         let mut required = Vec::new();
@@ -15731,6 +15725,18 @@ mod tests {
             .execute(parse("UPDATE public.messages SET body = 'blocked' WHERE id = 'one'").unwrap())
             .await
             .is_err());
+        assert!(matches!(
+            reader
+                .execute(parse("CREATE INDEX messages_body_idx ON public.messages (body)").unwrap())
+                .await,
+            Err(RymeError::Forbidden)
+        ));
+        assert!(matches!(
+            reader
+                .execute(parse("CREATE TABLE public.private_data (id TEXT PRIMARY KEY)").unwrap())
+                .await,
+            Err(RymeError::Forbidden)
+        ));
 
         executor
             .execute(parse("REVOKE SELECT ON TABLE public.messages FROM app_reader").unwrap())
