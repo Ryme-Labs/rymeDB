@@ -56,6 +56,8 @@ The equivalent CLI flags are `--pg-listen`, `--resp-listen`,
 Optional TLS listeners require `tls_cert_pem` and `tls_key_pem`. Add
 `tls_client_ca_pem` to require client certificates. `raft_tls` additionally
 requires a Raft listener, server certificate/key, and client CA.
+Non-loopback Raft listeners always require `raft_tls: true`; loopback-only
+development Raft listeners may remain plaintext.
 
 :::danger[Bind deliberately]
 
@@ -75,6 +77,10 @@ their local trust/development behavior.
 
 ```json
 {
+  "raft_tls": true,
+  "tls_cert_pem": "/etc/rymedb/tls/tls.crt",
+  "tls_key_pem": "/etc/rymedb/tls/tls.key",
+  "tls_client_ca_pem": "/etc/rymedb/tls/ca.crt",
   "cluster": {
     "node_index": 0,
     "raft_listen": "10.0.0.10:9080",

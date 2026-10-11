@@ -11,6 +11,12 @@ service:
 apiKeySecret:
   name: rymedb-api-key
   key: api-key
+raftTls:
+  enabled: true
+  secretName: ""
+  certKey: tls.crt
+  keyKey: tls.key
+  caKey: ca.crt
 config:
   durability: local-durable
   cacheBytes: 268435456

@@ -61,6 +61,9 @@ spec:
             - name: entrypoint
               mountPath: /etc/rymedb/entrypoint.sh
               subPath: entrypoint.sh
+            - name: raft-tls
+              mountPath: /etc/rymedb/tls
+              readOnly: true
           {{- with .Values.nodeSelector }}
           nodeSelector:
             {{- toYaml . | nindent 12 }}
@@ -78,6 +81,9 @@ spec:
           configMap:
             name: {{ include "rymedb.fullname" . }}-entrypoint
             defaultMode: 0755
+        - name: raft-tls
+          secret:
+            secretName: {{ required "raftTls.secretName is required for the chart's Raft mTLS" .Values.raftTls.secretName }}
   volumeClaimTemplates:
     - metadata:
         name: data

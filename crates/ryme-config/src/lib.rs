@@ -293,6 +293,11 @@ impl Config {
         if self.cluster.raft_listen.is_some() && self.shards > 1 {
             return Err(RymeError::InvalidArgument(String::from("cluster sharding")));
         }
+        if let Some(raft_listen) = self.cluster.raft_listen {
+            if !raft_listen.ip().is_loopback() && !self.raft_tls {
+                return Err(RymeError::InvalidArgument(String::from("raft tls")));
+            }
+        }
         if !self.replicated_tables.is_empty() && self.cluster.raft_listen.is_none() {
             return Err(RymeError::InvalidArgument(String::from("replicated_tables")));
         }
@@ -367,6 +372,21 @@ mod tests {
             ..Config::default()
         };
         assert!(full.validate().is_ok());
+    }
+
+    #[test]
+    fn non_loopback_raft_listener_requires_tls() {
+        let cluster = ClusterConfig {
+            raft_listen: Some(SocketAddr::from(([10, 0, 0, 10], 9080))),
+            ..ClusterConfig::default()
+        };
+        let config = Config { cluster, ..Config::default() };
+        assert!(config.validate().is_err());
+
+        let loopback_cluster =
+            ClusterConfig { raft_listen: Some(loopback(9080)), ..ClusterConfig::default() };
+        let loopback_config = Config { cluster: loopback_cluster, ..Config::default() };
+        assert!(loopback_config.validate().is_ok());
     }
 
     #[test]

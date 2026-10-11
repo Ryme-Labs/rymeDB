@@ -62,6 +62,11 @@ read -rsp 'API key: ' RYME_API_KEY; echo
 kubectl -n rymedb create secret generic rymedb-api-key \
   --from-literal=api-key="$RYME_API_KEY"
 unset RYME_API_KEY
+
+kubectl -n rymedb create secret generic rymedb-raft-tls \
+  --from-file=tls.crt=./tls.crt \
+  --from-file=tls.key=./tls.key \
+  --from-file=ca.crt=./ca.crt
 ```
 
 Install the chart, setting the image tag and your cluster's storage class:
@@ -71,8 +76,12 @@ helm upgrade --install rymedb deploy/k8s/helm/rymeDB \
   --namespace rymedb \
   --set image.repository=ghcr.io/ryme-labs/rymedb \
   --set image.tag=0.1.0 \
+  --set raftTls.secretName=rymedb-raft-tls \
   --set persistence.storageClass=YOUR_STORAGE_CLASS
 ```
+
+The chart binds Raft on the pod network and requires mutual TLS. Create the
+`rymedb-raft-tls` Secret with a certificate trusted by `ca.crt` before install.
 
 Wait for the pods and inspect cluster status:
 

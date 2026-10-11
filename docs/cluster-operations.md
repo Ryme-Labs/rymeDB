@@ -16,6 +16,10 @@ Create one JSON file per node. Use real reachable addresses in production:
   "http_listen": "10.0.0.10:8080",
   "data_dir": "/var/lib/rymedb",
   "durability": "local-durable",
+  "raft_tls": true,
+  "tls_cert_pem": "/etc/rymedb/tls/tls.crt",
+  "tls_key_pem": "/etc/rymedb/tls/tls.key",
+  "tls_client_ca_pem": "/etc/rymedb/tls/ca.crt",
   "cluster": {
     "node_index": 0,
     "raft_listen": "10.0.0.10:9080",
