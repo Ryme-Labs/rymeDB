@@ -7884,10 +7884,19 @@ async fn backup_restore(
     if !principal.can_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if state.backend.is_cluster() {
-        return error_response(ryme_error::RymeError::Unavailable(String::from(
-            "restore unavailable in cluster mode",
-        )));
+    if let Backend::Cluster(cluster) = &state.backend {
+        return match cluster.node().propose_restore(query.target).await {
+            Ok(raft_index) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "target": query.target,
+                    "raft_index": raft_index,
+                    "mode": "cluster"
+                })),
+            )
+                .into_response(),
+            Err(e) => error_response(e),
+        };
     }
     let restored = match &state.backend {
         Backend::Single(manager) => manager.restore_to(query.target).map(|replayed| vec![replayed]),

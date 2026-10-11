@@ -268,8 +268,22 @@ async fn cluster_write_failover_restart() {
         );
     }
     let first = wait_leader(&http, None).await;
-    let (status, _) = http_request(http[first], "PUT /v1/kv/docs/dkey", b"{\"n\":1}").await;
+    let (status, response) = http_request(http[first], "PUT /v1/kv/docs/dkey", b"{\"n\":1}").await;
     assert_eq!(status, 200);
+    let first_commit = serde_json::from_slice::<serde_json::Value>(&response)
+        .unwrap()
+        .get("commit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap();
+    wait_value(&http, "dkey", "{\"n\":1}").await;
+    let (status, _) = http_request(http[first], "PUT /v1/kv/docs/dkey", b"{\"n\":9}").await;
+    assert_eq!(status, 200);
+    wait_value(&http, "dkey", "{\"n\":9}").await;
+    let (status, response) =
+        http_request(http[first], &format!("POST /v1/backups/restore?target={first_commit}"), b"")
+            .await;
+    assert_eq!(status, 200, "cluster restore response: {}", String::from_utf8_lossy(&response));
+    assert!(String::from_utf8_lossy(&response).contains("\"mode\":\"cluster\""));
     wait_value(&http, "dkey", "{\"n\":1}").await;
     handles.remove(first).shutdown();
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -445,6 +459,10 @@ async fn cluster_range_split_replicates_metadata() {
     assert!(response.contains("\"verified\":true"), "range transfer failed: {response}");
     assert!(response.contains("\"leader\":\"raft-"));
     assert!(response.contains("\"source_cleanup\":true"), "source cleanup deferred: {response}");
+    let (status, response) =
+        http_request(http[leader], "POST /v1/backups/restore?target=1", b"").await;
+    assert_eq!(status, 503, "range restore response: {}", String::from_utf8_lossy(&response));
+    assert!(String::from_utf8_lossy(&response).contains("range ownership is active"));
     let verify_after =
         format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":2}}");
     let (status, response) =

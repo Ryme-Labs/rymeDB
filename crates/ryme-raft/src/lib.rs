@@ -180,6 +180,7 @@ pub enum ApplyPayload {
     Metadata { payload: Vec<u8> },
     Topic { payload: Vec<u8> },
     Resolution { payload: Vec<u8> },
+    Restore { target: u64 },
 }
 
 pub fn encode_conf(members: &[crate::net::Member]) -> Result<Vec<u8>> {
@@ -223,6 +224,13 @@ pub fn encode_resolution(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn encode_restore(target: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.push(5u8);
+    out.extend_from_slice(&target.to_be_bytes());
+    out
+}
+
 pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
     if input.first() == Some(&1u8) {
         let body = &input[1..];
@@ -252,6 +260,15 @@ pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
             return Err(RymeError::Corrupt(String::from("resolution")));
         }
         return Ok(ApplyPayload::Resolution { payload: input[1..].to_vec() });
+    }
+    if input.first() == Some(&5u8) {
+        if input.len() != 9 {
+            return Err(RymeError::Corrupt(String::from("restore")));
+        }
+        let target = u64::from_be_bytes(
+            input[1..9].try_into().map_err(|_| RymeError::Corrupt(String::from("restore")))?,
+        );
+        return Ok(ApplyPayload::Restore { target });
     }
     let (commit_ts, writes) = decode_applied(input)?;
     Ok(ApplyPayload::Data { commit_ts, writes })
@@ -580,5 +597,10 @@ mod tests {
             ApplyPayload::Resolution { payload: br#"{"pending":true}"#.to_vec() }
         );
         assert!(matches!(encode_resolution(&[]), Err(RymeError::InvalidArgument(_))));
+        assert_eq!(
+            decode_apply(&encode_restore(42)).unwrap(),
+            ApplyPayload::Restore { target: 42 }
+        );
+        assert!(matches!(decode_apply(&[5, 0]), Err(RymeError::Corrupt(_))));
     }
 }

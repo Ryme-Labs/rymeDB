@@ -163,11 +163,18 @@ retained snapshot. Point-in-time restore therefore reaches back to the oldest
 retained snapshot; older targets return `404 {"error":"snapshot"}`. Sealed
 archives are unaffected and remain the long-term recovery path.
 
-**Hard rule: restore is unavailable in cluster mode.** Both `Cluster` and
-`Hybrid` backends answer `503 {"error":"restore unavailable in cluster
-mode"}`. Only `Single` and `Sharded` backends restore. To recover a cluster,
-bring up fresh nodes and re-add them through the membership API instead (see
-`docs/cluster-operations.md`).
+Cluster restore is coordinated through Raft when the cluster is still in
+whole-dataset replication mode. The leader appends one restore command and
+each member rebuilds the state from its committed Raft data log, so a restart
+replays the same restore decision. The target must not be ahead of the latest
+commit. `Hybrid` remains unavailable.
+
+**Range-sharded mode cannot use this endpoint yet.** Once range ownership is
+active, each node intentionally stores only its assigned ranges and one Raft
+log is no longer a complete database image. The endpoint returns `503` rather
+than silently restoring an incomplete copy. Recover that layout from a
+range-aware backup by bringing up fresh nodes and re-adding them through the
+membership API (see `docs/cluster-operations.md`).
 
 ## S3 settings
 

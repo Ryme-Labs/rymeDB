@@ -123,9 +123,10 @@ cluster: the set changes atomically instead of passing through an intermediate
   and operator commands at the new leader (find it via `/ready`).
 - **Quorum loss:** restore at least a quorum of data dirs from backup/snapshot
   and restart those nodes; a single surviving copy cannot commit on its own.
-- **Restore caveat:** `POST /v1/backups/restore` is unavailable in cluster
-  mode (`503`). Rebuild clusters by re-adding fresh nodes, not by restoring
-  over a live quorum. See `docs/backup-restore.md`.
+- **Restore:** `POST /v1/backups/restore` is coordinated through Raft while
+  whole-dataset replication is active. It returns `503` after range ownership
+  is enabled because a single node no longer contains the complete dataset.
+  See `docs/backup-restore.md`.
 
 ## Placement ranges
 

@@ -1,6 +1,6 @@
 use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
-use ryme_storage::{RecordKey, TableVersion};
+use ryme_storage::{Engine, RecordKey, TableVersion};
 use ryme_txn::{decode_writes, encode_writes, now_unix, TxnManager};
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
@@ -703,6 +703,7 @@ fn validate_apply_payload(input: &[u8]) -> Result<()> {
             let _: ResolutionRecord = serde_json::from_slice(&payload)
                 .map_err(|_| RymeError::Corrupt(String::from("resolution")))?;
         }
+        ApplyPayload::Restore { .. } => {}
     }
     Ok(())
 }
@@ -1006,6 +1007,7 @@ impl Node {
         log.sort_by_key(|e| e.index);
         let mut applied = 0u64;
         let mut replayed_commit_ts = BTreeSet::new();
+        let mut replayed_data = Vec::new();
         let mut replayed: Option<crate::ConfChange> = None;
         let mut replayed_joint: Option<Vec<Member>> = None;
         let mut metadata = None;
@@ -1015,6 +1017,7 @@ impl Node {
                 ApplyPayload::Data { commit_ts, writes } => {
                     let writes = decode_writes(&writes)?;
                     manager.replay_at(commit_ts, &writes)?;
+                    replayed_data.push((commit_ts, writes));
                     replayed_commit_ts.insert(commit_ts);
                 }
                 ApplyPayload::Conf { change } => {
@@ -1059,6 +1062,14 @@ impl Node {
                         }
                         ResolutionRecord::Complete { .. } => {}
                     }
+                }
+                ApplyPayload::Restore { target } => {
+                    let replay = replayed_data
+                        .iter()
+                        .filter(|(commit_ts, _)| *commit_ts <= target)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    manager.restore_with_replay(Engine::default(), &replay)?;
                 }
             }
             applied = entry.index;
@@ -2013,6 +2024,9 @@ impl Node {
                 ApplyPayload::Resolution { payload } => {
                     self.apply_resolution(payload)?;
                 }
+                ApplyPayload::Restore { target } => {
+                    self.restore_to(target).await?;
+                }
             }
             self.inner.lock().await.applied = entry.index;
         }
@@ -2720,6 +2734,42 @@ impl Node {
         let index = self.propose_frame(encoded).await?;
         self.wait_applied(index).await?;
         Ok(index)
+    }
+
+    pub async fn propose_restore(self: &Arc<Self>, target: u64) -> Result<u64> {
+        if !self.range_owners().is_empty() {
+            return Err(RymeError::Unavailable(String::from(
+                "restore unavailable while range ownership is active",
+            )));
+        }
+        if target > self.manager.latest_commit() {
+            return Err(RymeError::InvalidArgument(String::from("restore target")));
+        }
+        let index = self.propose_frame(crate::encode_restore(target)).await?;
+        self.wait_applied(index).await?;
+        Ok(index)
+    }
+
+    async fn restore_to(&self, target: u64) -> Result<u64> {
+        if !self.range_owners().is_empty() {
+            return Err(RymeError::Unavailable(String::from(
+                "restore unavailable while range ownership is active",
+            )));
+        }
+        let entries = {
+            let inner = self.inner.lock().await;
+            inner.log.clone()
+        };
+        let mut replay = Vec::new();
+        for entry in entries {
+            let ApplyPayload::Data { commit_ts, writes } = decode_apply(&entry.payload)? else {
+                continue;
+            };
+            if commit_ts <= target {
+                replay.push((commit_ts, decode_writes(&writes)?));
+            }
+        }
+        self.manager.restore_with_replay(Engine::default(), &replay)
     }
 
     async fn propose_resolutions(
@@ -5639,6 +5689,42 @@ mod tests {
             node.purge_range_after_transfer("range-a", 2, &changed_snapshot).await,
             Err(RymeError::Conflict(message)) if message == "range changed during transfer"
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn restore_rebuilds_a_whole_dataset_from_the_committed_log() {
+        let dir = temp_dir("raft-restore");
+        let key = RecordKey::new("t", "d", "docs", b"row");
+        let mut first = BTreeMap::new();
+        first.insert(key.clone(), ryme_txn::WriteOp::put(b"before".to_vec()));
+        let mut second = BTreeMap::new();
+        second.insert(key.clone(), ryme_txn::WriteOp::put(b"after".to_vec()));
+        let entries = vec![
+            LogEntry {
+                index: 1,
+                term: 1,
+                payload: encode_applied(10, &encode_writes(&first).unwrap()),
+            },
+            LogEntry {
+                index: 2,
+                term: 1,
+                payload: encode_applied(20, &encode_writes(&second).unwrap()),
+            },
+            LogEntry { index: 3, term: 1, payload: crate::encode_restore(10) },
+        ];
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        {
+            let mut inner = node.inner.lock().await;
+            inner.persist_entries(&entries).unwrap();
+            inner.log.extend(entries);
+            inner.commit_index = 3;
+            inner.term = 1;
+        }
+        node.apply_ready().await.unwrap();
+
+        let mut probe = node.manager.begin();
+        assert_eq!(node.manager.get(&mut probe, &key).unwrap(), Some(b"before".to_vec()));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
