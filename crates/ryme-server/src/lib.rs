@@ -3929,15 +3929,20 @@ fn retain_rest_row(
 fn rest_matching_keys(
     gateway: &Gateway<BranchStorage>,
     principal: &Principal,
+    executor: &Executor<BranchStorage>,
     table: &str,
     raw: &str,
 ) -> ryme_error::Result<Vec<Vec<u8>>> {
     let mut cursor = None;
     let mut keys = Vec::new();
+    let rls_enabled = executor.row_security_enabled(table);
     loop {
         let (page, next) =
             gateway.scan_page(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)?;
-        let matches = rest_list_filtered(page, raw);
+        let matches = rest_list_filtered(page, raw)
+            .into_iter()
+            .filter(|(_, value)| !rls_enabled || executor.row_allowed_by_rls(table, value))
+            .collect::<Vec<_>>();
         if matches.len() > ryme_gateway::MAX_BATCH_ROWS.saturating_sub(keys.len()) {
             return Err(ryme_error::RymeError::Overload(String::from("rows")));
         }
@@ -3951,15 +3956,20 @@ fn rest_matching_keys(
 fn rest_conflict_key(
     gateway: &Gateway<BranchStorage>,
     principal: &Principal,
+    executor: &Executor<BranchStorage>,
     table: &str,
     field: &str,
     expected: &serde_json::Value,
 ) -> ryme_error::Result<Option<Vec<u8>>> {
     let mut cursor = None;
+    let rls_enabled = executor.row_security_enabled(table);
     loop {
         let (page, next) =
             gateway.scan_page(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)?;
         for (key, value) in page {
+            if rls_enabled && !executor.row_allowed_by_rls(table, &value) {
+                continue;
+            }
             let row = rest_row_to_json(&key, &value);
             if row.get(field) == Some(expected) {
                 return Ok(Some(key));
@@ -3982,9 +3992,16 @@ async fn rest_list(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_read() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let executor = match table_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &["SELECT"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
@@ -3998,6 +4015,7 @@ async fn rest_list(
     let count_exact = rest_prefer(&headers, "count=exact");
     let target = limit.saturating_add(offset);
     let full_order_scan = rest_order_requires_full_scan(query.order.as_deref());
+    let rls_enabled = executor.row_security_enabled(&table);
     let page_limit = REST_SCAN_PAGE_ROWS;
     let mut cursor = None;
     let mut filtered = Vec::new();
@@ -4011,7 +4029,10 @@ async fn rest_list(
             Ok(page) => page,
             Err(e) => return error_response(e),
         };
-        let matches = rest_list_filtered(page, raw);
+        let matches = rest_list_filtered(page, raw)
+            .into_iter()
+            .filter(|(_, value)| !rls_enabled || executor.row_allowed_by_rls(&table, value))
+            .collect::<Vec<_>>();
         total = total.saturating_add(matches.len());
         if full_order_scan {
             for row in matches {
@@ -4458,9 +4479,16 @@ async fn rest_insert(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let executor = match table_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &["INSERT"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
@@ -4484,12 +4512,26 @@ async fn rest_insert(
                 .filter(|field| !field.is_empty())
                 .map(str::to_string)
         });
+    let executor = if conflict_field.is_some() {
+        match table_executor_for_principal(
+            &state,
+            &headers,
+            &principal,
+            &table,
+            &["INSERT", "UPDATE"],
+        ) {
+            Ok(executor) => executor,
+            Err(e) => return error_response(e),
+        }
+    } else {
+        executor
+    };
     let mut pending = Vec::with_capacity(rows.len());
     for (body, (mut key, value)) in rows {
         if let Some(field) = conflict_field.as_deref() {
             if let Some(expected) = body.fields.get(field) {
                 if let Some(existing) =
-                    match rest_conflict_key(&gateway, &principal, &table, field, expected) {
+                    match rest_conflict_key(&gateway, &principal, &executor, &table, field, expected) {
                         Ok(existing) => existing,
                         Err(e) => return error_response(e),
                     }
@@ -4497,6 +4539,9 @@ async fn rest_insert(
                     key = existing;
                 }
             }
+        }
+        if !executor.row_allowed_for_write(&table, &value) {
+            return error_response(ryme_error::RymeError::Forbidden);
         }
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
@@ -4549,9 +4594,16 @@ async fn rest_upsert(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let executor = match table_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &["UPDATE"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
@@ -4559,7 +4611,7 @@ async fn rest_upsert(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    let keys = match rest_matching_keys(&gateway, &principal, &table, &raw) {
+    let keys = match rest_matching_keys(&gateway, &principal, &executor, &table, &raw) {
         Ok(keys) => keys,
         Err(e) => return error_response(e),
     };
@@ -4584,6 +4636,9 @@ async fn rest_upsert(
             Ok(value) => value,
             Err(e) => return error_response(ryme_error::RymeError::InvalidArgument(e.to_string())),
         };
+        if !executor.row_allowed_for_write(&table, &value) {
+            return error_response(ryme_error::RymeError::Forbidden);
+        }
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
@@ -4619,9 +4674,16 @@ async fn rest_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let executor = match table_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &["DELETE"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
@@ -4635,7 +4697,7 @@ async fn rest_delete(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    let keys = match rest_matching_keys(&gateway, &principal, &table, &raw) {
+    let keys = match rest_matching_keys(&gateway, &principal, &executor, &table, &raw) {
         Ok(keys) => keys,
         Err(e) => return error_response(e),
     };
@@ -4647,6 +4709,16 @@ async fn rest_delete(
             .into_response();
     }
     for key in &keys {
+        let current = match gateway.get(&principal, &table, key) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return error_response(ryme_error::RymeError::NotFound(String::from("row")))
+            }
+            Err(e) => return error_response(e),
+        };
+        if !executor.row_allowed_for_write(&table, &current) {
+            return error_response(ryme_error::RymeError::Forbidden);
+        }
         if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {
             return error_response(e);
         }
@@ -4760,9 +4832,24 @@ async fn graphql_exec(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_read() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let table = match parse_graphql_table(&body.query) {
+        Some(table) => table,
+        None => {
+            return error_response(ryme_error::RymeError::InvalidArgument(String::from(
+                "table(key:) required",
+            )))
+        }
+    };
+    let executor = match table_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &["SELECT"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
@@ -4770,7 +4857,7 @@ async fn graphql_exec(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    match execute_graphql(&state, &gateway, &principal, &body.query).await {
+    match execute_graphql(&state, &gateway, &principal, &executor, &table, &body.query).await {
         Ok(value) => (StatusCode::OK, Json(serde_json::json!({ "data": value }))).into_response(),
         Err(e) => error_response(e),
     }
@@ -4780,23 +4867,27 @@ async fn execute_graphql(
     state: &SharedState,
     gateway: &Gateway<BranchStorage>,
     principal: &Principal,
+    executor: &Executor<BranchStorage>,
+    table: &str,
     query: &str,
 ) -> ryme_error::Result<serde_json::Value> {
-    let table = parse_graphql_table(query).ok_or_else(|| {
-        ryme_error::RymeError::InvalidArgument(String::from("table(key:) required"))
-    })?;
     if let Some(key) = parse_graphql_key(query) {
         match gateway.get(principal, &table, key.as_bytes())? {
-            Some(value) => {
+            Some(value) if executor.row_allowed_by_rls(table, &value) => {
                 admit_egress(state, &principal.tenant, value.len() as u64)?;
                 let masked = gateway.masked(&table, value);
                 Ok(serde_json::json!({ table: rest_row_to_json(key.as_bytes(), &masked) }))
             }
-            None => Ok(serde_json::json!({ table: serde_json::Value::Null })),
+            _ => Ok(serde_json::json!({ table: serde_json::Value::Null })),
         }
     } else {
         let limit = parse_graphql_limit(query).unwrap_or(100).min(1000);
-        let rows = gateway.scan_async(principal, &table, limit).await?;
+        let rows = gateway
+            .scan_async(principal, table, limit)
+            .await?
+            .into_iter()
+            .filter(|(_, value)| executor.row_allowed_by_rls(table, value))
+            .collect::<Vec<_>>();
         let egress: u64 = rows.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
         admit_egress(state, &principal.tenant, egress)?;
         let items: Vec<serde_json::Value> = rows
@@ -8126,7 +8217,7 @@ fn index_space(tenant: &str, database: &str, table: &str) -> String {
     format!("{tenant}/{database}/{table}")
 }
 
-fn index_executor_for_principal(
+fn table_executor_for_principal(
     state: &SharedState,
     headers: &HeaderMap,
     principal: &Principal,
@@ -8257,7 +8348,7 @@ async fn vector_upsert(
             "vector target",
         )));
     }
-    let executor = match index_executor_for_principal(
+    let executor = match table_executor_for_principal(
         &state,
         &headers,
         &principal,
@@ -8310,7 +8401,7 @@ async fn vector_search(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match index_executor_for_principal(
+    let executor = match table_executor_for_principal(
         &state,
         &headers,
         &principal,
@@ -8366,7 +8457,7 @@ async fn vector_ann_search(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match index_executor_for_principal(
+    let executor = match table_executor_for_principal(
         &state,
         &headers,
         &principal,
@@ -8415,7 +8506,7 @@ async fn vector_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match index_executor_for_principal(
+    let executor = match table_executor_for_principal(
         &state,
         &headers,
         &principal,
@@ -8461,7 +8552,7 @@ async fn text_index(
     if request.table.is_empty() || request.id.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("text target")));
     }
-    let executor = match index_executor_for_principal(
+    let executor = match table_executor_for_principal(
         &state,
         &headers,
         &principal,
@@ -8514,7 +8605,7 @@ async fn text_search(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match index_executor_for_principal(
+    let executor = match table_executor_for_principal(
         &state,
         &headers,
         &principal,
@@ -8558,7 +8649,7 @@ async fn text_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match index_executor_for_principal(
+    let executor = match table_executor_for_principal(
         &state,
         &headers,
         &principal,

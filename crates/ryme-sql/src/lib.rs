@@ -8787,6 +8787,10 @@ where
         self.rls_is_enabled(table)
     }
 
+    pub fn row_allowed_for_write(&self, table: &str, value: &[u8]) -> bool {
+        self.enforce_rls(table, value).is_ok()
+    }
+
     fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
         if !self.rls_applies_to_role(table) {
             return Ok(());
