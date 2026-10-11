@@ -4406,6 +4406,8 @@ mod tests {
             ViewDefinition {
                 name: String::from("active_messages"),
                 query: parse("SELECT * FROM messages").unwrap(),
+                materialized: false,
+                rows: Vec::new(),
             },
         );
         executor.restore_schema_snapshot(snapshot).unwrap();

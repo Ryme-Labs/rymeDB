@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "apps/**"
+      - "schemas/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "apps/**"
+      - "schemas/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust core and protocol tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting for core packages
+        run: >-
+          cargo fmt
+          --package ryme-sql
+          --package ryme-wire-resp
+          --package ryme-wire-pg
+          --package ryme-raft
+          -- --check
+
+      - name: Run SQL and protocol tests
+        run: >-
+          cargo test --locked
+          -p ryme-sql
+          -p ryme-wire-resp
+          -p ryme-wire-pg
+
+      - name: Run Raft tests
+        run: cargo test --locked -p ryme-raft
+
+      - name: Compile the server
+        run: cargo check --locked -p ryme-server

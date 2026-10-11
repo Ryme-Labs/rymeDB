@@ -1,5 +1,7 @@
 # Changelog
 
+- Added a hosted CI workflow that checks formatting for core packages, runs
+  SQL/RESP/PostgreSQL/Raft tests, and compiles the server on Rust changes.
 - Materialized views now support `CREATE MATERIALIZED VIEW`, `WITH DATA` and
   `WITH NO DATA`, `REFRESH MATERIALIZED VIEW` (including `CONCURRENTLY` syntax),
   and `DROP MATERIALIZED VIEW`. Cached rows persist through schema snapshots.
