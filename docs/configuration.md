@@ -66,7 +66,9 @@ explicitly for a cluster. Do not expose trust-mode development listeners.
 Startup fails closed for non-loopback listeners unless the matching credentials
 are configured: `RYME_API_KEY` for HTTP/native/gRPC APIs,
 `RYME_PG_PASSWORD` for PostgreSQL, and `RYME_RESP_PASSWORD` for RESP. There is
-no fixed fallback owner key.
+no fixed fallback owner key. Credentials protecting non-loopback listeners
+must contain at least 16 bytes; loopback-only development listeners retain
+their local trust/development behavior.
 :::
 
 ## Cluster

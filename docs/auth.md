@@ -33,6 +33,10 @@ wss://db.example.com/v1/stream?table=messages&api_key=...&branch=main
 Never put a long-lived owner key in browser code. Mint a narrowly scoped
 application credential or use a server-side proxy.
 
+When a listener is bound beyond loopback, its API key or protocol password must
+contain at least 16 bytes. Use a randomly generated value rather than a sample
+or human-memorable password.
+
 ## Roles and tenants
 
 JWTs accept rymeDB claims (`tenant`, `roles`) and common Supabase claims

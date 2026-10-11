@@ -815,6 +815,10 @@ fn validate_listener_auth(
     pg_password: Option<&str>,
     resp_password: Option<&str>,
 ) -> ryme_error::Result<()> {
+    const MIN_EXTERNAL_CREDENTIAL_BYTES: usize = 16;
+    let strong_enough = |value: Option<&str>| {
+        value.is_some_and(|value| value.as_bytes().len() >= MIN_EXTERNAL_CREDENTIAL_BYTES)
+    };
     let requires_api_key = [
         Some(config.http_listen),
         config.native_listen,
@@ -826,23 +830,21 @@ fn validate_listener_auth(
     .into_iter()
     .flatten()
     .any(|listener| !listener.ip().is_loopback());
-    if requires_api_key && !matches!(api_key, Some(value) if !value.is_empty()) {
+    if requires_api_key && !strong_enough(api_key) {
         return Err(ryme_error::RymeError::InvalidArgument(String::from(
-            "RYME_API_KEY is required for non-loopback API listeners",
+            "RYME_API_KEY must contain at least 16 bytes for non-loopback API listeners",
         )));
     }
-    if !config.pg_listen.ip().is_loopback()
-        && !matches!(pg_password, Some(value) if !value.is_empty())
-    {
+    if !config.pg_listen.ip().is_loopback() && !strong_enough(pg_password) {
         return Err(ryme_error::RymeError::InvalidArgument(String::from(
-            "RYME_PG_PASSWORD is required for a non-loopback PostgreSQL listener",
+            "RYME_PG_PASSWORD must contain at least 16 bytes for a non-loopback PostgreSQL listener",
         )));
     }
     let resp_is_external = !config.resp_listen.ip().is_loopback()
         || config.resp_tls_listen.is_some_and(|listener| !listener.ip().is_loopback());
-    if resp_is_external && !matches!(resp_password, Some(value) if !value.is_empty()) {
+    if resp_is_external && !strong_enough(resp_password) {
         return Err(ryme_error::RymeError::InvalidArgument(String::from(
-            "RYME_RESP_PASSWORD is required for a non-loopback RESP listener",
+            "RYME_RESP_PASSWORD must contain at least 16 bytes for a non-loopback RESP listener",
         )));
     }
     Ok(())
@@ -12103,6 +12105,8 @@ mod realtime_policy_tests {
 
     #[test]
     fn public_listeners_require_explicit_protocol_credentials() {
+        const API_KEY: &str = "api-key-1234567890";
+        const PG_PASSWORD: &str = "pg-password-123456";
         let mut config = Config::default();
         assert!(validate_listener_auth(&config, None, None, None).is_ok());
 
@@ -12112,21 +12116,22 @@ mod realtime_policy_tests {
             Err(ryme_error::RymeError::InvalidArgument(message))
                 if message.contains("RYME_API_KEY")
         ));
-        assert!(validate_listener_auth(&config, Some("api-key"), None, None).is_ok());
+        assert!(validate_listener_auth(&config, Some("api-key"), None, None).is_err());
+        assert!(validate_listener_auth(&config, Some(API_KEY), None, None).is_ok());
 
         config = Config::default();
         config.pg_listen = "0.0.0.0:5433".parse().unwrap();
         assert!(matches!(
-            validate_listener_auth(&config, Some("api-key"), None, None),
+            validate_listener_auth(&config, Some(API_KEY), None, None),
             Err(ryme_error::RymeError::InvalidArgument(message))
                 if message.contains("RYME_PG_PASSWORD")
         ));
-        assert!(validate_listener_auth(&config, Some("api-key"), Some("pg-password"), None).is_ok());
+        assert!(validate_listener_auth(&config, Some(API_KEY), Some(PG_PASSWORD), None).is_ok());
 
         config = Config::default();
         config.resp_listen = "0.0.0.0:6380".parse().unwrap();
         assert!(matches!(
-            validate_listener_auth(&config, Some("api-key"), Some("pg-password"), None),
+            validate_listener_auth(&config, Some(API_KEY), Some(PG_PASSWORD), None),
             Err(ryme_error::RymeError::InvalidArgument(message))
                 if message.contains("RYME_RESP_PASSWORD")
         ));
