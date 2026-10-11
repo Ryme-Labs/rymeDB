@@ -11656,7 +11656,9 @@ mod realtime_policy_tests {
             "CREATE INDEX messages_id_idx ON public.messages (id)",
             "ALTER TABLE public.messages ADD COLUMN body TEXT",
         ] {
-            assert!(ryme_sql::parse(sql).unwrap().requires_admin(), "{sql}");
+            let statement = ryme_sql::parse(sql).unwrap();
+            assert!(statement.requires_admin(), "{sql}");
+            assert!(statement.is_write(), "DDL was not classified as a write: {sql}");
         }
         assert!(!ryme_sql::parse("SELECT * FROM messages").unwrap().requires_admin());
     }

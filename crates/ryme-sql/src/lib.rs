@@ -991,7 +991,7 @@ impl Statement {
                 operation: SequenceOperation::Nextval | SequenceOperation::Setval,
                 ..
             }
-        )
+        ) || self.is_schema_change()
     }
 
     pub fn is_schema_change(&self) -> bool {
