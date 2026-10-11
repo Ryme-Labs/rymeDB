@@ -97,6 +97,41 @@ pub struct RoleDefinition {
     pub inherit: bool,
 }
 
+/// Roles supplied by the platform rather than persisted as user-created SQL roles.
+///
+/// These names are part of the authentication and PostgreSQL compatibility
+/// contract. Allowing a schema snapshot or CREATE ROLE statement to redefine
+/// one would make authorization and catalog introspection disagree.
+pub const BUILTIN_SQL_ROLES: &[&str] =
+    &["postgres", "anon", "authenticated", "service_role", "realtime_subscriber"];
+
+fn is_builtin_sql_role(name: &str) -> bool {
+    BUILTIN_SQL_ROLES.iter().any(|builtin| builtin.eq_ignore_ascii_case(name))
+}
+
+fn reserved_role_error(name: &str) -> RymeError {
+    RymeError::Conflict(format!("role {name} is reserved"))
+}
+
+fn validate_role_catalog(roles: &BTreeMap<String, RoleDefinition>) -> Result<()> {
+    let mut names = HashSet::new();
+    for role in roles.values() {
+        if is_builtin_sql_role(&role.name) {
+            return Err(RymeError::Corrupt(format!(
+                "schema snapshot contains reserved role {}",
+                role.name
+            )));
+        }
+        if !names.insert(role.name.to_ascii_lowercase()) {
+            return Err(RymeError::Corrupt(format!(
+                "schema snapshot contains duplicate role {}",
+                role.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 const fn default_role_login() -> bool {
     false
 }
@@ -7458,9 +7493,12 @@ where
     }
 
     fn install_role(&self, definition: RoleDefinition) -> Result<()> {
+        if is_builtin_sql_role(&definition.name) {
+            return Err(reserved_role_error(&definition.name));
+        }
         let mut roles =
             self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
-        if roles.contains_key(&definition.name) {
+        if roles.keys().any(|name| name.eq_ignore_ascii_case(&definition.name)) {
             return Err(RymeError::Conflict(format!("role {}", definition.name)));
         }
         roles.insert(definition.name.clone(), definition);
@@ -7469,12 +7507,14 @@ where
     }
 
     fn drop_role(&self, name: &str, if_exists: bool) -> Result<()> {
-        let removed = self
-            .roles
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("role lock")))?
-            .remove(name)
-            .is_some();
+        if is_builtin_sql_role(name) {
+            return Err(reserved_role_error(name));
+        }
+        let mut roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        let key = roles.keys().find(|key| key.eq_ignore_ascii_case(name)).cloned();
+        let removed = key.and_then(|key| roles.remove(&key)).is_some();
+        drop(roles);
         if !removed && !if_exists {
             return Err(RymeError::NotFound(format!("role {name}")));
         }
@@ -7990,6 +8030,7 @@ where
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
+        validate_role_catalog(&snapshot.roles)?;
         let functions = snapshot.functions;
         let triggers = snapshot.triggers;
         let mut views = snapshot.views;
@@ -15691,6 +15732,47 @@ mod tests {
         executor.execute(parse("DROP ROLE app_reader").unwrap()).await.unwrap();
         executor.restore_schema_snapshot(snapshot).unwrap();
         assert!(executor.schema_snapshot().roles.contains_key("app_reader"));
+    }
+
+    #[tokio::test]
+    async fn builtin_roles_cannot_be_shadowed_dropped_or_restored() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        for name in BUILTIN_SQL_ROLES {
+            let create = format!("CREATE ROLE {name}");
+            assert!(matches!(
+                executor.execute(parse(&create).unwrap()).await,
+                Err(RymeError::Conflict(message)) if message.contains("reserved")
+            ));
+            let drop = format!("DROP ROLE {name}");
+            assert!(matches!(
+                executor.execute(parse(&drop).unwrap()).await,
+                Err(RymeError::Conflict(message)) if message.contains("reserved")
+            ));
+        }
+
+        executor.execute(parse("CREATE ROLE AppReader").unwrap()).await.unwrap();
+        assert!(matches!(
+            executor.execute(parse("CREATE ROLE appreader").unwrap()).await,
+            Err(RymeError::Conflict(message)) if message.contains("role appreader")
+        ));
+        executor.execute(parse("DROP ROLE appreader").unwrap()).await.unwrap();
+
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.roles.insert(
+            String::from("postgres"),
+            RoleDefinition {
+                name: String::from("postgres"),
+                login: true,
+                superuser: false,
+                createdb: false,
+                createrole: false,
+                inherit: true,
+            },
+        );
+        assert!(matches!(
+            executor.restore_schema_snapshot(snapshot),
+            Err(RymeError::Corrupt(message)) if message.contains("reserved role")
+        ));
     }
 
     #[tokio::test]

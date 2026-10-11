@@ -11,7 +11,7 @@ use ryme_router::RangeLoadHook;
 use ryme_sql::{
     bind, parse, Executor, Field, ForeignKeyAction, IndexDefinition, InsertValue, QueryResult,
     ReturningField, RoleDefinition, SchemaSnapshot, Statement, TransactionChange,
-    SQL_NULL_SENTINEL,
+    BUILTIN_SQL_ROLES, SQL_NULL_SENTINEL,
 };
 use ryme_txn::{Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager};
 use std::collections::{HashMap, HashSet};
@@ -1873,40 +1873,20 @@ where
     }
     if upper.contains("PG_CATALOG.PG_ROLES") || upper.contains("PG_ROLES") {
         let filter = sql_literal_after(query, "ROLNAME");
-        let mut roles = vec![
-            RoleDefinition {
-                name: String::from("postgres"),
-                login: true,
-                superuser: true,
-                createdb: true,
-                createrole: true,
-                inherit: true,
-            },
-            RoleDefinition {
-                name: String::from("anon"),
-                login: false,
-                superuser: false,
-                createdb: false,
-                createrole: false,
-                inherit: true,
-            },
-            RoleDefinition {
-                name: String::from("authenticated"),
-                login: false,
-                superuser: false,
-                createdb: false,
-                createrole: false,
-                inherit: true,
-            },
-            RoleDefinition {
-                name: String::from("service_role"),
-                login: false,
-                superuser: false,
-                createdb: false,
-                createrole: false,
-                inherit: true,
-            },
-        ];
+        let mut roles: Vec<RoleDefinition> = BUILTIN_SQL_ROLES
+            .iter()
+            .map(|name| {
+                let is_postgres = *name == "postgres";
+                RoleDefinition {
+                    name: String::from(*name),
+                    login: is_postgres,
+                    superuser: is_postgres,
+                    createdb: is_postgres,
+                    createrole: is_postgres,
+                    inherit: true,
+                }
+            })
+            .collect();
         for role in executor.catalog_roles() {
             if let Some(existing) = roles.iter_mut().find(|entry| entry.name == role.name) {
                 *existing = role;
@@ -5193,6 +5173,15 @@ mod tests {
         .unwrap();
         assert!(roles.windows(b"app_reader".len()).any(|window| window == b"app_reader"));
         assert!(roles.windows(b"t".len()).any(|window| window == b"t"));
+
+        let realtime_roles = catalog_query(
+            "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname = 'realtime_subscriber'",
+            &executor,
+        )
+        .unwrap();
+        assert!(realtime_roles
+            .windows(b"realtime_subscriber".len())
+            .any(|window| window == b"realtime_subscriber"));
 
         let privileges = catalog_query(
             "SELECT grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges WHERE table_name = 'messages'",
