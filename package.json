@@ -10,6 +10,7 @@
     "lint": "turbo run lint",
     "docs:dev": "node scripts/prepare-docs.mjs && docusaurus start",
     "docs:build": "node scripts/prepare-docs.mjs && docusaurus build",
+    "docs:build:ci": "node scripts/prepare-docs.mjs && docusaurus build --out-dir _site",
     "docs:serve": "docusaurus serve",
     "prepare": "husky"
   },
