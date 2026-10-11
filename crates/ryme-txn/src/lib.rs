@@ -912,6 +912,14 @@ impl TxnManager {
                 .engine
                 .write()
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+            for key in writes.keys() {
+                if engine
+                    .latest_version(key)
+                    .is_some_and(|(latest_ts, _, _)| latest_ts >= commit_ts)
+                {
+                    return Err(RymeError::Conflict(String::from("stale commit_ts")));
+                }
+            }
             for (key, op) in writes.iter() {
                 engine.apply_with_expiry(
                     key.clone(),
@@ -2375,6 +2383,25 @@ mod tests {
 
         assert_eq!(manager.commit(txn).unwrap(), 101);
         assert_eq!(manager.latest_commit(), 102);
+    }
+
+    #[test]
+    fn apply_rejects_a_stale_batch_without_partial_mutation() {
+        let manager = TxnManager::new();
+        let stale_key = RecordKey::new("t", "d", "s", b"z");
+        let fresh_key = RecordKey::new("t", "d", "s", b"a");
+        let mut seed = BTreeMap::new();
+        seed.insert(stale_key.clone(), WriteOp::put(b"seed".to_vec()));
+        manager.apply_at(10, &seed).unwrap();
+
+        let mut batch = BTreeMap::new();
+        batch.insert(fresh_key.clone(), WriteOp::put(b"must-not-appear".to_vec()));
+        batch.insert(stale_key.clone(), WriteOp::put(b"stale".to_vec()));
+        assert!(matches!(manager.apply_at(5, &batch), Err(RymeError::Conflict(_))));
+
+        let mut probe = manager.begin();
+        assert_eq!(manager.get(&mut probe, &fresh_key).unwrap(), None);
+        assert_eq!(manager.get(&mut probe, &stale_key).unwrap(), Some(b"seed".to_vec()));
     }
 
     #[test]
