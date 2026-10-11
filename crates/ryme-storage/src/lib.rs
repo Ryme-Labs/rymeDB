@@ -553,12 +553,13 @@ impl Engine {
         if magic != 0x52594D53 || (version != 1 && version != 2) {
             return Err(RymeError::Corrupt(String::from("snapshot magic")));
         }
-        let _max = take_u64(&mut cursor)?;
+        let declared_max = take_u64(&mut cursor)?;
         let count = take_u32(&mut cursor)? as usize;
         if count > 10_000_000 {
             return Err(RymeError::Corrupt(String::from("snapshot count")));
         }
         let mut engine = Engine::new();
+        let mut actual_max = 0u64;
         for _ in 0..count {
             let tenant = String::from_utf8(take_field(&mut cursor)?.to_vec())
                 .map_err(|_| RymeError::Corrupt(String::from("snapshot tenant")))?;
@@ -572,8 +573,16 @@ impl Engine {
                 return Err(RymeError::Corrupt(String::from("snapshot versions")));
             }
             let mut versions = Vec::with_capacity(vcount.min(64));
+            let mut previous_commit_ts = None;
             for _ in 0..vcount {
                 let commit_ts = take_u64(&mut cursor)?;
+                if commit_ts == 0
+                    || previous_commit_ts.is_some_and(|previous| commit_ts <= previous)
+                {
+                    return Err(RymeError::Corrupt(String::from("snapshot version order")));
+                }
+                previous_commit_ts = Some(commit_ts);
+                actual_max = actual_max.max(commit_ts);
                 let tombstone = take_u8(&mut cursor)?;
                 let value = if tombstone == 1 {
                     None
@@ -585,8 +594,10 @@ impl Engine {
                 let expires_at = if version == 2 { take_u64(&mut cursor)? } else { 0 };
                 versions.push(Version { commit_ts, value, expires_at });
             }
-            versions.sort_by_key(|v| v.commit_ts);
             let key = RecordKey { tenant, database, table, pk };
+            if engine.inner.contains_key(&key) {
+                return Err(RymeError::Corrupt(String::from("snapshot duplicate key")));
+            }
             engine.bytes_held += versions
                 .iter()
                 .filter_map(|v| v.value.as_ref())
@@ -596,6 +607,9 @@ impl Engine {
         }
         if !cursor.is_empty() {
             return Err(RymeError::Corrupt(String::from("snapshot trailing")));
+        }
+        if actual_max != declared_max {
+            return Err(RymeError::Corrupt(String::from("snapshot commit timestamp")));
         }
         Ok(engine)
     }
@@ -884,5 +898,32 @@ mod tests {
         let last = raw.len() - 1;
         raw[last] ^= 0xff;
         assert!(Engine::decode_snapshot(&raw).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_out_of_order_versions_and_timestamp_mismatch() {
+        let mut engine = Engine::new();
+        let key = RecordKey::new("t", "d", "users", b"k");
+        engine.apply(key.clone(), 10, Some(b"first".to_vec())).unwrap();
+        engine.apply(key, 20, Some(b"second".to_vec())).unwrap();
+        let raw_snapshot = engine.encode_snapshot().unwrap();
+
+        let mut out_of_order = raw_snapshot.clone();
+        // Header (20 bytes), three short strings (13 bytes), primary key
+        // chunk (5 bytes), and version count (4 bytes) precede the first LSN.
+        out_of_order[42..50].copy_from_slice(&30u64.to_be_bytes());
+        refresh_snapshot_checksum(&mut out_of_order);
+        assert!(matches!(Engine::decode_snapshot(&out_of_order), Err(RymeError::Corrupt(_))));
+
+        let mut mismatched_max = raw_snapshot;
+        mismatched_max[8..16].copy_from_slice(&21u64.to_be_bytes());
+        refresh_snapshot_checksum(&mut mismatched_max);
+        assert!(matches!(Engine::decode_snapshot(&mismatched_max), Err(RymeError::Corrupt(_))));
+    }
+
+    fn refresh_snapshot_checksum(snapshot: &mut [u8]) {
+        let checksum_offset = snapshot.len() - 4;
+        let checksum = crc32fast::hash(&snapshot[..checksum_offset]);
+        snapshot[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
     }
 }
