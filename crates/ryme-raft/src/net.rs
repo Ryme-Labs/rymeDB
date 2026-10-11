@@ -3228,6 +3228,9 @@ impl Node {
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
         }
+        if self.range_resolution(group_id, transaction_id, commit_ts) == Some(false) {
+            return Err(RymeError::Conflict(String::from("transaction already aborted")));
+        }
         let txn = self.manager.from_state(state.clone());
         if let Some(expected) = state.route_generation {
             if self.range_generation() != expected {
@@ -3263,6 +3266,12 @@ impl Node {
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
         }
+        if let Some(previous) = self.range_resolution(group_id, transaction_id, commit_ts) {
+            if previous == committed {
+                return Ok(());
+            }
+            return Err(RymeError::Conflict(String::from("transaction resolution changed")));
+        }
         let existing = self
             .range_prepared
             .lock()
@@ -3270,7 +3279,16 @@ impl Node {
             .get(&(group_id.to_string(), transaction_id))
             .cloned();
         let Some(existing) = existing else {
-            return Ok(());
+            if committed {
+                return Ok(());
+            }
+            return self
+                .commit_range_record(
+                    group_id,
+                    commit_ts,
+                    RangeEntryKind::Resolve { transaction_id, committed },
+                )
+                .await;
         };
         if existing.commit_ts != commit_ts {
             return Err(RymeError::Conflict(String::from("transaction timestamp changed")));
@@ -3523,6 +3541,27 @@ impl Node {
 
     fn range_entry(&self, group_id: &str, index: u64) -> Option<RangeLogRecord> {
         self.range_entries.lock().ok().and_then(|groups| groups.get(group_id)?.get(&index).cloned())
+    }
+
+    fn range_resolution(
+        &self,
+        group_id: &str,
+        transaction_id: u128,
+        commit_ts: u64,
+    ) -> Option<bool> {
+        self.range_entries.lock().ok()?.get(group_id)?.values().find_map(|record| {
+            if record.commit_ts != commit_ts {
+                return None;
+            }
+            match &record.kind {
+                RangeEntryKind::Resolve { transaction_id: id, committed }
+                    if *id == transaction_id =>
+                {
+                    Some(*committed)
+                }
+                _ => None,
+            }
+        })
     }
 
     fn ensure_range_group(&self, group_id: &str, leader: usize) -> RangeGroupState {
@@ -6056,6 +6095,11 @@ mod tests {
         node.retry_pending_range_decisions().await;
         assert!(node.range_decisions.lock().unwrap().is_empty());
         assert!(node.range_recovery_coordinations.lock().unwrap().is_empty());
+        let txn = node.manager.begin();
+        assert!(matches!(
+            node.prepare_range_group("range-a", 414, 8, txn.state()).await,
+            Err(RymeError::Conflict(message)) if message == "transaction already aborted"
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 

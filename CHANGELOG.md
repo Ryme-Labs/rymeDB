@@ -7,6 +7,8 @@
 - Range-leader promotion now scans committed coordination markers and aborts
   unresolved transactions before serving the recovered range, covering leader
   loss without requiring a process restart.
+- Aborted range resolutions now leave durable tombstones when cleanup races a
+  late prepare, fencing stale coordinators from recreating the intent.
 - Multi-owner transactions now persist their commit decision in a coordinator
   range quorum instead of the global data log. Each range resolves and
   materializes only its local prepared writes, with range-WAL recovery and
