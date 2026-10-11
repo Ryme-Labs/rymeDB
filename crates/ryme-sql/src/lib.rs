@@ -9783,6 +9783,7 @@ where
             } else {
                 query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
             };
+            rows = self.filter_rls_rows(table, rows);
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
             return Ok(rows);
@@ -9852,6 +9853,7 @@ where
             } else {
                 query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
             };
+            rows = self.filter_rls_rows(table, rows);
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
             return Ok(rows);
@@ -15584,6 +15586,61 @@ mod tests {
         let hidden_delete =
             executor.execute(parse("DELETE FROM messages WHERE id = 'hidden'").unwrap()).await;
         assert!(matches!(hidden_delete, Err(RymeError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn sql_rls_filters_regular_and_materialized_views() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT, body TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, tenant_id, body) VALUES ('visible', 'tenant-a', 'hello'), ('hidden', 'tenant-b', 'secret')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE VIEW message_view AS SELECT * FROM messages").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE MATERIALIZED VIEW message_snapshot AS SELECT * FROM messages WITH DATA",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        for view in ["message_view", "message_snapshot"] {
+            executor
+                .execute(
+                    parse(&format!(
+                        "CREATE POLICY own_{view} ON {view} FOR SELECT USING (auth.uid() = tenant_id)"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            executor
+                .execute(parse(&format!("ALTER TABLE {view} ENABLE ROW LEVEL SECURITY")).unwrap())
+                .await
+                .unwrap();
+            let result =
+                executor.execute(parse(&format!("SELECT * FROM {view}")).unwrap()).await.unwrap();
+            assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+            let realtime_rows = executor.realtime_view_rows(view, None).await.unwrap().unwrap();
+            assert_eq!(realtime_rows.len(), 1);
+        }
     }
 
     #[tokio::test]
