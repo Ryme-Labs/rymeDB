@@ -243,6 +243,77 @@ async fn range_group_elects_a_new_owner_after_leader_loss() {
 }
 
 #[tokio::test]
+async fn range_replica_catches_up_after_temporary_isolation() {
+    let root = std::env::temp_dir().join(format!(
+        "ryme-range-catchup-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut listeners = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for id in 0..3 {
+        let peers: Vec<String> = addrs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(peer, _)| *peer != id)
+            .map(|(_, address)| address.to_string())
+            .collect();
+        let peer_ids: Vec<usize> = (0..3).filter(|peer| *peer != id).collect();
+        let node = Node::open(id, peers, peer_ids, &root.join(format!("n{id}"))).unwrap();
+        tasks.push(node.spawn(listeners.remove(0)));
+        nodes.push(node);
+    }
+    let backends: Vec<ClusterBackend> = nodes.iter().cloned().map(ClusterBackend::new).collect();
+    let leader = wait_leader(&nodes, None).await;
+    let isolated = (leader + 1) % nodes.len();
+    let other = (leader + 2) % nodes.len();
+    let mut start = b"s".to_vec();
+    start.push(0);
+    let placement = RangeOwner {
+        id: String::from("catchup-range"),
+        start,
+        end: Vec::new(),
+        owner: leader,
+        replicas: vec![leader, isolated, other],
+        epoch: 1,
+    };
+    for node in &nodes {
+        node.set_range_owners(vec![placement.clone()]);
+    }
+    nodes[leader].pool(isolated).unwrap().set_isolated(true);
+
+    let mut txn = backends[leader].begin();
+    backends[leader].put(&mut txn, key("catchup"), b"value".to_vec());
+    backends[leader].commit(txn).await.unwrap();
+    assert_eq!(nodes[isolated].read_latest(&key("catchup")).await.unwrap(), None);
+
+    nodes[leader].pool(isolated).unwrap().set_isolated(false);
+    nodes[leader].pool(isolated).unwrap().purge();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if nodes[isolated].read_latest(&key("catchup")).await.unwrap() == Some(b"value".to_vec()) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "range replica did not catch up");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for (node, node_tasks) in nodes.iter().zip(tasks.into_iter()) {
+        node.shutdown(node_tasks);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn configured_range_owner_limits_follower_materialization() {
     let root = std::env::temp_dir().join(format!("ryme-owner-{}-{}", std::process::id(), now_ms()));
     let _ = std::fs::remove_dir_all(&root);

@@ -1127,30 +1127,133 @@ impl Node {
         let state = self.ensure_range_group(group_id, self.id);
         let last_index = self.range_last_index(group_id);
         let last_term = if last_index == 0 { 0 } else { self.range_last_term(group_id) };
-        let mut tasks = Vec::new();
         for replica in range.replicas.iter().copied().filter(|replica| *replica != self.id) {
-            let Some(pool) = self.pool_for(replica) else { continue };
-            let request = Rpc::RangeAppend {
-                group_id: group_id.to_string(),
-                index: 0,
-                term: state.term.max(1),
-                leader: self.id,
-                prev_index: last_index,
-                prev_term: last_term,
-                leader_commit: state.commit_index,
-                commit_ts: 0,
-                writes: Vec::new(),
-            };
-            tasks.push(tokio::spawn(async move { pool.roundtrip(&request).await }));
-        }
-        for task in tasks {
-            if let Ok(Ok(Rpc::RangeAppendResponse { term, .. })) = task.await {
-                if term > state.term {
-                    self.observe_range_term(group_id, term);
-                }
-            }
+            let _ = self
+                .sync_range_replica(
+                    group_id,
+                    replica,
+                    state.term.max(1),
+                    last_index,
+                    last_term,
+                    state.commit_index,
+                )
+                .await;
         }
         Ok(())
+    }
+
+    async fn sync_range_replica(
+        self: &Arc<Self>,
+        group_id: &str,
+        replica: usize,
+        term: u64,
+        leader_last: u64,
+        leader_last_term: u64,
+        leader_commit: u64,
+    ) -> Result<()> {
+        let pool = self
+            .pool_for(replica)
+            .ok_or_else(|| RymeError::Unavailable(String::from("range replica unavailable")))?;
+        let heartbeat = pool
+            .roundtrip(&Rpc::RangeAppend {
+                group_id: group_id.to_string(),
+                index: 0,
+                term,
+                leader: self.id,
+                prev_index: leader_last,
+                prev_term: leader_last_term,
+                leader_commit,
+                commit_ts: 0,
+                writes: Vec::new(),
+            })
+            .await?;
+        let mut peer_last = match heartbeat {
+            Rpc::RangeAppendResponse { term: peer_term, appended, last_index, .. } => {
+                if peer_term > term {
+                    self.observe_range_term(group_id, peer_term);
+                    return Err(RymeError::Unavailable(String::from("stale range leader")));
+                }
+                if appended {
+                    return Ok(());
+                }
+                last_index
+            }
+            _ => return Err(RymeError::Corrupt(String::from("range append rpc"))),
+        };
+        if peer_last > leader_last {
+            return Err(RymeError::Unavailable(String::from("range replica ahead")));
+        }
+        while peer_last < leader_last {
+            let index = peer_last + 1;
+            let record = self
+                .range_entry(group_id, index)
+                .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
+            let prev_index = index - 1;
+            let prev_term = if prev_index == 0 {
+                0
+            } else {
+                self.range_entry(group_id, prev_index)
+                    .map(|entry| entry.term)
+                    .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?
+            };
+            let response = pool
+                .roundtrip(&Rpc::RangeAppend {
+                    group_id: group_id.to_string(),
+                    index,
+                    term,
+                    leader: self.id,
+                    prev_index,
+                    prev_term,
+                    leader_commit: 0,
+                    commit_ts: record.commit_ts,
+                    writes: record.writes,
+                })
+                .await?;
+            match response {
+                Rpc::RangeAppendResponse {
+                    term: peer_term,
+                    appended: true,
+                    last_index,
+                    error: None,
+                } => {
+                    if peer_term > term {
+                        self.observe_range_term(group_id, peer_term);
+                        return Err(RymeError::Unavailable(String::from("stale range leader")));
+                    }
+                    peer_last = last_index;
+                }
+                Rpc::RangeAppendResponse { term: peer_term, .. } if peer_term > term => {
+                    self.observe_range_term(group_id, peer_term);
+                    return Err(RymeError::Unavailable(String::from("stale range leader")));
+                }
+                _ => return Err(RymeError::Unavailable(String::from("range replica gap"))),
+            }
+        }
+        let committed = pool
+            .roundtrip(&Rpc::RangeAppend {
+                group_id: group_id.to_string(),
+                index: 0,
+                term,
+                leader: self.id,
+                prev_index: leader_last,
+                prev_term: leader_last_term,
+                leader_commit,
+                commit_ts: 0,
+                writes: Vec::new(),
+            })
+            .await?;
+        match committed {
+            Rpc::RangeAppendResponse { term: peer_term, appended: true, .. }
+                if peer_term <= term =>
+            {
+                Ok(())
+            }
+            Rpc::RangeAppendResponse { term: peer_term, .. } if peer_term > term => {
+                self.observe_range_term(group_id, peer_term);
+                Err(RymeError::Unavailable(String::from("stale range leader")))
+            }
+            _ => Err(RymeError::Unavailable(String::from("range commit gap"))),
+        }
     }
 
     fn observe_range_term(&self, group_id: &str, term: u64) {
@@ -2348,6 +2451,10 @@ impl Node {
             .unwrap_or(0)
     }
 
+    fn range_entry(&self, group_id: &str, index: u64) -> Option<RangeLogRecord> {
+        self.range_entries.lock().ok().and_then(|groups| groups.get(group_id)?.get(&index).cloned())
+    }
+
     fn ensure_range_group(&self, group_id: &str, leader: usize) -> RangeGroupState {
         let mut groups = self.range_groups.lock().unwrap_or_else(|error| error.into_inner());
         let state = groups.entry(group_id.to_string()).or_default();
@@ -2590,37 +2697,13 @@ impl Node {
         replicas.dedup();
         let index = self.range_last_index(group_id) + 1;
         let term = self.ensure_range_group(group_id, self.id).term.max(1);
-        let prev_index = index.saturating_sub(1);
-        let prev_term = if prev_index == 0 { 0 } else { self.range_last_term(group_id) };
         self.append_range_entry(group_id, index, term, commit_ts, encoded_writes)?;
         let mut acknowledgements = 1usize;
         let mut acknowledged = vec![self.id];
         for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
-            let Some(pool) = self.pool_for(replica) else { continue };
-            let response = pool
-                .roundtrip(&Rpc::RangeAppend {
-                    group_id: group_id.to_string(),
-                    index,
-                    term,
-                    leader: self.id,
-                    prev_index,
-                    prev_term,
-                    leader_commit: 0,
-                    commit_ts,
-                    writes: encoded_writes.to_vec(),
-                })
-                .await;
-            if let Ok(Rpc::RangeAppendResponse { term: peer_term, appended, last_index, error }) =
-                response
-            {
-                if peer_term > term {
-                    self.observe_range_term(group_id, peer_term);
-                    return Err(RymeError::Unavailable(String::from("stale range leader")));
-                }
-                if appended && error.is_none() && last_index >= index {
-                    acknowledgements += 1;
-                    acknowledged.push(replica);
-                }
+            if self.sync_range_replica(group_id, replica, term, index, term, 0).await.is_ok() {
+                acknowledgements += 1;
+                acknowledged.push(replica);
             }
         }
         if acknowledgements < replicas.len() / 2 + 1 {
@@ -2639,20 +2722,7 @@ impl Node {
         self.apply_range_committed(group_id, index)?;
         self.persist_range_meta()?;
         for replica in acknowledged.into_iter().filter(|replica| *replica != self.id) {
-            let Some(pool) = self.pool_for(replica) else { continue };
-            let _ = pool
-                .roundtrip(&Rpc::RangeAppend {
-                    group_id: group_id.to_string(),
-                    index: 0,
-                    term,
-                    leader: self.id,
-                    prev_index: index,
-                    prev_term: term,
-                    leader_commit: index,
-                    commit_ts: 0,
-                    writes: Vec::new(),
-                })
-                .await;
+            let _ = self.sync_range_replica(group_id, replica, term, index, term, index).await;
         }
         Ok(())
     }

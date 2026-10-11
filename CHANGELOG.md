@@ -1,5 +1,9 @@
 # Changelog
 
+- Range leaders now repair lagging replicas from the range WAL before advancing
+  their commit view. Heartbeats report follower log positions, missing entries
+  are streamed in order, and a follower is committed only after the repaired
+  prefix is acknowledged.
 - Range groups now run independent quorum elections over their configured
   replicas. Range heartbeats maintain per-group liveness, candidates exchange
   range-local vote terms and log positions, and a promoted replica becomes the

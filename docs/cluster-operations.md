@@ -216,9 +216,12 @@ range-scoped append RPC. Range appends carry an independent group term and
 previous-log position; followers persist entries first, and materialize them
 only after the owner advances the range commit index. The owner syncs its
 range WAL before acknowledging a replica quorum, and startup replays those
-records before serving reads. This gives the current placement map a durable
-replica-materialization path without claiming that range logs elect leaders
-independently yet.
+records before serving reads. A range heartbeat also reports the follower's
+last durable index; when a replica is behind, the current range leader streams
+the missing records in order and advances that follower's commit view only
+after the repaired prefix is acknowledged. This gives the current placement
+map a durable replica-repair and materialization path without claiming that
+range logs provide independent cross-range transaction coordination.
 Range replicas also maintain their own election term and heartbeat deadline.
 If the configured range leader fails, a surviving replica can win a majority
 of that range's replica set and become the routed owner without changing the
