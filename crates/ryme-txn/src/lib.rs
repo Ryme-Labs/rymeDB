@@ -683,7 +683,7 @@ impl TxnManager {
     }
 
     pub fn begin(&self) -> Transaction {
-        let id = TXN_ID.fetch_add(1, Ordering::SeqCst);
+        let id = TXN_ID.fetch_add(1, Ordering::Relaxed);
         let read_ts = self.inner.applied.load(Ordering::SeqCst);
         self.inner.active.insert(id, read_ts);
         Transaction {
@@ -702,7 +702,7 @@ impl TxnManager {
 
     #[allow(clippy::wrong_self_convention)]
     pub fn from_state(&self, state: TransactionState) -> Transaction {
-        let id = TXN_ID.fetch_add(1, Ordering::SeqCst);
+        let id = TXN_ID.fetch_add(1, Ordering::Relaxed);
         self.inner.active.insert(id, state.read_ts);
         Transaction {
             id,

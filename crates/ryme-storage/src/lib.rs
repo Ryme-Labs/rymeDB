@@ -252,7 +252,7 @@ impl Engine {
         let start = RecordKey::new(tenant, database, table, start_after.unwrap_or_default());
         let start_bound =
             if start_after.is_some() { Bound::Excluded(&start) } else { Bound::Included(&start) };
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(limit.min(1024));
         for (key, versions) in self.inner.range((start_bound, Bound::Unbounded)) {
             if key.tenant != tenant || key.database != database || key.table != table {
                 break;
