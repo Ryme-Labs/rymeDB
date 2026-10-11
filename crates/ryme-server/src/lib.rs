@@ -5404,6 +5404,32 @@ fn encode_supabase_frame(frame: &SupabaseFrame, array_protocol: bool) -> String 
     }
 }
 
+fn supabase_broadcast_parts(payload: &serde_json::Value) -> (String, serde_json::Value) {
+    match payload {
+        serde_json::Value::Object(object) => {
+            let event = object
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("message")
+                .to_string();
+            let payload = match object.get("payload") {
+                Some(payload) => payload.clone(),
+                None => {
+                    let mut remainder = serde_json::Map::new();
+                    for (key, value) in object {
+                        if key != "event" {
+                            remainder.insert(key.clone(), value.clone());
+                        }
+                    }
+                    serde_json::Value::Object(remainder)
+                }
+            };
+            (event, payload)
+        }
+        payload => (String::from("message"), payload.clone()),
+    }
+}
+
 fn supabase_reply(
     frame: &SupabaseFrame,
     status: &str,
@@ -5957,16 +5983,7 @@ async fn forward_supabase_realtime(
                         }
                         let event_pre_admitted = record.fanout_quota_pre_admitted();
                         let pre_admitted_bytes = record.json_len();
-                        let (event_name, payload) = match record.payload.clone() {
-                            serde_json::Value::Object(mut payload) => {
-                                let event_name = payload.remove("event")
-                                    .and_then(|value| value.as_str().map(String::from))
-                                    .unwrap_or_else(|| String::from("message"));
-                                let payload = payload.remove("payload").unwrap_or(serde_json::Value::Object(payload));
-                                (event_name, payload)
-                            }
-                            payload => (String::from("message"), payload),
-                        };
+                        let (event_name, payload) = supabase_broadcast_parts(&record.payload);
                         let text = encode_supabase_frame(
                             &SupabaseFrame {
                                 join_ref: None,
@@ -11086,6 +11103,29 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn supabase_broadcast_parts_only_clone_the_forwarded_payload() {
+        let (event, payload) = supabase_broadcast_parts(&serde_json::json!({
+            "event": "updated",
+            "payload": {"id": 7},
+            "unused": {"large": [1, 2, 3]},
+        }));
+        assert_eq!(event, "updated");
+        assert_eq!(payload, serde_json::json!({"id": 7}));
+
+        let (event, payload) = supabase_broadcast_parts(&serde_json::json!({
+            "event": "updated",
+            "id": 7,
+        }));
+        assert_eq!(event, "updated");
+        assert_eq!(payload, serde_json::json!({"id": 7}));
+
+        let original = serde_json::json!([1, 2, 3]);
+        let (event, payload) = supabase_broadcast_parts(&original);
+        assert_eq!(event, "message");
+        assert_eq!(payload, original);
+    }
 
     #[tokio::test]
     async fn owner_scan_pages_filter_tenant_and_preserve_cursor() {
