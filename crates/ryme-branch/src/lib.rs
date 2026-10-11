@@ -460,14 +460,39 @@ where
         encoded
     }
 
-    fn decode(value: &[u8]) -> Option<Option<Vec<u8>>> {
+    fn encode_with_expiry(value: &[u8], expires_at: u64) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(BRANCH_VALUE_PREFIX.len() + 1 + 8 + value.len());
+        encoded.extend_from_slice(BRANCH_VALUE_PREFIX);
+        encoded.push(2);
+        encoded.extend_from_slice(&expires_at.to_be_bytes());
+        encoded.extend_from_slice(value);
+        encoded
+    }
+
+    fn decode_with_expiry(value: &[u8]) -> Option<(Option<Vec<u8>>, u64)> {
         if !value.starts_with(BRANCH_VALUE_PREFIX) {
-            return Some(Some(value.to_vec()));
+            return Some((Some(value.to_vec()), 0));
         }
         match value.get(BRANCH_VALUE_PREFIX.len()) {
-            Some(0) => Some(Some(value[BRANCH_VALUE_PREFIX.len() + 1..].to_vec())),
-            Some(1) => Some(None),
+            Some(0) => Some((Some(value[BRANCH_VALUE_PREFIX.len() + 1..].to_vec()), 0)),
+            Some(1) => Some((None, 0)),
+            Some(2) => {
+                let expiry_start = BRANCH_VALUE_PREFIX.len() + 1;
+                let expiry_end = expiry_start + 8;
+                let expiry = value.get(expiry_start..expiry_end)?;
+                let expires_at = u64::from_be_bytes(expiry.try_into().ok()?);
+                Some((Some(value[expiry_end..].to_vec()), expires_at))
+            }
             _ => None,
+        }
+    }
+
+    fn decode(value: &[u8]) -> Option<Option<Vec<u8>>> {
+        let (value, expires_at) = Self::decode_with_expiry(value)?;
+        if expires_at != 0 && expires_at <= ryme_txn::now_unix() {
+            Some(None)
+        } else {
+            Some(value)
         }
     }
 
@@ -565,6 +590,9 @@ where
         if let Some(value) = self.base.get(txn, &local)? {
             return Ok(Self::decode(&value).flatten());
         }
+        if self.base.expires_at_at(&local, u64::MAX)?.is_some() {
+            return Ok(None);
+        }
         let mut parent_txn = self.parent_transaction();
         self.base.get(&mut parent_txn, key)
     }
@@ -585,11 +613,10 @@ where
         expires_at: u64,
     ) {
         if self.overlay {
-            self.base.put_with_ttl(
+            self.base.put(
                 txn,
                 self.local_key(&key),
-                Self::encode(Some(&value)),
-                expires_at,
+                Self::encode_with_expiry(&value, expires_at),
             );
         } else {
             self.base.put_with_ttl(txn, key, value, expires_at);
@@ -611,11 +638,15 @@ where
         let local = self.local_key(key);
         let mut txn = self.base.begin();
         if let Some(value) = self.base.get(&mut txn, &local)? {
-            return Ok(if Self::decode(&value).flatten().is_some() {
-                self.base.expires_at_at(&local, u64::MAX)?
-            } else {
-                Some(1)
-            });
+            let (decoded, mut expires_at) = Self::decode_with_expiry(&value)
+                .ok_or_else(|| RymeError::Corrupt(String::from("branch value")))?;
+            if decoded.is_some() && expires_at == 0 {
+                expires_at = self.base.expires_at_at(&local, u64::MAX)?.unwrap_or(0);
+            }
+            return Ok(if decoded.is_some() { Some(expires_at) } else { Some(1) });
+        }
+        if let Some(expires_at) = self.base.expires_at_at(&local, u64::MAX)? {
+            return Ok(Some(expires_at));
         }
         self.base.expires_at_at(key, self.base_commit_ts)
     }
@@ -632,11 +663,15 @@ where
         let mut txn = self.base.begin();
         txn.restamp(u64::MAX);
         if let Some(value) = self.base.get(&mut txn, &local)? {
-            return Ok(if Self::decode(&value).flatten().is_some() {
-                self.base.expires_at_at(&local, u64::MAX)?
-            } else {
-                Some(1)
-            });
+            let (decoded, mut expires_at) = Self::decode_with_expiry(&value)
+                .ok_or_else(|| RymeError::Corrupt(String::from("branch value")))?;
+            if decoded.is_some() && expires_at == 0 {
+                expires_at = self.base.expires_at_at(&local, u64::MAX)?.unwrap_or(0);
+            }
+            return Ok(if decoded.is_some() { Some(expires_at) } else { Some(1) });
+        }
+        if let Some(expires_at) = self.base.expires_at_at(&local, u64::MAX)? {
+            return Ok(Some(expires_at));
         }
         self.base.expires_at_at(key, self.base_commit_ts.min(read_ts))
     }
@@ -978,6 +1013,18 @@ mod tests {
         base.put_with_ttl(&mut parent_update, parent_key.clone(), b"updated".to_vec(), updated_expiry);
         base.commit(parent_update).unwrap();
         assert_eq!(branch.expires_at(&parent_key).unwrap(), Some(parent_expiry));
+
+        let mut expired_override = branch.begin();
+        branch.put_with_ttl(
+            &mut expired_override,
+            parent_key.clone(),
+            b"expired-override".to_vec(),
+            now.saturating_sub(1),
+        );
+        base.commit(expired_override).unwrap();
+        let mut expired_read = branch.begin();
+        assert_eq!(branch.get(&mut expired_read, &parent_key).unwrap(), None);
+        assert!(branch.scan(&mut expired_read, "tenant", "default", "docs", 10).unwrap().is_empty());
 
         let local_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"local");
         let local_expiry = now + 30_000;
