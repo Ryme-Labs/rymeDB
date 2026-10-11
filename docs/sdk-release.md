@@ -19,8 +19,10 @@ cargo test --manifest-path sdks/rust/Cargo.toml --locked
 ```
 
 SDK releases are started from **Actions → sdk-release → Run workflow** on
-`main`. The workflow picks the next major automatically (`0.1.0` → `1.0.0` →
-`2.0.0`), tests both SDKs at that version, publishes npm and Cargo packages,
+`main`. The workflow picks the next major automatically. The release baseline
+is currently `1.0.0` because that npm version is already occupied, so the next
+release is `2.0.0`; later releases continue with `3.0.0`, and so on. The
+workflow tests both SDKs at the selected version, publishes npm and Cargo packages,
 commits the synchronized version fields, creates the matching `v*` tag and
 GitHub release, and attaches package archives with checksums. Do not create
 release tags manually. The first release uses `sdks/RELEASE_BASE_VERSION`;
