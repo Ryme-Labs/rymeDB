@@ -1,348 +1,77 @@
 # Cluster operations
 
-rymeDB clusters use Raft with joint-consensus membership changes. Every
-membership mutation goes through the leader over the HTTP API
-(`crates/ryme-server/src/lib.rs`, routes at the `router()` definition) or the
-matching `ryme` CLI commands (`apps/cli/src/cli.ts`).
+Cluster mode uses Raft for membership and quorum-committed replication. The
+leader owns membership changes and range metadata. A three-node cluster keeps
+committing through one node failure; a quorum loss is a recovery event.
 
-Auth: `GET /v1/cluster/members` requires any valid credential. All mutations
-(add, remove, transfer, replace) require an `Owner`/`Admin` principal,
-otherwise `403`, so application keys can never eject nodes or join a
-data-receiving member. Non-cluster nodes answer
-`400 {"error":"cluster"}`.
+## Bootstrap three nodes
 
-## Bootstrapping a cluster
-
-Each node needs a JSON config file (`ryme_config::Config::from_file`) with a
-`cluster` section:
+Create one JSON file per node. Use real reachable addresses in production:
 
 ```json
 {
+  "node_id": "node-0",
+  "pg_listen": "10.0.0.10:5433",
+  "resp_listen": "10.0.0.10:6380",
+  "http_listen": "10.0.0.10:8080",
+  "data_dir": "/var/lib/rymedb",
+  "durability": "local-durable",
   "cluster": {
     "node_index": 0,
-    "raft_listen": "127.0.0.1:9080",
+    "raft_listen": "10.0.0.10:9080",
+    "advertise_addr": "10.0.0.10:9080",
     "peers": [
-      { "id": 1, "addr": "127.0.0.1:9081" },
-      { "id": 2, "addr": "127.0.0.1:9082" }
-    ],
-    "learner": false,
-    "advertise_addr": null
+      { "id": 1, "addr": "10.0.0.11:9080" },
+      { "id": 2, "addr": "10.0.0.12:9080" }
+    ]
   }
 }
 ```
 
-Peer `addr` values are hostnames or IPs (`String`, resolved at dial time), so
-stable DNS names work — the Helm chart relies on this
-(`deploy/k8s/helm/rymeDB`). Start each node with:
+Change the node id, listener addresses, and `node_index` for nodes 1 and 2.
+Start them with `ryme-server --config node-0.json`. Set
+`advertise_addr` whenever a listener binds to a wildcard address. Use TLS/mTLS
+for a network that is not already private; see [configuration](configuration.md).
 
-```sh
-ryme-server --config node0.json --data-dir ./data0
+## Inspect and change membership
+
+```bash
+rymedb-cli --api-key "$RYME_API_KEY" cluster members
+rymedb-cli --api-key "$RYME_API_KEY" cluster add 3 10.0.0.13:9080
+rymedb-cli --api-key "$RYME_API_KEY" cluster transfer 1
+rymedb-cli --api-key "$RYME_API_KEY" cluster remove 3
+rymedb-cli --api-key "$RYME_API_KEY" cluster replace 0=10.0.0.10:9080 1=10.0.0.11:9080 2=10.0.0.12:9080
 ```
 
-CLI flags override the file: `--pg-listen`, `--resp-listen`, `--http-listen`,
-`--raft-listen`, `--advertise-addr`, `--data-dir`. A node whose config has
-`raft_listen` set boots `serve_cluster`; without it, it boots single-node
-`serve` (`crates/ryme-server/src/main.rs`).
+Boot a new member as a learner when possible. Wait for catch-up before
+admitting it. A non-empty joint-consensus state means another membership
+change must wait. Transfer leadership before planned maintenance or removal.
 
-`advertise_addr` is the address other members dial to reach this node. When
-unset, the node falls back to `raft_listen` unless that is a wildcard address
-(`0.0.0.0`), in which case the node reports an empty self addr. Always set
-`advertise_addr` when listening on a wildcard socket. The working E2E recipe
-is `crates/ryme-server/tests/cluster_e2e.rs`.
+## Ranges and placement
 
-## Inspecting membership
-
-```sh
-ryme cluster members
+```bash
+rymedb-cli --api-key "$RYME_API_KEY" ranges
+rymedb-cli --api-key "$RYME_API_KEY" ranges loads
+rymedb-cli --api-key "$RYME_API_KEY" ranges autosplit
+rymedb-cli --api-key "$RYME_API_KEY" shards layout
 ```
 
-Returns term, local leadership, commit index, the member list (`id`, `addr`,
-`self`), and any in-flight joint config as member ids:
+Range mutations are epoch-fenced. Read the current epoch, pass it to a split,
+merge, or transfer, and retry after a `409` with fresh placement data.
+`autosplit_writes: 0` keeps automatic splitting disabled. Range transfer
+copies the MVCC snapshot, verifies it at the source commit, commits placement
+metadata, and only then cleans up the old owner.
 
-```json
-{
-  "term": 1, "leader": true, "commit": 42,
-  "members": [{ "id": 0, "addr": "127.0.0.1:9080", "self": true }],
-  "joint": []
-}
-```
+## Failure runbook
 
-A non-empty `joint` array means a membership transition is mid-flight; wait
-for it to drain before starting another change. `/ready` also reports
-`leader` per node and is suitable for readiness probes.
+| Event | Response |
+| --- | --- |
+| Follower down | Keep serving while quorum remains; replace it after data is safe. |
+| Leader down | Wait for election, discover the new leader through `/ready` or members, then redirect operator writes. |
+| Quorum down | Do not force a single node to commit; restore a quorum from verified data. |
+| Split-brain suspicion | Stop writes, preserve logs, compare terms/commit indexes, and do not delete a data directory. |
+| Range lag | Inspect range loads and membership, then use controlled transfer/repair rather than manual file copying. |
 
-## Adding a member
-
-Boot the joiner with `learner: true` and the current members as peers. A
-learner replicates without campaigning, so it is safe to start before being
-admitted. Then, against the leader:
-
-```sh
-ryme cluster add 3 127.0.0.1:9083
-```
-
-The leader catch-ups the joiner, then commits a joint-consensus transition
-(`Node::add_member`). Empty addrs are rejected with `400`.
-
-## Removing a member
-
-```sh
-ryme cluster remove 3
-```
-
-The leader commits the removal the same joint-consensus way
-(`Node::remove_member`). Do not remove the leader without transferring first
-unless the remaining quorum can elect on its own.
-
-## Transferring leadership
-
-```sh
-ryme cluster transfer 1
-```
-
-Hands leadership to the target member (`Node::transfer`). Useful before
-removing or restarting the current leader. Poll `/ready` on the target until
-it reports `"leader": true`.
-
-## Replacing the member set
-
-```sh
-ryme cluster replace 0=127.0.0.1:9000 1=127.0.0.1:9001
-```
-
-Swaps the whole member set in one joint-consensus transition
-(`Node::replace_members`). Prefer this over add+remove pairs when reshaping a
-cluster: the set changes atomically instead of passing through an intermediate
-3-of-4 quorum.
-
-## Failure recovery
-
-- **Follower loss:** no action needed while a quorum remains; replace the
-  member when a fresh node is ready.
-- **Leader loss:** survivors elect a new leader automatically; point clients
-  and operator commands at the new leader (find it via `/ready`).
-- **Quorum loss:** restore at least a quorum of data dirs from backup/snapshot
-  and restart those nodes; a single surviving copy cannot commit on its own.
-- **Restore:** `POST /v1/backups/restore` is coordinated through Raft while
-  whole-dataset replication is active. It returns `503` after range ownership
-  is enabled because a single node no longer contains the complete dataset.
-  Hybrid restores also rewind the current node's local shard set and report
-  that scope explicitly; local hybrid data is intentionally not replicated.
-  See `docs/backup-restore.md`.
-
-## Placement ranges
-
-The control plane keeps an ordered key-range map (`ryme_router::Router`):
-every range has an id, start/end key, leader, replica set and epoch. Reads need any valid
-credential; splits, merges, and autosplit triggers need an `Owner`/`Admin`
-principal (`403` otherwise). Authentication runs before body parsing, so unauthenticated
-calls get `401` even with a malformed body, and malformed bodies from
-authenticated callers get `400`.
-
-- `GET /v1/ranges` lists ranges ordered by start key.
-- `GET /v1/ranges/loads` shows the counted write load per range
-  (`id`, `epoch`, `writes` since the range was created) that drives
-  auto-split.
-- `GET /v1/ranges?key=<text>` returns the range owning that key (`404` when
-  no range covers it).
-- `POST /v1/ranges/split` cuts a range at `mid` into `left_id`/`right_id`.
-- `POST /v1/ranges/merge` fuses two adjacent same-leader ranges.
-
-Every mutation bumps the affected epochs. Mutations are epoch-fenced: pass
-the `expected_epoch` you read, and a stale caller gets `409` naming the
-current epoch, so it re-reads placement and retries instead of forking the
-map. Merges additionally require adjacency and a shared leader.
-
-Automatic splitting: every range counts routed writes. REST KV put/delete,
-SQL writes and COPY row counts feed the counters, and so do the wire
-gateways: RESP notes committed staged keys (single commands, `EXEC`
-batches and blocking pops/moves), PG, native, and gRPC note row keys when
-the SQL statement exposes them and use a table-level fallback for predicates.
-When
-`autosplit_writes` is non-zero,
-`POST /v1/ranges/autosplit` splits every range at or above the threshold
-(`?min_writes=` overrides it for one call), and a background task repeats
-the pass every `autosplit_interval_secs` (default 30s, `0` disables the
-loop). A threshold of zero never splits: with the default off config the
-trigger endpoint is a no-op, and an explicit `?min_writes=0` is treated
-the same way, so a bare `POST /v1/ranges/autosplit` cannot surprise-split
-a quiet cluster. The loop is covered by an e2e that writes without ever calling the
-trigger endpoint and polls placement until the children appear. Splits use the key-space midpoint with the same epoch fencing as
-manual splits; child ids are `{id}-a-{epoch}` / `{id}-b-{epoch}`, child
-load counters start at zero, and unsplittable or contended ranges are
-skipped. Both settings default to off (`autosplit_writes: 0`), in which case
-write accounting is skipped entirely. Merges stay manual: only an operator
-can fuse ranges.
-
-On a local sharded backend (`shards > 1` without cluster mode), the persisted
-range topology is also the data-plane placement map once range splitting has
-been activated. A fresh deployment exposes a synthetic `range-0` through the
-control API but leaves data-plane routing in whole-table mode, so
-`POST /v1/shards/move` remains available until the first split or autosplit.
-After activation, point reads/writes route
-by `table\0primary-key`; a split or merge migrates affected rows between local
-shards before the new topology is persisted, and range assignments survive a
-restart. `POST /v1/shards/move` remains available for whole-table placement.
-Pure cluster backends replicate range metadata through the Raft log. Split,
-merge, and autosplit requests must reach the current leader and are only
-acknowledged after the metadata entry reaches quorum; followers apply the same
-range map before serving the updated range. This keeps routing metadata
-consistent across nodes. The leader now exposes `POST /v1/ranges/verify` as the first
-migration
-safety gate: it takes a consistent key-range snapshot from the requested Raft
-member, compares it with the leader at the supplied `expected_epoch`, and
-returns row/byte counts plus `matching` and `ready_for_transfer`. The endpoint
-is read-only; it never changes ownership, and a placement change during the
-check returns `409` so a future transfer cannot copy against a stale range
-epoch. Hybrid backends apply the same local range placement to their
-non-replicated tier, while replicated tables continue to follow the Raft-backed
-placement.
-
-`POST /v1/ranges/transfer` is the controlled handoff for a pure cluster. It
-reads the complete bounded MVCC snapshot—including version chains and
-tombstones—from the current range owner, installs it on the target member,
-reconciles stale visible keys, verifies the target at the source commit
-timestamp, and then bumps the range epoch and records the target as the
-logical range leader (for example, `raft-2`). The old owner is removed from
-the range replica set. After the metadata entry is applied on that owner, it
-purges its materialized range rows only if a fresh snapshot is identical to
-the transferred snapshot; a concurrent write leaves cleanup deferred rather
-than risking data loss. The response reports `source_cleanup` and
-`source_rows_purged`. The operation is leader-only and requires the expected
-epoch. Once that metadata is committed, main-branch point reads through the HTTP, native, gRPC, and RESP
-gateways use the range owner and fetch from the target over the authenticated
-mesh, including RLS checks at the serving gateway where applicable.
-PostgreSQL autocommit primary-key selects use the same owner path; PostgreSQL
-transactions, PostgreSQL scans, and transactional RESP commands still use the
-existing transaction backend so their MVCC snapshots are unchanged. Ordered
-scans through HTTP, native, gRPC, GraphQL, and PostgREST fan out to owners and
-merge bounded pages by primary key. Followers with a complete range map now
-materialize live committed writes only for their local owners while retaining
-global conflict metadata; leaders and recovery still keep the complete state.
-Each configured range replica also receives the range write set over a
-range-scoped append RPC. Range appends carry an independent group term and
-previous-log position; followers persist entries first, and materialize them
-only after the owner advances the range commit index. The owner syncs its
-range WAL before acknowledging a replica quorum, and startup replays those
-records before serving reads. A range heartbeat also reports the follower's
-last durable index; when a replica is behind, the current range leader streams
-the missing records in order and advances that follower's commit view only
-after the repaired prefix is acknowledged. This gives the current placement
-map a durable replica-repair and materialization path; range transaction
-records use the same quorum log while the global log still coordinates the
-cross-range decision.
-If a promoted leader finds an uncommitted divergent suffix, the follower
-reports the conflict index and the leader retries from the common prefix. The
-affected range WAL is rewritten while unrelated range records are retained;
-committed or already-applied range entries are never overwritten.
-On restart, range WAL records above the persisted range commit index remain
-uncommitted and are not materialized until a valid leader commit advances the
-range state. This keeps crash recovery from exposing speculative writes.
-Range replicas also maintain their own election term and heartbeat deadline.
-If the configured range leader fails, a surviving replica can win a majority
-of that range's replica set and become the routed owner without changing the
-global Raft membership. The range leader announcement is learned by followers
-through range heartbeats; global placement changes still remain epoch-fenced
-control-plane operations.
-The handoff removes the old owner from live range storage when the source is
-quiescent; range-WAL compaction and automatic replacement-replica placement
-remain separate operational work. Single-owner write-only transactions now
-route directly to the current range leader, replicate through that range's
-quorum log, validate/apply locally,
-and then advance the range commit index. Read-dependent, multi-owner, and
-write-only multi-owner transactions use the current range leaders for atomic
-forwarding. Transactions that include a read
-set now forward their snapshot and OCC metadata to the current leader, so a
-follower-started transaction can be validated against intervening commits.
-Direct range commits carry a publication marker in the range WAL. Once the
-range commit index advances, the owner and acknowledged range replicas feed
-that write set through the existing CDC hook. Range records created as mirrors
-of a global-log commit do not carry the marker, preventing duplicate realtime
-events.
-Multi-owner transactions now run an explicit prepare phase at each configured
-range owner. Each participant appends its prepare record through that range
-group's quorum log before the coordinator appends a durable decision to its
-own range quorum. Commit/abort resolution is also a committed range record,
-and unresolved records are recovered from the range WAL on participant
-restart. A committed resolution applies only that participant's prepared
-write set, so each range materializes its own portion of the transaction.
-Before preparing participants, the coordinator persists a coordination marker
-in its range quorum. If a node restarts after prepares but before a decision,
-recovery appends an abort decision and drives cleanup; a committed decision
-always takes precedence when one is already present. The same scan runs when a
-replica is promoted to range leader, so a range-leader failure does not require
-the whole process to restart before unresolved coordination is recovered.
-Abort resolutions also leave a range-local tombstone when cleanup races a late
-prepare. A stale coordinator cannot recreate an intent after cleanup has
-already passed that participant.
-Prepared intents also reserve their conflict set: ordinary local or
-range-local commits that overlap a prepared transaction are rejected until the
-coordinator resolves it. This prevents a fast path from bypassing the
-distributed prepare phase.
-The coordinator also records each participant's commit or abort resolution in
-a separate WAL and retries unacknowledged resolutions from its main loop after
-restart. The coordinator's committed range decision also rebuilds the
-participant list after coordinator restart, so a lost resolution RPC leaves
-recoverable work rather than an intent that can block the participant forever.
-Prepare and resolve retries refresh the range leader from the current placement
-map, so a range election between transaction phases does not keep targeting the
-original owner.
-The global Raft log is no longer the decision authority for multi-owner range
-transactions; it remains the control-plane log for membership and metadata.
-The per-range decision record is replicated before the commit result is
-returned, and participant materialization can finish asynchronously after a
-leader loss or restart. Transactions without active range ownership continue
-to use the global data log.
-Cluster transactions also carry the range-topology generation observed at
-begin. Changing the configured range map invalidates an older transaction at
-commit, including write-only owner forwarding; the mesh returns a typed
-`conflict: range topology changed` response so callers can retry against the
-new placement.
-Owner-routed point reads and scans carry the transaction's MVCC read timestamp
-to the range owner. If a transaction has not performed any operation yet and
-the gateway's local range view is stale, its first remote point read establishes
-the snapshot from the owner; subsequent reads and scans keep that timestamp.
-An existing transaction snapshot is never silently replaced by the owner's
-latest state.
-Point reads and point mutations in the PostgreSQL transaction path can now
-fetch missing rows from their configured range owner and add the result to the
-same transaction read set. Filtered scans, joins that depend on remote rows,
-and read-only aggregate queries now fan out bounded range pages, merge them by
-primary key, and preserve the transaction snapshot. Scan-based UPDATE/DELETE,
-UPDATE FROM, DELETE USING, and INSERT SELECT now use those pages before
-staging their writes. Foreign-key checks and cascading delete/update actions
-now use the same owner-routed point-read and scan paths, stage all dependent
-changes in the transaction, and commit through the existing distributed
-coordinator. View relation dependencies are persisted with the schema snapshot,
-so dependent objects cannot be dropped into an invalid state. Main-branch
-autocommit schema changes now use a tagged global-Raft metadata entry: the
-leader must coordinate the new schema snapshot through quorum before the
-request succeeds, and every follower restores and persists that same snapshot
-before applying later requests. A failed proposal restores the leader's
-previous schema locally. Branch executors clear this hook and keep branch DDL
-local. PostgreSQL explicit transactions capture a schema snapshot at `BEGIN`,
-restore it on `ROLLBACK` and savepoint rollback, and coordinate schema-only
-DDL at `COMMIT`; transactions that mix schema changes with row changes are
-rejected until one atomic protocol can cover both logs.
-
-Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
-must reach the current leader, which fans the event over the cluster mesh to
-the other live gateways. It is intentionally ephemeral and is not
-replayed after a member joins or restarts; use durable topics for resumable
-messages.
-
-Presence mutations follow the same leader-routed mesh path. `POST
-/v1/presence/join` and `POST /v1/presence/leave` are accepted by the current
-leader and applied to every live gateway with one shared expiry timestamp.
-Presence is intentionally ephemeral: a gateway that is down during a join or
-leave does not receive that event until the client sends its next heartbeat
-or leave, and presence is not replayed from the Raft log.
-
-Durable topic appends use the durable Raft path instead of the ephemeral mesh.
-The leader returns a cursor only after the entry reaches quorum and applies it;
-followers replay the entry and persist their bounded `topics.json` snapshot.
-
-Committed database writes also emit CDC on every live gateway. The leader's
-executor emits its local change after commit, while followers reconstruct the
-same change from the committed Raft write set after applying it, so clients can
-connect to any gateway and receive the database-change stream.
+Back up the cluster before membership surgery. Read [backup and restore](backup-restore.md)
+for cluster restore scope and [troubleshooting](troubleshooting.md) for logs
+and diagnostics.

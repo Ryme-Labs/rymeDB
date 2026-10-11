@@ -51,4 +51,4 @@ within their own quota (use QoS tiers).
 - Set `RYME_API_KEY` (and `RYME_KMS_KEY` for wrapped DEK persistence).
 - Terminate public traffic on `https_listen` / `native_tls_listen` /
   `resp_tls_listen`; require `tls_client_ca_pem` for service meshes.
-- Run `ryme backup verify <backup-id>` at least weekly.
+- Run `rymedb-cli backup verify <backup-id>` at least weekly.

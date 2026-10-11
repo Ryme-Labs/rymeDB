@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 type Method = "GET" | "POST" | "PUT" | "DELETE";
 
-const HELP = `ryme — rymeDB operator CLI
+const HELP = `rymedb-cli — rymeDB operator CLI
 
-usage: ryme [--base URL] [--api-key KEY] <group> <action> [args] [flags]
+usage: rymedb-cli [--base URL] [--api-key KEY] <group> <action> [args] [flags]
 
 groups:
   health                              GET /health
@@ -212,7 +212,7 @@ async function main(): Promise<void> {
       await call(options, "GET", `/${group}`);
       return;
     case "observe": {
-      if (action !== "slow" && action !== undefined) fail("usage: ryme observe slow [--limit N] [--table T]");
+      if (action !== "slow" && action !== undefined) fail("usage: rymedb-cli observe slow [--limit N] [--table T]");
       const limit = flag(options, "limit");
       const table = flag(options, "table");
       const params = new URLSearchParams();
@@ -223,7 +223,7 @@ async function main(): Promise<void> {
       return;
     }
     case "traces": {
-      if (action !== undefined) fail("usage: ryme traces [--limit N] [--name OP] [--table T]");
+      if (action !== undefined) fail("usage: rymedb-cli traces [--limit N] [--name OP] [--table T]");
       const limit = flag(options, "limit");
       const name = flag(options, "name");
       const table = flag(options, "table");
@@ -236,7 +236,7 @@ async function main(): Promise<void> {
       return;
     }
     case "kv": {
-      need(args, 2, "ryme kv <get|put|delete|ttl> <table> <key> [value]");
+      need(args, 2, "rymedb-cli kv <get|put|delete|ttl> <table> <key> [value]");
       const op = action!;
       const [table, key, ...rest] = args as [string, string, ...string[]];
       const query = flag(options, "ttl") !== undefined ? `?ttl=${flag(options, "ttl")}` : "";
@@ -246,14 +246,14 @@ async function main(): Promise<void> {
       else if (op === "put") {
         let value = rest.join(" ");
         if (options.flags.has("stdin")) value = await readStdin();
-        else if (!value) fail("usage: ryme kv put <table> <key> <value> [--stdin]");
+        else if (!value) fail("usage: rymedb-cli kv put <table> <key> <value> [--stdin]");
         await call(options, "PUT", `/v1/kv/${table}/${key}${query}`, value);
       } else fail(`unknown kv op ${op}`);
       return;
     }
     case "sql": {
       if (action === "copy") {
-        need(args, 2, "ryme sql copy <table> <k=v...>");
+        need(args, 2, "rymedb-cli sql copy <table> <k=v...>");
         const [table, ...pairs] = args;
         const rows = pairs.map((pair) => {
           const eq = pair.indexOf("=");
@@ -265,22 +265,22 @@ async function main(): Promise<void> {
       }
       if (action === "explain") {
         const statement = args.join(" ");
-        if (!statement) fail("usage: ryme sql explain <statement...>");
+        if (!statement) fail("usage: rymedb-cli sql explain <statement...>");
         await call(options, "POST", "/v1/sql/explain", JSON.stringify({ sql: statement }));
         return;
       }
       const statement = [action, ...args].filter((part) => part !== undefined).join(" ");
-      if (!statement) fail("usage: ryme sql <statement...>");
+      if (!statement) fail("usage: rymedb-cli sql <statement...>");
       await call(options, "POST", "/v1/sql", JSON.stringify({ sql: statement }));
       return;
     }
     case "rest": {
       if (action === "list") {
-        need(args, 1, "ryme rest list <table> [query]");
+        need(args, 1, "rymedb-cli rest list <table> [query]");
         const [table, query] = args;
         await call(options, "GET", `/rest/v1/${table}${query ? `?${query}` : ""}`);
       } else if (action === "insert") {
-        need(args, 3, "ryme rest insert <table> <key> <value>");
+        need(args, 3, "rymedb-cli rest insert <table> <key> <value>");
         await call(
           options,
           "POST",
@@ -288,14 +288,14 @@ async function main(): Promise<void> {
           JSON.stringify({ key: args[1], value: args[2] }),
         );
       } else if (action === "delete") {
-        need(args, 2, "ryme rest delete <table> <key>");
+        need(args, 2, "rymedb-cli rest delete <table> <key>");
         await call(options, "DELETE", `/rest/v1/${args[0]}?key=eq.${encodeURIComponent(args[1]!)}`);
-      } else fail("usage: ryme rest <list|insert|delete> ...");
+      } else fail("usage: rymedb-cli rest <list|insert|delete> ...");
       return;
     }
     case "graphql": {
       const query = [action, ...args].filter((part) => part !== undefined).join(" ");
-      if (!query) fail("usage: ryme graphql <query...>");
+      if (!query) fail("usage: rymedb-cli graphql <query...>");
       await call(options, "POST", "/graphql", JSON.stringify({ query }));
       return;
     }
@@ -304,7 +304,7 @@ async function main(): Promise<void> {
       return;
     case "qos": {
       if (action === "tier") {
-        need(args, 2, "ryme qos tier <tenant> <shared|dedicated_shard|dedicated_cluster>");
+        need(args, 2, "rymedb-cli qos tier <tenant> <shared|dedicated_shard|dedicated_cluster>");
         await call(
           options,
           "POST",
@@ -318,7 +318,7 @@ async function main(): Promise<void> {
     }
     case "auth": {
       if (action === "register") {
-        need(args, 2, "ryme auth register <id> <password>");
+        need(args, 2, "rymedb-cli auth register <id> <password>");
         await call(
           options,
           "POST",
@@ -326,7 +326,7 @@ async function main(): Promise<void> {
           JSON.stringify({ id: args[0], password: args[1] }),
         );
       } else if (action === "verify") {
-        need(args, 2, "ryme auth verify <id> <password>");
+        need(args, 2, "rymedb-cli auth verify <id> <password>");
         await call(
           options,
           "POST",
@@ -334,7 +334,7 @@ async function main(): Promise<void> {
           JSON.stringify({ id: args[0], password: args[1] }),
         );
       } else if (action === "token") {
-        need(args, 2, "ryme auth token <id> <password> [--code C]");
+        need(args, 2, "rymedb-cli auth token <id> <password> [--code C]");
         const code = flag(options, "code") ?? null;
         await call(
           options,
@@ -343,7 +343,7 @@ async function main(): Promise<void> {
           JSON.stringify({ id: args[0], password: args[1], code }),
         );
       } else if (action === "revoke") {
-        need(args, 1, "ryme auth revoke <key>");
+        need(args, 1, "rymedb-cli auth revoke <key>");
         await call(
           options,
           "DELETE",
@@ -351,7 +351,7 @@ async function main(): Promise<void> {
           JSON.stringify({ key: args[0] }),
         );
       } else if (action === "passkey-register") {
-        need(args, 3, "ryme auth passkey-register <user> <cred-id> <pubkey-b64>");
+        need(args, 3, "rymedb-cli auth passkey-register <user> <cred-id> <pubkey-b64>");
         await call(
           options,
           "POST",
@@ -359,7 +359,7 @@ async function main(): Promise<void> {
           JSON.stringify({ user: args[0], credential_id: args[1], public_key: args[2] }),
         );
       } else if (action === "passkey-verify") {
-        need(args, 5, "ryme auth passkey-verify <user> <cred-id> <auth-data-b64> <client-data-b64> <sig-b64>");
+        need(args, 5, "rymedb-cli auth passkey-verify <user> <cred-id> <auth-data-b64> <client-data-b64> <sig-b64>");
         await call(
           options,
           "POST",
@@ -373,7 +373,7 @@ async function main(): Promise<void> {
           }),
         );
       } else if (action === "mask") {
-        need(args, 2, "ryme auth mask <table> <field...>");
+        need(args, 2, "rymedb-cli auth mask <table> <field...>");
         await call(
           options,
           "POST",
@@ -381,7 +381,7 @@ async function main(): Promise<void> {
           JSON.stringify({ table: args[0], fields: args.slice(1) }),
         );
       } else if (action === "oidc-login") {
-        need(args, 1, "ryme auth oidc-login <redirect-uri> [--state S]");
+        need(args, 1, "rymedb-cli auth oidc-login <redirect-uri> [--state S]");
         await call(
           options,
           "POST",
@@ -389,19 +389,19 @@ async function main(): Promise<void> {
           JSON.stringify({ redirect_uri: args[0], state: flag(options, "state") ?? null }),
         );
       } else if (action === "oidc-token") {
-        need(args, 1, "ryme auth oidc-token <id-token>");
+        need(args, 1, "rymedb-cli auth oidc-token <id-token>");
         await call(
           options,
           "POST",
           "/v1/auth/oidc/token",
           JSON.stringify({ id_token: args[0] }),
         );
-      } else fail("usage: ryme auth <register|verify|mask|oidc-login|oidc-token> ...");
+      } else fail("usage: rymedb-cli auth <register|verify|mask|oidc-login|oidc-token> ...");
       return;
     }
     case "presence": {
       if (action === "join") {
-        need(args, 2, "ryme presence join <channel> <member>");
+        need(args, 2, "rymedb-cli presence join <channel> <member>");
         await call(
           options,
           "POST",
@@ -409,14 +409,14 @@ async function main(): Promise<void> {
           JSON.stringify({ channel: args[0], member: args[1] }),
         );
       } else if (action === "list") {
-        need(args, 1, "ryme presence list <channel>");
+        need(args, 1, "rymedb-cli presence list <channel>");
         await call(options, "GET", `/v1/presence/${encodeURIComponent(args[0]!)}`);
-      } else fail("usage: ryme presence <join|list> ...");
+      } else fail("usage: rymedb-cli presence <join|list> ...");
       return;
     }
     case "topics": {
       if (action === "append") {
-        need(args, 3, "ryme topics append <partition> <key> <value>");
+        need(args, 3, "rymedb-cli topics append <partition> <key> <value>");
         await call(
           options,
           "POST",
@@ -424,15 +424,15 @@ async function main(): Promise<void> {
           JSON.stringify({ partition: args[0], key: args[1], value: args[2] }),
         );
       } else if (action === "read") {
-        need(args, 1, "ryme topics read <partition> [--from N]");
+        need(args, 1, "rymedb-cli topics read <partition> [--from N]");
         const from = flag(options, "from") ?? "0";
         await call(options, "GET", `/v1/topics/read?partition=${encodeURIComponent(args[0]!)}&from=${from}&limit=100`);
-      } else fail("usage: ryme topics <append|read> ...");
+      } else fail("usage: rymedb-cli topics <append|read> ...");
       return;
     }
     case "vector": {
       if (action === "upsert") {
-        need(args, 3, "ryme vector upsert <table> <id> <v1,v2,...>");
+        need(args, 3, "rymedb-cli vector upsert <table> <id> <v1,v2,...>");
         const vector = args[2]!.split(",").map((v) => Number(v.trim()));
         if (vector.some((v) => Number.isNaN(v))) fail("vector must be comma-separated numbers");
         await call(
@@ -442,7 +442,7 @@ async function main(): Promise<void> {
           JSON.stringify({ table: args[0], id: args[1], vector }),
         );
       } else if (action === "search") {
-        need(args, 2, "ryme vector search <table> <v1,v2,...> [--top-k N]");
+        need(args, 2, "rymedb-cli vector search <table> <v1,v2,...> [--top-k N]");
         const vector = args[1]!.split(",").map((v) => Number(v.trim()));
         if (vector.some((v) => Number.isNaN(v))) fail("vector must be comma-separated numbers");
         const topK = Number(flag(options, "top-k") ?? "10");
@@ -453,10 +453,10 @@ async function main(): Promise<void> {
           JSON.stringify({ table: args[0], vector, top_k: topK }),
         );
       } else if (action === "delete") {
-        need(args, 2, "ryme vector delete <table> <id>");
+        need(args, 2, "rymedb-cli vector delete <table> <id>");
         await call(options, "DELETE", `/v1/vector/${args[0]}/${args[1]}`);
       } else if (action === "ann-search") {
-        need(args, 2, "ryme vector ann-search <table> <v1,v2,...> [--top-k N] [--ef N]");
+        need(args, 2, "rymedb-cli vector ann-search <table> <v1,v2,...> [--top-k N] [--ef N]");
         const vector = args[1]!.split(",").map((v) => Number(v.trim()));
         if (vector.some((v) => Number.isNaN(v))) fail("vector must be comma-separated numbers");
         const topK = Number(flag(options, "top-k") ?? "10");
@@ -467,12 +467,12 @@ async function main(): Promise<void> {
           "/v1/vector/ann-search",
           JSON.stringify({ table: args[0], vector, top_k: topK, ef }),
         );
-      } else fail("usage: ryme vector <upsert|search|ann-search|delete> ...");
+      } else fail("usage: rymedb-cli vector <upsert|search|ann-search|delete> ...");
       return;
     }
     case "text": {
       if (action === "index") {
-        need(args, 3, "ryme text index <table> <id> <text...>");
+        need(args, 3, "rymedb-cli text index <table> <id> <text...>");
         await call(
           options,
           "POST",
@@ -480,7 +480,7 @@ async function main(): Promise<void> {
           JSON.stringify({ table: args[0], id: args[1], text: args.slice(2).join(" ") }),
         );
       } else if (action === "search") {
-        need(args, 2, "ryme text search <table> <query...>");
+        need(args, 2, "rymedb-cli text search <table> <query...>");
         const topK = Number(flag(options, "top-k") ?? "10");
         await call(
           options,
@@ -489,15 +489,15 @@ async function main(): Promise<void> {
           JSON.stringify({ table: args[0], query: args.slice(1).join(" "), top_k: topK }),
         );
       } else if (action === "delete") {
-        need(args, 2, "ryme text delete <table> <id>");
+        need(args, 2, "rymedb-cli text delete <table> <id>");
         await call(options, "DELETE", `/v1/text/${args[0]}/${args[1]}`);
-      } else fail("usage: ryme text <index|search|delete> ...");
+      } else fail("usage: rymedb-cli text <index|search|delete> ...");
       return;
     }
     case "index": {
       if (action === "stats" || action === undefined) {
         await call(options, "GET", "/v1/index/stats");
-      } else fail("usage: ryme index stats");
+      } else fail("usage: rymedb-cli index stats");
       return;
     }
     case "autoscale": {
@@ -510,14 +510,14 @@ async function main(): Promise<void> {
       return;
     }
     case "scan": {
-      if (!action) fail("usage: ryme scan <table> [--limit N]");
+      if (!action) fail("usage: rymedb-cli scan <table> [--limit N]");
       const limit = flag(options, "limit");
       await call(options, "GET", `/v1/scan/${action}${limit !== undefined ? `?limit=${limit}` : ""}`);
       return;
     }
     case "branch": {
       if (action === "create") {
-        need(args, 3, "ryme branch create <id> <parent> <base_commit_ts>");
+        need(args, 3, "rymedb-cli branch create <id> <parent> <base_commit_ts>");
         const [id, parent, ts] = args;
         await call(
           options,
@@ -528,10 +528,10 @@ async function main(): Promise<void> {
       } else if (action === "list" || action === undefined) {
         await call(options, "GET", "/v1/branches");
       } else if (action === "get" || action === "delete") {
-        need(args, 1, `ryme branch ${action} <id>`);
+        need(args, 1, `rymedb-cli branch ${action} <id>`);
         await call(options, action === "get" ? "GET" : "DELETE", `/v1/branches/${args[0]}`);
       } else if (action === "reset") {
-        need(args, 2, "ryme branch reset <id> <base_commit_ts>");
+        need(args, 2, "rymedb-cli branch reset <id> <base_commit_ts>");
         await call(
           options,
           "POST",
@@ -539,12 +539,12 @@ async function main(): Promise<void> {
           JSON.stringify({ base_commit_ts: Number(args[1]) }),
         );
       } else if (action === "promote") {
-        need(args, 1, "ryme branch promote <id>");
+        need(args, 1, "rymedb-cli branch promote <id>");
         await call(options, "POST", `/v1/branches/${args[0]}/promote`);
       } else if (action === "diff") {
-        need(args, 2, "ryme branch diff <id> <against>");
+        need(args, 2, "rymedb-cli branch diff <id> <against>");
         await call(options, "GET", `/v1/branches/${args[0]}/diff?against=${encodeURIComponent(args[1]!)}`);
-      } else fail("usage: ryme branch <create|list|get|delete|reset|promote|diff> ...");
+      } else fail("usage: rymedb-cli branch <create|list|get|delete|reset|promote|diff> ...");
       return;
     }
     case "billing":
@@ -557,15 +557,15 @@ async function main(): Promise<void> {
       return;
     case "migrate": {
       if (action === "supabase") {
-        need(args, 1, "ryme migrate supabase <dump-file>");
+        need(args, 1, "rymedb-cli migrate supabase <dump-file>");
         const dump = await readFile(args[0]!);
         await call(options, "POST", "/v1/migrate/supabase", JSON.stringify({ dump }));
       } else if (action === "neon") {
-        need(args, 1, "ryme migrate neon <branches-json-file>");
+        need(args, 1, "rymedb-cli migrate neon <branches-json-file>");
         const branches = await readFile(args[0]!);
         await call(options, "POST", "/v1/migrate/neon", JSON.stringify({ branches }));
       } else if (action === "apply") {
-        need(args, 2, "ryme migrate apply <id> <sql> [--author A]");
+        need(args, 2, "rymedb-cli migrate apply <id> <sql> [--author A]");
         const author = flag(options, "author") ?? null;
         await call(
           options,
@@ -575,7 +575,7 @@ async function main(): Promise<void> {
         );
       } else if (action === "ledger") {
         await call(options, "GET", "/v1/migrate/ledger");
-      } else fail("usage: ryme migrate <supabase|neon|apply|ledger> ...");
+      } else fail("usage: rymedb-cli migrate <supabase|neon|apply|ledger> ...");
       return;
     }
     case "regions":
@@ -593,10 +593,10 @@ async function main(): Promise<void> {
       } else if (action === "latest") {
         await call(options, "GET", "/v1/backups/latest");
       } else if (action === "pitr") {
-        need(args, 1, "ryme backup pitr <target>");
+        need(args, 1, "rymedb-cli backup pitr <target>");
         await call(options, "GET", `/v1/backups/pitr?target=${args[0]}`);
       } else if (action === "restore") {
-        need(args, 1, "ryme backup restore <target>");
+        need(args, 1, "rymedb-cli backup restore <target>");
         await call(options, "POST", `/v1/backups/restore?target=${args[0]}`);
       } else if (action === "archive") {
         const backup = flag(options, "backup");
@@ -609,30 +609,30 @@ async function main(): Promise<void> {
       } else if (action === "archives") {
         await call(options, "GET", "/v1/backups/archives");
       } else if (action === "verify") {
-        need(args, 1, "ryme backup verify <backup-id>");
+        need(args, 1, "rymedb-cli backup verify <backup-id>");
         await call(options, "GET", `/v1/backups/verify?backup_id=${encodeURIComponent(args[0]!)}`);
       } else if (action === "drill") {
         await call(options, "GET", "/v1/backups/drill");
       } else if (action === "copy") {
-        need(args, 1, "ryme backup copy <backup-id>");
+        need(args, 1, "rymedb-cli backup copy <backup-id>");
         await call(
           options,
           "POST",
           "/v1/backups/copy",
           JSON.stringify({ backup_id: args[0] }),
         );
-      } else fail("usage: ryme backup <checkpoint|latest|pitr|restore|archive|archives|verify|drill|copy> ...");
+      } else fail("usage: rymedb-cli backup <checkpoint|latest|pitr|restore|archive|archives|verify|drill|copy> ...");
       return;
     }
     case "snapshot":
-      if (action !== "create") fail("usage: ryme snapshot create");
+      if (action !== "create") fail("usage: rymedb-cli snapshot create");
       await call(options, "POST", "/v1/snapshots");
       return;
     case "shards":
       if (action === "layout" || action === undefined) {
         await call(options, "GET", "/v1/shards");
       } else if (action === "move") {
-        need(args, 1, "ryme shards move <table> [--target N]");
+        need(args, 1, "rymedb-cli shards move <table> [--target N]");
         const target = flag(options, "target");
         await call(
           options,
@@ -640,16 +640,16 @@ async function main(): Promise<void> {
           "/v1/shards/move",
           JSON.stringify({ table: args[0], target: target === undefined ? null : Number(target) }),
         );
-      } else fail("usage: ryme shards <layout|move> ...");
+      } else fail("usage: rymedb-cli shards <layout|move> ...");
       return;
     case "ranges": {
       if (action === "list" || action === undefined) {
         await call(options, "GET", "/v1/ranges");
       } else if (action === "route") {
-        need(args, 1, "ryme ranges route <key>");
+        need(args, 1, "rymedb-cli ranges route <key>");
         await call(options, "GET", `/v1/ranges?key=${encodeURIComponent(args[0]!)}`);
       } else if (action === "split") {
-        need(args, 5, "ryme ranges split <id> <mid> <left> <right> <epoch>");
+        need(args, 5, "rymedb-cli ranges split <id> <mid> <left> <right> <epoch>");
         await call(
           options,
           "POST",
@@ -663,7 +663,7 @@ async function main(): Promise<void> {
           }),
         );
       } else if (action === "merge") {
-        need(args, 5, "ryme ranges merge <left> <right> <merged> <lepoch> <repoch>");
+        need(args, 5, "rymedb-cli ranges merge <left> <right> <merged> <lepoch> <repoch>");
         await call(
           options,
           "POST",
@@ -681,14 +681,14 @@ async function main(): Promise<void> {
         await call(options, "POST", `/v1/ranges/autosplit${min}`);
       } else if (action === "loads") {
         await call(options, "GET", "/v1/ranges/loads");
-      } else fail("usage: ryme ranges <list|route|split|merge|autosplit|loads> [min-writes]");
+      } else fail("usage: rymedb-cli ranges <list|route|split|merge|autosplit|loads> [min-writes]");
       return;
     }
     case "cluster": {
       if (action === "members" || action === undefined) {
         await call(options, "GET", "/v1/cluster/members");
       } else if (action === "add") {
-        need(args, 2, "ryme cluster add <id> <addr>");
+        need(args, 2, "rymedb-cli cluster add <id> <addr>");
         await call(
           options,
           "POST",
@@ -696,34 +696,34 @@ async function main(): Promise<void> {
           JSON.stringify({ id: Number(args[0]), addr: args[1] }),
         );
       } else if (action === "remove") {
-        need(args, 1, "ryme cluster remove <id>");
+        need(args, 1, "rymedb-cli cluster remove <id>");
         await call(options, "DELETE", `/v1/cluster/members/${args[0]}`);
       } else if (action === "transfer") {
-        need(args, 1, "ryme cluster transfer <target>");
+        need(args, 1, "rymedb-cli cluster transfer <target>");
         await call(options, "POST", "/v1/cluster/transfer", JSON.stringify({ target: Number(args[0]) }));
       } else if (action === "replace") {
-        if (args.length === 0) fail("usage: ryme cluster replace <id=addr>...");
+        if (args.length === 0) fail("usage: rymedb-cli cluster replace <id=addr>...");
         const members = args.map((entry) => {
           const eq = entry.indexOf("=");
           if (eq < 0) fail(`bad member ${entry}, want <id=addr>`);
           return { id: Number(entry.slice(0, eq)), addr: entry.slice(eq + 1) };
         });
         await call(options, "POST", "/v1/cluster/replace", JSON.stringify({ members }));
-      } else fail("usage: ryme cluster <members|add|remove|transfer|replace> ...");
+      } else fail("usage: rymedb-cli cluster <members|add|remove|transfer|replace> ...");
       return;
     }
     case "stream": {
       if (action !== "watch" && action !== "query" && action !== "broadcast") {
-        fail("usage: ryme stream <watch|query|broadcast> <table|channel> [--limit N] [--count N]");
+        fail("usage: rymedb-cli stream <watch|query|broadcast> <table|channel> [--limit N] [--count N]");
       }
       need(
         args,
         1,
         action === "watch"
-          ? "ryme stream watch <table> [--count N]"
+          ? "rymedb-cli stream watch <table> [--count N]"
           : action === "query"
-            ? "ryme stream query <table> [--limit N] [--count N]"
-            : "ryme stream broadcast <channel> [--count N]",
+            ? "rymedb-cli stream query <table> [--limit N] [--count N]"
+            : "rymedb-cli stream broadcast <channel> [--count N]",
       );
       const table = args[0]!;
       const limit = flag(options, "limit");
@@ -741,7 +741,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      fail(`unknown command ${group} (try: ryme help)`);
+      fail(`unknown command ${group} (try: rymedb-cli help)`);
   }
 }
 

@@ -1,6 +1,6 @@
 ![rymeDB banner](images/rymedb-banner.png)
 
-[Read the documentation](https://ryme-labs.github.io/rymeDB/) · [OpenAPI reference](https://ryme-labs.github.io/rymeDB/api/)
+[Read the documentation](https://db.rymelabs.dev/) · [OpenAPI reference](https://db.rymelabs.dev/api/)
 
 rymeDB is an open-source, ultra-low-latency distributed relational database and
 backend platform. One static `ryme-server` binary serves PostgreSQL wire
@@ -9,7 +9,8 @@ protocol clients, RESP (Valkey-compatible) clients, and a REST operator API.
 ## Quick start
 
 ```bash
-cargo run -p ryme-server --release
+export RYME_API_KEY=local-dev-key
+cargo run --locked -p ryme-server -- --http-listen 127.0.0.1:8080 --pg-listen 127.0.0.1:5433 --resp-listen 127.0.0.1:6380 --data-dir ./data
 ```
 
 Default listeners:
@@ -22,12 +23,21 @@ Set `RYME_API_KEY` for auth. See `docs/configuration.md` for all options.
 
 ```bash
 psql -h 127.0.0.1 -p 5433 -U postgres -c "SELECT 1"
-curl -H "Authorization: Bearer $RYME_API_KEY" http://127.0.0.1:8080/v1/health
+curl -H "Authorization: Bearer $RYME_API_KEY" http://127.0.0.1:8080/ready
 ```
 
 SDKs live in `sdks/` (Java, npm/TypeScript, and Rust).
 Release artifacts are published from version tags; see `docs/sdk-release.md`.
-CLI lives in `apps/cli`. Dashboard is served at `GET /dashboard`.
+
+The operator CLI lives in `apps/cli` and is installed as `rymedb-cli`:
+
+```bash
+pnpm --dir apps/cli install
+pnpm --dir apps/cli build
+node apps/cli/dist/cli.js --help
+```
+
+Dashboard is served at `GET /dashboard`.
 
 ## Docs
 

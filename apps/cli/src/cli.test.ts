@@ -28,7 +28,7 @@ function cliPaths(): Set<string> {
   return out;
 }
 
-describe("ryme cli", () => {
+describe("rymedb-cli cli", () => {
   it("only calls documented REST paths", () => {
     const documented = specPaths();
     const literals = cliPaths();

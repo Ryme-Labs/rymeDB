@@ -592,7 +592,7 @@ All notable changes to rymeDB are recorded here. Format follows
   port-race failures under parallel load.
 - SDK parity for placement ranges: `ranges`/`range_split`/`range_merge` in
   Python, JS, and Go SDKs with stub-based tests asserting method, path, and
-  body, plus `ryme ranges <list|route|split|merge>` CLI commands verified
+  body, plus `rymedb-cli ranges <list|route|split|merge>` CLI commands verified
   against a live server including the stale-epoch 409 path.
 - Automatic range splitting: per-range REST write-load counters
   (`Router::note_write`, shared atomics, serde-invisible, zeroed on
@@ -611,7 +611,7 @@ All notable changes to rymeDB are recorded here. Format follows
   notes `KvPut`/`KvDelete` by key and SQL writes by table — each behind
   `with_range_hook`, off by default with zero overhead.   The trigger is
   covered in Python/JS/Go/Rust SDKs (`range_autosplit`), thin Swift/Kotlin/
-  Dart/C# clients, `ryme ranges autosplit [min-writes]`, and a "Split hot"
+  Dart/C# clients, `rymedb-cli ranges autosplit [min-writes]`, and a "Split hot"
   button on the dashboard observe tab (wiring test extended). Covered by router unit
   tests, control midpoint/candidate tests, per-gateway hook tests, and
   live e2es where REST PUTs and RESP SETs/INCRs together push `range-0`
@@ -626,7 +626,7 @@ All notable changes to rymeDB are recorded here. Format follows
   `{id, epoch, writes}` counters behind auto-split (any credential;
   zeroed on split/merge), covered in Python/JS/Go/Rust SDKs
   (`range_loads`), thin Swift/Kotlin/Dart/C# clients,
-  `ryme ranges loads`, and a "Loads" dashboard button. OpenAPI grows
+  `rymedb-cli ranges loads`, and a "Loads" dashboard button. OpenAPI grows
   to 73 paths.
 - Dashboard overview shows range write loads next to placement ranges
   (`loads: count=` with per-range `writes=`), stub-tested including the
@@ -662,14 +662,14 @@ All notable changes to rymeDB are recorded here. Format follows
 - Slow-log table filter: `GET /v1/observe/slow?table=<name>` narrows the
   newest-first feed to one table (filter-then-take via
   `SlowLog::recent_filtered`), with the `table` query param in OpenAPI
-  and support in all eight SDKs, `ryme observe slow [--table T]`, and a
+  and support in all eight SDKs, `rymedb-cli observe slow [--table T]`, and a
   table-filter input on the dashboard observe tab. Covered by an observe
   unit test (ordering, limit, missing table) and a live e2e asserting the
   filtered shape.
 - Trace span filters: `GET /v1/traces` accepts `?name=` (exact operation
   name) and `?table=` (span table attribute) via
   `TraceCollector::recent_filtered`, with params in OpenAPI and support
-  in all eight SDKs, `ryme traces [--name OP] [--table T]`, and a
+  in all eight SDKs, `rymedb-cli traces [--name OP] [--table T]`, and a
   table-filter input on the dashboard observe tab. Covered by an observe
   unit test (name, table, combined, limits) and a live e2e asserting
   filtered/non-empty plus missing-filter/empty results.
@@ -721,14 +721,14 @@ All notable changes to rymeDB are recorded here. Format follows
   (register → token → key works on a protected route; wrong password
   `401`; OTP enrollment enforced; correct TOTP mints), OpenAPI schema,
   `auth_token` clients in Python/JS/Go/Rust SDKs with stub tests, and
-  `ryme auth token <id> <password> [--code C]`.
+  `rymedb-cli auth token <id> <password> [--code C]`.
 - Key revocation: minted keys could never be revoked. New
   `DELETE /v1/auth/keys` (key in the JSON body so it never hits access
   logs; write-capable principal; `404` for unknown keys), covered by a
   unit test and a live e2e (mint → use → revoke → `401`), OpenAPI
   schema, `auth_revoke` clients in Python/JS/Go/Rust SDKs with stub
   tests, `authRevoke` in the thin Swift/Kotlin/Dart/C# clients, and
-  `ryme auth revoke <key>`.
+  `rymedb-cli auth revoke <key>`.
 - OIDC login now issues keys too: `POST /v1/auth/oidc/token` returned a
   receipt only, leaving OIDC a second dead end. It now mints a
   `ryme_`-prefixed key for the verified identity (tenant/roles from
@@ -749,8 +749,8 @@ All notable changes to rymeDB are recorded here. Format follows
   ceremony with an in-test keypair, plus OpenAPI paths and schemas.
 - Passkey client parity: `passkey_register`/`passkey_verify` clients in
   Python/JS/Go/Rust SDKs (stub-tested) and thin Swift/Kotlin/Dart/C#
-  clients, plus `ryme auth passkey-register` and
-  `ryme auth passkey-verify`. Browser ceremony itself stays in
+  clients, plus `rymedb-cli auth passkey-register` and
+  `rymedb-cli auth passkey-verify`. Browser ceremony itself stays in
   authenticatorland; the dashboard console intentionally gains no
   passkey buttons (raw blob pasting is worse UX, not better).
 - Token parity follow-up: `authToken` in the thin Swift/Kotlin/Dart/C#
@@ -766,7 +766,7 @@ All notable changes to rymeDB are recorded here. Format follows
   executes the row into place, ledger versions, dup `409`, bad SQL
   `400`), OpenAPI paths and schemas, `migrate_apply`/`migrate_ledger`
   clients in all eight SDKs with stub tests, and
-  `ryme migrate apply <id> <sql>` / `ryme migrate ledger`.
+  `rymedb-cli migrate apply <id> <sql>` / `rymedb-cli migrate ledger`.
 - Migration apply semantics hardened: read-only statements are rejected
   with `400` (a migration that writes nothing is meaningless), and SQL
   execution failures now surface their real error instead of a generic
@@ -786,7 +786,7 @@ All notable changes to rymeDB are recorded here. Format follows
   the change feed), covered by a live e2e and OpenAPI. Subscribe parity
   in Python (`subscribe_broadcast`), JS (`subscribeBroadcast` +
   `BroadcastRecord`), Go (`SubscribeBroadcast` + `BroadcastMessage`),
-  and `ryme stream broadcast <channel> [--count N]` (plus a `?`/`&`
+  and `rymedb-cli stream broadcast <channel> [--count N]` (plus a `?`/`&`
   api_key separator fix shared with all stream commands), verified live
   against a real server.
 - Resumable change streams: `Realtime` keeps a bounded per-topic history
@@ -810,7 +810,7 @@ All notable changes to rymeDB are recorded here. Format follows
   fed by the `kv_put`/`sql`/`sql_copy` slow paths with kind, fingerprint,
   table, micros and timestamp — fingerprints only, never raw statements —
   served at `GET /v1/observe/slow?limit=` (authenticated) with
-  `slow_log` clients in Python/JS/Go/Rust SDKs and `ryme observe slow`.
+  `slow_log` clients in Python/JS/Go/Rust SDKs and `rymedb-cli observe slow`.
   Verified live: a 2000-row COPY lands as `COPY bulk` at 30ms. OpenAPI
   grows to 70 paths.
 - Live request tracing: `TraceCollector`/`TraceSpan` graduate from unit-tested
@@ -826,7 +826,7 @@ All notable changes to rymeDB are recorded here. Format follows
   off, service `rymedb`, 30s). Covered by encoder goldens, drain tests and a
   live export test against a stub receiver.
 - Traces parity: `traces(limit?)` clients in Python/JS/Go/Rust SDKs,
-  `ryme traces [--limit N]` CLI (verified live: empty log, then a `kv_put`
+  `rymedb-cli traces [--limit N]` CLI (verified live: empty log, then a `kv_put`
   span with table attributes after a PUT), and dashboard overview coverage
   with graceful degradation.
 - Benchmark re-validation after the wire-gateway QoS turn: set/get/mixed/tx
@@ -876,7 +876,7 @@ All notable changes to rymeDB are recorded here. Format follows
   path/body-key cross-check against the OpenAPI schemas (no toolchains
   available in this environment for those four languages).
 - Cross-region archive copies: `archive_replica` target plus
-  `POST /v1/backups/copy` (`ryme backup copy`) with SHA-256 verification
+  `POST /v1/backups/copy` (`rymedb-cli backup copy`) with SHA-256 verification
   on source reads and replica read-backs.
 - PostgreSQL wire: quote-aware multi-statement simple queries, SQL-level
   `PREPARE`/`EXECUTE`/`DEALLOCATE`, and the missing ErrorResponse
@@ -924,13 +924,13 @@ All notable changes to rymeDB are recorded here. Format follows
   invoices, autoscale advice, migration ledger, Supabase/Neon analyzers,
   OTel-style traces, query fingerprints, Prometheus exposition.
 - SDKs: JavaScript/TypeScript, Python, Go, Rust, Swift, Kotlin, Dart, C#.
-- Operator surfaces: `ryme` CLI, web admin console at `GET /dashboard`,
+- Operator surfaces: `rymedb-cli` CLI, web admin console at `GET /dashboard`,
   Helm chart, plain K8s manifests, branch-per-PR preview CI.
 - Correctness: Jepsen-style transfer invariant, chaos/restart/SIGKILL
   suites, fault-injection membership tests.
 - Benchmarks: `ryme-bench` with p50/p90/p95/p99/p99.9 histograms and an
   honest performance report in `docs/performance.md`.
-- gRPC gateway: new `ryme-wire-grpc` crate (`proto/ryme.proto`,
+- gRPC gateway: new `ryme-wire-grpc` crate (`proto/rymedb-cli.proto`,
   `rymedb.v1.Ryme` with `Health`, `KvGet`, `KvPut`, `KvDelete`, `Scan`,
   `Sql`) built on tonic with Bearer API-key auth, per-RPC QoS/metering and
   latency/histogram/slow observability mirroring the native gateway, wired
@@ -1142,7 +1142,7 @@ All notable changes to rymeDB are recorded here. Format follows
   `e2e_drill_reports_corruption` flips a byte in an archived segment and
   asserts the drill records the backup id with a non-empty error. Surfaced as `backupDrill`/`backup_drill`/
   `BackupDrill`/`backup_drill` in JS/Python/Go/Rust SDKs (stub-tested),
-  thin Swift/Kotlin/Dart/C# clients, `ryme backup drill`,
+  thin Swift/Kotlin/Dart/C# clients, `rymedb-cli backup drill`,
   `--verify-interval-secs`, the dashboard overview (with a `never run`
   state until the first drill), and a web-console Backups card button.
 - Honest durability tiers: `Durability::is_durable` centralizes the

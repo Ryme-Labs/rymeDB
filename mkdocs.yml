@@ -1,6 +1,6 @@
 site_name: rymeDB
 site_description: A Rust-first realtime distributed database and backend platform.
-site_url: https://ryme-labs.github.io/rymeDB/
+site_url: https://db.rymelabs.dev/
 repo_name: Ryme-Labs/rymeDB
 repo_url: https://github.com/Ryme-Labs/rymeDB
 edit_uri: edit/main/docs/
@@ -68,33 +68,39 @@ extra_css:
   - stylesheets/extra.css
 
 extra_javascript:
-  - https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js
   - https://unpkg.com/mermaid@11.4.1/dist/mermaid.min.js
   - javascripts/mermaid.js
 
 exclude_docs: |
   requirements-pages.txt
+  swagger-ui.html
 
 copyright: Copyright © Ryme Labs
 
 nav:
   - Start here:
       - Overview: index.md
+      - A–Z setup: setup.md
       - Configuration: configuration.md
-      - Isolation and tenancy: isolation.md
+      - Authentication and tenants: auth.md
+      - SQL and transactions: sql.md
+      - Isolation and retry behavior: isolation.md
   - Build and operate:
       - Production operations: production.md
       - Cluster operations: cluster-operations.md
       - Backup and restore: backup-restore.md
       - Streaming and realtime: streaming.md
+      - Troubleshooting: troubleshooting.md
       - RESP compatibility: resp.md
+      - PostgreSQL compatibility: postgres.md
       - Migrations: migration.md
       - Performance: performance.md
-  - API:
+  - API and clients:
       - REST API reference: api.md
-  - SDKs:
       - Java: sdk-java.md
       - npm / JavaScript: sdk-js.md
       - Rust: sdk-rust.md
   - Project:
+      - Development: development.md
+      - Security and vulnerability reports: security.md
       - SDK releases: sdk-release.md

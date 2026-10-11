@@ -1,195 +1,103 @@
-# Backup, PITR, snapshots, restore
+# Backups, snapshots, and point-in-time recovery
 
-rymeDB separates four related mechanisms. Handlers live in
-`crates/ryme-server/src/lib.rs`; the checkpoint record is
-`{ id, commit_ts, manifest_id, created_unix }`.
+rymeDB has separate mechanisms for a checkpoint marker, a local snapshot, an
+archive copy, and a restore. Test all four in a disposable data directory
+before declaring a recovery plan.
 
-## Checkpoints (PITR markers)
+## Recovery layers
 
-Creating a checkpoint requires a write-capable principal. The id is derived
-from the current backend commit (`ckpt-{commit}`); `manifest_id` defaults to
-`"genesis"` when omitted:
+| Layer | Purpose | Typical command |
+| --- | --- | --- |
+| Checkpoint | Record a commit/timestamp marker | `rymedb-cli backup checkpoint` |
+| Snapshot | Capture backend files at a commit | `rymedb-cli snapshot create` |
+| Archive | Copy snapshots and metadata to local/S3 storage | `rymedb-cli backup archive` |
+| PITR restore | Rewind WAL/segments to a timestamp | `rymedb-cli backup restore <unix-ts>` |
+| Restore drill | Verify hashes/decryption without touching live data | `rymedb-cli backup verify <backup-id>` |
 
-```sh
-ryme backup checkpoint
-ryme backup checkpoint --manifest nightly-042
+Checkpoints are metadata. They do not create a durable copy by themselves;
+retention must keep the relevant snapshot and WAL segments available.
+
+## Configure retention
+
+```json
+{
+  "archive": {
+    "local_dir": "/backup/rymedb",
+    "interval_secs": 300,
+    "verify_interval_secs": 604800,
+    "keep": 7,
+    "snapshot_keep": 8
+  },
+  "archive_replica": {
+    "s3_endpoint": "https://s3.example.com",
+    "s3_bucket": "rymedb-secondary",
+    "s3_region": "us-east-1",
+    "s3_path_style": true
+  }
+}
 ```
 
-`GET /v1/backups/latest` and `GET /v1/backups/pitr?target=<unix-ts>` need
-any valid credential and return `404 {"error":"checkpoint"}` when nothing
-matches:
+An S3 target needs endpoint, bucket, and region. `keep` controls archived
+manifests; `snapshot_keep` controls local snapshots and therefore the local
+PITR window. Long-term recovery requires archived copies.
 
-```sh
-ryme backup latest
-ryme backup pitr 1735689600
+## Operate a backup
+
+```bash
+rymedb-cli backup checkpoint --manifest before-release
+rymedb-cli snapshot create
+rymedb-cli backup archive
+rymedb-cli backup archives
+rymedb-cli backup latest
+rymedb-cli backup pitr 1760000000
 ```
 
-`pitr` selects the checkpoint covering the target timestamp
-(`backups.select_pitr`). Record checkpoints on a schedule (the `interval_secs`
-archiver does this when an archive target is configured) so PITR targets
-actually resolve. The control-plane snapshot in `data_dir/control.json` keeps
-the newest 128 markers
-(`BACKUP_LOG_KEEP`); effective PITR depth is additionally bounded by
-snapshot/WAL retention on disk.
-
-The same snapshot stores the contiguous range-shard topology. Split, merge,
-and autosplit operations persist before reporting success, and startup
-validates that restored ranges cover the keyspace without gaps.
-
-## Snapshots
-
-Snapshots capture backend files with their max commit. Requires write auth:
-
-```sh
-ryme snapshot create
-```
-
-Response shape: `{ "commit": <u64>, "files": [<names>] }`. Snapshots are the
-unit that gets shipped to the archive and the unit you copy back for
-single-node disaster recovery.
-
-For a cluster with active range ownership, snapshot creation reads every
-current range owner at one commit timestamp and combines the returned MVCC
-versions into one archive snapshot. It rejects a lagging owner, truncated
-range response, or invalid coverage instead of producing a partial backup.
-Legacy non-`raft-*` ranges are read locally until their ownership is moved
-into the range Raft groups.
-
-Durable managers append an immutable checksummed delta `.sst` segment under
-`<wal-dir>/segments` for each committed write, and write a full sorted base
-segment for each snapshot. Segments carry a sparse key index plus Bloom filter
-metadata. Startup merges the ordered base-plus-delta set when the snapshot
-pointer is unavailable; WAL replay still covers commits newer than the newest
-segment.
-
-When a shard reaches 64 segment files, the retention loop compacts its current
-MVCC state into one new full base segment and removes superseded files. The
-compaction holds the transaction commit gate while taking its consistent base,
-so it cannot publish a partial state.
-
-Point reads use a bounded decoded-segment LRU sized by `cache_bytes`. The
-storage layer exposes occupancy, hit, and miss counters through
-`SegmentStore::cache_stats`; entries are invalidated when a segment is
-rewritten, compacted, or pruned. Set `storage_mode` to `standard` to avoid
-materializing the full segment history at startup; point reads and bounded
-scans resolve versions directly from the immutable segment chain.
-
-PITR restore publishes a new immutable base at the selected commit, removes
-future segment/snapshot state, truncates future WAL records, and updates the
-latest snapshot pointer. A restart therefore keeps the restored state instead
-of replaying writes that occurred after the restore target.
-
-Archives include the SQL and control-plane metadata files: `schema.json`,
-`branches.json`, `control.json`, `topics.json`, `auth.json`, and the durable
-shard placement map `placements.json` when sharding is enabled. Branch schema
-snapshots are stored under `branch-schemas/<tenant>/<branch>.json`. Restore
-preserves those relative paths, so branch definitions and branch-only tables
-survive a disaster-recovery restore alongside the committed rows. The server
-also archives immutable `.sst` segment artifacts, and rebuilds
-secondary-index entries from the committed rows.
-
-## Archive
-
-With an archive target configured (`archive.local_dir` or the S3
-`endpoint`/`bucket`/`region` settings), the server archives on
-`interval_secs` (default 300s, keeping `keep` = 7) and on demand:
-
-```sh
-ryme backup archive
-ryme backup archive --backup <backup-id>
-ryme backup archives
-```
-
-Archiving requires an `Owner`/`Admin` principal: on-demand archives and
-cross-region copies drive full data reads plus object-store egress, so
-application keys cannot trigger them. Checkpoints stay write-level since
-they are metadata-only. Listing requires any valid credential, and `400`
-when no archive target is configured.
-
-## Cross-region copies
-
-Set `archive_replica` (same shape as `archive`: a second local dir or a
-different S3 endpoint/bucket/region) and copy any archived backup to it
-with hash verification on both sides:
-
-```sh
-ryme backup copy <backup-id>
-```
-
-The copy replays every file through SHA-256 checks against the source
-manifest, verifies the bytes read back from the replica, then writes
-the manifest, so a half-finished copy never leaves a valid-looking
-manifest behind. Missing replica configuration answers `400`;
-unknown backup IDs answer `404`.
-
-## Envelope encryption and restore drills
-
-Every archived file is sealed with the node's tenant DEK (`ryme-crypto`
-key ring, `data_dir/keyring.json`, mode 0600, rotated per tenant). Set
-`RYME_KMS_KEY` (base64url or raw, >= 16 bytes) to persist the ring
-KEK-wrapped instead of plaintext; without it the log warns and volume
-encryption remains the outer layer. Manifests record per-file
-`dek_id`/`nonce`/`tag` plus sha256 of the sealed bytes.
-
-Scheduled drills restore the latest backup into a unique temporary directory
-next to the live data directory, verify checksums and decrypt every file, then
-remove the restored copy without touching live data:
-
-```sh
-ryme backup verify <backup-id>
-```
-
-`GET /v1/backups/verify?backup_id=` re-reads every file, checks sha256,
-decrypts each envelope with the ring, and returns
-`{backup_id, commit, verified, encrypted}`. Run it at least weekly; alert
-when `verified` drops below the file count or the call fails.
-
-Set `archive.verify_interval_secs` (`--verify-interval-secs`, `0`
-disables) to run the same verification automatically against the latest
-backup on a cadence
-(weekly `604800` in production). The last report is served at
-`GET /v1/backups/drill` (`404` until the first drill completes) as
-`{backup_id, verified_files, at_unix, error}`; alert when `error` is set
-or `at_unix` goes stale.
+Archive and restore operations require an owner/admin principal. Listing and
+read-only inspection require a valid credential. Archives include schema,
+branch, control-plane, auth, topic, placement, WAL, and immutable segment
+artifacts as applicable.
 
 ## Restore
 
-```sh
-ryme backup restore <target-unix-ts>
+Always stop application writes or put the service in a controlled maintenance
+state before a planned restore:
+
+```bash
+rymedb-cli backup restore 1760000000
+curl -fsS -H "Authorization: Bearer $RYME_API_KEY" http://127.0.0.1:8080/ready
 ```
 
-Restore requires write auth and replays the WAL to the target timestamp,
-returning per-shard replay counts (`{ "target": ..., "replayed": [...] }`).
+The restore target must not be newer than the latest commit and must be within
+the retained snapshot/WAL window. Future segment state and WAL records are
+trimmed. In a Raft cluster the restore command is coordinated through the
+leader; range-sharded and hybrid deployments report the exact scope restored.
 
-## Retention
+## Verify and drill
 
-Every sweep interval the server collects MVCC versions invisible to all live
-transactions, prunes local snapshots down to `archive.snapshot_keep` (default
-8) per shard, and deletes WAL segments whose records all precede the oldest
-retained snapshot. Point-in-time restore therefore reaches back to the oldest
-retained snapshot; older targets return `404 {"error":"snapshot"}`. Sealed
-archives are unaffected and remain the long-term recovery path.
+```bash
+rymedb-cli backup verify backup-2026-01-01
+rymedb-cli backup drill
+curl -H "Authorization: Bearer $RYME_API_KEY" \
+  http://127.0.0.1:8080/v1/backups/drill
+```
 
-Cluster restore is coordinated through the global Raft log. The leader
-appends one restore command and each member applies the same target. In
-whole-dataset mode, members rebuild from the committed data log. In
-range-sharded mode, every local range replica rebuilds its owned range from
-the committed range log, removes records newer than the target, and persists
-the trimmed range WAL before serving reads again. Prepared intents left in
-the restored prefix are durably aborted so they cannot block later writes.
-The target must not be ahead of the latest commit. Hybrid deployments restore
-the replicated tier through Raft and the local shard set on the current node;
-the response labels the local replay scope as `current_node`. Run the restore
-operation on each node when node-local hybrid data must be restored everywhere.
+Verification checks manifest hashes and decrypts archived files into a unique
+temporary directory. Schedule it at least weekly and alert on a stale or
+failed report. A backup that has never been restored is an assumption, not a
+recovery plan.
 
-The range restore is range-local: data outside the active placement map is
-not reconstructed on a node that does not own that range. Range replicas
-converge through their normal range-log repair path if one was offline when
-the restore command committed.
+## Encryption and permissions
 
-## S3 settings
+Archive files are sealed with tenant data-encryption keys in
+`data_dir/keyring.json`. Set `RYME_KMS_KEY` to wrap the key ring with an
+external key; otherwise rely on disk/object-store encryption and strict file
+permissions. Keep the key ring and KMS material separate from the data copy.
 
-Archive to S3 with `archive.s3_endpoint`, `archive.s3_bucket`,
-`archive.s3_region`, and `archive.s3_path_style`. Validation rejects an
-endpoint without bucket and region. For local archives, set
-`archive.local_dir`.
+## Recovery checklist
+
+1. Identify the last verified backup and target timestamp.
+2. Confirm the target is older than the latest commit and inside retention.
+3. Preserve current logs and data directory before an emergency restore.
+4. Restore into a disposable directory first when time allows.
+5. Verify row counts, schema, branches, auth, and application invariants.
+6. Reopen traffic gradually and record the recovery point and duration.

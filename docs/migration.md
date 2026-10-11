@@ -1,365 +1,117 @@
-# Migration and compatibility
+# Migration from other databases
 
-## Ledger
+Migrate in stages: inventory, export, transform, load, verify, dual-run,
+cut over, and keep the source untouched until rollback is no longer needed.
+Never import an internal PostgreSQL, Redis, Neon, or Supabase storage file;
+move data through SQL, logical dumps, REST, or RESP.
 
-`POST /v1/migrate/apply` executes one SQL statement and records it in the
-tenant-and-branch-scoped control-plane hash-chained ledger (`{id, sql, author,
-checksum, parent_checksum, schema_version}`); duplicate ids get `409` before
-anything runs twice within that scope. The selected branch comes from
-`X-Ryme-Branch` (the default is `main`), and the SQL plus schema snapshot are
-applied to that branch. Migration applications are serialized per server
-process, so concurrent requests cannot execute the same id before the ledger
-is updated. `GET /v1/migrate/ledger` returns the selected branch, entries in
-apply order, schema version, and chain validity. Branch metadata, scoped
-migration ledgers, and backup checkpoints are persisted under
-`data_dir/control.json`/`data_dir/branches.json`; snapshots and archives cover
-data, not the migration ledger.
+## Compatibility matrix
 
-## PostgreSQL
+| Source | First tool | Main review points |
+| --- | --- | --- |
+| PostgreSQL | `pg_dump`, `COPY`, wire protocol | Extensions, PL/pgSQL, custom types, planner assumptions |
+| Supabase | SQL dump + policy inspection | Auth provider, RLS expressions, storage/functions, generated REST queries |
+| Neon | Logical SQL/data export + branch JSON | Branch metadata is mapped, not copied from internal pages/WAL |
+| Redis/Valkey | RESP scan/export | TTLs, data structures, stream/group semantics, durability expectations |
+| Other SQL | CSV/JSON plus schema translation | Types, constraints, indexes, transaction semantics |
 
-The wire gateway advertises `BackendKeyData` and honors PostgreSQL
-`CancelRequest` packets, returning SQLSTATE `57014` for a canceled statement
-at the next execution boundary.
-Explicit wire transactions support `SAVEPOINT name`, `RELEASE SAVEPOINT name`,
-and `ROLLBACK TO SAVEPOINT name`; rollback restores staged writes and the
-transaction's conflict-tracking state before continuing.
+## PostgreSQL or Supabase
 
-1. Export schema, then bulk load with PostgreSQL `COPY table [(columns...)] FROM STDIN`
-   through the wire gateway or `POST /v1/sql/copy` in 500-row transactions
-   (max 10000 rows per request). The wire path accepts tab-separated text,
-   decodes standard COPY escapes and `\\N` nulls into declared SQL columns,
-   applies normal defaults/identity values, and returns `COPY n` after the
-   final `CopyDone` message. Schemaless key/value tables retain their two-field
-   compatibility path.
-2. Export table data with PostgreSQL `COPY table [(columns...)] TO STDOUT`.
-   The wire gateway emits text-format `CopyOutResponse`, chunked `CopyData`,
-   `CopyDone`, and `COPY n`, preserving SQL nulls and COPY escaping while
-   applying the session's RLS visibility rules.
-3. Parse `COPY ... FROM stdin` tab-separated dumps with `ryme-migrate`
-   `parse_copy_text`, or `INSERT INTO ... VALUES` lines with
-   `parse_insert_line`.
-4. Validate with `validate_rows`, chunk with `chunk_rows`, gate cutover with
-   `plan_cutover(snapshot_rows, cdc_lag_ms)` (ready when lag <= 1000 ms).
-5. Verify types, nulls, sequences, constraints, prepared statements,
-   timezones, JSON, arrays, `RETURNING`, `ON CONFLICT`, session variables,
-   and named transaction savepoints.
+### 1. Inventory
 
-Common PostgreSQL driver probes are handled on both simple and extended
-protocol connections: `SELECT pg_catalog.version()`,
-`SELECT current_setting('application_name')`, `SET TIME ZONE`, `SET NAMES`,
-`SHOW ALL`, and prepared forms of scalar session queries.
-Common session defaults including `server_version_num`,
-`default_transaction_isolation`, `session_authorization`, `is_superuser`, and
-`max_identifier_length` are available through `SHOW` and `current_setting`.
-`READ COMMITTED` and `REPEATABLE READ` requests map to the engine's snapshot
-isolation semantics, while `SERIALIZABLE` retains serializable validation.
+List tables, indexes, extensions, functions, triggers, policies, roles,
+sequences, generated columns, custom types, and background jobs. Mark each as
+`direct`, `rewrite`, or `unsupported` before moving data.
 
-Realtime PostgreSQL clients can use `LISTEN channel`, `UNLISTEN channel` (or
-`UNLISTEN *`), and `NOTIFY channel, 'payload'`. Notifications are delivered as
-standard asynchronous `NotificationResponse` frames to listeners on the same
-tenant and database. They are intentionally ephemeral: they are not written to
-the WAL, are lost when a listener disconnects or the process restarts, and a
-transaction's `NOTIFY` records are delivered only after commit (and discarded
-by rollback). `LISTEN` and `UNLISTEN` registration changes also take effect at
-commit and revert on rollback. Delivery is currently scoped to gateways in the
-same process; use the durable realtime stream for replayable cross-gateway
-delivery.
+### 2. Export schema and data
 
-## Supabase
+```bash
+pg_dump --schema-only --no-owner source_db > schema.sql
+pg_dump --data-only --format=plain source_db > data.sql
+```
 
-REST: `GET /rest/v1/:table?select=&key=eq.<id>&order=key.desc&limit=&offset=`,
-with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is`, `like`, `ilike`, and
-`not.<operator>`, `or=(...)`, and `and=(...)` filters plus field
-projection/aliases. `order` accepts comma-separated fields with `asc`/`desc`
-and `nullsfirst`/`nullslast` modifiers,
-`POST /rest/v1/:table` with `{key, value}`, `{rows: [...]}`, a JSON object,
-or a JSON array of objects with an `id`/`key` field,
-and `on_conflict=<field>` resolves duplicate JSON rows by that field,
-`PATCH /rest/v1/:table?<field>=eq.<value>` with a JSON object for filtered
-partial updates,
-`DELETE /rest/v1/:table?<field>=eq.<value>` (including the legacy
-`key=eq.<id>` form).
-Bulk inserts, PATCH updates, and filtered deletes commit as one MVCC batch, so
-a validation or conflict error leaves the whole batch unchanged.
-Filtered reads continue across storage pages, and non-key `order` clauses
-scan the complete filtered result before sorting. PostgREST `Prefer:
-return=minimal` and `Prefer: count=exact` headers are supported for mutation
-responses and exact read totals.
+Prefer `COPY` for large tables. The wire gateway supports `COPY FROM STDIN`
+and `COPY TO STDOUT`; the HTTP copy endpoint accepts bounded batches. Preserve
+nulls, encodings, identity values, and primary keys.
 
-GraphQL: `POST /graphql` with `{ table(key: "k") }` or `{ table(limit: 100) }`.
+### 3. Apply reviewed schema
 
-Realtime: `GET /v1/stream?table=` for CDC, `GET /v1/query-stream?table=`
-for snapshot plus updates. The npm/TypeScript SDK exposes
-`subscribeTable`/`subscribeQuery`; Java and Rust clients can use the same
-HTTP/WebSocket endpoints directly.
+```bash
+rymedb-cli migrate apply 001-schema "$(cat schema.sql)" --author migration-bot
+rymedb-cli migrate ledger
+```
 
-Auth accepts Supabase-style JWT claims (`sub`, `tenant`, `roles`, `exp`)
-where feasible; use separate issuers for app users versus operators.
+Split a dump into compatible migration units when one large statement makes
+review or rollback difficult. Duplicate migration ids are rejected by the
+branch-scoped hash chain.
 
-RLS-filtered scans continue through storage pages before applying user-facing
-limits, so leading rows from other tenants do not starve authorized results.
+### 4. Load and verify
 
-The SQL executor also accepts common policies such as
-`CREATE POLICY own_rows ON public.messages FOR ALL USING (auth.uid() =
-tenant_id) WITH CHECK (auth.uid() = tenant_id)` together with
-`ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY`. The detected tenant
-column and RLS activation state are persisted with the schema and applied to
-SQL reads, writes, and realtime snapshots/updates; more complex policy
-expressions still require manual review. `DROP POLICY IF EXISTS name ON table`
-removes a named policy. Enabled tables without a matching
-policy command follow PostgreSQL default-deny behavior.
-Policy metadata is available through `pg_catalog.pg_policies`, including the
-policy name, command, `USING`, and `WITH CHECK` expressions used by migration
-verification and ORM introspection.
-Persisted function and trigger metadata is also available through
-`pg_catalog.pg_proc` and `pg_catalog.pg_trigger`.
-Common `CREATE VIEW` and `CREATE OR REPLACE VIEW` definitions over supported
-read queries are persisted in schema snapshots with their relation
-dependencies and can be removed with `DROP VIEW [IF EXISTS]` after dependent
-views are removed. Dropping a referenced table or view is rejected rather than
-leaving invalid view metadata. Views are exposed as `VIEW` rows through
-`information_schema.tables` and as `relkind = 'v'` in `pg_catalog.pg_class`.
-PostgreSQL sequences are also persisted and support `CREATE SEQUENCE`,
-`ALTER SEQUENCE ... RESTART/INCREMENT`, `DROP SEQUENCE`, and the common
-`nextval`, `currval`, and `setval` functions; their state survives schema
-snapshot restoration and is available through `pg_catalog.pg_sequences`.
-Common `CREATE ROLE`, `DROP ROLE`, `GRANT`, and `REVOKE` declarations are
-persisted as database privilege metadata. Role rows are available through
-`pg_catalog.pg_roles`, while table grants are exposed through
-`information_schema.table_privileges`; privilege enforcement remains at the
-authenticated gateway/RLS boundary until SQL sessions carry an explicit role.
-`ALTER DEFAULT PRIVILEGES` for tables and sequences is also persisted and
-applied to subsequently created tables, views, and sequences, including
-schema-scoped defaults and `FOR ROLE` owner selectors.
-The declarations are available through `pg_catalog.pg_default_acl` with
-PostgreSQL-style role OIDs, namespace OIDs, object-type codes, and ACL text.
+```bash
+psql 'postgresql://postgres@127.0.0.1:5433/postgres' \
+  -c "COPY messages FROM STDIN"
+```
 
-The PostgreSQL wire gateway also honors the common `statement_timeout` session
-setting for queries and row mutations. Values may be expressed in milliseconds
-or with `ms`, `s`, `min`, or `h` units; timed-out statements return SQLSTATE
-`57014`. Clustered schema DDL is excluded from the timeout wrapper so a
-cancelled request cannot leave Raft metadata coordination half-applied.
-`SET LOCAL` is supported inside explicit transactions for session settings
-such as `statement_timeout`, `search_path`, and `timezone`; the temporary
-values are restored by `COMMIT`, `ROLLBACK`, and `ROLLBACK TO SAVEPOINT`.
-Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
-persisted in schema snapshots. `BEFORE` row triggers that assign
-`NEW.column = now()` (or the equivalent current-timestamp expressions) are
-executed for inserts and updates; arbitrary PL/pgSQL statements still require
-manual compatibility review.
+Compare row counts, primary-key sets, null counts, checksums of canonicalized
+rows, sequence positions, and application-level invariants. Then run the
+application's generated SQL and realtime tests.
 
-Dump analysis: `POST /v1/migrate/supabase` with `{dump}` returns tables and
-`CREATE POLICY` entries with detected tenant columns (`auth.uid() = <col>`
-maps to `allow_table` RLS). CLI: `ryme migrate supabase dump.sql`.
-`WITH CHECK`-only policies yield empty expressions and need manual review.
-The PostgreSQL wire gateway and dump analyzer keep semicolons inside
-PostgreSQL dollar-quoted function/procedure bodies within one statement.
+### Supabase-specific review
 
-## Neon
+- Map Supabase JWT issuer/audience and `tenant_id`/role claims.
+- Translate simple `auth.uid() = tenant_column` RLS policies and test default
+  deny behavior.
+- Review storage buckets, Edge Functions, scheduled jobs, and extensions;
+  they are not automatically moved by a database dump.
+- Replace Supabase Realtime subscriptions with `/v1/stream`,
+  `/v1/query-stream`, or the Supabase-compatible channel endpoint.
 
-Map branch JSON (`[{name, parent, lsn}]`) with `POST /v1/migrate/neon` into
-`{id, parent, base_commit_ts}` plans (LSN `high/low` hex to u64), then create
-branches and cut over. CLI: `ryme migrate neon branches.json`. Migrate data
-at the logical level; internal page formats are never imported. A branch created
-with `base_commit_ts` set to zero pins the current commit automatically.
+The analyzer is useful for a first pass:
 
-Branch reads use MVCC snapshots without copying rows. Send
-`X-Ryme-Branch: <id>` to `/v1/sql`, `/v1/kv`, `/rest/v1`, or `/graphql` to
-read and write the selected tenant's branch through a copy-on-write overlay.
-Parent rows are visible at the branch base commit, branch mutations are stored
-under the branch namespace, and branch deletes mask (but do not remove) parent
-rows. Branch table and index definitions are stored under the data directory
-per tenant/branch, so branch DDL survives request/executor recreation without
-changing `main`. `main` keeps the live view.
-Resetting a branch advances its storage epoch, so prior branch-local writes are
-discarded from the new view. Epochs are allocated monotonically by the branch
-manager, so reset and delete/recreate cycles cannot reuse an old overlay
-namespace; deleting a branch removes its selectable metadata.
-Parents with live child branches must be deleted from the leaves upward so
-manifest references remain safe for segment garbage collection.
-`GET /v1/branches/<id>/diff?against=<branch>` keeps the manifest comparison
-fields and adds `changes`: effective row differences with the table name,
-base64url primary key, and base64url values on each side (`null` means the row
-is absent). This includes changes inherited from the branch snapshot, not only
-rows written directly in the branch overlay.
+```bash
+rymedb-cli migrate supabase supabase-dump.sql
+```
 
-## SQL dialect
+It reports tables, policies, and detected tenant columns. Treat its output as
+a plan requiring review.
 
-Projections, predicates, ordering, grouping, and RETURNING accept common
-relation-qualified references such as source.id and source.payload.
-CREATE INDEX CONCURRENTLY and DROP INDEX CONCURRENTLY are accepted for
-compatibility; index publication remains atomic.
-UPDATE target SET ... FROM source WHERE target.id = source.id supports
-qualified join columns, source predicates, source-backed assignments, and
-RETURNING.
-DELETE FROM target USING source WHERE target.id = source.id supports qualified
-join columns, source predicates, and RETURNING.
+## Neon branches
 
-`CREATE TABLE` (including `IF NOT EXISTS`, column types, single-column and composite
-`PRIMARY KEY` constraints, single-column and composite `UNIQUE` constraints,
-`CHECK`, `FOREIGN KEY ... REFERENCES`, `NOT NULL`, and `DEFAULT` values) plus single-column `ALTER TABLE ... ADD COLUMN`,
-`ALTER TABLE ... ADD PRIMARY KEY` and `ADD CONSTRAINT` for `UNIQUE`, `CHECK`, and `FOREIGN KEY ... REFERENCES`,
-plus `ALTER TABLE ... DROP CONSTRAINT [IF EXISTS]` for named constraints,
-`DROP COLUMN`, `RENAME COLUMN`, and `ALTER COLUMN` default/nullability/type changes
-(including `ALTER COLUMN ... TYPE` for supported scalar, boolean, array, and JSON values)
-(including `IF [NOT] EXISTS` where supported), plus
-foreign-key actions `ON DELETE`/`ON UPDATE RESTRICT`, `CASCADE`, `SET NULL`,
-and `SET DEFAULT`,
-`DROP TABLE [IF EXISTS]`, `TRUNCATE TABLE`, and `DROP INDEX [IF EXISTS]`,
-including `TRUNCATE ... RESTART IDENTITY`, `CONTINUE IDENTITY`, and
-foreign-key `CASCADE`/`RESTRICT`,
-common migration declarations `CREATE SCHEMA IF NOT EXISTS` and
-`CREATE EXTENSION IF NOT EXISTS ... [WITH SCHEMA ...]`,
-`CREATE VIEW`/`CREATE OR REPLACE VIEW` over supported read queries and
-`DROP VIEW [IF EXISTS]`,
-`CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, including
-`nextval`, `currval`, and `setval` sequence calls,
-typed PostgreSQL `COPY FROM STDIN` column lists with null/default handling,
-`CREATE ROLE`, `DROP ROLE`, `GRANT`, and `REVOKE` privilege declarations,
-`ALTER DEFAULT PRIVILEGES` declarations for tables and sequences,
-named transaction savepoints with `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO`,
-with PostgreSQL `information_schema.tables` and
-`information_schema.columns` introspection, custom key/value `INSERT`, and PostgreSQL-style
-`INSERT INTO table (...) VALUES (...)`; `ON CONFLICT (columns) DO UPDATE` uses
-the matching primary or unique constraint and supports `EXCLUDED.column`
-assignments and a conditional `WHERE` predicate, while targeted or untargeted
-`ON CONFLICT DO NOTHING` skips conflicting rows,
-and `UPDATE`/conflict assignments support atomic numeric and text expressions
-such as `count = count + 1`, `count + EXCLUDED.count`, concatenation,
-`COALESCE`, `GREATEST`, and `LEAST`,
-and `INSERT INTO table DEFAULT VALUES` materializes identity/serial and column
-defaults with normal constraints and `RETURNING`,
-`INSERT INTO target (...) SELECT ... FROM source [WHERE ...]` copies projected
-and filtered rows atomically,
-simple one or more `WITH name AS (SELECT * FROM source [WHERE ...])` CTEs can
-feed outer selects and `INSERT ... SELECT` statements,
-prepared PostgreSQL parameters are bound outside SQL literals/comments with
-multi-digit placeholder support and scalar type preservation,
-extended-protocol `Describe` returns prepared parameter metadata for drivers,
-`ALTER TABLE ... ALTER COLUMN ... TYPE ... USING column::type` is accepted for
-standard self-column casts,
-declared array columns (`text[]`, `integer[]`, and similar) accept PostgreSQL
-`ARRAY[...]` and `'{...}'` literals and remain structured arrays in JSON rows,
-JSONB projections support PostgreSQL `->` and `->>` operators, including
-chained object and array paths in selected columns,
-`serial`/`bigserial`/`smallserial` and `GENERATED ... AS IDENTITY` columns
-generate integer primary keys when omitted and recover their next value from
-durable rows after executor restart,
-`CREATE INDEX` and `CREATE UNIQUE INDEX` on the key/value compatibility fields or
-multiple declared columns,
-common `CREATE OR REPLACE FUNCTION` and `CREATE TRIGGER` declarations with
-timestamp assignments to `NEW` rows,
-and `DROP TRIGGER IF EXISTS name ON table`,
-with `pg_catalog.pg_indexes` and common PostgreSQL system-catalog introspection
-(`pg_namespace`, `pg_class`, `pg_type`, `pg_attribute`, `pg_constraint`, `pg_index`, `pg_policies`, `pg_proc`, and `pg_trigger`),
-and indexed equality lookup,
-`SELECT * FROM t KEY 'k'`, `SELECT * FROM t LIMIT n`, `UPDATE`, `DELETE`,
-predicate mutations such as `UPDATE t SET status = 'ready' WHERE id = '...'`
-and `DELETE FROM t WHERE status = 'expired'`, with `RETURNING` rows for bulk
-mutations,
-named projections such as `SELECT payload, count FROM t WHERE id = '...'` and
-explicit column aliases such as `SELECT payload AS body FROM t`,
-`COPY t FROM stdin` (bulk path), `SELECT DISTINCT`, `EXPLAIN <sql>` (planned access path), and
-`EXPLAIN ANALYZE <sql>` (executes the statement and reports actual rows plus elapsed microseconds),
-`CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, and
-`DROP MATERIALIZED VIEW` with snapshot-backed cached rows,
-`POST /v1/sql/explain` for plan without execution. Scalar builtins:
-`gen_random_uuid()` (v4) and `now()` (unix seconds) evaluate in KEY/VALUE
-positions; quoted literals are never evaluated.
-Scalar PostgreSQL reads without a `FROM` clause such as `SELECT 1`,
-`SELECT $1::text AS value`, `SELECT version()`, and `SELECT now()` use the
-shared SQL executor across simple and extended wire requests; `SELECT NULL`
-is emitted as a protocol-level null rather than the text `NULL`; nullable
-table projections and `RETURNING` cells use the same protocol-level encoding.
-Filtered scans: `SELECT * FROM t WHERE key = 'a' [AND key IN ('a', 'b')]
-[AND key NOT IN ('c', 'd')] [AND score BETWEEN 10 AND 20]
-[AND score NOT BETWEEN 30 AND 40] [AND key = 'a' OR key = 'b']
-[AND state IS DISTINCT FROM NULL] [AND value NOT ILIKE 'hello%']
-[AND value CONTAINS 'x'
-AND value != 'y'] [ORDER BY key|value|column|json_path ASC|DESC] [LIMIT n] [OFFSET n]`.
-Predicates evaluate on stored bytes as text; plain scans stream the ordered
-range while filtered/ordered/paged scans page through storage until the
-requested window is satisfied, with a 10k result cap unless an equality
-predicate can use a maintained secondary index.
-Aggregates: `SELECT COUNT(*) | COUNT(field) | SUM(field) | AVG(field) | MIN(field) | MAX(field)
-FROM t [WHERE ...]` compute over all visible filtered rows; numerics parse
-as f64 with non-numeric values skipped (`SUM`, `AVG`, `MIN`, and `MAX` over
-none yield SQL `NULL`). Aggregate names without parentheses
-are treated as ordinary projected columns; named schema columns and JSON paths
-are resolved from structured rows, and `COUNT(column)` excludes SQL `NULL`.
-Grouped queries also support `HAVING` predicates over group columns and
-aggregate aliases such as `COUNT(*) > 1`.
-Key-equality joins: `SELECT * FROM a [LEFT|RIGHT|FULL] [OUTER] JOIN b ON KEY = KEY
-[WHERE ...] [ORDER BY ...] [LIMIT n] [OFFSET n]` hash-joins on primary-key
-bytes and returns rows shaped `{"left": ..., "right": ...}` (lossy UTF-8),
-using JSON `null` for the unmatched side of an outer join. Other `ON` shapes
-are rejected, never misexecuted.
-Grouping: `SELECT <key|value|column|agg>, ... FROM t [WHERE ...] GROUP BY <key|value|column>
-[ORDER BY ...] [LIMIT n] [OFFSET n]` groups exact key/value bytes and
-structured column values (including JSON paths), and returns one row per group.
-Bare select items must name the group field; aggregates reuse the scalar rules
-above, and null values share one group.
-Set reads: top-level `SELECT ... UNION [ALL] SELECT ...`, `INTERSECT [ALL]`,
-and `EXCEPT [ALL]` combine compatible table projections under one transaction
-snapshot. Distinct operations remove duplicate rows; `ALL` preserves
-multiset counts. Chained operations follow PostgreSQL precedence, with
-`INTERSECT` binding more tightly than `UNION` and `EXCEPT`.
+```bash
+rymedb-cli migrate neon branches.json
+```
 
-## Observability
+The mapper converts branch names, parent branches, and LSN high/low values to
+rymeDB branch plans. Create a branch and load logical data; internal page
+formats and WAL are not portable. A branch is copy-on-write and selected with
+`X-Ryme-Branch` or `branch=` on WebSockets.
 
-`GET /metrics` JSON, `GET /metrics/prometheus` text, `EXPLAIN` plans,
-slow-query warn above 5 ms, per-fingerprint work via `ryme-observe`
-histograms, OTel-style trace spans (`TraceSpan`/`TraceCollector`) and
-`query_fingerprint` normalization for grouping slow queries.
+## Redis or Valkey
 
-## Realtime primitives
+Map by data type rather than copying serialized internals:
 
-- CDC: `GET /v1/stream?table=` (committed changes only).
-- Broadcast: `POST /v1/broadcast` ephemeral per-channel fanout.
-- Presence: `POST /v1/presence/join|leave`, `GET /v1/presence/:channel`
-  with TTL expiry.
-- Durable topics: `POST /v1/topics/append`, `GET /v1/topics/read` with
-  per-partition cursors and bounded retention for resumable consumers.
+| Source type | rymeDB path |
+| --- | --- |
+| String/session | RESP `SET`/`GET` or `/v1/kv` |
+| Hash/list/set/zset | RESP commands; validate JSON encoding and ordering behavior |
+| Stream | `XADD`/`XREAD`/consumer groups or durable topics when application replay is required |
+| Pub/sub | Broadcast for ephemeral fanout; durable topics for recovery |
+| TTL | `EX`, `PX`, and key TTL endpoints |
+| Lua | Review sandboxed `EVAL` behavior and rewrite filesystem/network assumptions |
 
-## Vector and full-text search
-- Vectors: `POST /v1/vector/upsert`, `POST /v1/vector/search` (exact,
-  `top_k`, cosine over length-normalized values), `DELETE /v1/vector/:table/:id`.
-  Exact scope: dim <= 4096, 100k vectors/space, in-memory per node,
-  tenant-isolated namespaces.
-- ANN: `POST /v1/vector/ann-search` (`top_k`, `ef`, default 64) over an HNSW
-  graph (M=16, beam ef-build 64) maintained alongside exact storage; deletes
-  are tombstoned. Spaces are hash-partitioned (`index_partitions`, default 4):
-  writes route by id, searches fan out per partition and merge top-k, so ANN
-  scales with partitions the way range shards scale tables. Recall is
-  workload-dependent; the `ann_recall_against_exact` test pins >= 80% top-10
-  overlap on synthetic 300x16 data. SDKs: `vectorAnnSearch` everywhere; CLI:
-  `ryme vector ann-search <table> <v,...> [--top-k N] [--ef N]`.
-- Full text: `POST /v1/text/index`, `POST /v1/text/search` (TF-IDF ranked),
-  `DELETE /v1/text/:table/:id`. Lowercase alphanumeric tokenizer,
-  100k docs/space. The npm/TypeScript, Java, and Rust SDKs expose the vector
-  and text endpoints;
-  CLI: `ryme vector ...`, `ryme text ...`.
+Use a cursor-based `SCAN`, dual-write, and compare key counts and TTL samples.
+Do not treat RESP compatibility as proof that every Redis module is present.
 
-## Application auth
+## Cutover plan
 
-Password register/verify, TOTP setup/verify, WebAuthn challenge, column
-masking, and OIDC: `POST /v1/auth/oidc/login` builds the provider
-authorization URL from `RYME_OIDC_*` env; `POST /v1/auth/oidc/token`
-verifies an HS256 ID token (`iss`/`aud`/`exp`) and returns a principal
-receipt. It can also verify RS256 tokens from a mounted JWKS JSON file. Set
-`RYME_JWT_JWKS_FILE` to the file path and optionally set
-`RYME_JWT_JWK_KID` to restrict the mounted set. Tokens with a `kid` select the
-matching RSA key, allowing normal signing-key rotation.
-The OIDC exchange may use `RYME_OIDC_JWKS_FILE` (or the shared JWT JWKS file)
-or the corresponding `RYME_OIDC_JWKS_URL`, plus `RYME_OIDC_JWK_KID`; its
-issuer and audience come from the `RYME_OIDC_*` settings.
-For either mode, set `RYME_JWT_ISSUER` and `RYME_JWT_AUDIENCE` together to
-enforce the expected issuer and audience. Configure one JWT verification mode
-per node: an HMAC secret or a mounted JWKS provider for RS256. `POST
-/v1/auth/token` returns the existing API key plus an opaque
-30-day refresh token. Send `{"grant_type":"refresh_token",
-"refresh_token":"..."}` to rotate it; each refresh token is single-use,
-stored only as a digest, and replaying a rotated token returns `401`. User
-password hashes, OTP enrollment, passkey credentials, API-key digests, and
-active refresh sessions are atomically persisted in `data_dir/auth.json`;
-WebAuthn challenges remain intentionally ephemeral.
+1. Freeze schema changes and record the source migration position.
+2. Bulk load a consistent snapshot.
+3. Replay changes or dual-write while measuring lag.
+4. Run read-only and authorization verification.
+5. Pause writes, drain lag, and switch clients.
+6. Keep the source read-only through the rollback window.
+7. Record the cutover migration and backup checkpoint.
+
+For large transfers, use `ryme-migrate` helpers to parse COPY/INSERT input,
+chunk rows, validate data, and gate cutover on bounded CDC lag. Rehearse the
+rollback with a branch or disposable node first.

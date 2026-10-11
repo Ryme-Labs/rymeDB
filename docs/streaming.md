@@ -1,298 +1,104 @@
-# Streaming (live changes and live queries)
+# Realtime, CDC, presence, and durable topics
 
-rymeDB exposes two WebSocket endpoints for realtime data. Both upgrade from
-`GET` and authenticate like the rest of the API: `Authorization: Bearer`
-header, `x-api-key` header, or `?api_key=` query param (handy because
-browser `WebSocket` clients cannot set headers).
+All realtime endpoints are WebSockets. Authenticate with a bearer header,
+`x-api-key`, or `api_key` query parameter. Browser clients normally use the
+query parameter; server clients should prefer headers.
 
-## `GET /v1/stream?table=<name>[&branch=<id>]` — change feed
+## Choose a stream
 
-Pushes one JSON text frame per committed change to the table. Auth requires a
-read-capable credential (`readwrite`, `readonly`, `realtime_subscriber`, or an
-administrative role). Each frame is a `ChangeRecord`
-(`crates/ryme-realtime/src/lib.rs`):
-```json
-{
-  "tenant": "default", "database": "default", "branch": "main",
-  "table": "docs", "op": "INSERT",
-  "pk": [107, 49], "before": null, "after": [111, 110, 101],
-  "commit_ts": 2, "tx_id": 2, "sequence": 1
-}
+| Endpoint | Semantics | Recovery |
+| --- | --- | --- |
+| `/v1/stream?table=messages` | One committed change record per write | `from` or `from_sequence` replay while retained |
+| `/v1/query-stream?table=messages` | Snapshot followed by current query updates | Sends a fresh snapshot if a consumer lags |
+| `/v1/broadcast/{channel}` | Ephemeral fanout | No history; use topics for replay |
+| `/v1/presence/{channel}/stream` | Snapshot plus join/leave state | Fresh state snapshot on lag |
+| `/v1/topics/{partition}/stream` | Ordered persisted messages | Cursor replay; `cursor_expired` when retention is gone |
+| `/realtime/v1/websocket` | Supabase/Phoenix channel protocol | Protocol-level join and presence behavior |
+
+## Change feed
+
+```text
+wss://db.example.com/v1/stream?table=messages&api_key=...&from_sequence=42
 ```
 
-- `op` is `INSERT`, `UPDATE`, or `DELETE` (uppercase).
-- `pk`, `before`, and `after` are **byte arrays** (JSON number arrays), not
-  strings: `[107, 49]` decodes to `"k1"`. `before` is `null` on inserts and
-  `after` is `null` on deletes.
-- `tx_id` identifies the committed transaction. It currently matches
-  `commit_ts`, while `sequence` remains the per-topic delivery cursor.
-- If a slow consumer lags behind the broadcast channel, the server replays
-  the missing changes from the retained topic ring. If retention is no longer
-  sufficient, the socket closes instead of silently presenting an incomplete
-  stream; use `/v1/query-stream` below when automatic state resynchronization
-  is preferred.
-- Resume with `?from=<commit>`: the socket first replays retained changes
-  with `commit_ts` after the watermark (oldest-first, up to the full ring
-  retention), then
-  continues live, suppressing any live redelivery by sequence number — so
-  a reconnecting client sees each change exactly once. Without `from` the
-  socket stays quiet until the next commit (legacy behavior). `commit_ts`
-  is a server-wide strictly increasing counter, so watermarks are exact.
-  Retention is the per-topic ring (server `Realtime::new` capacity);
-  changes committed while disconnected beyond retention cannot be
-  replayed. REST/SQL/native/gRPC/RESP writes all publish to the same
-  replayable CDC history, so reconnecting clients do not miss RESP mutations
-  made while no live subscriber was connected.
-- For exact reconnects, use `?from_sequence=<sequence>` from the last
-  delivered `ChangeRecord`. This distinguishes multiple writes sharing one
-  commit timestamp and uses the same retained ring for recovery. The
-  npm/TypeScript SDK exposes this cursor as `fromSequence`; Java and Rust
-  clients can pass `from_sequence` directly to the stream endpoint.
-  Server-backed streams use a deterministic commit-derived sequence, so the
-  same committed write has the same cursor on every gateway in a cluster;
-  reconnecting through another gateway does not change the watermark.
-- If a requested commit or sequence cursor has fallen out of the retained
-  topic ring, the server sends one error frame such as
-  `{"type":"error","error":"cursor_expired","cursor":"sequence","requested":1,"oldest":42}`
-  and closes the socket. Resynchronize from a current snapshot, then reconnect
-  without the expired cursor; the server never silently presents an incomplete
-  replay.
-- Streams default to the `main` branch. Set `?branch=<id>` for browser
-  WebSocket clients, or send `X-Ryme-Branch: <id>` from clients that can set
-  headers. The query parameter and header must agree when both are present.
-  Branch streams have separate replay history and only deliver changes from
-  that branch.
-- Send a Close frame (or just disconnect) to stop; the server breaks the
-  forwarding loop on close.
-- Idle stream sessions receive a WebSocket ping every 30 seconds, and client
-  ping frames are answered with pong frames so gateways and clients can detect
-  dead connections without application-level polling.
-- A WebSocket send is bounded by a 10-second timeout; persistently stalled
-  consumers are disconnected so their connection task and retained buffers do
-  not grow without bound.
-
-## `GET /v1/query-stream?table=<name>[&limit=<n>][&branch=<id>]` — live query
-
-Requires a read-capable principal (`403` otherwise). `limit` defaults to 100
-and is clamped to 1–1000. The first frame is always a full snapshot of the
-table at the current commit:
-
-```json
-{"type": "snapshot", "commit": 7, "branch": "main", "rows": [{"pk": "k1", "value": "one"}]}
-```
-
-Here `pk`/`value` are UTF-8 strings. Later frames are updates carrying only
-commits newer than the snapshot:
-
-```json
-{"type": "update", "commit": 8, "branch": "main", "rows": [{"pk": "k2", "value": "two"}], "truncated": false}
-```
-
-If the consumer lags, the server re-sends a fresh full snapshot instead of
-dropping data, so a query-stream consumer resynchronizes automatically —
-unlike the raw change feed.
-
-Query streams can use the same PostgREST-style query controls as REST:
-`select=key,body`, `order=created_at.desc`, and field filters such as
-`room_id=eq.lobby`, `status=in.(queued,running)`, or
-`or=(status.eq.ready,status.eq.queued)`. The filtered/projected/ordered mode
-tracks committed table changes and emits a fresh current result on each change;
-it never forwards rows that fail the query predicate. Projected rows retain
-the compatibility `pk` and raw `value` fields alongside selected JSON fields.
-The unqualified `table` stream keeps the lower-overhead table update path.
-
-The `table` parameter may also name a SQL view. The initial snapshot and each
-subsequent update evaluate the view through the branch SQL executor. The stream
-subscribes to every persisted base-relation dependency, expanding nested views
-to their underlying tables, so a write to any source table refreshes the view
-result while writes that do not match the view still produce the same current
-filtered snapshot.
-
-Query streams use the same branch selection rules as change feeds. A branch
-snapshot reads the branch's copy-on-write view, and later updates come only
-from that branch; omitting `branch` selects `main`.
-If a client falls behind the bounded update ring, the server sends a fresh
-snapshot labeled with the latest published topic commit before continuing live
-updates, so the client can advance its resume watermark safely.
-
-## Tenant isolation
-
-Presence rooms, broadcast channels, and durable partitions are scoped to
-the caller's tenant (`{tenant}/{name}` internally): two tenants can use
-the same channel or partition name without seeing each other, and durable
-cursors restart at zero per tenant. Table change feeds were already scoped
-by tenant/database/table.
-
-Presence members carry a TTL (default 60s, clamped to 1s..24h). Expiry is enforced on every
-read and join, and the TTL sweep loop prunes dead members across all rooms
-(including rooms nobody lists anymore) while dropping emptied rooms, so
-abandoned presence state cannot accumulate. Each room holds at most 1000
-members; joins beyond the cap get `429`, and re-joining an existing member
-always succeeds.
-
-`GET /v1/presence/<channel>/stream` upgrades to a tenant-scoped WebSocket for
-live presence synchronization. The first frame is a `presence_state` snapshot
-with the current members and a monotonic `sequence` watermark. Later frames are
-`join` and `leave` events carrying the member state, expiry timestamp, and
-sequence; TTL expiry produces a `leave` event.
-If a consumer falls behind the bounded event queue, the server sends a fresh
-`presence_state` snapshot instead of leaving the client with an incomplete
-room view. The stream has the same heartbeat, QoS, and bounded outgoing queue
-behavior as the other realtime endpoints.
-
-## Supabase Realtime protocol compatibility
-
-`/realtime/v1/websocket?apikey=<key>&vsn=1.0.0` accepts the Phoenix-style
-Supabase Realtime channel protocol. Join a topic such as `realtime:room` with
-`phx_join`, send `broadcast` events, leave with `phx_leave`, and answer
-connection heartbeats on the `phoenix` topic. The server sends `phx_reply`
-acknowledgements and tenant-scoped broadcast frames. `vsn=2.0.0` uses the
-array frame form; the default `1.0.0` uses JSON objects.
-
-Join payloads can also include Supabase `postgres_changes` subscriptions:
+Frames contain tenant, database, branch, table, operation, primary key,
+before/after bytes, commit timestamp, transaction id, and sequence:
 
 ```json
 {
-  "config": {
-    "postgres_changes": [
-      {"event":"INSERT", "schema":"public", "table":"messages", "filter":"room_id=eq.42"}
-    ]
-  }
+  "tenant": "default",
+  "database": "default",
+  "branch": "main",
+  "table": "messages",
+  "op": "INSERT",
+  "pk": [109, 45, 49],
+  "before": null,
+  "after": [104, 105],
+  "commit_ts": 7,
+  "tx_id": 7,
+  "sequence": 42
 }
 ```
 
-Presence can be enabled on the same channel with an optional stable key:
+`pk`, `before`, and `after` are byte arrays. The stream replays retained
+changes oldest-first and suppresses already delivered sequence numbers. If a
+cursor has expired, the server sends an error and closes instead of silently
+returning an incomplete history; resnapshot and reconnect.
 
-```json
-{
-  "config": { "presence": { "enabled": true, "key": "user-ada" } }
-}
+## Reactive queries
+
+```text
+wss://db.example.com/v1/query-stream?table=messages&limit=100&select=id,body&order=id.desc&status=eq.ready
 ```
 
-After the join reply, the server sends `presence_state`. Clients can send a
-`presence` frame with `event: "track"` or `event: "untrack"`; updates are
-broadcast as Supabase `presence_diff` frames with `joins` and `leaves` maps.
-Presence keys default to a connection-unique server-generated key, and the
-tracked state is removed when the channel leaves or the websocket closes.
+The first frame is a `snapshot`; subsequent frames are `update` messages.
+Filters, projections, order, views, and branch selection are reevaluated on
+committed changes. Lagging consumers receive a current snapshot.
 
-Committed table changes are delivered as `postgres_changes` frames with
-subscription IDs, `record`/`old_record`, columns, and event metadata. `*`,
-`INSERT`, `UPDATE`, and `DELETE` subscriptions are supported, along with
-common `eq`, `neq`, comparison, `in`, `like`/`ilike`, `is`, and negated
-filters. RLS is evaluated before a change is exposed. Presence and broadcast
-messages remain tenant-scoped and use the same bounded websocket queue and QoS
-accounting as the native realtime endpoints.
+## Broadcast and presence
 
-In cluster mode, presence joins and leaves must reach the current Raft leader.
-The leader fans each mutation over the live gateway mesh, and all gateways use
-the leader's expiry timestamp so reads converge without adding ephemeral
-presence traffic to the durable Raft log.
+Publish an ephemeral event:
 
-Channel, partition, and member names are capped at 256 bytes and presence
-state payloads at 4 KiB (`400` beyond), so rooms stay small enough for the
-1000-member cap to mean something.
-
-Idle realtime scopes are reclaimed on the sweep cadence: change-feed and
-broadcast senders with no receivers and no retained history, and query
-topics with no receivers, are dropped. Scopes holding replayable history
-are kept, so resuming consumers never lose retained changes.
-
-## Event sources
-
-Every committed write publishes exactly one change event per written key,
-after the commit succeeds, so no path can silently bypass the feed:
-- REST/Native KV gateway (`put`, `delete`, TTL touch)
-- SQL executor (`INSERT`, `UPSERT`, `UPDATE`, `DELETE`, `COPY`/bulk), which
-  also covers the PostgreSQL wire gateway, GraphQL, and native SQL
-- RESP gateway: single commands, `MULTI`/`EXEC` batches, blocking pops and
-  moves, and consumer-group deliveries (all under table `_kv`)
-- TTL sweeper: one `DELETE` per expired key
-
-`INSERT` vs `UPDATE` is decided from the transaction's pre-write read, so
-read-modify-write commands and SQL statements report the precise operation.
-Blind multi-writes (`MSET`, `UPSERT`, bulk ingest) pre-read their keys for
-the same reason. Commits with no subscribers for a table skip cloning
-entirely, so unwatched tables pay no CDC overhead. Replay, recovery, and
-follower-apply paths never publish, so each committed change is emitted once
-by the committing node.
-
-## Operator CLI
-
-```sh
-ryme stream watch docs --count 2
-ryme stream query docs --limit 100 --count 2
-ryme stream broadcast lobby --count 1
+```bash
+curl -fsS -X POST \
+  -H 'Authorization: Bearer local-dev-key' \
+  -H 'Content-Type: application/json' \
+  --data '{"channel":"lobby","payload":{"event":"typing","user":"ada"}}' \
+  http://127.0.0.1:8080/v1/broadcast
 ```
 
-`watch` tails `/v1/stream`; `query` tails `/v1/query-stream`; `broadcast`
-tails `/v1/broadcast/<channel>`. `--count N`
-exits after N frames (useful for scripting); without it, the command runs
-until the socket closes or you send SIGINT.
-
-## SDKs
-
-- **Java** (`sdks/java`): the dependency-free `RymeClient` covers HTTP and
-  Java 17 WebSocket subscriptions through `subscribeTable`, `subscribeQuery`,
-  `subscribeBroadcast`, `subscribePresence`, and `subscribeDurableTopic`; callbacks receive
-  complete JSON text frames.
-- **JS** (`sdks/js/src/index.ts`): `subscribeTable(base, table, onMessage,
-  {apiKey?})`
-  and `subscribeQuery(base, table, onMessage, {apiKey?, limit?})`, plus
-  `subscribeBroadcast(base, channel, onMessage, {apiKey?})`,
-  `subscribePresence(base, channel, onMessage, {apiKey?})`, and
-  `subscribeDurableTopic(base, partition, onMessage, {apiKey?, from?})`, all
-  returning `{ready, close}`. `onMessage` receives parsed `ChangeRecord` /
-  `QueryMessage` / `BroadcastRecord` / `PresenceEvent` /
-  `DurableTopicMessage` objects.
-- **Rust** (`sdks/rust`): `RymeClient` exposes `subscribe_table`,
-  `subscribe_query`, `subscribe_broadcast`, `subscribe_presence`, and
-  `subscribe_durable_topic`; `RealtimeSubscription::recv` handles ping/pong
-  while returning complete JSON text frames.
-
-## `GET /v1/broadcast/<channel>` — broadcast subscribe
-
-`POST /v1/broadcast` was previously fire-and-forget with no read path.
-The channel now has a WebSocket subscribe endpoint mirroring the change
-feed: authenticate like the other streams (header or `?api_key=`), then
-receive one `BroadcastMsg` JSON frame (`channel`, `from`, `payload`,
-`commit_ts`, `sequence`) per post to your tenant's channel. No history is
-replayed — broadcast stays ephemeral — and slow consumers skip lagged
-frames exactly like `/v1/stream`.
-
-In cluster mode, broadcast requests must reach the current Raft leader. The
-leader assigns the sequence and fans the event over the cluster mesh to
-every currently connected member gateway, so subscribers on different nodes
-receive the same event. Broadcast fanout is intentionally not written to the
-Raft/WAL path: it remains ephemeral and does not replay old chat messages when
-a node joins or restarts. A disconnected member can miss an event; use durable
-topics when replay and recovery are required.
-
-All three pass the key as `?api_key=` and default the base-URL scheme
-(`http`→`ws`, `https`→`wss`).
+Broadcast is tenant-scoped and intentionally not WAL-backed. Presence rooms
+start with a state snapshot, then emit joins/leaves. Members have a TTL,
+rooms cap at 1,000 members, and abandoned state is swept.
 
 ## Durable topics
 
-`POST /v1/topics/append` and `GET /v1/topics/read` provide tenant-scoped,
-ordered partitions with resumable cursors. Topic messages and their next
-cursor are atomically persisted in the server data directory (`topics.json`)
-after each append, so retained messages survive a process restart. The file
-is restricted to the server account on Unix; topic retention remains bounded
-to prevent an unbounded restart snapshot.
+```bash
+rymedb-cli topics append chat-room m-1 '{"text":"hello"}'
+rymedb-cli topics read chat-room --from 0
+rymedb-cli stream broadcast lobby --count 1
+```
 
-`GET /v1/topics/<partition>/stream?from=<cursor>` upgrades to a WebSocket.
-It replays retained messages at or after `from`, then follows new committed
-appends. The same cursor is emitted in every frame, and the connection uses
-the standard heartbeat, QoS accounting, bounded outgoing queue, and lag
-recovery behavior. If `from` is older than the retained cursor window, the
-server sends a `cursor_expired` error frame with the oldest available cursor
-and closes the stream so a client cannot silently lose messages.
+`POST /v1/topics/append` atomically persists a partition message and cursor.
+The topic stream replays from `from=<cursor>` and then follows live appends.
+Use it for chat delivery, agent jobs, or game events that must survive a
+disconnect. Retention is bounded; handle `cursor_expired` by taking a new
+application snapshot.
 
-In cluster mode, appends are accepted only by the current Raft leader and are
-committed through the durable Raft log before the cursor is returned. Every
-gateway applies the same cursor-ordered append and persists its local topic
-snapshot, so reads converge after a gateway receives the committed entry.
+## Supabase Realtime
 
-Cluster database-change streams follow the same gateway-independent rule:
-committed writes are emitted locally by the leader and reconstructed from the
-Raft write set on followers. A subscriber can therefore attach to any live
-gateway and receive the committed CDC stream.
+`/realtime/v1/websocket?apikey=<key>&vsn=1.0.0` accepts Phoenix-style
+`phx_join`, `phx_leave`, heartbeat, broadcast, presence, and
+`postgres_changes` configuration. RLS is checked before database changes are
+exposed. The JavaScript, Java, and Rust SDKs wrap this protocol.
+
+## Delivery rules
+
+- CDC is emitted once after a committed write; SQL, REST, native, gRPC, and
+  RESP writes share the history.
+- Change history and outgoing queues are bounded.
+- Heartbeats detect dead connections; stalled sends are disconnected after a
+  bounded timeout.
+- Broadcast is best-effort and ephemeral; query streams resnapshot; durable
+  topics replay within retention.
+- Tenant, branch, and QoS limits apply to sockets and delivered bytes.

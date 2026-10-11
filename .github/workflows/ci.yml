@@ -107,6 +107,8 @@ jobs:
           mkdir -p _site/openapi
           cp schemas/openapi/rest.yaml _site/openapi/rest.yaml
           cp -R images _site/images
+          mkdir -p _site/api
+          cp docs/swagger-ui.html _site/api/index.html
           python3 -c 'import json, pathlib, yaml; source=pathlib.Path("schemas/openapi/rest.yaml"); target=pathlib.Path("_site/openapi/rest.json"); target.write_text(json.dumps(yaml.safe_load(source.read_text()), indent=2) + "\n")'
 
       - name: Verify supported SDK surface
@@ -115,6 +117,8 @@ jobs:
           test "$actual" = "java,js,rust"
           test -f _site/index.html
           test -f _site/api/index.html
+          grep -q 'SwaggerUIBundle' _site/api/index.html
+          grep -q '../openapi/rest.yaml' _site/api/index.html
           test -f _site/openapi/rest.yaml
           test -f _site/openapi/rest.json
           test -f _site/sdk-java/index.html
