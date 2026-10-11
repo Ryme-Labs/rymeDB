@@ -10125,7 +10125,7 @@ fn apply_replicated_data(state: &SharedState, payload: &[u8]) -> ryme_error::Res
             Some(_) => ryme_realtime::Operation::Insert,
         };
         let after = write.value;
-        state.realtime.publish(ryme_realtime::NewChange {
+        let _ = state.realtime.publish(ryme_realtime::NewChange {
             tenant: key.tenant.clone(),
             database: key.database.clone(),
             branch: String::from("main"),
@@ -10136,7 +10136,7 @@ fn apply_replicated_data(state: &SharedState, payload: &[u8]) -> ryme_error::Res
             after,
             commit_ts,
             tx_id: commit_ts,
-        })?;
+        });
         query_tables.insert((key.tenant, key.database, key.table));
     }
     for (tenant, database, table) in query_tables {

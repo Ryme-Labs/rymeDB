@@ -436,7 +436,7 @@ where
         }
         let commit_ts = self.manager.commit(txn).await?;
         for (pk, before, after, op) in changes {
-            self.realtime.publish(NewChange {
+            self.publish_change(NewChange {
                 tenant: principal.tenant.clone(),
                 database: self.database.clone(),
                 branch: self.branch.clone(),
@@ -478,7 +478,7 @@ where
         }
         let commit_ts = self.manager.commit(txn).await?;
         let op = if before.is_some() { Operation::Update } else { Operation::Insert };
-        self.realtime.publish(NewChange {
+        self.publish_change(NewChange {
             tenant: principal.tenant.clone(),
             database: self.database.clone(),
             branch: self.branch.clone(),
@@ -518,7 +518,7 @@ where
             None => self.manager.try_put(&mut txn, key, current.clone())?,
         }
         let commit_ts = self.manager.commit(txn).await?;
-        self.realtime.publish(NewChange {
+        self.publish_change(NewChange {
             tenant: principal.tenant.clone(),
             database: self.database.clone(),
             branch: self.branch.clone(),
@@ -629,7 +629,7 @@ where
         }
         let commit_ts = self.manager.commit(txn).await?;
         for (pk, current) in changes {
-            self.realtime.publish(NewChange {
+            self.publish_change(NewChange {
                 tenant: principal.tenant.clone(),
                 database: self.database.clone(),
                 branch: self.branch.clone(),
@@ -854,6 +854,13 @@ where
 
     pub fn realtime(&self) -> Realtime {
         self.realtime.clone()
+    }
+
+    /// Realtime is a bounded derived stream. Storage has already committed
+    /// before this is called, so a stream admission failure must not turn a
+    /// successful write into an error that callers may retry.
+    fn publish_change(&self, change: NewChange) {
+        let _ = self.realtime.publish(change);
     }
 
     pub fn tenant_name(&self) -> &str {
