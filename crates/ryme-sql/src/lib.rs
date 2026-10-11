@@ -10043,21 +10043,69 @@ where
         }
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
-            if state
-                .entries
-                .get(&self.tenant)
-                .and_then(|entries| entries.get(&indexed))
-                .is_some_and(|pks| {
-                    pks.iter().any(|existing| {
-                        existing.as_slice() != pk
-                            && excluded_pk.is_none_or(|excluded| existing.as_slice() != excluded)
-                    })
-                })
-            {
+            if self.unique_index_conflicts_with_transaction(
+                txn,
+                state,
+                &indexed,
+                pk,
+                excluded_pk,
+            ) {
                 return Err(RymeError::Conflict(format!("unique index {}", state.definition.name)));
             }
         }
         Ok(())
+    }
+
+    fn unique_index_conflicts_with_transaction(
+        &self,
+        txn: &Transaction,
+        state: &IndexState,
+        indexed: &[u8],
+        pk: &[u8],
+        excluded_pk: Option<&[u8]>,
+    ) -> bool {
+        let is_other_pk = |candidate: &[u8]| {
+            candidate != pk && excluded_pk.is_none_or(|excluded| candidate != excluded)
+        };
+        if state
+            .entries
+            .get(&self.tenant)
+            .and_then(|entries| entries.get(indexed))
+            .is_some_and(|pks| {
+                pks.iter().any(|existing| {
+                    if !is_other_pk(existing) {
+                        return false;
+                    }
+                    let key = RecordKey::new(
+                        &self.tenant,
+                        &self.database,
+                        state.definition.table.as_str(),
+                        existing,
+                    );
+                    match txn.writes().get(&key) {
+                        Some(write) => write
+                            .value
+                            .as_ref()
+                            .and_then(|value| index_value(&state.definition, existing, value))
+                            .is_some_and(|current| current == indexed),
+                        None => true,
+                    }
+                })
+            })
+        {
+            return true;
+        }
+        txn.writes().iter().any(|(key, write)| {
+            key.tenant == self.tenant
+                && key.database == self.database
+                && key.table == state.definition.table
+                && is_other_pk(&key.pk)
+                && write
+                    .value
+                    .as_ref()
+                    .and_then(|value| index_value(&state.definition, &key.pk, value))
+                    .is_some_and(|current| current == indexed)
+        })
     }
 
     fn apply_index_change(&self, change: &TransactionChange) {
@@ -18428,6 +18476,42 @@ mod tests {
         );
         assert_eq!(first_result.is_ok() as usize + second_result.is_ok() as usize, 1);
         assert!(matches!(first_result.or(second_result), Err(RymeError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn conflict_do_nothing_sees_unique_rows_staged_in_same_transaction() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE profiles (id TEXT PRIMARY KEY, email TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE UNIQUE INDEX profiles_email_unique ON profiles (email)").unwrap())
+            .await
+            .unwrap();
+
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let (_, mut changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO profiles (id, email) VALUES ('p1', 'same@example.com')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, mut ignored) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO profiles (id, email) VALUES ('p2', 'same@example.com') ON CONFLICT DO NOTHING")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        changes.append(&mut ignored);
+        executor.commit_transaction(txn, changes).await.unwrap();
+
+        let result = executor.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 1 && rows[0].0 == b"p1"));
     }
 
     #[tokio::test]
