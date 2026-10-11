@@ -138,10 +138,14 @@ pub(crate) enum Rpc {
         index: u64,
         term: u64,
         leader: usize,
+        prev_index: u64,
+        prev_term: u64,
+        leader_commit: u64,
         commit_ts: u64,
         writes: Vec<u8>,
     },
     RangeAppendResponse {
+        term: u64,
         appended: bool,
         last_index: u64,
         error: Option<RpcError>,
@@ -267,6 +271,15 @@ struct RangeLogRecord {
     term: u64,
     commit_ts: u64,
     writes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RangeGroupState {
+    term: u64,
+    voted_for: Option<usize>,
+    leader: Option<usize>,
+    commit_index: u64,
+    applied_index: u64,
 }
 
 fn derived_range_id(start: &[u8], end: &[u8], epoch: u64) -> String {
@@ -695,6 +708,9 @@ pub struct Node {
     prepared: std::sync::Mutex<BTreeMap<u128, PreparedIntent>>,
     intent_wal: std::sync::Mutex<Wal>,
     range_logs: std::sync::Mutex<BTreeMap<String, u64>>,
+    range_entries: std::sync::Mutex<BTreeMap<String, BTreeMap<u64, RangeLogRecord>>>,
+    range_groups: std::sync::Mutex<BTreeMap<String, RangeGroupState>>,
+    range_meta_path: PathBuf,
     range_wal: std::sync::Mutex<Wal>,
 }
 
@@ -793,6 +809,14 @@ impl Node {
                 .map_err(|error| RymeError::Corrupt(format!("range log: {error}")))?;
             range_records.push(range_record);
         }
+        let range_meta_path = dir.join("range-meta.json");
+        let mut range_groups: BTreeMap<String, RangeGroupState> =
+            match std::fs::read(&range_meta_path) {
+                Ok(raw) => serde_json::from_slice(&raw)
+                    .map_err(|error| RymeError::Corrupt(format!("range metadata: {error}")))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(error) => return Err(RymeError::from(error)),
+            };
         let manager = TxnManager::new();
         let mut log: Vec<LogEntry> = Vec::new();
         for record in records {
@@ -827,11 +851,21 @@ impl Node {
             applied = entry.index;
         }
         let mut range_logs = BTreeMap::new();
+        let mut range_entries: BTreeMap<String, BTreeMap<u64, RangeLogRecord>> = BTreeMap::new();
         for range_record in range_records {
             let writes = decode_writes(&range_record.writes)?;
             manager.replay_at(range_record.commit_ts, &writes)?;
-            let last = range_logs.entry(range_record.group_id).or_insert(0);
+            let group_id = range_record.group_id.clone();
+            range_entries
+                .entry(group_id.clone())
+                .or_default()
+                .insert(range_record.index, range_record.clone());
+            let last = range_logs.entry(group_id.clone()).or_insert(0);
             *last = (*last).max(range_record.index);
+            let state = range_groups.entry(group_id).or_default();
+            state.term = state.term.max(range_record.term).max(1);
+            state.commit_index = state.commit_index.max(range_record.index);
+            state.applied_index = state.applied_index.max(range_record.index);
         }
         if let Some(change) = replayed {
             members = normalize_members(change.old.clone());
@@ -891,6 +925,9 @@ impl Node {
             prepared: std::sync::Mutex::new(prepared),
             intent_wal: std::sync::Mutex::new(intent_wal),
             range_logs: std::sync::Mutex::new(range_logs),
+            range_entries: std::sync::Mutex::new(range_entries),
+            range_groups: std::sync::Mutex::new(range_groups),
+            range_meta_path,
             range_wal: std::sync::Mutex::new(range_wal),
         });
         for commit_ts in replayed_commit_ts {
@@ -1621,12 +1658,37 @@ impl Node {
                     }
                 }
             }
-            Rpc::RangeAppend { group_id, index, term, leader: _, commit_ts, writes } => {
-                match self.append_range_local(&group_id, index, term, commit_ts, &writes) {
-                    Ok(last_index) => {
-                        Ok(Rpc::RangeAppendResponse { appended: true, last_index, error: None })
-                    }
+            Rpc::RangeAppend {
+                group_id,
+                index,
+                term,
+                leader,
+                prev_index,
+                prev_term,
+                leader_commit,
+                commit_ts,
+                writes,
+            } => {
+                let result = self.append_range_follower(
+                    &group_id,
+                    term,
+                    leader,
+                    prev_index,
+                    prev_term,
+                    index,
+                    commit_ts,
+                    &writes,
+                    leader_commit,
+                );
+                match result {
+                    Ok(last_index) => Ok(Rpc::RangeAppendResponse {
+                        term: self.range_term(&group_id),
+                        appended: true,
+                        last_index,
+                        error: None,
+                    }),
                     Err(error) => Ok(Rpc::RangeAppendResponse {
+                        term: self.range_term(&group_id),
                         appended: false,
                         last_index: self.range_last_index(&group_id),
                         error: Some(error.into()),
@@ -2026,7 +2088,56 @@ impl Node {
         self.range_logs.lock().ok().and_then(|logs| logs.get(group_id).copied()).unwrap_or(0)
     }
 
-    fn append_range_local(
+    fn range_last_term(&self, group_id: &str) -> u64 {
+        let last = self.range_last_index(group_id);
+        self.range_entries
+            .lock()
+            .ok()
+            .and_then(|groups| groups.get(group_id)?.get(&last).map(|record| record.term))
+            .unwrap_or(0)
+    }
+
+    fn ensure_range_group(&self, group_id: &str, leader: usize) -> RangeGroupState {
+        let mut groups = self.range_groups.lock().unwrap_or_else(|error| error.into_inner());
+        let state = groups.entry(group_id.to_string()).or_default();
+        if state.term == 0 {
+            state.term = 1;
+        }
+        if state.leader.is_none() {
+            state.leader = Some(leader);
+        }
+        state.clone()
+    }
+
+    fn range_term(&self, group_id: &str) -> u64 {
+        self.range_groups
+            .lock()
+            .ok()
+            .and_then(|groups| groups.get(group_id).map(|state| state.term))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    fn persist_range_meta(&self) -> Result<()> {
+        let states = self
+            .range_groups
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?
+            .clone();
+        let raw = serde_json::to_vec(&states)
+            .map_err(|error| RymeError::Internal(format!("range metadata: {error}")))?;
+        let temporary = self.range_meta_path.with_extension("json.tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&raw)?;
+            file.sync_data()?;
+        }
+        std::fs::rename(temporary, &self.range_meta_path)?;
+        Ok(())
+    }
+
+    fn append_range_entry(
         &self,
         group_id: &str,
         index: u64,
@@ -2034,7 +2145,7 @@ impl Node {
         commit_ts: u64,
         encoded_writes: &[u8],
     ) -> Result<u64> {
-        let writes = decode_writes(encoded_writes)?;
+        decode_writes(encoded_writes)?;
         let mut logs =
             self.range_logs.lock().map_err(|_| RymeError::Internal(String::from("range log")))?;
         let last = logs.get(group_id).copied().unwrap_or(0);
@@ -2056,9 +2167,135 @@ impl Node {
             self.range_wal.lock().map_err(|_| RymeError::Internal(String::from("range wal")))?;
         wal.append(commit_ts, &record)?;
         wal.sync()?;
-        self.manager.replay_at(commit_ts, &writes)?;
+        self.range_entries
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range entries")))?
+            .entry(group_id.to_string())
+            .or_default()
+            .insert(
+                index,
+                RangeLogRecord {
+                    group_id: group_id.to_string(),
+                    index,
+                    term,
+                    commit_ts,
+                    writes: encoded_writes.to_vec(),
+                },
+            );
         logs.insert(group_id.to_string(), index);
         Ok(index)
+    }
+
+    fn apply_range_committed(&self, group_id: &str, commit_index: u64) -> Result<()> {
+        let (start, end) = {
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+            let state = groups.entry(group_id.to_string()).or_default();
+            state.commit_index = state.commit_index.max(commit_index);
+            if state.commit_index <= state.applied_index {
+                return Ok(());
+            }
+            (state.applied_index + 1, state.commit_index)
+        };
+        let records: Vec<RangeLogRecord> = {
+            let entries = self
+                .range_entries
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range entries")))?;
+            let group = entries
+                .get(group_id)
+                .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
+            (start..=end)
+                .map(|index| {
+                    group
+                        .get(&index)
+                        .cloned()
+                        .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        for record in records {
+            let writes = decode_writes(&record.writes)?;
+            self.manager.replay_at(record.commit_ts, &writes)?;
+        }
+        {
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+            if let Some(state) = groups.get_mut(group_id) {
+                state.applied_index = state.applied_index.max(end);
+            }
+        }
+        self.persist_range_meta()
+    }
+
+    fn append_range_follower(
+        &self,
+        group_id: &str,
+        term: u64,
+        leader: usize,
+        prev_index: u64,
+        prev_term: u64,
+        index: u64,
+        commit_ts: u64,
+        encoded_writes: &[u8],
+        leader_commit: u64,
+    ) -> Result<u64> {
+        let mut state = self.ensure_range_group(group_id, leader);
+        if term < state.term {
+            return Err(RymeError::Unavailable(String::from("stale range term")));
+        }
+        if term > state.term || state.leader != Some(leader) {
+            state.term = term;
+            state.voted_for = None;
+            state.leader = Some(leader);
+            self.range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?
+                .insert(group_id.to_string(), state.clone());
+            self.persist_range_meta()?;
+        }
+        let last = self.range_last_index(group_id);
+        if prev_index != 0 {
+            if prev_index != last || self.range_last_term(group_id) != prev_term {
+                return Err(RymeError::Unavailable(String::from("range log conflict")));
+            }
+        } else if last != 0 && index > last + 1 {
+            return Err(RymeError::Unavailable(String::from("range log gap")));
+        }
+        let last = if index == 0 {
+            last
+        } else {
+            if index <= last {
+                let entries = self
+                    .range_entries
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("range entries")))?;
+                let existing = entries
+                    .get(group_id)
+                    .and_then(|group| group.get(&index))
+                    .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
+                if existing.term != term
+                    || existing.commit_ts != commit_ts
+                    || existing.writes != encoded_writes
+                {
+                    return Err(RymeError::Unavailable(String::from("range log conflict")));
+                }
+                last
+            } else {
+                if index != last + 1 {
+                    return Err(RymeError::Unavailable(String::from("range log gap")));
+                }
+                self.append_range_entry(group_id, index, term, commit_ts, encoded_writes)?
+            }
+        };
+        if leader_commit > 0 {
+            self.apply_range_committed(group_id, leader_commit.min(last))?;
+        }
+        Ok(last)
     }
 
     fn range_owner_by_id(&self, group_id: &str) -> Option<RangeOwner> {
@@ -2087,9 +2324,12 @@ impl Node {
         replicas.sort_unstable();
         replicas.dedup();
         let index = self.range_last_index(group_id) + 1;
-        let term = self.inner.lock().await.term.max(1);
-        self.append_range_local(group_id, index, term, commit_ts, encoded_writes)?;
+        let term = self.ensure_range_group(group_id, self.id).term.max(1);
+        let prev_index = index.saturating_sub(1);
+        let prev_term = if prev_index == 0 { 0 } else { self.range_last_term(group_id) };
+        self.append_range_entry(group_id, index, term, commit_ts, encoded_writes)?;
         let mut acknowledgements = 1usize;
+        let mut acknowledged = vec![self.id];
         for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
             let Some(pool) = self.pool_for(replica) else { continue };
             let response = pool
@@ -2098,20 +2338,52 @@ impl Node {
                     index,
                     term,
                     leader: self.id,
+                    prev_index,
+                    prev_term,
+                    leader_commit: 0,
                     commit_ts,
                     writes: encoded_writes.to_vec(),
                 })
                 .await;
             if matches!(
                 response,
-                Ok(Rpc::RangeAppendResponse { appended: true, last_index, error: None })
-                    if last_index >= index
+                Ok(Rpc::RangeAppendResponse { term: peer_term, appended: true, last_index, error: None })
+                    if last_index >= index && peer_term <= term
             ) {
                 acknowledgements += 1;
+                acknowledged.push(replica);
             }
         }
         if acknowledgements < replicas.len() / 2 + 1 {
             return Err(RymeError::Unavailable(String::from("range quorum")));
+        }
+        {
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+            let state = groups.entry(group_id.to_string()).or_default();
+            state.term = state.term.max(term).max(1);
+            state.leader = Some(self.id);
+            state.commit_index = state.commit_index.max(index);
+        }
+        self.apply_range_committed(group_id, index)?;
+        self.persist_range_meta()?;
+        for replica in acknowledged.into_iter().filter(|replica| *replica != self.id) {
+            let Some(pool) = self.pool_for(replica) else { continue };
+            let _ = pool
+                .roundtrip(&Rpc::RangeAppend {
+                    group_id: group_id.to_string(),
+                    index: 0,
+                    term,
+                    leader: self.id,
+                    prev_index: index,
+                    prev_term: term,
+                    leader_commit: index,
+                    commit_ts: 0,
+                    writes: Vec::new(),
+                })
+                .await;
         }
         Ok(())
     }
@@ -3012,7 +3284,9 @@ impl Node {
             }
             range.replicas.sort_unstable();
             range.replicas.dedup();
+            self.ensure_range_group(&range.id, range.owner);
         }
+        let _ = self.persist_range_meta();
         owners.sort_by(|left, right| left.start.cmp(&right.start));
         if let Ok(mut current) = self.range_owners.write() {
             if *current == owners {
@@ -3541,8 +3815,20 @@ mod tests {
         let encoded = encode_writes(&writes).unwrap();
         {
             let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
-            assert_eq!(node.append_range_local("range-a", 1, 3, 7, &encoded).unwrap(), 1);
+            assert_eq!(
+                node.append_range_follower("range-a", 3, 0, 0, 0, 1, 7, &encoded, 0).unwrap(),
+                1
+            );
             assert_eq!(node.range_last_index("range-a"), 1);
+            let mut pending = node.manager.begin();
+            assert_eq!(node.manager.get(&mut pending, &key).unwrap(), None);
+            assert!(matches!(
+                node.append_range_follower("range-a", 2, 0, 0, 0, 0, 0, &[], 0),
+                Err(RymeError::Unavailable(message)) if message == "stale range term"
+            ));
+            assert_eq!(node.append_range_follower("range-a", 3, 0, 1, 3, 0, 0, &[], 1).unwrap(), 1);
+            let mut committed = node.manager.begin();
+            assert_eq!(node.manager.get(&mut committed, &key).unwrap(), Some(b"value".to_vec()));
         }
 
         let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();

@@ -1,5 +1,10 @@
 # Changelog
 
+- Range replica appends now carry independent range-group terms, previous
+  index/term checks, and a range commit index. Followers persist entries but do
+  not materialize them until the owner advances the group commit, and stale
+  terms or log gaps are rejected. Range-group election and promotion are still
+  future work; placement metadata remains the current leader assignment.
 - Range placement now carries stable range ids and configured replica sets.
   After the global Raft decision commits, the range owner appends each affected
   write set to a synced range WAL and sends range-append quorum RPCs to its

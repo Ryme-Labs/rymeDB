@@ -211,11 +211,14 @@ scans through HTTP, native, gRPC, GraphQL, and PostgREST fan out to owners and
 merge bounded pages by primary key. Followers with a complete range map now
 materialize live committed writes only for their local owners while retaining
 global conflict metadata; leaders and recovery still keep the complete state.
-Each configured range replica also receives the committed range write set over
-a range-scoped append RPC. The owner syncs its range WAL before acknowledging
-a replica quorum, and startup replays those records before serving reads. This
-gives the current placement map a durable replica-materialization path without
-claiming that the range logs elect leaders independently.
+Each configured range replica also receives the range write set over a
+range-scoped append RPC. Range appends carry an independent group term and
+previous-log position; followers persist entries first, and materialize them
+only after the owner advances the range commit index. The owner syncs its
+range WAL before acknowledging a replica quorum, and startup replays those
+records before serving reads. This gives the current placement map a durable
+replica-materialization path without claiming that range logs elect leaders
+independently yet.
 This does not yet delete source replicas or claim full shared-nothing storage
 scale. Single-owner write-only transactions now route through the configured
 owner and then the current Raft leader; read-dependent, multi-owner, and
