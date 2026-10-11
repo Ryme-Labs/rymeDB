@@ -282,24 +282,27 @@ impl VectorSpace {
         if vector.is_empty() || vector.len() > MAX_DIM {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
-        if self.vectors.is_empty() {
-            self.dim = vector.len();
-        }
-        if vector.len() != self.dim {
+        if self.dim != 0 && vector.len() != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
         if !self.vectors.contains_key(&id) && self.vectors.len() >= MAX_VECTORS_PER_SPACE {
             return Err(RymeError::Overload(String::from("vector space")));
         }
         let normalized = normalize(&vector)?;
-        self.ann.upsert(self.dim, id.clone(), normalized.clone())?;
+        let dim = if self.dim == 0 { vector.len() } else { self.dim };
+        self.ann.upsert(dim, id.clone(), normalized.clone())?;
+        self.dim = dim;
         self.vectors.insert(id, normalized);
         Ok(())
     }
 
     fn remove(&mut self, id: &str) -> bool {
         self.ann.remove(id);
-        self.vectors.remove(id).is_some()
+        let removed = self.vectors.remove(id).is_some();
+        if removed && self.vectors.is_empty() {
+            self.ann = HnswIndex::default();
+        }
+        removed
     }
 
     fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>> {
@@ -346,11 +349,11 @@ struct TextSpace {
 }
 
 impl TextSpace {
-    fn index_doc(&mut self, id: String, text: &str) -> usize {
-        self.remove(&id);
-        if self.docs.len() >= MAX_DOCS_PER_SPACE {
-            return 0;
+    fn index_doc(&mut self, id: String, text: &str) -> Result<usize> {
+        if !self.docs.contains_key(&id) && self.docs.len() >= MAX_DOCS_PER_SPACE {
+            return Err(RymeError::Overload(String::from("text space")));
         }
+        self.remove(&id);
         let mut terms: HashMap<String, u32> = HashMap::new();
         for term in tokenize(text) {
             *terms.entry(term).or_insert(0) += 1;
@@ -360,7 +363,7 @@ impl TextSpace {
             self.postings.entry(term.clone()).or_default().insert(id.clone(), *freq);
         }
         self.docs.insert(id, terms);
-        count
+        Ok(count)
     }
 
     fn remove(&mut self, id: &str) -> bool {
@@ -470,7 +473,7 @@ impl IndexRegistry {
         if space.is_empty() || id.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("text target")));
         }
-        Ok(self.texts.entry(space.to_string()).or_default().index_doc(id, text))
+        self.texts.entry(space.to_string()).or_default().index_doc(id, text)
     }
 
     pub fn text_remove(&mut self, space: &str, id: &str) -> bool {
@@ -495,6 +498,8 @@ pub const MAX_PARTITIONS: usize = 64;
 pub struct PartitionedIndex {
     partitions: Vec<IndexRegistry>,
     dims: HashMap<String, usize>,
+    vector_counts: HashMap<String, usize>,
+    text_counts: HashMap<String, usize>,
 }
 
 impl PartitionedIndex {
@@ -504,7 +509,12 @@ impl PartitionedIndex {
         for _ in 0..count {
             out.push(IndexRegistry::new());
         }
-        Self { partitions: out, dims: HashMap::new() }
+        Self {
+            partitions: out,
+            dims: HashMap::new(),
+            vector_counts: HashMap::new(),
+            text_counts: HashMap::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -536,17 +546,32 @@ impl PartitionedIndex {
                 return Err(RymeError::InvalidArgument(String::from("vector dim")));
             }
             Some(_) => {}
-            None => {
-                self.dims.insert(space.to_string(), vector.len());
-            }
+            None => {}
         }
         let partition = self.route(space, &id);
-        self.partitions[partition].vector_upsert(space, id, vector)
+        let is_new = !self.partitions[partition]
+            .vectors
+            .get(space)
+            .is_some_and(|vectors| vectors.vectors.contains_key(&id));
+        if is_new && self.vector_counts.get(space).copied().unwrap_or(0) >= MAX_VECTORS_PER_SPACE {
+            return Err(RymeError::Overload(String::from("vector space")));
+        }
+        let dim = vector.len();
+        self.partitions[partition].vector_upsert(space, id, vector)?;
+        self.dims.entry(space.to_string()).or_insert(dim);
+        if is_new {
+            *self.vector_counts.entry(space.to_string()).or_default() += 1;
+        }
+        Ok(())
     }
 
     pub fn vector_remove(&mut self, space: &str, id: &str) -> bool {
         let partition = self.route(space, id);
-        self.partitions[partition].vector_remove(space, id)
+        let removed = self.partitions[partition].vector_remove(space, id);
+        if removed {
+            decrement_count(&mut self.vector_counts, space);
+        }
+        removed
     }
 
     pub fn vector_search(
@@ -605,12 +630,27 @@ impl PartitionedIndex {
             return Err(RymeError::InvalidArgument(String::from("text target")));
         }
         let partition = self.route(space, &id);
-        self.partitions[partition].text_index(space, id, text)
+        let is_new = !self.partitions[partition]
+            .texts
+            .get(space)
+            .is_some_and(|docs| docs.docs.contains_key(&id));
+        if is_new && self.text_counts.get(space).copied().unwrap_or(0) >= MAX_DOCS_PER_SPACE {
+            return Err(RymeError::Overload(String::from("text space")));
+        }
+        let terms = self.partitions[partition].text_index(space, id, text)?;
+        if is_new {
+            *self.text_counts.entry(space.to_string()).or_default() += 1;
+        }
+        Ok(terms)
     }
 
     pub fn text_remove(&mut self, space: &str, id: &str) -> bool {
         let partition = self.route(space, id);
-        self.partitions[partition].text_remove(space, id)
+        let removed = self.partitions[partition].text_remove(space, id);
+        if removed {
+            decrement_count(&mut self.text_counts, space);
+        }
+        removed
     }
 
     pub fn text_search(&self, space: &str, query: &str, top_k: usize) -> Vec<TextHit> {
@@ -631,6 +671,15 @@ impl PartitionedIndex {
         out.sort();
         out.dedup();
         out
+    }
+}
+
+fn decrement_count(counts: &mut HashMap<String, usize>, space: &str) {
+    if let Some(count) = counts.get_mut(space) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(space);
+        }
     }
 }
 
@@ -659,12 +708,45 @@ mod tests {
     }
 
     #[test]
+    fn rejected_first_vector_does_not_lock_dimension() {
+        let mut registry = PartitionedIndex::new(4);
+        assert!(registry.vector_upsert("s", String::from("bad"), vec![0.0, 0.0]).is_err());
+        registry.vector_upsert("s", String::from("good"), vec![1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(registry.vector_search("s", &[1.0, 0.0, 0.0], 1).unwrap()[0].id, "good");
+    }
+
+    #[test]
+    fn partitioned_vector_capacity_is_global_and_reclaimed_on_remove() {
+        let mut registry = PartitionedIndex::new(4);
+        registry.vector_upsert("s", String::from("existing"), vec![1.0]).unwrap();
+        registry.vector_counts.insert(String::from("s"), MAX_VECTORS_PER_SPACE);
+        registry.vector_upsert("s", String::from("existing"), vec![0.5]).unwrap();
+        assert!(matches!(
+            registry.vector_upsert("s", String::from("new"), vec![0.25]),
+            Err(RymeError::Overload(_))
+        ));
+        assert!(registry.vector_remove("s", "existing"));
+        registry.vector_upsert("s", String::from("new"), vec![0.25]).unwrap();
+    }
+
+    #[test]
     fn vector_remove_drops_hits() {
         let mut registry = IndexRegistry::new();
         registry.vector_upsert("s", String::from("a"), vec![1.0, 0.0]).unwrap();
         assert!(registry.vector_remove("s", "a"));
         assert!(!registry.vector_remove("s", "a"));
         assert!(registry.vector_search("s", &[1.0, 0.0], 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ann_rebuilds_entry_after_removing_every_vector() {
+        let mut registry = IndexRegistry::new();
+        registry.vector_upsert("s", String::from("old"), vec![1.0, 0.0]).unwrap();
+        assert!(registry.vector_remove("s", "old"));
+        registry.vector_upsert("s", String::from("new"), vec![0.0, 1.0]).unwrap();
+        let hits = registry.ann_search("s", &[0.0, 1.0], 1, 16).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "new");
     }
 
     #[test]
@@ -685,6 +767,24 @@ mod tests {
         assert!(registry.text_remove("docs", "d1"));
         assert!(registry.text_search("docs", "hello", 10).is_empty());
         assert!(registry.text_search("missing", "hello", 10).is_empty());
+    }
+
+    #[test]
+    fn partitioned_text_capacity_is_global_and_reindex_is_atomic() {
+        let mut registry = PartitionedIndex::new(4);
+        registry.text_index("docs", String::from("existing"), "before").unwrap();
+        registry.text_counts.insert(String::from("docs"), MAX_DOCS_PER_SPACE);
+
+        assert!(matches!(
+            registry.text_index("docs", String::from("new"), "blocked"),
+            Err(RymeError::Overload(_))
+        ));
+        registry.text_index("docs", String::from("existing"), "after").unwrap();
+        assert!(registry.text_search("docs", "before", 10).is_empty());
+        assert_eq!(registry.text_search("docs", "after", 10)[0].id, "existing");
+        assert!(registry.text_remove("docs", "existing"));
+        registry.text_index("docs", String::from("new"), "admitted").unwrap();
+        assert_eq!(registry.text_counts.get("docs"), Some(&MAX_DOCS_PER_SPACE));
     }
 
     #[test]
