@@ -2186,9 +2186,13 @@ impl SharedState {
     fn active_dek(&self) -> Option<ryme_crypto::Dek> {
         self.dek_ring.lock().ok()?.active(&self.tenant).or_else(|| {
             let mut ring = self.dek_ring.lock().ok()?;
+            let previous = ring.clone();
             let dek = ring.rotate(&self.tenant.clone(), now_secs());
             let path = self.data_dir.join("keyring.json");
-            let _ = persist_ring(&ring, &path);
+            if persist_ring(&ring, &path).is_err() {
+                *ring = previous;
+                return None;
+            }
             Some(dek)
         })
     }
@@ -12078,24 +12082,29 @@ fn load_or_create_ring(
     tenant: &str,
 ) -> ryme_error::Result<Arc<Mutex<KeyRing>>> {
     let path = data_dir.join("keyring.json");
-    if let Ok(raw) = std::fs::read(&path) {
-        if let Ok(wrapped) = serde_json::from_slice::<WrappedRing>(&raw) {
-            if let Some(kms) = kms_from_env() {
-                if kms.kek_id() == wrapped.kek_id {
-                    let mut ring = KeyRing::new();
-                    if ring.import_wrapped(wrapped.deks, &kms).is_ok()
-                        && ring.active(tenant).is_some()
-                    {
-                        return Ok(Arc::new(Mutex::new(ring)));
+    match std::fs::read(&path) {
+        Ok(raw) => {
+            if let Ok(wrapped) = serde_json::from_slice::<WrappedRing>(&raw) {
+                if let Some(kms) = kms_from_env() {
+                    if kms.kek_id() == wrapped.kek_id {
+                        let mut ring = KeyRing::new();
+                        if ring.import_wrapped(wrapped.deks, &kms).is_ok()
+                            && ring.active(tenant).is_some()
+                        {
+                            return Ok(Arc::new(Mutex::new(ring)));
+                        }
                     }
                 }
             }
-        }
-        if let Ok(ring) = serde_json::from_slice::<KeyRing>(&raw) {
-            if ring.active(tenant).is_some() {
-                return Ok(Arc::new(Mutex::new(ring)));
+            if let Ok(ring) = serde_json::from_slice::<KeyRing>(&raw) {
+                if ring.active(tenant).is_some() {
+                    return Ok(Arc::new(Mutex::new(ring)));
+                }
             }
+            return Err(ryme_error::RymeError::Corrupt(String::from("keyring")));
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let mut ring = KeyRing::new();
     ring.rotate(tenant, now_secs());
@@ -12120,11 +12129,24 @@ fn persist_ring(ring: &KeyRing, path: &std::path::Path) -> ryme_error::Result<()
             serde_json::to_vec(ring).map_err(|e| ryme_error::RymeError::Internal(e.to_string()))?
         }
     };
-    std::fs::write(path, &raw)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&raw)?;
+        file.sync_data()?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(temporary, path)?;
+    if let Some(parent) = path.parent() {
+        sync_metadata_directory(parent)?;
     }
     Ok(())
 }
@@ -12572,6 +12594,32 @@ mod realtime_policy_tests {
             Err(ryme_error::RymeError::InvalidArgument(message))
                 if message.contains("RYME_RESP_PASSWORD")
         ));
+    }
+
+    #[test]
+    fn keyring_persistence_is_atomic_and_invalid_state_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-keyring-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keyring.json");
+        let mut ring = KeyRing::new();
+        ring.rotate("tenant-a", now_secs());
+
+        persist_ring(&ring, &path).unwrap();
+        let loaded = load_or_create_ring(&dir, "tenant-a").unwrap();
+        assert!(loaded.lock().unwrap().active("tenant-a").is_some());
+        assert!(!path.with_extension("tmp").exists());
+
+        std::fs::write(&path, b"truncated-keyring").unwrap();
+        assert!(matches!(
+            load_or_create_ring(&dir, "tenant-a"),
+            Err(ryme_error::RymeError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
