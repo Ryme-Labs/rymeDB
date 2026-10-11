@@ -828,12 +828,20 @@ pub struct OidcConfig {
 
 impl OidcConfig {
     pub fn auth_url(&self, redirect_uri: &str, state: &str) -> Result<String> {
-        if self.auth_endpoint.is_empty() || redirect_uri.is_empty() || state.is_empty() {
+        if self.auth_endpoint.is_empty()
+            || self.client_id.is_empty()
+            || redirect_uri.is_empty()
+            || state.is_empty()
+        {
             return Err(RymeError::InvalidArgument(String::from("oidc login")));
         }
+        let separator = if self.auth_endpoint.contains('?') { '&' } else { '?' };
         Ok(format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid%20email%20profile&state={}",
-            self.auth_endpoint, self.client_id, redirect_uri, state
+            "{}{separator}response_type=code&client_id={}&redirect_uri={}&scope=openid%20email%20profile&state={}",
+            self.auth_endpoint,
+            encode_query_component(&self.client_id),
+            encode_query_component(redirect_uri),
+            encode_query_component(state),
         ))
     }
 
@@ -845,6 +853,20 @@ impl OidcConfig {
         );
         verifier.principal_from_token(id_token, now_secs)
     }
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(char::from_digit((byte >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+            encoded.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap().to_ascii_uppercase());
+        }
+    }
+    encoded
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1244,6 +1266,19 @@ mod tests {
         assert!(url.contains("response_type=code"));
         assert!(url.contains("state=xyz"));
         assert!(config.auth_url("", "xyz").is_err());
+    }
+
+    #[test]
+    fn oidc_encodes_untrusted_query_values() {
+        let config = oidc_test_config();
+        let url = config
+            .auth_url("https://app.test/callback?next=/home&state=evil", "x y&z")
+            .unwrap();
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Fapp.test%2Fcallback%3Fnext%3D%2Fhome%26state%3Devil"
+        ));
+        assert!(url.ends_with("&state=x%20y%26z"));
+        assert!(!url.contains("&state=evil"));
     }
 
     #[test]
