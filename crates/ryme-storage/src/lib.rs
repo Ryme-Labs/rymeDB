@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 
 mod segment;
@@ -260,7 +260,8 @@ impl Engine {
         // Validate every key's incoming history before changing the engine. A
         // malformed later row must not leave an earlier part of the import
         // visible to readers.
-        let mut histories: BTreeMap<RecordKey, (Option<u64>, BTreeSet<u64>)> = BTreeMap::new();
+        let mut histories: BTreeMap<RecordKey, (Option<u64>, BTreeMap<u64, (Option<&[u8]>, u64)>)> =
+            BTreeMap::new();
         for (pk, versions) in &rows {
             let key = RecordKey {
                 tenant: tenant.to_string(),
@@ -272,20 +273,33 @@ impl Engine {
                 let existing = self.inner.get(&key);
                 (
                     existing.and_then(|versions| versions.last().map(|version| version.commit_ts)),
-                    existing
-                        .into_iter()
-                        .flat_map(|versions| versions.iter().map(|version| version.commit_ts))
-                        .collect(),
+                    BTreeMap::new(),
                 )
             });
             for version in versions {
-                if !known.insert(version.commit_ts) {
+                let incoming_value = version.value.as_deref();
+                if let Some((known_value, known_expiry)) = known.get(&version.commit_ts) {
+                    if *known_value != incoming_value || *known_expiry != version.expires_at {
+                        return Err(RymeError::Corrupt(String::from("version conflict")));
+                    }
+                    continue;
+                }
+                if let Some(existing) = self.inner.get(&key).and_then(|history| {
+                    history.iter().find(|entry| entry.commit_ts == version.commit_ts)
+                }) {
+                    if existing.value.as_deref() != incoming_value
+                        || existing.expires_at != version.expires_at
+                    {
+                        return Err(RymeError::Corrupt(String::from("version conflict")));
+                    }
+                    known.insert(version.commit_ts, (incoming_value, version.expires_at));
                     continue;
                 }
                 if last.is_some_and(|last| version.commit_ts < last) {
                     return Err(RymeError::Corrupt(String::from("version order")));
                 }
                 *last = Some(version.commit_ts);
+                known.insert(version.commit_ts, (incoming_value, version.expires_at));
             }
         }
 
@@ -807,6 +821,46 @@ mod tests {
 
         assert!(matches!(result, Err(RymeError::Corrupt(_))));
         assert_eq!(engine.read(&earlier_batch_row, 7, 0).unwrap(), None);
+        assert_eq!(engine.read(&existing, 5, 0).unwrap(), Some(b"original".to_vec()));
+        assert_eq!(engine.bytes_held(), bytes_before);
+    }
+
+    #[test]
+    fn table_import_rejects_conflicting_duplicate_versions_atomically() {
+        let mut engine = Engine::new();
+        let existing = RecordKey::new("t", "d", "users", b"existing");
+        let new_row = RecordKey::new("t", "d", "users", b"new");
+        engine.apply(existing.clone(), 5, Some(b"original".to_vec())).unwrap();
+        let bytes_before = engine.bytes_held();
+
+        let result = engine.import_table(
+            "t",
+            "d",
+            "users",
+            vec![
+                (
+                    b"new".to_vec(),
+                    vec![TableVersion {
+                        commit_ts: 7,
+                        value: Some(b"would-have-been-imported".to_vec()),
+                        expires_at: 0,
+                    }],
+                ),
+                (
+                    b"existing".to_vec(),
+                    vec![TableVersion {
+                        commit_ts: 5,
+                        value: Some(b"conflicting".to_vec()),
+                        expires_at: 0,
+                    }],
+                ),
+            ],
+        );
+
+        assert!(
+            matches!(result, Err(RymeError::Corrupt(message)) if message == "version conflict")
+        );
+        assert_eq!(engine.read(&new_row, 7, 0).unwrap(), None);
         assert_eq!(engine.read(&existing, 5, 0).unwrap(), Some(b"original".to_vec()));
         assert_eq!(engine.bytes_held(), bytes_before);
     }
