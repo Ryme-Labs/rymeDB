@@ -7242,6 +7242,19 @@ where
         Ok(())
     }
 
+    fn validate_schema_mutation(&self, previous: &SchemaSnapshot, was_dirty: bool) -> Result<()> {
+        if let Err(error) = validate_schema_snapshot(&self.schema_snapshot()) {
+            self.restore_schema_snapshot(previous.clone()).map_err(|rollback_error| {
+                RymeError::Internal(format!(
+                    "schema limit exceeded: {error}; rollback failed: {rollback_error}"
+                ))
+            })?;
+            self.schema_dirty.store(was_dirty, Ordering::SeqCst);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn with_rls_tables(mut self, rls_tables: HashMap<String, String>) -> Self {
         let policies = rls_tables
             .iter()
@@ -12172,8 +12185,14 @@ where
         Ok(())
     }
 
-    fn ensure_table(&self, table: &str) {
+    fn ensure_table(&self, table: &str) -> Result<()> {
+        let was_dirty = self.schema_dirty.load(Ordering::SeqCst);
+        let previous = self.schema_snapshot();
+        if previous.tables.contains_key(table) {
+            return Ok(());
+        }
         self.register_table(table.to_string(), Vec::new());
+        self.validate_schema_mutation(&previous, was_dirty)
     }
 
     fn persist_schema_if_configured(&self) -> Result<()> {
@@ -12270,6 +12289,9 @@ where
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         self.enforce_statement_privileges(&statement)?;
+        let schema_statement = statement.is_schema_change();
+        let previous_schema = schema_statement.then(|| self.schema_snapshot());
+        let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
@@ -12321,7 +12343,7 @@ where
             Statement::AlterTableRenameColumn { .. } => {}
             Statement::AlterTableColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
-            statement if statement.is_write() => self.ensure_table(statement.table()),
+            statement if statement.is_write() => self.ensure_table(statement.table())?,
             _ => {}
         }
         let result = match statement {
@@ -12331,6 +12353,9 @@ where
             statement => self.execute_in_transaction_base(txn, statement).await,
         }?;
         txn.ensure_healthy()?;
+        if let Some(previous) = previous_schema.as_ref() {
+            self.validate_schema_mutation(previous, previous_schema_dirty)?;
+        }
         Ok(result)
     }
 
@@ -13845,11 +13870,21 @@ where
         schema_before: Option<SchemaSnapshot>,
     ) -> Result<u64> {
         self.check_transaction_uniqueness(&changes)?;
+        let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         let previous_schema = schema_before.clone();
         let schema_after = schema_before.as_ref().map(|_| self.schema_snapshot());
         let schema_changed = schema_after
             .as_ref()
             .is_some_and(|after| schema_before.as_ref().is_some_and(|before| before != after));
+        if schema_changed {
+            if let (Some(before), Some(after)) = (schema_before.as_ref(), schema_after.as_ref()) {
+                if let Err(error) = validate_schema_snapshot(after) {
+                    self.restore_schema_snapshot(before.clone())?;
+                    self.schema_dirty.store(previous_schema_dirty, Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
+        }
         if schema_changed && !changes.is_empty() {
             self.rollback_schema_transaction(previous_schema.clone())?;
             return Err(RymeError::InvalidArgument(String::from(
@@ -14231,6 +14266,7 @@ where
         self.enforce_statement_privileges(&statement)?;
         let schema_statement = statement.is_schema_change();
         let previous_schema = schema_statement.then(|| self.schema_snapshot());
+        let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
@@ -14282,7 +14318,7 @@ where
             Statement::AlterTableRenameColumn { .. } => {}
             Statement::AlterTableColumn { .. } => {}
             Statement::CreateIndex { .. } => {}
-            statement if statement.is_write() => self.ensure_table(statement.table()),
+            statement if statement.is_write() => self.ensure_table(statement.table())?,
             _ => {}
         }
         let sequence_state_statement = matches!(
@@ -14299,7 +14335,12 @@ where
             statement => self.execute_with_base(statement, isolation).await,
         };
         if result.is_ok() && schema_statement {
-            if let (Some(hook), Some(previous)) = (self.schema_hook.clone(), previous_schema.clone()) {
+            if let Some(previous) = previous_schema.as_ref() {
+                self.validate_schema_mutation(previous, previous_schema_dirty)?;
+            }
+            if let (Some(hook), Some(previous)) =
+                (self.schema_hook.clone(), previous_schema.clone())
+            {
                 let next = self.schema_snapshot();
                 if next != previous {
                     if let Err(error) = hook(previous.clone(), next).await {
@@ -15361,7 +15402,7 @@ where
         if rows.len() > 10000 {
             return Err(RymeError::InvalidArgument(String::from("batch too large")));
         }
-        self.ensure_table(&table);
+        self.ensure_table(&table)?;
         for chunk in rows.chunks(500) {
             let mut txn = self.begin_with(self.isolation);
             let mut staged: Vec<TransactionChange> = Vec::new();
@@ -17362,6 +17403,32 @@ mod tests {
             validate_schema_snapshot(&snapshot),
             Err(RymeError::Overload(message)) if message == "schema snapshot objects"
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_schema_mutations_enforce_object_limit_and_rollback() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        let mut snapshot = SchemaSnapshot::default();
+        for index in 0..MAX_SCHEMA_OBJECTS {
+            snapshot.tables.insert(format!("table_{index}"), Vec::new());
+        }
+        executor.restore_schema_snapshot(snapshot).unwrap();
+
+        let result = executor.execute(parse("CREATE ROLE overflow_role").unwrap()).await;
+        assert!(matches!(
+            result,
+            Err(RymeError::Overload(message)) if message == "schema snapshot objects"
+        ));
+        assert!(!executor.catalog_roles().iter().any(|role| role.name == "overflow_role"));
+
+        let result = executor
+            .execute(parse("INSERT INTO implicit_overflow KEY 'k' VALUE 'v'").unwrap())
+            .await;
+        assert!(matches!(
+            result,
+            Err(RymeError::Overload(message)) if message == "schema snapshot objects"
+        ));
+        assert!(!executor.catalog_tables().iter().any(|table| table == "implicit_overflow"));
     }
 
     #[tokio::test]
