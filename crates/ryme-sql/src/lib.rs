@@ -9825,6 +9825,17 @@ where
                     .collect());
             }
         }
+        let rls_enabled = self
+            .rls_enabled
+            .read()
+            .ok()
+            .is_some_and(|tables| tables.contains(table));
+        if txn.writes().is_empty() && filter.is_empty() && !rls_enabled {
+            return self
+                .manager
+                .scan_async(txn, &self.tenant, &self.database, table, limit)
+                .await;
+        }
         const PAGE: usize = 1024;
         let mut base = BTreeMap::new();
         let mut after = None;
