@@ -1658,6 +1658,15 @@ impl SharedState {
         };
         let oidc_enabled =
             oidc_secret.is_some() || oidc_jwks_path.is_some() || oidc_jwks_url.is_some();
+        validate_jwt_claim_configuration(
+            oidc_issuer.as_deref(),
+            oidc_audience.as_deref(),
+            oidc_enabled,
+            "oidc",
+        )?;
+        if let Some(secret) = oidc_secret.as_ref() {
+            validate_hmac_jwt_secret(secret.as_bytes())?;
+        }
         let oidc = match (oidc_issuer, oidc_audience) {
             (Some(issuer), Some(audience)) if oidc_enabled => {
                 if oidc_redirect_uris.is_empty() {
@@ -11322,18 +11331,46 @@ fn hmac_jwt_verifier(
     issuer: Option<String>,
     audience: Option<String>,
 ) -> ryme_error::Result<JwtVerifier> {
+    validate_hmac_jwt_secret(&secret)?;
+    validate_jwt_claim_configuration(issuer.as_deref(), audience.as_deref(), true, "jwt")?;
+    match (issuer, audience) {
+        (Some(issuer), Some(audience)) => Ok(JwtVerifier::with_issuer(secret, issuer, audience)),
+        (None, None) => Ok(JwtVerifier::new(secret)),
+        _ => unreachable!("jwt claim configuration was validated"),
+    }
+}
+
+fn validate_hmac_jwt_secret(secret: &[u8]) -> ryme_error::Result<()> {
     if secret.len() < 16 {
         return Err(ryme_error::RymeError::InvalidArgument(String::from(
             "jwt secret must contain at least 16 bytes",
         )));
     }
-    match (issuer, audience) {
-        (Some(issuer), Some(audience)) => Ok(JwtVerifier::with_issuer(secret, issuer, audience)),
-        (None, None) => Ok(JwtVerifier::new(secret)),
-        _ => Err(ryme_error::RymeError::InvalidArgument(String::from(
-            "jwt issuer and audience must be configured together",
-        ))),
+    Ok(())
+}
+
+fn validate_jwt_claim_configuration(
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    verification_source_configured: bool,
+    label: &str,
+) -> ryme_error::Result<()> {
+    if issuer.map(str::is_empty).unwrap_or(false) || audience.map(str::is_empty).unwrap_or(false) {
+        return Err(ryme_error::RymeError::InvalidArgument(format!(
+            "{label} issuer and audience must not be empty"
+        )));
     }
+    if issuer.is_some() != audience.is_some() {
+        return Err(ryme_error::RymeError::InvalidArgument(format!(
+            "{label} issuer and audience must be configured together"
+        )));
+    }
+    if !verification_source_configured && (issuer.is_some() || audience.is_some()) {
+        return Err(ryme_error::RymeError::InvalidArgument(format!(
+            "{label} issuer and audience require a verification secret or JWKS source"
+        )));
+    }
+    Ok(())
 }
 
 fn admit_auth_attempt(state: &SharedState, identity: &str) -> ryme_error::Result<()> {
@@ -11353,6 +11390,14 @@ fn complete_auth_attempt(state: &SharedState, identity: &str) {
 fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
     let issuer = std::env::var("RYME_JWT_ISSUER").ok();
     let audience = std::env::var("RYME_JWT_AUDIENCE").ok();
+    validate_jwt_claim_configuration(
+        issuer.as_deref(),
+        audience.as_deref(),
+        std::env::var("RYME_JWT_SECRET").is_ok()
+            || std::env::var_os("RYME_JWT_JWKS_FILE").is_some()
+            || std::env::var("RYME_JWT_JWKS_URL").is_ok(),
+        "jwt",
+    )?;
     if let Ok(secret) = std::env::var("RYME_JWT_SECRET") {
         return hmac_jwt_verifier(secret.into_bytes(), issuer, audience).map(Some);
     }
@@ -11398,6 +11443,24 @@ mod jwt_config_tests {
             Some(String::from("audience")),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn jwt_claims_require_a_verification_source() {
+        assert!(validate_jwt_claim_configuration(
+            Some("issuer"),
+            Some("audience"),
+            false,
+            "jwt",
+        )
+        .is_err());
+        assert!(validate_jwt_claim_configuration(None, None, false, "jwt").is_ok());
+    }
+
+    #[test]
+    fn jwt_claims_reject_empty_values() {
+        assert!(validate_jwt_claim_configuration(Some(""), Some("audience"), true, "jwt").is_err());
+        assert!(validate_jwt_claim_configuration(Some("issuer"), Some(""), true, "jwt").is_err());
     }
 }
 
@@ -11488,16 +11551,13 @@ fn load_jwks_verifier_bytes(
     if selected_keys.is_empty() {
         return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks rsa key")));
     }
+    validate_jwt_claim_configuration(issuer.as_deref(), audience.as_deref(), true, "jwt")?;
     let verifier = match (issuer, audience) {
         (Some(issuer), Some(audience)) => {
             JwtVerifier::with_rsa_jwks_issuer(selected_keys, issuer, audience)
         }
         (None, None) => JwtVerifier::with_rsa_jwks(selected_keys),
-        _ => {
-            return Err(ryme_error::RymeError::InvalidArgument(String::from(
-                "jwt issuer and audience must be configured together",
-            )))
-        }
+        _ => unreachable!("jwt claim configuration was validated"),
     };
     Ok(verifier)
 }
