@@ -385,7 +385,12 @@ impl JwtVerifier {
                 return Err(RymeError::Unauthorized);
             }
         }
-        let id = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("jwt").to_string();
+        let id = claims
+            .get("sub")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(RymeError::Unauthorized)?
+            .to_string();
         let tenant = claims
             .get("tenant")
             .or_else(|| claims.get("tenant_id"))
@@ -1063,6 +1068,32 @@ mod tests {
     fn jwt_reject_bad_signature() {
         let verifier = JwtVerifier::new(b"test-secret".to_vec());
         assert!(verifier.principal_from_token("a.b.c", 1000).is_err());
+    }
+
+    #[test]
+    fn jwt_requires_non_empty_subject() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let token = |payload: serde_json::Value| {
+            let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+            let payload = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
+            let input = format!("{header}.{payload}");
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"subject-secret").unwrap();
+            mac.update(input.as_bytes());
+            format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
+        };
+        let verifier = JwtVerifier::new(b"subject-secret".to_vec());
+
+        assert!(verifier
+            .principal_from_token(&token(serde_json::json!({ "exp": 2000000000u64 })), 1000)
+            .is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({ "sub": "  ", "exp": 2000000000u64 })),
+                1000,
+            )
+            .is_err());
     }
 
     #[test]
