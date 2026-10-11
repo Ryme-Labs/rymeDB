@@ -9545,8 +9545,22 @@ fn apply_cluster_metadata(state: &SharedState, payload: &[u8]) -> ryme_error::Re
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("cluster metadata: {error}")))?;
     match event {
         ClusterMetadata::Schema(snapshot) => {
+            let previous = state.executor.schema_snapshot();
             state.executor.restore_schema_snapshot(snapshot.clone())?;
-            ryme_sql::persist_schema_snapshot(&state.data_dir.join("schema.json"), &snapshot)
+            let path = state.data_dir.join("schema.json");
+            if let Err(error) = ryme_sql::persist_schema_snapshot(&path, &snapshot) {
+                let rollback = state
+                    .executor
+                    .restore_schema_snapshot(previous.clone())
+                    .and_then(|_| ryme_sql::persist_schema_snapshot(&path, &previous));
+                if let Err(rollback_error) = rollback {
+                    return Err(ryme_error::RymeError::Internal(format!(
+                        "replicated schema persistence failed: {error}; rollback failed: {rollback_error}"
+                    )));
+                }
+                return Err(error);
+            }
+            Ok(())
         }
     }
 }
