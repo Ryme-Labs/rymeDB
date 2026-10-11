@@ -464,8 +464,10 @@ async fn cluster_range_split_replicates_metadata() {
     assert!(String::from_utf8_lossy(&response).contains("snap-"));
     let (status, response) =
         http_request(http[leader], "POST /v1/backups/restore?target=1", b"").await;
-    assert_eq!(status, 503, "range restore response: {}", String::from_utf8_lossy(&response));
-    assert!(String::from_utf8_lossy(&response).contains("range ownership is active"));
+    assert_eq!(status, 200, "range restore response: {}", String::from_utf8_lossy(&response));
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.contains("\"mode\":\"cluster\""));
+    assert!(response.contains("\"raft_index\":"));
     let verify_after =
         format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":2}}");
     let (status, response) =
