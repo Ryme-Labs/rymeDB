@@ -163,11 +163,23 @@ pub struct TxnManager {
     inner: Arc<TxnInner>,
 }
 
+struct PendingCommitGuard {
+    manager: TxnManager,
+    commit_ts: u64,
+}
+
+impl Drop for PendingCommitGuard {
+    fn drop(&mut self) {
+        self.manager.clear_pending(self.commit_ts);
+    }
+}
+
 #[derive(Debug)]
 struct TxnInner {
     clock: AtomicU64,
     applied: AtomicU64,
     committed: Mutex<CommitIndex>,
+    pending: Mutex<BTreeMap<u64, BTreeSet<RecordKey>>>,
     engine: RwLock<Engine>,
     commit: Mutex<()>,
     active: Arc<ActiveRegistry>,
@@ -647,6 +659,7 @@ impl TxnManager {
                 clock: AtomicU64::new(1),
                 applied: AtomicU64::new(1),
                 committed: Mutex::new(CommitIndex::default()),
+                pending: Mutex::new(BTreeMap::new()),
                 engine: RwLock::new(Engine::new()),
                 commit: Mutex::new(()),
                 active,
@@ -826,7 +839,46 @@ impl TxnManager {
                 }
             }
         }
+        let pending = self
+            .inner
+            .pending
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("pending commits")))?;
+        for (_pending_ts, writes) in pending.range(..commit_ts) {
+            let write_conflict = txn.writes.keys().any(|key| writes.contains(key));
+            let read_conflict = txn.isolation == Isolation::Serializable
+                && (txn.read_set.iter().any(|key| writes.contains(key))
+                    || txn.scanned.iter().any(|table| {
+                        writes.iter().any(|key| {
+                            key.tenant == table.0 && key.database == table.1 && key.table == table.2
+                        })
+                    }));
+            if write_conflict || read_conflict {
+                return Err(RymeError::Conflict(String::from("pending commit conflict")));
+            }
+        }
         Ok(())
+    }
+
+    fn reserve_replicated(&self, txn: &Transaction) -> Result<u64> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let commit_ts = self.reserve_locked(txn)?;
+        self.inner
+            .pending
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("pending commits")))?
+            .insert(commit_ts, txn.writes.keys().cloned().collect());
+        Ok(commit_ts)
+    }
+
+    fn clear_pending(&self, commit_ts: u64) {
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.remove(&commit_ts);
+        }
     }
 
     pub fn validate_at(&self, txn: &Transaction, commit_ts: u64) -> Result<()> {
@@ -1028,8 +1080,9 @@ impl TxnManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
-        let commit_ts = self.reserve(&txn)?;
         let payload = encode_writes(&txn.writes)?;
+        let commit_ts = self.reserve_replicated(&txn)?;
+        let _pending = PendingCommitGuard { manager: self.clone(), commit_ts };
         replicate(commit_ts, payload).await?;
         let _guard = self
             .inner
@@ -2715,6 +2768,57 @@ mod tests {
         manager.put(&mut second, key_b.clone(), 10i64.to_le_bytes().to_vec());
         assert!(manager.commit(first).is_ok());
         assert!(manager.commit(second).is_ok());
+    }
+
+    #[tokio::test]
+    async fn replicated_commit_fences_conflicting_local_commit() {
+        let manager = TxnManager::new();
+        let key_a = RecordKey::new("t", "d", "replicated", b"a");
+        let key_b = RecordKey::new("t", "d", "replicated", b"b");
+        let mut seed = manager.begin();
+        manager.put(&mut seed, key_a.clone(), b"a".to_vec());
+        manager.put(&mut seed, key_b.clone(), b"b".to_vec());
+        manager.commit(seed).unwrap();
+
+        let mut first = manager.begin();
+        manager.get(&mut first, &key_b).unwrap();
+        manager.put(&mut first, key_a.clone(), b"first".to_vec());
+        let mut second = manager.begin();
+        manager.get(&mut second, &key_a).unwrap();
+        manager.put(&mut second, key_b.clone(), b"second".to_vec());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .commit_with(first, move |_, _| async move {
+                        started_tx
+                            .send(())
+                            .map_err(|_| RymeError::Internal(String::from("start")))?;
+                        release_rx.await.map_err(|_| RymeError::Internal(String::from("release")))
+                    })
+                    .await
+            }
+        });
+        started_rx.await.unwrap();
+
+        assert!(matches!(manager.commit(second), Err(RymeError::Conflict(_))));
+        release_tx.send(()).unwrap();
+        assert!(first_task.await.unwrap().is_ok());
+
+        let mut failed = manager.begin();
+        manager.put(&mut failed, key_b.clone(), b"failed".to_vec());
+        assert!(manager
+            .commit_with(failed, |_, _| async {
+                Err(RymeError::Unavailable(String::from("replication")))
+            })
+            .await
+            .is_err());
+        let mut retry = manager.begin();
+        manager.put(&mut retry, key_b, b"retry".to_vec());
+        assert!(manager.commit(retry).is_ok());
     }
 
     #[test]
