@@ -124,6 +124,17 @@ pub(crate) enum Rpc {
         resolved: bool,
         error: Option<RpcError>,
     },
+    RangeVoteRequest {
+        group_id: String,
+        term: u64,
+        candidate: usize,
+        last_term: u64,
+        last_index: u64,
+    },
+    RangeVoteResponse {
+        term: u64,
+        granted: bool,
+    },
     RangeCommit {
         group_id: String,
         commit_ts: u64,
@@ -274,12 +285,15 @@ struct RangeLogRecord {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct RangeGroupState {
     term: u64,
     voted_for: Option<usize>,
     leader: Option<usize>,
     commit_index: u64,
     applied_index: u64,
+    last_contact_ms: u64,
+    last_heartbeat_ms: u64,
 }
 
 fn derived_range_id(start: &[u8], end: &[u8], epoch: u64) -> String {
@@ -704,6 +718,7 @@ pub struct Node {
     presence_hook: MetadataHookSlot,
     topic_hook: MetadataHookSlot,
     range_owners: std::sync::RwLock<Vec<RangeOwner>>,
+    range_leaders: std::sync::RwLock<BTreeMap<String, usize>>,
     range_generation: AtomicU64,
     prepared: std::sync::Mutex<BTreeMap<u128, PreparedIntent>>,
     intent_wal: std::sync::Mutex<Wal>,
@@ -921,6 +936,7 @@ impl Node {
             presence_hook: MetadataHookSlot::default(),
             topic_hook: MetadataHookSlot::default(),
             range_owners: std::sync::RwLock::new(Vec::new()),
+            range_leaders: std::sync::RwLock::new(BTreeMap::new()),
             range_generation: AtomicU64::new(0),
             prepared: std::sync::Mutex::new(prepared),
             intent_wal: std::sync::Mutex::new(intent_wal),
@@ -1056,8 +1072,223 @@ impl Node {
         self.mesh_tls.lock().ok().and_then(|guard| guard.clone()).is_some()
     }
 
+    fn range_timeout_ms(&self, group_id: &str) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64 ^ self.id as u64;
+        for byte in group_id.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        350 + hash % 250
+    }
+
+    async fn range_tick(self: &Arc<Self>) {
+        let now = now_ms();
+        for configured in self.range_owners() {
+            let range = self.with_current_range_leader(configured);
+            if !range.replicas.contains(&self.id) {
+                continue;
+            }
+            let state = self.ensure_range_group(&range.id, range.owner);
+            if state.leader == Some(self.id) {
+                if now.saturating_sub(state.last_heartbeat_ms) >= 100 {
+                    if let Ok(mut groups) = self.range_groups.lock() {
+                        if let Some(current) = groups.get_mut(&range.id) {
+                            current.last_heartbeat_ms = now;
+                            current.last_contact_ms = now;
+                        }
+                    }
+                    let _ = self.persist_range_meta();
+                    let _ = self.range_heartbeat(&range.id).await;
+                }
+                continue;
+            }
+            if state.last_contact_ms == 0 {
+                if let Ok(mut groups) = self.range_groups.lock() {
+                    if let Some(current) = groups.get_mut(&range.id) {
+                        current.last_contact_ms = now;
+                    }
+                }
+                let _ = self.persist_range_meta();
+                continue;
+            }
+            if now.saturating_sub(state.last_contact_ms) >= self.range_timeout_ms(&range.id) {
+                self.campaign_range(&range).await;
+            }
+        }
+    }
+
+    async fn range_heartbeat(self: &Arc<Self>, group_id: &str) -> Result<()> {
+        let range = self
+            .range_owner_by_id(group_id)
+            .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
+        if range.owner != self.id {
+            return Err(RymeError::Unavailable(String::from("not range leader")));
+        }
+        let state = self.ensure_range_group(group_id, self.id);
+        let last_index = self.range_last_index(group_id);
+        let last_term = if last_index == 0 { 0 } else { self.range_last_term(group_id) };
+        let mut tasks = Vec::new();
+        for replica in range.replicas.iter().copied().filter(|replica| *replica != self.id) {
+            let Some(pool) = self.pool_for(replica) else { continue };
+            let request = Rpc::RangeAppend {
+                group_id: group_id.to_string(),
+                index: 0,
+                term: state.term.max(1),
+                leader: self.id,
+                prev_index: last_index,
+                prev_term: last_term,
+                leader_commit: state.commit_index,
+                commit_ts: 0,
+                writes: Vec::new(),
+            };
+            tasks.push(tokio::spawn(async move { pool.roundtrip(&request).await }));
+        }
+        for task in tasks {
+            if let Ok(Ok(Rpc::RangeAppendResponse { term, .. })) = task.await {
+                if term > state.term {
+                    self.observe_range_term(group_id, term);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_range_term(&self, group_id: &str, term: u64) {
+        let mut changed = false;
+        if let Ok(mut groups) = self.range_groups.lock() {
+            let state = groups.entry(group_id.to_string()).or_default();
+            if term > state.term {
+                state.term = term;
+                state.voted_for = None;
+                state.leader = None;
+                state.last_contact_ms = now_ms();
+                changed = true;
+            }
+        }
+        if changed {
+            if let Ok(mut leaders) = self.range_leaders.write() {
+                leaders.remove(group_id);
+            }
+            let _ = self.persist_range_meta();
+        }
+    }
+
+    async fn campaign_range(self: &Arc<Self>, range: &RangeOwner) {
+        let (term, last_term, last_index) = {
+            let mut groups = self.range_groups.lock().unwrap_or_else(|error| error.into_inner());
+            let state = groups.entry(range.id.clone()).or_default();
+            if state.leader == Some(self.id) {
+                return;
+            }
+            state.term = state.term.max(1).saturating_add(1);
+            state.voted_for = Some(self.id);
+            state.leader = None;
+            state.last_contact_ms = now_ms();
+            (state.term, self.range_last_term(&range.id), self.range_last_index(&range.id))
+        };
+        let _ = self.persist_range_meta();
+        let mut votes = vec![self.id];
+        let mut tasks = Vec::new();
+        for replica in range.replicas.iter().copied().filter(|replica| *replica != self.id) {
+            let Some(pool) = self.pool_for(replica) else { continue };
+            let request = Rpc::RangeVoteRequest {
+                group_id: range.id.clone(),
+                term,
+                candidate: self.id,
+                last_term,
+                last_index,
+            };
+            tasks.push(tokio::spawn(async move {
+                pool.roundtrip(&request).await.map(|response| (response, replica))
+            }));
+        }
+        for task in tasks {
+            let Ok(Ok((response, replica))) = task.await else { continue };
+            match response {
+                Rpc::RangeVoteResponse { term: peer_term, granted } => {
+                    if peer_term > term {
+                        self.observe_range_term(&range.id, peer_term);
+                        return;
+                    }
+                    if granted && !votes.contains(&replica) {
+                        votes.push(replica);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if votes.len() < majority(range.replicas.len()) {
+            return;
+        }
+        let won = if let Ok(mut groups) = self.range_groups.lock() {
+            let state = groups.entry(range.id.clone()).or_default();
+            if state.term == term && state.voted_for == Some(self.id) && state.leader.is_none() {
+                state.leader = Some(self.id);
+                state.last_contact_ms = now_ms();
+                state.last_heartbeat_ms = 0;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !won {
+            return;
+        }
+        if let Ok(mut leaders) = self.range_leaders.write() {
+            leaders.insert(range.id.clone(), self.id);
+        }
+        let _ = self.persist_range_meta();
+        let _ = self.range_heartbeat(&range.id).await;
+    }
+
+    fn handle_range_vote(
+        &self,
+        group_id: &str,
+        term: u64,
+        candidate: usize,
+        last_term: u64,
+        last_index: u64,
+    ) -> (u64, bool) {
+        let Some(range) = self.range_owners().into_iter().find(|range| range.id == group_id) else {
+            return (self.range_term(group_id), false);
+        };
+        if !range.replicas.contains(&self.id) || !range.replicas.contains(&candidate) {
+            return (self.range_term(group_id), false);
+        }
+        let mut groups = self.range_groups.lock().unwrap_or_else(|error| error.into_inner());
+        let state = groups.entry(group_id.to_string()).or_default();
+        if term < state.term {
+            return (state.term.max(1), false);
+        }
+        if term > state.term {
+            state.term = term;
+            state.voted_for = None;
+            state.leader = None;
+        }
+        let local_last_term = self.range_last_term(group_id);
+        let local_last_index = self.range_last_index(group_id);
+        let current_vote = state.voted_for;
+        let up_to_date = last_term > local_last_term
+            || (last_term == local_last_term && last_index >= local_last_index);
+        let granted = up_to_date && (current_vote.is_none() || current_vote == Some(candidate));
+        if granted {
+            state.voted_for = Some(candidate);
+            state.leader = None;
+            state.last_contact_ms = now_ms();
+        }
+        let response_term = state.term.max(1);
+        drop(groups);
+        if granted {
+            let _ = self.persist_range_meta();
+        }
+        (response_term, granted)
+    }
+
     async fn main_loop(self: Arc<Self>) {
         loop {
+            self.range_tick().await;
             if self.take_campaign().await {
                 self.campaign(true).await;
                 continue;
@@ -1650,6 +1881,11 @@ impl Node {
                     }),
                 }
             }
+            Rpc::RangeVoteRequest { group_id, term, candidate, last_term, last_index } => {
+                let (term, granted) =
+                    self.handle_range_vote(&group_id, term, candidate, last_term, last_index);
+                Ok(Rpc::RangeVoteResponse { term, granted })
+            }
             Rpc::RangeCommit { group_id, commit_ts, writes } => {
                 match self.commit_range_group(&group_id, commit_ts, &writes).await {
                     Ok(()) => Ok(Rpc::RangeCommitResponse { committed: true, error: None }),
@@ -1800,6 +2036,9 @@ impl Node {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
             Rpc::ResolveTransactionResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
+            Rpc::RangeVoteResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
             Rpc::RangeCommitResponse { .. } => {
@@ -2078,10 +2317,22 @@ impl Node {
         routing.extend_from_slice(key.table.as_bytes());
         routing.push(0);
         routing.extend_from_slice(&key.pk);
-        self.range_owners().into_iter().find(|range| {
-            routing.as_slice() >= range.start.as_slice()
-                && (range.end.is_empty() || routing.as_slice() < range.end.as_slice())
-        })
+        self.range_owners()
+            .into_iter()
+            .find(|range| {
+                routing.as_slice() >= range.start.as_slice()
+                    && (range.end.is_empty() || routing.as_slice() < range.end.as_slice())
+            })
+            .map(|range| self.with_current_range_leader(range))
+    }
+
+    fn with_current_range_leader(&self, mut range: RangeOwner) -> RangeOwner {
+        if let Some(leader) =
+            self.range_leaders.read().ok().and_then(|leaders| leaders.get(&range.id).copied())
+        {
+            range.owner = leader;
+        }
+        range
     }
 
     fn range_last_index(&self, group_id: &str) -> u64 {
@@ -2248,6 +2499,9 @@ impl Node {
         if term < state.term {
             return Err(RymeError::Unavailable(String::from("stale range term")));
         }
+        if term == state.term && state.leader.is_some() && state.leader != Some(leader) {
+            return Err(RymeError::Unavailable(String::from("range leader conflict")));
+        }
         if term > state.term || state.leader != Some(leader) {
             state.term = term;
             state.voted_for = None;
@@ -2257,6 +2511,14 @@ impl Node {
                 .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?
                 .insert(group_id.to_string(), state.clone());
             self.persist_range_meta()?;
+        }
+        if let Ok(mut groups) = self.range_groups.lock() {
+            if let Some(current) = groups.get_mut(group_id) {
+                current.last_contact_ms = now_ms();
+            }
+        }
+        if let Ok(mut leaders) = self.range_leaders.write() {
+            leaders.insert(group_id.to_string(), leader);
         }
         let last = self.range_last_index(group_id);
         if prev_index != 0 {
@@ -2299,7 +2561,10 @@ impl Node {
     }
 
     fn range_owner_by_id(&self, group_id: &str) -> Option<RangeOwner> {
-        self.range_owners().into_iter().find(|range| range.id == group_id)
+        self.range_owners()
+            .into_iter()
+            .find(|range| range.id == group_id)
+            .map(|range| self.with_current_range_leader(range))
     }
 
     async fn replicate_range_group(
@@ -2345,13 +2610,17 @@ impl Node {
                     writes: encoded_writes.to_vec(),
                 })
                 .await;
-            if matches!(
-                response,
-                Ok(Rpc::RangeAppendResponse { term: peer_term, appended: true, last_index, error: None })
-                    if last_index >= index && peer_term <= term
-            ) {
-                acknowledgements += 1;
-                acknowledged.push(replica);
+            if let Ok(Rpc::RangeAppendResponse { term: peer_term, appended, last_index, error }) =
+                response
+            {
+                if peer_term > term {
+                    self.observe_range_term(group_id, peer_term);
+                    return Err(RymeError::Unavailable(String::from("stale range leader")));
+                }
+                if appended && error.is_none() && last_index >= index {
+                    acknowledgements += 1;
+                    acknowledged.push(replica);
+                }
             }
         }
         if acknowledgements < replicas.len() / 2 + 1 {
@@ -3080,6 +3349,7 @@ impl Node {
         let ranges = self.range_owners();
         let mut spans = Vec::new();
         for range in ranges {
+            let range = self.with_current_range_leader(range);
             let lower = if range.start.as_slice() > table_start.as_slice() {
                 range.start
             } else {
@@ -3295,6 +3565,14 @@ impl Node {
             *current = owners;
             self.range_generation.fetch_add(1, Ordering::SeqCst);
         }
+        if let Ok(owners) = self.range_owners.read() {
+            if let Ok(mut leaders) = self.range_leaders.write() {
+                leaders.clear();
+                for range in owners.iter() {
+                    leaders.insert(range.id.clone(), range.owner);
+                }
+            }
+        }
     }
 
     pub fn range_generation(&self) -> u64 {
@@ -3313,7 +3591,15 @@ impl Node {
                 routing_key >= range.start.as_slice()
                     && (range.end.is_empty() || routing_key < range.end.as_slice())
             })
-            .map(|range| (range.owner, range.epoch))
+            .map(|range| {
+                let owner = self
+                    .range_leaders
+                    .read()
+                    .ok()
+                    .and_then(|leaders| leaders.get(&range.id).copied())
+                    .unwrap_or(range.owner);
+                (owner, range.epoch)
+            })
     }
 
     pub fn range_owner_key(&self, key: &RecordKey) -> Option<usize> {

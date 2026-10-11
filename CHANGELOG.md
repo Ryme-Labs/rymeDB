@@ -1,17 +1,22 @@
 # Changelog
 
+- Range groups now run independent quorum elections over their configured
+  replicas. Range heartbeats maintain per-group liveness, candidates exchange
+  range-local vote terms and log positions, and a promoted replica becomes the
+  routed owner after a leader failure. The global Raft membership/election
+  remains separate from range-group ownership.
 - Range replica appends now carry independent range-group terms, previous
   index/term checks, and a range commit index. Followers persist entries but do
   not materialize them until the owner advances the group commit, and stale
-  terms or log gaps are rejected. Range-group election and promotion are still
-  future work; placement metadata remains the current leader assignment.
+  terms or log gaps are rejected. Transaction decisions still use the global
+  Raft log while range-local election and promotion handle replica ownership.
 - Range placement now carries stable range ids and configured replica sets.
   After the global Raft decision commits, the range owner appends each affected
   write set to a synced range WAL and sends range-append quorum RPCs to its
   replicas. Recovery replays those range records, routed reads use the owner’s
   durable view, and follower writes avoid a mesh forwarding cycle. Independent
-  per-range elections and Raft logs are still future work; the global Raft log
-  remains the decision authority.
+  range transaction coordination remains future work; the global Raft log
+  remains the transaction decision authority.
 - Multi-owner cluster transactions now run an explicit participant protocol:
   range owners durably prepare transaction state in intent WALs before the
   coordinator records the global Raft decision, then resolve those intents on

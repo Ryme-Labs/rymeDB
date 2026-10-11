@@ -145,6 +145,104 @@ async fn backend_replicates_and_fails_over() {
 }
 
 #[tokio::test]
+async fn range_group_elects_a_new_owner_after_leader_loss() {
+    let root =
+        std::env::temp_dir().join(format!("ryme-range-elect-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut listeners = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for id in 0..3 {
+        let peers: Vec<String> = addrs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(peer, _)| *peer != id)
+            .map(|(_, address)| address.to_string())
+            .collect();
+        let peer_ids: Vec<usize> = (0..3).filter(|peer| *peer != id).collect();
+        let node = Node::open(id, peers, peer_ids, &root.join(format!("n{id}"))).unwrap();
+        tasks.push(node.spawn(listeners.remove(0)));
+        nodes.push(node);
+    }
+    let backends: Vec<ClusterBackend> = nodes.iter().cloned().map(ClusterBackend::new).collect();
+    let old_owner = wait_leader(&nodes, None).await;
+    let mut start = b"s".to_vec();
+    start.push(0);
+    let placement = RangeOwner {
+        id: String::from("electable-range"),
+        start,
+        end: Vec::new(),
+        owner: old_owner,
+        replicas: vec![0, 1, 2],
+        epoch: 1,
+    };
+    for node in &nodes {
+        node.set_range_owners(vec![placement.clone()]);
+    }
+
+    let mut seed = backends[old_owner].begin();
+    backends[old_owner].put(&mut seed, key("before-failover"), b"old".to_vec());
+    backends[old_owner].commit(seed).await.unwrap();
+    let dead_task = std::mem::take(&mut tasks[old_owner]);
+    nodes[old_owner].shutdown(dead_task);
+    let new_global_leader = wait_leader(&nodes, Some(old_owner)).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let range_leader = loop {
+        let elected = (0..nodes.len())
+            .filter(|id| *id != old_owner)
+            .find(|id| nodes[*id].range_owner_key(&key("after-failover")) == Some(*id));
+        if let Some(elected) = elected {
+            break elected;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "range leader did not fail over");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let global_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while nodes[new_global_leader].range_owner_key(&key("after-failover")) != Some(range_leader) {
+        assert!(tokio::time::Instant::now() < global_deadline, "range route did not converge");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut after = backends[new_global_leader].begin();
+    backends[new_global_leader].put(&mut after, key("after-failover"), b"new".to_vec());
+    backends[new_global_leader].commit(after).await.unwrap();
+
+    let remaining = (0..nodes.len()).filter(|id| *id != old_owner).collect::<Vec<_>>();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut converged = true;
+        for id in &remaining {
+            if nodes[*id].read_latest(&key("after-failover")).await.unwrap()
+                != Some(b"new".to_vec())
+            {
+                converged = false;
+            }
+        }
+        if converged {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "range write did not converge after election"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for (node, node_tasks) in nodes.iter().zip(tasks.into_iter()) {
+        node.shutdown(node_tasks);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn configured_range_owner_limits_follower_materialization() {
     let root = std::env::temp_dir().join(format!("ryme-owner-{}-{}", std::process::id(), now_ms()));
     let _ = std::fs::remove_dir_all(&root);

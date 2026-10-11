@@ -219,6 +219,12 @@ range WAL before acknowledging a replica quorum, and startup replays those
 records before serving reads. This gives the current placement map a durable
 replica-materialization path without claiming that range logs elect leaders
 independently yet.
+Range replicas also maintain their own election term and heartbeat deadline.
+If the configured range leader fails, a surviving replica can win a majority
+of that range's replica set and become the routed owner without changing the
+global Raft membership. The range leader announcement is learned by followers
+through range heartbeats; global placement changes still remain epoch-fenced
+control-plane operations.
 This does not yet delete source replicas or claim full shared-nothing storage
 scale. Single-owner write-only transactions now route through the configured
 owner and then the current Raft leader; read-dependent, multi-owner, and
