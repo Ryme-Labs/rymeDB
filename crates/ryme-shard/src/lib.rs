@@ -985,6 +985,15 @@ impl TxnBackend for ShardSet {
         manager.expires_at(key)
     }
 
+    fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
+        let _read =
+            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let shard = self.route_record(key);
+        let manager =
+            self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
+        manager.expires_at_at(key, read_ts)
+    }
+
     fn commit(&self, txn: Transaction) -> impl std::future::Future<Output = Result<u64>> + Send {
         let backend = self.clone();
         async move {
@@ -1291,6 +1300,15 @@ impl TxnBackend for HybridBackend {
         match tier {
             Tier::Replicated => inner.raft.expires_at(key),
             Tier::Local => inner.local.expires_at(key),
+        }
+    }
+
+    fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
+        let tier = self.tier(&TableRef::of(key));
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match tier {
+            Tier::Replicated => inner.raft.expires_at_at(key, read_ts),
+            Tier::Local => inner.local.expires_at_at(key, read_ts),
         }
     }
 

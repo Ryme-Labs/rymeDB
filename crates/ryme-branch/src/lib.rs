@@ -612,12 +612,33 @@ where
         let mut txn = self.base.begin();
         if let Some(value) = self.base.get(&mut txn, &local)? {
             return Ok(if Self::decode(&value).flatten().is_some() {
-                self.base.expires_at(&local)?
+                self.base.expires_at_at(&local, u64::MAX)?
             } else {
                 Some(1)
             });
         }
-        self.base.expires_at(key)
+        self.base.expires_at_at(key, self.base_commit_ts)
+    }
+
+    fn expires_at_at(
+        &self,
+        key: &ryme_storage::RecordKey,
+        read_ts: u64,
+    ) -> Result<Option<u64>> {
+        if !self.overlay {
+            return self.base.expires_at_at(key, read_ts);
+        }
+        let local = self.local_key(key);
+        let mut txn = self.base.begin();
+        txn.restamp(u64::MAX);
+        if let Some(value) = self.base.get(&mut txn, &local)? {
+            return Ok(if Self::decode(&value).flatten().is_some() {
+                self.base.expires_at_at(&local, u64::MAX)?
+            } else {
+                Some(1)
+            });
+        }
+        self.base.expires_at_at(key, self.base_commit_ts.min(read_ts))
     }
 
     fn commit(
@@ -933,5 +954,36 @@ mod tests {
             branch.scan(&mut reader, "tenant", "default", "docs", 10).unwrap(),
             vec![(b"row".to_vec(), b"from-parent".to_vec())]
         );
+    }
+
+    #[test]
+    fn branch_ttl_uses_parent_snapshot_and_local_expiry() {
+        let base = ryme_txn::TxnManager::new();
+        let parent_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"row");
+        let now = ryme_txn::now_unix();
+        let parent_expiry = now + 10_000;
+        let mut parent_write = base.begin();
+        base.put_with_ttl(&mut parent_write, parent_key.clone(), b"from-parent".to_vec(), parent_expiry);
+        let parent_commit = base.commit(parent_write).unwrap();
+        let branch = BranchBackend::new(
+            base.clone(),
+            String::from("default"),
+            String::from("preview"),
+            parent_commit,
+            0,
+        );
+
+        let updated_expiry = now + 20_000;
+        let mut parent_update = base.begin();
+        base.put_with_ttl(&mut parent_update, parent_key.clone(), b"updated".to_vec(), updated_expiry);
+        base.commit(parent_update).unwrap();
+        assert_eq!(branch.expires_at(&parent_key).unwrap(), Some(parent_expiry));
+
+        let local_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"local");
+        let local_expiry = now + 30_000;
+        let mut branch_write = branch.begin();
+        branch.put_with_ttl(&mut branch_write, local_key.clone(), b"from-branch".to_vec(), local_expiry);
+        base.commit(branch_write).unwrap();
+        assert_eq!(branch.expires_at(&local_key).unwrap(), Some(local_expiry));
     }
 }

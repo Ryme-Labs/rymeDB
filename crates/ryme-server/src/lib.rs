@@ -140,6 +140,19 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
+    fn expires_at_at(
+        &self,
+        key: &ryme_storage::RecordKey,
+        read_ts: u64,
+    ) -> ryme_error::Result<Option<u64>> {
+        match self {
+            Self::Single(manager) => manager.expires_at_at(key, read_ts),
+            Self::Cluster(backend) => backend.expires_at_at(key, read_ts),
+            Self::Sharded(shards) => shards.expires_at_at(key, read_ts),
+            Self::Hybrid(hybrid) => hybrid.expires_at_at(key, read_ts),
+        }
+    }
+
     fn commit(
         &self,
         txn: ryme_txn::Transaction,

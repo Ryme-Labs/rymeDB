@@ -5864,6 +5864,10 @@ impl ryme_txn::TxnBackend for ClusterBackend {
         self.node.manager().expires_at(key)
     }
 
+    fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
+        self.node.manager().expires_at_at(key, read_ts)
+    }
+
     fn commit(
         &self,
         txn: ryme_txn::Transaction,

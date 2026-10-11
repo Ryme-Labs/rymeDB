@@ -493,6 +493,9 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
     fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64);
     fn delete(&self, txn: &mut Transaction, key: RecordKey);
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>>;
+    fn expires_at_at(&self, key: &RecordKey, _read_ts: u64) -> Result<Option<u64>> {
+        self.expires_at(key)
+    }
     fn commit(&self, txn: Transaction) -> impl std::future::Future<Output = Result<u64>> + Send;
     fn scan(
         &self,
@@ -536,6 +539,10 @@ impl TxnBackend for TxnManager {
 
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
         TxnManager::expires_at(self, key)
+    }
+
+    fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
+        TxnManager::expires_at_at(self, key, read_ts)
     }
 
     fn commit(&self, txn: Transaction) -> impl std::future::Future<Output = Result<u64>> + Send {
@@ -590,6 +597,10 @@ impl TxnBackend for DurableManager {
 
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
         DurableManager::expires_at(self, key)
+    }
+
+    fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
+        DurableManager::expires_at_at(self, key, read_ts)
     }
 
     fn commit(&self, txn: Transaction) -> impl std::future::Future<Output = Result<u64>> + Send {
@@ -1393,7 +1404,10 @@ impl TxnManager {
     }
 
     pub fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
-        let read_ts = self.inner.applied.load(Ordering::SeqCst);
+        self.expires_at_at(key, self.latest_commit())
+    }
+
+    pub fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
         let engine = self
             .inner
             .engine
@@ -1863,11 +1877,15 @@ impl DurableManager {
     }
 
     pub fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
+        self.expires_at_at(key, self.latest_commit().saturating_sub(1))
+    }
+
+    pub fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
         match self.mode {
-            StorageMode::Hot => self.inner.expires_at(key),
+            StorageMode::Hot => self.inner.expires_at_at(key, read_ts),
             StorageMode::Standard => Ok(self
                 .segments
-                .version_at(key, self.latest_commit().saturating_sub(1))?
+                .version_at(key, read_ts)?
                 .and_then(|(_, value, expires_at)| value.map(|_| expires_at))),
         }
     }
