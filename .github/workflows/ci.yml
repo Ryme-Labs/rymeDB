@@ -68,18 +68,8 @@ jobs:
       - name: Run workspace Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Run SQL and protocol tests
-        run: >-
-          cargo test --locked
-          -p ryme-sql
-          -p ryme-wire-resp
-          -p ryme-wire-pg
-
-      - name: Run Raft tests
-        run: cargo test --locked -p ryme-raft
-
-      - name: Compile the server
-        run: cargo check --locked -p ryme-server
+      - name: Run the full locked workspace test matrix
+        run: cargo test --workspace --all-targets --locked
 
   platform:
     name: Validate API docs, Pages, and SDK surface
