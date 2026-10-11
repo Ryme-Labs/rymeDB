@@ -434,6 +434,16 @@ impl ShardSet {
         self.inner.lock().ok()?.shards.get(shard).cloned()
     }
 
+    pub fn restore_to(&self, target: u64) -> Result<Vec<u64>> {
+        let shards = self
+            .inner
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
+            .shards
+            .clone();
+        shards.into_iter().map(|shard| shard.restore_to(target)).collect()
+    }
+
     pub fn shard_wal_dir(&self, shard: usize) -> Option<std::path::PathBuf> {
         let inner = self.inner.lock().ok()?;
         if shard >= inner.shards.len() {
@@ -1802,6 +1812,35 @@ mod tests {
         assert_eq!(
             backend.get(&mut probe, &RecordKey::new("t", "d", &right, b"k")).unwrap(),
             Some(b"b".to_vec())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_to_rewinds_every_local_shard() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-restore-shards-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
+        let first = commit_table(&backend, "t", "d", "docs", writes(vec![("before", "one")]));
+        for index in 0..backend.shard_count() {
+            backend.shard_manager(index).unwrap().write_snapshot().unwrap();
+        }
+        commit_table(&backend, "t", "d", "docs", writes(vec![("after", "two")]));
+
+        let replayed = backend.restore_to(first).unwrap();
+        assert_eq!(replayed.len(), backend.shard_count());
+        let mut txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "docs", b"before")).unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "docs", b"after")).unwrap(),
+            None
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

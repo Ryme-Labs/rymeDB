@@ -7898,6 +7898,29 @@ async fn backup_restore(
             Err(e) => error_response(e),
         };
     }
+    if let Backend::Hybrid(hybrid) = &state.backend {
+        if !hybrid.raft().node().is_leader().await {
+            return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
+        }
+        let local_replayed = match hybrid.local().restore_to(query.target) {
+            Ok(replayed) => replayed,
+            Err(error) => return error_response(error),
+        };
+        return match hybrid.raft().node().propose_restore(query.target).await {
+            Ok(raft_index) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "target": query.target,
+                    "raft_index": raft_index,
+                    "local_replayed": local_replayed,
+                    "local_scope": "current_node",
+                    "mode": "hybrid"
+                })),
+            )
+                .into_response(),
+            Err(error) => error_response(error),
+        };
+    }
     let restored = match &state.backend {
         Backend::Single(manager) => manager.restore_to(query.target).map(|replayed| vec![replayed]),
         Backend::Cluster(_) | Backend::Hybrid(_) => Err(ryme_error::RymeError::Unavailable(

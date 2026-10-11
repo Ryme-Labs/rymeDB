@@ -1,5 +1,7 @@
 # Changelog
 
+- Hybrid PITR now restores the replicated tier through Raft and the current
+  node's local shard set, with the response identifying the local replay scope.
 - Added a hosted CI workflow that checks formatting for core packages, runs
   SQL/RESP/PostgreSQL/Raft tests, and compiles the server on Rust changes.
 - Materialized views now support `CREATE MATERIALIZED VIEW`, `WITH DATA` and

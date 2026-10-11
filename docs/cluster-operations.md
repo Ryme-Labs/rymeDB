@@ -126,6 +126,8 @@ cluster: the set changes atomically instead of passing through an intermediate
 - **Restore:** `POST /v1/backups/restore` is coordinated through Raft while
   whole-dataset replication is active. It returns `503` after range ownership
   is enabled because a single node no longer contains the complete dataset.
+  Hybrid restores also rewind the current node's local shard set and report
+  that scope explicitly; local hybrid data is intentionally not replicated.
   See `docs/backup-restore.md`.
 
 ## Placement ranges

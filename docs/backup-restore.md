@@ -177,8 +177,10 @@ range-sharded mode, every local range replica rebuilds its owned range from
 the committed range log, removes records newer than the target, and persists
 the trimmed range WAL before serving reads again. Prepared intents left in
 the restored prefix are durably aborted so they cannot block later writes.
-The target must not be ahead of the latest commit. `Hybrid` remains
-unavailable.
+The target must not be ahead of the latest commit. Hybrid deployments restore
+the replicated tier through Raft and the local shard set on the current node;
+the response labels the local replay scope as `current_node`. Run the restore
+operation on each node when node-local hybrid data must be restored everywhere.
 
 The range restore is range-local: data outside the active placement map is
 not reconstructed on a node that does not own that range. Range replicas
