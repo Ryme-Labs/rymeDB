@@ -641,6 +641,24 @@ impl SegmentStore {
                         + scope_start
                 })
                 .unwrap_or(scope_start);
+            if segment.is_snapshot() && selected.is_empty() {
+                let mut out = Vec::with_capacity(limit.min(scope_end - scan_start));
+                for key in &segment.keys[scan_start..scope_end] {
+                    let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts)
+                    else {
+                        continue;
+                    };
+                    if expires_at != 0 && expires_at <= now {
+                        continue;
+                    }
+                    let Some(value) = value else { continue };
+                    out.push((key.pk.clone(), value));
+                    if out.len() == limit {
+                        break;
+                    }
+                }
+                return Ok(out);
+            }
             // `keys` is the segment's already-sorted key directory. Reusing
             // it avoids cloning every key into a temporary Vec on every scan.
             // The key is known to be present in this segment, so going
@@ -1122,6 +1140,10 @@ mod tests {
         assert_eq!(
             store.scan("tenant", "db", "items", 10, 0, 10).unwrap(),
             vec![(b"a".to_vec(), b"one".to_vec()), (b"b".to_vec(), b"two".to_vec())]
+        );
+        assert_eq!(
+            store.scan("tenant", "db", "items", 10, 0, 1).unwrap(),
+            vec![(b"a".to_vec(), b"one".to_vec())]
         );
         assert_eq!(
             store.scan_after("tenant", "db", "items", 10, 0, b"a", 10).unwrap(),
