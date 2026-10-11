@@ -68,6 +68,11 @@ jobs:
       - name: Run workspace Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+      - name: Audit dependency licenses and advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
       - name: Run the full locked workspace test matrix
         run: cargo test --workspace --all-targets --locked
 
