@@ -181,9 +181,8 @@ impl EnvKms {
 impl KmsProvider for EnvKms {
     fn wrap(&self, dek: &[u8]) -> Result<KmsEnvelope> {
         let nonce = ryme_auth::random_bytes(12);
-        let stream = keystream(&self.kek, &nonce, dek.len());
-        let blob: Vec<u8> = dek.iter().zip(stream.iter()).map(|(p, s)| p ^ s).collect();
-        let tag = auth_tag(&self.kek, &nonce, &blob);
+        let (blob, tag) = aead_seal(&self.kek, self.kek_id.as_bytes(), &nonce, dek)
+            .map_err(|_| RymeError::Internal(String::from("kms encryption")))?;
         Ok(KmsEnvelope {
             kek_id: self.kek_id.clone(),
             nonce_b64: ryme_auth::base64_url_encode(&nonce),
@@ -199,6 +198,9 @@ impl KmsProvider for EnvKms {
             .map_err(|_| RymeError::Unauthorized)?;
         let tag =
             ryme_auth::base64_url_decode(&envelope.tag_b64).map_err(|_| RymeError::Unauthorized)?;
+        if tag.len() == AEAD_TAG_LEN {
+            return aead_open(&self.kek, self.kek_id.as_bytes(), &nonce, &blob, &tag);
+        }
         if !equal(&auth_tag(&self.kek, &nonce, &blob), &tag) {
             return Err(RymeError::Unauthorized);
         }
@@ -213,9 +215,8 @@ impl KmsProvider for EnvKms {
 
 pub fn seal_with(dek: &Dek, plaintext: &[u8]) -> Envelope {
     let nonce = ryme_auth::random_bytes(12);
-    let stream = keystream(&dek.key, &nonce, plaintext.len());
-    let blob: Vec<u8> = plaintext.iter().zip(stream.iter()).map(|(p, s)| p ^ s).collect();
-    let tag = auth_tag(&dek.key, &nonce, &blob);
+    let (blob, tag) = aead_seal(&dek.key, dek.id.as_bytes(), &nonce, plaintext)
+        .expect("fixed AES-GCM envelope parameters must be valid");
     Envelope {
         dek_id: dek.id.clone(),
         nonce_b64: ryme_auth::base64_url_encode(&nonce),
@@ -231,12 +232,58 @@ pub fn open_with(dek: &Dek, envelope: &Envelope) -> Result<Vec<u8>> {
         ryme_auth::base64_url_decode(&envelope.blob_b64).map_err(|_| RymeError::Unauthorized)?;
     let tag =
         ryme_auth::base64_url_decode(&envelope.tag_b64).map_err(|_| RymeError::Unauthorized)?;
+    if tag.len() == AEAD_TAG_LEN {
+        return aead_open(&dek.key, dek.id.as_bytes(), &nonce, &blob, &tag);
+    }
     let expected = auth_tag(&dek.key, &nonce, &blob);
     if !equal(&expected, &tag) {
         return Err(RymeError::Unauthorized);
     }
     let stream = keystream(&dek.key, &nonce, blob.len());
     Ok(blob.iter().zip(stream.iter()).map(|(b, s)| b ^ s).collect())
+}
+
+const AEAD_TAG_LEN: usize = 16;
+
+fn aead_key(key: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(key).into()
+}
+
+fn aead_seal(key: &[u8], aad: &[u8], nonce: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+
+    let key = aead_key(key);
+    let key = LessSafeKey::new(
+        UnboundKey::new(&AES_256_GCM, &key)
+            .map_err(|_| RymeError::Internal(String::from("aead key")))?,
+    );
+    let nonce = Nonce::try_assume_unique_for_key(nonce)
+        .map_err(|_| RymeError::Internal(String::from("aead nonce")))?;
+    let mut ciphertext = plaintext.to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::from(aad), &mut ciphertext)
+        .map_err(|_| RymeError::Internal(String::from("aead seal")))?;
+    let tag = ciphertext.split_off(ciphertext.len() - AEAD_TAG_LEN);
+    Ok((ciphertext, tag))
+}
+
+fn aead_open(key: &[u8], aad: &[u8], nonce: &[u8], blob: &[u8], tag: &[u8]) -> Result<Vec<u8>> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+
+    if tag.len() != AEAD_TAG_LEN {
+        return Err(RymeError::Unauthorized);
+    }
+    let key = aead_key(key);
+    let key =
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).map_err(|_| RymeError::Unauthorized)?);
+    let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| RymeError::Unauthorized)?;
+    let mut ciphertext = Vec::with_capacity(blob.len() + tag.len());
+    ciphertext.extend_from_slice(blob);
+    ciphertext.extend_from_slice(tag);
+    let plaintext = key
+        .open_in_place(nonce, Aad::from(aad), &mut ciphertext)
+        .map_err(|_| RymeError::Unauthorized)?;
+    Ok(plaintext.to_vec())
 }
 
 fn keystream(key: &[u8], nonce: &[u8], len: usize) -> Vec<u8> {
@@ -313,6 +360,42 @@ mod tests {
     }
 
     #[test]
+    fn envelope_binds_dek_id() {
+        let dek = Dek {
+            id: String::from("dek-1"),
+            key: vec![9u8; 32],
+            created_unix: 1000,
+            retired: false,
+        };
+        let mut envelope = seal_with(&dek, b"data");
+        envelope.dek_id = String::from("dek-2");
+        let replacement = Dek { id: envelope.dek_id.clone(), ..dek };
+        assert!(open_with(&replacement, &envelope).is_err());
+    }
+
+    #[test]
+    fn legacy_envelope_remains_readable() {
+        let dek = Dek {
+            id: String::from("dek-1"),
+            key: vec![7u8; 32],
+            created_unix: 1000,
+            retired: false,
+        };
+        let nonce = vec![3u8; 12];
+        let stream = keystream(&dek.key, &nonce, 7);
+        let blob: Vec<u8> =
+            b"legacy".iter().zip(stream).map(|(plain, mask)| plain ^ mask).collect();
+        let tag = auth_tag(&dek.key, &nonce, &blob);
+        let envelope = Envelope {
+            dek_id: dek.id.clone(),
+            nonce_b64: ryme_auth::base64_url_encode(&nonce),
+            blob_b64: base64_encode(&blob),
+            tag_b64: base64_encode(&tag),
+        };
+        assert_eq!(open_with(&dek, &envelope).unwrap(), b"legacy");
+    }
+
+    #[test]
     fn rotation_keeps_old_readable() {
         let mut ring = KeyRing::new();
         ring.rotate("t", 1000);
@@ -367,5 +450,20 @@ mod tests {
             tag_b64: envelope.tag_b64,
         });
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn kms_aead_binds_provider_id() {
+        let first = EnvKms::from_key(String::from("kek-1"), vec![3u8; 32]).unwrap();
+        let second = EnvKms::from_key(String::from("kek-2"), vec![3u8; 32]).unwrap();
+        let envelope = first.wrap(b"secret").unwrap();
+        assert!(second
+            .unwrap(&WrappedDekRef {
+                kek_id: envelope.kek_id,
+                nonce_b64: envelope.nonce_b64,
+                blob_b64: envelope.blob_b64,
+                tag_b64: envelope.tag_b64,
+            })
+            .is_err());
     }
 }
