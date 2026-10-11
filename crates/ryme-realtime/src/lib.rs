@@ -49,6 +49,7 @@ const TABLE_TOPIC_SHARDS: usize = 32;
 const PRESENCE_SHARDS: usize = 32;
 const STABLE_CDC_SEQUENCE_STRIDE: u64 = 1_000_000;
 const BROADCAST_BUFFER_CAPACITY: usize = 16_384;
+const MAX_BROADCAST_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_CHANGE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TABLE_HISTORY_BYTES: usize = 256 * 1024 * 1024;
 pub const DURABLE_PARTITION_MAX_BYTES: usize = 256;
@@ -245,6 +246,15 @@ impl BroadcastMsg {
         self.json_cache
             .get_or_init(|| serde_json::to_string(self).unwrap_or_else(|_| String::from("{}")))
             .len()
+    }
+
+    fn checked_json_len(&self) -> Result<usize> {
+        let bytes = self.json_len();
+        if bytes > MAX_BROADCAST_MESSAGE_BYTES {
+            Err(RymeError::Overload(String::from("broadcast payload")))
+        } else {
+            Ok(bytes)
+        }
     }
 
     pub fn fanout_quota_pre_admitted(&self) -> bool {
@@ -1448,6 +1458,7 @@ impl Realtime {
             encoded_frames: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
             fanout_quota_pre_admitted: false,
         };
+        message.checked_json_len()?;
         let _ = topic.sender.send(Arc::new(message));
         Ok(sequence)
     }
@@ -1475,7 +1486,7 @@ impl Realtime {
                 encoded_frames: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
                 fanout_quota_pre_admitted: true,
             };
-            admit(0, message.json_len() as u64)?;
+            admit(0, message.checked_json_len()? as u64)?;
             return Ok(sequence);
         };
         let _publish = topic
@@ -1494,7 +1505,7 @@ impl Realtime {
             fanout_quota_pre_admitted: true,
         };
         let receiver_count = topic.sender.receiver_count();
-        admit(receiver_count, message.json_len() as u64)?;
+        admit(receiver_count, message.checked_json_len()? as u64)?;
         let _ = topic.sender.send(Arc::new(message));
         Ok(sequence)
     }
@@ -1529,6 +1540,7 @@ impl Realtime {
             encoded_frames: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
             fanout_quota_pre_admitted: false,
         };
+        message.checked_json_len()?;
         let _ = topic.sender.send(Arc::new(message));
         Ok(sequence)
     }
@@ -2353,6 +2365,27 @@ mod tests {
         assert_eq!(realtime.prune_idle(), 0);
         drop(live);
         drop(kept_cast);
+    }
+
+    #[test]
+    fn broadcast_payload_is_bounded_at_the_fanout_boundary() {
+        let realtime = Realtime::new(64);
+        let mut receiver = realtime.broadcast_subscribe("t", "room");
+        let result = realtime.broadcast(
+            "t",
+            "room",
+            String::from("sender"),
+            serde_json::Value::String("x".repeat(MAX_BROADCAST_MESSAGE_BYTES + 1)),
+            1,
+        );
+        assert!(matches!(
+            result,
+            Err(RymeError::Overload(message)) if message == "broadcast payload"
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
