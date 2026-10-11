@@ -970,9 +970,17 @@ async fn extras_oidc_flow() {
     assert_eq!(status, 200);
     let text = String::from_utf8_lossy(&body).into_owned();
     assert!(text.contains("response_type=code"), "{text}");
-    assert!(text.contains("state=s1"), "{text}");
+    let login: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(login["client_state"], "s1");
+    let state = login["state"].as_str().unwrap();
+    assert_ne!(state, "s1");
     let (status, _) =
-        http_request(http, "POST /v1/auth/oidc/token", b"{\"id_token\":\"bad.token.here\"}").await;
+        http_request(
+            http,
+            "POST /v1/auth/oidc/token",
+            format!("{{\"id_token\":\"bad.token.here\",\"state\":\"{state}\"}}").as_bytes(),
+        )
+        .await;
     assert_eq!(status, 401);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -993,7 +1001,7 @@ async fn extras_oidc_flow() {
     let (status, body) = http_request(
         http,
         "POST /v1/auth/oidc/token",
-        format!("{{\"id_token\":\"{id_token}\"}}").as_bytes(),
+        format!("{{\"id_token\":\"{id_token}\",\"state\":\"{state}\"}}").as_bytes(),
     )
     .await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));

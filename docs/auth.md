@@ -74,7 +74,11 @@ rymedb-cli auth token ada '$PASSWORD'
 
 The REST surface also exposes `/v1/auth/register`, `/verify`, `/token`, OTP
 setup/verify, passkey challenge/register/verify, OIDC login/token, and key
-revocation. The server stores password hashes, API-key digests, refresh-token
+revocation. OIDC login returns a server-generated one-time `state`; send that
+value with `id_token` to `/v1/auth/oidc/token`. The state expires after ten
+minutes and cannot be reused. A caller-supplied login `state` is returned as
+`client_state` for application correlation, but is not used as the security
+state. The server stores password hashes, API-key digests, refresh-token
 digests, and auth metadata under `data_dir/auth.json`; raw secrets and
 WebAuthn challenges are not written there.
 

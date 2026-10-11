@@ -505,6 +505,8 @@ const AUTH_ATTEMPT_WINDOW_SECS: u64 = 60;
 const AUTH_ATTEMPTS_PER_IDENTITY: u32 = 5;
 const AUTH_ATTEMPTS_GLOBAL: u32 = 120;
 const AUTH_LIMITER_MAX_IDENTITIES: usize = 8192;
+const OIDC_STATE_TTL_SECS: u64 = 600;
+const OIDC_STATE_MAX_PENDING: usize = 8192;
 
 #[derive(Debug, Default)]
 struct AuthAttemptWindow {
@@ -562,6 +564,38 @@ impl AuthAttemptLimiter {
     }
 }
 
+#[derive(Debug, Default)]
+struct OidcStateStore {
+    pending: HashMap<String, u64>,
+}
+
+impl OidcStateStore {
+    fn issue(&mut self, state: String, now: u64) -> ryme_error::Result<()> {
+        self.prune(now);
+        if self.pending.len() >= OIDC_STATE_MAX_PENDING {
+            return Err(ryme_error::RymeError::Overload(String::from(
+                "oidc state capacity",
+            )));
+        }
+        self.pending.insert(state, now);
+        Ok(())
+    }
+
+    fn is_pending(&mut self, state: &str, now: u64) -> bool {
+        self.prune(now);
+        self.pending.contains_key(state)
+    }
+
+    fn consume(&mut self, state: &str, now: u64) -> ryme_error::Result<()> {
+        self.prune(now);
+        self.pending.remove(state).map(|_| ()).ok_or(ryme_error::RymeError::Unauthorized)
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.pending.retain(|_, issued| now.saturating_sub(*issued) < OIDC_STATE_TTL_SECS);
+    }
+}
+
 #[cfg(test)]
 mod auth_attempt_limiter_tests {
     use super::*;
@@ -592,6 +626,24 @@ mod auth_attempt_limiter_tests {
     }
 }
 
+#[cfg(test)]
+mod oidc_state_tests {
+    use super::*;
+
+    #[test]
+    fn oidc_state_is_single_use_and_expires() {
+        let mut states = OidcStateStore::default();
+        states.issue(String::from("state"), 100).unwrap();
+        assert!(states.is_pending("state", 100));
+        states.consume("state", 100).unwrap();
+        assert!(!states.is_pending("state", 100));
+
+        states.issue(String::from("expired"), 100).unwrap();
+        assert!(!states.is_pending("expired", 100 + OIDC_STATE_TTL_SECS));
+        assert!(states.consume("expired", 100 + OIDC_STATE_TTL_SECS).is_err());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SharedState {
     backend: Backend,
@@ -619,6 +671,7 @@ pub struct SharedState {
     http_max_body_bytes: u64,
     credentials: Arc<Mutex<CredentialStore>>,
     auth_attempts: Arc<Mutex<AuthAttemptLimiter>>,
+    oidc_states: Arc<Mutex<OidcStateStore>>,
     refresh_tokens: RefreshTokenStore,
     passkeys: Arc<Mutex<PasskeyRegistry>>,
     native_listen: Option<std::net::SocketAddr>,
@@ -1653,6 +1706,7 @@ impl SharedState {
             http_max_body_bytes: config.http_max_body_bytes,
             credentials: Arc::new(Mutex::new(CredentialStore::from_snapshot(auth_snapshot.users))),
             auth_attempts: Arc::new(Mutex::new(AuthAttemptLimiter::default())),
+            oidc_states: Arc::new(Mutex::new(OidcStateStore::default())),
             refresh_tokens: RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens),
             passkeys: Arc::new(Mutex::new(PasskeyRegistry::from_snapshot(auth_snapshot.passkeys))),
             native_listen: config.native_listen,
@@ -5120,6 +5174,7 @@ pub struct OidcLoginRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OidcTokenRequest {
     pub id_token: String,
+    pub state: String,
 }
 
 async fn oidc_login(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
@@ -5130,14 +5185,30 @@ async fn oidc_login(State(state): State<SharedState>, body: axum::body::Bytes) -
     let Some(config) = state.oidc.clone() else {
         return error_response(ryme_error::RymeError::Unavailable(String::from("oidc")));
     };
-    let state_value =
-        request.state.unwrap_or_else(|| ryme_auth::base64_url_encode(&ryme_auth::random_bytes(16)));
+    let client_state = request.state;
+    let state_value = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(32));
     match config.auth_url(&request.redirect_uri, &state_value) {
-        Ok(auth_url) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "auth_url": auth_url, "state": state_value })),
-        )
-            .into_response(),
+        Ok(auth_url) => {
+            let now = ryme_txn::now_unix();
+            let issued = state.oidc_states.lock().map_err(|_| {
+                ryme_error::RymeError::Internal(String::from("oidc state lock"))
+            });
+            let issued = match issued {
+                Ok(mut states) => states.issue(state_value.clone(), now),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = issued {
+                return error_response(error);
+            }
+            let mut response = serde_json::json!({
+                "auth_url": auth_url,
+                "state": state_value,
+            });
+            if let Some(client_state) = client_state {
+                response["client_state"] = serde_json::Value::String(client_state);
+            }
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -5155,12 +5226,24 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
         return error_response(ryme_error::RymeError::Unavailable(String::from("oidc")));
     };
     let now = ryme_txn::now_unix();
+    let pending = match state.oidc_states.lock() {
+        Ok(mut states) => states.is_pending(&request.state, now),
+        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("oidc state lock"))),
+    };
+    if !pending {
+        return error_response(ryme_error::RymeError::Unauthorized);
+    }
     let verified = match state.oidc_jwt.as_ref() {
         Some(verifier) => verifier.principal_from_token(&request.id_token, now),
         None => config.verify_id_token(&request.id_token, now),
     };
     match verified {
         Ok(principal) => {
+            if let Err(error) = state.oidc_states.lock().map_err(|_| {
+                ryme_error::RymeError::Internal(String::from("oidc state lock"))
+            }).and_then(|mut states| states.consume(&request.state, now)) {
+                return error_response(error);
+            }
             let (key, tenant) = issue_api_key(&state.keys, &principal);
             complete_auth_attempt(&state, &attempt_key);
             match state.persist_auth() {
