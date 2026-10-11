@@ -8,8 +8,9 @@ use ryme_observe::{
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
-    bind, parse, Executor, Field, ForeignKeyAction, InsertValue, QueryResult, ReturningField,
-    RoleDefinition, SchemaSnapshot, Statement, TransactionChange, SQL_NULL_SENTINEL,
+    bind, parse, Executor, Field, ForeignKeyAction, IndexDefinition, InsertValue, QueryResult,
+    ReturningField, RoleDefinition, SchemaSnapshot, Statement, TransactionChange,
+    SQL_NULL_SENTINEL,
 };
 use ryme_txn::{Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager};
 use std::collections::{HashMap, HashSet};
@@ -2125,8 +2126,30 @@ where
 
     if upper.contains("PG_CATALOG.PG_INDEXES") {
         let table = sql_literal_after(query, "TABLENAME");
-        let indexes =
+        let mut indexes =
             table.as_deref().map(|name| executor.catalog_indexes(name)).unwrap_or_default();
+        if let Some(table) = table.as_deref() {
+            let definitions = executor.catalog_columns(table);
+            let primary_columns = definitions
+                .iter()
+                .filter(|definition| definition.primary_key)
+                .map(|definition| definition.name.clone())
+                .collect::<Vec<_>>();
+            let (_, table_name) = catalog_table_parts(table);
+            let primary_name = format!("{table_name}_pkey");
+            if !primary_columns.is_empty()
+                && !indexes.iter().any(|index| index.name == primary_name)
+            {
+                indexes.push(IndexDefinition {
+                    name: primary_name,
+                    table: table.to_string(),
+                    field: Field::Key,
+                    column: None,
+                    columns: primary_columns,
+                    unique: true,
+                });
+            }
+        }
         let rows: Vec<Vec<Vec<u8>>> = indexes
             .into_iter()
             .map(|index| {
