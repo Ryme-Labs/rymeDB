@@ -1119,6 +1119,104 @@ fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, colum
 
 pub type Row = (Vec<u8>, Vec<u8>);
 
+// Queries that need a complete row set (aggregates, joins, grouped queries and
+// write-from scans) must fail closed before an unbounded tenant-sized
+// allocation becomes possible.  The byte limit accounts for row payloads and
+// a conservative amount of Vec/tuple bookkeeping; the row limit also bounds
+// overhead for many tiny rows.
+const MAX_QUERY_MATERIALIZED_ROWS: usize = 100_000;
+const MAX_QUERY_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
+const MATERIALIZED_ROW_OVERHEAD: usize = 64;
+
+fn materialization_overload() -> RymeError {
+    RymeError::Overload(String::from("query materialization"))
+}
+
+#[derive(Default)]
+struct MaterializationBudget {
+    rows: usize,
+    bytes: usize,
+}
+
+impl MaterializationBudget {
+    fn add_row(&mut self, row: &Row) -> Result<()> {
+        self.add_parts(&row.0, &row.1)
+    }
+
+    fn add_parts(&mut self, pk: &[u8], value: &[u8]) -> Result<()> {
+        let rows = self.rows.checked_add(1).ok_or_else(materialization_overload)?;
+        if rows > MAX_QUERY_MATERIALIZED_ROWS {
+            return Err(materialization_overload());
+        }
+        let row_bytes = pk
+            .len()
+            .checked_add(value.len())
+            .and_then(|bytes| bytes.checked_add(MATERIALIZED_ROW_OVERHEAD))
+            .ok_or_else(materialization_overload)?;
+        let bytes = self.bytes.checked_add(row_bytes).ok_or_else(materialization_overload)?;
+        if bytes > MAX_QUERY_MATERIALIZED_BYTES {
+            return Err(materialization_overload());
+        }
+        self.rows = rows;
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    fn add_rows(&mut self, rows: &[Row]) -> Result<()> {
+        for row in rows {
+            self.add_row(row)?;
+        }
+        Ok(())
+    }
+}
+
+fn ensure_materialized_rows(rows: &[Row]) -> Result<()> {
+    let mut budget = MaterializationBudget::default();
+    budget.add_rows(rows)
+}
+
+fn ensure_materialized_part(pk: &[u8], value: &[u8]) -> Result<()> {
+    let mut budget = MaterializationBudget::default();
+    budget.add_parts(pk, value)
+}
+
+fn ensure_materialized_cells(rows: &[Vec<Vec<u8>>]) -> Result<()> {
+    if rows.len() > MAX_QUERY_MATERIALIZED_ROWS {
+        return Err(materialization_overload());
+    }
+    let mut bytes = 0usize;
+    for row in rows {
+        bytes =
+            bytes.checked_add(MATERIALIZED_ROW_OVERHEAD).ok_or_else(materialization_overload)?;
+        for cell in row {
+            bytes = bytes
+                .checked_add(cell.len())
+                .and_then(|bytes| bytes.checked_add(MATERIALIZED_ROW_OVERHEAD))
+                .ok_or_else(materialization_overload)?;
+        }
+    }
+    if bytes > MAX_QUERY_MATERIALIZED_BYTES {
+        return Err(materialization_overload());
+    }
+    Ok(())
+}
+
+fn ensure_materialized_result(result: &QueryResult) -> Result<()> {
+    match result {
+        QueryResult::Ok => Ok(()),
+        QueryResult::Row { pk, value } => ensure_materialized_part(pk, value),
+        QueryResult::Rows { rows } => ensure_materialized_rows(rows),
+        QueryResult::Scalar { value, .. } => ensure_materialized_part(&[], value),
+        QueryResult::Returning { rows, .. } | QueryResult::Table { rows, .. } => {
+            ensure_materialized_cells(rows)
+        }
+    }
+}
+
+fn bounded_scan_limit(limit: usize) -> usize {
+    limit.min(MAX_QUERY_MATERIALIZED_ROWS.saturating_add(1))
+}
+
 fn query_cell_value(cell: &[u8]) -> serde_json::Value {
     if cell == SQL_NULL_SENTINEL {
         return serde_json::Value::Null;
@@ -6559,7 +6657,9 @@ fn merge_set_results(
     operation: SetOperation,
     all: bool,
 ) -> Result<QueryResult> {
-    match (left, right) {
+    ensure_materialized_result(&left)?;
+    ensure_materialized_result(&right)?;
+    let result = match (left, right) {
         (
             QueryResult::Table { columns, rows: left_rows },
             QueryResult::Table { columns: right_columns, rows: right_rows },
@@ -6569,10 +6669,10 @@ fn merge_set_results(
                     "set operation column mismatch",
                 )));
             }
-            Ok(QueryResult::Table {
+            QueryResult::Table {
                 columns,
                 rows: apply_set_operation(left_rows, right_rows, operation, all),
-            })
+            }
         }
         (left, right) => {
             let rows = |result| match result {
@@ -6590,9 +6690,11 @@ fn merge_set_results(
                     "set operation result shapes do not match",
                 )));
             };
-            Ok(QueryResult::Rows { rows: apply_set_operation(left, right, operation, all) })
+            QueryResult::Rows { rows: apply_set_operation(left, right, operation, all) }
         }
-    }
+    };
+    ensure_materialized_result(&result)?;
+    Ok(result)
 }
 
 fn join_rows(
@@ -6603,17 +6705,20 @@ fn join_rows(
     order: &Order,
     offset: usize,
     limit: usize,
-) -> QueryResult {
+) -> Result<QueryResult> {
     let mut right_index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut index_budget = MaterializationBudget::default();
     for (pk, value) in &right_rows {
+        index_budget.add_parts(pk, value)?;
         right_index.entry(pk.clone()).or_insert_with(|| value.clone());
     }
     let mut matched_right = HashSet::new();
     let mut rows = Vec::new();
+    let mut output_budget = MaterializationBudget::default();
     for (pk, left_value) in left_rows {
         if let Some(right_value) = right_index.get(&pk) {
             matched_right.insert(pk.clone());
-            rows.push((
+            let row = (
                 pk,
                 serde_json::json!({
                     "left": String::from_utf8_lossy(&left_value),
@@ -6621,9 +6726,11 @@ fn join_rows(
                 })
                 .to_string()
                 .into_bytes(),
-            ));
+            );
+            output_budget.add_row(&row)?;
+            rows.push(row);
         } else if matches!(join_type, JoinType::Left | JoinType::Full) {
-            rows.push((
+            let row = (
                 pk,
                 serde_json::json!({
                     "left": String::from_utf8_lossy(&left_value),
@@ -6631,7 +6738,9 @@ fn join_rows(
                 })
                 .to_string()
                 .into_bytes(),
-            ));
+            );
+            output_budget.add_row(&row)?;
+            rows.push(row);
         }
     }
     if matches!(join_type, JoinType::Right | JoinType::Full) {
@@ -6639,7 +6748,7 @@ fn join_rows(
             if matched_right.contains(&pk) {
                 continue;
             }
-            rows.push((
+            let row = (
                 pk,
                 serde_json::json!({
                     "left": serde_json::Value::Null,
@@ -6647,12 +6756,15 @@ fn join_rows(
                 })
                 .to_string()
                 .into_bytes(),
-            ));
+            );
+            output_budget.add_row(&row)?;
+            rows.push(row);
         }
     }
+    ensure_materialized_rows(&rows)?;
     rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
     rows.sort_by(|left, right| compare_order(order, left, right));
-    QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() }
+    Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
 }
 
 pub fn aggregate_rows(rows: &[(Vec<u8>, Vec<u8>)], func: AggFunc, field: Field) -> Vec<u8> {
@@ -8638,6 +8750,8 @@ where
     fn scan_all_rows_in_transaction(&self, txn: &mut Transaction, table: &str) -> Result<Vec<Row>> {
         const PAGE: usize = 10_000;
         let mut rows = self.manager.scan(&mut *txn, &self.tenant, &self.database, table, PAGE)?;
+        let mut budget = MaterializationBudget::default();
+        budget.add_rows(&rows)?;
         loop {
             if rows.len() < PAGE {
                 break;
@@ -8654,6 +8768,7 @@ where
             if next.is_empty() {
                 break;
             }
+            budget.add_rows(&next)?;
             rows.extend(next);
         }
         if !txn.writes().is_empty() {
@@ -8665,6 +8780,7 @@ where
                 }
                 match write.value.as_ref() {
                     Some(value) => {
+                        budget.add_parts(&key.pk, value)?;
                         merged.insert(key.pk.clone(), value.clone());
                     }
                     None => {
@@ -8672,8 +8788,11 @@ where
                     }
                 }
             }
-            return Ok(merged.into_iter().collect());
+            let rows: Vec<Row> = merged.into_iter().collect();
+            ensure_materialized_rows(&rows)?;
+            return Ok(rows);
         }
+        ensure_materialized_rows(&rows)?;
         Ok(rows)
     }
 
@@ -8685,6 +8804,8 @@ where
         const PAGE: usize = 10_000;
         let mut rows =
             self.manager.scan_async(&mut *txn, &self.tenant, &self.database, table, PAGE).await?;
+        let mut budget = MaterializationBudget::default();
+        budget.add_rows(&rows)?;
         loop {
             if rows.len() < PAGE {
                 break;
@@ -8697,6 +8818,7 @@ where
             if next.is_empty() {
                 break;
             }
+            budget.add_rows(&next)?;
             rows.extend(next);
         }
         if !txn.writes().is_empty() {
@@ -8708,6 +8830,7 @@ where
                 }
                 match write.value.as_ref() {
                     Some(value) => {
+                        budget.add_parts(&key.pk, value)?;
                         merged.insert(key.pk.clone(), value.clone());
                     }
                     None => {
@@ -8715,8 +8838,11 @@ where
                     }
                 }
             }
-            return Ok(merged.into_iter().collect());
+            let rows: Vec<Row> = merged.into_iter().collect();
+            ensure_materialized_rows(&rows)?;
+            return Ok(rows);
         }
+        ensure_materialized_rows(&rows)?;
         Ok(rows)
     }
 
@@ -9847,6 +9973,8 @@ where
         const PAGE: usize = 10_000;
         let mut txn = self.begin_with(self.isolation);
         let mut rows = self.manager.scan(&mut txn, &self.tenant, &self.database, table, PAGE)?;
+        let mut budget = MaterializationBudget::default();
+        budget.add_rows(&rows)?;
         loop {
             if rows.len() < PAGE {
                 break;
@@ -9863,8 +9991,10 @@ where
             if next.is_empty() {
                 break;
             }
+            budget.add_rows(&next)?;
             rows.extend(next);
         }
+        ensure_materialized_rows(&rows)?;
         Ok(rows)
     }
 
@@ -9972,33 +10102,51 @@ where
         Ok(())
     }
 
-    fn indexed_candidates(&self, table: &str, filter: &[Predicate]) -> Option<Vec<Vec<u8>>> {
-        self.ensure_index_entries_for_tenant(table).ok()?;
-        let indexes = self.indexes.lock().ok()?;
-        let state = indexes.get(table)?.iter().find(|state| {
-            if !state.definition.columns.is_empty() {
-                return index_filter_value(&state.definition, filter).is_some();
-            }
-            filter.iter().any(|predicate| {
-                predicate.op == Cmp::Eq
-                    && state.definition.field == predicate.field
-                    && state.definition.column == predicate.column
-            })
-        })?;
-        let key = if state.definition.columns.is_empty() {
-            filter
-                .iter()
-                .find(|predicate| {
+    fn indexed_candidates(
+        &self,
+        table: &str,
+        filter: &[Predicate],
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        self.ensure_index_entries_for_tenant(table)?;
+        let indexes =
+            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+        let Some(state) = indexes.get(table).and_then(|states| {
+            states.iter().find(|state| {
+                if !state.definition.columns.is_empty() {
+                    return index_filter_value(&state.definition, filter).is_some();
+                }
+                filter.iter().any(|predicate| {
                     predicate.op == Cmp::Eq
                         && state.definition.field == predicate.field
                         && state.definition.column == predicate.column
-                })?
-                .operand
-                .clone()
-        } else {
-            index_filter_value(&state.definition, filter)?
+                })
+            })
+        }) else {
+            return Ok(None);
         };
-        Some(state.entries.get(&self.tenant)?.get(&key)?.iter().cloned().collect())
+        let key = if state.definition.columns.is_empty() {
+            let Some(predicate) = filter.iter().find(|predicate| {
+                predicate.op == Cmp::Eq
+                    && state.definition.field == predicate.field
+                    && state.definition.column == predicate.column
+            }) else {
+                return Ok(None);
+            };
+            predicate.operand.clone()
+        } else {
+            let Some(key) = index_filter_value(&state.definition, filter) else {
+                return Ok(None);
+            };
+            key
+        };
+        let Some(pks) = state.entries.get(&self.tenant).and_then(|entries| entries.get(&key))
+        else {
+            return Ok(None);
+        };
+        if pks.len() > MAX_QUERY_MATERIALIZED_ROWS {
+            return Err(materialization_overload());
+        }
+        Ok(Some(pks.iter().cloned().collect()))
     }
 
     fn indexed_candidates_for_value(
@@ -10167,11 +10315,15 @@ where
     ) -> Result<Vec<Row>> {
         let rls_applies = self.rls_applies_to_role(table);
         if let Some(view) = self.view_definition(table)? {
+            if view.materialized && view.rows.len() > MAX_QUERY_MATERIALIZED_ROWS {
+                return Err(materialization_overload());
+            }
             let mut rows = if view.materialized {
                 view.rows
             } else {
                 query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
             };
+            ensure_materialized_rows(&rows)?;
             rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
@@ -10182,7 +10334,7 @@ where
             return Ok(Vec::new());
         }
         if txn.writes().is_empty() {
-            if let Some(candidates) = self.indexed_candidates(table, filter) {
+            if let Some(candidates) = self.indexed_candidates(table, filter)? {
                 let mut rows = Vec::with_capacity(candidates.len());
                 for pk in candidates {
                     let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
@@ -10190,8 +10342,9 @@ where
                         rows.push((pk, value));
                     }
                 }
-                return Ok(self
-                    .filter_rls_rows_with_context(table, rows, rls_applies)
+                ensure_materialized_rows(&rows)?;
+                let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
+                return Ok(rows
                     .into_iter()
                     .filter(|(pk, value)| {
                         filter.iter().all(|predicate| predicate.matches(pk, value))
@@ -10201,11 +10354,17 @@ where
             }
         }
         if txn.writes().is_empty() && filter.is_empty() && !rls_applies {
-            return self.manager.scan_async(txn, &self.tenant, &self.database, table, limit).await;
+            let rows = self
+                .manager
+                .scan_async(txn, &self.tenant, &self.database, table, bounded_scan_limit(limit))
+                .await?;
+            ensure_materialized_rows(&rows)?;
+            return Ok(rows);
         }
         if txn.writes().is_empty() && !filter.is_empty() {
             const PAGE: usize = 1024;
             let mut matched = Vec::new();
+            let mut budget = MaterializationBudget::default();
             let mut after = None;
             loop {
                 let page = match after.as_deref() {
@@ -10223,12 +10382,18 @@ where
                 if page.is_empty() {
                     break;
                 }
+                ensure_materialized_rows(&page)?;
                 let page_len = page.len();
                 let last = page.last().map(|(pk, _)| pk.clone());
-                matched.extend(page.into_iter().filter(|(pk, value)| {
-                    self.rls_allows_with_context(table, value, rls_applies)
-                        && filter.iter().all(|predicate| predicate.matches(pk, value))
-                }));
+                let matching: Vec<Row> = page
+                    .into_iter()
+                    .filter(|(pk, value)| {
+                        self.rls_allows_with_context(table, value, rls_applies)
+                            && filter.iter().all(|predicate| predicate.matches(pk, value))
+                    })
+                    .collect();
+                budget.add_rows(&matching)?;
+                matched.extend(matching);
                 if matched.len() >= limit || page_len < PAGE {
                     break;
                 }
@@ -10239,6 +10404,7 @@ where
         }
         const PAGE: usize = 1024;
         let mut base = BTreeMap::new();
+        let mut budget = MaterializationBudget::default();
         let mut after = None;
         loop {
             let page = match after.as_deref() {
@@ -10256,6 +10422,7 @@ where
             }
             let page_len = page.len();
             let last = page.last().map(|(pk, _)| pk.clone());
+            budget.add_rows(&page)?;
             base.extend(page);
             if page_len < PAGE {
                 break;
@@ -10268,6 +10435,7 @@ where
             }
             match write.value.as_ref() {
                 Some(value) if write.expires_at == 0 || write.expires_at > ryme_txn::now_unix() => {
+                    budget.add_parts(&key.pk, value)?;
                     base.insert(key.pk.clone(), value.clone());
                 }
                 _ => {
@@ -10275,7 +10443,9 @@ where
                 }
             }
         }
-        Ok(base
+        let rows: Vec<Row> = base.into_iter().collect();
+        ensure_materialized_rows(&rows)?;
+        Ok(rows
             .into_iter()
             .filter(|(pk, value)| {
                 self.rls_allows_with_context(table, value, rls_applies)
@@ -10294,11 +10464,15 @@ where
     ) -> Result<Vec<Row>> {
         let rls_applies = self.rls_applies_to_role(table);
         if let Some(view) = self.view_definition(table)? {
+            if view.materialized && view.rows.len() > MAX_QUERY_MATERIALIZED_ROWS {
+                return Err(materialization_overload());
+            }
             let mut rows = if view.materialized {
                 view.rows
             } else {
                 query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
             };
+            ensure_materialized_rows(&rows)?;
             rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
@@ -10311,6 +10485,7 @@ where
             const PAGE: usize = 1024;
             if txn.writes().is_empty() {
                 let mut visible = Vec::new();
+                let mut budget = MaterializationBudget::default();
                 let mut after = None;
                 loop {
                     let page = match after.as_deref() {
@@ -10329,12 +10504,18 @@ where
                     if page.is_empty() {
                         break;
                     }
+                    ensure_materialized_rows(&page)?;
                     let page_len = page.len();
                     let last = page.last().map(|(pk, _)| pk.clone());
-                    visible.extend(page.into_iter().filter(|(pk, value)| {
-                        self.rls_allows_with_context(table, value, rls_applies)
-                            && filter.iter().all(|predicate| predicate.matches(pk, value))
-                    }));
+                    let matching: Vec<Row> = page
+                        .into_iter()
+                        .filter(|(pk, value)| {
+                            self.rls_allows_with_context(table, value, rls_applies)
+                                && filter.iter().all(|predicate| predicate.matches(pk, value))
+                        })
+                        .collect();
+                    budget.add_rows(&matching)?;
+                    visible.extend(matching);
                     if visible.len() >= limit || page_len < PAGE {
                         break;
                     }
@@ -10345,6 +10526,7 @@ where
             }
 
             let mut merged = BTreeMap::new();
+            let mut budget = MaterializationBudget::default();
             let mut after = None;
             loop {
                 let page = match after.as_deref() {
@@ -10363,6 +10545,7 @@ where
                 }
                 let page_len = page.len();
                 let last = page.last().map(|(pk, _)| pk.clone());
+                budget.add_rows(&page)?;
                 merged.extend(page);
                 if page_len < PAGE {
                     break;
@@ -10376,6 +10559,7 @@ where
                 }
                 match write.value.as_ref() {
                     Some(value) => {
+                        budget.add_parts(&key.pk, value)?;
                         merged.insert(key.pk.clone(), value.clone());
                     }
                     None => {
@@ -10383,7 +10567,9 @@ where
                     }
                 }
             }
-            return Ok(merged
+            let rows: Vec<Row> = merged.into_iter().collect();
+            ensure_materialized_rows(&rows)?;
+            return Ok(rows
                 .into_iter()
                 .filter(|(pk, value)| {
                     self.rls_allows_with_context(table, value, rls_applies)
@@ -10393,7 +10579,7 @@ where
                 .collect());
         }
         if txn.writes().is_empty() {
-            if let Some(candidates) = self.indexed_candidates(table, filter) {
+            if let Some(candidates) = self.indexed_candidates(table, filter)? {
                 let mut rows = Vec::with_capacity(candidates.len());
                 for pk in candidates {
                     let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
@@ -10401,12 +10587,21 @@ where
                         rows.push((pk, value));
                     }
                 }
-                return Ok(self.filter_rls_rows_with_context(table, rows, rls_applies));
+                ensure_materialized_rows(&rows)?;
+                let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
+                return Ok(rows
+                    .into_iter()
+                    .filter(|(pk, value)| {
+                        filter.iter().all(|predicate| predicate.matches(pk, value))
+                    })
+                    .take(limit)
+                    .collect());
             }
 
             if !filter.is_empty() {
                 const PAGE: usize = 1024;
                 let mut matched = Vec::new();
+                let mut budget = MaterializationBudget::default();
                 let mut after = None;
                 loop {
                     let page = match after.as_deref() {
@@ -10425,11 +10620,17 @@ where
                     if page.is_empty() {
                         break;
                     }
+                    ensure_materialized_rows(&page)?;
                     let page_len = page.len();
                     let last = page.last().map(|(pk, _)| pk.clone());
-                    matched.extend(page.into_iter().filter(|(pk, value)| {
-                        filter.iter().all(|predicate| predicate.matches(pk, value))
-                    }));
+                    let matching: Vec<Row> = page
+                        .into_iter()
+                        .filter(|(pk, value)| {
+                            filter.iter().all(|predicate| predicate.matches(pk, value))
+                        })
+                        .collect();
+                    budget.add_rows(&matching)?;
+                    matched.extend(matching);
                     if matched.len() >= limit || page_len < PAGE {
                         break;
                     }
@@ -10442,6 +10643,7 @@ where
         if !txn.writes().is_empty() && !filter.is_empty() {
             const PAGE: usize = 1024;
             let mut merged = BTreeMap::new();
+            let mut budget = MaterializationBudget::default();
             let mut after = None;
             loop {
                 let page = match after.as_deref() {
@@ -10460,6 +10662,7 @@ where
                 }
                 let page_len = page.len();
                 let last = page.last().map(|(pk, _)| pk.clone());
+                budget.add_rows(&page)?;
                 merged.extend(page);
                 if page_len < PAGE {
                     break;
@@ -10473,6 +10676,7 @@ where
                 }
                 match write.value.as_ref() {
                     Some(value) => {
+                        budget.add_parts(&key.pk, value)?;
                         merged.insert(key.pk.clone(), value.clone());
                     }
                     None => {
@@ -10480,13 +10684,22 @@ where
                     }
                 }
             }
-            return Ok(merged
+            let rows: Vec<Row> = merged.into_iter().collect();
+            ensure_materialized_rows(&rows)?;
+            return Ok(rows
                 .into_iter()
                 .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
                 .take(limit)
                 .collect());
         }
-        let mut rows = self.manager.scan(txn, &self.tenant, &self.database, table, limit)?;
+        let mut rows = self.manager.scan(
+            txn,
+            &self.tenant,
+            &self.database,
+            table,
+            bounded_scan_limit(limit),
+        )?;
+        ensure_materialized_rows(&rows)?;
         if !txn.writes().is_empty() {
             let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = rows.drain(..).collect();
             for (key, write) in txn.writes() {
@@ -10505,7 +10718,9 @@ where
             }
             rows = merged.into_iter().take(limit).collect();
         }
-        Ok(self.filter_rls_rows(table, rows))
+        let rows = self.filter_rls_rows(table, rows);
+        ensure_materialized_rows(&rows)?;
+        Ok(rows)
     }
 
     fn register_table(&self, table: String, columns: Vec<ColumnDefinition>) {
@@ -13792,7 +14007,7 @@ where
             Statement::Join { left, right, join_type, limit, offset, order, filter } => {
                 let left_rows = self.scan_rows_async(txn, &left, &[], usize::MAX).await?;
                 let right_rows = self.scan_rows_async(txn, &right, &[], usize::MAX).await?;
-                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit))
+                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit)?)
             }
             statement => self.execute_read_in_transaction(txn, statement),
         }
@@ -13871,6 +14086,7 @@ where
                     groups.entry(key).or_default().push((pk, value));
                 }
                 let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut output_budget = MaterializationBudget::default();
                 for (group_key, members) in &groups {
                     let mut record = serde_json::Map::new();
                     for item in &select {
@@ -13928,7 +14144,9 @@ where
                     let record = serde_json::Value::Object(record);
                     let encoded = record.to_string().into_bytes();
                     if having.iter().all(|predicate| predicate.matches(group_key, &encoded)) {
-                        out.push((group_key.clone(), encoded));
+                        let row = (group_key.clone(), encoded);
+                        output_budget.add_row(&row)?;
+                        out.push(row);
                     }
                 }
                 out.sort_by(|a, b| compare_order(&order, a, b));
@@ -13937,7 +14155,7 @@ where
             Statement::Join { left, right, join_type, limit, offset, order, filter } => {
                 let left_rows = self.scan_rows(txn, &left, &[], usize::MAX)?;
                 let right_rows = self.scan_rows(txn, &right, &[], usize::MAX)?;
-                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit))
+                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit)?)
             }
             _ => Err(RymeError::InvalidArgument(String::from(
                 "statement is not readable in a transaction",
@@ -14876,6 +15094,7 @@ where
                     groups.entry(key).or_default().push((pk, value));
                 }
                 let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut output_budget = MaterializationBudget::default();
                 for (group_key, members) in &groups {
                     let mut record = serde_json::Map::new();
                     for item in &select {
@@ -14933,7 +15152,9 @@ where
                     let record = serde_json::Value::Object(record);
                     let encoded = record.to_string().into_bytes();
                     if having.iter().all(|predicate| predicate.matches(group_key, &encoded)) {
-                        out.push((group_key.clone(), encoded));
+                        let row = (group_key.clone(), encoded);
+                        output_budget.add_row(&row)?;
+                        out.push(row);
                     }
                 }
                 out.sort_by(|a, b| compare_order(&order, a, b));
@@ -14943,7 +15164,7 @@ where
                 let mut txn = self.begin_with(isolation);
                 let left_rows = self.scan_rows(&mut txn, &left, &[], usize::MAX)?;
                 let right_rows = self.scan_rows(&mut txn, &right, &[], usize::MAX)?;
-                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit))
+                Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit)?)
             }
             Statement::UpdateRow { table, pk, assignments } => {
                 self.reject_if_read_only()?;
@@ -15135,6 +15356,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_materialization_budget_is_bounded_without_partial_accounting() {
+        let row = (b"key".to_vec(), b"value".to_vec());
+        let mut budget = MaterializationBudget::default();
+        for _ in 0..MAX_QUERY_MATERIALIZED_ROWS {
+            budget.add_row(&row).unwrap();
+        }
+        assert!(
+            matches!(budget.add_row(&row), Err(RymeError::Overload(message)) if message == "query materialization")
+        );
+        assert_eq!(budget.rows, MAX_QUERY_MATERIALIZED_ROWS);
+
+        let mut byte_budget = MaterializationBudget {
+            rows: 0,
+            bytes: MAX_QUERY_MATERIALIZED_BYTES - 1,
+        };
+        assert!(byte_budget.add_row(&row).is_err());
+        assert_eq!(byte_budget.bytes, MAX_QUERY_MATERIALIZED_BYTES - 1);
+
+        let small = vec![(b"key".to_vec(), b"value".to_vec())];
+        assert!(ensure_materialized_rows(&small).is_ok());
+    }
 
     #[tokio::test]
     async fn schema_hook_coordinates_autocommit_ddl_and_rolls_back_on_failure() {
