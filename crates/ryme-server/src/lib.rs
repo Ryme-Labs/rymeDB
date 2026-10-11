@@ -1178,6 +1178,27 @@ fn resolve_branch_base_commit(state: &SharedState, requested: u64) -> ryme_error
     Ok(if requested == 0 { latest } else { requested })
 }
 
+fn validate_branch_parent(parent: &str) -> ryme_error::Result<()> {
+    if parent == "main" {
+        Ok(())
+    } else {
+        Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "only main branch parent is supported",
+        )))
+    }
+}
+
+#[cfg(test)]
+mod branch_request_tests {
+    use super::validate_branch_parent;
+
+    #[test]
+    fn only_main_can_be_a_branch_parent() {
+        assert!(validate_branch_parent("main").is_ok());
+        assert!(validate_branch_parent("preview").is_err());
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CheckpointRequest {
     pub manifest_id: Option<String>,
@@ -8418,6 +8439,9 @@ async fn branch_create(
     };
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
+    }
+    if let Err(error) = validate_branch_parent(&request.parent) {
+        return error_response(error);
     }
     let _migration_guard = state.migration_lock.lock().await;
     let base_commit_ts = match resolve_branch_base_commit(&state, request.base_commit_ts) {

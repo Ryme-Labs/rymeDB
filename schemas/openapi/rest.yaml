@@ -1173,7 +1173,7 @@ paths:
               $ref: '#/components/schemas/BranchRequest'
       responses:
         '200':
-          description: created
+          description: created; branch parents must be main
           content:
             application/json:
               schema:
@@ -2383,6 +2383,8 @@ components:
           type: string
         parent:
           type: string
+          enum: [main]
+          description: "Only main is supported as a branch parent."
         base_commit_ts:
           type: integer
           minimum: 0
