@@ -28,6 +28,8 @@ pub struct BranchManager {
     branches: HashMap<String, Branch>,
     manifests: HashMap<String, Manifest>,
     refs: HashMap<String, usize>,
+    #[serde(default)]
+    next_storage_epoch: u64,
 }
 
 impl BranchManager {
@@ -59,6 +61,10 @@ impl BranchManager {
             normalized.insert(key, branch);
         }
         manager.branches = normalized;
+        if let Some(highest_epoch) = manager.branches.values().map(|b| b.storage_epoch).max() {
+            manager.next_storage_epoch =
+                manager.next_storage_epoch.max(highest_epoch.saturating_add(1));
+        }
         manager.rebuild_refs()?;
         Ok(manager)
     }
@@ -126,6 +132,15 @@ impl BranchManager {
         Ok(())
     }
 
+    fn allocate_storage_epoch(&mut self) -> Result<u64> {
+        let epoch = self.next_storage_epoch.max(1);
+        if epoch == u64::MAX {
+            return Err(RymeError::Conflict(String::from("branch storage epoch exhausted")));
+        }
+        self.next_storage_epoch = epoch + 1;
+        Ok(epoch)
+    }
+
     pub fn create_root(&mut self, id: String, manifest: Manifest) -> Result<()> {
         self.create_root_for("default", id, manifest)
     }
@@ -188,6 +203,7 @@ impl BranchManager {
             .get(&scoped_key(tenant, parent))
             .ok_or_else(|| RymeError::NotFound(String::from("parent")))?
             .clone();
+        let storage_epoch = self.allocate_storage_epoch()?;
         let manifest_id = parent_branch.manifest_id.clone();
         *self.refs.entry(manifest_id.clone()).or_insert(0) += 1;
         self.branches.insert(
@@ -197,7 +213,7 @@ impl BranchManager {
                 tenant: tenant.to_string(),
                 parent_id: Some(parent.to_string()),
                 base_commit_ts,
-                storage_epoch: 0,
+                storage_epoch,
                 manifest_id,
                 schema_version: parent_branch.schema_version,
             },
@@ -292,12 +308,17 @@ impl BranchManager {
     }
 
     pub fn reset_for(&mut self, tenant: &str, id: &str, base_commit_ts: u64) -> Result<Branch> {
+        let key = scoped_key(tenant, id);
+        if !self.branches.contains_key(&key) {
+            return Err(RymeError::NotFound(String::from("branch")));
+        }
+        let storage_epoch = self.allocate_storage_epoch()?;
         let branch = self
             .branches
-            .get_mut(&scoped_key(tenant, id))
+            .get_mut(&key)
             .ok_or_else(|| RymeError::NotFound(String::from("branch")))?;
         branch.base_commit_ts = base_commit_ts;
-        branch.storage_epoch = branch.storage_epoch.saturating_add(1);
+        branch.storage_epoch = storage_epoch;
         Ok(branch.clone())
     }
 
@@ -713,7 +734,7 @@ mod tests {
         manager.create_child(String::from("preview"), "main", 7).unwrap();
         let branch = manager.reset("preview", 42).unwrap();
         assert_eq!(branch.base_commit_ts, 42);
-        assert_eq!(branch.storage_epoch, 1);
+        assert_eq!(branch.storage_epoch, 2);
         assert!(manager.reset("ghost", 1).is_err());
     }
 
@@ -811,6 +832,20 @@ mod tests {
         manager.create_child(String::from("preview"), "main", 7).unwrap();
         assert!(matches!(manager.delete("main"), Err(RymeError::Conflict(_))));
         assert!(manager.get("main").is_ok());
+    }
+
+    #[test]
+    fn storage_epochs_are_not_reused_after_reset_or_recreate() {
+        let mut manager = root_manager();
+        manager.create_child(String::from("preview"), "main", 1).unwrap();
+        let first = manager.get("preview").unwrap().storage_epoch;
+        let reset = manager.reset("preview", 2).unwrap();
+        assert!(reset.storage_epoch > first);
+
+        manager.delete("preview").unwrap();
+        manager.create_child(String::from("preview"), "main", 3).unwrap();
+        let recreated = manager.get("preview").unwrap().storage_epoch;
+        assert!(recreated > reset.storage_epoch);
     }
 
     #[test]

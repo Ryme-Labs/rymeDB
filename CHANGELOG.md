@@ -1,5 +1,8 @@
 # Changelog
 
+- Branch overlay epochs are now manager-wide, persisted, and monotonic. Reset
+  and delete/recreate cycles cannot reuse an old branch namespace and expose
+  stale branch-local writes.
 - Realtime table and durable-topic streams now validate reconnect cursors
   against retained history and return an explicit `cursor_expired` frame before
   closing when a replay would be incomplete. The SQL foreign-key cascade

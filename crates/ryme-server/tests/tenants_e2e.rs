@@ -273,6 +273,11 @@ async fn tenants_share_no_presence_or_partitions() {
     let (status, _) =
         bearer_branch_request(http, &alpha, "preview", "GET /v1/kv/docs/branch-write", b"").await;
     assert_eq!(status, 404);
+    let (status, _) = bearer_request(http, &alpha, "POST /v1/branches", branch.as_bytes()).await;
+    assert_eq!(status, 200);
+    let (status, _) =
+        bearer_branch_request(http, &alpha, "preview", "GET /v1/kv/docs/branch-write", b"").await;
+    assert_eq!(status, 404);
     let (status, _) = bearer_request(http, &beta, "POST /v1/branches", branch.as_bytes()).await;
     assert_eq!(status, 200);
     let (status, _) = bearer_request(http, KEY, "GET /v1/branches/preview", b"").await;

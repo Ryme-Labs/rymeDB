@@ -157,7 +157,9 @@ rows. Branch table and index definitions are stored under the data directory
 per tenant/branch, so branch DDL survives request/executor recreation without
 changing `main`. `main` keeps the live view.
 Resetting a branch advances its storage epoch, so prior branch-local writes are
-discarded from the new view; deleting a branch removes its selectable metadata.
+discarded from the new view. Epochs are allocated monotonically by the branch
+manager, so reset and delete/recreate cycles cannot reuse an old overlay
+namespace; deleting a branch removes its selectable metadata.
 Parents with live child branches must be deleted from the leaves upward so
 manifest references remain safe for segment garbage collection.
 `GET /v1/branches/<id>/diff?against=<branch>` keeps the manifest comparison
