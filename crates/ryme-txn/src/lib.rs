@@ -1009,6 +1009,25 @@ impl TxnManager {
         Ok(engine.purge_keys(keys))
     }
 
+    pub fn replace_routing_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        replacement: ryme_storage::Engine,
+    ) -> Result<usize> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let mut engine = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+        Ok(engine.replace_routing_range(start, end, &replacement))
+    }
+
     pub fn export_table(
         &self,
         tenant: &str,

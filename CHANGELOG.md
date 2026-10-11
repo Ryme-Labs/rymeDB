@@ -1,5 +1,8 @@
 # Changelog
 
+- Cluster PITR restore now works with active range ownership. Each range
+  replica rebuilds its historical state, trims post-target range WAL, and
+  reopens with the restored point-in-time state.
 - Distributed transaction coordinators now persist a range-quorum marker
   before preparing participants. Restart recovery aborts unresolved prepares
   when no commit decision exists, preventing coordinator crashes from leaving

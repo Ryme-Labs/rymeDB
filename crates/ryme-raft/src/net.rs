@@ -2925,11 +2925,6 @@ impl Node {
     }
 
     pub async fn propose_restore(self: &Arc<Self>, target: u64) -> Result<u64> {
-        if !self.range_owners().is_empty() {
-            return Err(RymeError::Unavailable(String::from(
-                "restore unavailable while range ownership is active",
-            )));
-        }
         if target > self.manager.latest_commit() {
             return Err(RymeError::InvalidArgument(String::from("restore target")));
         }
@@ -2940,9 +2935,7 @@ impl Node {
 
     async fn restore_to(&self, target: u64) -> Result<u64> {
         if !self.range_owners().is_empty() {
-            return Err(RymeError::Unavailable(String::from(
-                "restore unavailable while range ownership is active",
-            )));
+            return self.restore_active_ranges_to(target);
         }
         let entries = {
             let inner = self.inner.lock().await;
@@ -2958,6 +2951,94 @@ impl Node {
             }
         }
         self.manager.restore_with_replay(Engine::default(), &replay)
+    }
+
+    fn restore_active_ranges_to(&self, target: u64) -> Result<u64> {
+        let ranges = self.range_owners();
+        let mut restored = 0u64;
+        for range in ranges {
+            if !range.replicas.contains(&self.id) && range.owner != self.id {
+                continue;
+            }
+            let entries = self
+                .range_entries
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range entries")))?
+                .get(&range.id)
+                .cloned()
+                .unwrap_or_default();
+            let mut replacement = Engine::default();
+            let mut keep_through = 0u64;
+            let mut prepared = BTreeMap::<u128, ryme_txn::TransactionState>::new();
+            for (index, record) in &entries {
+                if record.commit_ts > target {
+                    continue;
+                }
+                keep_through = *index;
+                match &record.kind {
+                    RangeEntryKind::Data => {
+                        for (key, op) in decode_writes(&record.writes)? {
+                            replacement.apply_with_expiry(
+                                key,
+                                record.commit_ts,
+                                op.value,
+                                op.expires_at,
+                            )?;
+                        }
+                    }
+                    RangeEntryKind::Prepare { transaction_id, state } => {
+                        let state: ryme_txn::TransactionState = serde_json::from_slice(state)
+                            .map_err(|error| {
+                                RymeError::Corrupt(format!("range transaction prepare: {error}"))
+                            })?;
+                        prepared.insert(*transaction_id, state);
+                    }
+                    RangeEntryKind::Resolve { transaction_id, committed } => {
+                        if let Some(state) = prepared.remove(transaction_id) {
+                            if *committed {
+                                for (key, op) in state.writes {
+                                    replacement.apply_with_expiry(
+                                        key,
+                                        record.commit_ts,
+                                        op.value,
+                                        op.expires_at,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    RangeEntryKind::Decision { .. } | RangeEntryKind::Coordinate { .. } => {}
+                }
+            }
+            self.manager.replace_routing_range(&range.start, &range.end, replacement)?;
+            if let Ok(mut pending) = self.range_prepared.lock() {
+                pending.retain(|(group_id, _), _| group_id != &range.id);
+            }
+            if let Ok(mut pending) = self.range_decisions.lock() {
+                pending.retain(|(group_id, _, commit_ts), _| {
+                    group_id != &range.id || *commit_ts <= target
+                });
+            }
+            if let Ok(mut pending) = self.range_recovery_coordinations.lock() {
+                pending.retain(|(group_id, _, commit_ts), _| {
+                    group_id != &range.id || *commit_ts <= target
+                });
+            }
+            {
+                let mut groups = self
+                    .range_groups
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+                let state = groups.entry(range.id.clone()).or_default();
+                state.commit_index = state.commit_index.min(keep_through);
+                state.applied_index = state.applied_index.min(keep_through);
+            }
+            self.truncate_range_suffix(&range.id, keep_through)?;
+            restored = restored.max(target);
+        }
+        self.persist_range_meta()?;
+        self.manager.advance_to(target);
+        Ok(restored)
     }
 
     pub async fn propose_topic(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
@@ -6237,6 +6318,57 @@ mod tests {
         assert_eq!(reopened.range_last_index("range-a"), 1);
         let mut probe = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn range_restore_trims_future_state_and_wal() {
+        let dir = temp_dir("range-restore");
+        let key = RecordKey::new("t", "d", "s", b"restore");
+        let range = RangeOwner {
+            id: String::from("range-a"),
+            start: Vec::new(),
+            end: Vec::new(),
+            owner: 0,
+            replicas: vec![0],
+            epoch: 1,
+        };
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            node.set_range_owners(vec![range.clone()]);
+            for (index, commit_ts, value) in
+                [(1, 5, b"before".as_slice()), (2, 10, b"after".as_slice())]
+            {
+                let mut writes = BTreeMap::new();
+                writes.insert(key.clone(), ryme_txn::WriteOp::put(value.to_vec()));
+                let encoded = encode_writes(&writes).unwrap();
+                node.append_range_follower(
+                    "range-a",
+                    1,
+                    0,
+                    index - 1,
+                    if index == 1 { 0 } else { 1 },
+                    index,
+                    commit_ts,
+                    &encoded,
+                    0,
+                )
+                .unwrap();
+                node.append_range_follower("range-a", 1, 0, index, 1, 0, 0, &[], index).unwrap();
+            }
+            let mut current = node.manager.begin();
+            assert_eq!(node.manager.get(&mut current, &key).unwrap(), Some(b"after".to_vec()));
+            node.restore_to(5).await.unwrap();
+            let mut restored = node.manager.begin();
+            assert_eq!(node.manager.get(&mut restored, &key).unwrap(), Some(b"before".to_vec()));
+            assert_eq!(node.range_last_index("range-a"), 1);
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        reopened.set_range_owners(vec![range]);
+        let mut restored = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut restored, &key).unwrap(), Some(b"before".to_vec()));
+        assert_eq!(reopened.range_last_index("range-a"), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

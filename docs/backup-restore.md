@@ -170,18 +170,18 @@ retained snapshot. Point-in-time restore therefore reaches back to the oldest
 retained snapshot; older targets return `404 {"error":"snapshot"}`. Sealed
 archives are unaffected and remain the long-term recovery path.
 
-Cluster restore is coordinated through Raft when the cluster is still in
-whole-dataset replication mode. The leader appends one restore command and
-each member rebuilds the state from its committed Raft data log, so a restart
-replays the same restore decision. The target must not be ahead of the latest
-commit. `Hybrid` remains unavailable.
+Cluster restore is coordinated through the global Raft log. The leader
+appends one restore command and each member applies the same target. In
+whole-dataset mode, members rebuild from the committed data log. In
+range-sharded mode, every local range replica rebuilds its owned range from
+the committed range log, removes records newer than the target, and persists
+the trimmed range WAL before serving reads again. The target must not be
+ahead of the latest commit. `Hybrid` remains unavailable.
 
-**Range-sharded mode cannot use this endpoint yet.** Once range ownership is
-active, each node intentionally stores only its assigned ranges and one Raft
-log is no longer a complete database image. The endpoint returns `503` rather
-than silently restoring an incomplete copy. Recover that layout from a
-range-aware backup by bringing up fresh nodes and re-adding them through the
-membership API (see `docs/cluster-operations.md`).
+The range restore is range-local: data outside the active placement map is
+not reconstructed on a node that does not own that range. Range replicas
+converge through their normal range-log repair path if one was offline when
+the restore command committed.
 
 ## S3 settings
 

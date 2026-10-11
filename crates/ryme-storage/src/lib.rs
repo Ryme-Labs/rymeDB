@@ -334,6 +334,32 @@ impl Engine {
         removed
     }
 
+    pub fn replace_routing_range(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        replacement: &Engine,
+    ) -> usize {
+        let in_range = |key: &RecordKey| {
+            let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
+            routing.extend_from_slice(key.table.as_bytes());
+            routing.push(0);
+            routing.extend_from_slice(&key.pk);
+            routing.as_slice() >= start && (end.is_empty() || routing.as_slice() < end)
+        };
+        let keys: Vec<RecordKey> = self.inner.keys().filter(|key| in_range(key)).cloned().collect();
+        let removed = self.purge_keys(&keys);
+        for (key, versions) in replacement.inner.iter().filter(|(key, _)| in_range(key)) {
+            self.bytes_held += versions
+                .iter()
+                .filter_map(|version| version.value.as_ref())
+                .map(|value| value.len() as u64)
+                .sum::<u64>();
+            self.inner.insert(key.clone(), versions.clone());
+        }
+        removed
+    }
+
     pub fn spaces(&self) -> Vec<(String, String, String)> {
         let mut spaces = std::collections::BTreeSet::new();
         for key in self.inner.keys() {
