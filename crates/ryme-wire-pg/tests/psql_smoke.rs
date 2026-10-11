@@ -139,6 +139,10 @@ async fn psql_smoke() {
     .await;
     assert!(ok, "{out}");
     assert!(out.contains("messages_payload_idx|messages"), "{out}");
+    let (ok, out) = psql(addr, "SELECT indexname, tablename FROM pg_catalog.pg_indexes;").await;
+    assert!(ok, "{out}");
+    assert!(out.contains("messages_pkey|messages"), "{out}");
+    assert!(out.contains("messages_payload_idx|messages"), "{out}");
     let (ok, out) = psql(
         addr,
         "BEGIN; INSERT INTO docs (id, value) VALUES ('tx', 'inside'); SELECT * FROM docs KEY 'tx'; COMMIT;",

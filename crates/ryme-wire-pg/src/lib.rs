@@ -2147,30 +2147,34 @@ where
 
     if upper.contains("PG_CATALOG.PG_INDEXES") {
         let table = sql_literal_after(query, "TABLENAME");
-        let mut indexes =
-            table.as_deref().map(|name| executor.catalog_indexes(name)).unwrap_or_default();
-        if let Some(table) = table.as_deref() {
-            let definitions = executor.catalog_columns(table);
-            let primary_columns = definitions
-                .iter()
-                .filter(|definition| definition.primary_key)
-                .map(|definition| definition.name.clone())
-                .collect::<Vec<_>>();
-            let (_, table_name) = catalog_table_parts(table);
-            let primary_name = format!("{table_name}_pkey");
-            if !primary_columns.is_empty()
-                && !indexes.iter().any(|index| index.name == primary_name)
-            {
-                indexes.push(IndexDefinition {
-                    name: primary_name,
-                    table: table.to_string(),
-                    field: Field::Key,
-                    column: None,
-                    columns: primary_columns,
-                    unique: true,
-                });
-            }
-        }
+        let tables = table.map(|table| vec![table]).unwrap_or_else(|| executor.catalog_tables());
+        let indexes = tables
+            .into_iter()
+            .flat_map(|table| {
+                let mut indexes = executor.catalog_indexes(&table);
+                let definitions = executor.catalog_columns(&table);
+                let primary_columns = definitions
+                    .iter()
+                    .filter(|definition| definition.primary_key)
+                    .map(|definition| definition.name.clone())
+                    .collect::<Vec<_>>();
+                let (_, table_name) = catalog_table_parts(&table);
+                let primary_name = format!("{table_name}_pkey");
+                if !primary_columns.is_empty()
+                    && !indexes.iter().any(|index| index.name == primary_name)
+                {
+                    indexes.push(IndexDefinition {
+                        name: primary_name,
+                        table,
+                        field: Field::Key,
+                        column: None,
+                        columns: primary_columns,
+                        unique: true,
+                    });
+                }
+                indexes
+            })
+            .collect::<Vec<_>>();
         let rows: Vec<Vec<Vec<u8>>> = indexes
             .into_iter()
             .map(|index| {
