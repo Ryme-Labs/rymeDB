@@ -1,5 +1,8 @@
 # Changelog
 
+- Range WAL recovery now replays only entries at or below the persisted range
+  commit index. Replicated-but-uncommitted suffixes remain available for
+  conflict repair without becoming visible after a crash and restart.
 - Range replica repair now handles divergent uncommitted suffixes as well as
   missing entries. Followers report the first conflicting index, leaders retry
   from the common prefix, and the affected range WAL is rewritten atomically;

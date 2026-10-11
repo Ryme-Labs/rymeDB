@@ -226,6 +226,9 @@ If a promoted leader finds an uncommitted divergent suffix, the follower
 reports the conflict index and the leader retries from the common prefix. The
 affected range WAL is rewritten while unrelated range records are retained;
 committed or already-applied range entries are never overwritten.
+On restart, range WAL records above the persisted range commit index remain
+uncommitted and are not materialized until a valid leader commit advances the
+range state. This keeps crash recovery from exposing speculative writes.
 Range replicas also maintain their own election term and heartbeat deadline.
 If the configured range leader fails, a surviving replica can win a majority
 of that range's replica set and become the routed owner without changing the

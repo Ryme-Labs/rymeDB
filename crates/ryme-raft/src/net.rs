@@ -871,8 +871,6 @@ impl Node {
         let mut range_logs = BTreeMap::new();
         let mut range_entries: BTreeMap<String, BTreeMap<u64, RangeLogRecord>> = BTreeMap::new();
         for range_record in range_records {
-            let writes = decode_writes(&range_record.writes)?;
-            manager.replay_at(range_record.commit_ts, &writes)?;
             let group_id = range_record.group_id.clone();
             range_entries
                 .entry(group_id.clone())
@@ -882,8 +880,20 @@ impl Node {
             *last = (*last).max(range_record.index);
             let state = range_groups.entry(group_id).or_default();
             state.term = state.term.max(range_record.term).max(1);
-            state.commit_index = state.commit_index.max(range_record.index);
-            state.applied_index = state.applied_index.max(range_record.index);
+        }
+        for (group_id, entries) in &range_entries {
+            let state = range_groups.entry(group_id.clone()).or_default();
+            if state.commit_index > entries.keys().next_back().copied().unwrap_or(0) {
+                return Err(RymeError::Corrupt(String::from("range commit index")));
+            }
+            for index in 1..=state.commit_index {
+                let record = entries
+                    .get(&index)
+                    .ok_or_else(|| RymeError::Corrupt(String::from("range log gap")))?;
+                let writes = decode_writes(&record.writes)?;
+                manager.replay_at(record.commit_ts, &writes)?;
+            }
+            state.applied_index = state.commit_index;
         }
         if let Some(change) = replayed {
             members = normalize_members(change.old.clone());
@@ -4311,6 +4321,35 @@ mod tests {
         assert_eq!(reopened.range_last_index("range-a"), 1);
         let mut probe = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn uncommitted_range_wal_is_not_replayed_after_restart() {
+        let dir = temp_dir("range-uncommitted");
+        let key = RecordKey::new("t", "d", "s", b"pending-range");
+        let mut writes = BTreeMap::new();
+        writes.insert(key.clone(), ryme_txn::WriteOp::put(b"pending".to_vec()));
+        let encoded = encode_writes(&writes).unwrap();
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            node.append_range_follower("range-a", 4, 0, 0, 0, 1, 9, &encoded, 0).unwrap();
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let mut pending = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut pending, &key).unwrap(), None);
+        reopened.append_range_follower("range-a", 4, 0, 1, 4, 0, 0, &[], 1).unwrap();
+        let mut committed = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut committed, &key).unwrap(), Some(b"pending".to_vec()));
+        drop(reopened);
+
+        let reopened_again = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let mut probe = reopened_again.manager.begin();
+        assert_eq!(
+            reopened_again.manager.get(&mut probe, &key).unwrap(),
+            Some(b"pending".to_vec())
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
