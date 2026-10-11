@@ -5921,6 +5921,16 @@ fn supabase_json_value(record: &ryme_realtime::ChangeRecord, after: bool) -> ser
     })
 }
 
+fn masked_change_record<B: TxnBackend>(
+    gateway: &Gateway<B>,
+    record: &ryme_realtime::ChangeRecord,
+) -> ryme_realtime::ChangeRecord {
+    let mut masked = record.clone();
+    masked.before = masked.before.map(|value| gateway.masked(&masked.table, value));
+    masked.after = masked.after.map(|value| gateway.masked(&masked.table, value));
+    masked
+}
+
 fn supabase_column_value(
     record: &ryme_realtime::ChangeRecord,
     value: &serde_json::Value,
@@ -6334,6 +6344,7 @@ async fn forward_supabase_realtime(
                         if channel.postgres_tasks.is_empty() {
                             continue;
                         }
+                        let record = masked_change_record(&state.gateway, &record);
                         let text = encode_supabase_frame(
                             &SupabaseFrame {
                                 join_ref: None,
@@ -9954,6 +9965,7 @@ async fn stream(
     let from = query.from.unwrap_or(u64::MAX);
     let from_sequence = query.from_sequence;
     let qos = state.qos.clone();
+    let gateway = state.gateway.clone();
     let rls_executor =
         state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
     upgrade.on_upgrade(move |socket| async move {
@@ -9962,6 +9974,7 @@ async fn stream(
             socket,
             realtime,
             qos,
+            gateway,
             rls_executor,
             &tenant,
             &database,
@@ -10058,6 +10071,7 @@ async fn forward_changes(
     socket: axum::extract::ws::WebSocket,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
+    gateway: Gateway<BranchStorage>,
     rls_executor: Executor<BranchStorage>,
     tenant: &str,
     database: &str,
@@ -10109,7 +10123,8 @@ async fn forward_changes(
         if !realtime_change_allowed_by_executor(&rls_executor, tenant, branch, record) {
             continue;
         }
-        let text = serde_json::to_string(record).unwrap_or_else(|_| String::from("{}"));
+        let masked = masked_change_record(&gateway, record);
+        let text = serde_json::to_string(&masked).unwrap_or_else(|_| String::from("{}"));
         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
             return;
         }
@@ -10144,7 +10159,8 @@ async fn forward_changes(
                         ) {
                             continue;
                         }
-                        let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
+                        let masked = masked_change_record(&gateway, &record);
+                        let text = serde_json::to_string(&masked).unwrap_or_else(|_| String::from("{}"));
                         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
@@ -10188,7 +10204,8 @@ async fn forward_changes(
                             ) {
                                 continue;
                             }
-                            let text = serde_json::to_string(&record)
+                            let masked = masked_change_record(&gateway, &record);
+                            let text = serde_json::to_string(&masked)
                                 .unwrap_or_else(|_| String::from("{}"));
                             if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                                 return;
@@ -10269,6 +10286,7 @@ async fn query_stream(
     let database = state.database.clone();
     let table = query.table.clone();
     let qos = state.qos.clone();
+    let gateway = state.gateway.clone();
     let rls_executor =
         state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
     let dependencies =
@@ -10281,6 +10299,7 @@ async fn query_stream(
             backend,
             realtime,
             qos,
+            gateway,
             rls_executor,
             &tenant,
             &database,
@@ -10301,6 +10320,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
     backend: B,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
+    gateway: Gateway<BranchStorage>,
     rls_executor: Executor<BranchStorage>,
     tenant: &str,
     database: &str,
@@ -10317,6 +10337,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
             backend,
             realtime,
             qos,
+            gateway,
             rls_executor,
             tenant,
             database,
@@ -10339,6 +10360,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
         &outgoing,
         &backend,
         &qos,
+        &gateway,
         &rls_executor,
         tenant,
         database,
@@ -10378,7 +10400,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                                 rls_executor.row_allowed_by_rls(table, &row.value)
                             }).map(|row| serde_json::json!({
                                 "pk": String::from_utf8_lossy(&row.pk),
-                                "value": String::from_utf8_lossy(&row.value),
+                                "value": String::from_utf8_lossy(&gateway.masked(table, row.value.clone())),
                             })).collect::<Vec<_>>(),
                             "truncated": update.truncated,
                         }))
@@ -10401,6 +10423,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             &outgoing,
                             &backend,
                             &qos,
+                            &gateway,
                             &rls_executor,
                             tenant,
                             database,
@@ -10442,6 +10465,7 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
     backend: B,
     realtime: Realtime,
     qos: Arc<Mutex<QosRegistry>>,
+    gateway: Gateway<BranchStorage>,
     rls_executor: Executor<BranchStorage>,
     tenant: &str,
     database: &str,
@@ -10460,6 +10484,7 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
         &outgoing,
         &backend,
         &qos,
+        &gateway,
         &rls_executor,
         tenant,
         database,
@@ -10496,6 +10521,7 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
                             &outgoing,
                             &backend,
                             &qos,
+                            &gateway,
                             &rls_executor,
                             tenant,
                             database,
@@ -10524,6 +10550,7 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
                             &outgoing,
                             &backend,
                             &qos,
+                            &gateway,
                             &rls_executor,
                             tenant,
                             database,
@@ -10792,6 +10819,7 @@ async fn send_query_snapshot<B: TxnBackend>(
     outgoing: &RealtimeOutgoing,
     backend: &B,
     qos: &Arc<Mutex<QosRegistry>>,
+    gateway: &Gateway<BranchStorage>,
     rls_executor: &Executor<BranchStorage>,
     tenant: &str,
     database: &str,
@@ -10820,7 +10848,7 @@ async fn send_query_snapshot<B: TxnBackend>(
             .into_iter()
             .map(|(pk, value)| serde_json::json!({
                 "pk": String::from_utf8_lossy(&pk),
-                "value": String::from_utf8_lossy(&value),
+                "value": String::from_utf8_lossy(&gateway.masked(table, value)),
             }))
             .collect::<Vec<_>>(),
     });
@@ -10836,6 +10864,7 @@ async fn send_reactive_query_snapshot<B: TxnBackend>(
     outgoing: &RealtimeOutgoing,
     backend: &B,
     qos: &Arc<Mutex<QosRegistry>>,
+    gateway: &Gateway<BranchStorage>,
     rls_executor: &Executor<BranchStorage>,
     tenant: &str,
     database: &str,
@@ -10861,7 +10890,8 @@ async fn send_reactive_query_snapshot<B: TxnBackend>(
     let payload_rows = rows
         .into_iter()
         .map(|(pk, value)| {
-            let mut row = rest_project_row(rest_row_to_json(&pk, &value), spec.select.as_deref());
+            let masked = gateway.masked(table, value.clone());
+            let mut row = rest_project_row(rest_row_to_json(&pk, &masked), spec.select.as_deref());
             if let Some(object) = row.as_object_mut() {
                 object.insert(
                     String::from("pk"),
@@ -10869,7 +10899,7 @@ async fn send_reactive_query_snapshot<B: TxnBackend>(
                 );
                 object.insert(
                     String::from("value"),
-                    serde_json::Value::String(String::from_utf8_lossy(&value).to_string()),
+                    serde_json::Value::String(String::from_utf8_lossy(&masked).to_string()),
                 );
             }
             row
@@ -11520,6 +11550,35 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn realtime_change_records_mask_before_and_after_images() {
+        let gateway = Gateway::new(
+            String::from("tenant-a"),
+            String::from("default"),
+            String::from("main"),
+            PolicyEngine::new(),
+            Realtime::new(16),
+        );
+        gateway.set_mask(String::from("users"), vec![String::from("ssn")]);
+        let record = ryme_realtime::ChangeRecord {
+            tenant: String::from("tenant-a"),
+            database: String::from("default"),
+            branch: String::from("main"),
+            table: String::from("users"),
+            op: ryme_realtime::Operation::Update,
+            pk: b"u1".to_vec(),
+            before: Some(br#"{"ssn":"before"}"#.to_vec()),
+            after: Some(br#"{"ssn":"after"}"#.to_vec()),
+            commit_ts: 1,
+            tx_id: 1,
+            sequence: 1,
+        };
+
+        let masked = masked_change_record(&gateway, &record);
+        assert_eq!(masked.before.as_deref(), Some(br#"{"ssn":"***"}"#.as_slice()));
+        assert_eq!(masked.after.as_deref(), Some(br#"{"ssn":"***"}"#.as_slice()));
+    }
 
     #[test]
     fn public_listeners_require_explicit_protocol_credentials() {
