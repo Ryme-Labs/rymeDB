@@ -164,6 +164,8 @@ pub(crate) enum Rpc {
         leader_commit: u64,
         commit_ts: u64,
         writes: Vec<u8>,
+        #[serde(default)]
+        publish_data: bool,
     },
     RangeAppendResponse {
         term: u64,
@@ -294,6 +296,8 @@ struct RangeLogRecord {
     term: u64,
     commit_ts: u64,
     writes: Vec<u8>,
+    #[serde(default)]
+    publish_data: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1191,6 +1195,7 @@ impl Node {
                 leader_commit,
                 commit_ts: 0,
                 writes: Vec::new(),
+                publish_data: false,
             })
             .await?;
         let mut next_index = match heartbeat {
@@ -1239,6 +1244,7 @@ impl Node {
                     leader_commit: 0,
                     commit_ts: record.commit_ts,
                     writes: record.writes,
+                    publish_data: record.publish_data,
                 })
                 .await?;
             match response {
@@ -1296,6 +1302,7 @@ impl Node {
                 leader_commit,
                 commit_ts: 0,
                 writes: Vec::new(),
+                publish_data: false,
             })
             .await?;
         match committed {
@@ -2076,8 +2083,9 @@ impl Node {
                 leader_commit,
                 commit_ts,
                 writes,
+                publish_data,
             } => {
-                let result = self.append_range_follower(
+                let result = self.append_range_follower_marked(
                     &group_id,
                     term,
                     leader,
@@ -2087,6 +2095,7 @@ impl Node {
                     commit_ts,
                     &writes,
                     leader_commit,
+                    publish_data,
                 );
                 match result {
                     Ok(last_index) => Ok(Rpc::RangeAppendResponse {
@@ -2101,7 +2110,14 @@ impl Node {
                         appended: false,
                         last_index: self.range_last_index(&group_id),
                         conflict_index: self.range_conflict_index(
-                            &group_id, prev_index, prev_term, index, term, commit_ts, &writes,
+                            &group_id,
+                            prev_index,
+                            prev_term,
+                            index,
+                            term,
+                            commit_ts,
+                            &writes,
+                            publish_data,
                         ),
                         error: Some(error.into()),
                     }),
@@ -2629,6 +2645,7 @@ impl Node {
         term: u64,
         commit_ts: u64,
         encoded_writes: &[u8],
+        publish_data: bool,
     ) -> Result<u64> {
         decode_writes(encoded_writes)?;
         let mut logs =
@@ -2646,6 +2663,7 @@ impl Node {
             term,
             commit_ts,
             writes: encoded_writes.to_vec(),
+            publish_data,
         })
         .map_err(|error| RymeError::Internal(format!("range log: {error}")))?;
         let mut wal =
@@ -2665,6 +2683,7 @@ impl Node {
                     term,
                     commit_ts,
                     writes: encoded_writes.to_vec(),
+                    publish_data,
                 },
             );
         logs.insert(group_id.to_string(), index);
@@ -2749,6 +2768,9 @@ impl Node {
         for record in records {
             let writes = decode_writes(&record.writes)?;
             self.manager.replay_at(record.commit_ts, &writes)?;
+            if record.publish_data {
+                self.apply_data_hook(crate::encode_applied(record.commit_ts, &record.writes))?;
+            }
         }
         {
             let mut groups = self
@@ -2771,6 +2793,7 @@ impl Node {
         term: u64,
         commit_ts: u64,
         encoded_writes: &[u8],
+        publish_data: bool,
     ) -> Option<u64> {
         let last = self.range_last_index(group_id);
         if prev_index > last {
@@ -2786,6 +2809,7 @@ impl Node {
                 if existing.term != term
                     || existing.commit_ts != commit_ts
                     || existing.writes != encoded_writes
+                    || existing.publish_data != publish_data
                 {
                     return Some(index);
                 }
@@ -2798,6 +2822,7 @@ impl Node {
         }
     }
 
+    #[cfg(test)]
     fn append_range_follower(
         &self,
         group_id: &str,
@@ -2809,6 +2834,33 @@ impl Node {
         commit_ts: u64,
         encoded_writes: &[u8],
         leader_commit: u64,
+    ) -> Result<u64> {
+        self.append_range_follower_marked(
+            group_id,
+            term,
+            leader,
+            prev_index,
+            prev_term,
+            index,
+            commit_ts,
+            encoded_writes,
+            leader_commit,
+            false,
+        )
+    }
+
+    fn append_range_follower_marked(
+        &self,
+        group_id: &str,
+        term: u64,
+        leader: usize,
+        prev_index: u64,
+        prev_term: u64,
+        index: u64,
+        commit_ts: u64,
+        encoded_writes: &[u8],
+        leader_commit: u64,
+        publish_data: bool,
     ) -> Result<u64> {
         let mut state = self.ensure_range_group(group_id, leader);
         if term < state.term {
@@ -2860,6 +2912,7 @@ impl Node {
                 if existing.term != term
                     || existing.commit_ts != commit_ts
                     || existing.writes != encoded_writes
+                    || existing.publish_data != publish_data
                 {
                     self.truncate_range_suffix(group_id, index - 1)?;
                     last = index - 1;
@@ -2868,7 +2921,14 @@ impl Node {
             if index != last + 1 {
                 return Err(RymeError::Unavailable(String::from("range log gap")));
             }
-            last = self.append_range_entry(group_id, index, term, commit_ts, encoded_writes)?;
+            last = self.append_range_entry(
+                group_id,
+                index,
+                term,
+                commit_ts,
+                encoded_writes,
+                publish_data,
+            )?;
         }
         if leader_commit > 0 {
             self.apply_range_committed(group_id, leader_commit.min(last))?;
@@ -2888,6 +2948,7 @@ impl Node {
         group_id: &str,
         commit_ts: u64,
         encoded_writes: &[u8],
+        publish_data: bool,
     ) -> Result<(u64, u64, Vec<usize>)> {
         let range = self
             .range_owner_by_id(group_id)
@@ -2906,7 +2967,7 @@ impl Node {
         replicas.dedup();
         let index = self.range_last_index(group_id) + 1;
         let term = self.ensure_range_group(group_id, self.id).term.max(1);
-        self.append_range_entry(group_id, index, term, commit_ts, encoded_writes)?;
+        self.append_range_entry(group_id, index, term, commit_ts, encoded_writes, publish_data)?;
         let mut acknowledgements = 1usize;
         let mut acknowledged = vec![self.id];
         for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
@@ -2985,7 +3046,7 @@ impl Node {
         encoded_writes: &[u8],
     ) -> Result<()> {
         let (index, term, acknowledged) =
-            self.replicate_range_entry(group_id, commit_ts, encoded_writes).await?;
+            self.replicate_range_entry(group_id, commit_ts, encoded_writes, false).await?;
         self.commit_range_entry(group_id, index, term, &acknowledged).await
     }
 
@@ -3034,7 +3095,7 @@ impl Node {
         }
         let commit_ts = self.manager.reserve(&txn)?;
         let (index, term, acknowledged) =
-            match self.replicate_range_entry(group_id, commit_ts, encoded_writes).await {
+            match self.replicate_range_entry(group_id, commit_ts, encoded_writes, true).await {
                 Ok(result) => result,
                 Err(error) => return Err(error),
             };

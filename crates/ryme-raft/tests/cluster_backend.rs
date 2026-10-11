@@ -2,6 +2,7 @@ use ryme_raft::net::{ClusterBackend, Node, RangeOwner};
 use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, TxnBackend};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn writes(pairs: Vec<(&str, &str)>) -> BTreeMap<RecordKey, ryme_txn::WriteOp> {
@@ -436,6 +437,19 @@ async fn single_owner_write_from_follower_uses_range_quorum() {
     backends[leader].commit(seed).await.unwrap();
     let global_commit_before_range_write = nodes[leader].commit_index().await;
 
+    let data_events: Vec<Arc<Mutex<Vec<u64>>>> =
+        (0..nodes.len()).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+    for (node, events) in nodes.iter().zip(data_events.iter()) {
+        let events = events.clone();
+        node.set_data_hook(Arc::new(move |payload| {
+            let (commit_ts, encoded) = ryme_raft::decode_applied(payload)?;
+            ryme_txn::decode_writes(&encoded)?;
+            events.lock().unwrap().push(commit_ts);
+            Ok(())
+        }))
+        .unwrap();
+    }
+
     let mut txn = backends[client].begin();
     backends[client].put(&mut txn, key("routed"), b"from-follower".to_vec());
     backends[client].commit(txn).await.unwrap();
@@ -455,6 +469,13 @@ async fn single_owner_write_from_follower_uses_range_quorum() {
     );
     assert_eq!(nodes[leader].commit_index().await, global_commit_before_range_write);
     assert_eq!(nodes[client].read_latest(&key("routed")).await.unwrap(), None);
+    assert_eq!(data_events[owner].lock().unwrap().len(), 1);
+    assert_eq!(data_events[leader].lock().unwrap().len(), 1);
+    assert!(data_events[client].lock().unwrap().is_empty());
+    assert_eq!(
+        data_events[owner].lock().unwrap().as_slice(),
+        data_events[leader].lock().unwrap().as_slice()
+    );
 
     for (node, task) in nodes.iter().zip(tasks) {
         node.shutdown(task);

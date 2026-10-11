@@ -244,6 +244,11 @@ forwarding. This is not yet independent per-range Raft 2PC, and read-dependent c
 transaction routing remains separate work. Transactions that include a read
 set now forward their snapshot and OCC metadata to the current leader, so a
 follower-started transaction can be validated against intervening commits.
+Direct range commits carry a publication marker in the range WAL. Once the
+range commit index advances, the owner and acknowledged range replicas feed
+that write set through the existing CDC hook. Range records created as mirrors
+of a global-log commit do not carry the marker, preventing duplicate realtime
+events.
 Multi-owner transactions now run an explicit prepare phase at each configured
 range owner. Each participant writes a durable intent record before the
 coordinator appends the global Raft data decision, and commit/abort resolution

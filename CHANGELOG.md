@@ -1,5 +1,10 @@
 # Changelog
 
+- Direct range commits now carry an explicit CDC publication marker through
+  the range WAL and append RPCs. After a range quorum commits, the owner and
+  acknowledged replicas emit the committed write set through the existing
+  data hook; global-log range mirrors remain silent to avoid duplicate
+  realtime events.
 - Single-range write-only transactions now commit through the current range
   leader's quorum log and advance the range commit index directly. The global
   Raft log remains responsible for read-dependent and cross-range transactions,
