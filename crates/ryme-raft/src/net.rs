@@ -2,7 +2,7 @@ use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
 use ryme_storage::{Engine, RecordKey, TableVersion};
 use ryme_txn::{decode_writes, encode_writes, now_unix, TxnManager};
-use ryme_wal::Wal;
+use ryme_wal::{Wal, WalRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -844,6 +844,43 @@ impl Inner {
         }
         self.wal.sync()?;
         Ok(())
+    }
+
+    fn replace_log_suffix(&mut self, keep_through: u64, entries: &[LogEntry]) -> Result<()> {
+        if self.commit_index > keep_through || self.applied > keep_through {
+            return Err(RymeError::Conflict(String::from("committed log suffix")));
+        }
+        let dir = self
+            .meta_path
+            .parent()
+            .ok_or_else(|| RymeError::Internal(String::from("raft wal path")))?;
+        let records = Wal::read_all(dir)?;
+        let mut replacement = Vec::with_capacity(records.len() + entries.len());
+        for record in records {
+            let (index, _, _) = decode_log_frame(&record.payload)?;
+            if index <= keep_through {
+                replacement.push(record);
+            }
+        }
+        let mut next_lsn = match replacement.last() {
+            Some(record) => record
+                .lsn
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("raft wal lsn")))?,
+            None => 0,
+        };
+        for entry in entries {
+            let lsn = next_lsn;
+            next_lsn = next_lsn
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("raft wal lsn")))?;
+            replacement.push(WalRecord {
+                lsn,
+                commit_ts: entry.term,
+                payload: encode_log_frame(entry.index, entry.term, &entry.payload),
+            });
+        }
+        self.wal.replace_records(&replacement)
     }
 
     fn last_position(&self) -> (u64, u64) {
@@ -5927,23 +5964,26 @@ fn append_to_log(
             return Err(RymeError::Unavailable(String::from("missing prefix")));
         };
         if existing.term != prev_term {
-            inner.log.retain(|e| e.index < prev_index);
             return Err(RymeError::Unavailable(String::from("conflict")));
         }
-        inner.log.retain(|e| e.index <= prev_index);
     }
-    let mut fresh: Vec<LogEntry> = Vec::new();
-    for entry in entries {
-        if inner.log.iter().any(|e| e.index == entry.index) {
-            continue;
+    let needs_rewrite = inner.last_index() > prev_index;
+    let mut expected = prev_index.saturating_add(1);
+    for entry in &entries {
+        if entry.index != expected {
+            return Err(RymeError::Unavailable(String::from("log gap")));
         }
-        fresh.push(entry);
+        expected = expected.saturating_add(1);
     }
-    if !fresh.is_empty() {
-        inner.persist_entries(&fresh)?;
-        inner.log.extend(fresh);
-        inner.log.sort_by_key(|e| e.index);
+
+    if needs_rewrite {
+        inner.replace_log_suffix(prev_index, &entries)?;
+        inner.log.retain(|entry| entry.index <= prev_index);
+    } else if !entries.is_empty() {
+        inner.persist_entries(&entries)?;
     }
+    inner.log.extend(entries);
+    inner.log.sort_by_key(|e| e.index);
     let last = inner.last_index();
     if leader_commit > inner.commit_index {
         inner.commit_index = leader_commit.min(last);
@@ -6005,6 +6045,44 @@ mod tests {
 
         let result = Node::open(0, Vec::new(), Vec::new(), &dir);
         assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conflicting_append_rewrites_suffix_and_survives_restart() {
+        let dir = temp_dir("append-conflict");
+        let first =
+            LogEntry { index: 1, term: 1, payload: crate::encode_metadata(b"first").unwrap() };
+        let old_suffix =
+            LogEntry { index: 2, term: 1, payload: crate::encode_metadata(b"old").unwrap() };
+        let replacement =
+            LogEntry { index: 2, term: 2, payload: crate::encode_metadata(b"new").unwrap() };
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            let mut inner = node.inner.try_lock().unwrap();
+            inner.persist_entries(&[first.clone(), old_suffix.clone()]).unwrap();
+            inner.log.extend([first.clone(), old_suffix]);
+            inner.commit_index = 1;
+            inner.term = 2;
+            inner.persist_meta().unwrap();
+            append_to_log(&mut inner, 1, 1, vec![replacement.clone()], 1).unwrap();
+            assert_eq!(inner.log[1].payload, replacement.payload);
+        }
+        let records = ryme_wal::Wal::read_all(&dir).unwrap();
+        let decoded: Vec<LogEntry> = records
+            .iter()
+            .map(|record| {
+                let (index, term, payload) = decode_log_frame(&record.payload).unwrap();
+                LogEntry { index, term, payload }
+            })
+            .collect();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1].payload, replacement.payload);
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let inner = reopened.inner.try_lock().unwrap();
+        assert_eq!(inner.log.len(), 2);
+        assert_eq!(inner.log[1].payload, replacement.payload);
         let _ = std::fs::remove_dir_all(dir);
     }
 
