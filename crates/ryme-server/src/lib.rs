@@ -4417,6 +4417,9 @@ async fn migrate_apply(
         Ok(statement) => statement,
         Err(e) => return error_response(e),
     };
+    if statement.requires_admin() && !principal.can_admin() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     if !statement.is_write() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from(
             "read-only migration",
@@ -7614,6 +7617,9 @@ async fn sql_exec(
         Ok(statement) => statement,
         Err(e) => return error_response(e),
     };
+    if statement.requires_admin() && !principal.can_admin() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     if statement.is_write() && !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
@@ -11544,6 +11550,20 @@ mod realtime_policy_tests {
             Err(ryme_error::RymeError::InvalidArgument(message))
                 if message.contains("RYME_RESP_PASSWORD")
         ));
+    }
+
+    #[test]
+    fn sql_privilege_statements_are_admin_operations() {
+        for sql in [
+            "CREATE ROLE app_reader LOGIN",
+            "DROP ROLE app_reader",
+            "GRANT SELECT ON TABLE messages TO app_reader",
+            "REVOKE SELECT ON TABLE messages FROM app_reader",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_reader",
+        ] {
+            assert!(ryme_sql::parse(sql).unwrap().requires_admin(), "{sql}");
+        }
+        assert!(!ryme_sql::parse("SELECT * FROM messages").unwrap().requires_admin());
     }
 
     #[test]

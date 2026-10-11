@@ -929,6 +929,20 @@ pub type SchemaHook = Arc<
 >;
 
 impl Statement {
+    pub fn requires_admin(&self) -> bool {
+        match self {
+            Self::CreateRole { .. }
+            | Self::DropRole { .. }
+            | Self::PrivilegeChange { .. }
+            | Self::DefaultPrivilegeChange { .. } => true,
+            Self::Returning { statement, .. }
+            | Self::Distinct { statement, .. }
+            | Self::Explain { inner: statement, .. } => statement.requires_admin(),
+            Self::Union { left, right, .. } => left.requires_admin() || right.requires_admin(),
+            _ => false,
+        }
+    }
+
     pub fn is_write(&self) -> bool {
         if let Statement::Explain { inner, analyze, .. } = self {
             return *analyze && inner.is_write();

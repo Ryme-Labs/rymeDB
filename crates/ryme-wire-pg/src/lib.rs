@@ -237,14 +237,7 @@ fn admit_statement(limits: &ConnLimits, statement: &Statement, bytes: u64) -> Op
     if statement.is_write() && !limits.write_allowed {
         return Some(encode_error_code("42501", String::from("permission denied")));
     }
-    if matches!(
-        statement,
-        Statement::CreateRole { .. }
-            | Statement::DropRole { .. }
-            | Statement::PrivilegeChange { .. }
-            | Statement::DefaultPrivilegeChange { .. }
-    ) && !limits.admin_allowed
-    {
+    if statement.requires_admin() && !limits.admin_allowed {
         return Some(encode_error_code("42501", String::from("permission denied")));
     }
     let qos = limits.qos.as_ref()?;
