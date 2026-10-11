@@ -6357,7 +6357,7 @@ async fn forward_broadcast(
             message = receiver.recv() => {
                 match message {
                     Ok(record) => {
-                        let text = serde_json::to_string(&record).unwrap_or_else(|_| String::from("{}"));
+                        let text = record.json_text();
                         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }

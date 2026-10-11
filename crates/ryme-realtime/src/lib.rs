@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +120,20 @@ pub struct BroadcastMsg {
     pub payload: serde_json::Value,
     pub commit_ts: u64,
     pub sequence: u64,
+    #[serde(skip)]
+    json_cache: Arc<OnceLock<String>>,
+}
+
+impl BroadcastMsg {
+    /// Serialize the stable broadcast envelope once and reuse it for every
+    /// websocket subscriber. Each websocket still receives its own owned
+    /// frame, but subscriber fanout no longer repeats JSON traversal and
+    /// encoding for the same payload.
+    pub fn json_text(&self) -> String {
+        self.json_cache
+            .get_or_init(|| serde_json::to_string(self).unwrap_or_else(|_| String::from("{}")))
+            .clone()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -924,13 +938,16 @@ impl Realtime {
         let sequence = self.next_sequence();
         let sender =
             topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
-        let _ = sender.send(BroadcastMsg {
+        let message = BroadcastMsg {
             channel: channel.to_string(),
             from,
             payload,
             commit_ts,
             sequence,
-        });
+            json_cache: Arc::new(OnceLock::new()),
+        };
+        let _ = message.json_text();
+        let _ = sender.send(message);
         Ok(sequence)
     }
 
@@ -954,13 +971,16 @@ impl Realtime {
         self.sequence.fetch_max(sequence, Ordering::Relaxed);
         let sender =
             topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
-        let _ = sender.send(BroadcastMsg {
+        let message = BroadcastMsg {
             channel: channel.to_string(),
             from,
             payload,
             commit_ts,
             sequence,
-        });
+            json_cache: Arc::new(OnceLock::new()),
+        };
+        let _ = message.json_text();
+        let _ = sender.send(message);
         Ok(sequence)
     }
 

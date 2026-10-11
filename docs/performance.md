@@ -51,7 +51,15 @@ The 100-connection, 10,000-publish realtime stress run delivered 1,000,000 of
 1,000,000 expected messages with zero receive errors. It measured approximately
 266k fanout deliveries/s and 1.29k publish requests/s, but publish-to-client
 latency was about 5.3 s p50 and 8.6 s p99 under that burst. Reliability was
-fixed; the low-latency/10k-publish target is not yet met for this workload.
+fixed; the low-latency/10k-publish target is not yet met for that workload.
+
+The current release build also includes a cached broadcast envelope so one
+JSON payload is encoded once and reused across subscribers. A smaller
+20-connection loopback run on the same 12-vCPU machine delivered all 20,000
+messages with zero publish or receive errors at 13,089 publish requests/s and
+2.81 million fanout deliveries/s. Publish-to-client latency was 38.9 ms p50,
+69.6 ms p95, and 77.6 ms p99. This is a separate workload and should not be
+treated as a direct replacement for the 100-connection burst result.
 
 Run it yourself:
 
@@ -59,6 +67,15 @@ Run it yourself:
 ryme-bench realtime --addr 127.0.0.1:8080 --api-key local-dev-key \
   --connections 100 --connection-concurrency 256 --messages 10000 \
   --payload-bytes 128 --json
+```
+
+The cached-envelope run used 20 connections, 64 connection concurrency, 1,000
+messages, and 32 concurrent publishers:
+
+```bash
+ryme-bench realtime --addr 127.0.0.1:8080 --api-key local-dev-key \
+  --connections 20 --connection-concurrency 64 --messages 1000 \
+  --payload-bytes 128 --publish-concurrency 32 --json
 ```
 
 ## How to read the numbers
