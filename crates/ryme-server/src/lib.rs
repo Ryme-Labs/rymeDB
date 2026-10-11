@@ -794,6 +794,21 @@ fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("schema snapshot: {error}")))
 }
 
+fn load_existing_schema_snapshot(
+    path: &std::path::Path,
+) -> ryme_error::Result<ryme_sql::SchemaSnapshot> {
+    match std::fs::metadata(path) {
+        Ok(_) => load_schema_snapshot(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(ryme_error::RymeError::Corrupt(format!(
+                "missing schema snapshot: {}",
+                path.display()
+            )))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn validate_listener_auth(
     config: &Config,
     api_key: Option<&str>,
@@ -3250,10 +3265,8 @@ fn branch_executor(
             );
             let schema_path = state.branch_schema_path(tenant, &branch);
             let mut branch_executor = executor.with_isolated_schema(manager).with_branch(branch);
-            if schema_path.exists() {
-                let snapshot = load_schema_snapshot(&schema_path)?;
-                branch_executor.restore_schema_snapshot(snapshot)?;
-            }
+            let snapshot = load_existing_schema_snapshot(&schema_path)?;
+            branch_executor.restore_schema_snapshot(snapshot)?;
             branch_executor.set_schema_path(schema_path);
             Ok(branch_executor)
         }
@@ -8147,13 +8160,9 @@ async fn branch_create(
         state.executor.schema_snapshot()
     } else {
         let parent_path = state.branch_schema_path(&principal.tenant, &request.parent);
-        if parent_path.exists() {
-            match load_schema_snapshot(&parent_path) {
-                Ok(snapshot) => snapshot,
-                Err(e) => return error_response(e),
-            }
-        } else {
-            state.executor.schema_snapshot()
+        match load_existing_schema_snapshot(&parent_path) {
+            Ok(snapshot) => snapshot,
+            Err(e) => return error_response(e),
         }
     };
     let branch_id = request.id.clone();
@@ -8290,12 +8299,6 @@ async fn branch_reset(
         Ok(branch) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
-                if let Err(e) = ryme_sql::persist_schema_snapshot(
-                    &state.branch_schema_path(&principal.tenant, &id),
-                    &state.executor.schema_snapshot(),
-                ) {
-                    return error_response(e);
-                }
                 (StatusCode::OK, Json(branch)).into_response()
             }
             Err(e) => error_response(e),
@@ -8370,6 +8373,14 @@ async fn promote_branch_data(
     state.backend.commit(write_txn).await
 }
 
+fn install_promoted_schema(
+    state: &SharedState,
+    snapshot: &ryme_sql::SchemaSnapshot,
+) -> ryme_error::Result<()> {
+    state.executor.restore_schema_snapshot(snapshot.clone())?;
+    ryme_sql::persist_schema_snapshot(&state.data_dir.join("schema.json"), snapshot)
+}
+
 async fn branch_promote(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -8382,7 +8393,14 @@ async fn branch_promote(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let child_schema = match load_existing_schema_snapshot(&state.branch_schema_path(&principal.tenant, &id)) {
+        Ok(snapshot) => snapshot,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = promote_branch_data(&state, &principal.tenant, &id).await {
+        return error_response(e);
+    }
+    if let Err(e) = install_promoted_schema(&state, &child_schema) {
         return error_response(e);
     }
     let mut control = match state.control.lock() {
@@ -12412,6 +12430,64 @@ mod realtime_policy_tests {
         let recreated = branch_executor(&state, &headers, "default").unwrap();
         assert!(recreated.catalog_tables().contains(&String::from("branch_only")));
         assert!(!state.executor.catalog_tables().contains(&String::from("branch_only")));
+        std::fs::remove_file(state.branch_schema_path("default", "preview")).unwrap();
+        assert!(branch_executor(&state, &headers, "default").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn branch_schema_promotion_replaces_main_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-branch-schema-promote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("branch-schema-promote");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .executor
+            .execute(ryme_sql::parse("CREATE TABLE main_only (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+
+        {
+            let mut control = state.control.lock().unwrap();
+            let mut branches = control.branches.clone();
+            branches
+                .create_child_for(
+                    "default",
+                    String::from("preview"),
+                    "main",
+                    state.backend.latest_commit(),
+                )
+                .unwrap();
+            branches.persist(&state.branch_path).unwrap();
+            control.branches = branches;
+        }
+        ryme_sql::persist_schema_snapshot(
+            &state.branch_schema_path("default", "preview"),
+            &state.executor.schema_snapshot(),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ryme-branch", axum::http::HeaderValue::from_static("preview"));
+        let branch = branch_executor(&state, &headers, "default").unwrap();
+        branch
+            .execute(ryme_sql::parse("CREATE TABLE branch_only (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        assert!(!state.executor.catalog_tables().contains(&String::from("branch_only")));
+
+        let child_schema = load_existing_schema_snapshot(&state.branch_schema_path("default", "preview"))
+            .unwrap();
+        install_promoted_schema(&state, &child_schema).unwrap();
+        assert!(state.executor.catalog_tables().contains(&String::from("branch_only")));
+        let persisted = load_schema_snapshot(&dir.join("schema.json")).unwrap();
+        assert!(persisted.tables.contains_key("branch_only"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
