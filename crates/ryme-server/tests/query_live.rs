@@ -206,6 +206,68 @@ async fn live_query_snapshot_update_reconnect() {
 }
 
 #[tokio::test]
+async fn live_view_query_updates_from_base_relation() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root =
+        std::env::temp_dir().join(format!("ryme-view-query-{}-{}", std::process::id(), now_ms()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let mut config = test_config(&root);
+    config.pg_listen = pg;
+    config.resp_listen = resp;
+    config.http_listen = http;
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for sql in [
+        "CREATE TABLE messages (id TEXT PRIMARY KEY, room TEXT, body TEXT)",
+        "CREATE VIEW lobby_messages AS SELECT * FROM messages WHERE room = 'lobby'",
+        "INSERT INTO messages (id, room, body) VALUES ('a', 'lobby', 'hello')",
+    ] {
+        let body = serde_json::json!({"sql": sql}).to_string();
+        let (status, response) = http_request(http, "POST /v1/sql", body.as_bytes()).await;
+        assert_eq!(status, 200, "{sql}: {}", String::from_utf8_lossy(&response));
+    }
+
+    let url = format!("ws://{http}/v1/query-stream?table=lobby_messages&limit=100&api_key={KEY}");
+    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let snapshot = next_text(&mut stream).await;
+    assert_eq!(snapshot["type"], "snapshot");
+    assert_eq!(row_pks(&snapshot), vec![String::from("a")], "{snapshot}");
+
+    let body = serde_json::json!({
+        "sql": "INSERT INTO messages (id, room, body) VALUES ('b', 'lobby', 'world')"
+    })
+    .to_string();
+    let (status, response) = http_request(http, "POST /v1/sql", body.as_bytes()).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&response));
+    let update = next_text(&mut stream).await;
+    assert_eq!(update["type"], "update");
+    assert_eq!(row_pks(&update), vec![String::from("a"), String::from("b")], "{update}");
+
+    let body = serde_json::json!({
+        "sql": "INSERT INTO messages (id, room, body) VALUES ('c', 'other', 'hidden')"
+    })
+    .to_string();
+    let (status, response) = http_request(http, "POST /v1/sql", body.as_bytes()).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&response));
+    let update = next_text(&mut stream).await;
+    assert_eq!(update["type"], "update");
+    assert_eq!(row_pks(&update), vec![String::from("a"), String::from("b")], "{update}");
+    stream.close(None).await.unwrap();
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn branch_realtime_streams_are_isolated_and_read_branch_snapshots() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root = std::env::temp_dir().join(format!(

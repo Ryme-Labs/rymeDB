@@ -8111,6 +8111,25 @@ where
         names
     }
 
+    pub fn view_dependencies(&self, name: &str) -> Option<Vec<String>> {
+        self.view_definition(name).ok().flatten().map(|view| view.dependencies)
+    }
+
+    pub async fn realtime_view_rows(
+        &self,
+        name: &str,
+        read_ts: Option<u64>,
+    ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+        if self.view_definition(name)?.is_none() {
+            return Ok(None);
+        }
+        let mut txn = self.begin_with(self.isolation);
+        if let Some(read_ts) = read_ts {
+            txn.restamp(read_ts);
+        }
+        Ok(Some(self.scan_rows_async(&mut txn, name, &[], usize::MAX).await?))
+    }
+
     pub fn catalog_sequences(&self) -> Vec<SequenceDefinition> {
         let Ok(sequences) = self.sequences.lock() else { return Vec::new() };
         let mut definitions: Vec<SequenceDefinition> = sequences.values().cloned().collect();

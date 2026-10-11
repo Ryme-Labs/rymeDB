@@ -9816,10 +9816,12 @@ async fn query_stream(
     let tenant = principal.tenant.clone();
     let database = state.database.clone();
     let table = query.table.clone();
-    let query_spec = ReactiveQuerySpec::from_query(&query);
     let qos = state.qos.clone();
     let rls_executor =
         state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
+    let dependencies =
+        rls_executor.view_dependencies(&table).unwrap_or_else(|| vec![table.clone()]);
+    let query_spec = ReactiveQuerySpec::from_query(&query);
     upgrade.on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_query(
@@ -9834,6 +9836,7 @@ async fn query_stream(
             &branch,
             limit,
             branch_commit,
+            dependencies,
             query_spec,
         )
         .await;
@@ -9853,9 +9856,10 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
     branch: &str,
     limit: usize,
     initial_commit: u64,
+    dependencies: Vec<String>,
     query_spec: ReactiveQuerySpec,
 ) {
-    if query_spec.is_reactive() {
+    if query_spec.is_reactive() || dependencies != vec![table.to_string()] {
         forward_reactive_query(
             socket,
             backend,
@@ -9868,6 +9872,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
             branch,
             limit,
             initial_commit,
+            dependencies,
             query_spec,
         )
         .await;
@@ -9889,7 +9894,8 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
         branch,
         limit,
         current_commit,
-    );
+    )
+    .await;
     if !snapshot_queued {
         return;
     }
@@ -9950,7 +9956,8 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                             branch,
                             limit,
                             current_commit,
-                        );
+                        )
+                        .await;
                         if !queued {
                             break;
                         }
@@ -9990,9 +9997,11 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
     branch: &str,
     limit: usize,
     initial_commit: u64,
+    dependencies: Vec<String>,
     spec: ReactiveQuerySpec,
 ) {
-    let mut receiver = realtime.subscribe_branch(tenant, database, branch, table);
+    let mut receiver =
+        subscribe_reactive_dependencies(&realtime, tenant, database, branch, &dependencies);
     let (sender, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sender);
     let (mut snapshot_commit, snapshot_queued) = send_reactive_query_snapshot(
@@ -10008,7 +10017,8 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
         initial_commit,
         &spec,
         "snapshot",
-    );
+    )
+    .await;
     if !snapshot_queued {
         return;
     }
@@ -10043,16 +10053,21 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
                             change.commit_ts,
                             &spec,
                             "update",
-                        );
+                        )
+                        .await;
                         if !queued {
                             break;
                         }
                         snapshot_commit = commit;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let current_commit = initial_commit.max(
-                            realtime.latest_change_commit_branch(tenant, database, branch, table),
-                        );
+                        let current_commit = initial_commit.max(latest_dependency_commit(
+                            &realtime,
+                            tenant,
+                            database,
+                            branch,
+                            &dependencies,
+                        ));
                         let (commit, queued) = send_reactive_query_snapshot(
                             &outgoing,
                             &backend,
@@ -10066,7 +10081,8 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
                             current_commit,
                             &spec,
                             "snapshot",
-                        );
+                        )
+                        .await;
                         if !queued {
                             break;
                         }
@@ -10091,6 +10107,53 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
             }
         }
     }
+}
+
+fn subscribe_reactive_dependencies(
+    realtime: &Realtime,
+    tenant: &str,
+    database: &str,
+    branch: &str,
+    dependencies: &[String],
+) -> tokio::sync::broadcast::Receiver<ryme_realtime::ChangeRecord> {
+    if dependencies.len() == 1 {
+        return realtime.subscribe_branch(tenant, database, branch, &dependencies[0]);
+    }
+    let (sender, receiver) = tokio::sync::broadcast::channel(256);
+    for dependency in dependencies {
+        let mut source = realtime.subscribe_branch(tenant, database, branch, dependency);
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            loop {
+                match source.recv().await {
+                    Ok(change) => {
+                        if sender.send(change).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+    receiver
+}
+
+fn latest_dependency_commit(
+    realtime: &Realtime,
+    tenant: &str,
+    database: &str,
+    branch: &str,
+    dependencies: &[String],
+) -> u64 {
+    dependencies
+        .iter()
+        .map(|dependency| {
+            realtime.latest_change_commit_branch(tenant, database, branch, dependency)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -10234,7 +10297,43 @@ fn scan_realtime_rows_with_executor<B: TxnBackend>(
     visible
 }
 
-fn send_query_snapshot<B: TxnBackend>(
+async fn scan_realtime_rows_for_query<B: TxnBackend>(
+    backend: &B,
+    rls_executor: &Executor<BranchStorage>,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    limit: usize,
+    read_ts: Option<u64>,
+    filters: &[(String, String)],
+    order: Option<&str>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if rls_executor.view_dependencies(table).is_some() {
+        let rows = rls_executor
+            .realtime_view_rows(table, read_ts)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut rows = filter_rows_by_params(rows, filters);
+        rows = order_rows(rows, order);
+        rows.truncate(limit);
+        return rows;
+    }
+    scan_realtime_rows_with_executor(
+        backend,
+        rls_executor,
+        tenant,
+        database,
+        table,
+        limit,
+        read_ts,
+        filters,
+        order,
+    )
+}
+
+async fn send_query_snapshot<B: TxnBackend>(
     outgoing: &RealtimeOutgoing,
     backend: &B,
     qos: &Arc<Mutex<QosRegistry>>,
@@ -10246,7 +10345,7 @@ fn send_query_snapshot<B: TxnBackend>(
     limit: usize,
     commit: u64,
 ) -> (u64, bool) {
-    let rows = scan_realtime_rows_with_executor(
+    let rows = scan_realtime_rows_for_query(
         backend,
         rls_executor,
         tenant,
@@ -10256,7 +10355,8 @@ fn send_query_snapshot<B: TxnBackend>(
         None,
         &[],
         None,
-    );
+    )
+    .await;
     let snapshot = serde_json::json!({
         "type": "snapshot",
         "commit": commit,
@@ -10276,7 +10376,7 @@ fn send_query_snapshot<B: TxnBackend>(
     (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text)))
 }
 
-fn send_reactive_query_snapshot<B: TxnBackend>(
+async fn send_reactive_query_snapshot<B: TxnBackend>(
     outgoing: &RealtimeOutgoing,
     backend: &B,
     qos: &Arc<Mutex<QosRegistry>>,
@@ -10290,7 +10390,7 @@ fn send_reactive_query_snapshot<B: TxnBackend>(
     spec: &ReactiveQuerySpec,
     kind: &str,
 ) -> (u64, bool) {
-    let rows = scan_realtime_rows_with_executor(
+    let rows = scan_realtime_rows_for_query(
         backend,
         rls_executor,
         tenant,
@@ -10300,7 +10400,8 @@ fn send_reactive_query_snapshot<B: TxnBackend>(
         Some(commit),
         &spec.filters,
         spec.order.as_deref(),
-    );
+    )
+    .await;
     let payload_rows = rows
         .into_iter()
         .map(|(pk, value)| {
