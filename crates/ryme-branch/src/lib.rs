@@ -5,6 +5,17 @@ use std::path::Path;
 
 type BranchChange = (Vec<u8>, Option<Vec<u8>>);
 
+#[cfg(unix)]
+fn sync_branch_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_branch_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Branch {
     pub id: String,
@@ -86,6 +97,9 @@ impl BranchManager {
             file.sync_data()?;
         }
         std::fs::rename(temporary, path)?;
+        if let Some(parent) = path.parent() {
+            sync_branch_directory(parent)?;
+        }
         Ok(())
     }
 

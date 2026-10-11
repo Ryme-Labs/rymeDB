@@ -1098,6 +1098,17 @@ pub struct ClusterReplaceRequest {
     pub members: Vec<ClusterMemberRequest>,
 }
 
+#[cfg(unix)]
+fn sync_metadata_directory(path: &std::path::Path) -> ryme_error::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_metadata_directory(_path: &std::path::Path) -> ryme_error::Result<()> {
+    Ok(())
+}
+
 impl SharedState {
     fn branch_schema_path(&self, tenant: &str, branch: &str) -> std::path::PathBuf {
         let tenant = ryme_auth::base64_url_encode(tenant.as_bytes());
@@ -1138,6 +1149,9 @@ impl SharedState {
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
         std::fs::rename(temporary, &self.auth_path)?;
+        if let Some(parent) = self.auth_path.parent() {
+            sync_metadata_directory(parent)?;
+        }
         Ok(())
     }
 
@@ -1175,6 +1189,9 @@ impl SharedState {
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
         std::fs::rename(temporary, &self.control_path)?;
+        if let Some(parent) = self.control_path.parent() {
+            sync_metadata_directory(parent)?;
+        }
         Ok(())
     }
 
@@ -1199,6 +1216,9 @@ impl SharedState {
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
         std::fs::rename(temporary, &self.durable_path)?;
+        if let Some(parent) = self.durable_path.parent() {
+            sync_metadata_directory(parent)?;
+        }
         Ok(())
     }
 

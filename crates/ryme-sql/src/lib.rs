@@ -815,6 +815,17 @@ fn default_rls_policy_command() -> String {
     String::from("ALL")
 }
 
+#[cfg(unix)]
+fn sync_schema_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_schema_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -834,6 +845,9 @@ pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(temporary, path)?;
+    if let Some(parent) = path.parent() {
+        sync_schema_directory(parent)?;
+    }
     Ok(())
 }
 
