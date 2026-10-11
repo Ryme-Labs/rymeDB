@@ -21,6 +21,7 @@ pub struct Wal {
     active_id: u64,
     active: File,
     next_lsn: u64,
+    poisoned: bool,
 }
 
 impl Wal {
@@ -29,8 +30,24 @@ impl Wal {
         let active_id = latest_segment_id(dir)?;
         let path = dir.join(segment_name(active_id));
         let mut active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
-        let next_lsn = recover_next_lsn(&mut active)?;
-        Ok(Self { dir: dir.to_path_buf(), segment_size_bytes, active_id, active, next_lsn })
+        recover_next_lsn(&mut active)?;
+        let next_lsn = Self::read_all(dir)?
+            .last()
+            .map(|record| {
+                record
+                    .lsn
+                    .checked_add(1)
+                    .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
+            })
+            .unwrap_or(Ok(0))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            segment_size_bytes,
+            active_id,
+            active,
+            next_lsn,
+            poisoned: false,
+        })
     }
 
     pub fn next_lsn(&self) -> u64 {
@@ -38,6 +55,11 @@ impl Wal {
     }
 
     pub fn append(&mut self, commit_ts: u64, payload: &[u8]) -> Result<WalRecord> {
+        if self.poisoned {
+            return Err(RymeError::Unavailable(String::from(
+                "wal append failed; reopen the wal before writing again",
+            )));
+        }
         if payload.len() > u32::MAX as usize {
             return Err(RymeError::InvalidArgument(String::from("payload too large")));
         }
@@ -46,11 +68,19 @@ impl Wal {
             .checked_add(1)
             .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))?;
         let frame = encode_frame(lsn, commit_ts, payload);
-        let active_len = self.active.metadata()?.len();
-        if active_len + frame.len() as u64 > self.segment_size_bytes {
+        let mut active_len = self.active.metadata()?.len();
+        if active_len.saturating_add(frame.len() as u64) > self.segment_size_bytes {
             self.rotate()?;
+            active_len = 0;
         }
-        self.active.write_all(&frame)?;
+        let write_result =
+            write_frame_with_rollback(&mut self.active, &frame, active_len, |file, frame| {
+                file.write_all(frame)
+            });
+        if let Err(error) = write_result {
+            self.poisoned = true;
+            return Err(error.into());
+        }
         self.next_lsn = next_lsn;
         Ok(WalRecord { lsn, commit_ts, payload: payload.to_vec() })
     }
@@ -147,6 +177,15 @@ impl Wal {
         if records.windows(2).any(|pair| pair[0].lsn >= pair[1].lsn) {
             return Err(RymeError::InvalidArgument(String::from("wal lsn order")));
         }
+        let next_lsn = records
+            .last()
+            .map(|record| {
+                record
+                    .lsn
+                    .checked_add(1)
+                    .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
+            })
+            .unwrap_or(Ok(0))?;
         let temporary = self.dir.join(".rewrite");
         if temporary.exists() {
             std::fs::remove_dir_all(&temporary)?;
@@ -181,7 +220,8 @@ impl Wal {
         self.active_id = latest_segment_id(&self.dir)?;
         let active_path = self.dir.join(segment_name(self.active_id));
         self.active = OpenOptions::new().create(true).read(true).append(true).open(active_path)?;
-        self.next_lsn = records.last().map(|record| record.lsn + 1).unwrap_or(0);
+        self.next_lsn = next_lsn;
+        self.poisoned = false;
         Ok(())
     }
 
@@ -191,6 +231,27 @@ impl Wal {
         let path = self.dir.join(segment_name(self.active_id));
         self.active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
         Ok(())
+    }
+}
+
+fn write_frame_with_rollback<F>(
+    file: &mut File,
+    frame: &[u8],
+    offset: u64,
+    mut write: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&mut File, &[u8]) -> std::io::Result<()>,
+{
+    match write(file, frame) {
+        Ok(()) => Ok(()),
+        Err(write_error) => match file.set_len(offset).and_then(|()| file.sync_data()) {
+            Ok(()) => Err(write_error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("WAL append failed ({write_error}); rollback failed ({rollback_error})"),
+            )),
+        },
     }
 }
 
@@ -385,6 +446,72 @@ mod tests {
 
         assert!(matches!(wal.replace_records(&invalid), Err(RymeError::InvalidArgument(_))));
         assert_eq!(Wal::read_all(&dir).unwrap()[0].payload, b"existing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacement_rejects_lsn_overflow_without_changing_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-replace-overflow-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 1024).unwrap();
+        wal.append(1, b"existing").unwrap();
+        wal.sync().unwrap();
+        let invalid = [WalRecord { lsn: u64::MAX, commit_ts: 2, payload: b"overflow".to_vec() }];
+
+        assert!(matches!(wal.replace_records(&invalid), Err(RymeError::Corrupt(_))));
+        assert_eq!(Wal::read_all(&dir).unwrap()[0].payload, b"existing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_uses_previous_segment_when_active_segment_is_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-empty-active-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 1024).unwrap();
+        wal.append(1, b"first").unwrap();
+        wal.sync().unwrap();
+        wal.rotate().unwrap();
+        drop(wal);
+
+        let mut reopened = Wal::open(&dir, 1024).unwrap();
+        assert_eq!(reopened.next_lsn(), 1);
+        reopened.append(2, b"second").unwrap();
+        reopened.sync().unwrap();
+        let records = Wal::read_all(&dir).unwrap();
+        assert_eq!(records.iter().map(|record| record.lsn).collect::<Vec<_>>(), vec![0, 1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_partial_frame_write_rolls_back_to_record_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-partial-write-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(segment_name(0));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"valid-prefix").unwrap();
+        file.sync_data().unwrap();
+        let offset = file.metadata().unwrap().len();
+        let result =
+            write_frame_with_rollback(&mut file, b"partial-frame", offset, |file, frame| {
+                file.write_all(&frame[..5])?;
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure"))
+            });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"valid-prefix");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
