@@ -513,6 +513,8 @@ pub enum Statement {
     Explain {
         plan: String,
         inner: Box<Statement>,
+        #[serde(default)]
+        analyze: bool,
     },
     Distinct {
         statement: Box<Statement>,
@@ -769,6 +771,9 @@ pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result
 
 impl Statement {
     pub fn is_write(&self) -> bool {
+        if let Statement::Explain { inner, analyze, .. } = self {
+            return *analyze && inner.is_write();
+        }
         matches!(
             self,
             Statement::CreateSchema { .. }
@@ -822,6 +827,24 @@ pub enum QueryResult {
     Scalar { label: String, value: Vec<u8> },
     Returning { columns: Vec<String>, rows: Vec<Vec<Vec<u8>>> },
     Table { columns: Vec<String>, rows: Vec<Vec<Vec<u8>>> },
+}
+
+fn explain_analyze_result(
+    plan: String,
+    result: &QueryResult,
+    changes: usize,
+    elapsed: std::time::Duration,
+) -> QueryResult {
+    let result_rows = match result {
+        QueryResult::Ok => 0,
+        QueryResult::Row { .. } | QueryResult::Scalar { .. } => 1,
+        QueryResult::Rows { rows } => rows.len(),
+        QueryResult::Returning { rows, .. } | QueryResult::Table { rows, .. } => rows.len(),
+    };
+    let rows = changes.max(result_rows);
+    let value =
+        format!("{plan}\nactual rows={rows} duration_us={}", elapsed.as_micros()).into_bytes();
+    QueryResult::Row { pk: b"plan".to_vec(), value }
 }
 
 /// Internal marker used for SQL NULL cells in byte-oriented query results.
@@ -5842,19 +5865,31 @@ fn parse_copy(tokens: &[String]) -> Result<Statement> {
 fn parse_explain(input: &str) -> Result<Statement> {
     let trimmed = input.trim();
     let inner_sql = trimmed
-        .strip_prefix("EXPLAIN")
-        .or_else(|| trimmed.strip_prefix("explain"))
-        .or_else(|| trimmed.strip_prefix("Explain"))
+        .get("EXPLAIN".len()..)
+        .filter(|_| trimmed[.."EXPLAIN".len()].eq_ignore_ascii_case("EXPLAIN"))
         .unwrap_or("")
-        .trim()
-        .trim_start_matches([':', ';', ' '])
-        .to_string();
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, ':' | ';')
+        });
     if inner_sql.is_empty() {
         return Err(RymeError::InvalidArgument(String::from("explain input")));
     }
-    let inner = parse(&inner_sql)?;
+    let (analyze, inner_sql) = if inner_sql
+        .split_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("ANALYZE"))
+    {
+        let offset = inner_sql.find(char::is_whitespace).unwrap_or(inner_sql.len());
+        (true, inner_sql[offset..].trim_start())
+    } else {
+        (false, inner_sql)
+    };
+    if inner_sql.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("explain input")));
+    }
+    let inner = parse(inner_sql)?;
     let plan = describe_plan(&inner);
-    Ok(Statement::Explain { plan, inner: Box::new(inner) })
+    Ok(Statement::Explain { plan, inner: Box::new(inner), analyze })
 }
 
 pub fn describe_plan(statement: &Statement) -> String {
@@ -6083,7 +6118,9 @@ pub fn describe_plan(statement: &Statement) -> String {
                 filter.len()
             )
         }
-        Statement::Explain { plan, .. } => format!("explain({plan})"),
+        Statement::Explain { plan, analyze, .. } => {
+            format!("explain{}({plan})", if *analyze { " analyze" } else { "" })
+        }
         Statement::Distinct { statement, limit, offset } => {
             format!("distinct({}) limit {limit} offset {offset}", describe_plan(statement))
         }
@@ -11391,10 +11428,21 @@ where
                 )?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
-            Statement::Explain { plan, .. } => Ok((
-                QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() },
-                Vec::new(),
-            )),
+            Statement::Explain { plan, inner, analyze } => {
+                if !analyze {
+                    return Ok((
+                        QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() },
+                        Vec::new(),
+                    ));
+                }
+                let started = std::time::Instant::now();
+                let (result, changes) = Box::pin(self.execute_in_transaction(txn, *inner)).await?;
+                let change_count = changes.len();
+                Ok((
+                    explain_analyze_result(plan, &result, change_count, started.elapsed()),
+                    changes,
+                ))
+            }
             Statement::CopyFrom { table, columns, rows } => {
                 self.reject_if_read_only()?;
                 if rows.len() > 10000 {
@@ -13565,8 +13613,13 @@ where
                 self.bulk_upsert(table, rows).await?;
                 Ok(QueryResult::Ok)
             }
-            Statement::Explain { plan, .. } => {
-                Ok(QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() })
+            Statement::Explain { plan, inner, analyze } => {
+                if !analyze {
+                    return Ok(QueryResult::Row { pk: b"plan".to_vec(), value: plan.into_bytes() });
+                }
+                let started = std::time::Instant::now();
+                let result = Box::pin(self.execute_with(*inner, isolation)).await?;
+                Ok(explain_analyze_result(plan, &result, 0, started.elapsed()))
             }
             Statement::InsertRow {
                 table,
@@ -17474,6 +17527,36 @@ mod tests {
         assert!(plan.contains("point_lookup"));
         let nested = parse("EXPLAIN SELECT * FROM docs LIMIT 10").unwrap();
         assert!(matches!(nested, Statement::Explain { .. }));
+        let analyzed = parse("EXPLAIN ANALYZE SELECT * FROM docs LIMIT 10").unwrap();
+        assert!(matches!(analyzed, Statement::Explain { analyze: true, .. }));
+        assert!(!analyzed.is_write());
+        assert!(parse("explain analyze insert into docs key 'k' value 'v'").unwrap().is_write());
+    }
+
+    #[tokio::test]
+    async fn explain_analyze_executes_inner_statement() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("INSERT INTO docs KEY 'k' VALUE 'v'").unwrap()).await.unwrap();
+
+        let result = executor
+            .execute(parse("EXPLAIN ANALYZE SELECT * FROM docs KEY 'k'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Row { value, .. }
+                if String::from_utf8_lossy(&value).contains("actual rows=1")
+                    && String::from_utf8_lossy(&value).contains("duration_us=")
+        ));
+
+        executor
+            .execute(parse("EXPLAIN ANALYZE UPSERT INTO docs KEY 'k' VALUE 'updated'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            executor.execute(parse("SELECT * FROM docs KEY 'k'").unwrap()).await.unwrap(),
+            QueryResult::Row { value, .. } if value == b"updated"
+        ));
     }
 
     #[tokio::test]
