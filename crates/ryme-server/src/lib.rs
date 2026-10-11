@@ -8321,10 +8321,20 @@ fn range_owners(ranges: &[Range]) -> Vec<RangeOwner> {
         .iter()
         .filter_map(|range| {
             let owner = range.leader.strip_prefix("raft-")?.parse().ok()?;
+            let mut replicas: Vec<usize> = range
+                .replicas
+                .iter()
+                .filter_map(|replica| replica.strip_prefix("raft-")?.parse().ok())
+                .collect();
+            if replicas.is_empty() {
+                replicas.push(owner);
+            }
             Some(RangeOwner {
+                id: range.id.clone(),
                 start: range.start.clone(),
                 end: range.end.clone(),
                 owner,
+                replicas,
                 epoch: range.epoch,
             })
         })
@@ -10607,9 +10617,11 @@ mod realtime_policy_tests {
         );
         node.manager().commit(txn).unwrap();
         node.set_range_owners(vec![RangeOwner {
+            id: String::from("docs"),
             start: b"docs\0".to_vec(),
             end: b"docs\x01".to_vec(),
             owner: 0,
+            replicas: vec![0],
             epoch: 1,
         }]);
 

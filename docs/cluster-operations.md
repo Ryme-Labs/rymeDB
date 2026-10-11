@@ -130,7 +130,7 @@ cluster: the set changes atomically instead of passing through an intermediate
 ## Placement ranges
 
 The control plane keeps an ordered key-range map (`ryme_router::Router`):
-every range has an id, start/end key, leader and epoch. Reads need any valid
+every range has an id, start/end key, leader, replica set and epoch. Reads need any valid
 credential; splits, merges, and autosplit triggers need an `Owner`/`Admin`
 principal (`403` otherwise). Authentication runs before body parsing, so unauthenticated
 calls get `401` even with a malformed body, and malformed bodies from
@@ -211,6 +211,11 @@ scans through HTTP, native, gRPC, GraphQL, and PostgREST fan out to owners and
 merge bounded pages by primary key. Followers with a complete range map now
 materialize live committed writes only for their local owners while retaining
 global conflict metadata; leaders and recovery still keep the complete state.
+Each configured range replica also receives the committed range write set over
+a range-scoped append RPC. The owner syncs its range WAL before acknowledging
+a replica quorum, and startup replays those records before serving reads. This
+gives the current placement map a durable replica-materialization path without
+claiming that the range logs elect leaders independently.
 This does not yet delete source replicas or claim full shared-nothing storage
 scale. Single-owner write-only transactions now route through the configured
 owner and then the current Raft leader; read-dependent, multi-owner, and

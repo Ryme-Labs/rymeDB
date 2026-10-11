@@ -43,6 +43,8 @@ pub struct Range {
     pub start: Vec<u8>,
     pub end: Vec<u8>,
     pub leader: String,
+    #[serde(default)]
+    pub replicas: Vec<String>,
     pub epoch: u64,
     #[serde(skip, default = "fresh_load")]
     pub load: Arc<AtomicU64>,
@@ -54,7 +56,7 @@ fn fresh_load() -> Arc<AtomicU64> {
 
 impl Range {
     pub fn new(id: String, start: Vec<u8>, end: Vec<u8>, leader: String, epoch: u64) -> Self {
-        Self { id, start, end, leader, epoch, load: fresh_load() }
+        Self { id, start, end, replicas: vec![leader.clone()], leader, epoch, load: fresh_load() }
     }
 
     pub fn writes(&self) -> u64 {
@@ -68,6 +70,7 @@ impl PartialEq for Range {
             && self.start == other.start
             && self.end == other.end
             && self.leader == other.leader
+            && self.replicas == other.replicas
             && self.epoch == other.epoch
     }
 }
@@ -165,6 +168,7 @@ impl Router {
                 start: original.start.clone(),
                 end: mid.clone(),
                 leader: original.leader.clone(),
+                replicas: original.replicas.clone(),
                 epoch: original.epoch + 1,
                 load: fresh_load(),
             },
@@ -176,6 +180,7 @@ impl Router {
                 start: mid,
                 end: original.end,
                 leader: original.leader,
+                replicas: original.replicas,
                 epoch: original.epoch + 1,
                 load: fresh_load(),
             },
@@ -201,6 +206,10 @@ impl Router {
         self.ranges.remove(&left.start);
         self.ranges.remove(&right.start);
         let epoch = left.epoch.max(right.epoch) + 1;
+        let mut replicas = left.replicas.clone();
+        replicas.extend(right.replicas);
+        replicas.sort();
+        replicas.dedup();
         self.ranges.insert(
             left.start.clone(),
             Range {
@@ -208,6 +217,7 @@ impl Router {
                 start: left.start,
                 end: right.end,
                 leader: left.leader,
+                replicas,
                 epoch,
                 load: fresh_load(),
             },
@@ -222,6 +232,11 @@ impl Router {
             return Err(RymeError::InvalidArgument(String::from("leader")));
         }
         range.leader = leader;
+        if !range.replicas.contains(&range.leader) {
+            range.replicas.push(range.leader.clone());
+            range.replicas.sort();
+            range.replicas.dedup();
+        }
         range.epoch = range.epoch.saturating_add(1);
         self.insert(range.clone());
         Ok(range)
@@ -239,6 +254,7 @@ mod tests {
             start: Vec::new(),
             end: Vec::new(),
             leader: String::from("n1"),
+            replicas: vec![String::from("n1")],
             epoch: 0,
             load: fresh_load(),
         });
@@ -283,6 +299,7 @@ mod tests {
             start: Vec::new(),
             end: b"m".to_vec(),
             leader: String::from("n1"),
+            replicas: vec![String::from("n1")],
             epoch: 0,
             load: fresh_load(),
         });
@@ -291,6 +308,7 @@ mod tests {
             start: b"z".to_vec(),
             end: Vec::new(),
             leader: String::from("n1"),
+            replicas: vec![String::from("n1")],
             epoch: 0,
             load: fresh_load(),
         });
@@ -300,6 +318,7 @@ mod tests {
             start: b"m".to_vec(),
             end: b"z".to_vec(),
             leader: String::from("n2"),
+            replicas: vec![String::from("n2")],
             epoch: 0,
             load: fresh_load(),
         });

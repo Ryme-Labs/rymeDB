@@ -111,9 +111,11 @@ async fn backend_replicates_and_fails_over() {
     assert_eq!(filtered_snapshot.rows.len(), 1);
     assert_eq!(nodes[first].install_range_snapshot_on(target, snapshot).await.unwrap(), 1);
     nodes[first].set_range_owners(vec![RangeOwner {
+        id: String::from("range-test"),
         start: b"s\0".to_vec(),
         end: Vec::new(),
         owner: target,
+        replicas: vec![first, target],
         epoch: 1,
     }]);
     assert_eq!(nodes[first].range_owner(b"s\0k"), Some((target, 1)));
@@ -173,7 +175,14 @@ async fn configured_range_owner_limits_follower_materialization() {
     let owner = (leader + 1) % nodes.len();
     let mut start = b"s".to_vec();
     start.push(0);
-    let placement = RangeOwner { start, end: Vec::new(), owner, epoch: 1 };
+    let placement = RangeOwner {
+        id: String::from("range-owned"),
+        start,
+        end: Vec::new(),
+        owner,
+        replicas: vec![leader, owner],
+        epoch: 1,
+    };
     for node in &nodes {
         node.set_range_owners(vec![placement.clone()]);
     }
@@ -241,7 +250,14 @@ async fn single_owner_write_from_follower_routes_through_mesh() {
     let client = (leader + 2) % nodes.len();
     let mut start = b"s".to_vec();
     start.push(0);
-    let placement = RangeOwner { start, end: Vec::new(), owner, epoch: 1 };
+    let placement = RangeOwner {
+        id: String::from("range-routed"),
+        start,
+        end: Vec::new(),
+        owner,
+        replicas: vec![leader, owner],
+        epoch: 1,
+    };
     for node in &nodes {
         node.set_range_owners(vec![placement.clone()]);
     }
@@ -313,8 +329,22 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
     start.push(0);
     let upper_start = split.clone();
     let placement = vec![
-        RangeOwner { start, end: split, owner: leader, epoch: 1 },
-        RangeOwner { start: upper_start, end: Vec::new(), owner: upper_owner, epoch: 1 },
+        RangeOwner {
+            id: String::from("left"),
+            start,
+            end: split,
+            owner: leader,
+            replicas: vec![leader, upper_owner],
+            epoch: 1,
+        },
+        RangeOwner {
+            id: String::from("right"),
+            start: upper_start,
+            end: Vec::new(),
+            owner: upper_owner,
+            replicas: vec![leader, upper_owner],
+            epoch: 1,
+        },
     ];
     for node in &nodes {
         node.set_range_owners(placement.clone());
@@ -341,6 +371,17 @@ async fn multi_range_write_only_transaction_forwards_to_leader() {
     }
     assert_eq!(nodes[client].read_latest(&key("a")).await.unwrap(), None);
     assert_eq!(nodes[client].read_latest(&key("z")).await.unwrap(), None);
+
+    let replica_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let left_replica = nodes[upper_owner].read_latest(&key("a")).await.unwrap();
+        let right_replica = nodes[leader].read_latest(&key("z")).await.unwrap();
+        if left_replica == Some(b"left".to_vec()) && right_replica == Some(b"right".to_vec()) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < replica_deadline, "range replica did not converge");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let mut routed_scan = backends[client].begin();
     let first_page = backends[client].scan_async(&mut routed_scan, "t", "d", "s", 2).await.unwrap();
@@ -522,8 +563,22 @@ fn range_owner_respects_half_open_bounds() {
     let _ = std::fs::remove_dir_all(&root);
     let node = Node::open(0, Vec::new(), Vec::new(), &root).unwrap();
     node.set_range_owners(vec![
-        RangeOwner { start: b"a".to_vec(), end: b"m".to_vec(), owner: 1, epoch: 4 },
-        RangeOwner { start: b"m".to_vec(), end: Vec::new(), owner: 2, epoch: 5 },
+        RangeOwner {
+            id: String::from("left"),
+            start: b"a".to_vec(),
+            end: b"m".to_vec(),
+            owner: 1,
+            replicas: vec![1, 2],
+            epoch: 4,
+        },
+        RangeOwner {
+            id: String::from("right"),
+            start: b"m".to_vec(),
+            end: Vec::new(),
+            owner: 2,
+            replicas: vec![1, 2],
+            epoch: 5,
+        },
     ]);
     assert_eq!(node.range_owner(b"a"), Some((1, 4)));
     assert_eq!(node.range_owner(b"l"), Some((1, 4)));

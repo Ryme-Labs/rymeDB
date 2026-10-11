@@ -1,5 +1,12 @@
 # Changelog
 
+- Range placement now carries stable range ids and configured replica sets.
+  After the global Raft decision commits, the range owner appends each affected
+  write set to a synced range WAL and sends range-append quorum RPCs to its
+  replicas. Recovery replays those range records, routed reads use the owner’s
+  durable view, and follower writes avoid a mesh forwarding cycle. Independent
+  per-range elections and Raft logs are still future work; the global Raft log
+  remains the decision authority.
 - Multi-owner cluster transactions now run an explicit participant protocol:
   range owners durably prepare transaction state in intent WALs before the
   coordinator records the global Raft decision, then resolve those intents on

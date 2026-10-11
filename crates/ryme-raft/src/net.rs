@@ -124,6 +124,28 @@ pub(crate) enum Rpc {
         resolved: bool,
         error: Option<RpcError>,
     },
+    RangeCommit {
+        group_id: String,
+        commit_ts: u64,
+        writes: Vec<u8>,
+    },
+    RangeCommitResponse {
+        committed: bool,
+        error: Option<RpcError>,
+    },
+    RangeAppend {
+        group_id: String,
+        index: u64,
+        term: u64,
+        leader: usize,
+        commit_ts: u64,
+        writes: Vec<u8>,
+    },
+    RangeAppendResponse {
+        appended: bool,
+        last_index: u64,
+        error: Option<RpcError>,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -216,9 +238,13 @@ pub struct RangeSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RangeOwner {
+    #[serde(default)]
+    pub id: String,
     pub start: Vec<u8>,
     pub end: Vec<u8>,
     pub owner: usize,
+    #[serde(default)]
+    pub replicas: Vec<usize>,
     pub epoch: u64,
 }
 
@@ -232,6 +258,24 @@ enum IntentRecord {
 struct PreparedIntent {
     commit_ts: u64,
     state: ryme_txn::TransactionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RangeLogRecord {
+    group_id: String,
+    index: u64,
+    term: u64,
+    commit_ts: u64,
+    writes: Vec<u8>,
+}
+
+fn derived_range_id(start: &[u8], end: &[u8], epoch: u64) -> String {
+    let mut hash = 0xcbf29ce484222325u64 ^ epoch;
+    for byte in start.iter().chain([0xff].iter()).chain(end.iter()) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("range-{hash:016x}")
 }
 
 fn next_prefix(prefix: &[u8]) -> Vec<u8> {
@@ -650,6 +694,8 @@ pub struct Node {
     range_generation: AtomicU64,
     prepared: std::sync::Mutex<BTreeMap<u128, PreparedIntent>>,
     intent_wal: std::sync::Mutex<Wal>,
+    range_logs: std::sync::Mutex<BTreeMap<String, u64>>,
+    range_wal: std::sync::Mutex<Wal>,
 }
 
 impl Node {
@@ -739,6 +785,14 @@ impl Node {
                 }
             }
         }
+        let range_dir = dir.join("range-wal");
+        let range_wal = Wal::open(&range_dir, 64 * 1024 * 1024)?;
+        let mut range_records = Vec::new();
+        for record in Wal::read_all(&range_dir)? {
+            let range_record: RangeLogRecord = serde_json::from_slice(&record.payload)
+                .map_err(|error| RymeError::Corrupt(format!("range log: {error}")))?;
+            range_records.push(range_record);
+        }
         let manager = TxnManager::new();
         let mut log: Vec<LogEntry> = Vec::new();
         for record in records {
@@ -771,6 +825,13 @@ impl Node {
                 ApplyPayload::Topic { .. } => {}
             }
             applied = entry.index;
+        }
+        let mut range_logs = BTreeMap::new();
+        for range_record in range_records {
+            let writes = decode_writes(&range_record.writes)?;
+            manager.replay_at(range_record.commit_ts, &writes)?;
+            let last = range_logs.entry(range_record.group_id).or_insert(0);
+            *last = (*last).max(range_record.index);
         }
         if let Some(change) = replayed {
             members = normalize_members(change.old.clone());
@@ -829,6 +890,8 @@ impl Node {
             range_generation: AtomicU64::new(0),
             prepared: std::sync::Mutex::new(prepared),
             intent_wal: std::sync::Mutex::new(intent_wal),
+            range_logs: std::sync::Mutex::new(range_logs),
+            range_wal: std::sync::Mutex::new(range_wal),
         });
         for commit_ts in replayed_commit_ts {
             node.clear_prepared_for_commit(commit_ts)?;
@@ -1550,6 +1613,26 @@ impl Node {
                     }),
                 }
             }
+            Rpc::RangeCommit { group_id, commit_ts, writes } => {
+                match self.commit_range_group(&group_id, commit_ts, &writes).await {
+                    Ok(()) => Ok(Rpc::RangeCommitResponse { committed: true, error: None }),
+                    Err(error) => {
+                        Ok(Rpc::RangeCommitResponse { committed: false, error: Some(error.into()) })
+                    }
+                }
+            }
+            Rpc::RangeAppend { group_id, index, term, leader: _, commit_ts, writes } => {
+                match self.append_range_local(&group_id, index, term, commit_ts, &writes) {
+                    Ok(last_index) => {
+                        Ok(Rpc::RangeAppendResponse { appended: true, last_index, error: None })
+                    }
+                    Err(error) => Ok(Rpc::RangeAppendResponse {
+                        appended: false,
+                        last_index: self.range_last_index(&group_id),
+                        error: Some(error.into()),
+                    }),
+                }
+            }
             Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows, tenant, database } => {
                 let snapshot = self.snapshot_range_for(
                     &start,
@@ -1657,6 +1740,12 @@ impl Node {
             Rpc::ResolveTransactionResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
+            Rpc::RangeCommitResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
+            Rpc::RangeAppendResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
         }
     }
 
@@ -1755,18 +1844,8 @@ impl Node {
         if self.is_leader().await {
             return self.propose_write_with_generation(writes, route_generation).await;
         }
-        if owner == self.id {
-            return self.forward_write_to_leader(writes, route_generation).await;
-        }
-        let pool = self
-            .pool_for(owner)
-            .ok_or_else(|| RymeError::Unavailable(String::from("range owner unavailable")))?;
-        let payload = encode_writes(&writes)?;
-        match pool.roundtrip(&Rpc::ProposeWrite { payload, route_generation }).await? {
-            Rpc::ProposeWriteResponse { commit_ts: Some(commit_ts), error: None } => Ok(commit_ts),
-            Rpc::ProposeWriteResponse { error: Some(error), .. } => Err(error.into()),
-            _ => Err(RymeError::Corrupt(String::from("range write rpc"))),
-        }
+        let _ = owner;
+        self.forward_write_to_leader(writes, route_generation).await
     }
 
     pub async fn propose_write_to_leader(
@@ -1932,6 +2011,172 @@ impl Node {
         Ok(())
     }
 
+    fn range_for_record(&self, key: &RecordKey) -> Option<RangeOwner> {
+        let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
+        routing.extend_from_slice(key.table.as_bytes());
+        routing.push(0);
+        routing.extend_from_slice(&key.pk);
+        self.range_owners().into_iter().find(|range| {
+            routing.as_slice() >= range.start.as_slice()
+                && (range.end.is_empty() || routing.as_slice() < range.end.as_slice())
+        })
+    }
+
+    fn range_last_index(&self, group_id: &str) -> u64 {
+        self.range_logs.lock().ok().and_then(|logs| logs.get(group_id).copied()).unwrap_or(0)
+    }
+
+    fn append_range_local(
+        &self,
+        group_id: &str,
+        index: u64,
+        term: u64,
+        commit_ts: u64,
+        encoded_writes: &[u8],
+    ) -> Result<u64> {
+        let writes = decode_writes(encoded_writes)?;
+        let mut logs =
+            self.range_logs.lock().map_err(|_| RymeError::Internal(String::from("range log")))?;
+        let last = logs.get(group_id).copied().unwrap_or(0);
+        if index <= last {
+            return Ok(last);
+        }
+        if index != last + 1 {
+            return Err(RymeError::Unavailable(String::from("range log gap")));
+        }
+        let record = serde_json::to_vec(&RangeLogRecord {
+            group_id: group_id.to_string(),
+            index,
+            term,
+            commit_ts,
+            writes: encoded_writes.to_vec(),
+        })
+        .map_err(|error| RymeError::Internal(format!("range log: {error}")))?;
+        let mut wal =
+            self.range_wal.lock().map_err(|_| RymeError::Internal(String::from("range wal")))?;
+        wal.append(commit_ts, &record)?;
+        wal.sync()?;
+        self.manager.replay_at(commit_ts, &writes)?;
+        logs.insert(group_id.to_string(), index);
+        Ok(index)
+    }
+
+    fn range_owner_by_id(&self, group_id: &str) -> Option<RangeOwner> {
+        self.range_owners().into_iter().find(|range| range.id == group_id)
+    }
+
+    async fn replicate_range_group(
+        self: &Arc<Self>,
+        group_id: &str,
+        commit_ts: u64,
+        encoded_writes: &[u8],
+    ) -> Result<()> {
+        let range = self
+            .range_owner_by_id(group_id)
+            .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
+        if range.owner != self.id {
+            return Err(RymeError::Unavailable(String::from("not range leader")));
+        }
+        let mut replicas = range.replicas;
+        if replicas.is_empty() {
+            replicas.push(range.owner);
+        }
+        if !replicas.contains(&self.id) {
+            return Err(RymeError::Unavailable(String::from("range replica")));
+        }
+        replicas.sort_unstable();
+        replicas.dedup();
+        let index = self.range_last_index(group_id) + 1;
+        let term = self.inner.lock().await.term.max(1);
+        self.append_range_local(group_id, index, term, commit_ts, encoded_writes)?;
+        let mut acknowledgements = 1usize;
+        for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
+            let Some(pool) = self.pool_for(replica) else { continue };
+            let response = pool
+                .roundtrip(&Rpc::RangeAppend {
+                    group_id: group_id.to_string(),
+                    index,
+                    term,
+                    leader: self.id,
+                    commit_ts,
+                    writes: encoded_writes.to_vec(),
+                })
+                .await;
+            if matches!(
+                response,
+                Ok(Rpc::RangeAppendResponse { appended: true, last_index, error: None })
+                    if last_index >= index
+            ) {
+                acknowledgements += 1;
+            }
+        }
+        if acknowledgements < replicas.len() / 2 + 1 {
+            return Err(RymeError::Unavailable(String::from("range quorum")));
+        }
+        Ok(())
+    }
+
+    async fn commit_range_group(
+        self: &Arc<Self>,
+        group_id: &str,
+        commit_ts: u64,
+        encoded_writes: &[u8],
+    ) -> Result<()> {
+        self.replicate_range_group(group_id, commit_ts, encoded_writes).await
+    }
+
+    async fn append_range_on(
+        self: &Arc<Self>,
+        owner: usize,
+        group_id: &str,
+        commit_ts: u64,
+        encoded_writes: &[u8],
+    ) -> Result<()> {
+        if owner == self.id {
+            return self.commit_range_group(group_id, commit_ts, encoded_writes).await;
+        }
+        let pool = self
+            .pool_for(owner)
+            .ok_or_else(|| RymeError::Unavailable(String::from("range leader unavailable")))?;
+        match pool
+            .roundtrip(&Rpc::RangeCommit {
+                group_id: group_id.to_string(),
+                commit_ts,
+                writes: encoded_writes.to_vec(),
+            })
+            .await?
+        {
+            Rpc::RangeCommitResponse { committed: true, error: None } => Ok(()),
+            Rpc::RangeCommitResponse { error: Some(error), .. } => Err(error.into()),
+            _ => Err(RymeError::Corrupt(String::from("range commit rpc"))),
+        }
+    }
+
+    async fn publish_range_writes(
+        self: &Arc<Self>,
+        commit_ts: u64,
+        writes: &BTreeMap<RecordKey, ryme_txn::WriteOp>,
+    ) -> Result<()> {
+        if self.range_owners().is_empty() {
+            return Ok(());
+        }
+        let mut groups: BTreeMap<String, (usize, BTreeMap<RecordKey, ryme_txn::WriteOp>)> =
+            BTreeMap::new();
+        for (key, op) in writes {
+            let Some(range) = self.range_for_record(key) else { continue };
+            groups
+                .entry(range.id)
+                .or_insert_with(|| (range.owner, BTreeMap::new()))
+                .1
+                .insert(key.clone(), op.clone());
+        }
+        for (group_id, (owner, writes)) in groups {
+            let encoded = encode_writes(&writes)?;
+            self.append_range_on(owner, &group_id, commit_ts, &encoded).await?;
+        }
+        Ok(())
+    }
+
     pub fn transaction_participants(&self, txn: &ryme_txn::Transaction) -> BTreeSet<usize> {
         let ranges = self.range_owners();
         if ranges.is_empty() {
@@ -2010,16 +2255,40 @@ impl Node {
         }
     }
 
+    async fn commit_global_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
+        let writes = txn.writes().clone();
+        let result = self
+            .manager
+            .commit_with(txn, |commit_ts, encoded| async move {
+                self.replicate_frame(commit_ts, encoded).await.map(|_| ())
+            })
+            .await;
+        if let Ok(commit_ts) = result {
+            if let Err(error) = self.publish_range_writes(commit_ts, &writes).await {
+                tracing::error!(commit_ts, %error, "range replica publish failed after global commit");
+            }
+        }
+        result
+    }
+
     async fn commit_txn_at(
         self: &Arc<Self>,
         txn: ryme_txn::Transaction,
         commit_ts: u64,
     ) -> Result<u64> {
-        self.manager
+        let writes = txn.writes().clone();
+        let result = self
+            .manager
             .commit_at_with(txn, commit_ts, |commit_ts, encoded| async move {
                 self.replicate_frame(commit_ts, encoded).await.map(|_| ())
             })
-            .await
+            .await;
+        if let Ok(commit_ts) = result {
+            if let Err(error) = self.publish_range_writes(commit_ts, &writes).await {
+                tracing::error!(commit_ts, %error, "range replica publish failed after global commit");
+            }
+        }
+        result
     }
 
     async fn commit_distributed_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
@@ -2028,12 +2297,7 @@ impl Node {
         }
         let participants = self.transaction_participants(&txn);
         if participants.len() < 2 {
-            return self
-                .manager
-                .commit_with(txn, |commit_ts, encoded| async move {
-                    self.replicate_frame(commit_ts, encoded).await.map(|_| ())
-                })
-                .await;
+            return self.commit_global_txn(txn).await;
         }
         let transaction_id = self.intent_id(&txn);
         let commit_ts = self.manager.reserve(&txn)?;
@@ -2077,11 +2341,7 @@ impl Node {
         if self.transaction_participants(&txn).len() > 1 {
             return self.commit_distributed_txn(txn).await;
         }
-        self.manager
-            .commit_with(txn, |commit_ts, encoded| async move {
-                self.replicate_frame(commit_ts, encoded).await.map(|_| ())
-            })
-            .await
+        self.commit_global_txn(txn).await
     }
 
     async fn replicate_frame(self: &Arc<Self>, commit_ts: u64, encoded: Vec<u8>) -> Result<()> {
@@ -2740,6 +3000,19 @@ impl Node {
     }
 
     pub fn set_range_owners(&self, mut owners: Vec<RangeOwner>) {
+        for range in &mut owners {
+            if range.id.is_empty() {
+                range.id = derived_range_id(&range.start, &range.end, range.epoch);
+            }
+            if range.replicas.is_empty() {
+                range.replicas.push(range.owner);
+            }
+            if !range.replicas.contains(&range.owner) {
+                range.replicas.push(range.owner);
+            }
+            range.replicas.sort_unstable();
+            range.replicas.dedup();
+        }
         owners.sort_by(|left, right| left.start.cmp(&right.start));
         if let Ok(mut current) = self.range_owners.write() {
             if *current == owners {
@@ -2954,7 +3227,10 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             if txn.writes().contains_key(key) {
                 return node.manager().get(txn, key);
             }
-            let (value, _) = node.fetch_range_value(owner, key.clone(), txn.read_ts).await?;
+            // The routing replica may observe the global commit after the client
+            // replica does. Ask the range owner for its current durable view so a
+            // successful write is immediately visible through a routed read.
+            let (value, _) = node.fetch_range_value(owner, key.clone(), 0).await?;
             txn.record_read(key.clone(), value.is_some());
             Ok(value)
         })
@@ -2971,8 +3247,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
     {
         let node = self.node.clone();
         Box::pin(async move {
-            let page =
-                node.scan_range_page(tenant, database, table, None, txn.read_ts, limit).await?;
+            let page = node.scan_range_page(tenant, database, table, None, 0, limit).await?;
             let Some(page) = page else {
                 return node.manager().scan(txn, tenant, database, table, limit);
             };
@@ -2993,9 +3268,8 @@ impl ryme_txn::TxnBackend for ClusterBackend {
     {
         let node = self.node.clone();
         Box::pin(async move {
-            let page = node
-                .scan_range_page(tenant, database, table, Some(start_after), txn.read_ts, limit)
-                .await?;
+            let page =
+                node.scan_range_page(tenant, database, table, Some(start_after), 0, limit).await?;
             let Some(page) = page else {
                 return node.manager().scan_after(txn, tenant, database, table, start_after, limit);
             };
@@ -3063,7 +3337,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             None
         };
         async move {
-            match routed {
+            let result = match routed {
                 Some((Some(owner), writes)) => {
                     node.propose_write_on(owner, writes, route_generation).await
                 }
@@ -3071,7 +3345,14 @@ impl ryme_txn::TxnBackend for ClusterBackend {
                     node.propose_write_to_leader(writes, route_generation).await
                 }
                 None => node.commit_transaction_to_leader(txn).await,
+            };
+            if let Ok(commit_ts) = result {
+                // Keep transactions opened on a follower from lagging behind a
+                // commit it just forwarded to the global leader. Range reads
+                // still fetch their current value from the range owner.
+                node.manager().advance_to(commit_ts);
             }
+            result
         }
     }
 
@@ -3246,6 +3527,26 @@ mod tests {
 
         let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
         assert_eq!(reopened.prepared.lock().unwrap().len(), 0);
+        let mut probe = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn range_log_records_replay_after_restart() {
+        let dir = temp_dir("range-log");
+        let key = RecordKey::new("t", "d", "s", b"replica");
+        let mut writes = BTreeMap::new();
+        writes.insert(key.clone(), ryme_txn::WriteOp::put(b"value".to_vec()));
+        let encoded = encode_writes(&writes).unwrap();
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            assert_eq!(node.append_range_local("range-a", 1, 3, 7, &encoded).unwrap(), 1);
+            assert_eq!(node.range_last_index("range-a"), 1);
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        assert_eq!(reopened.range_last_index("range-a"), 1);
         let mut probe = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), Some(b"value".to_vec()));
         let _ = std::fs::remove_dir_all(dir);
