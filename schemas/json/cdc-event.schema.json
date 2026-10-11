@@ -1,19 +1,22 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://db.rymelabs.dev/schemas/json/cdc-event.schema.json",
   "title": "ChangeRecord",
+  "description": "A committed row change emitted by the table CDC and realtime streams. Rust u64 fields are serialized as JSON numbers.",
   "type": "object",
   "required": ["tenant", "database", "branch", "table", "op", "pk", "before", "after", "commit_ts", "tx_id", "sequence"],
   "properties": {
-    "tenant": {"type": "string"},
-    "database": {"type": "string"},
-    "branch": {"type": "string"},
-    "table": {"type": "string"},
+    "tenant": {"type": "string", "description": "Tenant that owns the change."},
+    "database": {"type": "string", "description": "Logical database name."},
+    "branch": {"type": "string", "description": "Branch visible to the writer."},
+    "table": {"type": "string", "description": "Table containing the changed row."},
     "op": {"type": "string", "enum": ["INSERT", "UPDATE", "DELETE"]},
-    "pk": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}},
-    "before": {"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}},
-    "after": {"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}},
-    "commit_ts": {"type": "integer"},
-    "tx_id": {"type": "integer"},
-    "sequence": {"type": "integer"}
-  }
+    "pk": {"type": "array", "description": "Primary-key bytes encoded as an unsigned-byte array.", "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+    "before": {"type": ["array", "null"], "description": "Previous row bytes; null for INSERT.", "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+    "after": {"type": ["array", "null"], "description": "New row bytes; null for DELETE.", "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+    "commit_ts": {"type": "integer", "minimum": 0},
+    "tx_id": {"type": "integer", "minimum": 0},
+    "sequence": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": false
 }
