@@ -45,6 +45,7 @@ const BROADCAST_BUFFER_CAPACITY: usize = 16_384;
 
 type BroadcastTopicShard = Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>;
 type PresenceTopicShard = Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>;
+type PresenceStateShard = Mutex<HashMap<String, HashMap<String, PresenceMember>>>;
 type DurableTopicShard = Mutex<HashMap<String, broadcast::Sender<DurableMsg>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +67,7 @@ pub struct Realtime {
     table_topics: Arc<Vec<Mutex<TableTopicShard>>>,
     broadcast_topics: Arc<Vec<BroadcastTopicShard>>,
     presence_topics: Arc<Vec<PresenceTopicShard>>,
+    presence_state: Arc<Vec<PresenceStateShard>>,
     durable_topics: Arc<Vec<DurableTopicShard>>,
     broadcast_capacity: usize,
     capacity: usize,
@@ -84,7 +86,6 @@ struct QueryTopic {
 
 #[derive(Debug)]
 struct RealtimeInner {
-    presence: HashMap<String, HashMap<String, PresenceMember>>,
     durable: HashMap<String, DurableTopic>,
 }
 
@@ -192,10 +193,7 @@ impl Realtime {
         let capacity = capacity.clamp(16, 100000);
         let (changes, _) = broadcast::channel(capacity);
         Self {
-            inner: Arc::new(Mutex::new(RealtimeInner {
-                presence: HashMap::new(),
-                durable: HashMap::new(),
-            })),
+            inner: Arc::new(Mutex::new(RealtimeInner { durable: HashMap::new() })),
             changes,
             table_topics: Arc::new(
                 (0..TABLE_TOPIC_SHARDS).map(|_| Mutex::new(TableTopicShard::default())).collect(),
@@ -204,6 +202,9 @@ impl Realtime {
                 (0..BROADCAST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             ),
             presence_topics: Arc::new(
+                (0..PRESENCE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            ),
+            presence_state: Arc::new(
                 (0..PRESENCE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             ),
             durable_topics: Arc::new(
@@ -651,10 +652,15 @@ impl Realtime {
         expires_unix: u64,
         now_unix: u64,
     ) -> Result<usize> {
-        let mut inner =
-            self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
         let key = scope_key(tenant, channel);
-        let members = inner.presence.entry(key).or_insert_with(HashMap::new);
+        let shard = self.presence_shard(&key);
+        let mut presence = self
+            .presence_state
+            .get(shard)
+            .ok_or_else(|| RymeError::Internal(String::from("presence state shard")))?
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("presence state lock")))?;
+        let members = presence.entry(key).or_insert_with(HashMap::new);
         let expired_members: Vec<String> = members
             .iter()
             .filter(|(_, member)| member.expires_unix <= now_unix)
@@ -674,7 +680,7 @@ impl Realtime {
             member.clone(),
             PresenceMember { member: member.clone(), state: state.clone(), expires_unix },
         );
-        drop(inner);
+        drop(presence);
         for (expired_member, sequence) in expired {
             self.publish_presence(
                 tenant,
@@ -703,31 +709,32 @@ impl Realtime {
     }
 
     pub fn prune_presence(&self, now_unix: u64) -> usize {
-        let Ok(mut inner) = self.inner.lock() else { return 0 };
         let mut expired_events = Vec::new();
         let mut removed = 0;
-        inner.presence.retain(|key, members| {
-            let before = members.len();
-            let expired: Vec<String> = members
-                .iter()
-                .filter(|(_, member)| member.expires_unix <= now_unix)
-                .map(|(member, _)| member.clone())
-                .collect();
-            members.retain(|_, member| member.expires_unix > now_unix);
-            if let Some((tenant, channel)) = key.split_once('/') {
-                for member in expired {
-                    expired_events.push((
-                        tenant.to_string(),
-                        channel.to_string(),
-                        member,
-                        self.next_presence_sequence(),
-                    ));
+        for shard in self.presence_state.iter() {
+            let Ok(mut presence) = shard.lock() else { continue };
+            presence.retain(|key, members| {
+                let before = members.len();
+                let expired: Vec<String> = members
+                    .iter()
+                    .filter(|(_, member)| member.expires_unix <= now_unix)
+                    .map(|(member, _)| member.clone())
+                    .collect();
+                members.retain(|_, member| member.expires_unix > now_unix);
+                if let Some((tenant, channel)) = key.split_once('\0') {
+                    for member in expired {
+                        expired_events.push((
+                            tenant.to_string(),
+                            channel.to_string(),
+                            member,
+                            self.next_presence_sequence(),
+                        ));
+                    }
                 }
-            }
-            removed += before - members.len();
-            !members.is_empty()
-        });
-        drop(inner);
+                removed += before - members.len();
+                !members.is_empty()
+            });
+        }
         for (tenant, channel, member, sequence) in expired_events {
             let _ = self.publish_presence(
                 &tenant,
@@ -816,15 +823,21 @@ impl Realtime {
     }
 
     pub fn presence_leave(&self, tenant: &str, channel: &str, member: &str) -> Result<bool> {
-        let mut inner =
-            self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
-        let removed = inner
-            .presence
-            .get_mut(&scope_key(tenant, channel))
-            .map(|members| members.remove(member).is_some())
-            .unwrap_or(false);
+        let key = scope_key(tenant, channel);
+        let shard = self.presence_shard(&key);
+        let mut presence = self
+            .presence_state
+            .get(shard)
+            .ok_or_else(|| RymeError::Internal(String::from("presence state shard")))?
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("presence state lock")))?;
+        let removed =
+            presence.get_mut(&key).map(|members| members.remove(member).is_some()).unwrap_or(false);
+        if presence.get(&key).is_some_and(HashMap::is_empty) {
+            presence.remove(&key);
+        }
         let sequence = removed.then(|| self.next_presence_sequence());
-        drop(inner);
+        drop(presence);
         if removed {
             self.publish_presence(
                 tenant,
@@ -854,44 +867,53 @@ impl Realtime {
         let mut out = Vec::new();
         let mut expired = Vec::new();
         let sequence;
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(members) = inner.presence.get_mut(&scope_key(tenant, channel)) {
-                expired = members
-                    .iter()
-                    .filter(|(_, member)| member.expires_unix <= now_unix)
-                    .map(|(member, _)| member.clone())
-                    .collect();
-                members.retain(|_, member| member.expires_unix > now_unix);
-                let mut names: Vec<String> = members.keys().cloned().collect();
-                names.sort();
-                for name in names {
-                    if let Some(member) = members.get(&name) {
-                        out.push(PresenceMember {
-                            member: name,
-                            state: member.state.clone(),
-                            expires_unix: member.expires_unix,
-                        });
+        let key = scope_key(tenant, channel);
+        let shard = self.presence_shard(&key);
+        if let Some(state_shard) = self.presence_state.get(shard) {
+            if let Ok(mut presence) = state_shard.lock() {
+                if let Some(members) = presence.get_mut(&key) {
+                    expired = members
+                        .iter()
+                        .filter(|(_, member)| member.expires_unix <= now_unix)
+                        .map(|(member, _)| member.clone())
+                        .collect();
+                    members.retain(|_, member| member.expires_unix > now_unix);
+                    let mut names: Vec<String> = members.keys().cloned().collect();
+                    names.sort();
+                    for name in names {
+                        if let Some(member) = members.get(&name) {
+                            out.push(PresenceMember {
+                                member: name,
+                                state: member.state.clone(),
+                                expires_unix: member.expires_unix,
+                            });
+                        }
+                    }
+                    if members.is_empty() {
+                        presence.remove(&key);
                     }
                 }
-            }
-            let expired = expired
-                .into_iter()
-                .map(|member| (member, self.next_presence_sequence()))
-                .collect::<Vec<_>>();
-            sequence = self.presence_sequence.load(Ordering::Acquire);
-            drop(inner);
-            for (member, sequence) in expired {
-                let _ = self.publish_presence(
-                    tenant,
-                    PresenceEvent {
-                        kind: String::from("leave"),
-                        channel: channel.to_string(),
-                        member,
-                        state: serde_json::Value::Null,
-                        expires_unix: 0,
-                        sequence,
-                    },
-                );
+                let expired = expired
+                    .into_iter()
+                    .map(|member| (member, self.next_presence_sequence()))
+                    .collect::<Vec<_>>();
+                sequence = self.presence_sequence.load(Ordering::Acquire);
+                drop(presence);
+                for (member, sequence) in expired {
+                    let _ = self.publish_presence(
+                        tenant,
+                        PresenceEvent {
+                            kind: String::from("leave"),
+                            channel: channel.to_string(),
+                            member,
+                            state: serde_json::Value::Null,
+                            expires_unix: 0,
+                            sequence,
+                        },
+                    );
+                }
+            } else {
+                sequence = self.presence_sequence.load(Ordering::Acquire);
             }
         } else {
             sequence = self.presence_sequence.load(Ordering::Acquire);
@@ -1254,7 +1276,7 @@ fn branch_topic_key(tenant: &str, database: &str, branch: &str, table: &str) -> 
 }
 
 fn scope_key(tenant: &str, name: &str) -> String {
-    format!("{tenant}/{name}")
+    format!("{tenant}\0{name}")
 }
 
 fn durable_key(tenant: &str, partition: &str) -> String {
@@ -1494,6 +1516,40 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_presence_rooms_use_independent_state_shards() {
+        let realtime = Realtime::new(64);
+        let first_channel = "room-0";
+        let first_key = scope_key("t", first_channel);
+        let first_shard = realtime.presence_shard(&first_key);
+        let (second_channel, second_key, second_shard) = (1..)
+            .map(|index| {
+                let channel = format!("room-{index}");
+                let key = scope_key("t", &channel);
+                let shard = realtime.presence_shard(&key);
+                (channel, key, shard)
+            })
+            .find(|(_, _, shard)| *shard != first_shard)
+            .expect("room keys should distribute across presence shards");
+
+        realtime
+            .presence_join("t", first_channel, String::from("a"), serde_json::Value::Null, 60, 1000)
+            .unwrap();
+        realtime
+            .presence_join(
+                "t",
+                &second_channel,
+                String::from("b"),
+                serde_json::Value::Null,
+                60,
+                1000,
+            )
+            .unwrap();
+
+        assert!(realtime.presence_state[first_shard].lock().unwrap().contains_key(&first_key));
+        assert!(realtime.presence_state[second_shard].lock().unwrap().contains_key(&second_key));
+    }
+
+    #[test]
     fn presence_room_cap_and_ttl_clamp() {
         let realtime = Realtime::new(64);
         for index in 0..PRESENCE_MAX_MEMBERS {
@@ -1516,11 +1572,11 @@ mod tests {
     #[test]
     fn presence_subscribers_receive_join_leave_and_expiry_events() {
         let realtime = Realtime::new(64);
-        let mut events = realtime.presence_subscribe("t", "room");
+        let mut events = realtime.presence_subscribe("org/team", "room/main");
         realtime
             .presence_join(
-                "t",
-                "room",
+                "org/team",
+                "room/main",
                 String::from("ada"),
                 serde_json::json!({"typing": true}),
                 10,
