@@ -13813,7 +13813,7 @@ where
             statement => self.execute_with_base(statement, isolation).await,
         };
         if result.is_ok() && schema_statement {
-            if let (Some(hook), Some(previous)) = (self.schema_hook.clone(), previous_schema) {
+            if let (Some(hook), Some(previous)) = (self.schema_hook.clone(), previous_schema.clone()) {
                 let next = self.schema_snapshot();
                 if next != previous {
                     if let Err(error) = hook(previous.clone(), next).await {
@@ -13825,7 +13825,20 @@ where
             }
         }
         if result.is_ok() && (schema_statement || sequence_state_statement) {
-            self.persist_schema_if_configured()?;
+            if let Err(error) = self.persist_schema_if_configured() {
+                if let Some(previous) = previous_schema {
+                    let rollback = self.restore_schema_snapshot(previous).and_then(|_| {
+                        self.schema_dirty.store(true, Ordering::SeqCst);
+                        self.persist_schema_if_configured()
+                    });
+                    if let Err(rollback_error) = rollback {
+                        return Err(RymeError::Internal(format!(
+                            "schema persistence failed: {error}; rollback failed: {rollback_error}"
+                        )));
+                    }
+                }
+                return Err(error);
+            }
         }
         result
     }
@@ -16805,6 +16818,31 @@ mod tests {
         ));
         assert_eq!(executor.schema_snapshot(), before);
         assert!(executor.catalog_indexes("docs").is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_schema_persistence_rolls_back_ddl() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-schema-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut executor = Executor::new(String::from("t"), String::from("d"));
+        executor.set_schema_path(dir.clone());
+        assert!(executor
+            .execute(parse("CREATE TABLE should_rollback (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .is_err());
+        assert!(!executor.catalog_tables().contains(&String::from("should_rollback")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("tmp"));
     }
 
     #[tokio::test]
