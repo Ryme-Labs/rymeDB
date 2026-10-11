@@ -618,7 +618,7 @@ mod tests {
         let result =
             write_frame_with_rollback(&mut file, b"partial-frame", offset, |file, frame| {
                 file.write_all(&frame[..5])?;
-                Err(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure"))
+                Err(std::io::Error::other("injected write failure"))
             });
 
         assert!(result.is_err());
