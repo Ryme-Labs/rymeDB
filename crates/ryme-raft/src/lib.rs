@@ -179,6 +179,7 @@ pub enum ApplyPayload {
     Conf { change: ConfChange },
     Metadata { payload: Vec<u8> },
     Topic { payload: Vec<u8> },
+    Resolution { payload: Vec<u8> },
 }
 
 pub fn encode_conf(members: &[crate::net::Member]) -> Result<Vec<u8>> {
@@ -212,6 +213,16 @@ pub fn encode_topic(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn encode_resolution(payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("resolution")));
+    }
+    let mut out = Vec::with_capacity(payload.len() + 1);
+    out.push(4u8);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
 pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
     if input.first() == Some(&1u8) {
         let body = &input[1..];
@@ -235,6 +246,12 @@ pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
             return Err(RymeError::Corrupt(String::from("topic")));
         }
         return Ok(ApplyPayload::Topic { payload: input[1..].to_vec() });
+    }
+    if input.first() == Some(&4u8) {
+        if input.len() == 1 {
+            return Err(RymeError::Corrupt(String::from("resolution")));
+        }
+        return Ok(ApplyPayload::Resolution { payload: input[1..].to_vec() });
     }
     let (commit_ts, writes) = decode_applied(input)?;
     Ok(ApplyPayload::Data { commit_ts, writes })
@@ -557,5 +574,11 @@ mod tests {
             ApplyPayload::Topic { payload: b"event".to_vec() }
         );
         assert!(matches!(encode_topic(&[]), Err(RymeError::InvalidArgument(_))));
+        let resolution = encode_resolution(br#"{"pending":true}"#).unwrap();
+        assert_eq!(
+            decode_apply(&resolution).unwrap(),
+            ApplyPayload::Resolution { payload: br#"{"pending":true}"#.to_vec() }
+        );
+        assert!(matches!(encode_resolution(&[]), Err(RymeError::InvalidArgument(_))));
     }
 }

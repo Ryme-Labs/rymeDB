@@ -336,6 +336,12 @@ enum ResolutionRecord {
         #[serde(default)]
         group_id: String,
     },
+    Batch {
+        transaction_id: u128,
+        commit_ts: u64,
+        committed: bool,
+        participants: Vec<ResolutionParticipant>,
+    },
     Complete {
         transaction_id: u128,
         commit_ts: u64,
@@ -343,6 +349,12 @@ enum ResolutionRecord {
         #[serde(default)]
         group_id: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolutionParticipant {
+    participant: usize,
+    group_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -679,6 +691,10 @@ fn validate_apply_payload(input: &[u8]) -> Result<()> {
                 return Err(RymeError::Corrupt(String::from("topic")));
             }
         }
+        ApplyPayload::Resolution { payload } => {
+            let _: ResolutionRecord = serde_json::from_slice(&payload)
+                .map_err(|_| RymeError::Corrupt(String::from("resolution")))?;
+        }
     }
     Ok(())
 }
@@ -929,6 +945,25 @@ impl Node {
                         },
                     );
                 }
+                ResolutionRecord::Batch { transaction_id, commit_ts, committed, participants } => {
+                    for participant in participants {
+                        pending_resolutions.insert(
+                            (
+                                participant.group_id.clone(),
+                                transaction_id,
+                                commit_ts,
+                                participant.participant,
+                            ),
+                            PendingResolution {
+                                transaction_id,
+                                commit_ts,
+                                participant: participant.participant,
+                                committed,
+                                group_id: participant.group_id,
+                            },
+                        );
+                    }
+                }
                 ResolutionRecord::Complete { transaction_id, commit_ts, participant, group_id } => {
                     pending_resolutions.remove(&(group_id, transaction_id, commit_ts, participant));
                 }
@@ -966,6 +1001,7 @@ impl Node {
         let mut replayed: Option<crate::ConfChange> = None;
         let mut replayed_joint: Option<Vec<Member>> = None;
         let mut metadata = None;
+        let mut replayed_resolutions = Vec::new();
         for entry in log.iter().filter(|e| e.index <= meta.commit_index) {
             match decode_apply(&entry.payload)? {
                 ApplyPayload::Data { commit_ts, writes } => {
@@ -980,6 +1016,42 @@ impl Node {
                     metadata = Some(payload);
                 }
                 ApplyPayload::Topic { .. } => {}
+                ApplyPayload::Resolution { payload } => {
+                    let resolution: ResolutionRecord = serde_json::from_slice(&payload)
+                        .map_err(|error| RymeError::Corrupt(format!("resolution: {error}")))?;
+                    match resolution {
+                        ResolutionRecord::Pending {
+                            transaction_id,
+                            commit_ts,
+                            participant,
+                            committed,
+                            group_id,
+                        } => replayed_resolutions.push(PendingResolution {
+                            transaction_id,
+                            commit_ts,
+                            participant,
+                            committed,
+                            group_id,
+                        }),
+                        ResolutionRecord::Batch {
+                            transaction_id,
+                            commit_ts,
+                            committed,
+                            participants,
+                        } => {
+                            replayed_resolutions.extend(participants.into_iter().map(
+                                |participant| PendingResolution {
+                                    transaction_id,
+                                    commit_ts,
+                                    participant: participant.participant,
+                                    committed,
+                                    group_id: participant.group_id,
+                                },
+                            ));
+                        }
+                        ResolutionRecord::Complete { .. } => {}
+                    }
+                }
             }
             applied = entry.index;
         }
@@ -1101,6 +1173,15 @@ impl Node {
         });
         for commit_ts in replayed_commit_ts {
             node.clear_prepared_for_commit(commit_ts)?;
+        }
+        for resolution in replayed_resolutions {
+            node.queue_resolution_for_group(
+                &resolution.group_id,
+                resolution.transaction_id,
+                resolution.commit_ts,
+                resolution.participant,
+                resolution.committed,
+            )?;
         }
         Ok(node)
     }
@@ -1921,6 +2002,9 @@ impl Node {
                 ApplyPayload::Topic { payload } => {
                     self.apply_topic(payload)?;
                 }
+                ApplyPayload::Resolution { payload } => {
+                    self.apply_resolution(payload)?;
+                }
             }
             self.inner.lock().await.applied = entry.index;
         }
@@ -1983,6 +2067,39 @@ impl Node {
             hook(&payload)?;
         }
         Ok(())
+    }
+
+    fn apply_resolution(&self, payload: Vec<u8>) -> Result<()> {
+        let resolution: ResolutionRecord = serde_json::from_slice(&payload)
+            .map_err(|error| RymeError::Corrupt(format!("resolution: {error}")))?;
+        match resolution {
+            ResolutionRecord::Pending {
+                transaction_id,
+                commit_ts,
+                participant,
+                committed,
+                group_id,
+            } => self.queue_resolution_for_group(
+                &group_id,
+                transaction_id,
+                commit_ts,
+                participant,
+                committed,
+            ),
+            ResolutionRecord::Batch { transaction_id, commit_ts, committed, participants } => {
+                for participant in participants {
+                    self.queue_resolution_for_group(
+                        &participant.group_id,
+                        transaction_id,
+                        commit_ts,
+                        participant.participant,
+                        committed,
+                    )?;
+                }
+                Ok(())
+            }
+            ResolutionRecord::Complete { .. } => Ok(()),
+        }
     }
 
     fn apply_presence(&self, payload: Vec<u8>) -> Result<()> {
@@ -2587,6 +2704,32 @@ impl Node {
     pub async fn propose_metadata(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
         let encoded = crate::encode_metadata(&payload)?;
         let index = self.propose_frame(encoded).await?;
+        self.wait_applied(index).await?;
+        Ok(index)
+    }
+
+    async fn propose_resolutions(
+        self: &Arc<Self>,
+        transaction_id: u128,
+        commit_ts: u64,
+        participants: &BTreeMap<String, RangeOwner>,
+        committed: bool,
+    ) -> Result<u64> {
+        let participants = participants
+            .iter()
+            .map(|(group_id, range)| ResolutionParticipant {
+                participant: range.owner,
+                group_id: group_id.clone(),
+            })
+            .collect();
+        let payload = serde_json::to_vec(&ResolutionRecord::Batch {
+            transaction_id,
+            commit_ts,
+            committed,
+            participants,
+        })
+        .map_err(|error| RymeError::Internal(format!("resolution: {error}")))?;
+        let index = self.propose_frame(crate::encode_resolution(&payload)?).await?;
         self.wait_applied(index).await?;
         Ok(index)
     }
@@ -3774,6 +3917,18 @@ impl Node {
         Ok(())
     }
 
+    async fn replicate_range_resolutions(
+        self: &Arc<Self>,
+        transaction_id: u128,
+        commit_ts: u64,
+        participants: &BTreeMap<String, RangeOwner>,
+        committed: bool,
+    ) -> Result<()> {
+        self.propose_resolutions(transaction_id, commit_ts, participants, committed)
+            .await
+            .map(|_| ())
+    }
+
     async fn commit_global_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
         let writes = txn.writes().clone();
         let result = self
@@ -3829,12 +3984,30 @@ impl Node {
             {
                 Ok(()) => {}
                 Err(error) => {
-                    self.queue_range_resolutions(
+                    if let Err(queue_error) = self.queue_range_resolutions(
                         transaction_id,
                         commit_ts,
                         &participant_ids,
                         false,
-                    )?;
+                    ) {
+                        tracing::error!(transaction_id, commit_ts, %queue_error, "transaction abort resolution queue failed");
+                    }
+                    if let Err(resolution_error) = self
+                        .replicate_range_resolutions(
+                            transaction_id,
+                            commit_ts,
+                            &participant_ids,
+                            false,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            transaction_id,
+                            commit_ts,
+                            %resolution_error,
+                            "transaction abort resolution replication failed"
+                        );
+                    }
                     self.retry_pending_resolutions().await;
                     return Err(error);
                 }
@@ -3847,11 +4020,32 @@ impl Node {
                 {
                     tracing::error!(transaction_id, commit_ts, %error, "transaction resolution queue failed");
                 }
+                if let Err(error) = self
+                    .replicate_range_resolutions(transaction_id, commit_ts, &participant_ids, true)
+                    .await
+                {
+                    tracing::error!(transaction_id, commit_ts, %error, "transaction resolution replication failed");
+                }
                 self.retry_pending_resolutions().await;
                 Ok(commit_ts)
             }
             Err(error) => {
-                self.queue_range_resolutions(transaction_id, commit_ts, &participant_ids, false)?;
+                if let Err(queue_error) =
+                    self.queue_range_resolutions(transaction_id, commit_ts, &participant_ids, false)
+                {
+                    tracing::error!(transaction_id, commit_ts, %queue_error, "transaction abort resolution queue failed");
+                }
+                if let Err(resolution_error) = self
+                    .replicate_range_resolutions(transaction_id, commit_ts, &participant_ids, false)
+                    .await
+                {
+                    tracing::error!(
+                        transaction_id,
+                        commit_ts,
+                        %resolution_error,
+                        "transaction abort resolution replication failed"
+                    );
+                }
                 self.retry_pending_resolutions().await;
                 Err(error)
             }
@@ -5137,6 +5331,44 @@ mod tests {
 
         let reopened_again = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
         assert!(reopened_again.pending_resolutions_snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn committed_resolution_record_replays_after_restart() {
+        let dir = temp_dir("committed-resolution");
+        let payload = serde_json::to_vec(&ResolutionRecord::Batch {
+            transaction_id: 91,
+            commit_ts: 12,
+            committed: true,
+            participants: vec![
+                ResolutionParticipant { participant: 3, group_id: String::from("range-a") },
+                ResolutionParticipant { participant: 4, group_id: String::from("range-b") },
+            ],
+        })
+        .unwrap();
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            let entry = LogEntry {
+                index: 1,
+                term: 1,
+                payload: crate::encode_resolution(&payload).unwrap(),
+            };
+            let mut inner = node.inner.try_lock().unwrap();
+            inner.persist_entries(std::slice::from_ref(&entry)).unwrap();
+            inner.log.push(entry);
+            inner.term = 1;
+            inner.commit_index = 1;
+            inner.persist_meta().unwrap();
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let pending = reopened.pending_resolutions_snapshot();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1].transaction_id, 91);
+        assert_eq!(pending[1].participant, 4);
+        assert_eq!(pending[1].group_id, "range-b");
+        assert!(pending[1].committed);
         let _ = std::fs::remove_dir_all(dir);
     }
 

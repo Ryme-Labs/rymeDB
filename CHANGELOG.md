@@ -1,5 +1,9 @@
 # Changelog
 
+- Distributed transaction resolution records now replicate through the global
+  Raft log. Every member rebuilds pending participant-resolution work from
+  committed entries after restart, while the local resolution WAL keeps the
+  retry path idempotent.
 - Cluster SQL mutations now validate foreign keys and execute cascading
   delete/update actions through the configured range owners, preserving the
   transaction snapshot instead of treating remote rows as missing. The

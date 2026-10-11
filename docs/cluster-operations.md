@@ -261,10 +261,12 @@ coordinator resolves it. This prevents a fast path from bypassing the
 distributed prepare phase.
 The coordinator also records each participant's commit or abort resolution in
 a separate WAL and retries unacknowledged resolutions from its main loop after
-restart. A lost resolution RPC therefore leaves recoverable work rather than
-an intent that can block the participant forever.
-The global Raft log is still the decision authority, so this is a range-durable
-participant protocol, not yet an independent per-range transaction coordinator
+restart. The same pending resolution is published as a committed global Raft
+record, so every member can rebuild and retry participant work after coordinator
+loss or restart. A lost resolution RPC therefore leaves recoverable work rather
+than an intent that can block the participant forever.
+The global Raft log is still the decision authority, so this is a replicated
+resolution protocol, not yet an independent per-range transaction coordinator
 or fully independent per-range Raft 2PC decision path.
 Cluster transactions also carry the range-topology generation observed at
 begin. Changing the configured range map invalidates an older transaction at
