@@ -470,6 +470,8 @@ fn scoped_key(tenant: &str, branch: &str) -> String {
 }
 
 const BRANCH_VALUE_PREFIX: &[u8] = b"\0RYME_BRANCH\x01";
+pub const MAX_BRANCH_CHANGE_ROWS: usize = 100_000;
+pub const MAX_BRANCH_CHANGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// A copy-on-write view over a transactional backend.
 ///
@@ -587,7 +589,7 @@ where
         table: &str,
     ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
         let mut rows = BTreeMap::new();
-        let local_rows = self.base.scan(txn, tenant, &self.branch_database, table, usize::MAX)?;
+        let local_rows = self.bounded_local_rows(txn, tenant, table)?;
         for (pk, value) in local_rows {
             if let Some(decoded) = Self::decode(&value) {
                 rows.insert(pk, decoded);
@@ -603,11 +605,106 @@ where
         table: &str,
     ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
         let mut rows = BTreeMap::new();
-        let local_rows =
-            self.scan_all_async(txn, tenant, &self.branch_database, table, usize::MAX).await?;
+        let local_rows = self.bounded_local_rows_async(txn, tenant, table).await?;
         for (pk, value) in local_rows {
             if let Some(decoded) = Self::decode(&value) {
                 rows.insert(pk, decoded);
+            }
+        }
+        Ok(rows)
+    }
+
+    fn bounded_local_rows(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        table: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        const PAGE: usize = 16;
+        let mut rows = Vec::new();
+        let mut start_after = None;
+        let mut bytes = 0usize;
+        loop {
+            let remaining = MAX_BRANCH_CHANGE_ROWS + 1 - rows.len();
+            let limit = remaining.min(PAGE);
+            let page = match start_after.as_deref() {
+                Some(start_after) => self.base.scan_after(
+                    txn,
+                    tenant,
+                    &self.branch_database,
+                    table,
+                    start_after,
+                    limit,
+                )?,
+                None => self.base.scan(txn, tenant, &self.branch_database, table, limit)?,
+            };
+            if page.is_empty() {
+                break;
+            }
+            let page_bytes =
+                page.iter().map(|(pk, value)| pk.len().saturating_add(value.len())).sum::<usize>();
+            bytes = bytes.saturating_add(page_bytes);
+            if rows.len().saturating_add(page.len()) > MAX_BRANCH_CHANGE_ROWS
+                || bytes > MAX_BRANCH_CHANGE_BYTES
+            {
+                return Err(RymeError::Overload(String::from("branch changes")));
+            }
+            start_after = page.last().map(|(pk, _)| pk.clone());
+            let count = page.len();
+            rows.extend(page);
+            if count < limit {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn bounded_local_rows_async(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        table: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        const PAGE: usize = 16;
+        let mut rows = Vec::new();
+        let mut start_after = None;
+        let mut bytes = 0usize;
+        loop {
+            let remaining = MAX_BRANCH_CHANGE_ROWS + 1 - rows.len();
+            let limit = remaining.min(PAGE);
+            let page = match start_after.as_deref() {
+                Some(start_after) => {
+                    self.base
+                        .scan_after_async(
+                            txn,
+                            tenant,
+                            &self.branch_database,
+                            table,
+                            start_after,
+                            limit,
+                        )
+                        .await?
+                }
+                None => {
+                    self.base.scan_async(txn, tenant, &self.branch_database, table, limit).await?
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            let page_bytes =
+                page.iter().map(|(pk, value)| pk.len().saturating_add(value.len())).sum::<usize>();
+            bytes = bytes.saturating_add(page_bytes);
+            if rows.len().saturating_add(page.len()) > MAX_BRANCH_CHANGE_ROWS
+                || bytes > MAX_BRANCH_CHANGE_BYTES
+            {
+                return Err(RymeError::Overload(String::from("branch changes")));
+            }
+            start_after = page.last().map(|(pk, _)| pk.clone());
+            let count = page.len();
+            rows.extend(page);
+            if count < limit {
+                break;
             }
         }
         Ok(rows)

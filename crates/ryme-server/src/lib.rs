@@ -8948,8 +8948,19 @@ async fn prepare_branch_promotion(
         }
     }
     let mut changes = Vec::new();
+    let mut change_bytes = 0usize;
     for table in tables {
         for (pk, value) in branch.changes(tenant, &table)? {
+            let value_bytes = value.as_ref().map_or(0, Vec::len);
+            let row_bytes = table.len().saturating_add(pk.len()).saturating_add(value_bytes);
+            if changes.len() >= ryme_branch::MAX_BRANCH_CHANGE_ROWS
+                || change_bytes.saturating_add(row_bytes) > ryme_branch::MAX_BRANCH_CHANGE_BYTES
+            {
+                return Err(ryme_error::RymeError::Overload(String::from(
+                    "branch promotion changes",
+                )));
+            }
+            change_bytes = change_bytes.saturating_add(row_bytes);
             changes.push((table.clone(), pk, value));
         }
     }
