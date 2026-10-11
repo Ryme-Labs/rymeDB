@@ -127,6 +127,7 @@ jobs:
           test -f _site/index.html
           test -f _site/api/index.html
           grep -q 'SwaggerUIBundle' _site/api/index.html
+          grep -q 'swagger-ui-dist@5.33.1' _site/api/index.html
           grep -q '../openapi/rest.yaml' _site/api/index.html
           test -f _site/openapi/rest.yaml
           test -f _site/openapi/rest.json
