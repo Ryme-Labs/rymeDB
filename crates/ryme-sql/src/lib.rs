@@ -6929,7 +6929,7 @@ impl<B: std::fmt::Debug> std::fmt::Debug for Executor<B> {
 #[derive(Debug, Clone)]
 struct IndexState {
     definition: IndexDefinition,
-    entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>>,
+    entries: BTreeMap<String, BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>>>,
 }
 
 impl Executor<TxnManager> {
@@ -9854,15 +9854,17 @@ where
             }
         }
         let rows = self.scan_all_rows(&definition.table)?;
-        let mut entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = BTreeMap::new();
+        let mut tenant_entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> =
+            BTreeMap::new();
         for (pk, value) in rows {
             let Some(indexed) = index_value(&definition, &pk, &value) else { continue };
-            let pks = entries.entry(indexed).or_default();
+            let pks = tenant_entries.entry(indexed).or_default();
             if definition.unique && !pks.is_empty() && !pks.contains(&pk) {
                 return Err(RymeError::Conflict(format!("unique index {}", definition.name)));
             }
             pks.insert(pk);
         }
+        let entries = [(self.tenant.clone(), tenant_entries)].into_iter().collect();
         let mut indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let table_indexes = indexes.entry(definition.table.clone()).or_default();
@@ -9902,6 +9904,7 @@ where
     }
 
     fn indexed_candidates(&self, table: &str, filter: &[Predicate]) -> Option<Vec<Vec<u8>>> {
+        self.ensure_index_entries_for_tenant(table).ok()?;
         let indexes = self.indexes.lock().ok()?;
         let state = indexes.get(table)?.iter().find(|state| {
             if !state.definition.columns.is_empty() {
@@ -9926,7 +9929,22 @@ where
         } else {
             index_filter_value(&state.definition, filter)?
         };
-        Some(state.entries.get(&key)?.iter().cloned().collect())
+        Some(state.entries.get(&self.tenant)?.get(&key)?.iter().cloned().collect())
+    }
+
+    fn ensure_index_entries_for_tenant(&self, table: &str) -> Result<()> {
+        let needs_rebuild = self
+            .indexes
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("index lock")))?
+            .get(table)
+            .is_some_and(|states| {
+                states.iter().any(|state| !state.entries.contains_key(&self.tenant))
+            });
+        if needs_rebuild {
+            self.rebuild_index_entries(table)?;
+        }
+        Ok(())
     }
 
     fn check_unique(&self, table: &str, pk: &[u8], value: &[u8]) -> Result<()> {
@@ -9940,17 +9958,23 @@ where
         value: &[u8],
         excluded_pk: Option<&[u8]>,
     ) -> Result<()> {
+        self.ensure_index_entries_for_tenant(table)?;
         let indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
-            if state.entries.get(&indexed).is_some_and(|pks| {
-                pks.iter().any(|existing| {
-                    existing.as_slice() != pk
-                        && excluded_pk.is_none_or(|excluded| existing.as_slice() != excluded)
+            if state
+                .entries
+                .get(&self.tenant)
+                .and_then(|entries| entries.get(&indexed))
+                .is_some_and(|pks| {
+                    pks.iter().any(|existing| {
+                        existing.as_slice() != pk
+                            && excluded_pk.is_none_or(|excluded| existing.as_slice() != excluded)
+                    })
                 })
-            }) {
+            {
                 return Err(RymeError::Conflict(format!("unique index {}", state.definition.name)));
             }
         }
@@ -9961,13 +9985,14 @@ where
         let Ok(mut indexes) = self.indexes.lock() else { return };
         let Some(table_indexes) = indexes.get_mut(&change.table) else { return };
         for state in table_indexes {
+            let Some(entries) = state.entries.get_mut(&self.tenant) else { continue };
             let previous_pk = change.previous_pk.as_deref().unwrap_or(&change.pk);
             if let Some(before) = change.before.as_ref() {
                 if let Some(indexed) = index_value(&state.definition, previous_pk, before) {
-                    if let Some(pks) = state.entries.get_mut(&indexed) {
+                    if let Some(pks) = entries.get_mut(&indexed) {
                         pks.remove(previous_pk);
                         if pks.is_empty() {
-                            state.entries.remove(&indexed);
+                            entries.remove(&indexed);
                         }
                     }
                 }
@@ -9976,7 +10001,7 @@ where
                 let Some(indexed) = index_value(&state.definition, &change.pk, after) else {
                     continue;
                 };
-                state.entries.entry(indexed).or_default().insert(change.pk.clone());
+                entries.entry(indexed).or_default().insert(change.pk.clone());
             }
         }
     }
@@ -10358,7 +10383,9 @@ where
                                     columns: Vec::new(),
                                     unique: true,
                                 },
-                                entries: BTreeMap::new(),
+                                entries: [(self.tenant.clone(), BTreeMap::new())]
+                                    .into_iter()
+                                    .collect(),
                             });
                         }
                     }
@@ -10748,7 +10775,10 @@ where
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         if let Some(states) = indexes.get_mut(table) {
             for state in states {
-                state.entries = entries.remove(&state.definition.name).unwrap_or_default();
+                state.entries.insert(
+                    self.tenant.clone(),
+                    entries.remove(&state.definition.name).unwrap_or_default(),
+                );
             }
         }
         Ok(())
@@ -11171,7 +11201,7 @@ where
             for table in &tables {
                 if let Some(table_indexes) = indexes.get_mut(table) {
                     for state in table_indexes {
-                        state.entries.clear();
+                        state.entries.remove(&self.tenant);
                     }
                 }
             }
@@ -11293,8 +11323,10 @@ where
                 self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
             let table_indexes = indexes.entry(table).or_default();
             if !table_indexes.iter().any(|state| state.definition.name == index_definition.name) {
-                table_indexes
-                    .push(IndexState { definition: index_definition, entries: index_entries });
+                table_indexes.push(IndexState {
+                    definition: index_definition,
+                    entries: [(self.tenant.clone(), index_entries)].into_iter().collect(),
+                });
             }
         }
         self.schema_dirty.store(true, Ordering::SeqCst);
@@ -11521,7 +11553,7 @@ where
                                         .insert(pk.clone());
                                 }
                             }
-                            state.entries = entries;
+                            state.entries.insert(self.tenant.clone(), entries);
                         }
                     }
                     if let Some(indexed) = state.definition.column.as_deref() {
@@ -11537,7 +11569,7 @@ where
                                         .insert(pk.clone());
                                 }
                             }
-                            state.entries = entries;
+                            state.entries.insert(self.tenant.clone(), entries);
                         }
                     }
                 }
@@ -13364,6 +13396,10 @@ where
     }
 
     fn check_transaction_uniqueness(&self, changes: &[TransactionChange]) -> Result<()> {
+        let tables: BTreeSet<String> = changes.iter().map(|change| change.table.clone()).collect();
+        for table in &tables {
+            self.ensure_index_entries_for_tenant(table)?;
+        }
         let indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         for (table, table_indexes) in indexes.iter() {
@@ -13381,7 +13417,9 @@ where
                     .collect();
                 let mut occupied: HashMap<Vec<u8>, Vec<u8>> = state
                     .entries
-                    .iter()
+                    .get(&self.tenant)
+                    .into_iter()
+                    .flat_map(|entries| entries.iter())
                     .filter_map(|(indexed, pks)| {
                         pks.iter()
                             .find(|pk| !touched.contains(*pk))
@@ -17879,6 +17917,36 @@ mod tests {
             .unwrap();
         assert!(executor
             .execute(parse("INSERT INTO messages KEY '4' VALUE 'three'").unwrap())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn secondary_indexes_are_scoped_per_tenant() {
+        let manager = TxnManager::new();
+        let tenant_a =
+            Executor::with_manager(String::from("tenant-a"), String::from("d"), manager.clone());
+        tenant_a.execute(parse("CREATE TABLE docs").unwrap()).await.unwrap();
+        tenant_a.execute(parse("INSERT INTO docs KEY 'a' VALUE 'a'").unwrap()).await.unwrap();
+        let tenant_b = tenant_a.clone().with_tenant(String::from("tenant-b"));
+        tenant_b.execute(parse("INSERT INTO docs KEY 'b' VALUE 'b'").unwrap()).await.unwrap();
+
+        tenant_a
+            .execute(parse("CREATE INDEX docs_value_idx ON docs (value)").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            tenant_b.execute(parse("SELECT * FROM docs WHERE value = 'b'").unwrap()).await,
+            Ok(QueryResult::Rows { rows }) if rows == vec![(b"b".to_vec(), b"b".to_vec())]
+        ));
+
+        tenant_a
+            .execute(parse("CREATE UNIQUE INDEX docs_value_unique ON docs (value)").unwrap())
+            .await
+            .unwrap();
+        tenant_b.execute(parse("INSERT INTO docs KEY 'same' VALUE 'a'").unwrap()).await.unwrap();
+        assert!(tenant_a
+            .execute(parse("INSERT INTO docs KEY 'duplicate' VALUE 'a'").unwrap())
             .await
             .is_err());
     }
