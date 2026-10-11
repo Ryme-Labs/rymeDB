@@ -80,7 +80,7 @@ implementation disagree.
 
 | You are… | Read… |
 | --- | --- |
-| Running a local server | [A–Z setup](setup.md) |
+| Setting up rymeDB | [Setup rymeDB](setup.md) |
 | Connecting an existing app | [PostgreSQL](postgres.md), [RESP](resp.md), or an [SDK guide](sdk-js.md) |
 | Building chat, games, or agents | [Realtime](streaming.md), [auth and tenants](auth.md), and [operations](production.md) |
 | Moving data from PostgreSQL, Supabase, Neon, or Redis | [Migration guide](migration.md) |

@@ -1,22 +1,110 @@
-# Setup from A to Z
+# Setup rymeDB
 
-This page gets a developer from an empty checkout or Docker host to a tested
-database connection. For production hardening, continue with [configuration](configuration.md),
+Choose one of the three deployment paths below. Docker is the quickest way to
+try rymeDB, Kubernetes is for a cluster deployment, and running from source is
+best for development. All examples use the default PostgreSQL, RESP, and HTTP
+ports: `5433`, `6380`, and `8080`.
+
+Use a unique API key outside local testing. For production settings, TLS,
+backups, and operational guidance, see [configuration](configuration.md),
 [security](security.md), and [production operations](production.md).
 
-## 1. Prerequisites
+## Docker
 
-| Path | Requirement |
-| --- | --- |
-| Run the server | Rust 1.89 or the pinned toolchain in `rust-toolchain.toml` |
-| JavaScript SDK/CLI | Node.js 18+, pnpm, and TypeScript for local builds |
-| Java SDK | JDK 17+ and Maven |
-| Rust SDK | Rust and Cargo |
-| PostgreSQL compatibility | `psql` |
-| RESP compatibility | `redis-cli` or `valkey-cli` |
-| Container path | Docker with BuildKit |
+Install Docker with BuildKit, then pull the published image:
 
-Clone the repository and verify the toolchain:
+```bash
+docker pull ghcr.io/ryme-labs/rymedb:latest
+```
+
+If GHCR returns `unauthorized`, the package may be private. An organization
+admin must make it public for anonymous pulls, or you can authenticate with a
+GitHub classic token that has `read:packages`. When using `sudo docker`, log in
+with `sudo` as well; root and your regular user keep separate Docker credentials.
+
+Create a persistent volume and start a single node:
+
+```bash
+docker volume create rymedb-data
+docker run --name rymedb --rm \
+  -e RYME_API_KEY=local-dev-key \
+  -p 5433:5433 -p 6380:6380 -p 8080:8080 \
+  -v rymedb-data:/var/lib/rymedb \
+  ghcr.io/ryme-labs/rymedb:latest \
+  --pg-listen 0.0.0.0:5433 --resp-listen 0.0.0.0:6380 --http-listen 0.0.0.0:8080
+```
+
+The explicit listener addresses are needed because Docker port forwarding
+cannot reach a process bound only to the container's loopback interface. The
+volume stores database state; do not mount it read-write into multiple
+containers.
+
+Check readiness and connect over PostgreSQL and RESP:
+
+```bash
+curl -fsS -H 'Authorization: Bearer local-dev-key' http://127.0.0.1:8080/ready
+psql 'postgresql://postgres@127.0.0.1:5433/postgres' -c 'SELECT 1;'
+redis-cli -p 6380 PING
+```
+
+To build the image from a checkout instead, run
+`docker buildx build --load -f deploy/docker/Dockerfile.server -t rymedb:local .`
+and use `rymedb:local` in the `docker run` command.
+
+## Kubernetes
+
+This path uses the Helm chart, which configures a three-node Raft cluster by
+default. Install `kubectl`, Helm, and a cluster with a persistent-volume
+storage class. The chart defaults to a storage class named `nvme`; override it
+if your cluster uses another name.
+
+Create a namespace and API-key Secret before installing the chart. The prompt
+below avoids putting the key itself in your shell history:
+
+```bash
+kubectl create namespace rymedb
+read -rsp 'API key: ' RYME_API_KEY; echo
+kubectl -n rymedb create secret generic rymedb-api-key \
+  --from-literal=api-key="$RYME_API_KEY"
+unset RYME_API_KEY
+```
+
+Install the chart, setting the image tag and your cluster's storage class:
+
+```bash
+helm upgrade --install rymedb deploy/k8s/helm/rymeDB \
+  --namespace rymedb \
+  --set image.repository=ghcr.io/ryme-labs/rymedb \
+  --set image.tag=0.1.0 \
+  --set persistence.storageClass=YOUR_STORAGE_CLASS
+```
+
+Wait for the pods and inspect cluster status:
+
+```bash
+kubectl -n rymedb rollout status statefulset/rymedb
+kubectl -n rymedb get pods -o wide
+kubectl -n rymedb port-forward service/rymedb 8080:8080 5433:5433 6380:6380
+```
+
+In another terminal, verify the forwarded endpoints:
+
+```bash
+curl -fsS -H 'Authorization: Bearer replace-with-a-long-random-key' http://127.0.0.1:8080/ready
+psql 'postgresql://postgres@127.0.0.1:5433/postgres' -c 'SELECT 1;'
+redis-cli -p 6380 PING
+```
+
+The chart's Service is internal to the cluster; use an intentional ingress or
+load balancer for remote access, and configure TLS before exposing client
+traffic. A single-node StatefulSet manifest is also available at
+[`deploy/k8s/base/statefulset.yaml`](https://github.com/Ryme-Labs/rymeDB/blob/main/deploy/k8s/base/statefulset.yaml).
+
+## Run from source
+
+Install Rust using the repository's pinned toolchain. For PostgreSQL and RESP
+smoke tests, also install `psql` and `redis-cli` (or `valkey-cli`). Clone the
+repository and verify the Rust toolchain:
 
 ```bash
 git clone https://github.com/Ryme-Labs/rymeDB.git
@@ -24,151 +112,38 @@ cd rymeDB
 rustup show active-toolchain
 ```
 
-## 2. Run from source
+Start a local server with loopback-only listeners and a local data directory:
 
 ```bash
 export RYME_API_KEY=local-dev-key
 cargo run --locked -p ryme-server -- --http-listen 127.0.0.1:8080 --pg-listen 127.0.0.1:5433 --resp-listen 127.0.0.1:6380 --data-dir ./data
 ```
 
-The `--` is Cargo's separator. `ryme-server` accepts listener flags directly;
-there is no `serve --listen` subcommand. Use `cargo run --locked -p
-ryme-server -- --help` to see every flag.
+Cargo's `--` separates Cargo options from server options. The server accepts
+listener flags directly; there is no `serve --listen` subcommand. Run
+`cargo run --locked -p ryme-server -- --help` to see the available options.
 
-## 3. Health check
+Verify readiness and try SQL, HTTP key/value, and RESP:
 
 ```bash
-curl -fsS -H 'Authorization: Bearer local-dev-key' http://127.0.0.1:8080/health
 curl -fsS -H 'Authorization: Bearer local-dev-key' http://127.0.0.1:8080/ready
-curl -fsS -H 'Authorization: Bearer local-dev-key' http://127.0.0.1:8080/metrics
-```
+psql 'postgresql://postgres@127.0.0.1:5433/postgres' -c 'SELECT 1;'
 
-`/health` is a liveness check. `/ready` reports node, commit, leader, and
-cluster state. `/metrics` returns JSON; `/metrics/prometheus` returns scrape
-text.
-
-## 4. First data
-
-### SQL
-
-```bash
-psql 'postgresql://postgres@127.0.0.1:5433/postgres' <<'SQL'
-CREATE TABLE messages (
-  id TEXT PRIMARY KEY,
-  room TEXT NOT NULL,
-  body TEXT NOT NULL
-);
-INSERT INTO messages VALUES ('m-1', 'lobby', 'hello');
-SELECT * FROM messages;
-SQL
-```
-
-### HTTP key/value
-
-```bash
 curl -fsS -X PUT \
   -H 'Authorization: Bearer local-dev-key' \
   -H 'Content-Type: application/json' \
   --data '{"value":"hello"}' \
   http://127.0.0.1:8080/v1/kv/cache/greeting
 
-curl -fsS -H 'Authorization: Bearer local-dev-key' \
-  http://127.0.0.1:8080/v1/kv/cache/greeting
-```
-
-### RESP
-
-```bash
 redis-cli -p 6380 SET greeting hello
 redis-cli -p 6380 GET greeting
 ```
 
-## 5. Run with Docker
+Stop the foreground server with Ctrl-C. Its data is in `./data`; preserve or
+back it up before resetting a development database. Set `RUST_LOG=info` or
+`RUST_LOG=debug` when you need more diagnostic output.
 
-Pull the published image:
-
-```bash
-docker pull ghcr.io/ryme-labs/rymedb:latest
-```
-
-Run a persistent single node. The container must override the loopback
-defaults because Docker port forwarding reaches the container network:
-
-```bash
-docker volume create rymeDB-data
-docker run --name rymeDB --rm \
-  -e RYME_API_KEY=local-dev-key \
-  -p 5433:5433 -p 6380:6380 -p 8080:8080 \
-  -v rymeDB-data:/var/lib/rymedb \
-  ghcr.io/ryme-labs/rymedb:latest \
-  --pg-listen 0.0.0.0:5433 --resp-listen 0.0.0.0:6380 --http-listen 0.0.0.0:8080
-```
-
-The image exposes PostgreSQL on 5433, RESP on 6380, and HTTP on 8080. The
-volume contains WAL, schema, authentication, branches, topics, and snapshots.
-Do not mount a production volume read-write into multiple containers.
-
-Build the image locally:
-
-```bash
-docker buildx build --load -f deploy/docker/Dockerfile.server -t rymeDB:local .
-```
-
-## 6. Kubernetes
-
-The plain manifest runs one node. Apply it after creating the API-key secret:
-
-```bash
-kubectl apply -f deploy/k8s/base/statefulset.yaml
-kubectl -n rymedb create secret generic rymedb-api-key \
-  --from-literal=api-key=local-dev-key --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n rymedb rollout status statefulset/rymedb
-kubectl -n rymedb get pods -w
-```
-
-For the peer-aware three-node Raft chart, install Helm and set the image to
-the tag you want to run:
-
-```bash
-helm upgrade --install rymedb deploy/k8s/helm/rymeDB \
-  --namespace rymedb --create-namespace \
-  --set image.repository=ghcr.io/ryme-labs/rymedb \
-  --set image.tag=0.1.0
-```
-
-Create the `rymedb-api-key` secret before the pods start if the chart is being
-installed into an existing namespace. Keep the database volume attached to a
-single pod and use a storage class that supports the requested durability.
-
-## 7. Install a client
-
-| Client | Local checkout | Published package |
-| --- | --- | --- |
-| npm/TypeScript | `pnpm --dir sdks/js build` | `@rymelabs/rymedb` |
-| Rust | `cargo test --manifest-path sdks/rust/Cargo.toml --locked` | `rymedb-client` |
-| Java | `mvn -f sdks/java/pom.xml verify` | `com.rymelabs:rymedb-client` |
-
-The SDK pages contain complete connection examples. Raw HTTP, WebSocket,
-PostgreSQL, and RESP clients are first-class supported paths too.
-
-## 7. Stop, reset, and inspect
-
-Stop the foreground server with Ctrl-C. To reset a local development database,
-stop all clients and move the explicit data directory to a backup location;
-never remove an unknown path recursively. For Docker, stop the container and
-inspect the volume with `docker volume inspect rymeDB-data`.
-
-Inspect logs with the process' stderr or your service manager. Set
-`RUST_LOG=info`/`RUST_LOG=debug` when the binary is run with tracing support.
-Use `/v1/observe/slow`, `/v1/traces`, and `/metrics` before changing code.
-
-## 8. Run the verification suite
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --locked
-```
-
-CI additionally builds the Pages site, validates OpenAPI, checks the three
-SDK directories, and exercises PostgreSQL compatibility with `psql`.
+The [JavaScript](sdk-js.md), [Rust](sdk-rust.md), and [Java](sdk-java.md) guides
+show how to connect with the supported SDKs. For issues, see
+[troubleshooting](troubleshooting.md); contributors can continue with the
+[development setup](development.md).
