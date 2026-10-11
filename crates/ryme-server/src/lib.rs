@@ -4106,6 +4106,9 @@ async fn billing_invoice(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let tenant = query.tenant.unwrap_or_else(|| principal.tenant.clone());
     if tenant != principal.tenant
         && !principal.roles.contains(&Role::Owner)
@@ -4733,6 +4736,9 @@ async fn passkey_challenge(
         Ok(principal) => principal,
         Err(error) => return error_response(error),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     if request.user.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
     }
@@ -7670,6 +7676,9 @@ async fn branch_get(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
@@ -7719,6 +7728,9 @@ async fn branch_list(State(state): State<SharedState>, headers: HeaderMap) -> Re
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
@@ -7995,6 +8007,9 @@ async fn branch_diff(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let branches = match state.control.lock() {
         Ok(guard) => guard.branches.clone(),
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
