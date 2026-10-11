@@ -246,6 +246,8 @@ named projections such as `SELECT payload, count FROM t WHERE id = '...'` and
 explicit column aliases such as `SELECT payload AS body FROM t`,
 `COPY t FROM stdin` (bulk path), `SELECT DISTINCT`, `EXPLAIN <sql>` (planned access path), and
 `EXPLAIN ANALYZE <sql>` (executes the statement and reports actual rows plus elapsed microseconds),
+`CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, and
+`DROP MATERIALIZED VIEW` with snapshot-backed cached rows,
 `POST /v1/sql/explain` for plan without execution. Scalar builtins:
 `gen_random_uuid()` (v4) and `now()` (unix seconds) evaluate in KEY/VALUE
 positions; quoted literals are never evaluated.

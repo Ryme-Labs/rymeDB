@@ -1,5 +1,10 @@
 # Changelog
 
+- Materialized views now support `CREATE MATERIALIZED VIEW`, `WITH DATA` and
+  `WITH NO DATA`, `REFRESH MATERIALIZED VIEW` (including `CONCURRENTLY` syntax),
+  and `DROP MATERIALIZED VIEW`. Cached rows persist through schema snapshots.
+- `EXPLAIN ANALYZE` now executes its inner statement and reports actual rows
+  with elapsed microseconds while preserving transactional writes.
 - The PostgreSQL-wire benchmark now supports extended prepared statements
   and labels simple versus prepared results separately.
 - Added a PostgreSQL-wire SQL benchmark driver for comparable simple-query

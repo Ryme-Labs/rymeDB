@@ -148,6 +148,14 @@ pub enum Statement {
         #[serde(default)]
         replace: bool,
     },
+    CreateMaterializedView {
+        name: String,
+        query: Box<Statement>,
+        #[serde(default)]
+        replace: bool,
+        #[serde(default = "default_materialized_view_data")]
+        with_data: bool,
+    },
     CreateTrigger {
         name: String,
         table: String,
@@ -211,6 +219,16 @@ pub enum Statement {
         name: String,
         #[serde(default)]
         if_exists: bool,
+    },
+    DropMaterializedView {
+        name: String,
+        #[serde(default)]
+        if_exists: bool,
+    },
+    RefreshMaterializedView {
+        name: String,
+        #[serde(default)]
+        concurrently: bool,
     },
     DropSequence {
         name: String,
@@ -537,6 +555,10 @@ fn default_distinct_limit() -> usize {
     10_000
 }
 
+const fn default_materialized_view_data() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InsertValue {
     Value(Vec<u8>),
@@ -616,6 +638,10 @@ pub struct TriggerDefinition {
 pub struct ViewDefinition {
     pub name: String,
     pub query: Statement,
+    #[serde(default)]
+    pub materialized: bool,
+    #[serde(default)]
+    pub rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -781,11 +807,14 @@ impl Statement {
                 | Statement::CreateSequence { .. }
                 | Statement::CreateFunction { .. }
                 | Statement::CreateView { .. }
+                | Statement::CreateMaterializedView { .. }
                 | Statement::CreateTrigger { .. }
                 | Statement::CreatePolicy { .. }
                 | Statement::DropPolicy { .. }
                 | Statement::DropTrigger { .. }
                 | Statement::DropView { .. }
+                | Statement::DropMaterializedView { .. }
+                | Statement::RefreshMaterializedView { .. }
                 | Statement::DropSequence { .. }
                 | Statement::AlterSequence { .. }
                 | Statement::CreateRole { .. }
@@ -1307,13 +1336,16 @@ impl Statement {
             | Self::CreateExtension { .. }
             | Self::CreateSequence { .. }
             | Self::CreateFunction { .. }
-            | Self::CreateView { .. } => "",
+            | Self::CreateView { .. }
+            | Self::CreateMaterializedView { .. } => "",
             Self::CreateTrigger { table, .. } => table,
             Self::CreatePolicy { table, .. } => table,
             Self::DropPolicy { table, .. } => table,
             Self::DropIndex { name, .. } => name,
             Self::DropTrigger { table, .. } => table,
             Self::DropView { name, .. } => name,
+            Self::DropMaterializedView { name, .. }
+            | Self::RefreshMaterializedView { name, .. } => name,
             Self::DropSequence { name, .. } | Self::AlterSequence { name, .. } => name,
             Self::CreateRole { .. }
             | Self::PrivilegeChange { .. }
@@ -1344,6 +1376,7 @@ pub fn parse(input: &str) -> Result<Statement> {
             match head.as_str() {
                 "CREATE" => parse_create(&tokens, input),
                 "DROP" => parse_drop(&tokens),
+                "REFRESH" => parse_refresh(&tokens),
                 "GRANT" => parse_privilege_change(&tokens, input, true),
                 "REVOKE" => parse_privilege_change(&tokens, input, false),
                 "TRUNCATE" => parse_truncate(&tokens),
@@ -1465,7 +1498,11 @@ fn prepare_distinct(statement: Statement) -> Statement {
 fn parse_drop(tokens: &[String]) -> Result<Statement> {
     let kind =
         tokens.get(1).ok_or_else(|| RymeError::InvalidArgument(String::from("drop object")))?;
-    let initial_object_pos = if kind.eq_ignore_ascii_case("INDEX")
+    let is_materialized = kind.eq_ignore_ascii_case("MATERIALIZED")
+        && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("VIEW"));
+    let initial_object_pos = if is_materialized {
+        3
+    } else if kind.eq_ignore_ascii_case("INDEX")
         && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("CONCURRENTLY"))
     {
         3
@@ -1518,6 +1555,9 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
     if kind.eq_ignore_ascii_case("VIEW") {
         return Ok(Statement::DropView { name: object, if_exists });
     }
+    if is_materialized {
+        return Ok(Statement::DropMaterializedView { name: object, if_exists });
+    }
     if kind.eq_ignore_ascii_case("SEQUENCE") {
         return Ok(Statement::DropSequence { name: object, if_exists });
     }
@@ -1531,6 +1571,26 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
         return Ok(Statement::DropIndex { name: object, if_exists });
     }
     Err(RymeError::InvalidArgument(String::from("drop object")))
+}
+
+fn parse_refresh(tokens: &[String]) -> Result<Statement> {
+    if !tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("MATERIALIZED"))
+        || !tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("VIEW"))
+    {
+        return Err(RymeError::InvalidArgument(String::from("refresh materialized view")));
+    }
+    let concurrently =
+        tokens.get(3).is_some_and(|token| token.eq_ignore_ascii_case("CONCURRENTLY"));
+    let name_index = if concurrently { 4 } else { 3 };
+    let name = tokens
+        .get(name_index)
+        .map(|value| unquote(value.trim_end_matches(';')))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("refresh materialized view")))?;
+    if tokens.len() != name_index + 1 {
+        return Err(RymeError::InvalidArgument(String::from("refresh materialized view")));
+    }
+    Ok(Statement::RefreshMaterializedView { name, concurrently })
 }
 
 fn parse_truncate(tokens: &[String]) -> Result<Statement> {
@@ -2138,9 +2198,7 @@ fn parse_create(tokens: &[String], raw: &str) -> Result<Statement> {
     if tokens.get(kind_index).is_some_and(|token| token.eq_ignore_ascii_case("MATERIALIZED"))
         && tokens.get(kind_index + 1).is_some_and(|token| token.eq_ignore_ascii_case("VIEW"))
     {
-        return Err(RymeError::InvalidArgument(String::from(
-            "materialized views are not supported; use CREATE VIEW",
-        )));
+        return parse_create_materialized_view(tokens, raw, kind_index);
     }
     if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("POLICY")) {
         return parse_create_policy(tokens, raw);
@@ -2626,6 +2684,52 @@ fn parse_create_view(tokens: &[String], raw: &str, kind_index: usize) -> Result<
         name,
         query: Box::new(query),
         replace: tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("OR")),
+    })
+}
+
+fn parse_create_materialized_view(
+    tokens: &[String],
+    raw: &str,
+    kind_index: usize,
+) -> Result<Statement> {
+    let keyword = tokens
+        .get(kind_index)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("materialized view")))?;
+    let keyword_pos = find_sql_keyword(raw, keyword, 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("materialized view")))?;
+    let rest = raw[keyword_pos + keyword.len()..].trim_start();
+    if !rest.split_whitespace().next().is_some_and(|token| token.eq_ignore_ascii_case("VIEW")) {
+        return Err(RymeError::InvalidArgument(String::from("materialized view")));
+    }
+    let view_offset = find_sql_keyword(rest, "VIEW", 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("materialized view")))?
+        + "VIEW".len();
+    let rest = rest[view_offset..].trim_start();
+    let as_pos = find_sql_keyword(rest, "AS", 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("materialized view query")))?;
+    let name = unqualified_name(rest[..as_pos].trim());
+    let mut query_sql = rest[as_pos + "AS".len()..].trim().trim_end_matches(';').trim();
+    let upper = query_sql.to_ascii_uppercase();
+    let (with_data, query_end) = if upper.ends_with("WITH NO DATA") {
+        (false, query_sql.len() - "WITH NO DATA".len())
+    } else if upper.ends_with("WITH DATA") {
+        (true, query_sql.len() - "WITH DATA".len())
+    } else {
+        (true, query_sql.len())
+    };
+    query_sql = query_sql[..query_end].trim();
+    if name.is_empty() || query_sql.is_empty() {
+        return Err(RymeError::InvalidArgument(String::from("materialized view")));
+    }
+    let query = parse(query_sql)?;
+    if query.is_write() {
+        return Err(RymeError::InvalidArgument(String::from("view query must be readable")));
+    }
+    Ok(Statement::CreateMaterializedView {
+        name,
+        query: Box::new(query),
+        replace: tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("OR")),
+        with_data,
     })
 }
 
@@ -5908,6 +6012,10 @@ pub fn describe_plan(statement: &Statement) -> String {
         Statement::CreateView { name, replace, .. } => {
             format!("ddl {}view({name})", if *replace { "replace_" } else { "create_" })
         }
+        Statement::CreateMaterializedView { name, replace, .. } => format!(
+            "ddl {}materialized_view({name})",
+            if *replace { "replace_" } else { "create_" }
+        ),
         Statement::CreateTrigger { name, table, timing, events, function } => format!(
             "ddl create_trigger({name} on {table} {timing} {} -> {function})",
             events.join("/")
@@ -5930,6 +6038,12 @@ pub fn describe_plan(statement: &Statement) -> String {
             format!("ddl drop_trigger({name}) on {table}")
         }
         Statement::DropView { name, .. } => format!("ddl drop_view({name})"),
+        Statement::DropMaterializedView { name, .. } => {
+            format!("ddl drop_materialized_view({name})")
+        }
+        Statement::RefreshMaterializedView { name, .. } => {
+            format!("ddl refresh_materialized_view({name})")
+        }
         Statement::DropSequence { name, .. } => format!("ddl drop_sequence({name})"),
         Statement::AlterSequence { name, restart, increment } => {
             format!("ddl alter_sequence({name}) restart {restart:?} increment {increment:?}")
@@ -6843,6 +6957,13 @@ where
     }
 
     fn install_view(&self, definition: ViewDefinition, replace: bool) -> Result<()> {
+        self.install_view_definition(
+            ViewDefinition { materialized: false, rows: Vec::new(), ..definition },
+            replace,
+        )
+    }
+
+    fn install_view_definition(&self, definition: ViewDefinition, replace: bool) -> Result<()> {
         let mut views =
             self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
         if !replace && views.contains_key(&definition.name) {
@@ -6855,6 +6976,31 @@ where
         views.insert(object_name.clone(), definition);
         drop(views);
         self.apply_default_privileges_for("TABLE", &object_name)?;
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn refresh_materialized_view(&self, txn: &mut Transaction, name: &str) -> Result<()> {
+        let definition = self
+            .view_definition(name)?
+            .ok_or_else(|| RymeError::NotFound(format!("materialized view {name}")))?;
+        if !definition.materialized {
+            return Err(RymeError::InvalidArgument(String::from(
+                "refresh target is not a materialized view",
+            )));
+        }
+        let result = self.execute_read_in_transaction(txn, definition.query.clone())?;
+        let mut refreshed = definition;
+        refreshed.rows = query_result_rows(result);
+        let mut views =
+            self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
+        let key = views
+            .keys()
+            .find(|candidate| candidate.eq_ignore_ascii_case(name))
+            .cloned()
+            .ok_or_else(|| RymeError::NotFound(format!("materialized view {name}")))?;
+        views.insert(key, refreshed);
+        drop(views);
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -9439,7 +9585,11 @@ where
         limit: usize,
     ) -> Result<Vec<Row>> {
         if let Some(view) = self.view_definition(table)? {
-            let mut rows = query_result_rows(self.execute_read_in_transaction(txn, view.query)?);
+            let mut rows = if view.materialized {
+                view.rows
+            } else {
+                query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
+            };
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
             return Ok(rows);
@@ -9504,7 +9654,11 @@ where
         limit: usize,
     ) -> Result<Vec<Row>> {
         if let Some(view) = self.view_definition(table)? {
-            let mut rows = query_result_rows(self.execute_read_in_transaction(txn, view.query)?);
+            let mut rows = if view.materialized {
+                view.rows
+            } else {
+                query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
+            };
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
             return Ok(rows);
@@ -11186,11 +11340,14 @@ where
             | Statement::CreateSequence { .. }
             | Statement::CreateFunction { .. }
             | Statement::CreateView { .. }
+            | Statement::CreateMaterializedView { .. }
             | Statement::CreateTrigger { .. }
             | Statement::CreatePolicy { .. }
             | Statement::DropPolicy { .. }
             | Statement::DropTrigger { .. }
             | Statement::DropView { .. }
+            | Statement::DropMaterializedView { .. }
+            | Statement::RefreshMaterializedView { .. }
             | Statement::DropSequence { .. }
             | Statement::AlterSequence { .. }
             | Statement::CreateRole { .. }
@@ -11338,7 +11495,23 @@ where
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreateView { name, query, replace } => {
-                self.install_view(ViewDefinition { name, query: *query }, replace)?;
+                self.install_view(
+                    ViewDefinition { name, query: *query, materialized: false, rows: Vec::new() },
+                    replace,
+                )?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::CreateMaterializedView { name, query, replace, with_data } => {
+                let query = *query;
+                let rows = if with_data {
+                    query_result_rows(self.execute_read_in_transaction(txn, query.clone())?)
+                } else {
+                    Vec::new()
+                };
+                self.install_view_definition(
+                    ViewDefinition { name, query, materialized: true, rows },
+                    replace,
+                )?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::CreateTrigger { name, table, timing, events, function } => {
@@ -11351,6 +11524,14 @@ where
             }
             Statement::DropView { name, if_exists } => {
                 self.drop_view(&name, if_exists)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::DropMaterializedView { name, if_exists } => {
+                self.drop_view(&name, if_exists)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::RefreshMaterializedView { name, concurrently: _ } => {
+                self.refresh_materialized_view(txn, &name)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::DropSequence { name, if_exists } => {
@@ -12980,11 +13161,14 @@ where
             | Statement::CreateSequence { .. }
             | Statement::CreateFunction { .. }
             | Statement::CreateView { .. }
+            | Statement::CreateMaterializedView { .. }
             | Statement::CreateTrigger { .. }
             | Statement::CreatePolicy { .. }
             | Statement::DropPolicy { .. }
             | Statement::DropTrigger { .. }
             | Statement::DropView { .. }
+            | Statement::DropMaterializedView { .. }
+            | Statement::RefreshMaterializedView { .. }
             | Statement::DropSequence { .. }
             | Statement::AlterSequence { .. }
             | Statement::CreateRole { .. }
@@ -13033,11 +13217,14 @@ where
                 | Statement::CreateRole { .. }
                 | Statement::CreateFunction { .. }
                 | Statement::CreateView { .. }
+                | Statement::CreateMaterializedView { .. }
                 | Statement::CreateTrigger { .. }
                 | Statement::CreatePolicy { .. }
                 | Statement::DropPolicy { .. }
                 | Statement::DropTrigger { .. }
                 | Statement::DropView { .. }
+                | Statement::DropMaterializedView { .. }
+                | Statement::RefreshMaterializedView { .. }
                 | Statement::DropSequence { .. }
                 | Statement::AlterSequence { .. }
                 | Statement::DropRole { .. }
@@ -13513,7 +13700,24 @@ where
                 Ok(QueryResult::Ok)
             }
             Statement::CreateView { name, query, replace } => {
-                self.install_view(ViewDefinition { name, query: *query }, replace)?;
+                self.install_view(
+                    ViewDefinition { name, query: *query, materialized: false, rows: Vec::new() },
+                    replace,
+                )?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::CreateMaterializedView { name, query, replace, with_data } => {
+                let query = *query;
+                let mut txn = self.begin_with(isolation);
+                let rows = if with_data {
+                    query_result_rows(self.execute_read_in_transaction(&mut txn, query.clone())?)
+                } else {
+                    Vec::new()
+                };
+                self.install_view_definition(
+                    ViewDefinition { name, query, materialized: true, rows },
+                    replace,
+                )?;
                 Ok(QueryResult::Ok)
             }
             Statement::CreateTrigger { name, table, timing, events, function } => {
@@ -13526,6 +13730,15 @@ where
             }
             Statement::DropView { name, if_exists } => {
                 self.drop_view(&name, if_exists)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::DropMaterializedView { name, if_exists } => {
+                self.drop_view(&name, if_exists)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::RefreshMaterializedView { name, concurrently: _ } => {
+                let mut txn = self.begin_with(isolation);
+                self.refresh_materialized_view(&mut txn, &name)?;
                 Ok(QueryResult::Ok)
             }
             Statement::DropSequence { name, if_exists } => {
@@ -14715,6 +14928,76 @@ mod tests {
         assert!(
             matches!(restored, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"hello".to_vec()]])
         );
+    }
+
+    #[tokio::test]
+    async fn materialized_views_refresh_and_restore_cached_rows() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO messages (id, body) VALUES ('1', 'hello')").unwrap())
+            .await
+            .unwrap();
+
+        let create =
+            parse("CREATE MATERIALIZED VIEW message_snapshot AS SELECT * FROM messages WITH DATA")
+                .unwrap();
+        assert!(matches!(
+            create,
+            Statement::CreateMaterializedView { ref name, with_data: true, .. }
+                if name == "message_snapshot"
+        ));
+        assert!(matches!(
+            parse("CREATE MATERIALIZED VIEW empty_snapshot AS SELECT * FROM messages WITH NO DATA")
+                .unwrap(),
+            Statement::CreateMaterializedView { with_data: false, .. }
+        ));
+        executor.execute(create).await.unwrap();
+        assert!(matches!(
+            executor
+                .execute(parse("SELECT * FROM message_snapshot").unwrap())
+                .await
+                .unwrap(),
+            QueryResult::Rows { rows } if rows.len() == 1
+        ));
+
+        executor
+            .execute(parse("INSERT INTO messages (id, body) VALUES ('2', 'world')").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            executor
+                .execute(parse("SELECT * FROM message_snapshot").unwrap())
+                .await
+                .unwrap(),
+            QueryResult::Rows { rows } if rows.len() == 1
+        ));
+
+        executor
+            .execute(parse("REFRESH MATERIALIZED VIEW CONCURRENTLY message_snapshot").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            executor
+                .execute(parse("SELECT * FROM message_snapshot").unwrap())
+                .await
+                .unwrap(),
+            QueryResult::Rows { rows } if rows.len() == 2
+        ));
+
+        let snapshot = executor.schema_snapshot();
+        executor.execute(parse("DROP MATERIALIZED VIEW message_snapshot").unwrap()).await.unwrap();
+        executor.restore_schema_snapshot(snapshot).unwrap();
+        assert!(matches!(
+            executor
+                .execute(parse("SELECT * FROM message_snapshot").unwrap())
+                .await
+                .unwrap(),
+            QueryResult::Rows { rows } if rows.len() == 2
+        ));
     }
 
     #[tokio::test]
