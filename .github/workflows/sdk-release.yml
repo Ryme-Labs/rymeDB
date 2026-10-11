@@ -8,32 +8,19 @@ on:
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "sdks/RELEASE_BASE_VERSION"
       - "docs/sdk-release.md"
       - ".github/workflows/sdk-release.yml"
-      - ".github/workflows/sdk-tag-release.yml"
   pull_request:
     paths:
       - "sdks/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "sdks/RELEASE_BASE_VERSION"
       - "docs/sdk-release.md"
       - ".github/workflows/sdk-release.yml"
-      - ".github/workflows/sdk-tag-release.yml"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: Publish the tested SDKs to their registries
-        required: false
-        type: boolean
-        default: false
-  workflow_call:
-    inputs:
-      publish:
-        description: Publish the tested SDKs to their registries
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: sdk-release-${{ github.ref }}
@@ -85,16 +72,6 @@ jobs:
           pnpm --filter @rymelabs/rymedb build
           pnpm --filter @rymelabs/rymedb test
 
-      - name: Check tag version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          expected="${GITHUB_REF_NAME#v}"
-          actual="$(node -p "require('./sdks/js/package.json').version")"
-          test "$actual" = "$expected" || {
-            echo "npm SDK version $actual does not match tag $GITHUB_REF_NAME"
-            exit 1
-          }
-
       - name: Pack npm artifact
         run: mkdir -p "$RUNNER_TEMP/npm" && npm pack --pack-destination "$RUNNER_TEMP/npm"
         working-directory: sdks/js
@@ -134,16 +111,6 @@ jobs:
       - name: Package crate
         run: cargo package --manifest-path sdks/rust/Cargo.toml --locked
 
-      - name: Check tag version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          expected="${GITHUB_REF_NAME#v}"
-          actual="$(sed -n 's/^version = "\(.*\)"/\1/p' sdks/rust/Cargo.toml | head -n 1)"
-          test "$actual" = "$expected" || {
-            echo "Rust SDK version $actual does not match tag $GITHUB_REF_NAME"
-            exit 1
-          }
-
       - name: Upload Cargo artifact
         uses: actions/upload-artifact@v4
         with:
@@ -151,10 +118,38 @@ jobs:
           path: sdks/rust/target/package/*.crate
           if-no-files-found: error
 
+  release-version:
+    name: Choose next automatic SDK version
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Calculate next major version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          previous_release="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0] // empty')"
+          if [[ -n "$previous_release" ]]; then
+            current="${previous_release#v}"
+          else
+            current="$(tr -d '\r\n' < sdks/RELEASE_BASE_VERSION)"
+          fi
+          major="${current%%.*}"
+          [[ "$major" =~ ^[0-9]+$ ]]
+          version="$((major + 1)).0.0"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "SDK release version: $version (after $current)"
+
   publish-npm:
     name: Publish npm SDK
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
-    needs: npm
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    needs: [npm, release-version]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -169,23 +164,59 @@ jobs:
       - name: Install npm with trusted publishing support
         run: npm install --global npm@11.5.1
 
-      - name: Download tested npm package
-        uses: actions/download-artifact@v4
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
         with:
-          name: sdk-npm
-          path: ${{ runner.temp }}/npm
+          version: 9.0.0
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set automatic release version
+        env:
+          RELEASE_VERSION: ${{ needs.release-version.outputs.version }}
+        run: node scripts/set-sdk-version.mjs "$RELEASE_VERSION"
+
+      - name: Install dependencies and test release package
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @rymelabs/rymedb build
+          pnpm --filter @rymelabs/rymedb test
+
+      - name: Pack npm artifact
+        run: mkdir -p "$RUNNER_TEMP/npm" && npm pack --pack-destination "$RUNNER_TEMP/npm"
+        working-directory: sdks/js
+
+      - name: Upload npm release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-npm-release
+          path: ${{ runner.temp }}/npm/*.tgz
+          if-no-files-found: error
 
       - name: Publish npm package
+        env:
+          RELEASE_VERSION: ${{ needs.release-version.outputs.version }}
         run: |
           shopt -s nullglob
           packages=("$RUNNER_TEMP/npm/"*.tgz)
           test "${#packages[@]}" -eq 1
-          npm publish "${packages[0]}" --access public --provenance
+          expected="sha512-$(openssl dgst -sha512 -binary "${packages[0]}" | openssl base64 -A)"
+          published="$(npm view "@rymelabs/rymedb@$RELEASE_VERSION" dist.integrity --json 2>/dev/null | tr -d '\"\r\n' || true)"
+          if [[ -n "$published" && "$published" != "undefined" && "$published" != "null" ]]; then
+            if [[ "$published" != "$expected" ]]; then
+              echo "@rymelabs/rymedb@$RELEASE_VERSION already exists with different contents"
+              exit 1
+            fi
+            echo "@rymelabs/rymedb@$RELEASE_VERSION already published with matching integrity; skipping"
+          else
+            npm publish "${packages[0]}" --access public --provenance
+          fi
 
   publish-cargo:
     name: Publish Rust SDK
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
-    needs: rust
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    needs: [rust, release-version]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -193,49 +224,96 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Download tested Cargo package
-        uses: actions/download-artifact@v4
-        with:
-          name: sdk-cargo
-          path: ${{ runner.temp }}/cargo
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      - name: Publish tested crate
+      - name: Set automatic release version
+        env:
+          RELEASE_VERSION: ${{ needs.release-version.outputs.version }}
+        run: node scripts/set-sdk-version.mjs "$RELEASE_VERSION"
+
+      - name: Test and package release crate
+        run: |
+          cargo test --manifest-path sdks/rust/Cargo.toml --locked
+          cargo package --manifest-path sdks/rust/Cargo.toml --locked
+
+      - name: Upload Cargo release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-cargo-release
+          path: sdks/rust/target/package/*.crate
+          if-no-files-found: error
+
+      - name: Publish crate if not already published
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_VERSION: ${{ needs.release-version.outputs.version }}
         run: |
           shopt -s nullglob
-          packages=("$RUNNER_TEMP/cargo/"*.crate)
+          packages=("sdks/rust/target/package/"*.crate)
           test "${#packages[@]}" -eq 1
-          stage="$RUNNER_TEMP/cargo-publish"
-          mkdir -p "$stage"
-          tar -xzf "${packages[0]}" -C "$stage"
-          manifest="$(find "$stage" -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit)"
-          test -n "$manifest"
-          cargo publish --manifest-path "$manifest" --locked --no-verify
+          expected="$(sha256sum "${packages[0]}" | cut -d ' ' -f1)"
+          metadata="$(curl --retry 3 --retry-all-errors -fsSL \
+            -H 'User-Agent: rymeDB (https://github.com/Ryme-Labs/rymeDB)' \
+            "https://crates.io/api/v1/crates/rymedb-client/$RELEASE_VERSION" 2>/dev/null || true)"
+          published="$(jq -r '.version.checksum // empty' <<< "$metadata")"
+          if [[ -n "$published" ]]; then
+            if [[ "$published" != "$expected" ]]; then
+              echo "rymedb-client@$RELEASE_VERSION already exists with different contents"
+              exit 1
+            fi
+            echo "rymedb-client@$RELEASE_VERSION already published with matching checksum; skipping"
+          else
+            cargo publish --manifest-path sdks/rust/Cargo.toml --locked --no-verify
+          fi
 
   release:
-    name: Upload SDK release artifacts
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    needs: [npm, rust]
+    name: Commit version and create SDK release
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    needs: [publish-npm, publish-cargo, release-version]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download SDK artifacts
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: sdk-*
+          pattern: sdk-*-release
           path: release
           merge-multiple: true
 
-      - name: Create GitHub release
+      - name: Commit automatic version and publish release tag
         env:
+          RELEASE_VERSION: ${{ needs.release-version.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mapfile -t artifacts < <(
-            find release -type f \( -name '*.tgz' -o -name '*.crate' \) -print
-          )
-          test "${#artifacts[@]}" -gt 0
+          node scripts/set-sdk-version.mjs "$RELEASE_VERSION"
+          git config user.name deyoyk
+          git config user.email deyoyk@users.noreply.github.com
+          git add sdks/js/package.json sdks/rust/Cargo.toml sdks/rust/Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "Release SDKs v$RELEASE_VERSION"
+            git push origin HEAD:main
+          fi
+          tag="v$RELEASE_VERSION"
+          git fetch --tags origin
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            test "$(git rev-parse "$tag^{}")" = "$(git rev-parse HEAD)"
+          else
+            git tag -a "$tag" -m "SDK release $tag"
+            git push origin "$tag"
+          fi
           (cd release && find . -type f \( -name '*.tgz' -o -name '*.crate' \) -print0 | sort -z | xargs -0 sha256sum) > release/SHA256SUMS
-          artifacts+=(release/SHA256SUMS)
-          gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --verify-tag --generate-notes
+          mapfile -t artifacts < <(find release -type f \( -name '*.tgz' -o -name '*.crate' -o -name 'SHA256SUMS' \) -print | sort)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${artifacts[@]}" --clobber
+          else
+            gh release create "$tag" "${artifacts[@]}" --verify-tag --title "SDK release $tag" \
+              --notes "SDK release run: $GITHUB_RUN_ID"
+          fi

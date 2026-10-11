@@ -22,7 +22,6 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/pages.yml"
       - ".github/workflows/sdk-release.yml"
-      - ".github/workflows/sdk-tag-release.yml"
   pull_request:
     paths:
       - "Cargo.toml"
@@ -43,7 +42,6 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/pages.yml"
       - ".github/workflows/sdk-release.yml"
-      - ".github/workflows/sdk-tag-release.yml"
   workflow_dispatch:
 
 permissions:

@@ -18,11 +18,25 @@ pnpm --dir sdks/js build && pnpm --dir sdks/js test
 cargo test --manifest-path sdks/rust/Cargo.toml --locked
 ```
 
-Version each manifest before creating a `v*` tag. The tag workflow publishes
-npm and Cargo artifacts and uploads checksums to the GitHub release. npm uses
-Trusted Publishing through GitHub OIDC; Cargo publishing uses the configured
-registry token. The release workflow tests artifacts before publishing and the
-Pages build verifies that only `js` and `rust` exist under `sdks/`.
+SDK releases are started from **Actions → sdk-release → Run workflow** on
+`main`. The workflow picks the next major automatically (`0.1.0` → `1.0.0` →
+`2.0.0`), tests both SDKs at that version, publishes npm and Cargo packages,
+commits the synchronized version fields, creates the matching `v*` tag and
+GitHub release, and attaches package archives with checksums. Do not create
+release tags manually. The first release uses `sdks/RELEASE_BASE_VERSION`;
+later versions follow completed GitHub SDK releases.
+
+The workflow is idempotent if a registry already contains the exact artifact;
+it rejects a version whose published contents differ. npm uses Trusted
+Publishing through GitHub OIDC. Cargo publishing uses the repository Actions
+secret `CARGO_REGISTRY_TOKEN`.
+
+The npm trusted publisher must name the workflow file `sdk-release.yml` (not a
+tag-trigger workflow). If an older trusted-publisher entry names a removed
+workflow, delete that entry and create a new one for `sdk-release.yml`.
+
+Pushes and pull requests run build/test/package checks only; they do not publish.
+The Pages build verifies that only `js` and `rust` exist under `sdks/`.
 
 SDK methods should remain thin protocol clients. Add database semantics to the
 server/API contract first, then update both clients and their examples.
