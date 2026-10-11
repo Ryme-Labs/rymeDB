@@ -13376,21 +13376,22 @@ where
         schema_before: Option<SchemaSnapshot>,
     ) -> Result<u64> {
         self.check_transaction_uniqueness(&changes)?;
+        let previous_schema = schema_before.clone();
         let schema_after = schema_before.as_ref().map(|_| self.schema_snapshot());
         let schema_changed = schema_after
             .as_ref()
             .is_some_and(|after| schema_before.as_ref().is_some_and(|before| before != after));
-        if schema_changed && !changes.is_empty() && self.schema_hook.is_some() {
-            self.rollback_schema_transaction(schema_before)?;
+        if schema_changed && !changes.is_empty() {
+            self.rollback_schema_transaction(previous_schema.clone())?;
             return Err(RymeError::InvalidArgument(String::from(
-                "schema changes and row changes cannot share a clustered transaction",
+                "schema changes and row changes cannot share a transaction",
             )));
         }
         let commit_ts = match self.manager.commit(txn).await {
             Ok(commit_ts) => commit_ts,
             Err(error) => {
                 if schema_changed {
-                    self.rollback_schema_transaction(schema_before)?;
+                    self.rollback_schema_transaction(previous_schema.clone())?;
                 }
                 return Err(error);
             }
@@ -13409,7 +13410,20 @@ where
             self.apply_index_change(&change);
             self.emit(&change.table, change.pk, change.op, change.before, change.after, commit_ts)?;
         }
-        self.persist_schema_if_configured()?;
+        if let Err(error) = self.persist_schema_if_configured() {
+            if schema_changed {
+                let rollback = self.rollback_schema_transaction(previous_schema).and_then(|_| {
+                    self.schema_dirty.store(true, Ordering::SeqCst);
+                    self.persist_schema_if_configured()
+                });
+                if let Err(rollback_error) = rollback {
+                    return Err(RymeError::Internal(format!(
+                        "schema persistence failed: {error}; rollback failed: {rollback_error}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
         Ok(commit_ts)
     }
 
@@ -16843,6 +16857,80 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(dir.with_extension("tmp"));
+    }
+
+    #[tokio::test]
+    async fn explicit_transaction_schema_persistence_failure_rolls_back_ddl() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-schema-transaction-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut executor = Executor::new(String::from("t"), String::from("d"));
+        executor.set_schema_path(dir.clone());
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let before = executor.schema_transaction_snapshot();
+        let (_, changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("CREATE TABLE should_rollback (id TEXT PRIMARY KEY)").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(executor
+            .commit_transaction_with_schema(txn, changes, before)
+            .await
+            .is_err());
+        assert!(!executor.catalog_tables().contains(&String::from("should_rollback")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("tmp"));
+    }
+
+    #[tokio::test]
+    async fn standalone_transactions_reject_mixed_schema_and_row_changes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let before = executor.schema_transaction_snapshot();
+        let (_, mut changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("CREATE TABLE migration (id TEXT PRIMARY KEY)").unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, row_changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO messages (id) VALUES ('one')").unwrap(),
+            )
+            .await
+            .unwrap();
+        changes.extend(row_changes);
+
+        let result = executor.commit_transaction_with_schema(txn, changes, before).await;
+        assert!(matches!(
+            result,
+            Err(RymeError::InvalidArgument(message))
+                if message.contains("schema changes and row changes")
+        ));
+        assert!(!executor.catalog_tables().contains(&String::from("migration")));
+        assert!(matches!(
+            executor.execute(parse("SELECT * FROM messages").unwrap()).await,
+            Ok(QueryResult::Rows { ref rows }) if rows.is_empty()
+        ));
     }
 
     #[tokio::test]
