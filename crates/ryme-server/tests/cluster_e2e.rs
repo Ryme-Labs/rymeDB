@@ -440,10 +440,11 @@ async fn cluster_range_split_replicates_metadata() {
     let transfer = format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":1}}");
     let (status, response) =
         http_request(http[leader], "POST /v1/ranges/transfer", transfer.as_bytes()).await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "range transfer response: {}", String::from_utf8_lossy(&response));
     let response = String::from_utf8_lossy(&response);
     assert!(response.contains("\"verified\":true"), "range transfer failed: {response}");
     assert!(response.contains("\"leader\":\"raft-"));
+    assert!(response.contains("\"source_cleanup\":true"), "source cleanup deferred: {response}");
     let verify_after =
         format!("{{\"id\":\"range-left\",\"target\":{target},\"expected_epoch\":2}}");
     let (status, response) =

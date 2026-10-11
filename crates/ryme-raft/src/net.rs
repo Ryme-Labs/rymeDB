@@ -76,6 +76,14 @@ pub(crate) enum Rpc {
     RangeInstallResponse {
         rows: u64,
     },
+    RangePurgeRequest {
+        group_id: String,
+        expected_epoch: u64,
+        snapshot: RangeSnapshot,
+    },
+    RangePurgeResponse {
+        rows: u64,
+    },
     RangeReadRequest {
         key: RecordKey,
         read_ts: u64,
@@ -2418,6 +2426,11 @@ impl Node {
                 let rows = self.install_range_snapshot(&snapshot)?;
                 Ok(Rpc::RangeInstallResponse { rows })
             }
+            Rpc::RangePurgeRequest { group_id, expected_epoch, snapshot } => {
+                let rows =
+                    self.purge_range_after_transfer(&group_id, expected_epoch, &snapshot).await?;
+                Ok(Rpc::RangePurgeResponse { rows })
+            }
             Rpc::RangeReadRequest { key, read_ts } => {
                 let (value, expires_at) = self.read_range_value(&key, read_ts)?;
                 let effective_read_ts =
@@ -2496,6 +2509,7 @@ impl Node {
             | Rpc::PresenceResponse { .. }
             | Rpc::RangeSnapshotResponse { .. }
             | Rpc::RangeInstallResponse { .. }
+            | Rpc::RangePurgeResponse { .. }
             | Rpc::RangeReadResponse { .. }
             | Rpc::RangeReadBatchResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
@@ -3687,6 +3701,12 @@ impl Node {
             return Err(RymeError::InvalidArgument(String::from("writes")));
         }
         let _commit = self.txn_commit_lock.lock().await;
+        let current = self
+            .range_owner_by_id(group_id)
+            .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
+        if current.owner != self.id || current.epoch != range.epoch {
+            return Err(RymeError::Conflict(String::from("range topology changed")));
+        }
         let mut txn = self.manager.begin();
         if let Some(generation) = route_generation {
             txn.set_route_generation(generation);
@@ -4711,6 +4731,42 @@ impl Node {
         Ok(snapshot.rows.len() as u64)
     }
 
+    pub async fn purge_range_after_transfer(
+        &self,
+        group_id: &str,
+        expected_epoch: u64,
+        snapshot: &RangeSnapshot,
+    ) -> Result<u64> {
+        if snapshot.truncated {
+            return Err(RymeError::Overload(String::from("range snapshot")));
+        }
+        let _commit = self.txn_commit_lock.lock().await;
+        let range = self
+            .range_owner_by_id(group_id)
+            .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
+        if range.epoch != expected_epoch || range.owner == self.id {
+            return Err(RymeError::Unavailable(String::from("range ownership update pending")));
+        }
+        let current = self.snapshot_range(
+            &snapshot.start,
+            &snapshot.end,
+            self.manager.latest_commit(),
+            100_000,
+        )?;
+        if current.truncated || current.rows != snapshot.rows {
+            return Err(RymeError::Conflict(String::from("range changed during transfer")));
+        }
+        let keys: Vec<RecordKey> = current
+            .rows
+            .iter()
+            .map(|row| RecordKey::new(&row.tenant, &row.database, &row.table, &row.pk))
+            .collect();
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.manager.purge_keys(&keys)? as u64)
+    }
+
     pub async fn install_range_snapshot_on(
         &self,
         peer: usize,
@@ -4720,6 +4776,21 @@ impl Node {
         match pool.roundtrip(&Rpc::RangeInstallRequest { snapshot }).await? {
             Rpc::RangeInstallResponse { rows } => Ok(rows),
             _ => Err(RymeError::Corrupt(String::from("range install rpc"))),
+        }
+    }
+
+    pub async fn purge_range_after_transfer_on(
+        &self,
+        peer: usize,
+        group_id: String,
+        expected_epoch: u64,
+        snapshot: RangeSnapshot,
+    ) -> Result<u64> {
+        let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
+        match pool.roundtrip(&Rpc::RangePurgeRequest { group_id, expected_epoch, snapshot }).await?
+        {
+            Rpc::RangePurgeResponse { rows } => Ok(rows),
+            _ => Err(RymeError::Corrupt(String::from("range purge rpc"))),
         }
     }
 
@@ -5534,6 +5605,40 @@ mod tests {
         let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
         assert_eq!(reopened.range_last_term("range-a"), 2);
         assert_eq!(Wal::read_all(&reopened.range_wal_path).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn transferred_range_purges_only_an_unchanged_source() {
+        let dir = temp_dir("range-transfer-purge");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let key = RecordKey::new("t", "d", "docs", b"row");
+        let mut writes = BTreeMap::new();
+        writes.insert(key.clone(), ryme_txn::WriteOp::put(b"before".to_vec()));
+        node.manager.replay_at(10, &writes).unwrap();
+        let snapshot = node.snapshot_range(b"docs\0", b"docs\0\xff", 0, 100).unwrap();
+
+        node.set_range_owners(vec![RangeOwner {
+            id: String::from("range-a"),
+            start: b"docs\0".to_vec(),
+            end: b"docs\0\xff".to_vec(),
+            owner: 1,
+            replicas: vec![1],
+            epoch: 2,
+        }]);
+        assert_eq!(node.purge_range_after_transfer("range-a", 2, &snapshot).await.unwrap(), 1);
+        let mut probe = node.manager.begin();
+        assert_eq!(node.manager.get(&mut probe, &key).unwrap(), None);
+
+        let mut changed = BTreeMap::new();
+        changed.insert(key.clone(), ryme_txn::WriteOp::put(b"after".to_vec()));
+        node.manager.replay_at(20, &changed).unwrap();
+        let changed_snapshot = node.snapshot_range(b"docs\0", b"docs\0\xff", 0, 100).unwrap();
+        node.manager.replay_at(30, &changed).unwrap();
+        assert!(matches!(
+            node.purge_range_after_transfer("range-a", 2, &changed_snapshot).await,
+            Err(RymeError::Conflict(message)) if message == "range changed during transfer"
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

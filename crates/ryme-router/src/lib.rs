@@ -231,12 +231,12 @@ impl Router {
             self.insert(range.clone());
             return Err(RymeError::InvalidArgument(String::from("leader")));
         }
+        let previous_leader = range.leader.clone();
         range.leader = leader;
-        if !range.replicas.contains(&range.leader) {
-            range.replicas.push(range.leader.clone());
-            range.replicas.sort();
-            range.replicas.dedup();
-        }
+        range.replicas.retain(|replica| replica != &previous_leader);
+        range.replicas.push(range.leader.clone());
+        range.replicas.sort();
+        range.replicas.dedup();
         range.epoch = range.epoch.saturating_add(1);
         self.insert(range.clone());
         Ok(range)
@@ -331,6 +331,7 @@ mod tests {
         let moved = router.move_leader("r0", String::from("raft-1")).unwrap();
         assert_eq!(moved.leader, "raft-1");
         assert_eq!(moved.epoch, 1);
+        assert_eq!(moved.replicas, vec![String::from("raft-1")]);
         assert!(moved.start.is_empty() && moved.end.is_empty());
         assert!(router.move_leader("r0", String::from("raft-1")).is_err());
     }

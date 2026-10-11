@@ -184,8 +184,8 @@ Pure cluster backends replicate range metadata through the Raft log. Split,
 merge, and autosplit requests must reach the current leader and are only
 acknowledged after the metadata entry reaches quorum; followers apply the same
 range map before serving the updated range. This keeps routing metadata
-consistent across nodes, but it does not yet move range-owned data between
-nodes. The leader now exposes `POST /v1/ranges/verify` as the first migration
+consistent across nodes. The leader now exposes `POST /v1/ranges/verify` as the first
+migration
 safety gate: it takes a consistent key-range snapshot from the requested Raft
 member, compares it with the leader at the supplied `expected_epoch`, and
 returns row/byte counts plus `matching` and `ready_for_transfer`. The endpoint
@@ -195,13 +195,18 @@ epoch. Hybrid backends apply the same local range placement to their
 non-replicated tier, while replicated tables continue to follow the Raft-backed
 placement.
 
-`POST /v1/ranges/transfer` is the controlled next step for a pure cluster. It
-installs the complete bounded MVCC snapshot—including version chains and
-tombstones—on the target member, reconciles stale visible keys, verifies the
-target at the source commit timestamp, and then bumps the range epoch and
-records the target as the logical range leader (for example, `raft-2`). The
-operation is leader-only and requires the expected epoch. Once that metadata is
-committed, main-branch point reads through the HTTP, native, gRPC, and RESP
+`POST /v1/ranges/transfer` is the controlled handoff for a pure cluster. It
+reads the complete bounded MVCC snapshot—including version chains and
+tombstones—from the current range owner, installs it on the target member,
+reconciles stale visible keys, verifies the target at the source commit
+timestamp, and then bumps the range epoch and records the target as the
+logical range leader (for example, `raft-2`). The old owner is removed from
+the range replica set. After the metadata entry is applied on that owner, it
+purges its materialized range rows only if a fresh snapshot is identical to
+the transferred snapshot; a concurrent write leaves cleanup deferred rather
+than risking data loss. The response reports `source_cleanup` and
+`source_rows_purged`. The operation is leader-only and requires the expected
+epoch. Once that metadata is committed, main-branch point reads through the HTTP, native, gRPC, and RESP
 gateways use the range owner and fetch from the target over the authenticated
 mesh, including RLS checks at the serving gateway where applicable.
 PostgreSQL autocommit primary-key selects use the same owner path; PostgreSQL
@@ -236,9 +241,11 @@ of that range's replica set and become the routed owner without changing the
 global Raft membership. The range leader announcement is learned by followers
 through range heartbeats; global placement changes still remain epoch-fenced
 control-plane operations.
-This does not yet delete source replicas or claim full shared-nothing storage
-scale. Single-owner write-only transactions now route directly to the current
-range leader, replicate through that range's quorum log, validate/apply locally,
+The handoff removes the old owner from live range storage when the source is
+quiescent; range-WAL compaction and automatic replacement-replica placement
+remain separate operational work. Single-owner write-only transactions now
+route directly to the current range leader, replicate through that range's
+quorum log, validate/apply locally,
 and then advance the range commit index. Read-dependent, multi-owner, and
 write-only multi-owner transactions use the current global log for atomic
 forwarding. This is not yet independent per-range Raft 2PC, and read-dependent cross-range

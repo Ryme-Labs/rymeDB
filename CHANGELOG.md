@@ -1,5 +1,9 @@
 # Changelog
 
+- Range transfers now copy from the current range owner, replace the old owner
+  in the replica set, and safely purge the source's materialized rows after
+  epoch-fenced verification. Concurrent source changes defer cleanup instead
+  of risking data loss.
 - Branch overlay epochs are now manager-wide, persisted, and monotonic. Reset
   and delete/recreate cycles cannot reuse an old branch namespace and expose
   stale branch-local writes.

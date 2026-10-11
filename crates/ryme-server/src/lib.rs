@@ -8980,10 +8980,19 @@ async fn range_verify(
         return error_response(ryme_error::RymeError::NotFound(String::from("peer")));
     }
     let max_rows = request.max_rows.unwrap_or(100_000).clamp(1, 100_000);
-    let read_ts = node.manager().latest_commit();
-    let source = match node.snapshot_range(&range.start, &range.end, read_ts, max_rows) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return error_response(error),
+    let source_node = range.leader.strip_prefix("raft-").and_then(|id| id.parse::<usize>().ok());
+    let source = match source_node {
+        Some(source) if source != node.node_id() => match node
+            .fetch_range_snapshot(source, range.start.clone(), range.end.clone(), 0, max_rows)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_response(error),
+        },
+        _ => match node.snapshot_range(&range.start, &range.end, 0, max_rows) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_response(error),
+        },
     };
     let target = if request.target == node.node_id() {
         source.clone()
@@ -8993,7 +9002,7 @@ async fn range_verify(
                 request.target,
                 range.start.clone(),
                 range.end.clone(),
-                read_ts,
+                source.snapshot_ts,
                 max_rows,
             )
             .await
@@ -9076,9 +9085,6 @@ async fn range_transfer(
     if !node.is_leader().await {
         return error_response(ryme_error::RymeError::Unavailable(String::from("not leader")));
     }
-    if request.target == node.node_id() {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("target")));
-    }
     let range = {
         let control = match state.control.lock() {
             Ok(guard) => guard,
@@ -9096,13 +9102,25 @@ async fn range_transfer(
         }
         range
     };
+    let source_node = range.leader.strip_prefix("raft-").and_then(|id| id.parse::<usize>().ok());
+    if request.target == node.node_id()
+        || range.leader == format!("raft-{}", request.target)
+    {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("target")));
+    }
     let members = node.current_config().await;
     if !members.iter().any(|member| member.id == request.target) {
         return error_response(ryme_error::RymeError::NotFound(String::from("peer")));
     }
     let max_rows = request.max_rows.unwrap_or(100_000).clamp(1, 100_000);
-    let read_ts = node.manager().latest_commit();
-    let snapshot = match node.snapshot_range(&range.start, &range.end, read_ts, max_rows) {
+    let snapshot_result = match source_node {
+        Some(source) if source != node.node_id() => {
+            node.fetch_range_snapshot(source, range.start.clone(), range.end.clone(), 0, max_rows)
+                .await
+        }
+        _ => node.snapshot_range(&range.start, &range.end, 0, max_rows),
+    };
+    let snapshot = match snapshot_result {
         Ok(snapshot) if !snapshot.truncated => snapshot,
         Ok(_) => {
             return error_response(ryme_error::RymeError::Overload(String::from("range snapshot")))
@@ -9165,6 +9183,49 @@ async fn range_transfer(
         return error_response(error);
     }
     let moved = previous.2;
+    let retained: std::collections::HashSet<usize> = moved
+        .replicas
+        .iter()
+        .filter_map(|replica| replica.strip_prefix("raft-")?.parse().ok())
+        .collect();
+    let cleanup_peers: Vec<usize> = members
+        .iter()
+        .map(|member| member.id)
+        .filter(|peer| !retained.contains(peer))
+        .collect();
+    let mut source_cleanup = true;
+    let mut source_rows_purged = 0u64;
+    for peer in cleanup_peers {
+        let mut purged = None;
+        for _ in 0..20 {
+            let result = if peer == node.node_id() {
+                node.purge_range_after_transfer(&moved.id, moved.epoch, &snapshot).await
+            } else {
+                node.purge_range_after_transfer_on(
+                    peer,
+                    moved.id.clone(),
+                    moved.epoch,
+                    snapshot.clone(),
+                )
+                .await
+            };
+            match result {
+                Ok(rows) => {
+                    purged = Some(rows);
+                    break;
+                }
+                Err(ryme_error::RymeError::Unavailable(_)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        if let Some(rows) = purged {
+            source_rows_purged = source_rows_purged.saturating_add(rows);
+        } else {
+            source_cleanup = false;
+        }
+    }
     let bytes: u64 =
         snapshot.rows.iter().map(|row| row.pk.len() as u64 + row.value.len() as u64).sum();
     (
@@ -9178,6 +9239,8 @@ async fn range_transfer(
             "bytes": bytes,
             "snapshot_ts": snapshot.snapshot_ts,
             "verified": true,
+            "source_cleanup": source_cleanup,
+            "source_rows_purged": source_rows_purged,
         })),
     )
         .into_response()
