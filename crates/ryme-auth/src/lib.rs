@@ -252,6 +252,10 @@ pub struct JwtVerifier {
     audience: Option<String>,
 }
 
+const MAX_JWT_TOKEN_LEN: usize = 16 * 1024;
+const MAX_PRINCIPAL_ID_LEN: usize = 256;
+const MAX_TENANT_LEN: usize = 256;
+
 impl JwtVerifier {
     pub fn new(secret: Vec<u8>) -> Self {
         Self { key: JwtKey::Hmac(secret), leeway_secs: 60, issuer: None, audience: None }
@@ -291,6 +295,9 @@ impl JwtVerifier {
     pub fn principal_from_token(&self, token: &str, now_secs: u64) -> Result<Principal> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
+        if token.len() > MAX_JWT_TOKEN_LEN {
+            return Err(RymeError::Unauthorized);
+        }
         let mut parts = token.split('.');
         let header_b64 = parts.next().ok_or(RymeError::Unauthorized)?;
         let payload_b64 = parts.next().ok_or(RymeError::Unauthorized)?;
@@ -389,6 +396,7 @@ impl JwtVerifier {
             .get("sub")
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
+            .filter(|value| value.len() <= MAX_PRINCIPAL_ID_LEN)
             .ok_or(RymeError::Unauthorized)?
             .to_string();
         let tenant = claims
@@ -396,10 +404,12 @@ impl JwtVerifier {
             .or_else(|| claims.get("tenant_id"))
             .or_else(|| claims.get("app_metadata").and_then(|v| v.get("tenant")))
             .and_then(|v| v.as_str())
-            .unwrap_or("default")
-            .to_string();
+            .unwrap_or("default");
+        if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN {
+            return Err(RymeError::Unauthorized);
+        }
         let roles = claim_roles(&claims);
-        Ok(Principal { id, tenant, roles })
+        Ok(Principal { id, tenant: tenant.to_string(), roles })
     }
 }
 
@@ -1134,6 +1144,49 @@ mod tests {
         assert!(verifier
             .principal_from_token(
                 &token(serde_json::json!({ "sub": "  ", "exp": 2000000000u64 })),
+                1000,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn jwt_bounds_token_and_principal_sizes() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let token = |payload: serde_json::Value| {
+            let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+            let payload = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
+            let input = format!("{header}.{payload}");
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"size-secret").unwrap();
+            mac.update(input.as_bytes());
+            format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
+        };
+        let verifier = JwtVerifier::new(b"size-secret".to_vec());
+
+        assert!(verifier.principal_from_token(&"x".repeat(MAX_JWT_TOKEN_LEN + 1), 1000).is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({
+                    "sub": "u".repeat(MAX_PRINCIPAL_ID_LEN + 1),
+                    "exp": 2000000000u64,
+                })),
+                1000,
+            )
+            .is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({
+                    "sub": "u",
+                    "tenant": "t".repeat(MAX_TENANT_LEN + 1),
+                    "exp": 2000000000u64,
+                })),
+                1000,
+            )
+            .is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({ "sub": "u", "tenant": "", "exp": 2000000000u64 })),
                 1000,
             )
             .is_err());
