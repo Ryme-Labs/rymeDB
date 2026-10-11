@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 const KV_TABLE: &str = "_kv";
+const RESP_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RESP_SCRIPT_MAX_BYTES: usize = 1024 * 1024;
 const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
 const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -1208,7 +1209,7 @@ where
             if !replies.is_empty() {
                 writer.write_all(&replies).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
-            if pending.len() > 1024 * 1024 {
+            if pending.len() > RESP_MAX_FRAME_BYTES {
                 return Err(RymeError::Overload(String::from("request")));
             }
         }
@@ -5544,6 +5545,11 @@ fn decode_inline(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
     let Some(end) = find_crlf(input) else {
         return Ok(None);
     };
+    let frame_end =
+        end.checked_add(2).ok_or_else(|| RymeError::Overload(String::from("request")))?;
+    if frame_end > RESP_MAX_FRAME_BYTES {
+        return Err(RymeError::Overload(String::from("request")));
+    }
     let line = String::from_utf8_lossy(&input[..end]).into_owned();
     let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
     if parts.is_empty() {
@@ -5568,7 +5574,11 @@ fn decode_array(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
     if count == 0 || count > 1025 {
         return Err(RymeError::InvalidArgument(String::from("resp arity")));
     }
-    let mut offset = first_end + 2;
+    let mut offset =
+        first_end.checked_add(2).ok_or_else(|| RymeError::Overload(String::from("request")))?;
+    if offset > RESP_MAX_FRAME_BYTES {
+        return Err(RymeError::Overload(String::from("request")));
+    }
     let mut parts: Vec<Vec<u8>> = Vec::new();
     for _ in 0..count {
         if offset >= input.len() || input[offset] != b'$' {
@@ -5580,15 +5590,23 @@ fn decode_array(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
         let length: usize = String::from_utf8_lossy(&input[offset + 1..len_end])
             .parse()
             .map_err(|_| RymeError::InvalidArgument(String::from("resp")))?;
-        if length > 8 * 1024 * 1024 {
-            return Err(RymeError::Overload(String::from("bulk")));
+        let value_start =
+            len_end.checked_add(2).ok_or_else(|| RymeError::Overload(String::from("request")))?;
+        let frame_end = value_start
+            .checked_add(length)
+            .and_then(|end| end.checked_add(2))
+            .ok_or_else(|| RymeError::Overload(String::from("request")))?;
+        if frame_end > RESP_MAX_FRAME_BYTES {
+            return Err(RymeError::Overload(String::from("request")));
         }
-        offset = len_end + 2;
-        if input.len() < offset + length + 2 {
+        if input.len() < frame_end {
             return Ok(None);
         }
-        parts.push(input[offset..offset + length].to_vec());
-        offset += length + 2;
+        if &input[value_start + length..frame_end] != b"\r\n" {
+            return Err(RymeError::InvalidArgument(String::from("resp")));
+        }
+        parts.push(input[value_start..value_start + length].to_vec());
+        offset = frame_end;
     }
     if parts.is_empty() {
         return Err(RymeError::InvalidArgument(String::from("resp")));
@@ -5966,6 +5984,25 @@ fn slice_list(list: &[String], start: i64, stop: i64) -> Vec<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resp_decoder_rejects_oversized_frames_before_copying_payload() {
+        let mut input = b"*2\r\n$3\r\nGET\r\n$1048570\r\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', RESP_MAX_FRAME_BYTES));
+        assert!(matches!(
+            decode_array(&input),
+            Err(RymeError::Overload(message)) if message == "request"
+        ));
+    }
+
+    #[test]
+    fn resp_decoder_requires_bulk_string_terminator() {
+        let input = b"*2\r\n$3\r\nGET\r\n$3\r\nkeyxx";
+        assert!(matches!(
+            decode_array(input),
+            Err(RymeError::InvalidArgument(message)) if message == "resp"
+        ));
+    }
 
     #[test]
     fn script_cache_is_scoped_and_bounded() {
