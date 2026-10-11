@@ -19,7 +19,7 @@ outside the storage/transaction hot path when possible.
 | `apps/cli` | `rymedb-cli` operator CLI |
 | `sdks/` | Java, npm/TypeScript, and Rust clients only |
 | `schemas/openapi` | REST contract and validator |
-| `docs/` | MkDocs Material documentation |
+| `docs/` | Docusaurus documentation source |
 
 ## Local setup
 
@@ -48,7 +48,8 @@ pnpm --dir sdks/js test
 mvn -f sdks/java/pom.xml verify
 cargo test --manifest-path sdks/rust/Cargo.toml --locked
 python3 schemas/openapi/validate.py
-uv run --with-requirements docs/requirements-pages.txt mkdocs build --strict --site-dir /tmp/rymedb-site
+pnpm docs:dev
+pnpm docs:build
 ```
 
 The CI workflows run on `ubuntu-24.04`, install `protoc` and `psql`, test the
@@ -74,7 +75,7 @@ and error count. Do not tune a benchmark by weakening correctness semantics.
 
 ## Documentation development
 
-Docs use MkDocs Material. Keep paragraphs short, put options in tables, keep
-commands on one line unless shell continuation is intentional, and link to
-the generated OpenAPI reference rather than duplicating every schema. Build
-with `--strict` before committing.
+Docs use Docusaurus. Run `pnpm docs:dev` for a local preview and
+`pnpm docs:build` to validate static output. Keep paragraphs short, put options
+in tables, keep commands on one line unless shell continuation is intentional,
+and link to the generated OpenAPI reference rather than duplicating schemas.

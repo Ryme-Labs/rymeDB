@@ -1,15 +1,17 @@
-# REST and GraphQL API
+---
+slug: /api-guide
+title: REST and GraphQL API
+---
 
-The dedicated <a href="../api/">/api/</a> page is a standalone Swagger UI for the
-checked-in OpenAPI contract. It is deliberately separate from this
-documentation site so the API explorer gets the full viewport and Swagger's
-native request, schema, and authorization controls.
+The dedicated [REST/OpenAPI explorer](https://db.rymelabs.dev/api/) is a
+standalone Swagger UI for the checked-in OpenAPI contract. It is deliberately
+separate from this documentation site so the API explorer gets the full
+viewport and Swagger's native request, schema, and authorization controls.
 
 The source contract is
 [`schemas/openapi/rest.yaml`](https://github.com/Ryme-Labs/rymeDB/blob/main/schemas/openapi/rest.yaml).
-The published artifacts are available as
-<a href="../openapi/rest.yaml">OpenAPI YAML</a> and
-<a href="../openapi/rest.json">OpenAPI JSON</a>.
+The published artifacts are available as [OpenAPI YAML](https://db.rymelabs.dev/openapi/rest.yaml)
+and [OpenAPI JSON](https://db.rymelabs.dev/openapi/rest.json).
 
 ## Authentication
 

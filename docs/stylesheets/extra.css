@@ -1,79 +1,87 @@
 :root {
-  --ryme-ink: #172033;
-  --ryme-blue: #4355d6;
-  --ryme-cyan: #08a7bb;
-  --ryme-surface: #f7f9fc;
+  --ifm-color-primary: #4355d6;
+  --ifm-color-primary-dark: #303fa8;
+  --ifm-color-primary-darker: #293895;
+  --ifm-color-primary-darkest: #222e7b;
+  --ifm-color-primary-light: #6372e0;
+  --ifm-color-primary-lighter: #7e8ae8;
+  --ifm-color-primary-lightest: #aab2f2;
+  --ifm-background-color: #f7f9fc;
+  --ifm-font-size-base: 16px;
+  --ifm-line-height-base: 1.7;
+  --ifm-heading-font-weight: 700;
+  --ifm-code-font-size: 90%;
 }
 
-[data-md-color-scheme="default"] {
-  --md-primary-fg-color: var(--ryme-blue);
-  --md-primary-fg-color--light: #6372e0;
-  --md-primary-fg-color--dark: #303fa8;
-  --md-accent-fg-color: var(--ryme-cyan);
-  --md-default-bg-color: var(--ryme-surface);
+[data-theme="dark"] {
+  --ifm-color-primary: #929eff;
+  --ifm-color-primary-dark: #7483f0;
+  --ifm-color-primary-darker: #6373e5;
+  --ifm-color-primary-darkest: #4355d6;
+  --ifm-color-primary-light: #aab3ff;
+  --ifm-color-primary-lighter: #c3caff;
+  --ifm-color-primary-lightest: #e0e4ff;
+  --ifm-background-color: #111827;
 }
 
-[data-md-color-scheme="slate"] {
-  --md-primary-fg-color: #7583f0;
-  --md-primary-fg-color--light: #9aa4fa;
-  --md-primary-fg-color--dark: #5565d8;
-  --md-accent-fg-color: #43d7e2;
-}
-
-.md-header__title,
-.md-nav__title {
+.navbar__title,
+.menu__link--sublist,
+.footer__title {
   font-weight: 700;
 }
 
-.md-content h1 {
-  letter-spacing: -0.025em;
+.markdown h1 {
+  letter-spacing: -0.035em;
 }
 
-.md-content h2 {
-  margin-top: 2em;
+.markdown h2 {
+  margin-top: 2.25rem;
+  letter-spacing: -0.02em;
 }
 
 .docs-banner {
   display: block;
   width: 100%;
   max-height: 18rem;
-  margin: 1.5rem 0 2rem;
+  margin: 1rem 0 2rem;
   border-radius: 0.75rem;
   object-fit: cover;
 }
 
-.md-content table:not([class]) {
+.markdown table {
   display: table;
   width: 100%;
+  border-collapse: collapse;
 }
 
-.md-content table:not([class]) th {
-  background: color-mix(in srgb, var(--md-primary-fg-color) 10%, transparent);
+.markdown th {
+  background: color-mix(in srgb, var(--ifm-color-primary) 10%, transparent);
 }
 
-.md-typeset .highlight {
+.markdown td,
+.markdown th {
+  vertical-align: top;
+}
+
+.markdown pre {
   overflow-x: auto;
 }
 
-.md-typeset .highlight code {
+.markdown pre code {
   white-space: pre;
 }
 
-.api-reference {
-  margin: 1rem -0.5rem 2rem;
-  min-height: 70vh;
-  padding: 0.5rem;
-  background: var(--md-default-bg-color);
+.theme-doc-markdown {
+  max-width: 82ch;
 }
 
-.md-typeset .cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 1rem;
+.theme-doc-markdown .admonition {
+  border-radius: 0.65rem;
 }
 
 @media screen and (max-width: 600px) {
-  .api-reference {
-    margin-inline: -0.25rem;
+  .markdown table {
+    display: block;
+    overflow-x: auto;
   }
 }

@@ -8,10 +8,20 @@
     "build": "turbo run build",
     "test": "turbo run test",
     "lint": "turbo run lint",
+    "docs:dev": "node scripts/prepare-docs.mjs && docusaurus start",
+    "docs:build": "node scripts/prepare-docs.mjs && docusaurus build",
+    "docs:serve": "docusaurus serve",
     "prepare": "husky"
   },
   "devDependencies": {
+    "@docusaurus/core": "3.10.2",
+    "@docusaurus/preset-classic": "3.10.2",
+    "@docusaurus/theme-mermaid": "3.10.2",
+    "@mermaid-js/layout-elk": "0.1.9",
     "husky": "^9.1.7",
+    "mermaid": "11.17.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
     "turbo": "2.11.3",
     "typescript": "7.0.2"
   },
@@ -20,6 +30,5 @@
   "directories": {
     "doc": "docs"
   },
-  "keywords": [],
-  "type": "commonjs"
+  "keywords": []
 }

@@ -1,19 +1,23 @@
-# rymeDB
+---
+slug: /
+title: rymeDB documentation
+sidebar_label: Overview
+---
 
-<img class="docs-banner" src="images/rymedb-banner.png" alt="rymeDB logo and wordmark">
+<img className="docs-banner" src="/images/rymedb-banner.png" alt="rymeDB logo and wordmark" />
 
 rymeDB is a Rust-first database and backend server for realtime applications.
 One `ryme-server` process exposes relational SQL, a PostgreSQL-compatible wire
 endpoint, RESP2/RESP3, REST, GraphQL, WebSockets, optional native/gRPC
 listeners, authentication, branching, backups, and cluster administration.
 
-!!! warning "Project status"
+:::warning[Project status]
 
-    This repository is an active early-stage project. Compatibility is broad
-    but not identical to PostgreSQL, Redis/Valkey, or Supabase. Test your
-    migrations and workload before using it for production data. The benchmark
-    page reports measured results and does not claim a universal “10000x”
-    speedup.
+This repository is an active early-stage project. Compatibility is broad but
+not identical to PostgreSQL, Redis/Valkey, or Supabase. Test your migrations
+and workload before using it for production data. The benchmark page reports
+measured results and does not claim a universal “10000x” speedup.
+:::
 
 ## Start in five minutes
 
@@ -67,7 +71,7 @@ smoke test.
 | Security | API keys, password auth, JWT/JWKS, OIDC helpers, OTP, passkeys, TLS/mTLS, tenant scoping, RLS |
 | Clients | Java, npm/TypeScript, and Rust SDKs; raw HTTP/WebSocket, PostgreSQL, RESP, and CLI access |
 
-The standalone <a href="/api/">REST/OpenAPI reference</a> is generated from
+The standalone <a href="https://db.rymelabs.dev/api/">REST/OpenAPI reference</a> is generated from
 the checked-in `schemas/openapi/rest.yaml` and served through Swagger UI. The
 source code and tests remain the final authority when documentation and
 implementation disagree.

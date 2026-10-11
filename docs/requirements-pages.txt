@@ -1,4 +1,0 @@
-mkdocs>=1.6,<2
-mkdocs-material>=9.6,<10
-mkdocs-include-markdown-plugin>=7,<8
-PyYAML>=6.0,<7

@@ -1,6 +1,10 @@
 target
 node_modules
 .turbo/
+.docusaurus/
+/_site/
+/static/images/
+/static/openapi/
 .ruff_cache/
 dist
 build

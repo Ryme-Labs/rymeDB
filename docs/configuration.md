@@ -57,11 +57,12 @@ Optional TLS listeners require `tls_cert_pem` and `tls_key_pem`. Add
 `tls_client_ca_pem` to require client certificates. `raft_tls` additionally
 requires a Raft listener, server certificate/key, and client CA.
 
-!!! danger "Bind deliberately"
+:::danger[Bind deliberately]
 
-    Defaults are loopback-only. If you bind to `0.0.0.0`, enable TLS and
-    authentication, restrict firewall access, and set `cluster.advertise_addr`
-    explicitly for a cluster. Do not expose trust-mode development listeners.
+Defaults are loopback-only. If you bind to `0.0.0.0`, enable TLS and
+authentication, restrict firewall access, and set `cluster.advertise_addr`
+explicitly for a cluster. Do not expose trust-mode development listeners.
+:::
 
 ## Cluster
 
