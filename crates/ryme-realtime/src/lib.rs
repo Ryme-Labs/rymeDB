@@ -946,7 +946,6 @@ impl Realtime {
             sequence,
             json_cache: Arc::new(OnceLock::new()),
         };
-        let _ = message.json_text();
         let _ = sender.send(message);
         Ok(sequence)
     }
@@ -979,7 +978,6 @@ impl Realtime {
             sequence,
             json_cache: Arc::new(OnceLock::new()),
         };
-        let _ = message.json_text();
         let _ = sender.send(message);
         Ok(sequence)
     }
