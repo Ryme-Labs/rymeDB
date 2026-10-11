@@ -4,6 +4,7 @@ use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::ops::Bound::Excluded;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -579,12 +580,22 @@ impl TxnManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
-        let commit_ts = self.inner.clock.fetch_add(1, Ordering::SeqCst) + 1;
+        let previous = self
+            .inner
+            .clock
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |clock| clock.checked_add(1))
+            .map_err(|_| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+        let commit_ts = previous + 1;
         self.check_locked(txn, commit_ts)?;
         Ok(commit_ts)
     }
 
     fn check_locked(&self, txn: &Transaction, commit_ts: u64) -> Result<()> {
+        if commit_ts <= txn.read_ts {
+            return Err(RymeError::Conflict(String::from(
+                "commit timestamp must be newer than transaction snapshot",
+            )));
+        }
         let mut committed = self
             .inner
             .committed
@@ -594,20 +605,20 @@ impl TxnManager {
             committed.retain(|ts, _| *ts > floor);
         }
         for key in txn.writes.keys() {
-            let mut cursor = committed.range((txn.read_ts + 1)..commit_ts);
+            let mut cursor = committed.range((Excluded(txn.read_ts), Excluded(commit_ts)));
             if cursor.any(|(_, keys)| keys.contains(key)) {
                 return Err(RymeError::Conflict(String::from("write-write conflict")));
             }
         }
         if txn.isolation == Isolation::Serializable {
             for key in txn.read_set.iter() {
-                let mut cursor = committed.range((txn.read_ts + 1)..commit_ts);
+                let mut cursor = committed.range((Excluded(txn.read_ts), Excluded(commit_ts)));
                 if cursor.any(|(_, keys)| keys.contains(key)) {
                     return Err(RymeError::Conflict(String::from("read-write conflict")));
                 }
             }
             for table in txn.scanned.iter() {
-                let mut cursor = committed.range((txn.read_ts + 1)..commit_ts);
+                let mut cursor = committed.range((Excluded(txn.read_ts), Excluded(commit_ts)));
                 let phantom = cursor.any(|(_, keys)| {
                     keys.iter().any(|key| {
                         key.tenant == table.0 && key.database == table.1 && key.table == table.2
@@ -649,7 +660,7 @@ impl TxnManager {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         self.apply_locked(commit_ts, &writes)?;
-        self.inner.clock.fetch_max(commit_ts + 1, Ordering::SeqCst);
+        self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
         Ok(())
     }
 
@@ -738,8 +749,9 @@ impl TxnManager {
                 committed.insert(commit_ts, keys.to_vec());
             }
         }
-        self.inner.clock.fetch_max(commit_ts + 1, Ordering::SeqCst);
-        self.inner.applied.fetch_max(commit_ts + 1, Ordering::SeqCst);
+        let visible_ts = commit_ts.saturating_add(1);
+        self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
+        self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
         Ok(())
     }
 
@@ -779,8 +791,9 @@ impl TxnManager {
                 .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
             committed.insert(commit_ts, writes.keys().cloned().collect());
         }
-        self.inner.clock.fetch_max(commit_ts + 1, Ordering::SeqCst);
-        self.inner.applied.fetch_max(commit_ts + 1, Ordering::SeqCst);
+        let visible_ts = commit_ts.saturating_add(1);
+        self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
+        self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
         publish_commit(commit_ts);
         Ok(())
     }
@@ -975,8 +988,9 @@ impl TxnManager {
     }
 
     pub fn advance_to(&self, commit_ts: u64) {
-        self.inner.clock.fetch_max(commit_ts + 1, Ordering::SeqCst);
-        self.inner.applied.fetch_max(commit_ts + 1, Ordering::SeqCst);
+        let visible_ts = commit_ts.saturating_add(1);
+        self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
+        self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
     }
 
     pub fn clear_engine(&self) -> Result<()> {
@@ -1116,8 +1130,9 @@ impl TxnManager {
             engine.import_table(tenant, database, table, rows)?
         };
         if max > 0 {
-            self.inner.clock.fetch_max(max + 1, Ordering::SeqCst);
-            self.inner.applied.fetch_max(max + 1, Ordering::SeqCst);
+            let visible_ts = max.saturating_add(1);
+            self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
+            self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
         }
         Ok(max)
     }
@@ -1195,8 +1210,9 @@ impl TxnManager {
                 .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
             committed.clear();
         }
-        self.inner.clock.fetch_max(max + 1, Ordering::SeqCst);
-        self.inner.applied.fetch_max(max + 1, Ordering::SeqCst);
+        let visible_ts = max.saturating_add(1);
+        self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
+        self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
         Ok(max)
     }
 
@@ -1231,8 +1247,9 @@ impl TxnManager {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?
             .clear();
-        self.inner.clock.store(max + 1, Ordering::SeqCst);
-        self.inner.applied.store(max + 1, Ordering::SeqCst);
+        let visible_ts = max.saturating_add(1);
+        self.inner.clock.store(visible_ts, Ordering::SeqCst);
+        self.inner.applied.store(visible_ts, Ordering::SeqCst);
         Ok(max)
     }
 }
@@ -2110,6 +2127,25 @@ mod tests {
         let mut second = manager.begin();
         let value = manager.get(&mut second, &key).unwrap();
         assert_eq!(value, Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn commit_clock_accepts_last_timestamp_then_rejects_overflow() {
+        let manager = TxnManager::new();
+        manager.advance_to(u64::MAX - 2);
+
+        let key = RecordKey::new("t", "d", "s", b"last");
+        let mut last_commit = manager.begin();
+        manager.put(&mut last_commit, key.clone(), b"at-limit".to_vec());
+        assert_eq!(manager.commit(last_commit).unwrap(), u64::MAX);
+        assert_eq!(manager.latest_commit(), u64::MAX);
+
+        let mut overflow = manager.begin();
+        let overflow_key = RecordKey::new("t", "d", "s", b"overflow");
+        manager.put(&mut overflow, overflow_key.clone(), b"must-not-commit".to_vec());
+        assert!(matches!(manager.commit(overflow), Err(RymeError::Corrupt(_))));
+        assert_eq!(manager.get(&mut manager.begin(), &overflow_key).unwrap(), None);
+        assert_eq!(manager.get(&mut manager.begin(), &key).unwrap(), Some(b"at-limit".to_vec()));
     }
 
     #[test]
