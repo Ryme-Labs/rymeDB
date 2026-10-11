@@ -501,6 +501,97 @@ impl Backend {
 
 type BranchStorage = ryme_branch::BranchBackend<Backend>;
 
+const AUTH_ATTEMPT_WINDOW_SECS: u64 = 60;
+const AUTH_ATTEMPTS_PER_IDENTITY: u32 = 5;
+const AUTH_ATTEMPTS_GLOBAL: u32 = 120;
+const AUTH_LIMITER_MAX_IDENTITIES: usize = 8192;
+
+#[derive(Debug, Default)]
+struct AuthAttemptWindow {
+    started_at: u64,
+    attempts: u32,
+}
+
+#[derive(Debug, Default)]
+struct AuthAttemptLimiter {
+    global: AuthAttemptWindow,
+    identities: HashMap<String, AuthAttemptWindow>,
+}
+
+impl AuthAttemptLimiter {
+    fn admit(&mut self, identity: &str, now: u64) -> ryme_error::Result<()> {
+        Self::reset_if_expired(&mut self.global, now);
+        if self.global.attempts >= AUTH_ATTEMPTS_GLOBAL {
+            return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
+        }
+
+        if !self.identities.contains_key(identity)
+            && self.identities.len() >= AUTH_LIMITER_MAX_IDENTITIES
+        {
+            let oldest = self
+                .identities
+                .iter()
+                .min_by_key(|(_, window)| window.started_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.identities.remove(&oldest);
+            }
+        }
+        let window = self.identities.entry(identity.to_string()).or_default();
+        Self::reset_if_expired(window, now);
+        if window.attempts >= AUTH_ATTEMPTS_PER_IDENTITY {
+            return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
+        }
+        window.attempts += 1;
+        self.global.attempts += 1;
+        Ok(())
+    }
+
+    fn success(&mut self, identity: &str) {
+        self.identities.remove(identity);
+    }
+
+    fn reset_if_expired(window: &mut AuthAttemptWindow, now: u64) {
+        if window.started_at == 0
+            || now < window.started_at
+            || now.saturating_sub(window.started_at) >= AUTH_ATTEMPT_WINDOW_SECS
+        {
+            window.started_at = now;
+            window.attempts = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod auth_attempt_limiter_tests {
+    use super::*;
+
+    #[test]
+    fn limits_identity_and_resets_after_success_or_window() {
+        let mut limiter = AuthAttemptLimiter::default();
+        for _ in 0..AUTH_ATTEMPTS_PER_IDENTITY {
+            assert!(limiter.admit("password:ada", 100).is_ok());
+        }
+        assert!(limiter.admit("password:ada", 100).is_err());
+        limiter.success("password:ada");
+        assert!(limiter.admit("password:ada", 100).is_ok());
+
+        for _ in 0..AUTH_ATTEMPTS_PER_IDENTITY - 1 {
+            assert!(limiter.admit("password:ada", 100).is_ok());
+        }
+        assert!(limiter.admit("password:ada", 160).is_ok());
+    }
+
+    #[test]
+    fn global_limit_caps_rotating_identities() {
+        let mut limiter = AuthAttemptLimiter::default();
+        for index in 0..AUTH_ATTEMPTS_GLOBAL {
+            assert!(limiter.admit(&format!("password:user-{index}"), 100).is_ok());
+        }
+        assert!(limiter.admit("password:last", 100).is_err());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SharedState {
     backend: Backend,
@@ -527,6 +618,7 @@ pub struct SharedState {
     indexes: Arc<RwLock<PartitionedIndex>>,
     http_max_body_bytes: u64,
     credentials: Arc<Mutex<CredentialStore>>,
+    auth_attempts: Arc<Mutex<AuthAttemptLimiter>>,
     refresh_tokens: RefreshTokenStore,
     passkeys: Arc<Mutex<PasskeyRegistry>>,
     native_listen: Option<std::net::SocketAddr>,
@@ -1490,6 +1582,7 @@ impl SharedState {
             indexes: Arc::new(RwLock::new(PartitionedIndex::new(config.index_partitions))),
             http_max_body_bytes: config.http_max_body_bytes,
             credentials: Arc::new(Mutex::new(CredentialStore::from_snapshot(auth_snapshot.users))),
+            auth_attempts: Arc::new(Mutex::new(AuthAttemptLimiter::default())),
             refresh_tokens: RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens),
             passkeys: Arc::new(Mutex::new(PasskeyRegistry::from_snapshot(auth_snapshot.passkeys))),
             native_listen: config.native_listen,
@@ -4558,6 +4651,10 @@ async fn auth_verify(State(state): State<SharedState>, body: axum::body::Bytes) 
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    let attempt_key = format!("password:{}", request.id);
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+        return error_response(error);
+    }
     let credentials = state.credentials.clone();
     let verified = tokio::task::spawn_blocking(move || match credentials.lock() {
         Ok(store) => store.verify_password(&request.id, &request.password),
@@ -4566,6 +4663,7 @@ async fn auth_verify(State(state): State<SharedState>, body: axum::body::Bytes) 
     .await;
     match verified {
         Ok(Ok(principal)) => {
+            complete_auth_attempt(&state, &attempt_key);
             (StatusCode::OK, Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })))
                 .into_response()
         }
@@ -4588,6 +4686,16 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    let attempt_key = if request.refresh_token.is_some()
+        || request.grant_type.as_deref() == Some("refresh_token")
+    {
+        String::from("refresh")
+    } else {
+        format!("password:{}", request.id)
+    };
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+        return error_response(error);
+    }
     let credentials = state.credentials.clone();
     let keys = state.keys.clone();
     let refresh_tokens = state.refresh_tokens.clone();
@@ -4629,16 +4737,19 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     .await;
     match issued {
         Ok(Ok((key, tenant, refresh_token))) => match state.persist_auth() {
-            Ok(()) => (
-                StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "key": key,
-                    "tenant": tenant,
-                    "refresh_token": refresh_token,
-                    "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
-                })),
-            )
-                .into_response(),
+            Ok(()) => {
+                complete_auth_attempt(&state, &attempt_key);
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "key": key,
+                        "tenant": tenant,
+                        "refresh_token": refresh_token,
+                        "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
+                    })),
+                )
+                    .into_response()
+            }
             Err(e) => error_response(e),
         },
         Ok(Err(e)) => error_response(e),
@@ -4724,6 +4835,10 @@ async fn otp_verify(State(state): State<SharedState>, body: axum::body::Bytes) -
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    let attempt_key = format!("otp:{}", request.id);
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+        return error_response(error);
+    }
     let now = ryme_txn::now_unix();
     let verified = match state.credentials.lock() {
         Ok(store) => store.verify_otp(&request.id, &request.code, now),
@@ -4731,6 +4846,7 @@ async fn otp_verify(State(state): State<SharedState>, body: axum::body::Bytes) -
     };
     match verified {
         Ok(principal) => {
+            complete_auth_attempt(&state, &attempt_key);
             (StatusCode::OK, Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })))
                 .into_response()
         }
@@ -4817,6 +4933,10 @@ async fn passkey_verify(State(state): State<SharedState>, body: axum::body::Byte
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    let attempt_key = format!("passkey:{}", request.user);
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+        return error_response(error);
+    }
     if state.passkey_rp_id.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from(
             "passkey rp_id",
@@ -4878,6 +4998,7 @@ async fn passkey_verify(State(state): State<SharedState>, body: axum::body::Byte
         Err(e) => return error_response(e),
     };
     let (key, tenant) = issue_api_key(&keys, &principal);
+    complete_auth_attempt(&state, &attempt_key);
     match state.persist_auth() {
         Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
             .into_response(),
@@ -4921,6 +5042,10 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    let attempt_key = String::from("oidc");
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+        return error_response(error);
+    }
     let Some(config) = state.oidc.clone() else {
         return error_response(ryme_error::RymeError::Unavailable(String::from("oidc")));
     };
@@ -4932,6 +5057,7 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     match verified {
         Ok(principal) => {
             let (key, tenant) = issue_api_key(&state.keys, &principal);
+            complete_auth_attempt(&state, &attempt_key);
             match state.persist_auth() {
                 Ok(()) => {
                     (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
@@ -10726,6 +10852,20 @@ fn error_response(error: ryme_error::RymeError) -> Response {
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn admit_auth_attempt(state: &SharedState, identity: &str) -> ryme_error::Result<()> {
+    state
+        .auth_attempts
+        .lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("auth rate limit lock")))?
+        .admit(identity, now_secs())
+}
+
+fn complete_auth_attempt(state: &SharedState, identity: &str) {
+    if let Ok(mut limiter) = state.auth_attempts.lock() {
+        limiter.success(identity);
+    }
 }
 
 fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {

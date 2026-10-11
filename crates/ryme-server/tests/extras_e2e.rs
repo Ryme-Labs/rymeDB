@@ -1743,6 +1743,22 @@ async fn extras_auth_token_issues_usable_keys() {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
+    for _ in 0..5 {
+        let (status, _) = http_request(
+            http,
+            "POST /v1/auth/verify",
+            b"{\"id\":\"missing-user\",\"password\":\"wrong-password\"}",
+        )
+        .await;
+        assert_eq!(status, 401);
+    }
+    let (status, _) = http_request(
+        http,
+        "POST /v1/auth/verify",
+        b"{\"id\":\"missing-user\",\"password\":\"wrong-password\"}",
+    )
+    .await;
+    assert_eq!(status, 429);
     let (status, _) = http_request(
         http,
         "POST /v1/auth/register",
