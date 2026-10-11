@@ -199,6 +199,7 @@ struct ConnLimits {
     database: String,
     read_allowed: bool,
     write_allowed: bool,
+    admin_allowed: bool,
     qos: Option<Arc<Mutex<QosRegistry>>>,
     metering: Option<Arc<Mutex<MeterRegistry>>>,
     latency: Option<LatencyWindow>,
@@ -234,6 +235,16 @@ fn admit_statement(limits: &ConnLimits, statement: &Statement, bytes: u64) -> Op
         return Some(encode_error_code("42501", String::from("permission denied")));
     }
     if statement.is_write() && !limits.write_allowed {
+        return Some(encode_error_code("42501", String::from("permission denied")));
+    }
+    if matches!(
+        statement,
+        Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::PrivilegeChange { .. }
+            | Statement::DefaultPrivilegeChange { .. }
+    ) && !limits.admin_allowed
+    {
         return Some(encode_error_code("42501", String::from("permission denied")));
     }
     let qos = limits.qos.as_ref()?;
@@ -440,6 +451,7 @@ where
             database: self.database.clone(),
             read_allowed: true,
             write_allowed: true,
+            admin_allowed: true,
             qos: self.qos.clone(),
             metering: self.metering.clone(),
             latency: self.latency.clone(),
@@ -701,6 +713,7 @@ where
     let mut limits = limits.with_tenant(tenant);
     limits.read_allowed = principal.can_read();
     limits.write_allowed = principal.can_write();
+    limits.admin_allowed = principal.can_admin();
     Ok((executor, limits))
 }
 
@@ -4500,6 +4513,41 @@ mod tests {
         assert!(session.is_empty());
         assert!(session_command("SET", &mut session).is_none());
         assert!(session_command("SHOW", &mut session).is_none());
+    }
+
+    #[test]
+    fn authorization_catalog_changes_require_admin_access() {
+        let mut limits = ConnLimits {
+            tenant: String::from("tenant"),
+            database: String::from("db"),
+            read_allowed: true,
+            write_allowed: true,
+            admin_allowed: false,
+            qos: None,
+            metering: None,
+            latency: None,
+            histogram: None,
+            slow_log: None,
+            traces: None,
+            range_hook: RangeLoadHook::default(),
+            remote_reader: None,
+        };
+        for sql in [
+            "CREATE ROLE app_reader LOGIN",
+            "DROP ROLE app_reader",
+            "GRANT SELECT ON TABLE messages TO app_reader",
+            "REVOKE SELECT ON TABLE messages FROM app_reader",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_reader",
+        ] {
+            let statement = parse(sql).unwrap();
+            assert!(
+                admit_statement(&limits, &statement, sql.len() as u64).is_some(),
+                "non-admin unexpectedly allowed: {sql}"
+            );
+            limits.admin_allowed = true;
+            assert!(admit_statement(&limits, &statement, sql.len() as u64).is_none(), "{sql}");
+            limits.admin_allowed = false;
+        }
     }
 
     #[test]
