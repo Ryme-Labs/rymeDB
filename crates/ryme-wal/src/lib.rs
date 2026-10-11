@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub const WAL_MAGIC: u32 = 0x52594D45;
 pub const WAL_VERSION: u16 = 1;
+pub const MAX_WAL_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 const REWRITE_DIR: &str = ".rewrite";
 const REWRITE_MARKER: &str = ".rewrite-in-progress";
 
@@ -33,6 +34,9 @@ impl Wal {
             return Err(RymeError::InvalidArgument(String::from(
                 "wal segment size must be positive",
             )));
+        }
+        if segment_size_bytes > MAX_WAL_SEGMENT_BYTES {
+            return Err(RymeError::Overload(String::from("wal segment")));
         }
         std::fs::create_dir_all(dir)?;
         recover_rewrite(dir)?;
@@ -99,9 +103,7 @@ impl Wal {
         let mut previous_lsn = None;
         for id in ids {
             let path = dir.join(segment_name(id));
-            let mut file = File::open(&path)?;
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)?;
+            let raw = read_segment_file(&path)?;
             let mut cursor = raw.as_slice();
             while !cursor.is_empty() {
                 match decode_frame(cursor)? {
@@ -130,9 +132,7 @@ impl Wal {
                 continue;
             }
             let path = self.dir.join(segment_name(id));
-            let mut file = File::open(&path)?;
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)?;
+            let raw = read_segment_file(&path)?;
             let mut cursor = raw.as_slice();
             let mut keep = false;
             while !cursor.is_empty() {
@@ -276,7 +276,7 @@ fn install_rewrite(dir: &Path) -> Result<()> {
 
     let mut previous_lsn = None;
     for (_, path, name) in &staged {
-        let raw = std::fs::read(path)?;
+        let raw = read_segment_file(path)?;
         let mut cursor = raw.as_slice();
         while !cursor.is_empty() {
             let Some((record, consumed)) = decode_frame(cursor)? else {
@@ -365,6 +365,20 @@ fn parse_segment_name(name: &str) -> Option<u64> {
     rest.parse::<u64>().ok()
 }
 
+fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_WAL_SEGMENT_BYTES {
+        return Err(RymeError::Overload(String::from("wal segment")));
+    }
+    let mut raw = Vec::with_capacity(length as usize);
+    file.take(MAX_WAL_SEGMENT_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_WAL_SEGMENT_BYTES {
+        return Err(RymeError::Overload(String::from("wal segment")));
+    }
+    Ok(raw)
+}
+
 fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64> {
     let mut ids = segment_ids(dir)?;
     ids.sort_unstable();
@@ -372,12 +386,21 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
     let mut previous_lsn = None;
 
     for id in ids {
-        let mut raw = Vec::new();
+        let raw;
         if id == active_id {
+            let length = active.metadata()?.len();
+            if length > MAX_WAL_SEGMENT_BYTES {
+                return Err(RymeError::Overload(String::from("wal segment")));
+            }
+            let mut contents = Vec::with_capacity(length as usize);
             active.seek(SeekFrom::Start(0))?;
-            active.read_to_end(&mut raw)?;
+            active.take(MAX_WAL_SEGMENT_BYTES + 1).read_to_end(&mut contents)?;
+            if contents.len() as u64 > MAX_WAL_SEGMENT_BYTES {
+                return Err(RymeError::Overload(String::from("wal segment")));
+            }
+            raw = contents;
         } else {
-            File::open(dir.join(segment_name(id)))?.read_to_end(&mut raw)?;
+            raw = read_segment_file(&dir.join(segment_name(id)))?;
         }
         let mut cursor = raw.as_slice();
         while !cursor.is_empty() {
@@ -491,6 +514,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(Wal::open(&dir, 0), Err(RymeError::InvalidArgument(_))));
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn open_rejects_oversized_segment_before_reading() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-oversized-segment-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(segment_name(0));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_WAL_SEGMENT_BYTES + 1).unwrap();
+
+        assert!(matches!(
+            Wal::open(&dir, 1024 * 1024),
+            Err(RymeError::Overload(message)) if message == "wal segment"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
