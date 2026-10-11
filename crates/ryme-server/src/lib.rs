@@ -2497,18 +2497,29 @@ fn require_platform_admin(
 }
 
 fn can_manage_user(state: &SharedState, principal: &Principal, user: &str) -> bool {
-    if principal.can_platform_admin() || principal.id == user {
+    if principal.can_platform_admin() {
         return true;
     }
-    if !principal.can_admin() {
-        return false;
-    }
-    state
+    let user_tenant = state
         .credentials
         .lock()
         .ok()
-        .and_then(|credentials| credentials.tenant_of(user).map(str::to_owned))
-        .is_some_and(|tenant| tenant == principal.tenant)
+        .and_then(|credentials| credentials.tenant_of(user).map(str::to_owned));
+    can_manage_user_for_tenant(principal, user, user_tenant.as_deref())
+}
+
+fn can_manage_user_for_tenant(
+    principal: &Principal,
+    user: &str,
+    user_tenant: Option<&str>,
+) -> bool {
+    if principal.can_platform_admin() {
+        return true;
+    }
+    if principal.id == user {
+        return user_tenant == Some(principal.tenant.as_str());
+    }
+    principal.can_admin() && user_tenant == Some(principal.tenant.as_str())
 }
 
 pub fn router(state: SharedState) -> axum::Router {
@@ -13330,6 +13341,26 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn user_management_requires_a_matching_tenant_for_self_or_admin() {
+        let self_principal = Principal {
+            id: String::from("alice"),
+            tenant: String::from("tenant-a"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        assert!(can_manage_user_for_tenant(&self_principal, "alice", Some("tenant-a")));
+        assert!(!can_manage_user_for_tenant(&self_principal, "alice", Some("tenant-b")));
+        assert!(!can_manage_user_for_tenant(&self_principal, "alice", None));
+
+        let admin = Principal {
+            id: String::from("admin"),
+            tenant: String::from("tenant-a"),
+            roles: [Role::Admin].into_iter().collect(),
+        };
+        assert!(can_manage_user_for_tenant(&admin, "alice", Some("tenant-a")));
+        assert!(!can_manage_user_for_tenant(&admin, "alice", Some("tenant-b")));
+    }
 
     #[test]
     fn auth_snapshot_rejects_oversized_file() {
