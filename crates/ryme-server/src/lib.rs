@@ -8142,6 +8142,7 @@ async fn branch_create(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let _migration_guard = state.migration_lock.lock().await;
     let base_commit_ts = match resolve_branch_base_commit(&state, request.base_commit_ts) {
         Ok(commit) => commit,
         Err(error) => return error_response(error),
@@ -8235,6 +8236,7 @@ async fn branch_delete(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let _migration_guard = state.migration_lock.lock().await;
     let mut control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
@@ -8294,6 +8296,7 @@ async fn branch_reset(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let _migration_guard = state.migration_lock.lock().await;
     let base_commit_ts = match resolve_branch_base_commit(&state, request.base_commit_ts) {
         Ok(commit) => commit,
         Err(error) => return error_response(error),
@@ -8315,11 +8318,11 @@ async fn branch_reset(
     }
 }
 
-async fn promote_branch_data(
+async fn prepare_branch_promotion(
     state: &SharedState,
     tenant: &str,
     id: &str,
-) -> ryme_error::Result<u64> {
+) -> ryme_error::Result<(ryme_branch::Branch, ryme_txn::Transaction)> {
     let child = {
         let control = state
             .control
@@ -8357,11 +8360,11 @@ async fn promote_branch_data(
 
     let mut base_txn = state.backend.begin();
     base_txn.restamp(child.base_commit_ts);
-    let mut current_txn = state.backend.begin();
+    let mut write_txn = state.backend.begin();
     for (table, pk, _value) in &changes {
         let key = ryme_storage::RecordKey::new(tenant, &state.database, table, pk);
         let base = state.backend.get(&mut base_txn, &key)?;
-        let current = state.backend.get(&mut current_txn, &key)?;
+        let current = state.backend.get(&mut write_txn, &key)?;
         if base != current {
             return Err(ryme_error::RymeError::Conflict(format!(
                 "branch conflict on {table}/{}",
@@ -8370,7 +8373,6 @@ async fn promote_branch_data(
         }
     }
 
-    let mut write_txn = state.backend.begin();
     for (table, pk, value) in changes {
         let key = ryme_storage::RecordKey::new(tenant, &state.database, &table, &pk);
         match value {
@@ -8378,7 +8380,7 @@ async fn promote_branch_data(
             None => state.backend.delete(&mut write_txn, key),
         }
     }
-    state.backend.commit(write_txn).await
+    Ok((child, write_txn))
 }
 
 fn install_promoted_schema(
@@ -8401,35 +8403,72 @@ async fn branch_promote(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    let child_schema = match load_existing_schema_snapshot(&state.branch_schema_path(&principal.tenant, &id)) {
-        Ok(snapshot) => snapshot,
+    let _migration_guard = state.migration_lock.lock().await;
+    let child_schema =
+        match load_existing_schema_snapshot(&state.branch_schema_path(&principal.tenant, &id)) {
+            Ok(snapshot) => snapshot,
+            Err(e) => return error_response(e),
+        };
+    let previous_schema = state.executor.schema_snapshot();
+    let (child, write_txn) = match prepare_branch_promotion(&state, &principal.tenant, &id).await {
+        Ok(prepared) => prepared,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = promote_branch_data(&state, &principal.tenant, &id).await {
-        return error_response(e);
-    }
     if let Err(e) = install_promoted_schema(&state, &child_schema) {
         return error_response(e);
     }
+
+    let (old_branches, new_branches, old_main_ledger) = {
+        let mut control = match state.control.lock() {
+            Ok(guard) => guard,
+            Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        let old_branches = control.branches.clone();
+        let mut new_branches = old_branches.clone();
+        if let Err(error) = new_branches.promote_for(&principal.tenant, &id) {
+            let _ = install_promoted_schema(&state, &previous_schema);
+            return error_response(error);
+        }
+        if let Err(error) = new_branches.persist(&state.branch_path) {
+            let _ = install_promoted_schema(&state, &previous_schema);
+            return error_response(error);
+        }
+        let old_main_ledger = control.migration_ledger(&principal.tenant, "main");
+        control.clone_migration_scope(&principal.tenant, &id, "main");
+        if let Err(error) = state.persist_control_locked(&control) {
+            control.set_migration_ledger(&principal.tenant, "main", old_main_ledger.clone());
+            let _ = old_branches.persist(&state.branch_path);
+            let _ = install_promoted_schema(&state, &previous_schema);
+            return error_response(error);
+        }
+        (old_branches, new_branches, old_main_ledger)
+    };
+
+    if let Err(error) = state.backend.commit(write_txn).await {
+        let schema_rollback = install_promoted_schema(&state, &previous_schema).err();
+        let branch_rollback = old_branches.persist(&state.branch_path).err();
+        let control_rollback = match state.control.lock() {
+            Ok(mut control) => {
+                control.set_migration_ledger(&principal.tenant, "main", old_main_ledger);
+                state.persist_control_locked(&control)
+            }
+            Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        if schema_rollback.is_some() || branch_rollback.is_some() || control_rollback.is_err() {
+            return error_response(ryme_error::RymeError::Internal(format!(
+                "branch promotion failed: {error}; rollback incomplete"
+            )));
+        }
+        return error_response(error);
+    }
+
     let mut control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    let mut branches = control.branches.clone();
-    match branches.promote_for(&principal.tenant, &id) {
-        Ok(branch) => match branches.persist(&state.branch_path) {
-            Ok(()) => {
-                control.branches = branches;
-                control.clone_migration_scope(&principal.tenant, &id, "main");
-                if let Err(e) = state.persist_control_locked(&control) {
-                    return error_response(e);
-                }
-                (StatusCode::OK, Json(branch)).into_response()
-            }
-            Err(e) => error_response(e),
-        },
-        Err(e) => error_response(e),
-    }
+    control.branches = new_branches;
+    let promoted = control.branches.get_for(&principal.tenant, "main").unwrap_or(child);
+    (StatusCode::OK, Json(promoted)).into_response()
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
