@@ -747,8 +747,9 @@ fn decode_log_frame(input: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
     );
     let length = u64::from_be_bytes(
         input[16..24].try_into().map_err(|_| RymeError::Corrupt(String::from("log frame")))?,
-    ) as usize;
-    if input.len() != 24 + length {
+    );
+    let available = input.len().saturating_sub(24) as u64;
+    if length != available {
         return Err(RymeError::Corrupt(String::from("log frame")));
     }
     Ok((index, term, input[24..].to_vec()))
