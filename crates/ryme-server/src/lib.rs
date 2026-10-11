@@ -15,7 +15,7 @@ use ryme_config::{Config, OtelConfig};
 use ryme_control::ControlPlane;
 use ryme_crypto::{EnvKms, KeyRing, KmsProvider, WrappedDek};
 use ryme_gateway::{Gateway, RemoteRead, RemoteReader, RemoteScan, RemoteScanPage, RemoteScanner};
-use ryme_index::PartitionedIndex;
+use ryme_index::{PartitionedIndex, TextHit, VectorHit};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{Histogram, LatencyWindow, SlowEntry, SlowLog, TraceCollector, TraceSpan};
 use ryme_qos::{QosRegistry, Tier};
@@ -8126,6 +8126,88 @@ fn index_space(tenant: &str, database: &str, table: &str) -> String {
     format!("{tenant}/{database}/{table}")
 }
 
+fn index_executor_for_principal(
+    state: &SharedState,
+    headers: &HeaderMap,
+    principal: &Principal,
+    table: &str,
+    privileges: &[&str],
+) -> ryme_error::Result<Executor<BranchStorage>> {
+    if table.is_empty() {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from("table")));
+    }
+    let executor = branch_executor_for_principal(state, headers, principal)?;
+    if privileges.iter().all(|privilege| executor.can_table_privilege(table, privilege)) {
+        Ok(executor)
+    } else {
+        Err(ryme_error::RymeError::Forbidden)
+    }
+}
+
+async fn index_row_visible(
+    state: &SharedState,
+    headers: &HeaderMap,
+    principal: &Principal,
+    executor: &Executor<BranchStorage>,
+    table: &str,
+    id: &str,
+) -> ryme_error::Result<bool> {
+    if !executor.row_security_enabled(table) {
+        return Ok(true);
+    }
+    let gateway = branch_gateway(state, headers, &principal.tenant)?;
+    let Some(value) = gateway.get_async(principal, table, id.as_bytes()).await? else {
+        return Ok(false);
+    };
+    Ok(executor.row_allowed_by_rls(table, &value))
+}
+
+async fn filter_vector_hits(
+    state: &SharedState,
+    headers: &HeaderMap,
+    principal: &Principal,
+    executor: &Executor<BranchStorage>,
+    table: &str,
+    hits: Vec<VectorHit>,
+) -> ryme_error::Result<Vec<VectorHit>> {
+    if !executor.row_security_enabled(table) {
+        return Ok(hits);
+    }
+    let gateway = branch_gateway(state, headers, &principal.tenant)?;
+    let mut visible = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await?
+            && executor.row_allowed_by_rls(table, &value)
+        {
+            visible.push(hit);
+        }
+    }
+    Ok(visible)
+}
+
+async fn filter_text_hits(
+    state: &SharedState,
+    headers: &HeaderMap,
+    principal: &Principal,
+    executor: &Executor<BranchStorage>,
+    table: &str,
+    hits: Vec<TextHit>,
+) -> ryme_error::Result<Vec<TextHit>> {
+    if !executor.row_security_enabled(table) {
+        return Ok(hits);
+    }
+    let gateway = branch_gateway(state, headers, &principal.tenant)?;
+    let mut visible = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await?
+            && executor.row_allowed_by_rls(table, &value)
+        {
+            visible.push(hit);
+        }
+    }
+    Ok(visible)
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct VectorUpsertRequest {
     pub table: String,
@@ -8175,6 +8257,30 @@ async fn vector_upsert(
             "vector target",
         )));
     }
+    let executor = match index_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &request.table,
+        &["INSERT", "UPDATE"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
+    if let Err(e) = index_row_visible(
+        &state,
+        &headers,
+        &principal,
+        &executor,
+        &request.table,
+        &request.id,
+    )
+    .await
+    .and_then(|visible| {
+        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
+    }) {
+        return error_response(e);
+    }
     if let Err(e) = admit_write(&state, &principal.tenant, (request.vector.len() * 4) as u64) {
         return error_response(e);
     }
@@ -8204,16 +8310,37 @@ async fn vector_search(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_read() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let executor = match index_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &request.table,
+        &["SELECT"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
     let space = index_space(&principal.tenant, &state.database, &request.table);
-    let indexes = state.indexes.read().await;
-    match indexes.vector_search(&space, &request.vector, request.top_k.unwrap_or(10)) {
-        Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+    let result = {
+        let indexes = state.indexes.read().await;
+        indexes.vector_search(&space, &request.vector, request.top_k.unwrap_or(10))
+    };
+    match result {
+        Ok(hits) => match filter_vector_hits(
+            &state,
+            &headers,
+            &principal,
+            &executor,
+            &request.table,
+            hits,
+        )
+        .await {
+            Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
@@ -8239,21 +8366,42 @@ async fn vector_ann_search(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_read() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let executor = match index_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &request.table,
+        &["SELECT"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
     let space = index_space(&principal.tenant, &state.database, &request.table);
-    let indexes = state.indexes.read().await;
-    match indexes.ann_search(
-        &space,
-        &request.vector,
-        request.top_k.unwrap_or(10),
-        request.ef.unwrap_or(64),
-    ) {
-        Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+    let result = {
+        let indexes = state.indexes.read().await;
+        indexes.ann_search(
+            &space,
+            &request.vector,
+            request.top_k.unwrap_or(10),
+            request.ef.unwrap_or(64),
+        )
+    };
+    match result {
+        Ok(hits) => match filter_vector_hits(
+            &state,
+            &headers,
+            &principal,
+            &executor,
+            &request.table,
+            hits,
+        )
+        .await {
+            Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
@@ -8267,8 +8415,29 @@ async fn vector_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
-        return error_response(ryme_error::RymeError::Forbidden);
+    let executor = match index_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &["DELETE"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
+    if let Err(e) = index_row_visible(
+        &state,
+        &headers,
+        &principal,
+        &executor,
+        &table,
+        &id,
+    )
+    .await
+    .and_then(|visible| {
+        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
+    }) {
+        return error_response(e);
     }
     let space = index_space(&principal.tenant, &state.database, &table);
     let mut indexes = state.indexes.write().await;
@@ -8289,11 +8458,32 @@ async fn text_index(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
     if request.table.is_empty() || request.id.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("text target")));
+    }
+    let executor = match index_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &request.table,
+        &["INSERT", "UPDATE"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
+    if let Err(e) = index_row_visible(
+        &state,
+        &headers,
+        &principal,
+        &executor,
+        &request.table,
+        &request.id,
+    )
+    .await
+    .and_then(|visible| {
+        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
+    }) {
+        return error_response(e);
     }
     if let Err(e) = admit_write(&state, &principal.tenant, request.text.len() as u64) {
         return error_response(e);
@@ -8324,16 +8514,37 @@ async fn text_search(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_read() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
+    let executor = match index_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &request.table,
+        &["SELECT"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
     let space = index_space(&principal.tenant, &state.database, &request.table);
-    let indexes = state.indexes.read().await;
-    match indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10)) {
-        Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+    let result = {
+        let indexes = state.indexes.read().await;
+        indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10))
+    };
+    match result {
+        Ok(hits) => match filter_text_hits(
+            &state,
+            &headers,
+            &principal,
+            &executor,
+            &request.table,
+            hits,
+        )
+        .await {
+            Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+            Err(e) => error_response(e),
+        },
         Err(e) => error_response(e),
     }
 }
@@ -8347,8 +8558,29 @@ async fn text_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_write() {
-        return error_response(ryme_error::RymeError::Forbidden);
+    let executor = match index_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &["DELETE"],
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
+    if let Err(e) = index_row_visible(
+        &state,
+        &headers,
+        &principal,
+        &executor,
+        &table,
+        &id,
+    )
+    .await
+    .and_then(|visible| {
+        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
+    }) {
+        return error_response(e);
     }
     let space = index_space(&principal.tenant, &state.database, &table);
     let mut indexes = state.indexes.write().await;

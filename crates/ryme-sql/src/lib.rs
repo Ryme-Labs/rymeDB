@@ -8570,6 +8570,10 @@ where
         self.role_is_superuser() || self.has_table_privilege(table, "SELECT")
     }
 
+    pub fn can_table_privilege(&self, table: &str, privilege: &str) -> bool {
+        self.role_is_superuser() || self.has_table_privilege(table, privilege)
+    }
+
     pub fn can_select_all_tables(&self) -> bool {
         self.role_is_superuser()
     }
@@ -8777,6 +8781,10 @@ where
         // must keep filtering rows even when their internal executor uses the
         // postgres role to inspect committed storage.
         !self.rls_is_enabled(table) || self.rls_policy_allows(table, value)
+    }
+
+    pub fn row_security_enabled(&self, table: &str) -> bool {
+        self.rls_is_enabled(table)
     }
 
     fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
@@ -16475,6 +16483,8 @@ mod tests {
             .unwrap();
 
         let reader = executor.clone().with_role(String::from("app_reader"));
+        assert!(reader.can_table_privilege("public.messages", "SELECT"));
+        assert!(!reader.can_table_privilege("public.messages", "UPDATE"));
         assert!(reader
             .execute(parse("SELECT body FROM public.messages WHERE id = 'one'").unwrap())
             .await
