@@ -434,44 +434,10 @@ pub fn base64_url_encode(raw: &[u8]) -> String {
 }
 
 pub fn random_bytes(count: usize) -> Vec<u8> {
+    use ring::rand::{SecureRandom, SystemRandom};
+
     let mut out = vec![0u8; count];
-    let mut filled = 0usize;
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let mut remaining = &mut out[..];
-        while !remaining.is_empty() {
-            match file.read(remaining) {
-                Ok(0) => break,
-                Ok(read) => {
-                    filled += read;
-                    remaining = &mut out[filled..];
-                }
-                Err(_) => break,
-            }
-        }
-    }
-    if filled < count {
-        let mut state = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9e3779b97f4a7c15);
-        if state == 0 {
-            state = 0x9e3779b97f4a7c15;
-        }
-        let mut index = filled;
-        while index < count {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            for byte in state.to_le_bytes() {
-                if index >= count {
-                    break;
-                }
-                out[index] = out[index].wrapping_add(byte);
-                index += 1;
-            }
-        }
-    }
+    SystemRandom::new().fill(&mut out).expect("OS secure random source unavailable");
     out
 }
 
