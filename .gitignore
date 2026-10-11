@@ -18,4 +18,3 @@ coverage
 *.db
 *.wal
 *.sst
-*.tsbuildinfo
