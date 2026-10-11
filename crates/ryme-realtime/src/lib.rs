@@ -721,7 +721,7 @@ impl Realtime {
                     .map(|(member, _)| member.clone())
                     .collect();
                 members.retain(|_, member| member.expires_unix > now_unix);
-                if let Some((tenant, channel)) = key.split_once('\0') {
+                if let Some((tenant, channel)) = split_scope_key(key) {
                     for member in expired {
                         expired_events.push((
                             tenant.to_string(),
@@ -1276,7 +1276,13 @@ fn branch_topic_key(tenant: &str, database: &str, branch: &str, table: &str) -> 
 }
 
 fn scope_key(tenant: &str, name: &str) -> String {
-    format!("{tenant}\0{name}")
+    format!("{}:{tenant}{name}", tenant.len())
+}
+
+fn split_scope_key(key: &str) -> Option<(&str, &str)> {
+    let (tenant_len, scope) = key.split_once(':')?;
+    let tenant_len = tenant_len.parse::<usize>().ok()?;
+    Some((scope.get(..tenant_len)?, scope.get(tenant_len..)?))
 }
 
 fn durable_key(tenant: &str, partition: &str) -> String {
@@ -1547,6 +1553,28 @@ mod tests {
 
         assert!(realtime.presence_state[first_shard].lock().unwrap().contains_key(&first_key));
         assert!(realtime.presence_state[second_shard].lock().unwrap().contains_key(&second_key));
+    }
+
+    #[test]
+    fn presence_scope_keys_do_not_collide_on_embedded_separators() {
+        let realtime = Realtime::new(64);
+        realtime
+            .presence_join("a\0b", "c", String::from("first"), serde_json::Value::Null, 60, 1000)
+            .unwrap();
+        realtime
+            .presence_join("a", "b\0c", String::from("second"), serde_json::Value::Null, 60, 1000)
+            .unwrap();
+
+        let first = realtime.presence_list("a\0b", "c", 1001);
+        let second = realtime.presence_list("a", "b\0c", 1001);
+        assert_eq!(
+            first.iter().map(|member| member.member.as_str()).collect::<Vec<_>>(),
+            ["first"]
+        );
+        assert_eq!(
+            second.iter().map(|member| member.member.as_str()).collect::<Vec<_>>(),
+            ["second"]
+        );
     }
 
     #[test]
