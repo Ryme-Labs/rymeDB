@@ -259,7 +259,6 @@ jobs:
           shopt -s nullglob
           packages=("$RUNNER_TEMP/npm/"*.tgz)
           test "${#packages[@]}" -eq 1
-          expected="sha512-$(openssl dgst -sha512 -binary "${packages[0]}" | openssl base64 -A)"
           metadata_file="$RUNNER_TEMP/npm-publish-$RELEASE_VERSION.json"
           if ! npm_status="$(curl --retry 3 --retry-all-errors -sS \
             -H 'Cache-Control: no-cache' \
@@ -276,7 +275,7 @@ jobs:
                 exit 1
               }
               published="$(jq -r --arg version "$RELEASE_VERSION" \
-                '.versions[$version].dist.integrity // empty' "$metadata_file")"
+                '.versions[$version].version // empty' "$metadata_file")"
               ;;
             404)
               published=""
@@ -286,12 +285,26 @@ jobs:
               exit 1
               ;;
           esac
-          if [[ -n "$published" && "$published" != "undefined" && "$published" != "null" ]]; then
-            if [[ "$published" != "$expected" ]]; then
+          if [[ -n "$published" ]]; then
+            published_tarball="$(jq -er --arg version "$RELEASE_VERSION" \
+              '.versions[$version].dist.tarball // empty' "$metadata_file")" || {
+              echo "npm metadata has no tarball for @rymelabs/rymedb@$RELEASE_VERSION"
+              exit 1
+            }
+            existing_tgz="$RUNNER_TEMP/npm-existing-$RELEASE_VERSION.tgz"
+            existing_dir="$RUNNER_TEMP/npm-existing-$RELEASE_VERSION"
+            local_dir="$RUNNER_TEMP/npm-local-$RELEASE_VERSION"
+            mkdir -p "$existing_dir" "$local_dir"
+            curl --retry 3 --retry-all-errors -sS \
+              -H 'Cache-Control: no-cache' \
+              --output "$existing_tgz" "$published_tarball"
+            tar -xzf "$existing_tgz" -C "$existing_dir"
+            tar -xzf "${packages[0]}" -C "$local_dir"
+            if ! diff -qr "$existing_dir/package" "$local_dir/package"; then
               echo "@rymelabs/rymedb@$RELEASE_VERSION already exists with different contents"
               exit 1
             fi
-            echo "@rymelabs/rymedb@$RELEASE_VERSION already published with matching integrity; skipping"
+            echo "@rymelabs/rymedb@$RELEASE_VERSION already published with matching package files; skipping"
           else
             npm publish "${packages[0]}" --access public --provenance
           fi
