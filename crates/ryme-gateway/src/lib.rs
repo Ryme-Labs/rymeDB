@@ -273,7 +273,9 @@ where
         txn: &mut ryme_txn::Transaction,
         key: &RecordKey,
     ) -> Result<Option<Vec<u8>>> {
-        let Some(reader) = self.remote_reader.as_ref() else {
+        let Some(reader) =
+            self.remote_reader.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
+        else {
             return self.manager.get(txn, key);
         };
         match reader.read(key.clone()).await? {
@@ -323,7 +325,9 @@ where
         table: &str,
         pk: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let Some(reader) = self.remote_reader.as_ref() else {
+        let Some(reader) =
+            self.remote_reader.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
+        else {
             return self.get(principal, table, pk);
         };
         self.policies.predicate(principal, table)?;
@@ -511,7 +515,9 @@ where
     }
 
     pub async fn ttl_of_async(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Ttl> {
-        let Some(reader) = self.remote_reader.as_ref() else {
+        let Some(reader) =
+            self.remote_reader.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
+        else {
             return self.ttl_of(principal, table, pk);
         };
         self.policies.predicate(principal, table)?;
@@ -923,6 +929,31 @@ mod tests {
             gateway.ttl_of_async(&principal, "docs", b"k").await.unwrap(),
             Ttl::Seconds(seconds) if seconds > 0 && seconds <= 60
         ));
+    }
+
+    #[tokio::test]
+    async fn branch_gateways_do_not_use_main_remote_reader() {
+        let gateway = gateway();
+        let principal = owner();
+        gateway.put(&principal, "docs", b"k".to_vec(), b"branch-value".to_vec()).await.unwrap();
+        let branch = gateway.clone().with_branch(String::from("feature")).with_remote_reader(
+            RemoteReader::new(|_| async {
+                Ok(RemoteRead::Value {
+                    value: Some(b"main-value".to_vec()),
+                    expires_at: Some(ryme_txn::now_unix() + 600),
+                })
+            }),
+        );
+
+        assert_eq!(
+            branch.get_async(&principal, "docs", b"k").await.unwrap(),
+            Some(b"branch-value".to_vec())
+        );
+        assert_eq!(branch.ttl_of_async(&principal, "docs", b"k").await.unwrap(), Ttl::Persistent);
+        let mut changes = branch.realtime().subscribe("t", "d", "feature");
+        branch.put(&principal, "docs", b"k".to_vec(), b"updated".to_vec()).await.unwrap();
+        let change = changes.recv().await.unwrap();
+        assert_eq!(change.before, Some(b"branch-value".to_vec()));
     }
 
     #[tokio::test]
