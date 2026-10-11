@@ -78,7 +78,7 @@ jobs:
         run: python3 schemas/openapi/validate.py
 
       - name: Build static site
-        run: pnpm run docs:build -- --out-dir _site
+        run: pnpm run docs:build --out-dir _site
 
       - name: Add OpenAPI artifacts and repository images
         run: |
