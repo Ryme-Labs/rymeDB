@@ -590,7 +590,7 @@ where
         if let Some(value) = self.base.get(txn, &local)? {
             return Ok(Self::decode(&value).flatten());
         }
-        if self.base.expires_at_at(&local, u64::MAX)?.is_some() {
+        if self.base.expires_at_at(&local, txn.read_ts)?.is_some() {
             return Ok(None);
         }
         let mut parent_txn = self.parent_transaction();
@@ -645,32 +645,28 @@ where
             }
             return Ok(if decoded.is_some() { Some(expires_at) } else { Some(1) });
         }
-        if let Some(expires_at) = self.base.expires_at_at(&local, u64::MAX)? {
+        if let Some(expires_at) = self.base.expires_at_at(&local, txn.read_ts)? {
             return Ok(Some(expires_at));
         }
         self.base.expires_at_at(key, self.base_commit_ts)
     }
 
-    fn expires_at_at(
-        &self,
-        key: &ryme_storage::RecordKey,
-        read_ts: u64,
-    ) -> Result<Option<u64>> {
+    fn expires_at_at(&self, key: &ryme_storage::RecordKey, read_ts: u64) -> Result<Option<u64>> {
         if !self.overlay {
             return self.base.expires_at_at(key, read_ts);
         }
         let local = self.local_key(key);
         let mut txn = self.base.begin();
-        txn.restamp(u64::MAX);
+        txn.restamp(read_ts);
         if let Some(value) = self.base.get(&mut txn, &local)? {
             let (decoded, mut expires_at) = Self::decode_with_expiry(&value)
                 .ok_or_else(|| RymeError::Corrupt(String::from("branch value")))?;
             if decoded.is_some() && expires_at == 0 {
-                expires_at = self.base.expires_at_at(&local, u64::MAX)?.unwrap_or(0);
+                expires_at = self.base.expires_at_at(&local, read_ts)?.unwrap_or(0);
             }
             return Ok(if decoded.is_some() { Some(expires_at) } else { Some(1) });
         }
-        if let Some(expires_at) = self.base.expires_at_at(&local, u64::MAX)? {
+        if let Some(expires_at) = self.base.expires_at_at(&local, read_ts)? {
             return Ok(Some(expires_at));
         }
         self.base.expires_at_at(key, self.base_commit_ts.min(read_ts))
@@ -984,11 +980,19 @@ mod tests {
         branch.put(&mut branch_write, parent_key.clone(), b"from-branch".to_vec());
         base.commit(branch_write).unwrap();
 
+        let local_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"local");
+        let local_expiry = ryme_txn::now_unix() + 10_000;
+        let mut local_write = branch.begin();
+        branch.put_with_ttl(&mut local_write, local_key.clone(), b"local".to_vec(), local_expiry);
+        base.commit(local_write).unwrap();
+
         assert_eq!(branch.get(&mut reader, &parent_key).unwrap(), Some(b"from-parent".to_vec()));
         assert_eq!(
             branch.scan(&mut reader, "tenant", "default", "docs", 10).unwrap(),
             vec![(b"row".to_vec(), b"from-parent".to_vec())]
         );
+        assert_eq!(branch.expires_at_at(&local_key, reader.read_ts).unwrap(), None);
+        assert_eq!(branch.expires_at_at(&local_key, u64::MAX).unwrap(), Some(local_expiry));
     }
 
     #[test]
