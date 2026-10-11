@@ -90,7 +90,9 @@ application snapshot.
 `/realtime/v1/websocket?apikey=<key>&vsn=1.0.0` accepts Phoenix-style
 `phx_join`, `phx_leave`, heartbeat, broadcast, presence, and
 `postgres_changes` configuration. RLS is checked before database changes are
-exposed. The npm/TypeScript and Rust SDKs wrap this protocol.
+exposed. Each connection is bounded to 64 channels and 32 database-change
+subscriptions per channel; incoming frames are limited to 1 MiB and broadcast
+payloads to 64 KiB. The npm/TypeScript and Rust SDKs wrap this protocol.
 
 ## Delivery rules
 

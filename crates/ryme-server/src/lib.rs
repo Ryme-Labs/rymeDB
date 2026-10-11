@@ -5689,6 +5689,12 @@ struct SupabaseFrame {
 
 static NEXT_SUPABASE_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SUPABASE_PRESENCE_KEY: AtomicU64 = AtomicU64::new(1);
+const REALTIME_MAX_INCOMING_FRAME_BYTES: usize = 1024 * 1024;
+const REALTIME_MAX_CHANNELS_PER_CONNECTION: usize = 64;
+const REALTIME_MAX_POSTGRES_SUBSCRIPTIONS_PER_CHANNEL: usize = 32;
+const REALTIME_MAX_SELECT_COLUMNS: usize = 128;
+const REALTIME_MAX_FILTER_BYTES: usize = 1024;
+const REALTIME_MAX_BROADCAST_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 struct SupabaseChangeSubscription {
@@ -5905,6 +5911,9 @@ fn supabase_subscription_config(
     let Some(entries) = value.as_array() else {
         return Err(String::from("postgres_changes must be an array"));
     };
+    if entries.len() > REALTIME_MAX_POSTGRES_SUBSCRIPTIONS_PER_CHANNEL {
+        return Err(String::from("too many postgres_changes subscriptions"));
+    }
     let mut subscriptions = Vec::with_capacity(entries.len());
     for entry in entries {
         let Some(object) = entry.as_object() else {
@@ -5931,19 +5940,40 @@ fn supabase_subscription_config(
             .and_then(serde_json::Value::as_str)
             .filter(|table| !table.is_empty())
             .map(String::from);
-        let filter = object.get("filter").and_then(serde_json::Value::as_str).map(String::from);
-        let select = object.get("select").map(|value| {
-            value
-                .as_array()
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(String::from)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        });
+        if table.as_deref().is_some_and(|table| table.len() > 256) {
+            return Err(String::from("postgres_changes table"));
+        }
+        let filter = object
+            .get("filter")
+            .and_then(serde_json::Value::as_str)
+            .map(|filter| {
+                if filter.len() > REALTIME_MAX_FILTER_BYTES {
+                    Err(String::from("postgres_changes filter"))
+                } else {
+                    Ok(String::from(filter))
+                }
+            })
+            .transpose()?;
+        let select = match object.get("select") {
+            None => None,
+            Some(value) => {
+                let values = value
+                    .as_array()
+                    .ok_or_else(|| String::from("postgres_changes select must be an array"))?;
+                if values.len() > REALTIME_MAX_SELECT_COLUMNS {
+                    return Err(String::from("too many postgres_changes columns"));
+                }
+                let mut columns = Vec::with_capacity(values.len());
+                for value in values {
+                    let column = value
+                        .as_str()
+                        .filter(|column| !column.is_empty() && column.len() <= 256)
+                        .ok_or_else(|| String::from("postgres_changes column"))?;
+                    columns.push(String::from(column));
+                }
+                Some(columns)
+            }
+        };
         let id = NEXT_SUPABASE_SUBSCRIPTION_ID.fetch_add(1, AtomicOrdering::Relaxed);
         subscriptions.push(SupabaseChangeSubscription { id, event, schema, table, filter, select });
     }
@@ -6519,6 +6549,9 @@ async fn forward_supabase_realtime(
                 let axum::extract::ws::Message::Text(text) = message else {
                     continue;
                 };
+                if text.len() > REALTIME_MAX_INCOMING_FRAME_BYTES {
+                    break;
+                }
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
                     continue;
                 };
@@ -6537,6 +6570,23 @@ async fn forward_supabase_realtime(
                         if !frame.topic.starts_with("realtime:") || frame.topic.len() > 256 {
                             let reply = supabase_reply(&frame, "error", serde_json::json!({"reason":"invalid topic"}), array_protocol);
                             if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                            continue;
+                        }
+                        if !channels.contains_key(&frame.topic)
+                            && channels.len() >= REALTIME_MAX_CHANNELS_PER_CONNECTION
+                        {
+                            let reply = supabase_reply(
+                                &frame,
+                                "error",
+                                serde_json::json!({"reason":"channel limit"}),
+                                array_protocol,
+                            );
+                            if !queue_realtime_message(
+                                &outgoing,
+                                axum::extract::ws::Message::Text(reply),
+                            ) {
+                                break;
+                            }
                             continue;
                         }
                         if let Some(channel) = channels.remove(&frame.topic) {
@@ -6713,6 +6763,24 @@ async fn forward_supabase_realtime(
                             }
                             payload => (String::from("message"), payload),
                         };
+                        let payload_bytes = serde_json::to_vec(&payload)
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX);
+                        if payload_bytes > REALTIME_MAX_BROADCAST_PAYLOAD_BYTES {
+                            let reply = supabase_reply(
+                                &frame,
+                                "error",
+                                serde_json::json!({"reason":"broadcast payload"}),
+                                array_protocol,
+                            );
+                            if !queue_realtime_message(
+                                &outgoing,
+                                axum::extract::ws::Message::Text(reply),
+                            ) {
+                                break;
+                            }
+                            continue;
+                        }
                         let published = publish_broadcast(
                             &state,
                             &tenant,
@@ -11710,6 +11778,30 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn supabase_realtime_subscription_limits_are_bounded() {
+        let subscriptions = serde_json::json!({
+            "config": {
+                "postgres_changes": (0..=REALTIME_MAX_POSTGRES_SUBSCRIPTIONS_PER_CHANNEL)
+                    .map(|_| serde_json::json!({"table": "messages"}))
+                    .collect::<Vec<_>>()
+            }
+        });
+        assert!(supabase_subscription_config(&subscriptions).is_err());
+
+        let columns = serde_json::json!({
+            "config": {
+                "postgres_changes": [{
+                    "table": "messages",
+                    "select": (0..=REALTIME_MAX_SELECT_COLUMNS)
+                        .map(|index| format!("column_{index}"))
+                        .collect::<Vec<_>>()
+                }]
+            }
+        });
+        assert!(supabase_subscription_config(&columns).is_err());
+    }
 
     #[test]
     fn search_index_spaces_are_tenant_scoped() {
