@@ -64,7 +64,10 @@ impl Wal {
         let frame = encode_frame(lsn, commit_ts, payload);
         let mut active_len = self.active.metadata()?.len();
         if active_len.saturating_add(frame.len() as u64) > self.segment_size_bytes {
-            self.rotate()?;
+            if let Err(error) = self.rotate() {
+                self.poisoned = true;
+                return Err(error);
+            }
             active_len = 0;
         }
         let write_result =
@@ -218,9 +221,15 @@ impl Wal {
 
     fn rotate(&mut self) -> Result<()> {
         self.active.sync_data()?;
-        self.active_id += 1;
-        let path = self.dir.join(segment_name(self.active_id));
-        self.active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
+        let next_id = self
+            .active_id
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Corrupt(String::from("wal segment id overflow")))?;
+        let path = self.dir.join(segment_name(next_id));
+        let next = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
+        sync_directory(&self.dir)?;
+        self.active = next;
+        self.active_id = next_id;
         Ok(())
     }
 }
@@ -572,6 +581,24 @@ mod tests {
         reopened.sync().unwrap();
         let records = Wal::read_all(&dir).unwrap();
         assert_eq!(records.iter().map(|record| record.lsn).collect::<Vec<_>>(), vec![0, 1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_rejects_segment_id_overflow_without_changing_active_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-segment-overflow-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 1024).unwrap();
+        let original_id = wal.active_id;
+        wal.active_id = u64::MAX;
+        assert!(matches!(wal.rotate(), Err(RymeError::Corrupt(_))));
+        assert_eq!(wal.active_id, u64::MAX);
+        assert_eq!(wal.active.metadata().unwrap().len(), 0);
+        wal.active_id = original_id;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
