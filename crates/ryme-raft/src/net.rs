@@ -3881,28 +3881,47 @@ impl Node {
         commit_ts: u64,
         state: ryme_txn::TransactionState,
     ) -> Result<()> {
-        let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
-        if owner == self.id {
-            return self.prepare_range_group(group_id, transaction_id, commit_ts, state).await;
-        }
-        let pool = self
-            .pool_for(owner)
-            .ok_or_else(|| RymeError::Unavailable(String::from("range participant unavailable")))?;
         let payload = serde_json::to_vec(&state)
             .map_err(|error| RymeError::Internal(format!("transaction prepare: {error}")))?;
-        match pool
-            .roundtrip(&Rpc::RangePrepareTransaction {
-                group_id: group_id.to_string(),
-                transaction_id,
-                commit_ts,
-                payload,
-            })
-            .await?
-        {
-            Rpc::RangePrepareTransactionResponse { prepared: true, error: None } => Ok(()),
-            Rpc::RangePrepareTransactionResponse { error: Some(error), .. } => Err(error.into()),
-            _ => Err(RymeError::Corrupt(String::from("transaction prepare rpc"))),
+        for attempt in 0..3 {
+            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let result = if owner == self.id {
+                self.prepare_range_group(group_id, transaction_id, commit_ts, state.clone()).await
+            } else {
+                match self.pool_for(owner) {
+                    Some(pool) => match pool
+                        .roundtrip(&Rpc::RangePrepareTransaction {
+                            group_id: group_id.to_string(),
+                            transaction_id,
+                            commit_ts,
+                            payload: payload.clone(),
+                        })
+                        .await
+                    {
+                        Ok(Rpc::RangePrepareTransactionResponse {
+                            prepared: true,
+                            error: None,
+                        }) => Ok(()),
+                        Ok(Rpc::RangePrepareTransactionResponse { error: Some(error), .. }) => {
+                            Err(error.into())
+                        }
+                        Ok(_) => Err(RymeError::Corrupt(String::from("transaction prepare rpc"))),
+                        Err(error) => Err(error),
+                    },
+                    None => {
+                        Err(RymeError::Unavailable(String::from("range participant unavailable")))
+                    }
+                }
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < 2 && matches!(&error, RymeError::Unavailable(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        Err(RymeError::Unavailable(String::from("range participant unavailable")))
     }
 
     async fn resolve_on(
@@ -3913,35 +3932,63 @@ impl Node {
         commit_ts: u64,
         committed: bool,
     ) -> Result<()> {
-        let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
-        if owner == self.id {
-            if group_id.is_empty() {
-                return self.resolve_intent(transaction_id, commit_ts, committed);
+        for attempt in 0..3 {
+            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let result = if owner == self.id {
+                if group_id.is_empty() {
+                    self.resolve_intent(transaction_id, commit_ts, committed)
+                } else {
+                    self.resolve_range_group(group_id, transaction_id, commit_ts, committed).await
+                }
+            } else {
+                match self.pool_for(owner) {
+                    Some(pool) => {
+                        let response = if group_id.is_empty() {
+                            pool.roundtrip(&Rpc::ResolveTransaction {
+                                transaction_id,
+                                commit_ts,
+                                committed,
+                            })
+                            .await
+                        } else {
+                            pool.roundtrip(&Rpc::RangeResolveTransaction {
+                                group_id: group_id.to_string(),
+                                transaction_id,
+                                commit_ts,
+                                committed,
+                            })
+                            .await
+                        };
+                        match response {
+                            Ok(Rpc::ResolveTransactionResponse { resolved: true, error: None })
+                            | Ok(Rpc::RangeResolveTransactionResponse {
+                                resolved: true,
+                                error: None,
+                            }) => Ok(()),
+                            Ok(Rpc::ResolveTransactionResponse { error: Some(error), .. })
+                            | Ok(Rpc::RangeResolveTransactionResponse {
+                                error: Some(error), ..
+                            }) => Err(error.into()),
+                            Ok(_) => {
+                                Err(RymeError::Corrupt(String::from("transaction resolve rpc")))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    None => {
+                        Err(RymeError::Unavailable(String::from("range participant unavailable")))
+                    }
+                }
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < 2 && matches!(&error, RymeError::Unavailable(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                Err(error) => return Err(error),
             }
-            return self.resolve_range_group(group_id, transaction_id, commit_ts, committed).await;
         }
-        let pool = self
-            .pool_for(owner)
-            .ok_or_else(|| RymeError::Unavailable(String::from("range participant unavailable")))?;
-        let response = if group_id.is_empty() {
-            pool.roundtrip(&Rpc::ResolveTransaction { transaction_id, commit_ts, committed })
-                .await?
-        } else {
-            pool.roundtrip(&Rpc::RangeResolveTransaction {
-                group_id: group_id.to_string(),
-                transaction_id,
-                commit_ts,
-                committed,
-            })
-            .await?
-        };
-        match response {
-            Rpc::ResolveTransactionResponse { resolved: true, error: None }
-            | Rpc::RangeResolveTransactionResponse { resolved: true, error: None } => Ok(()),
-            Rpc::ResolveTransactionResponse { error: Some(error), .. }
-            | Rpc::RangeResolveTransactionResponse { error: Some(error), .. } => Err(error.into()),
-            _ => Err(RymeError::Corrupt(String::from("transaction resolve rpc"))),
-        }
+        Err(RymeError::Unavailable(String::from("range participant unavailable")))
     }
 
     async fn retry_pending_resolutions(self: &Arc<Self>) {
