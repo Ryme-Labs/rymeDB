@@ -40,7 +40,6 @@ module.exports = {
           href: "https://db.rymelabs.dev/api/",
         },
         "api",
-        "sdk-java",
         "sdk-js",
         "sdk-rust",
       ],

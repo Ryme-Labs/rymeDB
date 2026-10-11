@@ -1,7 +1,7 @@
 # Development guide
 
-The core is Rust. TypeScript is used for the operator CLI and npm SDK; Java
-and Rust SDKs are thin protocol clients. Keep gateway and platform features
+The core is Rust. TypeScript is used for the operator CLI and npm SDK; the
+Rust SDK is a thin protocol client. Keep gateway and platform features
 outside the storage/transaction hot path when possible.
 
 ## Repository map
@@ -17,7 +17,7 @@ outside the storage/transaction hot path when possible.
 | `crates/ryme-realtime` | CDC, presence, broadcast, durable topics |
 | `crates/ryme-server` | listeners, auth, HTTP/WebSocket routes |
 | `apps/cli` | `rymedb-cli` operator CLI |
-| `sdks/` | Java, npm/TypeScript, and Rust clients only |
+| `sdks/` | npm/TypeScript and Rust clients only |
 | `schemas/openapi` | REST contract and validator |
 | `docs/` | Docusaurus documentation source |
 
@@ -45,7 +45,6 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 pnpm --dir sdks/js build
 pnpm --dir sdks/js test
-mvn -f sdks/java/pom.xml verify
 cargo test --manifest-path sdks/rust/Cargo.toml --locked
 python3 schemas/openapi/validate.py
 pnpm docs:dev
@@ -53,7 +52,7 @@ pnpm docs:build
 ```
 
 The CI workflows run on `ubuntu-24.04`, install `protoc` and `psql`, test the
-protocols, build Pages, and publish only the Java, npm/JS, and Rust SDKs.
+protocols, build Pages, and publish only the npm/JS and Rust SDKs.
 
 ## Adding a feature
 

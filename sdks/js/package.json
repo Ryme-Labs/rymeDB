@@ -15,7 +15,8 @@
     "registry": "https://registry.npmjs.org"
   },
   "files": [
-    "dist",
+    "dist/index.js",
+    "dist/index.d.ts",
     "README.md"
   ],
   "exports": {

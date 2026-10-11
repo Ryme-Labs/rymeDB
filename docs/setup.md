@@ -143,7 +143,7 @@ Stop the foreground server with Ctrl-C. Its data is in `./data`; preserve or
 back it up before resetting a development database. Set `RUST_LOG=info` or
 `RUST_LOG=debug` when you need more diagnostic output.
 
-The [JavaScript](sdk-js.md), [Rust](sdk-rust.md), and [Java](sdk-java.md) guides
-show how to connect with the supported SDKs. For issues, see
+The [npm/TypeScript](sdk-js.md) and [Rust](sdk-rust.md) guides show how to
+connect with the supported SDKs. For issues, see
 [troubleshooting](troubleshooting.md); contributors can continue with the
 [development setup](development.md).

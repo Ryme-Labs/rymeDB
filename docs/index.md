@@ -69,7 +69,7 @@ smoke test.
 | Recovery | Checkpoints, snapshots, PITR, local/S3 archives, replica copies, encrypted archive verification drills |
 | Backend APIs | REST CRUD, SQL, GraphQL, key/value, vector search, text search, health/metrics/observability |
 | Security | API keys, password auth, JWT/JWKS, OIDC helpers, OTP, passkeys, TLS/mTLS, tenant scoping, RLS |
-| Clients | Java, npm/TypeScript, and Rust SDKs; raw HTTP/WebSocket, PostgreSQL, RESP, and CLI access |
+| Clients | npm/TypeScript and Rust SDKs; raw HTTP/WebSocket, PostgreSQL, RESP, and CLI access |
 
 The standalone <a href="https://db.rymelabs.dev/api/">REST/OpenAPI reference</a> is generated from
 the checked-in `schemas/openapi/rest.yaml` and served through Swagger UI. The

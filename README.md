@@ -26,7 +26,7 @@ psql -h 127.0.0.1 -p 5433 -U postgres -c "SELECT 1"
 curl -H "Authorization: Bearer $RYME_API_KEY" http://127.0.0.1:8080/ready
 ```
 
-SDKs live in `sdks/` (Java, npm/TypeScript, and Rust).
+SDKs live in `sdks/` (npm/TypeScript and Rust).
 Release artifacts are published from version tags; see `docs/sdk-release.md`.
 
 The operator CLI lives in `apps/cli` and is installed as `rymedb-cli`:

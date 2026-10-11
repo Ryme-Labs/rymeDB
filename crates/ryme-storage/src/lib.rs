@@ -337,8 +337,7 @@ impl Engine {
             keep
         });
         self.bytes_held = self.bytes_held.saturating_sub(reclaimed);
-        let count = before - self.inner.len();
-        count
+        before - self.inner.len()
     }
 
     pub fn purge_keys(&mut self, keys: &[RecordKey]) -> usize {

@@ -85,7 +85,7 @@ const config = {
       copyright: `Copyright © ${new Date().getFullYear()} Ryme Labs`,
     },
     prism: {
-      additionalLanguages: ["bash", "java", "json", "rust", "sql", "toml", "yaml"],
+      additionalLanguages: ["bash", "json", "rust", "sql", "toml", "yaml"],
     },
   },
 };

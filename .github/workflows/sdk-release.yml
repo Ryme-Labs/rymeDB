@@ -50,10 +50,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Allow only Java, npm, and Rust SDKs
+      - name: Allow only npm and Rust SDKs
         run: |
           actual="$(find sdks -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)"
-          test "$actual" = "java,js,rust" || {
+          test "$actual" = "js,rust" || {
             echo "unexpected SDK directories: $actual"
             exit 1
           }
@@ -112,6 +112,10 @@ jobs:
           test -n "$archive"
           tar -tzf "$archive" | grep -qx 'package/dist/index.js'
           tar -tzf "$archive" | grep -qx 'package/dist/index.d.ts'
+          if tar -tzf "$archive" | grep -qE '(^|/)client\.test\.'; then
+            echo "npm artifact unexpectedly contains test files"
+            exit 1
+          fi
 
   rust:
     name: Build Rust SDK
@@ -146,51 +150,6 @@ jobs:
           name: sdk-cargo
           path: sdks/rust/target/package/*.crate
           if-no-files-found: error
-
-  java:
-    name: Build Java SDK
-    needs: scope
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Java
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: 17
-          cache: maven
-
-      - name: Verify Maven package
-        run: mvn --batch-mode --update-snapshots -f sdks/java/pom.xml verify
-
-      - name: Check tag version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          expected="${GITHUB_REF_NAME#v}"
-          actual="$(mvn --batch-mode --quiet -f sdks/java/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)"
-          test "$actual" = "$expected" || {
-            echo "Java SDK version $actual does not match tag $GITHUB_REF_NAME"
-            exit 1
-          }
-
-      - name: Stage Maven artifacts
-        run: |
-          stage="$RUNNER_TEMP/sdk-maven"
-          mkdir -p "$stage/target"
-          cp sdks/java/pom.xml "$stage/pom.xml"
-          cp sdks/java/target/*.jar "$stage/target/"
-
-      - name: Store Maven artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sdk-maven
-          path: ${{ runner.temp }}/sdk-maven
-          if-no-files-found: error
-
-      - name: Verify Maven artifact set
-        run: test "$(find "$RUNNER_TEMP/sdk-maven/target" -maxdepth 1 -type f -name '*.jar' | wc -l)" -eq 3
 
   publish-npm:
     name: Publish npm SDK
@@ -254,52 +213,10 @@ jobs:
           test -n "$manifest"
           cargo publish --manifest-path "$manifest" --locked --no-verify
 
-  publish-java:
-    name: Publish Java SDK
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
-    needs: java
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Set up Java
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: 17
-          server-id: github
-          server-username: GITHUB_ACTOR
-          server-password: GITHUB_TOKEN
-          cache: maven
-
-      - name: Download tested Maven artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: sdk-maven
-          path: ${{ runner.temp }}/maven
-
-      - name: Publish tested Maven package to GitHub Packages
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
-        run: |
-          jar="$(find "$RUNNER_TEMP/maven/target" -maxdepth 1 -type f -name 'rymedb-client-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' -print -quit)"
-          sources="$(find "$RUNNER_TEMP/maven/target" -maxdepth 1 -type f -name 'rymedb-client-*-sources.jar' -print -quit)"
-          javadoc="$(find "$RUNNER_TEMP/maven/target" -maxdepth 1 -type f -name 'rymedb-client-*-javadoc.jar' -print -quit)"
-          test -n "$jar" -a -n "$sources" -a -n "$javadoc"
-          mvn --batch-mode org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy-file \
-            -Dfile="$jar" \
-            -DpomFile="$RUNNER_TEMP/maven/pom.xml" \
-            -Dsources="$sources" \
-            -Djavadoc="$javadoc" \
-            -DrepositoryId=github \
-            -Durl=https://maven.pkg.github.com/Ryme-Labs/rymeDB
-
   release:
     name: Upload SDK release artifacts
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    needs: [npm, rust, java]
+    needs: [npm, rust]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -316,9 +233,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mapfile -t artifacts < <(
-            find release -type f \( -name '*.tgz' -o -name '*.crate' -o -name '*.jar' \) -print
+            find release -type f \( -name '*.tgz' -o -name '*.crate' \) -print
           )
           test "${#artifacts[@]}" -gt 0
-          (cd release && find . -type f \( -name '*.tgz' -o -name '*.crate' -o -name '*.jar' \) -print0 | sort -z | xargs -0 sha256sum) > release/SHA256SUMS
+          (cd release && find . -type f \( -name '*.tgz' -o -name '*.crate' \) -print0 | sort -z | xargs -0 sha256sum) > release/SHA256SUMS
           artifacts+=(release/SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" "${artifacts[@]}" --verify-tag --generate-notes

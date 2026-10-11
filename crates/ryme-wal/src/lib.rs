@@ -314,10 +314,9 @@ where
         Ok(()) => Ok(()),
         Err(write_error) => match file.set_len(offset).and_then(|()| file.sync_data()) {
             Ok(()) => Err(write_error),
-            Err(rollback_error) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("WAL append failed ({write_error}); rollback failed ({rollback_error})"),
-            )),
+            Err(rollback_error) => Err(std::io::Error::other(format!(
+                "WAL append failed ({write_error}); rollback failed ({rollback_error})"
+            ))),
         },
     }
 }
