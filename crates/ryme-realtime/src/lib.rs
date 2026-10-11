@@ -2,7 +2,7 @@ use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
 
@@ -42,6 +42,8 @@ pub const PRESENCE_MAX_MEMBERS: usize = 1000;
 pub const PRESENCE_MAX_TTL_SECS: u64 = 86400;
 pub const PRESENCE_MAX_MEMBER_BYTES: usize = 256;
 pub const PRESENCE_MAX_STATE_BYTES: usize = 64 * 1024;
+pub const PRESENCE_MAX_MEMBERS_TOTAL: usize = 100_000;
+pub const PRESENCE_MAX_STATE_BYTES_TOTAL: usize = 256 * 1024 * 1024;
 const BROADCAST_SHARDS: usize = 32;
 const TABLE_TOPIC_SHARDS: usize = 32;
 const PRESENCE_SHARDS: usize = 32;
@@ -161,6 +163,8 @@ pub struct Realtime {
     capacity: usize,
     sequence: Arc<AtomicU64>,
     presence_sequence: Arc<AtomicU64>,
+    presence_member_count: Arc<AtomicUsize>,
+    presence_state_bytes: Arc<AtomicUsize>,
     stable_cdc: bool,
     cdc_sequences: Arc<Mutex<HashMap<String, (u64, u64)>>>,
 }
@@ -191,6 +195,10 @@ pub struct PresenceMember {
     pub member: String,
     pub state: serde_json::Value,
     pub expires_unix: u64,
+}
+
+fn encoded_presence_state_bytes(state: &serde_json::Value) -> usize {
+    serde_json::to_vec(state).map(|bytes| bytes.len()).unwrap_or(usize::MAX)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +359,8 @@ impl Realtime {
             capacity,
             sequence: Arc::new(AtomicU64::new(0)),
             presence_sequence: Arc::new(AtomicU64::new(0)),
+            presence_member_count: Arc::new(AtomicUsize::new(0)),
+            presence_state_bytes: Arc::new(AtomicUsize::new(0)),
             stable_cdc: false,
             cdc_sequences: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -369,6 +379,38 @@ impl Realtime {
 
     fn next_presence_sequence(&self) -> u64 {
         self.presence_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn reserve_presence_capacity(&self, members: usize, state_bytes: usize) -> bool {
+        let members_reserved = self.presence_member_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                current.checked_add(members).filter(|next| *next <= PRESENCE_MAX_MEMBERS_TOTAL)
+            },
+        );
+        if members_reserved.is_err() {
+            return false;
+        }
+        let bytes_reserved = self.presence_state_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                current
+                    .checked_add(state_bytes)
+                    .filter(|next| *next <= PRESENCE_MAX_STATE_BYTES_TOTAL)
+            },
+        );
+        if bytes_reserved.is_err() {
+            self.presence_member_count.fetch_sub(members, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn release_presence_capacity(&self, members: usize, state_bytes: usize) {
+        self.presence_member_count.fetch_sub(members, Ordering::AcqRel);
+        self.presence_state_bytes.fetch_sub(state_bytes, Ordering::AcqRel);
     }
 
     pub fn reserve_sequence(&self) -> u64 {
@@ -863,23 +905,63 @@ impl Realtime {
             .ok_or_else(|| RymeError::Internal(String::from("presence state shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("presence state lock")))?;
-        if !presence.contains_key(&key) {
+        let new_room = !presence.contains_key(&key);
+        if new_room {
             self.admit_topic(TopicKind::PresenceRoom, tenant)?;
         }
         let members = presence.entry(key).or_insert_with(HashMap::new);
-        let expired_members: Vec<String> = members
+        let expired_members: Vec<(String, usize)> = members
             .iter()
             .filter(|(_, member)| member.expires_unix <= now_unix)
-            .map(|(member, _)| member.clone())
+            .map(|(member, value)| (member.clone(), encoded_presence_state_bytes(&value.state)))
             .collect();
+        let expired_state_bytes = expired_members.iter().map(|(_, bytes)| *bytes).sum();
         members.retain(|_, member| member.expires_unix > now_unix);
-        if !members.contains_key(&member) && members.len() >= PRESENCE_MAX_MEMBERS {
+        if !expired_members.is_empty() {
+            self.release_presence_capacity(expired_members.len(), expired_state_bytes);
+        }
+        let existing_state_bytes =
+            members.get(&member).map(|value| encoded_presence_state_bytes(&value.state));
+        let is_new_member = existing_state_bytes.is_none();
+        if is_new_member && members.len() >= PRESENCE_MAX_MEMBERS {
+            if new_room {
+                presence.remove(&key);
+            }
+            drop(presence);
+            if new_room {
+                self.release_topic(TopicKind::PresenceRoom, tenant);
+            }
             return Err(RymeError::Overload(String::from("presence room full")));
         }
-        let count = members.len() + usize::from(!members.contains_key(&member));
+        let new_state_bytes = state_bytes.len();
+        let capacity_reserved = if let Some(old_state_bytes) = existing_state_bytes {
+            if new_state_bytes > old_state_bytes {
+                self.reserve_presence_capacity(0, new_state_bytes - old_state_bytes)
+            } else {
+                true
+            }
+        } else {
+            self.reserve_presence_capacity(1, new_state_bytes)
+        };
+        if !capacity_reserved {
+            if new_room {
+                presence.remove(&key);
+            }
+            drop(presence);
+            if new_room {
+                self.release_topic(TopicKind::PresenceRoom, tenant);
+            }
+            return Err(RymeError::Overload(String::from("presence capacity")));
+        }
+        if let Some(old_state_bytes) = existing_state_bytes {
+            if old_state_bytes > new_state_bytes {
+                self.release_presence_capacity(0, old_state_bytes - new_state_bytes);
+            }
+        }
+        let count = members.len() + usize::from(is_new_member);
         let expired: Vec<(String, u64)> = expired_members
             .into_iter()
-            .map(|member| (member, self.next_presence_sequence()))
+            .map(|(member, _)| (member, self.next_presence_sequence()))
             .collect();
         let sequence = self.next_presence_sequence();
         members.insert(
@@ -918,18 +1000,22 @@ impl Realtime {
         let mut expired_events = Vec::new();
         let mut expired_rooms = Vec::new();
         let mut removed = 0;
+        let mut removed_state_bytes = 0usize;
         for shard in self.presence_state.iter() {
             let Ok(mut presence) = shard.lock() else { continue };
             presence.retain(|key, members| {
                 let before = members.len();
-                let expired: Vec<String> = members
+                let expired: Vec<(String, usize)> = members
                     .iter()
                     .filter(|(_, member)| member.expires_unix <= now_unix)
-                    .map(|(member, _)| member.clone())
+                    .map(|(member, value)| {
+                        (member.clone(), encoded_presence_state_bytes(&value.state))
+                    })
                     .collect();
                 members.retain(|_, member| member.expires_unix > now_unix);
+                removed_state_bytes += expired.iter().map(|(_, bytes)| *bytes).sum::<usize>();
                 if let Some((tenant, channel)) = split_scope_key(key) {
-                    for member in expired {
+                    for (member, _) in expired {
                         expired_events.push((
                             tenant.to_string(),
                             channel.to_string(),
@@ -946,6 +1032,9 @@ impl Realtime {
                     true
                 }
             });
+        }
+        if removed > 0 {
+            self.release_presence_capacity(removed, removed_state_bytes);
         }
         for key in expired_rooms {
             if let Some((tenant, _)) = split_scope_key(&key) {
@@ -1066,6 +1155,10 @@ impl Realtime {
             .ok_or_else(|| RymeError::Internal(String::from("presence state shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("presence state lock")))?;
+        let removed_state_bytes = presence
+            .get(&key)
+            .and_then(|members| members.get(member))
+            .map(|value| encoded_presence_state_bytes(&value.state));
         let removed =
             presence.get_mut(&key).map(|members| members.remove(member).is_some()).unwrap_or(false);
         let empty = presence.get(&key).is_some_and(HashMap::is_empty);
@@ -1074,6 +1167,9 @@ impl Realtime {
         }
         let sequence = removed.then(|| self.next_presence_sequence());
         drop(presence);
+        if removed {
+            self.release_presence_capacity(1, removed_state_bytes.unwrap_or(0));
+        }
         if empty {
             self.release_topic(TopicKind::PresenceRoom, tenant);
         }
@@ -1104,7 +1200,7 @@ impl Realtime {
         now_unix: u64,
     ) -> (Vec<PresenceMember>, u64) {
         let mut out = Vec::new();
-        let mut expired = Vec::new();
+        let mut expired: Vec<(String, usize)> = Vec::new();
         let sequence;
         let key = scope_key(tenant, channel);
         let shard = self.presence_shard(&key);
@@ -1115,7 +1211,9 @@ impl Realtime {
                     expired = members
                         .iter()
                         .filter(|(_, member)| member.expires_unix <= now_unix)
-                        .map(|(member, _)| member.clone())
+                        .map(|(member, value)| {
+                            (member.clone(), encoded_presence_state_bytes(&value.state))
+                        })
                         .collect();
                     members.retain(|_, member| member.expires_unix > now_unix);
                     let mut names: Vec<String> = members.keys().cloned().collect();
@@ -1134,12 +1232,17 @@ impl Realtime {
                         emptied = true;
                     }
                 }
+                let expired_count = expired.len();
+                let expired_state_bytes = expired.iter().map(|(_, bytes)| *bytes).sum();
                 let expired = expired
                     .into_iter()
-                    .map(|member| (member, self.next_presence_sequence()))
+                    .map(|(member, _)| (member, self.next_presence_sequence()))
                     .collect::<Vec<_>>();
                 sequence = self.presence_sequence.load(Ordering::Acquire);
                 drop(presence);
+                if expired_count > 0 {
+                    self.release_presence_capacity(expired_count, expired_state_bytes);
+                }
                 if emptied {
                     self.release_topic(TopicKind::PresenceRoom, tenant);
                 }
@@ -1991,6 +2094,29 @@ mod tests {
             .presence_join("t", "far", String::from("a"), serde_json::json!(null), u64::MAX, 1000)
             .unwrap();
         assert!(realtime.presence_list("t", "far", 1000 + PRESENCE_MAX_TTL_SECS + 1).is_empty());
+    }
+
+    #[test]
+    fn presence_global_capacity_is_bounded_and_released() {
+        let realtime = Realtime::new(64);
+        assert!(realtime
+            .reserve_presence_capacity(PRESENCE_MAX_MEMBERS_TOTAL, PRESENCE_MAX_STATE_BYTES_TOTAL));
+        assert!(matches!(
+            realtime.presence_join(
+                "t",
+                "full",
+                String::from("member"),
+                serde_json::Value::Null,
+                60,
+                1000,
+            ),
+            Err(RymeError::Overload(message)) if message == "presence capacity"
+        ));
+        realtime
+            .release_presence_capacity(PRESENCE_MAX_MEMBERS_TOTAL, PRESENCE_MAX_STATE_BYTES_TOTAL);
+        assert!(realtime
+            .presence_join("t", "full", String::from("member"), serde_json::Value::Null, 60, 1000)
+            .is_ok());
     }
 
     #[test]
