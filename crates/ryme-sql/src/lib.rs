@@ -7599,6 +7599,7 @@ where
         value: Option<i64>,
         is_called: bool,
     ) -> Result<i64> {
+        self.enforce_sequence_privilege(operation, name)?;
         let mut sequences = self
             .sequences
             .lock()
@@ -8532,12 +8533,18 @@ where
                 .is_some_and(|role| role.superuser)
     }
 
-    fn has_table_privilege(&self, table: &str, privilege: &str) -> bool {
-        let canonical = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
+    fn has_object_privilege(&self, object_type: &str, object: &str, privilege: &str) -> bool {
+        let canonical = match object_type {
+            "TABLE" => self.canonical_table_name(object).unwrap_or_else(|| object.to_string()),
+            "SEQUENCE" => {
+                self.canonical_sequence_name(object).unwrap_or_else(|| object.to_string())
+            }
+            _ => object.to_string(),
+        };
         let canonical_schema = canonical.rsplit_once('.').map(|(schema, _)| schema);
         self.privileges.lock().ok().is_some_and(|privileges| {
             privileges.iter().any(|grant| {
-                if !grant.object_type.eq_ignore_ascii_case("TABLE")
+                if !grant.object_type.eq_ignore_ascii_case(object_type)
                     || !(grant.grantee.eq_ignore_ascii_case(&self.role)
                         || grant.grantee.eq_ignore_ascii_case("PUBLIC"))
                 {
@@ -8555,9 +8562,50 @@ where
         })
     }
 
+    fn has_table_privilege(&self, table: &str, privilege: &str) -> bool {
+        self.has_object_privilege("TABLE", table, privilege)
+    }
+
+    fn canonical_sequence_name(&self, sequence: &str) -> Option<String> {
+        self.sequences.lock().ok().and_then(|sequences| {
+            sequences.get_key_value(sequence).map(|(name, _)| name.clone()).or_else(|| {
+                sequences
+                    .keys()
+                    .find_map(|name| same_relation(name, sequence).then(|| name.clone()))
+            })
+        })
+    }
+
+    fn sequence_privileges(operation: SequenceOperation) -> &'static [&'static str] {
+        match operation {
+            SequenceOperation::Nextval => &["USAGE", "UPDATE"],
+            SequenceOperation::Currval => &["USAGE", "SELECT"],
+            SequenceOperation::Setval => &["UPDATE"],
+        }
+    }
+
+    fn enforce_sequence_privilege(
+        &self,
+        operation: SequenceOperation,
+        sequence: &str,
+    ) -> Result<()> {
+        if self.role_is_superuser()
+            || Self::sequence_privileges(operation)
+                .iter()
+                .any(|privilege| self.has_object_privilege("SEQUENCE", sequence, privilege))
+        {
+            Ok(())
+        } else {
+            Err(RymeError::Forbidden)
+        }
+    }
+
     fn enforce_statement_privileges(&self, statement: &Statement) -> Result<()> {
         if self.role_is_superuser() {
             return Ok(());
+        }
+        if let Statement::SequenceValue { operation, name, .. } = statement {
+            self.enforce_sequence_privilege(*operation, name)?;
         }
         if statement.is_schema_change() {
             return Err(RymeError::Forbidden);
@@ -16514,6 +16562,69 @@ mod tests {
                 && grant.privilege == "SELECT"
                 && grant.grantee == "authenticated"
         }));
+    }
+
+    #[tokio::test]
+    async fn sequence_operations_require_sequence_privileges() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE SEQUENCE public.events_id_seq START WITH 10").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE public.events (id BIGINT PRIMARY KEY DEFAULT nextval('public.events_id_seq'::regclass), body TEXT)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor.execute(parse("CREATE ROLE app_writer LOGIN").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT INSERT ON TABLE public.events TO app_writer").unwrap())
+            .await
+            .unwrap();
+
+        let writer = executor.clone().with_role(String::from("app_writer"));
+        assert!(matches!(
+            writer
+                .execute(parse("SELECT nextval('public.events_id_seq'::regclass)").unwrap())
+                .await,
+            Err(RymeError::Forbidden)
+        ));
+        assert!(matches!(
+            writer
+                .execute(parse("INSERT INTO public.events (body) VALUES ('blocked')").unwrap())
+                .await,
+            Err(RymeError::Forbidden)
+        ));
+
+        executor
+            .execute(parse("GRANT USAGE ON SEQUENCE public.events_id_seq TO app_writer").unwrap())
+            .await
+            .unwrap();
+        writer
+            .execute(parse("INSERT INTO public.events (body) VALUES ('allowed')").unwrap())
+            .await
+            .unwrap();
+        assert!(writer
+            .execute(parse("SELECT currval('public.events_id_seq')").unwrap())
+            .await
+            .is_ok());
+        assert!(matches!(
+            writer.execute(parse("SELECT setval('public.events_id_seq', 99)").unwrap()).await,
+            Err(RymeError::Forbidden)
+        ));
+
+        executor
+            .execute(parse("GRANT UPDATE ON SEQUENCE public.events_id_seq TO app_writer").unwrap())
+            .await
+            .unwrap();
+        assert!(writer
+            .execute(parse("SELECT setval('public.events_id_seq', 99)").unwrap())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
