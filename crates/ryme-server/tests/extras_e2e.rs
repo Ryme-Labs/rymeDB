@@ -510,7 +510,14 @@ async fn extras_branch_lifecycle_and_billing() {
     let (status, _) = http_request(
         http,
         "POST /v1/branches",
-        b"{\"id\":\"preview-9\",\"parent\":\"main\",\"base_commit_ts\":3}",
+        b"{\"id\":\"future\",\"parent\":\"main\",\"base_commit_ts\":18446744073709551615}",
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/branches",
+        b"{\"id\":\"preview-9\",\"parent\":\"main\",\"base_commit_ts\":1}",
     )
     .await;
     assert_eq!(status, 200);
@@ -523,14 +530,21 @@ async fn extras_branch_lifecycle_and_billing() {
     assert!(String::from_utf8_lossy(&body).contains("preview-9"));
     assert_eq!(http_status_no_auth(http, "GET /v1/branches/preview-9").await, 401);
     assert_eq!(http_status_no_auth(http, "GET /v1/branches").await, 401);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/branches/preview-9/reset",
+        b"{\"base_commit_ts\":18446744073709551615}",
+    )
+    .await;
+    assert_eq!(status, 400);
     let (status, body) =
         http_request(http, "GET /v1/branches/preview-9/diff?against=main", b"").await;
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&body).contains("only_left"));
     let (status, body) =
-        http_request(http, "POST /v1/branches/preview-9/reset", b"{\"base_commit_ts\":9}").await;
+        http_request(http, "POST /v1/branches/preview-9/reset", b"{\"base_commit_ts\":1}").await;
     assert_eq!(status, 200);
-    assert!(String::from_utf8_lossy(&body).contains('9'));
+    assert!(String::from_utf8_lossy(&body).contains('1'));
     let (status, body) = http_request(http, "POST /v1/branches/preview-9/promote", b"").await;
     assert_eq!(status, 200);
     assert!(String::from_utf8_lossy(&body).contains("main"));

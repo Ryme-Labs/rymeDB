@@ -2385,12 +2385,18 @@ components:
           type: string
         base_commit_ts:
           type: integer
+          minimum: 0
+          format: int64
+          description: "Snapshot commit watermark; 0 means current and nonzero values cannot be in the future."
     BranchResetRequest:
       type: object
       required: [base_commit_ts]
       properties:
         base_commit_ts:
           type: integer
+          minimum: 0
+          format: int64
+          description: "Snapshot commit watermark; 0 means current and nonzero values cannot be in the future."
     CheckpointRequest:
       type: object
       properties:

@@ -1112,6 +1112,16 @@ pub struct BranchRequest {
     pub base_commit_ts: u64,
 }
 
+fn resolve_branch_base_commit(state: &SharedState, requested: u64) -> ryme_error::Result<u64> {
+    let latest = state.backend.latest_commit();
+    if requested > latest {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "base_commit_ts",
+        )));
+    }
+    Ok(if requested == 0 { latest } else { requested })
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CheckpointRequest {
     pub manifest_id: Option<String>,
@@ -8111,6 +8121,10 @@ async fn branch_create(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let base_commit_ts = match resolve_branch_base_commit(&state, request.base_commit_ts) {
+        Ok(commit) => commit,
+        Err(error) => return error_response(error),
+    };
     let mut control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
@@ -8129,11 +8143,6 @@ async fn branch_create(
             return error_response(e);
         }
     }
-    let base_commit_ts = if request.base_commit_ts == 0 {
-        state.backend.latest_commit()
-    } else {
-        request.base_commit_ts
-    };
     let parent_schema = if request.parent == "main" {
         state.executor.schema_snapshot()
     } else {
@@ -8268,16 +8277,15 @@ async fn branch_reset(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let base_commit_ts = match resolve_branch_base_commit(&state, request.base_commit_ts) {
+        Ok(commit) => commit,
+        Err(error) => return error_response(error),
+    };
     let mut control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     let mut branches = control.branches.clone();
-    let base_commit_ts = if request.base_commit_ts == 0 {
-        state.backend.latest_commit()
-    } else {
-        request.base_commit_ts
-    };
     match branches.reset_for(&principal.tenant, &id, base_commit_ts) {
         Ok(branch) => match branches.persist(&state.branch_path) {
             Ok(()) => {
