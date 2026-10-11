@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 mod segment;
@@ -262,6 +262,38 @@ impl Engine {
         table: &str,
         rows: TableRows,
     ) -> Result<u64> {
+        // Validate every key's incoming history before changing the engine. A
+        // malformed later row must not leave an earlier part of the import
+        // visible to readers.
+        let mut histories: BTreeMap<RecordKey, (Option<u64>, BTreeSet<u64>)> = BTreeMap::new();
+        for (pk, versions) in &rows {
+            let key = RecordKey {
+                tenant: tenant.to_string(),
+                database: database.to_string(),
+                table: table.to_string(),
+                pk: pk.clone(),
+            };
+            let (last, known) = histories.entry(key.clone()).or_insert_with(|| {
+                let existing = self.inner.get(&key);
+                (
+                    existing.and_then(|versions| versions.last().map(|version| version.commit_ts)),
+                    existing
+                        .into_iter()
+                        .flat_map(|versions| versions.iter().map(|version| version.commit_ts))
+                        .collect(),
+                )
+            });
+            for version in versions {
+                if !known.insert(version.commit_ts) {
+                    continue;
+                }
+                if last.is_some_and(|last| version.commit_ts < last) {
+                    return Err(RymeError::Corrupt(String::from("version order")));
+                }
+                *last = Some(version.commit_ts);
+            }
+        }
+
         let mut max = 0u64;
         for (pk, versions) in rows {
             let key = RecordKey {
@@ -731,6 +763,44 @@ mod tests {
         assert_eq!(engine.purge_keys(&[purged.clone(), purged]), 1);
         assert_eq!(engine.bytes_held(), b"retain".len() as u64);
         assert_eq!(engine.read(&retained, 4, 0).unwrap(), Some(b"retain".to_vec()));
+    }
+
+    #[test]
+    fn failed_table_import_does_not_apply_a_prefix_of_rows() {
+        let mut engine = Engine::new();
+        let existing = RecordKey::new("t", "d", "users", b"existing");
+        let earlier_batch_row = RecordKey::new("t", "d", "users", b"new");
+        engine.apply(existing.clone(), 5, Some(b"original".to_vec())).unwrap();
+        let bytes_before = engine.bytes_held();
+
+        let result = engine.import_table(
+            "t",
+            "d",
+            "users",
+            vec![
+                (
+                    b"new".to_vec(),
+                    vec![TableVersion {
+                        commit_ts: 7,
+                        value: Some(b"would-have-been-imported".to_vec()),
+                        expires_at: 0,
+                    }],
+                ),
+                (
+                    b"existing".to_vec(),
+                    vec![TableVersion {
+                        commit_ts: 4,
+                        value: Some(b"stale".to_vec()),
+                        expires_at: 0,
+                    }],
+                ),
+            ],
+        );
+
+        assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        assert_eq!(engine.read(&earlier_batch_row, 7, 0).unwrap(), None);
+        assert_eq!(engine.read(&existing, 5, 0).unwrap(), Some(b"original".to_vec()));
+        assert_eq!(engine.bytes_held(), bytes_before);
     }
 
     #[test]
