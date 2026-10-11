@@ -9018,7 +9018,7 @@ where
                             self.enforce_checks(&child_table, &child_pk, &after)?;
                             self.enforce_foreign_keys_async(txn, &child_table, &child_pk, &after)
                                 .await?;
-                            self.check_unique(&child_table, &child_pk, &after)?;
+                            self.check_unique(txn, &child_table, &child_pk, &after)?;
                             self.manager.put(
                                 txn,
                                 RecordKey::new(
@@ -9142,7 +9142,7 @@ where
                     self.enforce_checks(&child_table, &child_pk, &child_after)?;
                     self.enforce_foreign_keys_async(txn, &child_table, &child_pk, &child_after)
                         .await?;
-                    self.check_unique(&child_table, &child_pk, &child_after)?;
+                    self.check_unique(txn, &child_table, &child_pk, &child_after)?;
                     self.manager.put(
                         txn,
                         RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
@@ -9594,7 +9594,7 @@ where
             self.enforce_rls(&table, &after)?;
             self.enforce_checks(&table, &new_pk, &after)?;
             self.enforce_foreign_keys_async(txn, &table, &new_pk, &after).await?;
-            self.check_unique_excluding(&table, &new_pk, &after, Some(&pk))?;
+            self.check_unique_excluding(txn, &table, &new_pk, &after, Some(&pk))?;
             if new_pk != pk
                 && self
                     .manager
@@ -10016,12 +10016,19 @@ where
         Ok(())
     }
 
-    fn check_unique(&self, table: &str, pk: &[u8], value: &[u8]) -> Result<()> {
-        self.check_unique_excluding(table, pk, value, None)
+    fn check_unique(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        pk: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        self.check_unique_excluding(txn, table, pk, value, None)
     }
 
     fn check_unique_excluding(
         &self,
+        txn: &mut Transaction,
         table: &str,
         pk: &[u8],
         value: &[u8],
@@ -10031,6 +10038,9 @@ where
         let indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
+        if table_indexes.iter().any(|state| state.definition.unique) {
+            txn.record_constraint_scan(&self.tenant, &self.database, table);
+        }
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
             if state
@@ -12346,7 +12356,7 @@ where
                 if before.is_some() {
                     return Err(RymeError::Conflict(String::from("exists")));
                 }
-                self.check_unique(&table, &pk, &value)?;
+                self.check_unique(txn, &table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
                 Ok((
                     QueryResult::Ok,
@@ -12370,7 +12380,7 @@ where
                 if self.manager.get_async(txn, &key).await?.is_some() {
                     return Ok((QueryResult::Ok, Vec::new()));
                 }
-                if let Err(error) = self.check_unique(&table, &pk, &value) {
+                if let Err(error) = self.check_unique(txn, &table, &pk, &value) {
                     if matches!(error, RymeError::Conflict(_)) {
                         return Ok((QueryResult::Ok, Vec::new()));
                     }
@@ -12422,7 +12432,7 @@ where
                 if let Some(before) = before.as_deref() {
                     self.enforce_rls(&table, before)?;
                 }
-                self.check_unique(&table, &pk, &value)?;
+                self.check_unique(txn, &table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
                 let mut changes = Vec::new();
                 if let Some(before_value) = before.as_deref() {
@@ -12473,7 +12483,7 @@ where
                     self.enforce_rls(&table, &after)?;
                     self.enforce_checks(&table, &new_pk, &after)?;
                     self.enforce_foreign_keys_async(txn, &table, &new_pk, &after).await?;
-                    self.check_unique_excluding(&table, &new_pk, &after, Some(&pk))?;
+                    self.check_unique_excluding(txn, &table, &new_pk, &after, Some(&pk))?;
                     if new_pk != pk
                         && self
                             .manager
@@ -12553,7 +12563,7 @@ where
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
-                self.check_unique_excluding(&table, &new_pk, &value, Some(&pk))?;
+                self.check_unique_excluding(txn, &table, &new_pk, &value, Some(&pk))?;
                 if new_pk != pk
                     && self
                         .manager
@@ -14640,7 +14650,7 @@ where
                 if before.is_some() {
                     return Err(RymeError::Conflict(String::from("exists")));
                 }
-                self.check_unique(&table, &pk, &value)?;
+                self.check_unique(&mut txn, &table, &pk, &value)?;
                 let after = self.realtime.as_ref().map(|_| value.clone());
                 self.manager.put(&mut txn, key, value.clone());
                 let commit_ts = self.manager.commit(txn).await?;
@@ -18375,6 +18385,47 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_unique_inserts_conflict_at_commit() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE profiles (id TEXT PRIMARY KEY, email TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("CREATE UNIQUE INDEX profiles_email_unique ON profiles (email)").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut first = executor.begin_transaction(Isolation::Snapshot);
+        let mut second = executor.begin_transaction(Isolation::Snapshot);
+        let (_, first_changes) = executor
+            .execute_in_transaction(
+                &mut first,
+                parse("INSERT INTO profiles (id, email) VALUES ('p1', 'same@example.com')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, second_changes) = executor
+            .execute_in_transaction(
+                &mut second,
+                parse("INSERT INTO profiles (id, email) VALUES ('p2', 'same@example.com')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            executor.commit_transaction(first, first_changes),
+            executor.commit_transaction(second, second_changes),
+        );
+        assert_eq!(first_result.is_ok() as usize + second_result.is_ok() as usize, 1);
+        assert!(matches!(first_result.or(second_result), Err(RymeError::Conflict(_))));
     }
 
     #[tokio::test]

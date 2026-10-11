@@ -286,6 +286,7 @@ pub struct Transaction {
     read_set: BTreeSet<RecordKey>,
     observed: BTreeMap<RecordKey, bool>,
     scanned: BTreeSet<(String, String, String)>,
+    constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
     route_generation: Option<u64>,
     #[allow(dead_code)]
@@ -299,6 +300,8 @@ pub struct TransactionState {
     pub read_set: Vec<RecordKey>,
     pub observed: Vec<(RecordKey, bool)>,
     pub scanned: Vec<(String, String, String)>,
+    #[serde(default)]
+    pub constraint_scanned: Vec<(String, String, String)>,
     pub isolation: Isolation,
     #[serde(default)]
     pub route_generation: Option<u64>,
@@ -311,6 +314,7 @@ pub struct TransactionCheckpoint {
     read_set: BTreeSet<RecordKey>,
     observed: BTreeMap<RecordKey, bool>,
     scanned: BTreeSet<(String, String, String)>,
+    constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
     route_generation: Option<u64>,
 }
@@ -323,6 +327,7 @@ impl Transaction {
             read_set: self.read_set.clone(),
             observed: self.observed.clone(),
             scanned: self.scanned.clone(),
+            constraint_scanned: self.constraint_scanned.clone(),
             isolation: self.isolation,
             route_generation: self.route_generation,
         }
@@ -335,6 +340,7 @@ impl Transaction {
             read_set: self.read_set.iter().cloned().collect(),
             observed: self.observed.iter().map(|(key, value)| (key.clone(), *value)).collect(),
             scanned: self.scanned.iter().cloned().collect(),
+            constraint_scanned: self.constraint_scanned.iter().cloned().collect(),
             isolation: self.isolation,
             route_generation: self.route_generation,
         }
@@ -346,6 +352,7 @@ impl Transaction {
         self.read_set.clone_from(&checkpoint.read_set);
         self.observed.clone_from(&checkpoint.observed);
         self.scanned.clone_from(&checkpoint.scanned);
+        self.constraint_scanned.clone_from(&checkpoint.constraint_scanned);
         self.isolation = checkpoint.isolation;
         self.route_generation = checkpoint.route_generation;
         self.pin.active.insert(self.id, self.read_ts);
@@ -387,6 +394,14 @@ impl Transaction {
 
     pub fn record_scan(&mut self, tenant: &str, database: &str, table: &str) {
         self.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+    }
+
+    pub fn record_constraint_scan(&mut self, tenant: &str, database: &str, table: &str) {
+        self.constraint_scanned.insert((
+            tenant.to_string(),
+            database.to_string(),
+            table.to_string(),
+        ));
     }
 
     pub fn scanned_tables(&self) -> &BTreeSet<(String, String, String)> {
@@ -678,6 +693,7 @@ impl TxnManager {
             read_set: BTreeSet::new(),
             observed: BTreeMap::new(),
             scanned: BTreeSet::new(),
+            constraint_scanned: BTreeSet::new(),
             isolation: Isolation::Serializable,
             route_generation: None,
             pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
@@ -695,6 +711,7 @@ impl TxnManager {
             read_set: state.read_set.into_iter().collect(),
             observed: state.observed.into_iter().collect(),
             scanned: state.scanned.into_iter().collect(),
+            constraint_scanned: state.constraint_scanned.into_iter().collect(),
             isolation: state.isolation,
             route_generation: state.route_generation,
             pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
@@ -839,6 +856,14 @@ impl TxnManager {
                 }
             }
         }
+        for table in txn.constraint_scanned.iter() {
+            let conflict = committed.by_table.get(table).is_some_and(|timestamps| {
+                timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
+            });
+            if conflict {
+                return Err(RymeError::Conflict(String::from("constraint conflict")));
+            }
+        }
         let pending = self
             .inner
             .pending
@@ -853,7 +878,12 @@ impl TxnManager {
                             key.tenant == table.0 && key.database == table.1 && key.table == table.2
                         })
                     }));
-            if write_conflict || read_conflict {
+            let constraint_conflict = txn.constraint_scanned.iter().any(|table| {
+                writes.iter().any(|key| {
+                    key.tenant == table.0 && key.database == table.1 && key.table == table.2
+                })
+            });
+            if write_conflict || read_conflict || constraint_conflict {
                 return Err(RymeError::Conflict(String::from("pending commit conflict")));
             }
         }
