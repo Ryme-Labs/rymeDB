@@ -60,6 +60,7 @@ impl Wal {
     pub fn read_all(dir: &Path) -> Result<Vec<WalRecord>> {
         let mut ids = segment_ids(dir)?;
         ids.sort_unstable();
+        let latest_id = ids.last().copied();
         let mut out = Vec::new();
         for id in ids {
             let path = dir.join(segment_name(id));
@@ -73,7 +74,8 @@ impl Wal {
                         cursor = &cursor[consumed..];
                         out.push(record);
                     }
-                    None => break,
+                    None if Some(id) == latest_id => break,
+                    None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
                 }
             }
         }
@@ -229,7 +231,14 @@ fn recover_next_lsn(active: &mut File) -> Result<u64> {
                 cursor = &cursor[consumed..];
                 max = Some(record.lsn);
             }
-            None => break,
+            None => {
+                let valid_len = raw.len() - cursor.len();
+                if valid_len < raw.len() {
+                    active.set_len(valid_len as u64)?;
+                    active.sync_data()?;
+                }
+                break;
+            }
         }
     }
     active.seek(SeekFrom::End(0))?;
@@ -369,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_tail_recovers_prefix() {
+    fn torn_tail_is_removed_before_new_appends() {
         let dir =
             std::env::temp_dir().join(format!("ryme-wal-torn-{}-{}", std::process::id(), now_ms()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -384,8 +393,37 @@ mod tests {
         let records = Wal::read_all(&dir).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].payload, b"first");
-        let reopened = Wal::open(&dir, 1024 * 1024).unwrap();
+        let mut reopened = Wal::open(&dir, 1024 * 1024).unwrap();
         assert_eq!(reopened.next_lsn(), 1);
+        reopened.append(3, b"after-recovery").unwrap();
+        reopened.sync().unwrap();
+        drop(reopened);
+        let records = Wal::read_all(&dir).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].payload, b"first");
+        assert_eq!(records[1].payload, b"after-recovery");
+        assert_eq!(records[1].lsn, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn torn_non_active_segment_is_corruption() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-torn-sealed-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 64).unwrap();
+        wal.append(1, b"first").unwrap();
+        wal.append(2, b"second").unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+
+        let sealed = dir.join("seg-00000000000000000000.wal");
+        let raw = std::fs::read(&sealed).unwrap();
+        std::fs::write(&sealed, &raw[..raw.len() - 1]).unwrap();
+        assert!(matches!(Wal::read_all(&dir), Err(RymeError::Corrupt(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
