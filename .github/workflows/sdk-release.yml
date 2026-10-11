@@ -199,6 +199,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -219,7 +220,7 @@ jobs:
           shopt -s nullglob
           packages=("$RUNNER_TEMP/npm/"*.tgz)
           test "${#packages[@]}" -eq 1
-          npm publish "${packages[0]}" --access public
+          npm publish "${packages[0]}" --access public --provenance
 
   publish-cargo:
     name: Publish Rust SDK

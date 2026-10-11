@@ -27,13 +27,17 @@ repository configuration values:
 - `GITHUB_TOKEN`: supplied by Actions for GitHub Packages and release uploads
 
 Java packages are published to the repository's GitHub Maven registry. npm
-and Cargo packages are published to their public registries. The Java job
+and Cargo packages are published to their public registries. npm releases use
+GitHub's OIDC provenance attestation. The Java job
 stages its tested POM and JARs into a flat artifact before publishing, so the
 publish job cannot accidentally rebuild or select an untested package. A
 manual run can set the `publish` input when a tag is not being pushed.
 
 The Pages builder and release workflow fail if `sdks/` contains anything other
 than `java`, `js` (npm), and `rust`, keeping the supported SDK surface explicit.
+Pages deploys only from the repository default branch; pull requests and
+manual builds still run the complete site validation without publishing a
+deployment.
 
 The realtime SDK guides are generated into the Pages site from those three
 README files, including the sequence-based reconnect APIs for table streams.

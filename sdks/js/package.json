@@ -10,6 +10,10 @@
     "directory": "sdks/js"
   },
   "homepage": "https://ryme-labs.github.io/rymeDB/",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "files": [
     "dist",
     "README.md"
