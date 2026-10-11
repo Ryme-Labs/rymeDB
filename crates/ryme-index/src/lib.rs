@@ -29,6 +29,9 @@ struct VectorSpace {
 }
 
 fn normalize(vector: &[f32]) -> Result<Vec<f32>> {
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(RymeError::InvalidArgument(String::from("non-finite vector value")));
+    }
     let norm = (vector.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
     if norm == 0.0 {
         return Err(RymeError::InvalidArgument(String::from("zero vector")));
@@ -308,6 +311,9 @@ impl VectorSpace {
     fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>> {
         if query.len() != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
+        }
+        if query.iter().any(|value| !value.is_finite()) {
+            return Err(RymeError::InvalidArgument(String::from("non-finite vector value")));
         }
         let norm = (query.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
         if norm == 0.0 {
@@ -705,6 +711,20 @@ mod tests {
         assert!(registry.vector_upsert("s", String::from("c"), vec![0.0, 0.0]).is_err());
         assert!(registry.vector_search("s", &[1.0], 1).is_err());
         assert!(registry.vector_search("missing", &[1.0, 0.0], 1).is_err());
+    }
+
+    #[test]
+    fn vector_operations_reject_non_finite_values() {
+        let mut registry = IndexRegistry::new();
+        for (index, value) in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY].into_iter().enumerate() {
+            assert!(registry.vector_upsert("s", format!("bad-{index}"), vec![value, 1.0]).is_err());
+        }
+        registry.vector_upsert("s", String::from("valid"), vec![1.0, 0.0]).unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(registry.vector_search("s", &[value, 0.0], 1).is_err());
+            assert!(registry.ann_search("s", &[value, 0.0], 1, 16).is_err());
+        }
+        assert_eq!(registry.vector_search("s", &[1.0, 0.0], 1).unwrap()[0].id, "valid");
     }
 
     #[test]
