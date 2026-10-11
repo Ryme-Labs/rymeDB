@@ -1,5 +1,9 @@
 # Changelog
 
+- Distributed transaction coordinators now persist a range-quorum marker
+  before preparing participants. Restart recovery aborts unresolved prepares
+  when no commit decision exists, preventing coordinator crashes from leaving
+  range intents permanently blocked.
 - Multi-owner transactions now persist their commit decision in a coordinator
   range quorum instead of the global data log. Each range resolves and
   materializes only its local prepared writes, with range-WAL recovery and

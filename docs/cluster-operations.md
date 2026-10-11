@@ -264,6 +264,10 @@ own range quorum. Commit/abort resolution is also a committed range record,
 and unresolved records are recovered from the range WAL on participant
 restart. A committed resolution applies only that participant's prepared
 write set, so each range materializes its own portion of the transaction.
+Before preparing participants, the coordinator persists a coordination marker
+in its range quorum. If a node restarts after prepares but before a decision,
+recovery appends an abort decision and drives cleanup; a committed decision
+always takes precedence when one is already present.
 Prepared intents also reserve their conflict set: ordinary local or
 range-local commits that overlap a prepared transaction are rejected until the
 coordinator resolves it. This prevents a fast path from bypassing the

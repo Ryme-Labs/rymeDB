@@ -165,6 +165,16 @@ pub(crate) enum Rpc {
         recorded: bool,
         error: Option<RpcError>,
     },
+    RangeCoordinateTransaction {
+        group_id: String,
+        transaction_id: u128,
+        commit_ts: u64,
+        participants: Vec<ResolutionParticipant>,
+    },
+    RangeCoordinateTransactionResponse {
+        recorded: bool,
+        error: Option<RpcError>,
+    },
     RangeVoteRequest {
         group_id: String,
         term: u64,
@@ -332,6 +342,7 @@ pub(crate) enum RangeEntryKind {
     Prepare { transaction_id: u128, state: Vec<u8> },
     Resolve { transaction_id: u128, committed: bool },
     Decision { transaction_id: u128, committed: bool, participants: Vec<ResolutionParticipant> },
+    Coordinate { transaction_id: u128, participants: Vec<ResolutionParticipant> },
 }
 
 impl Default for RangeEntryKind {
@@ -392,6 +403,14 @@ struct PendingRangeDecision {
     transaction_id: u128,
     commit_ts: u64,
     committed: bool,
+    participants: Vec<ResolutionParticipant>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRangeCoordination {
+    group_id: String,
+    transaction_id: u128,
+    commit_ts: u64,
     participants: Vec<ResolutionParticipant>,
 }
 
@@ -856,6 +875,8 @@ pub struct Node {
     resolution_wal: std::sync::Mutex<Wal>,
     range_prepared: std::sync::Mutex<BTreeMap<(String, u128), PreparedIntent>>,
     range_decisions: std::sync::Mutex<BTreeMap<(String, u128, u64), PendingRangeDecision>>,
+    range_recovery_coordinations:
+        std::sync::Mutex<BTreeMap<(String, u128, u64), PendingRangeCoordination>>,
     range_logs: std::sync::Mutex<BTreeMap<String, u64>>,
     range_entries: std::sync::Mutex<BTreeMap<String, BTreeMap<u64, RangeLogRecord>>>,
     range_groups: std::sync::Mutex<BTreeMap<String, RangeGroupState>>,
@@ -1100,6 +1121,7 @@ impl Node {
         let mut range_entries: BTreeMap<String, BTreeMap<u64, RangeLogRecord>> = BTreeMap::new();
         let mut range_prepared = BTreeMap::new();
         let mut range_decisions = BTreeMap::new();
+        let mut range_recovery_coordinations = BTreeMap::new();
         for range_record in range_records {
             let group_id = range_record.group_id.clone();
             range_entries
@@ -1153,6 +1175,11 @@ impl Node {
                         }
                     }
                     RangeEntryKind::Decision { transaction_id, committed, participants } => {
+                        range_recovery_coordinations.remove(&(
+                            group_id.clone(),
+                            *transaction_id,
+                            record.commit_ts,
+                        ));
                         range_decisions.insert(
                             (group_id.clone(), *transaction_id, record.commit_ts),
                             PendingRangeDecision {
@@ -1160,6 +1187,17 @@ impl Node {
                                 transaction_id: *transaction_id,
                                 commit_ts: record.commit_ts,
                                 committed: *committed,
+                                participants: participants.clone(),
+                            },
+                        );
+                    }
+                    RangeEntryKind::Coordinate { transaction_id, participants } => {
+                        range_recovery_coordinations.insert(
+                            (group_id.clone(), *transaction_id, record.commit_ts),
+                            PendingRangeCoordination {
+                                group_id: group_id.clone(),
+                                transaction_id: *transaction_id,
+                                commit_ts: record.commit_ts,
                                 participants: participants.clone(),
                             },
                         );
@@ -1231,6 +1269,7 @@ impl Node {
             resolution_wal: std::sync::Mutex::new(resolution_wal),
             range_prepared: std::sync::Mutex::new(range_prepared),
             range_decisions: std::sync::Mutex::new(range_decisions),
+            range_recovery_coordinations: std::sync::Mutex::new(range_recovery_coordinations),
             range_logs: std::sync::Mutex::new(range_logs),
             range_entries: std::sync::Mutex::new(range_entries),
             range_groups: std::sync::Mutex::new(range_groups),
@@ -2421,6 +2460,26 @@ impl Node {
                     }),
                 }
             }
+            Rpc::RangeCoordinateTransaction {
+                group_id,
+                transaction_id,
+                commit_ts,
+                participants,
+            } => {
+                let _commit = self.txn_commit_lock.lock().await;
+                match self
+                    .record_range_coordination(&group_id, transaction_id, commit_ts, participants)
+                    .await
+                {
+                    Ok(()) => {
+                        Ok(Rpc::RangeCoordinateTransactionResponse { recorded: true, error: None })
+                    }
+                    Err(error) => Ok(Rpc::RangeCoordinateTransactionResponse {
+                        recorded: false,
+                        error: Some(error.into()),
+                    }),
+                }
+            }
             Rpc::RangeVoteRequest { group_id, term, candidate, last_term, last_index } => {
                 let (term, granted) =
                     self.handle_range_vote(&group_id, term, candidate, last_term, last_index);
@@ -2622,6 +2681,9 @@ impl Node {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
             Rpc::RangeDecisionTransactionResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
+            Rpc::RangeCoordinateTransactionResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
             Rpc::RangeVoteResponse { .. } => {
@@ -3181,6 +3243,19 @@ impl Node {
         committed: bool,
         participants: Vec<ResolutionParticipant>,
     ) -> Result<()> {
+        let key = (group_id.to_string(), transaction_id, commit_ts);
+        if let Some(existing) = self
+            .range_decisions
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range decisions")))?
+            .get(&key)
+            .cloned()
+        {
+            if existing.committed == committed && existing.participants == participants {
+                return Ok(());
+            }
+            return Err(RymeError::Conflict(String::from("transaction decision changed")));
+        }
         let range = self
             .range_owner_by_id(group_id)
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
@@ -3191,6 +3266,27 @@ impl Node {
             group_id,
             commit_ts,
             RangeEntryKind::Decision { transaction_id, committed, participants },
+        )
+        .await
+    }
+
+    async fn record_range_coordination(
+        self: &Arc<Self>,
+        group_id: &str,
+        transaction_id: u128,
+        commit_ts: u64,
+        participants: Vec<ResolutionParticipant>,
+    ) -> Result<()> {
+        let range = self
+            .range_owner_by_id(group_id)
+            .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
+        if range.owner != self.id {
+            return Err(RymeError::Unavailable(String::from("not range leader")));
+        }
+        self.commit_range_record(
+            group_id,
+            commit_ts,
+            RangeEntryKind::Coordinate { transaction_id, participants },
         )
         .await
     }
@@ -3235,6 +3331,61 @@ impl Node {
                             error: Some(error), ..
                         }) => Err(error.into()),
                         Ok(_) => Err(RymeError::Corrupt(String::from("range decision rpc"))),
+                        Err(error) => Err(error),
+                    },
+                    None => {
+                        Err(RymeError::Unavailable(String::from("range participant unavailable")))
+                    }
+                }
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < 2 && matches!(&error, RymeError::Unavailable(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(RymeError::Unavailable(String::from("range participant unavailable")))
+    }
+
+    async fn record_range_coordination_on(
+        self: &Arc<Self>,
+        group_id: &str,
+        owner: usize,
+        transaction_id: u128,
+        commit_ts: u64,
+        participants: Vec<ResolutionParticipant>,
+    ) -> Result<()> {
+        for attempt in 0..3 {
+            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let result = if owner == self.id {
+                self.record_range_coordination(
+                    group_id,
+                    transaction_id,
+                    commit_ts,
+                    participants.clone(),
+                )
+                .await
+            } else {
+                match self.pool_for(owner) {
+                    Some(pool) => match pool
+                        .roundtrip(&Rpc::RangeCoordinateTransaction {
+                            group_id: group_id.to_string(),
+                            transaction_id,
+                            commit_ts,
+                            participants: participants.clone(),
+                        })
+                        .await
+                    {
+                        Ok(Rpc::RangeCoordinateTransactionResponse {
+                            recorded: true,
+                            error: None,
+                        }) => Ok(()),
+                        Ok(Rpc::RangeCoordinateTransactionResponse {
+                            error: Some(error), ..
+                        }) => Err(error.into()),
+                        Ok(_) => Err(RymeError::Corrupt(String::from("range coordination rpc"))),
                         Err(error) => Err(error),
                     },
                     None => {
@@ -3554,6 +3705,10 @@ impl Node {
                     }
                 }
                 RangeEntryKind::Decision { transaction_id, committed, participants } => {
+                    self.range_recovery_coordinations
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("range recoveries")))?
+                        .remove(&(group_id.to_string(), transaction_id, record.commit_ts));
                     self.range_decisions
                         .lock()
                         .map_err(|_| RymeError::Internal(String::from("range decisions")))?
@@ -3568,6 +3723,7 @@ impl Node {
                             },
                         );
                 }
+                RangeEntryKind::Coordinate { .. } => {}
             }
         }
         {
@@ -4187,7 +4343,43 @@ impl Node {
                 }
             }
         }
+        self.recover_pending_range_coordinations().await;
         self.retry_pending_range_decisions().await;
+    }
+
+    fn pending_range_coordinations_snapshot(&self) -> Vec<PendingRangeCoordination> {
+        self.range_recovery_coordinations
+            .lock()
+            .map(|coordinations| coordinations.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    async fn recover_pending_range_coordinations(self: &Arc<Self>) {
+        for coordination in self.pending_range_coordinations_snapshot() {
+            let Some(range) = self.range_owner_by_id(&coordination.group_id) else {
+                continue;
+            };
+            if range.owner != self.id {
+                continue;
+            }
+            if let Err(error) = self
+                .record_range_decision(
+                    &coordination.group_id,
+                    coordination.transaction_id,
+                    coordination.commit_ts,
+                    false,
+                    coordination.participants.clone(),
+                )
+                .await
+            {
+                tracing::error!(
+                    transaction_id = coordination.transaction_id,
+                    commit_ts = coordination.commit_ts,
+                    %error,
+                    "range transaction recovery abort failed"
+                );
+            }
+        }
     }
 
     fn pending_range_decisions_snapshot(&self) -> Vec<PendingRangeDecision> {
@@ -4301,6 +4493,20 @@ impl Node {
                 group_id: group_id.clone(),
             })
             .collect::<Vec<_>>();
+        let (coordinator_group, coordinator_owner) = decision_participants
+            .first()
+            .map(|participant| (participant.group_id.clone(), participant.participant))
+            .ok_or_else(|| {
+                RymeError::Internal(String::from("distributed transaction coordinator"))
+            })?;
+        self.record_range_coordination_on(
+            &coordinator_group,
+            coordinator_owner,
+            transaction_id,
+            commit_ts,
+            decision_participants.clone(),
+        )
+        .await?;
         for (group_id, range) in &participants {
             match self
                 .prepare_on(group_id, range.owner, transaction_id, commit_ts, state.clone())
@@ -4316,17 +4522,29 @@ impl Node {
                     ) {
                         tracing::error!(transaction_id, commit_ts, %queue_error, "transaction abort resolution queue failed");
                     }
+                    if let Err(decision_error) = self
+                        .record_range_decision_on(
+                            &coordinator_group,
+                            coordinator_owner,
+                            transaction_id,
+                            commit_ts,
+                            false,
+                            decision_participants.clone(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            transaction_id,
+                            commit_ts,
+                            %decision_error,
+                            "transaction abort decision recovery left pending"
+                        );
+                    }
                     self.retry_pending_resolutions().await;
                     return Err(error);
                 }
             }
         }
-        let (coordinator_group, coordinator_owner) = decision_participants
-            .first()
-            .map(|participant| (participant.group_id.clone(), participant.participant))
-            .ok_or_else(|| {
-                RymeError::Internal(String::from("distributed transaction coordinator"))
-            })?;
         if let Err(error) = self
             .record_range_decision_on(
                 &coordinator_group,
@@ -4338,12 +4556,12 @@ impl Node {
             )
             .await
         {
-            if let Err(queue_error) =
-                self.queue_range_resolutions(transaction_id, commit_ts, &participant_ids, false)
-            {
-                tracing::error!(transaction_id, commit_ts, %queue_error, "transaction abort resolution queue failed");
-            }
-            self.retry_pending_resolutions().await;
+            tracing::error!(
+                transaction_id,
+                commit_ts,
+                %error,
+                "transaction decision is unresolved; coordinator recovery will choose abort"
+            );
             return Err(error);
         }
         if let Err(error) =
@@ -5714,6 +5932,60 @@ mod tests {
         assert_eq!(reopened.manager.get(&mut probe, &left).unwrap(), Some(b"one".to_vec()));
         assert_eq!(reopened.manager.get(&mut probe, &right).unwrap(), Some(b"two".to_vec()));
         assert!(reopened.range_decisions.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovery_aborts_prepared_ranges_without_a_decision() {
+        let dir = temp_dir("range-coordinator-recovery");
+        let configure = |node: &Node| {
+            node.set_range_owners(vec![
+                RangeOwner {
+                    id: String::from("range-a"),
+                    start: Vec::new(),
+                    end: b"m\0".to_vec(),
+                    owner: 0,
+                    replicas: vec![0],
+                    epoch: 1,
+                },
+                RangeOwner {
+                    id: String::from("range-b"),
+                    start: b"m\0".to_vec(),
+                    end: Vec::new(),
+                    owner: 0,
+                    replicas: vec![0],
+                    epoch: 1,
+                },
+            ]);
+        };
+        let left = RecordKey::new("t", "d", "a", b"left");
+        let right = RecordKey::new("t", "d", "z", b"right");
+        let participants = vec![
+            ResolutionParticipant { participant: 0, group_id: String::from("range-a") },
+            ResolutionParticipant { participant: 0, group_id: String::from("range-b") },
+        ];
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            configure(&node);
+            node.record_range_coordination("range-a", 313, 7, participants.clone()).await.unwrap();
+            let mut txn = node.manager.begin();
+            node.manager.put(&mut txn, left.clone(), b"one".to_vec());
+            node.manager.put(&mut txn, right.clone(), b"two".to_vec());
+            node.prepare_range_group("range-a", 313, 7, txn.state()).await.unwrap();
+            node.prepare_range_group("range-b", 313, 7, txn.state()).await.unwrap();
+            assert_eq!(node.range_prepared.lock().unwrap().len(), 2);
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        configure(&reopened);
+        assert_eq!(reopened.range_recovery_coordinations.lock().unwrap().len(), 1);
+        reopened.retry_pending_resolutions().await;
+        assert!(reopened.range_prepared.lock().unwrap().is_empty());
+        assert!(reopened.range_recovery_coordinations.lock().unwrap().is_empty());
+        assert!(reopened.range_decisions.lock().unwrap().is_empty());
+        let mut probe = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut probe, &left).unwrap(), None);
+        assert_eq!(reopened.manager.get(&mut probe, &right).unwrap(), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
