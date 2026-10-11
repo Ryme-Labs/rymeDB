@@ -832,6 +832,7 @@ pub struct OidcConfig {
     pub client_secret: Vec<u8>,
     pub auth_endpoint: String,
     pub client_id: String,
+    pub redirect_uris: Vec<String>,
 }
 
 impl OidcConfig {
@@ -842,6 +843,9 @@ impl OidcConfig {
             || state.is_empty()
         {
             return Err(RymeError::InvalidArgument(String::from("oidc login")));
+        }
+        if !self.redirect_uris.iter().any(|allowed| allowed == redirect_uri) {
+            return Err(RymeError::InvalidArgument(String::from("oidc redirect_uri")));
         }
         let separator = if self.auth_endpoint.contains('?') { '&' } else { '?' };
         Ok(format!(
@@ -1234,6 +1238,10 @@ mod tests {
             client_secret: b"issuer-secret".to_vec(),
             auth_endpoint: String::from("https://auth.rymedb.test/authorize"),
             client_id: String::from("rymedb-app"),
+            redirect_uris: vec![
+                String::from("https://app.test/callback"),
+                String::from("https://app.test/callback?next=/home&state=evil"),
+            ],
         }
     }
 
@@ -1287,6 +1295,7 @@ mod tests {
         ));
         assert!(url.ends_with("&state=x%20y%26z"));
         assert!(!url.contains("&state=evil"));
+        assert!(config.auth_url("https://evil.test/callback", "xyz").is_err());
     }
 
     #[test]

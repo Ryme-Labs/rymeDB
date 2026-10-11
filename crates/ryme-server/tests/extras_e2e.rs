@@ -926,6 +926,7 @@ async fn extras_oidc_flow() {
     std::env::set_var("RYME_OIDC_SECRET", "oidc-e2e-secret");
     std::env::set_var("RYME_OIDC_AUTH_ENDPOINT", "https://auth.rymedb.test/authorize");
     std::env::set_var("RYME_OIDC_CLIENT_ID", "rymedb-app");
+    std::env::set_var("RYME_OIDC_REDIRECT_URIS", "https://app.test/callback");
     let root = std::env::temp_dir().join(format!(
         "ryme-extras-oidc-{}-{}",
         std::process::id(),
@@ -953,6 +954,13 @@ async fn extras_oidc_flow() {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
+    let (status, _) = http_request(
+        http,
+        "POST /v1/auth/oidc/login",
+        b"{\"redirect_uri\":\"https://evil.test/callback\",\"state\":\"s1\"}",
+    )
+    .await;
+    assert_eq!(status, 400);
     let (status, body) = http_request(
         http,
         "POST /v1/auth/oidc/login",
@@ -1000,6 +1008,7 @@ async fn extras_oidc_flow() {
     std::env::remove_var("RYME_OIDC_SECRET");
     std::env::remove_var("RYME_OIDC_AUTH_ENDPOINT");
     std::env::remove_var("RYME_OIDC_CLIENT_ID");
+    std::env::remove_var("RYME_OIDC_REDIRECT_URIS");
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -13,7 +13,7 @@ model supplies a tenant, roles, and capabilities across all gateways.
 | RESP password | `RYME_RESP_PASSWORD` | `AUTH` command; unset means local trust mode |
 | HMAC JWT | `RYME_JWT_SECRET` | HS256 bearer tokens |
 | JWKS JWT | `RYME_JWT_JWKS_FILE` or `RYME_JWT_JWKS_URL` | RS256-style verification from a mounted key set or URL |
-| OIDC | `RYME_OIDC_*` | OIDC login/token helpers and issuer/audience validation |
+| OIDC | `RYME_OIDC_*` | OIDC login/token helpers and issuer/audience validation; configure `RYME_OIDC_REDIRECT_URIS` as a comma-separated exact allowlist |
 | OTP/passkey | REST auth endpoints | Application sign-in and WebAuthn assertions |
 
 For HTTP:
@@ -77,6 +77,10 @@ setup/verify, passkey challenge/register/verify, OIDC login/token, and key
 revocation. The server stores password hashes, API-key digests, refresh-token
 digests, and auth metadata under `data_dir/auth.json`; raw secrets and
 WebAuthn challenges are not written there.
+
+When OIDC is enabled, `RYME_OIDC_REDIRECT_URIS` is required. It must contain
+the exact callback URLs accepted by `/v1/auth/oidc/login`; arbitrary callback
+URLs are rejected.
 
 ## Row-level security
 

@@ -1400,6 +1400,13 @@ impl SharedState {
         let oidc_issuer = std::env::var("RYME_OIDC_ISSUER").ok();
         let oidc_audience = std::env::var("RYME_OIDC_AUDIENCE").ok();
         let oidc_secret = std::env::var("RYME_OIDC_SECRET").ok();
+        let oidc_redirect_uris = std::env::var("RYME_OIDC_REDIRECT_URIS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>();
         let oidc_jwks_path = std::env::var_os("RYME_OIDC_JWKS_FILE")
             .or_else(|| std::env::var_os("RYME_JWT_JWKS_FILE"));
         let oidc_jwks_url = if oidc_jwks_path.is_none() {
@@ -1412,13 +1419,21 @@ impl SharedState {
         let oidc_enabled =
             oidc_secret.is_some() || oidc_jwks_path.is_some() || oidc_jwks_url.is_some();
         let oidc = match (oidc_issuer, oidc_audience) {
-            (Some(issuer), Some(audience)) if oidc_enabled => Some(OidcConfig {
-                issuer,
-                audience,
-                client_secret: oidc_secret.unwrap_or_default().into_bytes(),
-                auth_endpoint: std::env::var("RYME_OIDC_AUTH_ENDPOINT").unwrap_or_default(),
-                client_id: std::env::var("RYME_OIDC_CLIENT_ID").unwrap_or_default(),
-            }),
+            (Some(issuer), Some(audience)) if oidc_enabled => {
+                if oidc_redirect_uris.is_empty() {
+                    return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                        "oidc redirect uris are required",
+                    )));
+                }
+                Some(OidcConfig {
+                    issuer,
+                    audience,
+                    client_secret: oidc_secret.unwrap_or_default().into_bytes(),
+                    auth_endpoint: std::env::var("RYME_OIDC_AUTH_ENDPOINT").unwrap_or_default(),
+                    client_id: std::env::var("RYME_OIDC_CLIENT_ID").unwrap_or_default(),
+                    redirect_uris: oidc_redirect_uris,
+                })
+            }
             (None, None) if !oidc_enabled => None,
             _ if oidc_enabled => {
                 return Err(ryme_error::RymeError::InvalidArgument(String::from(
