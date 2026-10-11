@@ -58,6 +58,8 @@ enum DecodedCopy {
 
 const MAX_PREPARED_STATEMENTS: usize = 256;
 const MAX_PORTALS: usize = 256;
+const MAX_NOTIFICATION_CHANNEL_BYTES: usize = 63;
+const MAX_NOTIFICATION_PAYLOAD_BYTES: usize = 8_000;
 
 struct SessionTransaction {
     txn: Transaction,
@@ -166,6 +168,20 @@ fn notification_sender(tenant: &str, database: &str) -> broadcast::Sender<PgNoti
     let key = (tenant.to_string(), database.to_string());
     let mut channels = PG_NOTIFICATIONS.lock().unwrap_or_else(|error| error.into_inner());
     channels.entry(key).or_insert_with(|| broadcast::channel(1024).0).clone()
+}
+
+fn notification_receiver(tenant: &str, database: &str) -> broadcast::Receiver<PgNotification> {
+    let key = (tenant.to_string(), database.to_string());
+    let mut channels = PG_NOTIFICATIONS.lock().unwrap_or_else(|error| error.into_inner());
+    channels.entry(key).or_insert_with(|| broadcast::channel(1024).0).subscribe()
+}
+
+fn remove_notification_sender(tenant: &str, database: &str) {
+    let key = (tenant.to_string(), database.to_string());
+    let mut channels = PG_NOTIFICATIONS.lock().unwrap_or_else(|error| error.into_inner());
+    if channels.get(&key).is_some_and(|sender| sender.receiver_count() == 0) {
+        channels.remove(&key);
+    }
 }
 
 fn publish_notifications(tenant: &str, database: &str, notifications: &mut Vec<PgNotification>) {
@@ -526,12 +542,14 @@ where
         authenticate_startup(&mut socket, executor, limits, &startup, authenticator.as_ref())
             .await?;
     let (pid, secret, cancellation) = register_backend();
+    let notification_tenant = limits.tenant.clone();
+    let notification_database = limits.database.clone();
     let result = async {
         send_auth_ok(&mut socket).await?;
         send_greeting(&mut socket).await?;
         send_backend_key_data(&mut socket, pid, secret).await?;
         send_ready(&mut socket).await?;
-        let notifications = notification_sender(&limits.tenant, &limits.database).subscribe();
+        let notifications = notification_receiver(&limits.tenant, &limits.database);
         serve_loop(
             socket,
             executor,
@@ -545,6 +563,7 @@ where
         .await
     }
     .await;
+    remove_notification_sender(&notification_tenant, &notification_database);
     unregister_backend(pid, secret);
     result
 }
@@ -1000,8 +1019,7 @@ where
                     ) {
                         out.extend_from_slice(&response);
                         if was_listening_empty && !listening.is_empty() {
-                            notifications =
-                                notification_sender(&limits.tenant, &limits.database).subscribe();
+                            notifications = notification_receiver(&limits.tenant, &limits.database);
                         }
                     } else if let Some(response) = catalog_query(trimmed, &executor) {
                         out.extend_from_slice(&response);
@@ -1017,8 +1035,7 @@ where
                         .await;
                         out.extend_from_slice(&response);
                         if was_listening_empty && !listening.is_empty() {
-                            notifications =
-                                notification_sender(&limits.tenant, &limits.database).subscribe();
+                            notifications = notification_receiver(&limits.tenant, &limits.database);
                         }
                         publish_notifications(
                             &limits.tenant,
@@ -1046,8 +1063,7 @@ where
                     {
                         out.extend_from_slice(&response);
                         if was_listening_empty && !listening.is_empty() {
-                            notifications =
-                                notification_sender(&limits.tenant, &limits.database).subscribe();
+                            notifications = notification_receiver(&limits.tenant, &limits.database);
                         }
                         publish_notifications(
                             &limits.tenant,
@@ -1336,8 +1352,7 @@ where
                     response
                 };
                 if was_listening_empty && !listening.is_empty() {
-                    notifications =
-                        notification_sender(&limits.tenant, &limits.database).subscribe();
+                    notifications = notification_receiver(&limits.tenant, &limits.database);
                 }
                 publish_notifications(
                     &limits.tenant,
@@ -3805,6 +3820,12 @@ fn notification_command(
             return None;
         }
         let payload = unquote_literal(payload.trim()).replace("''", "'");
+        if payload.len() > MAX_NOTIFICATION_PAYLOAD_BYTES {
+            return Some(encode_error_code(
+                "22023",
+                String::from("NOTIFY payload exceeds the 8000 byte limit"),
+            ));
+        }
         let notification = PgNotification { channel, payload, pid };
         if let Some(transaction) = active.as_mut() {
             transaction.notifications.push(notification);
@@ -3822,9 +3843,14 @@ fn normalize_notification_name(value: &str) -> Option<String> {
         return None;
     }
     if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        return Some(value[1..value.len() - 1].replace("\"\"", "\""));
+        let name = value[1..value.len() - 1].replace("\"\"", "\"");
+        return (name.as_bytes().len() <= MAX_NOTIFICATION_CHANNEL_BYTES).then_some(name);
     }
-    (!value.chars().any(char::is_whitespace)).then(|| value.to_ascii_lowercase())
+    if value.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let name = value.to_ascii_lowercase();
+    (name.as_bytes().len() <= MAX_NOTIFICATION_CHANNEL_BYTES).then_some(name)
 }
 
 fn unquote_literal(value: &str) -> String {
@@ -5292,5 +5318,35 @@ mod tests {
         });
         assert!(packet.windows(b"sum\0".len()).any(|window| window == b"sum\0"));
         assert!(packet.windows(4).any(|window| window == (-1i32).to_be_bytes()));
+    }
+
+    #[test]
+    fn notification_sender_is_removed_after_last_receiver_closes() {
+        let tenant = "notification-cleanup-tenant";
+        let database = "notification-cleanup-database";
+        let receiver = notification_receiver(tenant, database);
+        drop(receiver);
+        remove_notification_sender(tenant, database);
+
+        let channels = PG_NOTIFICATIONS.lock().unwrap();
+        assert!(!channels.contains_key(&(tenant.to_string(), database.to_string())));
+    }
+
+    #[test]
+    fn notification_names_and_payloads_are_bounded() {
+        assert!(normalize_notification_name(&"c".repeat(MAX_NOTIFICATION_CHANNEL_BYTES)).is_some());
+        assert!(
+            normalize_notification_name(&"c".repeat(MAX_NOTIFICATION_CHANNEL_BYTES + 1)).is_none()
+        );
+        let response = notification_command(
+            &format!("NOTIFY room, '{}'", "x".repeat(MAX_NOTIFICATION_PAYLOAD_BYTES + 1)),
+            "tenant",
+            "database",
+            1,
+            &mut HashSet::new(),
+            &mut None,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("8000 byte limit"));
     }
 }
