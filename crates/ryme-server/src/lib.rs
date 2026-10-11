@@ -6160,6 +6160,9 @@ async fn presence_list(
     if !principal.can_read() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    if let Err(error) = ryme_realtime::validate_channel(&channel) {
+        return error_response(error);
+    }
     let now = ryme_txn::now_unix();
     let members = state.realtime.presence_list(&principal.tenant, &channel, now);
     (StatusCode::OK, Json(members)).into_response()
@@ -6179,8 +6182,8 @@ async fn presence_stream(
     if !principal.can_read() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if channel.is_empty() || channel.len() > 256 {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("presence")));
+    if let Err(error) = ryme_realtime::validate_channel(&channel) {
+        return error_response(error);
     }
     if let Err(error) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(error);
@@ -6267,6 +6270,7 @@ async fn publish_broadcast(
     channel: String,
     payload: serde_json::Value,
 ) -> ryme_error::Result<u64> {
+    ryme_realtime::validate_channel(&channel)?;
     let payload_bytes = serde_json::to_vec(&payload)
         .map_err(|error| ryme_error::RymeError::Internal(error.to_string()))?;
     if payload_bytes.len() > REALTIME_MAX_BROADCAST_PAYLOAD_BYTES {
@@ -6326,11 +6330,8 @@ async fn broadcast_post(
     if !principal.can_publish() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if request.channel.is_empty() {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("channel")));
-    }
-    if request.channel.len() > 256 {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("channel")));
+    if let Err(error) = ryme_realtime::validate_channel(&request.channel) {
+        return error_response(error);
     }
     match publish_broadcast(
         &state,
@@ -7000,6 +7001,7 @@ async fn supabase_presence_join(
     member: String,
     presence_state: serde_json::Value,
 ) -> ryme_error::Result<usize> {
+    ryme_realtime::validate_channel(channel)?;
     let now = ryme_txn::now_unix();
     if let Some(node) = state.raft_node() {
         if !node.is_leader().await {
@@ -7035,6 +7037,7 @@ async fn supabase_presence_leave(
     channel: &str,
     member: &str,
 ) -> ryme_error::Result<bool> {
+    ryme_realtime::validate_channel(channel)?;
     if let Some(node) = state.raft_node() {
         if !node.is_leader().await {
             return Err(ryme_error::RymeError::Unavailable(String::from("not leader")));
@@ -7559,8 +7562,8 @@ async fn broadcast_stream(
     if !principal.can_read() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if channel.is_empty() {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("channel")));
+    if let Err(error) = ryme_realtime::validate_channel(&channel) {
+        return error_response(error);
     }
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);

@@ -52,6 +52,7 @@ const BROADCAST_BUFFER_CAPACITY: usize = 16_384;
 const MAX_BROADCAST_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_CHANGE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TABLE_HISTORY_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_CHANNEL_BYTES: usize = 256;
 pub const DURABLE_PARTITION_MAX_BYTES: usize = 256;
 pub const DURABLE_KEY_MAX_BYTES: usize = 1024;
 pub const DURABLE_VALUE_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -317,6 +318,13 @@ pub fn validate_durable_partition(partition: &str) -> Result<()> {
         || partition.contains('\0')
     {
         return Err(RymeError::InvalidArgument(String::from("partition")));
+    }
+    Ok(())
+}
+
+pub fn validate_channel(channel: &str) -> Result<()> {
+    if channel.is_empty() || channel.len() > MAX_CHANNEL_BYTES {
+        return Err(RymeError::InvalidArgument(String::from("channel")));
     }
     Ok(())
 }
@@ -987,6 +995,7 @@ impl Realtime {
         expires_unix: u64,
         now_unix: u64,
     ) -> Result<usize> {
+        validate_channel(channel)?;
         if member.is_empty() || member.len() > PRESENCE_MAX_MEMBER_BYTES {
             return Err(RymeError::InvalidArgument(String::from("presence member")));
         }
@@ -1269,6 +1278,7 @@ impl Realtime {
     }
 
     pub fn presence_leave(&self, tenant: &str, channel: &str, member: &str) -> Result<bool> {
+        validate_channel(channel)?;
         if member.is_empty() || member.len() > PRESENCE_MAX_MEMBER_BYTES {
             return Err(RymeError::InvalidArgument(String::from("presence member")));
         }
@@ -1324,6 +1334,9 @@ impl Realtime {
         channel: &str,
         now_unix: u64,
     ) -> (Vec<PresenceMember>, u64) {
+        if validate_channel(channel).is_err() {
+            return (Vec::new(), self.presence_sequence.load(Ordering::Acquire));
+        }
         let mut out = Vec::new();
         let mut expired: Vec<(String, usize)> = Vec::new();
         let sequence;
@@ -1398,6 +1411,10 @@ impl Realtime {
         tenant: &str,
         channel: &str,
     ) -> broadcast::Receiver<PresenceEvent> {
+        if validate_channel(channel).is_err() {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        }
         let key = scope_key(tenant, channel);
         let shard = self.presence_shard(&key);
         let Ok(mut topics) = self.presence_topics[shard].lock() else {
@@ -1416,6 +1433,7 @@ impl Realtime {
     }
 
     fn publish_presence(&self, tenant: &str, event: PresenceEvent) -> Result<()> {
+        validate_channel(&event.channel)?;
         let key = scope_key(tenant, &event.channel);
         let shard = self.presence_shard(&key);
         let topics = self
@@ -1438,6 +1456,7 @@ impl Realtime {
         payload: serde_json::Value,
         commit_ts: u64,
     ) -> Result<u64> {
+        validate_channel(channel)?;
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
         let Some(topic) = self.existing_broadcast_topic(shard, &key)? else {
@@ -1472,6 +1491,7 @@ impl Realtime {
         commit_ts: u64,
         admit: impl FnOnce(usize, u64) -> Result<()>,
     ) -> Result<u64> {
+        validate_channel(channel)?;
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
         let Some(topic) = self.existing_broadcast_topic(shard, &key)? else {
@@ -1519,6 +1539,7 @@ impl Realtime {
         commit_ts: u64,
         sequence: u64,
     ) -> Result<u64> {
+        validate_channel(channel)?;
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
         let Some(topic) = self.existing_broadcast_topic(shard, &key)? else {
@@ -1550,6 +1571,10 @@ impl Realtime {
         tenant: &str,
         channel: &str,
     ) -> broadcast::Receiver<Arc<BroadcastMsg>> {
+        if validate_channel(channel).is_err() {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        }
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
         let Ok(topic) = self.broadcast_topic(shard, key) else {
@@ -2314,6 +2339,34 @@ mod tests {
             Err(RymeError::Overload(message)) if message == "presence state"
         ));
         assert!(realtime.presence_list("t", "room", 1000).is_empty());
+    }
+
+    #[test]
+    fn realtime_channels_are_bounded_before_scope_admission() {
+        let realtime = Realtime::new(64);
+        let channel = "x".repeat(MAX_CHANNEL_BYTES + 1);
+        assert!(matches!(
+            realtime.presence_join(
+                "t",
+                &channel,
+                String::from("member"),
+                serde_json::Value::Null,
+                60,
+                1000,
+            ),
+            Err(RymeError::InvalidArgument(message)) if message == "channel"
+        ));
+        assert!(matches!(
+            realtime.broadcast(
+                "t",
+                &channel,
+                String::from("sender"),
+                serde_json::Value::Null,
+                1,
+            ),
+            Err(RymeError::InvalidArgument(message)) if message == "channel"
+        ));
+        assert!(realtime.presence_list("t", &channel, 1000).is_empty());
     }
 
     #[test]
