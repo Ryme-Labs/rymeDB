@@ -46,6 +46,8 @@ const PRESENCE_SHARDS: usize = 32;
 const STABLE_CDC_SEQUENCE_STRIDE: u64 = 1_000_000;
 const BROADCAST_BUFFER_CAPACITY: usize = 16_384;
 pub const DURABLE_PARTITION_MAX_BYTES: usize = 256;
+pub const DURABLE_KEY_MAX_BYTES: usize = 1024;
+pub const DURABLE_VALUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const DURABLE_READ_MAX_MESSAGES: usize = 1000;
 
 type BroadcastTopicShard = Mutex<HashMap<String, Arc<BroadcastTopic>>>;
@@ -1190,6 +1192,12 @@ impl Realtime {
             return Err(RymeError::InvalidArgument(String::from("tenant")));
         }
         validate_durable_partition(partition)?;
+        if key.is_empty() || key.len() > DURABLE_KEY_MAX_BYTES {
+            return Err(RymeError::InvalidArgument(String::from("key")));
+        }
+        if value.len() > DURABLE_VALUE_MAX_BYTES {
+            return Err(RymeError::Overload(String::from("value")));
+        }
         let topic_key = durable_key(tenant, partition);
         let topic = inner.durable.entry(topic_key.clone()).or_insert_with(|| DurableTopic {
             messages: VecDeque::new(),
@@ -1337,6 +1345,13 @@ impl Realtime {
                 .map_err(|_| RymeError::Corrupt(String::from("durable topic identity")))?;
             if snapshot.messages.iter().any(|message| message.partition != snapshot.partition) {
                 return Err(RymeError::Corrupt(String::from("durable topic partition")));
+            }
+            if snapshot.messages.iter().any(|message| {
+                message.key.is_empty()
+                    || message.key.len() > DURABLE_KEY_MAX_BYTES
+                    || message.value.len() > DURABLE_VALUE_MAX_BYTES
+            }) {
+                return Err(RymeError::Corrupt(String::from("durable topic message")));
             }
             let retention = snapshot.retention.clamp(16, 100000);
             let mut messages = snapshot.messages;
@@ -2074,6 +2089,44 @@ mod tests {
             Err(RymeError::Corrupt(_))
         ));
         assert!(realtime.durable_read("tenant", "bad\0partition", 0, 10).is_empty());
+    }
+
+    #[test]
+    fn durable_topics_bound_message_shapes_at_the_storage_boundary() {
+        let realtime = Realtime::new(64);
+        assert!(matches!(
+            realtime.durable_append("tenant", "orders", Vec::new(), b"v".to_vec(), 5, 16),
+            Err(RymeError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            realtime.durable_append(
+                "tenant",
+                "orders",
+                b"k".to_vec(),
+                vec![b'v'; DURABLE_VALUE_MAX_BYTES + 1],
+                5,
+                16,
+            ),
+            Err(RymeError::Overload(_))
+        ));
+
+        let snapshot = DurableTopicSnapshot {
+            tenant: String::from("tenant"),
+            partition: String::from("orders"),
+            messages: vec![DurableMsg {
+                partition: String::from("orders"),
+                cursor: 0,
+                key: b"k".to_vec(),
+                value: vec![b'v'; DURABLE_VALUE_MAX_BYTES + 1],
+                commit_ts: 1,
+            }],
+            next_cursor: 1,
+            retention: 16,
+        };
+        assert!(matches!(
+            realtime.restore_durable_snapshot(vec![snapshot]),
+            Err(RymeError::Corrupt(_))
+        ));
     }
 
     #[test]
