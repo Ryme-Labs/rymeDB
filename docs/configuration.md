@@ -106,7 +106,9 @@ membership changes are made through the leader; see [cluster operations](cluster
 For S3-compatible storage, set `s3_endpoint`, `s3_bucket`, `s3_region`, and
 optionally `s3_path_style`. Configure `archive_replica` for a second target.
 The OTLP endpoint is optional; `/metrics`, `/metrics/prometheus`,
-`/v1/observe/slow`, and `/v1/traces` are available without it.
+`/v1/observe/slow`, and `/v1/traces` remain available locally without an OTLP
+collector. These operational routes still require an authenticated owner or
+admin principal.
 
 ## Tenant policies
 

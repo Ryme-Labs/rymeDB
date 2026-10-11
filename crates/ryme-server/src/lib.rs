@@ -1866,7 +1866,10 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
     )
 }
 
-async fn regions(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn regions(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
+    }
     Json(serde_json::json!({
         "region": state.region,
         "read_only": state.read_only,
@@ -1874,6 +1877,7 @@ async fn regions(State(state): State<SharedState>) -> Json<serde_json::Value> {
         "commit": state.backend.latest_commit(),
         "leader": state.backend.is_leader().await,
     }))
+    .into_response()
 }
 
 #[derive(Default)]
@@ -2678,7 +2682,10 @@ async fn ready(State(state): State<SharedState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn metrics(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn metrics(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
+    }
     let snapshot = state.latency.snapshot();
     let histogram = state.histogram.snapshot();
     Json(serde_json::json!({
@@ -2694,9 +2701,13 @@ async fn metrics(State(state): State<SharedState>) -> Json<serde_json::Value> {
         "p99_micros": histogram.p99_micros,
         "p999_micros": histogram.p999_micros,
     }))
+    .into_response()
 }
 
-async fn prometheus(State(state): State<SharedState>) -> Response {
+async fn prometheus(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
+    }
     let histogram = state.histogram.snapshot();
     let body = format!(
         "# HELP rymedb_uptime_seconds node uptime\n# TYPE rymedb_uptime_seconds counter\nrymedb_uptime_seconds {} \n# HELP rymedb_commit_index latest commit\n# TYPE rymedb_commit_index gauge\nrymedb_commit_index {} \n# HELP rymedb_rest_microseconds rest latency\n# TYPE rymedb_rest_microseconds summary\nrymedb_rest_microseconds{{quantile=\"0.5\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.9\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.95\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.99\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.999\"}} {}\nrymedb_rest_microseconds_count {}\nrymedb_rest_microseconds_max {} \n",
@@ -4260,6 +4271,9 @@ async fn migrate_ledger(State(state): State<SharedState>, headers: HeaderMap) ->
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
+    if !principal.can_read() {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let branch = match branch_snapshot(&state, &headers, &principal.tenant) {
         Ok(Some((branch, _, _))) => branch,
         Ok(None) => String::from("main"),
@@ -4284,8 +4298,12 @@ async fn migrate_ledger(State(state): State<SharedState>, headers: HeaderMap) ->
 
 async fn autoscale_advice(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Query(query): Query<AutoscaleQuery>,
 ) -> Response {
+    if let Err(error) = require_admin(&state, &headers) {
+        return error_response(error);
+    }
     let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),

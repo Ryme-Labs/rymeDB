@@ -23,7 +23,8 @@ Probe:
 ```bash
 curl -fsS https://db.example.com/health
 curl -fsS https://db.example.com/ready
-curl -fsS https://db.example.com/metrics/prometheus
+curl -fsS -H "Authorization: Bearer $RYME_API_KEY" \
+  https://db.example.com/metrics/prometheus
 ```
 
 Alert on readiness loss, leader absence, term churn, commit lag, range

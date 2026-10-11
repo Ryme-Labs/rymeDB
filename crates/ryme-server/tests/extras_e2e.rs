@@ -1508,6 +1508,16 @@ async fn extras_auth_privilege_boundaries() {
     let (status, _) =
         bearer_request(http, &app_key, "POST /v1/backups/restore?target=1", b"").await;
     assert_eq!(status, 403);
+    for endpoint in [
+        "GET /metrics",
+        "GET /metrics/prometheus",
+        "GET /v1/regions",
+        "GET /v1/autoscale",
+    ] {
+        let (status, _) = bearer_request(http, &app_key, endpoint, b"").await;
+        assert_eq!(status, 403, "{endpoint}");
+        assert_eq!(http_status_no_auth(http, endpoint).await, 401, "{endpoint}");
+    }
     let (status, _) = bearer_request(
         http,
         &app_key,
