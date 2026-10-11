@@ -140,12 +140,19 @@ impl ControlPlane {
         }
         let mut router = Router::new();
         let mut ids = std::collections::HashSet::new();
+        let routing_version = ranges[0].routing_version;
+        ryme_storage::validate_routing_version(routing_version)?;
         for (index, range) in ranges.iter().enumerate() {
             if !ids.insert(range.id.clone()) {
                 return Err(RymeError::Corrupt(String::from("duplicate range id")));
             }
             if !range.end.is_empty() && range.start >= range.end {
                 return Err(RymeError::Corrupt(String::from("invalid range bounds")));
+            }
+            if range.routing_version != routing_version {
+                return Err(RymeError::Corrupt(String::from(
+                    "range snapshot has mixed routing versions",
+                )));
             }
             if let Some(next) = ranges.get(index + 1) {
                 if range.end.is_empty() || range.end != next.start {
@@ -160,6 +167,17 @@ impl ControlPlane {
 
     pub fn route(&self, key: &[u8]) -> Result<Range> {
         self.router.route(key)
+    }
+
+    pub fn note_range_write(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        pk: &[u8],
+        count: u64,
+    ) -> Result<Range> {
+        self.router.note_record(tenant, database, table, pk, count)
     }
 
     pub fn ranges(&self) -> Vec<Range> {

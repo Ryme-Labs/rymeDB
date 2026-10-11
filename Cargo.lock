@@ -1816,6 +1816,7 @@ dependencies = [
  "ryme-error",
  "ryme-migrate",
  "ryme-router",
+ "ryme-storage",
  "serde",
 ]
 
@@ -1925,6 +1926,7 @@ name = "ryme-router"
 version = "0.1.0"
 dependencies = [
  "ryme-error",
+ "ryme-storage",
  "serde",
  "serde_json",
 ]

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub type RangeLoadHookFn = Arc<dyn Fn(&[u8], u64) + Send + Sync>;
+pub type RangeLoadHookFn = Arc<dyn Fn(&str, &str, &str, &[u8], u64) + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub struct RangeLoadHook {
@@ -30,9 +30,9 @@ impl RangeLoadHook {
         self.inner.is_some()
     }
 
-    pub fn note(&self, key: &[u8], count: u64) {
+    pub fn note(&self, tenant: &str, database: &str, table: &str, pk: &[u8], count: u64) {
         if let Some(hook) = self.inner.as_ref() {
-            hook(key, count);
+            hook(tenant, database, table, pk, count);
         }
     }
 }
@@ -42,6 +42,8 @@ pub struct Range {
     pub id: String,
     pub start: Vec<u8>,
     pub end: Vec<u8>,
+    #[serde(default)]
+    pub routing_version: u8,
     pub leader: String,
     #[serde(default)]
     pub replicas: Vec<String>,
@@ -56,7 +58,16 @@ fn fresh_load() -> Arc<AtomicU64> {
 
 impl Range {
     pub fn new(id: String, start: Vec<u8>, end: Vec<u8>, leader: String, epoch: u64) -> Self {
-        Self { id, start, end, replicas: vec![leader.clone()], leader, epoch, load: fresh_load() }
+        Self {
+            id,
+            start,
+            end,
+            routing_version: ryme_storage::CURRENT_ROUTING_VERSION,
+            replicas: vec![leader.clone()],
+            leader,
+            epoch,
+            load: fresh_load(),
+        }
     }
 
     pub fn writes(&self) -> u64 {
@@ -69,6 +80,7 @@ impl PartialEq for Range {
         self.id == other.id
             && self.start == other.start
             && self.end == other.end
+            && self.routing_version == other.routing_version
             && self.leader == other.leader
             && self.replicas == other.replicas
             && self.epoch == other.epoch
@@ -104,6 +116,38 @@ impl Router {
             Some(range) if key < range.end.as_slice() || range.end.is_empty() => Ok(range.clone()),
             _ => Err(RymeError::NotFound(String::from("range"))),
         }
+    }
+
+    pub fn routing_version(&self) -> u8 {
+        self.ranges
+            .values()
+            .next()
+            .map(|range| range.routing_version)
+            .unwrap_or(ryme_storage::CURRENT_ROUTING_VERSION)
+    }
+
+    pub fn route_record(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        pk: &[u8],
+    ) -> Result<Range> {
+        let key = ryme_storage::routing_key(self.routing_version(), tenant, database, table, pk)?;
+        self.route(&key)
+    }
+
+    pub fn note_record(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        pk: &[u8],
+        count: u64,
+    ) -> Result<Range> {
+        let routed = self.route_record(tenant, database, table, pk)?;
+        routed.load.fetch_add(count, Ordering::Relaxed);
+        Ok(routed)
     }
 
     pub fn get(&self, id: &str) -> Result<Range> {
@@ -167,6 +211,7 @@ impl Router {
                 id: left_id,
                 start: original.start.clone(),
                 end: mid.clone(),
+                routing_version: original.routing_version,
                 leader: original.leader.clone(),
                 replicas: original.replicas.clone(),
                 epoch: original.epoch + 1,
@@ -179,6 +224,7 @@ impl Router {
                 id: right_id,
                 start: mid,
                 end: original.end,
+                routing_version: original.routing_version,
                 leader: original.leader,
                 replicas: original.replicas,
                 epoch: original.epoch + 1,
@@ -200,6 +246,9 @@ impl Router {
         if left.leader != right.leader {
             return Err(RymeError::InvalidArgument(String::from("leader mismatch")));
         }
+        if left.routing_version != right.routing_version {
+            return Err(RymeError::InvalidArgument(String::from("routing version mismatch")));
+        }
         if self.ranges.values().any(|range| range.id == merged_id) {
             return Err(RymeError::Conflict(String::from("range id exists")));
         }
@@ -216,6 +265,7 @@ impl Router {
                 id: merged_id,
                 start: left.start,
                 end: right.end,
+                routing_version: left.routing_version,
                 leader: left.leader,
                 replicas,
                 epoch,
@@ -253,6 +303,7 @@ mod tests {
             id: String::from("r0"),
             start: Vec::new(),
             end: Vec::new(),
+            routing_version: 0,
             leader: String::from("n1"),
             replicas: vec![String::from("n1")],
             epoch: 0,
@@ -298,6 +349,7 @@ mod tests {
             id: String::from("a"),
             start: Vec::new(),
             end: b"m".to_vec(),
+            routing_version: 0,
             leader: String::from("n1"),
             replicas: vec![String::from("n1")],
             epoch: 0,
@@ -307,6 +359,7 @@ mod tests {
             id: String::from("b"),
             start: b"z".to_vec(),
             end: Vec::new(),
+            routing_version: 0,
             leader: String::from("n1"),
             replicas: vec![String::from("n1")],
             epoch: 0,
@@ -317,6 +370,7 @@ mod tests {
             id: String::from("c"),
             start: b"m".to_vec(),
             end: b"z".to_vec(),
+            routing_version: 0,
             leader: String::from("n2"),
             replicas: vec![String::from("n2")],
             epoch: 0,
@@ -348,6 +402,29 @@ mod tests {
         let empty = Router::new();
         assert!(empty.note_write(b"anything", 1).is_err());
         assert!(empty.loads().is_empty());
+    }
+
+    #[test]
+    fn scoped_record_routing_keeps_tenants_on_their_side_of_a_split() {
+        let mut router = Router::new();
+        router.insert(Range::new(
+            String::from("r0"),
+            Vec::new(),
+            Vec::new(),
+            String::from("n1"),
+            0,
+        ));
+        let split = ryme_storage::routing_key(
+            ryme_storage::CURRENT_ROUTING_VERSION,
+            "tenant-b",
+            "db",
+            "docs",
+            &[],
+        )
+        .unwrap();
+        router.split("r0", split, String::from("left"), String::from("right")).unwrap();
+        assert_eq!(router.route_record("tenant-a", "db", "docs", b"same").unwrap().id, "left");
+        assert_eq!(router.route_record("tenant-b", "db", "docs", b"same").unwrap().id, "right");
     }
 
     #[test]

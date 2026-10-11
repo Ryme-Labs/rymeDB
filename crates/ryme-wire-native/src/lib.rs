@@ -198,19 +198,15 @@ where
         self
     }
 
-    fn note_routing_key(&self, table: &str, pk: &[u8], count: u64) {
+    fn note_routing_key(&self, tenant: &str, table: &str, pk: &[u8], count: u64) {
         if !self.range_hook.is_armed() {
             return;
         }
-        let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
-        routing.extend_from_slice(table.as_bytes());
-        routing.push(0);
-        routing.extend_from_slice(pk);
-        self.range_hook.note(&routing, count);
+        self.range_hook.note(tenant, self.gateway.database_name(), table, pk, count);
     }
 
-    fn note_table_key(&self, table: &str, pk: &str, count: u64) {
-        self.note_routing_key(table, pk.as_bytes(), count);
+    fn note_table_key(&self, tenant: &str, table: &str, pk: &str, count: u64) {
+        self.note_routing_key(tenant, table, pk.as_bytes(), count);
     }
 
     fn sql_range_keys(statement: &ryme_sql::Statement) -> Option<Vec<Vec<u8>>> {
@@ -489,7 +485,7 @@ where
             .await
         {
             Ok(commit) => {
-                self.note_table_key(&request.table, &request.pk, 1);
+                self.note_table_key(&principal.tenant, &request.table, &request.pk, 1);
                 let mut response = Response::ok();
                 response.commit = Some(commit);
                 response
@@ -517,7 +513,7 @@ where
             .await
         {
             Ok(commit) => {
-                self.note_table_key(&request.table, &request.pk, 1);
+                self.note_table_key(&principal.tenant, &request.table, &request.pk, 1);
                 let mut response = Response::ok();
                 response.commit = Some(commit);
                 response
@@ -616,10 +612,16 @@ where
                 if write {
                     if let Some(keys) = range_keys.as_deref() {
                         for key in keys {
-                            self.note_routing_key(&table, key, 1);
+                            self.note_routing_key(&principal.tenant, &table, key, 1);
                         }
                     } else {
-                        self.range_hook.note(table.as_bytes(), 1);
+                        self.range_hook.note(
+                            &principal.tenant,
+                            self.gateway.database_name(),
+                            &table,
+                            &[],
+                            1,
+                        );
                     }
                 }
                 Response::ok()
@@ -833,8 +835,8 @@ mod tests {
 
     #[tokio::test]
     async fn native_sql_uses_configured_rls_executor() {
-        use std::collections::{HashMap, HashSet};
         use ryme_storage::RecordKey;
+        use std::collections::{HashMap, HashSet};
 
         let gateway = Gateway::new(
             String::from("t"),
@@ -844,12 +846,12 @@ mod tests {
             ryme_realtime::Realtime::new(16),
         );
         let manager = gateway.manager_clone();
-        let executor = ryme_sql::Executor::with_backend(
-            String::from("t"),
-            String::from("d"),
-            manager.clone(),
-        )
-        .with_rls_tables(HashMap::from([(String::from("docs"), String::from("tenant_id"))]));
+        let executor =
+            ryme_sql::Executor::with_backend(String::from("t"), String::from("d"), manager.clone())
+                .with_rls_tables(HashMap::from([(
+                    String::from("docs"),
+                    String::from("tenant_id"),
+                )]));
         executor
             .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
             .await

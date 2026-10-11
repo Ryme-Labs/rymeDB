@@ -192,7 +192,11 @@ impl ryme_txn::TxnBackend for Backend {
         table: &'a str,
         limit: usize,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>>
+                + Send
+                + 'a,
+        >,
     > {
         match self {
             Self::Single(manager) => manager.scan_async(txn, tenant, database, table, limit),
@@ -236,7 +240,11 @@ impl ryme_txn::TxnBackend for Backend {
         start_after: &'a [u8],
         limit: usize,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>>>
+                + Send
+                + 'a,
+        >,
     > {
         match self {
             Self::Single(manager) => {
@@ -586,9 +594,7 @@ impl OidcStateStore {
     fn issue(&mut self, state: String, now: u64) -> ryme_error::Result<()> {
         self.prune(now);
         if self.pending.len() >= OIDC_STATE_MAX_PENDING {
-            return Err(ryme_error::RymeError::Overload(String::from(
-                "oidc state capacity",
-            )));
+            return Err(ryme_error::RymeError::Overload(String::from("oidc state capacity")));
         }
         self.pending.insert(state, now);
         Ok(())
@@ -837,12 +843,9 @@ fn load_existing_schema_snapshot(
 ) -> ryme_error::Result<ryme_sql::SchemaSnapshot> {
     match std::fs::metadata(path) {
         Ok(_) => load_schema_snapshot(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(ryme_error::RymeError::Corrupt(format!(
-                "missing schema snapshot: {}",
-                path.display()
-            )))
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+            ryme_error::RymeError::Corrupt(format!("missing schema snapshot: {}", path.display())),
+        ),
         Err(error) => Err(error.into()),
     }
 }
@@ -1170,9 +1173,7 @@ pub struct BranchRequest {
 fn resolve_branch_base_commit(state: &SharedState, requested: u64) -> ryme_error::Result<u64> {
     let latest = state.backend.latest_commit();
     if requested > latest {
-        return Err(ryme_error::RymeError::InvalidArgument(String::from(
-            "base_commit_ts",
-        )));
+        return Err(ryme_error::RymeError::InvalidArgument(String::from("base_commit_ts")));
     }
     Ok(if requested == 0 { latest } else { requested })
 }
@@ -1381,9 +1382,7 @@ impl SharedState {
         Ok(())
     }
 
-    fn load_branch_promotion_journal(
-        &self,
-    ) -> ryme_error::Result<Option<BranchPromotionJournal>> {
+    fn load_branch_promotion_journal(&self) -> ryme_error::Result<Option<BranchPromotionJournal>> {
         let bytes = match std::fs::read(&self.promotion_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1542,11 +1541,7 @@ impl SharedState {
             let reader = RemoteReader::new(move |key| {
                 let node = single_node.clone();
                 async move {
-                    let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
-                    routing.extend_from_slice(key.table.as_bytes());
-                    routing.push(0);
-                    routing.extend_from_slice(&key.pk);
-                    let Some((owner, _epoch)) = node.range_owner(&routing) else {
+                    let Some(owner) = node.range_owner_key(key) else {
                         return Ok(RemoteRead::Local);
                     };
                     if owner == node.node_id() {
@@ -1563,11 +1558,7 @@ impl SharedState {
                     let mut grouped: BTreeMap<usize, Vec<(usize, ryme_storage::RecordKey)>> =
                         BTreeMap::new();
                     for (index, key) in keys.into_iter().enumerate() {
-                        let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
-                        routing.extend_from_slice(key.table.as_bytes());
-                        routing.push(0);
-                        routing.extend_from_slice(&key.pk);
-                        let Some((owner, _epoch)) = node.range_owner(&routing) else {
+                        let Some(owner) = node.range_owner_key(&key) else {
                             continue;
                         };
                         if owner != node.node_id() {
@@ -1638,11 +1629,10 @@ impl SharedState {
                             "schema changes require the raft leader",
                         )));
                     }
-                    let payload = serde_json::to_vec(&ClusterMetadata::Schema(next)).map_err(
-                        |error| {
+                    let payload =
+                        serde_json::to_vec(&ClusterMetadata::Schema(next)).map_err(|error| {
                             ryme_error::RymeError::Internal(format!("schema metadata: {error}"))
-                        },
-                    )?;
+                        })?;
                     node.propose_metadata(payload).await.map(|_| ())
                 })
             });
@@ -1694,6 +1684,7 @@ impl SharedState {
                     id: range.id,
                     start: range.start,
                     end: range.end,
+                    routing_version: range.routing_version,
                     shard: 0,
                 })
                 .collect()
@@ -1887,9 +1878,7 @@ impl SharedState {
         journal: &BranchPromotionJournal,
     ) -> ryme_error::Result<()> {
         if journal.tenant.is_empty() || journal.branch.is_empty() {
-            return Err(ryme_error::RymeError::Corrupt(String::from(
-                "branch promotion identity",
-            )));
+            return Err(ryme_error::RymeError::Corrupt(String::from("branch promotion identity")));
         }
         let old_child = journal.old_branches.get_for(&journal.tenant, &journal.branch)?;
         let new_main = journal.new_branches.get_for(&journal.tenant, "main")?;
@@ -1897,13 +1886,13 @@ impl SharedState {
             || old_child.base_commit_ts != journal.base_commit_ts
             || new_main.parent_id.is_some()
         {
-            return Err(ryme_error::RymeError::Corrupt(String::from(
-                "branch promotion metadata",
-            )));
+            return Err(ryme_error::RymeError::Corrupt(String::from("branch promotion metadata")));
         }
-        if journal.writes.iter().any(|(key, _)| {
-            key.tenant != journal.tenant || key.database != self.database
-        }) {
+        if journal
+            .writes
+            .iter()
+            .any(|(key, _)| key.tenant != journal.tenant || key.database != self.database)
+        {
             return Err(ryme_error::RymeError::Corrupt(String::from(
                 "branch promotion write scope",
             )));
@@ -1911,10 +1900,7 @@ impl SharedState {
         Ok(())
     }
 
-    fn promotion_data_state(
-        &self,
-        journal: &BranchPromotionJournal,
-    ) -> ryme_error::Result<bool> {
+    fn promotion_data_state(&self, journal: &BranchPromotionJournal) -> ryme_error::Result<bool> {
         let mut base_txn = self.backend.begin();
         base_txn.restamp(journal.base_commit_ts);
         let mut current_txn = self.backend.begin();
@@ -2014,10 +2000,7 @@ impl SharedState {
             self.persist_branch_promotion_journal(&journal)?;
         }
         if matches!(journal.phase, BranchPromotionPhase::SchemaInstalled) {
-            if let Err(error) = self
-                .commit_branch_promotion_data(&journal, prepared)
-                .await
-            {
+            if let Err(error) = self.commit_branch_promotion_data(&journal, prepared).await {
                 match self.promotion_data_state(&journal) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -2631,11 +2614,13 @@ fn spawn_gateways(
     pg_executor.set_read_only(state.read_only);
     let range_hook: ryme_router::RangeLoadHook = if autosplit_writes > 0 {
         let control = state.control.clone();
-        ryme_router::RangeLoadHook::armed(Arc::new(move |key: &[u8], count: u64| {
-            if let Ok(control) = control.lock() {
-                let _ = control.router.note_write(key, count);
-            }
-        }))
+        ryme_router::RangeLoadHook::armed(Arc::new(
+            move |tenant: &str, database: &str, table: &str, pk: &[u8], count: u64| {
+                if let Ok(control) = control.lock() {
+                    let _ = control.note_range_write(tenant, database, table, pk, count);
+                }
+            },
+        ))
     } else {
         ryme_router::RangeLoadHook::default()
     };
@@ -3541,16 +3526,14 @@ fn branch_executor(
 ) -> ryme_error::Result<Executor<BranchStorage>> {
     let executor = state.executor.clone().with_tenant(tenant.to_string());
     match branch_snapshot(state, headers, tenant)? {
-        Some((branch, base_commit_ts, storage_epoch)) => {
-            branch_executor_from_snapshot(
-                state,
-                executor,
-                tenant,
-                &branch,
-                base_commit_ts,
-                storage_epoch,
-            )
-        }
+        Some((branch, base_commit_ts, storage_epoch)) => branch_executor_from_snapshot(
+            state,
+            executor,
+            tenant,
+            &branch,
+            base_commit_ts,
+            storage_epoch,
+        ),
         None => Ok(executor),
     }
 }
@@ -3574,7 +3557,8 @@ fn branch_executor_from_snapshot(
         storage_epoch,
     );
     let schema_path = state.branch_schema_path(tenant, branch);
-    let mut branch_executor = executor.with_isolated_schema(manager).with_branch(branch.to_string());
+    let mut branch_executor =
+        executor.with_isolated_schema(manager).with_branch(branch.to_string());
     let snapshot = load_existing_schema_snapshot(&schema_path)?;
     branch_executor.restore_schema_snapshot(snapshot)?;
     branch_executor.set_schema_path(schema_path);
@@ -3588,14 +3572,6 @@ fn branch_executor_for_principal(
 ) -> ryme_error::Result<Executor<BranchStorage>> {
     branch_executor(state, headers, &principal.tenant)
         .map(|executor| executor.with_role(principal.sql_role().to_string()))
-}
-
-fn range_routing_key(table: &str, key: &[u8]) -> Vec<u8> {
-    let mut routing = Vec::with_capacity(table.len() + key.len() + 1);
-    routing.extend_from_slice(table.as_bytes());
-    routing.push(0);
-    routing.extend_from_slice(key);
-    routing
 }
 
 fn sql_range_keys(statement: &Statement) -> Option<Vec<Vec<u8>>> {
@@ -3613,12 +3589,19 @@ fn sql_range_keys(statement: &Statement) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-fn note_range_write(state: &SharedState, routing_key: &[u8], count: u64) {
+fn note_range_write(
+    state: &SharedState,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    pk: &[u8],
+    count: u64,
+) {
     if state.autosplit_writes == 0 {
         return;
     }
     if let Ok(control) = state.control.lock() {
-        let _ = control.router.note_write(routing_key, count);
+        let _ = control.note_range_write(tenant, database, table, pk, count);
     }
 }
 
@@ -4206,7 +4189,7 @@ async fn rest_insert(
         .iter()
         .map(|(key, value)| {
             record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
-            note_range_write(&state, &range_routing_key(&table, key), 1);
+            note_range_write(&state, &principal.tenant, &state.database, &table, key, 1);
             rest_row_to_json(key, value)
         })
         .collect::<Vec<_>>();
@@ -4294,7 +4277,7 @@ async fn rest_upsert(
         .iter()
         .map(|(key, value)| {
             record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
-            note_range_write(&state, &range_routing_key(&table, key), 1);
+            note_range_write(&state, &principal.tenant, &state.database, &table, key, 1);
             rest_row_to_json(key, value)
         })
         .collect::<Vec<_>>();
@@ -4339,10 +4322,7 @@ async fn rest_delete(
         if rest_prefer(&headers, "return=minimal") {
             return StatusCode::OK.into_response();
         }
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "commit": 0u64, "deleted": 0u64 })),
-        )
+        return (StatusCode::OK, Json(serde_json::json!({ "commit": 0u64, "deleted": 0u64 })))
             .into_response();
     }
     for key in &keys {
@@ -4356,7 +4336,7 @@ async fn rest_delete(
     };
     for key in &keys {
         record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
-        note_range_write(&state, &range_routing_key(&table, key), 1);
+        note_range_write(&state, &principal.tenant, &state.database, &table, key, 1);
     }
     let deleted = keys.len() as u64;
     if rest_prefer(&headers, "return=minimal") {
@@ -4591,7 +4571,14 @@ async fn sql_copy(
         Ok(count) => {
             record_meter(&state, &principal.tenant, Metric::WriteUnit, count as u64);
             for (key, _) in rows.iter().take(count) {
-                note_range_write(&state, &range_routing_key(&request.table, key), 1);
+                note_range_write(
+                    &state,
+                    &principal.tenant,
+                    &state.database,
+                    &request.table,
+                    key,
+                    1,
+                );
             }
             let micros = elapsed_micros(start);
             state.latency.observe_micros(micros);
@@ -5520,9 +5507,10 @@ async fn oidc_login(State(state): State<SharedState>, body: axum::body::Bytes) -
     match config.auth_url(&request.redirect_uri, &state_value) {
         Ok(auth_url) => {
             let now = ryme_txn::now_unix();
-            let issued = state.oidc_states.lock().map_err(|_| {
-                ryme_error::RymeError::Internal(String::from("oidc state lock"))
-            });
+            let issued = state
+                .oidc_states
+                .lock()
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("oidc state lock")));
             let issued = match issued {
                 Ok(mut states) => states.issue(state_value.clone(), now),
                 Err(error) => Err(error),
@@ -5558,7 +5546,9 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     let now = ryme_txn::now_unix();
     let pending = match state.oidc_states.lock() {
         Ok(mut states) => states.is_pending(&request.state, now),
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("oidc state lock"))),
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Internal(String::from("oidc state lock")))
+        }
     };
     if !pending {
         return error_response(ryme_error::RymeError::Unauthorized);
@@ -5569,9 +5559,12 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     };
     match verified {
         Ok(principal) => {
-            if let Err(error) = state.oidc_states.lock().map_err(|_| {
-                ryme_error::RymeError::Internal(String::from("oidc state lock"))
-            }).and_then(|mut states| states.consume(&request.state, now)) {
+            if let Err(error) = state
+                .oidc_states
+                .lock()
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("oidc state lock")))
+                .and_then(|mut states| states.consume(&request.state, now))
+            {
                 return error_response(error);
             }
             let (key, tenant) = issue_api_key(&state.keys, &principal);
@@ -6121,11 +6114,8 @@ impl Serialize for SupabaseBroadcastDataRef<'_> {
         match self {
             Self::Value(value) => value.serialize(serializer),
             Self::ObjectWithoutEvent(object) => {
-                let entry_count = if object.contains_key("event") {
-                    object.len() - 1
-                } else {
-                    object.len()
-                };
+                let entry_count =
+                    if object.contains_key("event") { object.len() - 1 } else { object.len() };
                 let mut map = serializer.serialize_map(Some(entry_count))?;
                 for (key, value) in *object {
                     if key != "event" {
@@ -6194,10 +6184,8 @@ fn encode_supabase_broadcast_frame(
 ) -> String {
     let (event, data) = match payload {
         serde_json::Value::Object(object) => {
-            let event = object
-                .get("event")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("message");
+            let event =
+                object.get("event").and_then(serde_json::Value::as_str).unwrap_or("message");
             let data = match object.get("payload") {
                 Some(payload) => SupabaseBroadcastDataRef::Value(payload),
                 None => SupabaseBroadcastDataRef::ObjectWithoutEvent(object),
@@ -6310,9 +6298,7 @@ fn supabase_subscription_config(
     Ok(subscriptions)
 }
 
-fn supabase_presence_config(
-    payload: &serde_json::Value,
-) -> Result<Option<String>, String> {
+fn supabase_presence_config(payload: &serde_json::Value) -> Result<Option<String>, String> {
     let Some(value) = payload.pointer("/config/presence") else {
         return Ok(None);
     };
@@ -6327,7 +6313,9 @@ fn supabase_presence_config(
         .and_then(serde_json::Value::as_str)
         .filter(|key| !key.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| format!("ryme-{}", NEXT_SUPABASE_PRESENCE_KEY.fetch_add(1, AtomicOrdering::Relaxed)));
+        .unwrap_or_else(|| {
+            format!("ryme-{}", NEXT_SUPABASE_PRESENCE_KEY.fetch_add(1, AtomicOrdering::Relaxed))
+        });
     if key.len() > 256 {
         return Err(String::from("presence key"));
     }
@@ -6350,9 +6338,7 @@ fn supabase_presence_meta(
     serde_json::Value::Object(meta)
 }
 
-fn supabase_presence_state(
-    members: &[ryme_realtime::PresenceMember],
-) -> serde_json::Value {
+fn supabase_presence_state(members: &[ryme_realtime::PresenceMember]) -> serde_json::Value {
     let mut state = serde_json::Map::new();
     for member in members {
         state.insert(
@@ -6778,11 +6764,8 @@ async fn forward_supabase_realtime(
 ) {
     let (sink, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sink);
-    let rls_executor = state
-        .executor
-        .clone()
-        .with_tenant(tenant.clone())
-        .with_branch(String::from("main"));
+    let rls_executor =
+        state.executor.clone().with_tenant(tenant.clone()).with_branch(String::from("main"));
     let (events, mut event_queue) =
         tokio::sync::mpsc::channel::<SupabaseRealtimeEvent>(REALTIME_OUTGOING_QUEUE_CAPACITY);
     let mut channels: HashMap<String, SupabaseChannelState> = HashMap::new();
@@ -8061,7 +8044,9 @@ async fn kv_put(
     let result =
         inner_kv_put(&state, &headers, &table, key_bytes.clone(), body.to_vec(), query.ttl).await;
     if result.status() == StatusCode::OK {
-        note_range_write(&state, &range_routing_key(&table, &key_bytes), 1);
+        if let Ok(principal) = state.principal(&headers) {
+            note_range_write(&state, &principal.tenant, &state.database, &table, &key_bytes, 1);
+        }
     }
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);
@@ -8191,7 +8176,7 @@ async fn kv_delete(
         Err(e) => error_response(e),
     };
     if result.status() == StatusCode::OK {
-        note_range_write(&state, &range_routing_key(&table, &key_bytes), 1);
+        note_range_write(&state, &principal.tenant, &state.database, &table, &key_bytes, 1);
     }
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);
@@ -8342,10 +8327,10 @@ async fn sql_exec(
     if write_statement && result.status() == StatusCode::OK {
         if let Some(keys) = range_keys.as_deref() {
             for key in keys {
-                note_range_write(&state, &range_routing_key(&table_name, key), 1);
+                note_range_write(&state, &principal.tenant, &state.database, &table_name, key, 1);
             }
         } else {
-            note_range_write(&state, table_name.as_bytes(), 1);
+            note_range_write(&state, &principal.tenant, &state.database, &table_name, &[], 1);
         }
     }
     let micros = elapsed_micros(start);
@@ -8749,10 +8734,7 @@ async fn branch_promote(
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    let promoted = control
-        .branches
-        .get_for(&principal.tenant, "main")
-        .unwrap_or(child);
+    let promoted = control.branches.get_for(&principal.tenant, "main").unwrap_or(child);
     (StatusCode::OK, Json(promoted)).into_response()
 }
 
@@ -8860,7 +8842,8 @@ fn branch_diff_data(
     )?;
     for table in tables {
         let mut left_rows = scan_branch_diff_rows(&left_backend, tenant, &state.database, &table)?;
-        let mut right_rows = scan_branch_diff_rows(&right_backend, tenant, &state.database, &table)?;
+        let mut right_rows =
+            scan_branch_diff_rows(&right_backend, tenant, &state.database, &table)?;
         left_rows.retain(|_, value| left_executor.row_allowed_by_rls(&table, value));
         right_rows.retain(|_, value| right_executor.row_allowed_by_rls(&table, value));
         let keys: BTreeSet<Vec<u8>> = left_rows.keys().chain(right_rows.keys()).cloned().collect();
@@ -9531,6 +9514,7 @@ fn range_owners(ranges: &[Range]) -> Vec<RangeOwner> {
                 id: range.id.clone(),
                 start: range.start.clone(),
                 end: range.end.clone(),
+                routing_version: range.routing_version,
                 owner,
                 replicas,
                 epoch: range.epoch,
@@ -9539,14 +9523,13 @@ fn range_owners(ranges: &[Range]) -> Vec<RangeOwner> {
         .collect()
 }
 
-fn table_routing_bounds(table: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut start = table.as_bytes().to_vec();
-    start.push(0);
-    let mut end = start.clone();
-    if let Some(last) = end.last_mut() {
-        *last = last.saturating_add(1);
-    }
-    (start, end)
+fn table_routing_bounds(
+    version: u8,
+    tenant: &str,
+    database: &str,
+    table: &str,
+) -> ryme_error::Result<(Vec<u8>, Vec<u8>)> {
+    ryme_storage::table_routing_bounds(version, tenant, database, table)
 }
 
 fn max_routing_bound(left: &[u8], right: &[u8]) -> Vec<u8> {
@@ -9598,7 +9581,12 @@ async fn remote_scan_range_page(
     if owners.is_empty() {
         return Ok(RemoteScan::Local);
     }
-    let (table_start, table_end) = table_routing_bounds(&table);
+    let routing_version = owners[0].routing_version;
+    if owners.iter().any(|range| range.routing_version != routing_version) {
+        return Err(ryme_error::RymeError::Corrupt(String::from("mixed range routing versions")));
+    }
+    let (table_start, table_end) =
+        table_routing_bounds(routing_version, &tenant, &database, &table)?;
     let cursor = start_after.as_ref().map(|pk| {
         let mut routing = table_start.clone();
         routing.extend_from_slice(pk);
@@ -9627,7 +9615,8 @@ async fn remote_scan_range_page(
         let database = database.clone();
         requests.push(async move {
             let snapshot = if range.owner == node.node_id() {
-                node.snapshot_range_for(
+                node.snapshot_range_for_version(
+                    routing_version,
                     &lower,
                     &upper,
                     read_ts,
@@ -9636,8 +9625,9 @@ async fn remote_scan_range_page(
                     Some(&database),
                 )?
             } else {
-                node.fetch_range_snapshot_for(
+                node.fetch_range_snapshot_for_version(
                     range.owner,
+                    routing_version,
                     lower,
                     upper,
                     read_ts,
@@ -10064,6 +10054,7 @@ fn sync_range_topology(state: &SharedState, ranges: &[Range]) -> ryme_error::Res
             id: range.id,
             start: range.start,
             end: range.end,
+            routing_version: range.routing_version,
             shard: 0,
         })
         .collect();
@@ -10200,13 +10191,28 @@ async fn range_verify(
     let source_node = range.leader.strip_prefix("raft-").and_then(|id| id.parse::<usize>().ok());
     let source = match source_node {
         Some(source) if source != node.node_id() => match node
-            .fetch_range_snapshot(source, range.start.clone(), range.end.clone(), 0, max_rows)
+            .fetch_range_snapshot_with_version(
+                source,
+                range.routing_version,
+                range.start.clone(),
+                range.end.clone(),
+                0,
+                max_rows,
+            )
             .await
         {
             Ok(snapshot) => snapshot,
             Err(error) => return error_response(error),
         },
-        _ => match node.snapshot_range(&range.start, &range.end, 0, max_rows) {
+        _ => match node.snapshot_range_for_version(
+            range.routing_version,
+            &range.start,
+            &range.end,
+            0,
+            max_rows,
+            None,
+            None,
+        ) {
             Ok(snapshot) => snapshot,
             Err(error) => return error_response(error),
         },
@@ -10215,8 +10221,9 @@ async fn range_verify(
         source.clone()
     } else {
         match node
-            .fetch_range_snapshot(
+            .fetch_range_snapshot_with_version(
                 request.target,
+                range.routing_version,
                 range.start.clone(),
                 range.end.clone(),
                 source.snapshot_ts,
@@ -10320,9 +10327,7 @@ async fn range_transfer(
         range
     };
     let source_node = range.leader.strip_prefix("raft-").and_then(|id| id.parse::<usize>().ok());
-    if request.target == node.node_id()
-        || range.leader == format!("raft-{}", request.target)
-    {
+    if request.target == node.node_id() || range.leader == format!("raft-{}", request.target) {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("target")));
     }
     let members = node.current_config().await;
@@ -10332,10 +10337,25 @@ async fn range_transfer(
     let max_rows = request.max_rows.unwrap_or(100_000).clamp(1, 100_000);
     let snapshot_result = match source_node {
         Some(source) if source != node.node_id() => {
-            node.fetch_range_snapshot(source, range.start.clone(), range.end.clone(), 0, max_rows)
-                .await
+            node.fetch_range_snapshot_with_version(
+                source,
+                range.routing_version,
+                range.start.clone(),
+                range.end.clone(),
+                0,
+                max_rows,
+            )
+            .await
         }
-        _ => node.snapshot_range(&range.start, &range.end, 0, max_rows),
+        _ => node.snapshot_range_for_version(
+            range.routing_version,
+            &range.start,
+            &range.end,
+            0,
+            max_rows,
+            None,
+            None,
+        ),
     };
     let snapshot = match snapshot_result {
         Ok(snapshot) if !snapshot.truncated => snapshot,
@@ -10352,8 +10372,9 @@ async fn range_transfer(
         snapshot.rows.len()
     };
     let verified = match node
-        .fetch_range_snapshot(
+        .fetch_range_snapshot_with_version(
             request.target,
+            range.routing_version,
             range.start.clone(),
             range.end.clone(),
             snapshot.snapshot_ts,
@@ -10405,11 +10426,8 @@ async fn range_transfer(
         .iter()
         .filter_map(|replica| replica.strip_prefix("raft-")?.parse().ok())
         .collect();
-    let cleanup_peers: Vec<usize> = members
-        .iter()
-        .map(|member| member.id)
-        .filter(|peer| !retained.contains(peer))
-        .collect();
+    let cleanup_peers: Vec<usize> =
+        members.iter().map(|member| member.id).filter(|peer| !retained.contains(peer)).collect();
     let mut source_cleanup = true;
     let mut source_rows_purged = 0u64;
     for peer in cleanup_peers {
@@ -11395,9 +11413,7 @@ fn realtime_change_for_executor<B: TxnBackend>(
     match record.op {
         ryme_realtime::Operation::Insert if after_allowed => Some(record.clone()),
         ryme_realtime::Operation::Delete if before_allowed => Some(record.clone()),
-        ryme_realtime::Operation::Update if before_allowed && after_allowed => {
-            Some(record.clone())
-        }
+        ryme_realtime::Operation::Update if before_allowed && after_allowed => Some(record.clone()),
         ryme_realtime::Operation::Update if before_allowed => Some(ryme_realtime::ChangeRecord {
             op: ryme_realtime::Operation::Delete,
             after: None,
@@ -11820,13 +11836,8 @@ mod jwt_config_tests {
 
     #[test]
     fn jwt_claims_require_a_verification_source() {
-        assert!(validate_jwt_claim_configuration(
-            Some("issuer"),
-            Some("audience"),
-            false,
-            "jwt",
-        )
-        .is_err());
+        assert!(validate_jwt_claim_configuration(Some("issuer"), Some("audience"), false, "jwt",)
+            .is_err());
         assert!(validate_jwt_claim_configuration(None, None, false, "jwt").is_ok());
     }
 
@@ -11875,9 +11886,7 @@ fn validate_jwks_url_transport(url: &str) -> ryme_error::Result<()> {
         .host_str()
         .ok_or_else(|| ryme_error::RymeError::InvalidArgument(String::from("jwt jwks url")))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(ryme_error::RymeError::InvalidArgument(String::from(
-            "jwt jwks url",
-        )));
+        return Err(ryme_error::RymeError::InvalidArgument(String::from("jwt jwks url")));
     }
     if parsed.scheme() == "https"
         || (parsed.scheme() == "http"
@@ -11889,9 +11898,7 @@ fn validate_jwks_url_transport(url: &str) -> ryme_error::Result<()> {
     {
         return Ok(());
     }
-    Err(ryme_error::RymeError::InvalidArgument(String::from(
-        "jwt jwks url must use https",
-    )))
+    Err(ryme_error::RymeError::InvalidArgument(String::from("jwt jwks url must use https")))
 }
 
 fn load_jwks_verifier(
@@ -12308,6 +12315,13 @@ async fn snapshot_cluster_ranges(
 ) -> ryme_error::Result<(ryme_storage::Engine, u64)> {
     let mut ordered = owners.to_vec();
     ordered.sort_by(|left, right| left.start.cmp(&right.start));
+    let routing_version = ordered
+        .first()
+        .map(|range| range.routing_version)
+        .unwrap_or(ryme_storage::LEGACY_ROUTING_VERSION);
+    if ordered.iter().any(|range| range.routing_version != routing_version) {
+        return Err(ryme_error::RymeError::Corrupt(String::from("mixed range routing versions")));
+    }
     let mut next_start = Vec::new();
     let mut segments = Vec::new();
     for range in &ordered {
@@ -12330,13 +12344,34 @@ async fn snapshot_cluster_ranges(
     let mut engine = ryme_storage::Engine::default();
     for (start, end, owner) in segments {
         let snapshot = match owner {
-            None => node.snapshot_range(&start, &end, read_ts, 100_000)?,
-            Some(owner) if owner == node.node_id() => {
-                node.snapshot_range(&start, &end, read_ts, 100_000)?
-            }
+            None => node.snapshot_range_for_version(
+                routing_version,
+                &start,
+                &end,
+                read_ts,
+                100_000,
+                None,
+                None,
+            )?,
+            Some(owner) if owner == node.node_id() => node.snapshot_range_for_version(
+                routing_version,
+                &start,
+                &end,
+                read_ts,
+                100_000,
+                None,
+                None,
+            )?,
             Some(owner) => {
-                node.fetch_range_snapshot(owner, start.clone(), end.clone(), read_ts, 100_000)
-                    .await?
+                node.fetch_range_snapshot_with_version(
+                    owner,
+                    routing_version,
+                    start.clone(),
+                    end.clone(),
+                    read_ts,
+                    100_000,
+                )
+                .await?
             }
         };
         if snapshot.truncated {
@@ -12348,12 +12383,7 @@ async fn snapshot_cluster_ranges(
             )));
         }
         for row in snapshot.rows {
-            let key = ryme_storage::RecordKey::new(
-                &row.tenant,
-                &row.database,
-                &row.table,
-                &row.pk,
-            );
+            let key = ryme_storage::RecordKey::new(&row.tenant, &row.database, &row.table, &row.pk);
             for version in row.versions {
                 engine.apply_with_expiry(
                     key.clone(),
@@ -12605,6 +12635,7 @@ mod realtime_policy_tests {
             id: String::from("docs"),
             start: b"docs\0".to_vec(),
             end: b"docs\x01".to_vec(),
+            routing_version: 0,
             owner: 0,
             replicas: vec![0],
             epoch: 1,
@@ -12958,10 +12989,8 @@ mod realtime_policy_tests {
         state
             .executor
             .execute(
-                ryme_sql::parse(
-                    "CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)",
-                )
-                .unwrap(),
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)")
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -13003,7 +13032,8 @@ mod realtime_policy_tests {
             .await
             .unwrap();
 
-        let selected = branch_snapshot_selected(&state, &headers, "default", None).unwrap().unwrap();
+        let selected =
+            branch_snapshot_selected(&state, &headers, "default", None).unwrap().unwrap();
         let streaming_executor = branch_executor_from_snapshot(
             &state,
             state.executor.clone().with_tenant(String::from("default")),
@@ -13013,14 +13043,11 @@ mod realtime_policy_tests {
             selected.2,
         )
         .unwrap();
-        assert!(!streaming_executor.row_allowed_by_rls(
-            "messages",
-            br#"{"id":"hidden","tenant_id":"other"}"#,
-        ));
-        assert!(state.executor.row_allowed_by_rls(
-            "messages",
-            br#"{"id":"hidden","tenant_id":"other"}"#,
-        ));
+        assert!(!streaming_executor
+            .row_allowed_by_rls("messages", br#"{"id":"hidden","tenant_id":"other"}"#,));
+        assert!(state
+            .executor
+            .row_allowed_by_rls("messages", br#"{"id":"hidden","tenant_id":"other"}"#,));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13040,10 +13067,8 @@ mod realtime_policy_tests {
         state
             .executor
             .execute(
-                ryme_sql::parse(
-                    "CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)",
-                )
-                .unwrap(),
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)")
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -13154,8 +13179,8 @@ mod realtime_policy_tests {
             .unwrap();
         assert!(!state.executor.catalog_tables().contains(&String::from("branch_only")));
 
-        let child_schema = load_existing_schema_snapshot(&state.branch_schema_path("default", "preview"))
-            .unwrap();
+        let child_schema =
+            load_existing_schema_snapshot(&state.branch_schema_path("default", "preview")).unwrap();
         install_promoted_schema(&state, &child_schema).unwrap();
         assert!(state.executor.catalog_tables().contains(&String::from("branch_only")));
         let persisted = load_schema_snapshot(&dir.join("schema.json")).unwrap();
@@ -13178,8 +13203,7 @@ mod realtime_policy_tests {
         state
             .executor
             .execute(
-                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)")
-                    .unwrap(),
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap(),
             )
             .await
             .unwrap();
@@ -13217,13 +13241,12 @@ mod realtime_policy_tests {
             .await
             .unwrap();
 
-        let child_schema = load_existing_schema_snapshot(&state.branch_schema_path("default", "preview"))
-            .unwrap();
+        let child_schema =
+            load_existing_schema_snapshot(&state.branch_schema_path("default", "preview")).unwrap();
         let previous_schema = state.executor.schema_snapshot();
         install_promoted_schema(&state, &child_schema).unwrap();
-        let (child, write_txn) = prepare_branch_promotion(&state, "default", "preview")
-            .await
-            .unwrap();
+        let (child, write_txn) =
+            prepare_branch_promotion(&state, "default", "preview").await.unwrap();
         let (old_branches, new_branches, old_main_ledger, new_main_ledger) = {
             let control = state.control.lock().unwrap();
             let old_branches = control.branches.clone();

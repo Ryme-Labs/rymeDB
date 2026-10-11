@@ -39,9 +39,17 @@ async fn range_hook_records_native_put_and_delete() {
     );
     let seen = Arc::new(Mutex::new(Vec::new()));
     let moved = seen.clone();
-    let hook = RangeLoadHook::armed(Arc::new(move |key: &[u8], count: u64| {
-        moved.lock().unwrap().push((key.to_vec(), count));
-    }));
+    let hook = RangeLoadHook::armed(Arc::new(
+        move |tenant: &str, database: &str, table: &str, key: &[u8], count: u64| {
+            moved.lock().unwrap().push((
+                tenant.to_string(),
+                database.to_string(),
+                table.to_string(),
+                key.to_vec(),
+                count,
+            ));
+        },
+    ));
     let native = NativeGateway::with_gateway(gateway, keys).with_range_hook(hook);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -57,8 +65,7 @@ async fn range_hook_records_native_put_and_delete() {
     assert_eq!(reply["ok"], true);
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
-    let mut expected = b"docs\0a".to_vec();
-    assert_eq!(seen[0], (expected.clone(), 1));
-    expected = b"docs\0a".to_vec();
-    assert_eq!(seen[1], (expected, 1));
+    let expected = (String::from("t"), String::from("d"), String::from("docs"), b"a".to_vec(), 1);
+    assert_eq!(seen[0], expected);
+    assert_eq!(seen[1], expected);
 }

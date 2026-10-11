@@ -402,18 +402,14 @@ where
     }
 
     fn note_range_write(&self, key: &RecordKey) {
-        self.note_range_key(&key.table, &key.pk);
+        self.note_range_key(&key.tenant, &key.table, &key.pk);
     }
 
-    fn note_range_key(&self, table: &str, pk: &[u8]) {
+    fn note_range_key(&self, tenant: &str, table: &str, pk: &[u8]) {
         if !self.range_hook.is_armed() {
             return;
         }
-        let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
-        routing.extend_from_slice(table.as_bytes());
-        routing.push(0);
-        routing.extend_from_slice(pk);
-        self.range_hook.note(&routing, 1);
+        self.range_hook.note(tenant, &self.database, table, pk, 1);
     }
 
     fn record_timing(&self, fingerprint: &str, micros: u64) {
@@ -1437,7 +1433,7 @@ where
                 let pending = self.cdc_pending(&txn);
                 match self.manager.commit(txn).await {
                     Ok(commit_ts) => {
-                        self.note_range_key(KV_TABLE, &key);
+                        self.note_range_key(&self.tenant, KV_TABLE, &key);
                         self.cdc_emit(pending, commit_ts);
                         self.observe(true);
                         let mut out = format!("*2\r\n${}\r\n", key.len()).into_bytes();
@@ -1513,8 +1509,8 @@ where
                             let pending = self.cdc_pending(&txn);
                             match self.manager.commit(txn).await {
                                 Ok(commit_ts) => {
-                                    self.note_range_key(KV_TABLE, &args[0]);
-                                    self.note_range_key(KV_TABLE, &args[1]);
+                                    self.note_range_key(&self.tenant, KV_TABLE, &args[0]);
+                                    self.note_range_key(&self.tenant, KV_TABLE, &args[1]);
                                     self.cdc_emit(pending, commit_ts);
                                     self.observe(true);
                                     return encode_bulk(value.as_bytes());

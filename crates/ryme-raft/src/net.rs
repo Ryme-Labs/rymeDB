@@ -70,6 +70,8 @@ pub(crate) enum Rpc {
     RangeSnapshotRequest {
         start: Vec<u8>,
         end: Vec<u8>,
+        #[serde(default)]
+        routing_version: u8,
         read_ts: u64,
         max_rows: u32,
         #[serde(default)]
@@ -322,6 +324,8 @@ pub struct RangeSnapshotVersion {
 pub struct RangeSnapshot {
     pub start: Vec<u8>,
     pub end: Vec<u8>,
+    #[serde(default)]
+    pub routing_version: u8,
     pub snapshot_ts: u64,
     pub applied_commit: u64,
     pub rows: Vec<RangeSnapshotRow>,
@@ -334,6 +338,8 @@ pub struct RangeOwner {
     pub id: String,
     pub start: Vec<u8>,
     pub end: Vec<u8>,
+    #[serde(default)]
+    pub routing_version: u8,
     pub owner: usize,
     #[serde(default)]
     pub replicas: Vec<usize>,
@@ -464,18 +470,6 @@ fn derived_range_id(start: &[u8], end: &[u8], epoch: u64) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("range-{hash:016x}")
-}
-
-fn next_prefix(prefix: &[u8]) -> Vec<u8> {
-    let mut next = prefix.to_vec();
-    for index in (0..next.len()).rev() {
-        if next[index] < u8::MAX {
-            next[index] += 1;
-            next.truncate(index + 1);
-            return next;
-        }
-    }
-    Vec::new()
 }
 
 fn snapshot_live_value(row: &RangeSnapshotRow, snapshot_ts: u64) -> Option<Vec<u8>> {
@@ -2655,8 +2649,17 @@ impl Node {
                     }),
                 }
             }
-            Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows, tenant, database } => {
-                let snapshot = self.snapshot_range_for(
+            Rpc::RangeSnapshotRequest {
+                start,
+                end,
+                routing_version,
+                read_ts,
+                max_rows,
+                tenant,
+                database,
+            } => {
+                let snapshot = self.snapshot_range_for_version(
+                    routing_version,
                     &start,
                     &end,
                     read_ts,
@@ -3058,7 +3061,12 @@ impl Node {
                     RangeEntryKind::Decision { .. } | RangeEntryKind::Coordinate { .. } => {}
                 }
             }
-            self.manager.replace_routing_range(&range.start, &range.end, replacement)?;
+            self.manager.replace_routing_range_for_version(
+                range.routing_version,
+                &range.start,
+                &range.end,
+                replacement,
+            )?;
             if let Ok(mut pending) = self.range_prepared.lock() {
                 pending.retain(|(group_id, _), _| group_id != &range.id);
             }
@@ -3645,11 +3653,10 @@ impl Node {
     }
 
     fn range_for_record(&self, key: &RecordKey) -> Option<RangeOwner> {
-        let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
-        routing.extend_from_slice(key.table.as_bytes());
-        routing.push(0);
-        routing.extend_from_slice(&key.pk);
-        self.range_owners()
+        let owners = self.range_owners();
+        let version = owners.first()?.routing_version;
+        let routing = ryme_storage::record_routing_key(version, key).ok()?;
+        owners
             .into_iter()
             .find(|range| {
                 routing.as_slice() >= range.start.as_slice()
@@ -4405,22 +4412,26 @@ impl Node {
             return BTreeMap::new();
         }
         let mut participants = BTreeMap::new();
+        let routing_version = ranges
+            .first()
+            .map(|range| range.routing_version)
+            .unwrap_or(ryme_storage::LEGACY_ROUTING_VERSION);
         for key in txn.writes().keys().chain(txn.read_keys().iter()) {
             if let Some(range) = self.range_for_record(key) {
                 participants.insert(range.id.clone(), range);
             }
         }
         for (tenant, database, table) in txn.scanned_tables() {
-            let mut prefix = Vec::with_capacity(table.len() + 1);
-            prefix.extend_from_slice(table.as_bytes());
-            prefix.push(0);
-            let end = next_prefix(&prefix);
+            let Ok((prefix, end)) =
+                ryme_storage::table_routing_bounds(routing_version, tenant, database, table)
+            else {
+                continue;
+            };
             for range in &ranges {
                 let starts_before_end = end.is_empty() || range.start.as_slice() < end.as_slice();
                 let ends_after_start =
                     range.end.is_empty() || range.end.as_slice() > prefix.as_slice();
                 if starts_before_end && ends_after_start {
-                    let _ = (tenant, database);
                     let range = self.with_current_range_leader(range.clone());
                     participants.insert(range.id.clone(), range);
                 }
@@ -5168,7 +5179,15 @@ impl Node {
         read_ts: u64,
         max_rows: usize,
     ) -> Result<RangeSnapshot> {
-        self.snapshot_range_for(start, end, read_ts, max_rows, None, None)
+        self.snapshot_range_for_version(
+            ryme_storage::LEGACY_ROUTING_VERSION,
+            start,
+            end,
+            read_ts,
+            max_rows,
+            None,
+            None,
+        )
     }
 
     pub fn snapshot_range_for(
@@ -5180,6 +5199,29 @@ impl Node {
         tenant_filter: Option<&str>,
         database_filter: Option<&str>,
     ) -> Result<RangeSnapshot> {
+        self.snapshot_range_for_version(
+            ryme_storage::LEGACY_ROUTING_VERSION,
+            start,
+            end,
+            read_ts,
+            max_rows,
+            tenant_filter,
+            database_filter,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn snapshot_range_for_version(
+        &self,
+        routing_version: u8,
+        start: &[u8],
+        end: &[u8],
+        read_ts: u64,
+        max_rows: usize,
+        tenant_filter: Option<&str>,
+        database_filter: Option<&str>,
+    ) -> Result<RangeSnapshot> {
+        ryme_storage::validate_routing_version(routing_version)?;
         if start >= end && !end.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("range")));
         }
@@ -5194,10 +5236,8 @@ impl Node {
                 continue;
             }
             for (pk, table_versions) in self.manager.export_table(&tenant, &database, &table)? {
-                let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
-                routing.extend_from_slice(table.as_bytes());
-                routing.push(0);
-                routing.extend_from_slice(&pk);
+                let routing =
+                    ryme_storage::routing_key(routing_version, &tenant, &database, &table, &pk)?;
                 if routing.as_slice() < start || (!end.is_empty() && routing.as_slice() >= end) {
                     continue;
                 }
@@ -5256,6 +5296,7 @@ impl Node {
         Ok(RangeSnapshot {
             start: start.to_vec(),
             end: end.to_vec(),
+            routing_version,
             snapshot_ts,
             applied_commit: self.manager.latest_commit(),
             rows,
@@ -5275,13 +5316,13 @@ impl Node {
         if limit == 0 {
             return Ok(Some(Vec::new()));
         }
-        let table_start = {
-            let mut prefix = table.as_bytes().to_vec();
-            prefix.push(0);
-            prefix
-        };
-        let table_end = next_prefix(&table_start);
         let ranges = self.range_owners();
+        let routing_version = ranges
+            .first()
+            .map(|range| range.routing_version)
+            .unwrap_or(ryme_storage::LEGACY_ROUTING_VERSION);
+        let (table_start, table_end) =
+            ryme_storage::table_routing_bounds(routing_version, tenant, database, table)?;
         let mut spans = Vec::new();
         for range in ranges {
             let range = self.with_current_range_leader(range);
@@ -5309,7 +5350,8 @@ impl Node {
         let mut rows = BTreeMap::new();
         for (owner, lower, upper) in spans {
             let snapshot = if owner == self.id {
-                self.snapshot_range_for(
+                self.snapshot_range_for_version(
+                    routing_version,
                     &lower,
                     &upper,
                     read_ts,
@@ -5318,8 +5360,9 @@ impl Node {
                     Some(database),
                 )?
             } else {
-                self.fetch_range_snapshot_for(
+                self.fetch_range_snapshot_for_version(
                     owner,
+                    routing_version,
                     lower,
                     upper,
                     read_ts,
@@ -5353,6 +5396,26 @@ impl Node {
         read_ts: u64,
         max_rows: usize,
     ) -> Result<RangeSnapshot> {
+        self.fetch_range_snapshot_with_version(
+            peer,
+            ryme_storage::LEGACY_ROUTING_VERSION,
+            start,
+            end,
+            read_ts,
+            max_rows,
+        )
+        .await
+    }
+
+    pub async fn fetch_range_snapshot_with_version(
+        &self,
+        peer: usize,
+        routing_version: u8,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        read_ts: u64,
+        max_rows: usize,
+    ) -> Result<RangeSnapshot> {
         let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
         let max_rows = u32::try_from(max_rows.min(100_000))
             .map_err(|_| RymeError::InvalidArgument(String::from("max_rows")))?;
@@ -5360,6 +5423,7 @@ impl Node {
             .roundtrip(&Rpc::RangeSnapshotRequest {
                 start,
                 end,
+                routing_version,
                 read_ts,
                 max_rows,
                 tenant: None,
@@ -5383,13 +5447,37 @@ impl Node {
         tenant: String,
         database: String,
     ) -> Result<RangeSnapshot> {
+        self.fetch_range_snapshot_for_version(
+            peer,
+            ryme_storage::LEGACY_ROUTING_VERSION,
+            start,
+            end,
+            read_ts,
+            max_rows,
+            tenant,
+            database,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_range_snapshot_for_version(
+        &self,
+        peer: usize,
+        routing_version: u8,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        read_ts: u64,
+        max_rows: usize,
+        tenant: String,
+        database: String,
+    ) -> Result<RangeSnapshot> {
         let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
-        let max_rows = u32::try_from(max_rows.min(100_000))
-            .map_err(|_| RymeError::InvalidArgument(String::from("max_rows")))?;
         match pool
             .roundtrip(&Rpc::RangeSnapshotRequest {
                 start,
                 end,
+                routing_version,
                 read_ts,
                 max_rows,
                 tenant: Some(tenant),
@@ -5412,8 +5500,15 @@ impl Node {
         if self.manager.latest_commit() > snapshot.snapshot_ts {
             return Err(RymeError::Unavailable(String::from("target ahead")));
         }
-        let existing =
-            self.snapshot_range(&snapshot.start, &snapshot.end, snapshot.snapshot_ts, 100_000)?;
+        let existing = self.snapshot_range_for_version(
+            snapshot.routing_version,
+            &snapshot.start,
+            &snapshot.end,
+            snapshot.snapshot_ts,
+            100_000,
+            None,
+            None,
+        )?;
         if existing.truncated {
             return Err(RymeError::Overload(String::from("target range")));
         }
@@ -5480,11 +5575,14 @@ impl Node {
         if range.epoch != expected_epoch || range.owner == self.id {
             return Err(RymeError::Unavailable(String::from("range ownership update pending")));
         }
-        let current = self.snapshot_range(
+        let current = self.snapshot_range_for_version(
+            snapshot.routing_version,
             &snapshot.start,
             &snapshot.end,
             self.manager.latest_commit(),
             100_000,
+            None,
+            None,
         )?;
         if current.truncated || current.rows != snapshot.rows {
             return Err(RymeError::Conflict(String::from("range changed during transfer")));
@@ -5528,6 +5626,13 @@ impl Node {
     }
 
     pub fn set_range_owners(&self, mut owners: Vec<RangeOwner>) {
+        if let Some(first) = owners.first() {
+            if ryme_storage::validate_routing_version(first.routing_version).is_err()
+                || owners.iter().any(|range| range.routing_version != first.routing_version)
+            {
+                return;
+            }
+        }
         for range in &mut owners {
             if range.id.is_empty() {
                 range.id = derived_range_id(&range.start, &range.end, range.epoch);
@@ -5589,10 +5694,8 @@ impl Node {
     }
 
     pub fn range_owner_key(&self, key: &RecordKey) -> Option<usize> {
-        let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
-        routing.extend_from_slice(key.table.as_bytes());
-        routing.push(0);
-        routing.extend_from_slice(&key.pk);
+        let version = self.range_owners().first()?.routing_version;
+        let routing = ryme_storage::record_routing_key(version, key).ok()?;
         self.range_owner(&routing).map(|(owner, _)| owner)
     }
 
@@ -6123,6 +6226,7 @@ mod tests {
                 id: String::from("range-a"),
                 start: Vec::new(),
                 end: Vec::new(),
+                routing_version: 0,
                 owner: 0,
                 replicas: vec![0],
                 epoch: 1,
@@ -6166,6 +6270,7 @@ mod tests {
                     id: String::from("range-a"),
                     start: Vec::new(),
                     end: b"m\0".to_vec(),
+                    routing_version: 0,
                     owner: 0,
                     replicas: vec![0],
                     epoch: 1,
@@ -6174,6 +6279,7 @@ mod tests {
                     id: String::from("range-b"),
                     start: b"m\0".to_vec(),
                     end: Vec::new(),
+                    routing_version: 0,
                     owner: 0,
                     replicas: vec![0],
                     epoch: 1,
@@ -6217,6 +6323,7 @@ mod tests {
                     id: String::from("range-a"),
                     start: Vec::new(),
                     end: b"m\0".to_vec(),
+                    routing_version: 0,
                     owner: 0,
                     replicas: vec![0],
                     epoch: 1,
@@ -6225,6 +6332,7 @@ mod tests {
                     id: String::from("range-b"),
                     start: b"m\0".to_vec(),
                     end: Vec::new(),
+                    routing_version: 0,
                     owner: 0,
                     replicas: vec![0],
                     epoch: 1,
@@ -6270,6 +6378,7 @@ mod tests {
             id: String::from("range-a"),
             start: Vec::new(),
             end: Vec::new(),
+            routing_version: 0,
             owner: 0,
             replicas: vec![0],
             epoch: 1,
@@ -6434,6 +6543,7 @@ mod tests {
             id: String::from("range-a"),
             start: Vec::new(),
             end: Vec::new(),
+            routing_version: 0,
             owner: 0,
             replicas: vec![0],
             epoch: 1,
@@ -6485,6 +6595,7 @@ mod tests {
             id: String::from("range-a"),
             start: Vec::new(),
             end: Vec::new(),
+            routing_version: 0,
             owner: 0,
             replicas: vec![0],
             epoch: 1,
@@ -6648,6 +6759,7 @@ mod tests {
             id: String::from("range-a"),
             start: b"docs\0".to_vec(),
             end: b"docs\0\xff".to_vec(),
+            routing_version: 0,
             owner: 1,
             replicas: vec![1],
             epoch: 2,
@@ -6712,6 +6824,7 @@ mod tests {
             id: String::from("range-a"),
             start: Vec::new(),
             end: Vec::new(),
+            routing_version: 0,
             owner: 2,
             replicas: vec![1, 2],
             epoch: 4,
@@ -6723,6 +6836,7 @@ mod tests {
                 id: String::from("range-a"),
                 start: Vec::new(),
                 end: Vec::new(),
+                routing_version: 0,
                 owner: 1,
                 replicas: vec![1, 2],
                 epoch: 4,

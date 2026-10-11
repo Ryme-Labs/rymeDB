@@ -45,6 +45,8 @@ pub struct RangePlacement {
     pub id: String,
     pub start: Vec<u8>,
     pub end: Vec<u8>,
+    #[serde(default)]
+    pub routing_version: u8,
     pub shard: usize,
 }
 
@@ -208,12 +210,8 @@ fn persist_range_assignments(
     Ok(())
 }
 
-fn range_key(key: &RecordKey) -> Vec<u8> {
-    let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
-    routing.extend_from_slice(key.table.as_bytes());
-    routing.push(0);
-    routing.extend_from_slice(&key.pk);
-    routing
+fn range_key(version: u8, key: &RecordKey) -> Option<Vec<u8>> {
+    ryme_storage::record_routing_key(version, key).ok()
 }
 
 fn route_range(ranges: &[RangePlacement], key: &[u8]) -> Option<usize> {
@@ -224,6 +222,11 @@ fn route_range(ranges: &[RangePlacement], key: &[u8]) -> Option<usize> {
             None
         }
     })
+}
+
+fn route_record(ranges: &[RangePlacement], key: &RecordKey) -> Option<usize> {
+    let version = ranges.first()?.routing_version;
+    route_range(ranges, range_key(version, key)?.as_slice())
 }
 
 fn decode_decision(raw: &[u8]) -> Result<(u64, DecisionParts)> {
@@ -474,7 +477,7 @@ impl ShardSet {
     fn route_record(&self, key: &RecordKey) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let table = TableRef::of(key);
-        route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+        route_record(&inner.ranges, key).unwrap_or_else(|| {
             inner
                 .place
                 .get(&table)
@@ -489,6 +492,12 @@ impl ShardSet {
 
     pub fn set_range_topology(&self, mut ranges: Vec<RangePlacement>) -> Result<()> {
         ranges.sort_by(|left, right| left.start.cmp(&right.start));
+        if let Some(first) = ranges.first() {
+            ryme_storage::validate_routing_version(first.routing_version)?;
+            if ranges.iter().any(|range| range.routing_version != first.routing_version) {
+                return Err(RymeError::InvalidArgument(String::from("mixed routing versions")));
+            }
+        }
         for (index, range) in ranges.iter().enumerate() {
             if range.shard >= self.shard_count() {
                 return Err(RymeError::InvalidArgument(String::from("range shard")));
@@ -549,10 +558,9 @@ impl ShardSet {
         inner.ranges = ranges;
         inner.range_assignments = assignments;
         if old_assignments != inner.range_assignments {
-            if let Err(error) = persist_range_assignments(
-                &inner.range_placement_path,
-                &inner.range_assignments,
-            ) {
+            if let Err(error) =
+                persist_range_assignments(&inner.range_placement_path, &inner.range_assignments)
+            {
                 inner.ranges = previous_ranges;
                 inner.range_assignments = previous_assignments;
                 return Err(error);
@@ -587,7 +595,7 @@ impl ShardSet {
                 let rows = source.export_table(&tenant, &database, &table)?;
                 for (pk, versions) in rows {
                     let key = RecordKey::new(&tenant, &database, &table, &pk);
-                    let target = route_range(ranges, &range_key(&key))
+                    let target = route_record(ranges, &key)
                         .unwrap_or_else(|| hash_table(&TableRef::of(&key), inner.shards.len()));
                     if target != source_index {
                         moves
@@ -674,7 +682,7 @@ impl ShardSet {
         }
         let shard = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let shard = route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+            let shard = route_record(&inner.ranges, key).unwrap_or_else(|| {
                 inner
                     .place
                     .get(&table)
@@ -736,7 +744,7 @@ impl ShardSet {
             if inner.paused.contains(&table) {
                 return Err(RymeError::Unavailable(String::from("rescheduling")));
             }
-            let shard = route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+            let shard = route_record(&inner.ranges, key).unwrap_or_else(|| {
                 inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
             });
             cohort.insert(shard);
@@ -777,7 +785,7 @@ impl ShardSet {
             .keys()
             .map(|key| {
                 let table = TableRef::of(key);
-                route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                route_record(&inner.ranges, key).unwrap_or_else(|| {
                     inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
                 })
             })
@@ -795,7 +803,7 @@ impl ShardSet {
                 .iter()
                 .filter(|(key, _)| {
                     let table = TableRef::of(key);
-                    route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                    route_record(&inner.ranges, key).unwrap_or_else(|| {
                         inner
                             .place
                             .get(&table)
@@ -819,7 +827,7 @@ impl ShardSet {
             let index = *shard;
             manager.commit_at(&txn, commit_ts, |key| {
                 let table = TableRef::of(key);
-                route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
+                route_record(&inner.ranges, key).unwrap_or_else(|| {
                     inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
                 }) == index
             })?;
@@ -1043,7 +1051,7 @@ impl TxnBackend for ShardSet {
             let mut cohort: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             for key in txn.writes().keys().chain(txn.read_keys().iter()) {
                 let table = TableRef::of(key);
-                let shard = route_range(&guard.ranges, &range_key(key)).unwrap_or_else(|| {
+                let shard = route_record(&guard.ranges, key).unwrap_or_else(|| {
                     guard.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
                 });
                 cohort.insert(shard);
@@ -1485,6 +1493,7 @@ mod tests {
                 id: String::from("users-all"),
                 start: Vec::new(),
                 end: Vec::new(),
+                routing_version: 0,
                 shard: 0,
             }])
             .unwrap();
@@ -1494,12 +1503,14 @@ mod tests {
                     id: String::from("users-left"),
                     start: Vec::new(),
                     end: b"users\0m".to_vec(),
+                    routing_version: 0,
                     shard: 0,
                 },
                 RangePlacement {
                     id: String::from("users-right"),
                     start: b"users\0m".to_vec(),
                     end: Vec::new(),
+                    routing_version: 0,
                     shard: 0,
                 },
             ])
@@ -1541,12 +1552,14 @@ mod tests {
                     id: String::from("users-left"),
                     start: Vec::new(),
                     end: b"users\0m".to_vec(),
+                    routing_version: 0,
                     shard: 0,
                 },
                 RangePlacement {
                     id: String::from("users-right"),
                     start: b"users\0m".to_vec(),
                     end: Vec::new(),
+                    routing_version: 0,
                     shard: 0,
                 },
             ])
@@ -1579,6 +1592,7 @@ mod tests {
                 id: String::from("users-all"),
                 start: Vec::new(),
                 end: Vec::new(),
+                routing_version: 0,
                 shard: 0,
             }])
             .unwrap();
@@ -1588,12 +1602,14 @@ mod tests {
                     id: String::from("users-left"),
                     start: Vec::new(),
                     end: b"users\0m".to_vec(),
+                    routing_version: 0,
                     shard: 0,
                 },
                 RangePlacement {
                     id: String::from("users-right"),
                     start: b"users\0m".to_vec(),
                     end: Vec::new(),
+                    routing_version: 0,
                     shard: 0,
                 },
             ])

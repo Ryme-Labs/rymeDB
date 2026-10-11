@@ -98,14 +98,6 @@ where
         self
     }
 
-    fn table_key(table: &str, pk: &[u8]) -> Vec<u8> {
-        let mut routing = Vec::with_capacity(table.len() + pk.len() + 1);
-        routing.extend_from_slice(table.as_bytes());
-        routing.push(0);
-        routing.extend_from_slice(pk);
-        routing
-    }
-
     fn sql_range_keys(statement: &ryme_sql::Statement) -> Option<Vec<Vec<u8>>> {
         match statement {
             ryme_sql::Statement::Insert { pk, .. }
@@ -390,23 +382,22 @@ where
             }
             secs => Some(ryme_txn::now_unix().saturating_add(secs)),
         };
-        let routing = if self.range_hook.is_armed() {
-            Some(Self::table_key(&inner.table, &inner.pk))
-        } else {
-            None
-        };
         let reply = match self
             .gateway
-            .put_with_ttl(&principal, &inner.table, inner.pk, inner.value, expires_at)
+            .put_with_ttl(&principal, &inner.table, inner.pk.clone(), inner.value, expires_at)
             .await
         {
             Ok(commit) => proto::CommitReply { ok: true, error: String::new(), commit },
             Err(e) => proto::CommitReply { ok: false, error: e.to_string(), commit: 0 },
         };
         if reply.ok {
-            if let Some(key) = routing {
-                self.range_hook.note(&key, 1);
-            }
+            self.range_hook.note(
+                &principal.tenant,
+                self.gateway.database_name(),
+                &inner.table,
+                inner.pk.as_bytes(),
+                1,
+            );
         }
         self.observe(&principal, true);
         self.record_timing("kv_put", &inner.table, start.elapsed().as_micros() as u64, parent);
@@ -425,19 +416,18 @@ where
             return Err(Status::invalid_argument("table/pk required"));
         }
         self.admit_write(&principal, inner.pk.len() as u64).map_err(status_of)?;
-        let routing = if self.range_hook.is_armed() {
-            Some(Self::table_key(&inner.table, &inner.pk))
-        } else {
-            None
-        };
-        let reply = match self.gateway.delete(&principal, &inner.table, inner.pk).await {
+        let reply = match self.gateway.delete(&principal, &inner.table, inner.pk.clone()).await {
             Ok(commit) => proto::CommitReply { ok: true, error: String::new(), commit },
             Err(e) => proto::CommitReply { ok: false, error: e.to_string(), commit: 0 },
         };
         if reply.ok {
-            if let Some(key) = routing {
-                self.range_hook.note(&key, 1);
-            }
+            self.range_hook.note(
+                &principal.tenant,
+                self.gateway.database_name(),
+                &inner.table,
+                inner.pk.as_bytes(),
+                1,
+            );
         }
         self.observe(&principal, true);
         self.record_timing("kv_delete", &inner.table, start.elapsed().as_micros() as u64, parent);
@@ -529,10 +519,22 @@ where
                 if write && self.range_hook.is_armed() {
                     if let Some(keys) = range_keys.as_deref() {
                         for key in keys {
-                            self.range_hook.note(&Self::table_key(&table, key), 1);
+                            self.range_hook.note(
+                                &principal.tenant,
+                                self.gateway.database_name(),
+                                &table,
+                                key,
+                                1,
+                            );
                         }
                     } else {
-                        self.range_hook.note(table.as_bytes(), 1);
+                        self.range_hook.note(
+                            &principal.tenant,
+                            self.gateway.database_name(),
+                            &table,
+                            &[],
+                            1,
+                        );
                     }
                 }
                 proto::SqlReply { ok: true, error: String::new(), rows: Vec::new() }

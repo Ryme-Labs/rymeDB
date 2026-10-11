@@ -64,9 +64,17 @@ async fn simple(socket: &mut tokio::net::TcpStream, sql: &str) -> Vec<u8> {
 async fn range_hook_records_pg_writes_by_primary_key() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let moved = seen.clone();
-    let hook = RangeLoadHook::armed(Arc::new(move |key: &[u8], count: u64| {
-        moved.lock().unwrap().push((key.to_vec(), count));
-    }));
+    let hook = RangeLoadHook::armed(Arc::new(
+        move |tenant: &str, database: &str, table: &str, key: &[u8], count: u64| {
+            moved.lock().unwrap().push((
+                tenant.to_string(),
+                database.to_string(),
+                table.to_string(),
+                key.to_vec(),
+                count,
+            ));
+        },
+    ));
     let gateway =
         ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d")).with_range_hook(hook);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -83,5 +91,12 @@ async fn range_hook_records_pg_writes_by_primary_key() {
     assert!(String::from_utf8_lossy(&deleted).contains("OK"), "{deleted:?}");
     let _ = simple(&mut socket, "SELECT * FROM docs KEY 'k1'").await;
     let seen = seen.lock().unwrap();
-    assert_eq!(&*seen, &vec![(b"k1".to_vec(), 1), (b"k1".to_vec(), 1), (b"k1".to_vec(), 1)]);
+    assert_eq!(
+        &*seen,
+        &vec![
+            (String::from("t"), String::from("d"), String::from("docs"), b"k1".to_vec(), 1),
+            (String::from("t"), String::from("d"), String::from("docs"), b"k1".to_vec(), 1),
+            (String::from("t"), String::from("d"), String::from("docs"), b"k1".to_vec(), 1),
+        ]
+    );
 }

@@ -23,6 +23,71 @@ pub struct TableVersion {
 
 pub type TableRows = Vec<(Vec<u8>, Vec<TableVersion>)>;
 
+/// Routing-key formats are part of persisted range topology. Keep the legacy
+/// format readable so an existing deployment can restart, while new
+/// topologies include the isolation scopes that precede every record.
+pub const LEGACY_ROUTING_VERSION: u8 = 0;
+pub const SCOPED_ROUTING_VERSION: u8 = 1;
+pub const CURRENT_ROUTING_VERSION: u8 = SCOPED_ROUTING_VERSION;
+
+pub fn validate_routing_version(version: u8) -> Result<()> {
+    match version {
+        LEGACY_ROUTING_VERSION | SCOPED_ROUTING_VERSION => Ok(()),
+        _ => Err(RymeError::Corrupt(format!("unsupported routing version {version}"))),
+    }
+}
+
+pub fn routing_key(
+    version: u8,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    pk: &[u8],
+) -> Result<Vec<u8>> {
+    validate_routing_version(version)?;
+    let scoped_components = if version == SCOPED_ROUTING_VERSION {
+        [tenant, database, table].as_slice()
+    } else {
+        [table].as_slice()
+    };
+    if scoped_components.iter().any(|component| component.as_bytes().contains(&0)) {
+        return Err(RymeError::InvalidArgument(String::from("routing component")));
+    }
+    let mut out = Vec::with_capacity(
+        tenant.len() + database.len() + table.len() + pk.len() + if version == 0 { 1 } else { 3 },
+    );
+    if version == SCOPED_ROUTING_VERSION {
+        out.extend_from_slice(tenant.as_bytes());
+        out.push(0);
+        out.extend_from_slice(database.as_bytes());
+        out.push(0);
+    }
+    out.extend_from_slice(table.as_bytes());
+    out.push(0);
+    out.extend_from_slice(pk);
+    Ok(out)
+}
+
+pub fn record_routing_key(version: u8, key: &RecordKey) -> Result<Vec<u8>> {
+    routing_key(version, &key.tenant, &key.database, &key.table, &key.pk)
+}
+
+pub fn table_routing_bounds(
+    version: u8,
+    tenant: &str,
+    database: &str,
+    table: &str,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let start = routing_key(version, tenant, database, table, &[])?;
+    let mut end = start.clone();
+    let last =
+        end.last_mut().ok_or_else(|| RymeError::Corrupt(String::from("empty routing prefix")))?;
+    *last = last
+        .checked_add(1)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("routing prefix")))?;
+    Ok((start, end))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RecordKey {
     pub tenant: String,
@@ -368,16 +433,40 @@ impl Engine {
         end: &[u8],
         replacement: &Engine,
     ) -> usize {
-        let in_range = |key: &RecordKey| {
-            let mut routing = Vec::with_capacity(key.table.len() + key.pk.len() + 1);
-            routing.extend_from_slice(key.table.as_bytes());
-            routing.push(0);
-            routing.extend_from_slice(&key.pk);
-            routing.as_slice() >= start && (end.is_empty() || routing.as_slice() < end)
+        self.replace_routing_range_for_version(LEGACY_ROUTING_VERSION, start, end, replacement)
+            .unwrap_or_default()
+    }
+
+    pub fn replace_routing_range_for_version(
+        &mut self,
+        version: u8,
+        start: &[u8],
+        end: &[u8],
+        replacement: &Engine,
+    ) -> Result<usize> {
+        validate_routing_version(version)?;
+        let in_range = |key: &RecordKey| -> Result<bool> {
+            let routing = record_routing_key(version, key)?;
+            Ok(routing.as_slice() >= start && (end.is_empty() || routing.as_slice() < end))
         };
-        let keys: Vec<RecordKey> = self.inner.keys().filter(|key| in_range(key)).cloned().collect();
+        let keys: Vec<RecordKey> = self
+            .inner
+            .keys()
+            .map(|key| in_range(key).map(|matched| (key, matched)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(key, matched)| matched.then(|| key.clone()))
+            .collect();
+        let replacement_rows: Vec<_> = replacement
+            .inner
+            .iter()
+            .map(|(key, versions)| in_range(key).map(|matched| (key, versions, matched)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(key, versions, matched)| matched.then_some((key, versions)))
+            .collect();
         let removed = self.purge_keys(&keys);
-        for (key, versions) in replacement.inner.iter().filter(|(key, _)| in_range(key)) {
+        for (key, versions) in replacement_rows {
             self.bytes_held += versions
                 .iter()
                 .filter_map(|version| version.value.as_ref())
@@ -385,7 +474,7 @@ impl Engine {
                 .sum::<u64>();
             self.inner.insert(key.clone(), versions.clone());
         }
-        removed
+        Ok(removed)
     }
 
     pub fn spaces(&self) -> Vec<(String, String, String)> {
@@ -967,6 +1056,57 @@ mod tests {
         mismatched_max[8..16].copy_from_slice(&21u64.to_be_bytes());
         refresh_snapshot_checksum(&mut mismatched_max);
         assert!(matches!(Engine::decode_snapshot(&mismatched_max), Err(RymeError::Corrupt(_))));
+    }
+
+    #[test]
+    fn routing_versions_keep_tenants_and_databases_ordered() {
+        let legacy = routing_key(LEGACY_ROUTING_VERSION, "tenant-a", "db-a", "docs", b"k").unwrap();
+        assert_eq!(legacy, b"docs\0k");
+        let scoped = routing_key(SCOPED_ROUTING_VERSION, "tenant-a", "db-a", "docs", b"k").unwrap();
+        assert_eq!(scoped, b"tenant-a\0db-a\0docs\0k");
+        assert_ne!(
+            scoped,
+            routing_key(SCOPED_ROUTING_VERSION, "tenant-b", "db-a", "docs", b"k").unwrap()
+        );
+        assert!(routing_key(SCOPED_ROUTING_VERSION, "tenant\0a", "db", "docs", b"k").is_err());
+        assert!(routing_key(9, "tenant", "db", "docs", b"k").is_err());
+    }
+
+    #[test]
+    fn scoped_table_bounds_cover_only_one_database_table() {
+        let (start, end) = table_routing_bounds(SCOPED_ROUTING_VERSION, "t", "d", "docs").unwrap();
+        assert_eq!(start, b"t\0d\0docs\0");
+        assert_eq!(end, b"t\0d\0docs\x01");
+        assert!(routing_key(SCOPED_ROUTING_VERSION, "t", "d", "docs", b"z").unwrap() < end);
+        assert!(routing_key(SCOPED_ROUTING_VERSION, "t", "d2", "docs", b"a").unwrap() >= end);
+    }
+
+    #[test]
+    fn scoped_range_replacement_does_not_cross_tenants() {
+        let tenant_a = RecordKey::new("tenant-a", "db", "docs", b"k");
+        let tenant_b = RecordKey::new("tenant-b", "db", "docs", b"k");
+        let mut engine = Engine::new();
+        engine.apply(tenant_a.clone(), 1, Some(b"old-a".to_vec())).unwrap();
+        engine.apply(tenant_b.clone(), 2, Some(b"old-b".to_vec())).unwrap();
+
+        let mut replacement = Engine::new();
+        replacement.apply(tenant_a.clone(), 3, Some(b"new-a".to_vec())).unwrap();
+        let (start, end) =
+            table_routing_bounds(SCOPED_ROUTING_VERSION, "tenant-a", "db", "docs").unwrap();
+
+        assert_eq!(
+            engine
+                .replace_routing_range_for_version(
+                    SCOPED_ROUTING_VERSION,
+                    &start,
+                    &end,
+                    &replacement,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(engine.read(&tenant_a, 3, 0).unwrap(), Some(b"new-a".to_vec()));
+        assert_eq!(engine.read(&tenant_b, 3, 0).unwrap(), Some(b"old-b".to_vec()));
     }
 
     fn refresh_snapshot_checksum(snapshot: &mut [u8]) {

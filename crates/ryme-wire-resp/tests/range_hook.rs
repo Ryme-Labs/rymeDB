@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-type Seen = Arc<Mutex<Vec<(Vec<u8>, u64)>>>;
+type Seen = Arc<Mutex<Vec<(String, String, String, Vec<u8>, u64)>>>;
 
 async fn command(addr: std::net::SocketAddr, parts: &[&str]) -> String {
     let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -45,17 +45,18 @@ async fn serve(hook: RangeLoadHook) -> std::net::SocketAddr {
 fn recorder() -> (RangeLoadHook, Seen) {
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
     let moved = seen.clone();
-    let hook = RangeLoadHook::armed(Arc::new(move |key: &[u8], count: u64| {
-        moved.lock().unwrap().push((key.to_vec(), count));
-    }));
+    let hook = RangeLoadHook::armed(Arc::new(
+        move |tenant: &str, database: &str, table: &str, key: &[u8], count: u64| {
+            moved.lock().unwrap().push((
+                tenant.to_string(),
+                database.to_string(),
+                table.to_string(),
+                key.to_vec(),
+                count,
+            ));
+        },
+    ));
     (hook, seen)
-}
-
-fn routing(table: &str, pk: &str) -> Vec<u8> {
-    let mut out = table.as_bytes().to_vec();
-    out.push(0);
-    out.extend_from_slice(pk.as_bytes());
-    out
 }
 
 #[tokio::test]
@@ -67,14 +68,20 @@ async fn range_hook_records_committed_resp_writes() {
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0], (routing("_kv", "k"), 1));
+        assert_eq!(
+            seen[0],
+            (String::from("t"), String::from("d"), String::from("_kv"), b"k".to_vec(), 1)
+        );
     }
     assert_eq!(command(addr, &["DEL", "k"]).await, ":1");
     assert_eq!(command(addr, &["DEL", "missing"]).await, ":0");
     {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
-        assert_eq!(seen[1], (routing("_kv", "k"), 1));
+        assert_eq!(
+            seen[1],
+            (String::from("t"), String::from("d"), String::from("_kv"), b"k".to_vec(), 1)
+        );
     }
 }
 

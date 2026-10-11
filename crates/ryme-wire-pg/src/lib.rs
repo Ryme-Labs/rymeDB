@@ -69,15 +69,17 @@ struct SessionTransaction {
 
 fn note_range_changes(
     hook: &RangeLoadHook,
+    tenant: &str,
+    database: &str,
     table: &str,
     changes: &[TransactionChange],
     count: u64,
 ) {
     if changes.is_empty() {
-        hook.note(table.as_bytes(), count.max(1));
+        hook.note(tenant, database, table, &[], count.max(1));
     } else {
         for change in changes {
-            hook.note(&change.pk, 1);
+            hook.note(tenant, database, table, &change.pk, 1);
         }
     }
 }
@@ -97,13 +99,20 @@ fn statement_range_keys(statement: &Statement) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-fn note_statement_range(hook: &RangeLoadHook, table: &str, keys: Option<&[Vec<u8>]>, count: u64) {
+fn note_statement_range(
+    hook: &RangeLoadHook,
+    tenant: &str,
+    database: &str,
+    table: &str,
+    keys: Option<&[Vec<u8>]>,
+    count: u64,
+) {
     if let Some(keys) = keys {
         for key in keys {
-            hook.note(key, 1);
+            hook.note(tenant, database, table, key, 1);
         }
     } else {
-        hook.note(table.as_bytes(), count.max(1));
+        hook.note(tenant, database, table, &[], count.max(1));
     }
 }
 
@@ -854,6 +863,8 @@ where
                                         Ok((_result, changes)) => {
                                             note_range_changes(
                                                 &limits.range_hook,
+                                                &limits.tenant,
+                                                &limits.database,
                                                 &table,
                                                 &changes,
                                                 count.max(1) as u64,
@@ -895,6 +906,8 @@ where
                                             observe_statement(&limits, true);
                                             note_statement_range(
                                                 &limits.range_hook,
+                                                &limits.tenant,
+                                                &limits.database,
                                                 &table,
                                                 range_keys.as_deref(),
                                                 count as u64,
@@ -3216,6 +3229,8 @@ where
                 if write {
                     note_range_changes(
                         &limits.range_hook,
+                        &limits.tenant,
+                        &limits.database,
                         &table,
                         &changes,
                         changes.len().max(1) as u64,
@@ -3236,7 +3251,14 @@ where
             Ok(result) => {
                 observe_statement(limits, write);
                 if write {
-                    note_statement_range(&limits.range_hook, &table, range_keys.as_deref(), 1);
+                    note_statement_range(
+                        &limits.range_hook,
+                        &limits.tenant,
+                        &limits.database,
+                        &table,
+                        range_keys.as_deref(),
+                        1,
+                    );
                 }
                 record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
                 encode_result(result)
