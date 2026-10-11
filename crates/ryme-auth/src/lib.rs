@@ -547,16 +547,36 @@ pub struct PasswordHash {
     pub rounds: u32,
 }
 
+/// Legacy SHA-256 work factor retained for serialized-hash compatibility.
 pub const PASSWORD_ROUNDS: u32 = 210_000;
+const ARGON2ID_MARKER: u32 = u32::MAX;
+const ARGON2ID_MEMORY_KIB: u32 = 19 * 1024;
+const ARGON2ID_TIME_COST: u32 = 2;
+const ARGON2ID_PARALLELISM: u32 = 1;
+const PASSWORD_HASH_LEN: usize = 32;
+const MAX_LEGACY_PASSWORD_ROUNDS: u32 = 1_000_000;
 pub const MAX_PASSWORD_LEN: usize = 256;
 pub const MAX_USER_LEN: usize = 256;
 pub const MAX_CHALLENGES: usize = 4096;
 
 pub fn hash_password(password: &str) -> PasswordHash {
     let salt = random_bytes(16);
-    hash_password_with_salt(password, &salt, PASSWORD_ROUNDS)
+    let mut hash = [0u8; PASSWORD_HASH_LEN];
+    argon2id()
+        .hash_password_into(password.as_bytes(), &salt, &mut hash)
+        .expect("fixed Argon2id password parameters must be valid");
+    PasswordHash {
+        salt_b64: base64_url_encode(&salt),
+        hash_b64: base64_url_encode(&hash),
+        rounds: ARGON2ID_MARKER,
+    }
 }
 
+/// Hash a password using the legacy SHA-256 format.
+///
+/// New credentials must use [`hash_password`]. This remains available so
+/// callers can create fixtures and retain compatibility with stored hashes
+/// written before Argon2id was introduced.
 pub fn hash_password_with_salt(password: &str, salt: &[u8], rounds: u32) -> PasswordHash {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
@@ -576,8 +596,30 @@ pub fn verify_password(password: &str, stored: &PasswordHash) -> bool {
     let Ok(salt) = base64_url_decode(&stored.salt_b64) else {
         return false;
     };
-    let candidate = hash_password_with_salt(password, &salt, stored.rounds);
-    constant_time_equal(candidate.hash_b64.as_bytes(), stored.hash_b64.as_bytes())
+    let candidate = if stored.rounds == ARGON2ID_MARKER {
+        let mut hash = [0u8; PASSWORD_HASH_LEN];
+        if argon2id().hash_password_into(password.as_bytes(), &salt, &mut hash).is_err() {
+            return false;
+        }
+        base64_url_encode(&hash)
+    } else {
+        if stored.rounds == 0 || stored.rounds > MAX_LEGACY_PASSWORD_ROUNDS {
+            return false;
+        }
+        hash_password_with_salt(password, &salt, stored.rounds).hash_b64
+    };
+    constant_time_equal(candidate.as_bytes(), stored.hash_b64.as_bytes())
+}
+
+fn argon2id() -> argon2::Argon2<'static> {
+    let params = argon2::Params::new(
+        ARGON2ID_MEMORY_KIB,
+        ARGON2ID_TIME_COST,
+        ARGON2ID_PARALLELISM,
+        Some(PASSWORD_HASH_LEN),
+    )
+    .expect("fixed Argon2id password parameters must be valid");
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
 }
 
 pub fn totp_code(secret: &[u8], unix_secs: u64) -> String {
@@ -889,7 +931,7 @@ impl CredentialStore {
                 dummy = PasswordHash {
                     salt_b64: base64_url_encode(&[0u8; 16]),
                     hash_b64: base64_url_encode(&[0u8; 32]),
-                    rounds: PASSWORD_ROUNDS,
+                    rounds: ARGON2ID_MARKER,
                 };
                 &dummy
             }
@@ -1252,6 +1294,17 @@ mod tests {
         let stored = hash_password_with_salt("hunter2", b"fixed-salt-123456", 2);
         assert!(verify_password("hunter2", &stored));
         assert!(!verify_password("wrong", &stored));
+    }
+
+    #[test]
+    fn new_passwords_use_argon2id_and_legacy_work_factor_is_bounded() {
+        let stored = hash_password("hunter2");
+        assert_eq!(stored.rounds, ARGON2ID_MARKER);
+        assert!(verify_password("hunter2", &stored));
+        assert!(!verify_password("wrong", &stored));
+
+        let malformed = PasswordHash { rounds: u32::MAX - 1, ..stored };
+        assert!(!verify_password("hunter2", &malformed));
     }
 
     #[test]

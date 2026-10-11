@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ryme-error = { workspace = true }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hmac = "0.12"
