@@ -4,6 +4,7 @@ use ryme_error::{Result, RymeError};
 use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_storage::RecordKey;
 use ryme_txn::{TxnBackend, TxnManager};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -331,6 +332,59 @@ where
         self.put_with_ttl(principal, table, pk, value, None).await
     }
 
+    /// Apply a group of puts under one MVCC commit. This is the transaction
+    /// boundary used by bulk REST writes and keeps partial batches from
+    /// becoming visible when a later row fails validation.
+    pub async fn put_many(
+        &self,
+        principal: &Principal,
+        table: &str,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<u64> {
+        self.reject_if_read_only()?;
+        if table.is_empty() || rows.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("rows")));
+        }
+        self.policies.check_write(principal, table)?;
+        let mut txn = self.begin();
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut changes = Vec::with_capacity(rows.len());
+        for (pk, value) in rows {
+            if pk.is_empty() || pk.len() > MAX_KEY_BYTES {
+                return Err(RymeError::InvalidArgument(String::from("key")));
+            }
+            if value.len() > MAX_VALUE_BYTES {
+                return Err(RymeError::Overload(String::from("value")));
+            }
+            if !seen.insert(pk.clone()) {
+                return Err(RymeError::Conflict(String::from("duplicate key")));
+            }
+            self.policies.check_write_row(principal, table, &value)?;
+            let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
+            let before = self.read_for_write(&mut txn, &key).await?;
+            let op = if before.is_some() { Operation::Update } else { Operation::Insert };
+            self.manager.put(&mut txn, key, value.clone());
+            changes.push((pk, before, value, op));
+        }
+        let commit_ts = self.manager.commit(txn).await?;
+        for (pk, before, after, op) in changes {
+            self.realtime.publish(NewChange {
+                tenant: principal.tenant.clone(),
+                database: self.database.clone(),
+                branch: self.branch.clone(),
+                table: table.to_string(),
+                op,
+                pk,
+                before,
+                after: Some(after),
+                commit_ts,
+                tx_id: commit_ts,
+            })?;
+        }
+        self.refresh_table(principal, table, commit_ts);
+        Ok(commit_ts)
+    }
+
     pub async fn put_with_ttl(
         &self,
         principal: &Principal,
@@ -452,30 +506,57 @@ where
     }
 
     pub async fn delete(&self, principal: &Principal, table: &str, pk: Vec<u8>) -> Result<u64> {
+        self.delete_many(principal, table, vec![pk]).await
+    }
+
+    /// Delete a group of rows under one MVCC commit. Missing or unauthorized
+    /// rows abort the complete batch instead of leaving a partial delete.
+    pub async fn delete_many(
+        &self,
+        principal: &Principal,
+        table: &str,
+        pks: Vec<Vec<u8>>,
+    ) -> Result<u64> {
         self.reject_if_read_only()?;
         self.policies.check_write(principal, table)?;
-        let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
-        let mut txn = self.begin();
-        let Some(current) = self.read_for_write(&mut txn, &key).await? else {
-            return Err(RymeError::NotFound(String::from("row")));
-        };
-        if !self.policies.row_allowed(principal, table, &current)? {
-            return Err(RymeError::NotFound(String::from("row")));
+        if table.is_empty() || pks.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("keys")));
         }
-        self.manager.delete(&mut txn, key);
+        let mut txn = self.begin();
+        let mut seen = HashSet::with_capacity(pks.len());
+        let mut changes = Vec::with_capacity(pks.len());
+        for pk in pks {
+            if pk.is_empty() || pk.len() > MAX_KEY_BYTES {
+                return Err(RymeError::InvalidArgument(String::from("key")));
+            }
+            if !seen.insert(pk.clone()) {
+                return Err(RymeError::Conflict(String::from("duplicate key")));
+            }
+            let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
+            let Some(current) = self.read_for_write(&mut txn, &key).await? else {
+                return Err(RymeError::NotFound(String::from("row")));
+            };
+            if !self.policies.row_allowed(principal, table, &current)? {
+                return Err(RymeError::NotFound(String::from("row")));
+            }
+            self.manager.delete(&mut txn, key);
+            changes.push((pk, current));
+        }
         let commit_ts = self.manager.commit(txn).await?;
-        self.realtime.publish(NewChange {
-            tenant: principal.tenant.clone(),
-            database: self.database.clone(),
-            branch: self.branch.clone(),
-            table: table.to_string(),
-            op: Operation::Delete,
-            pk,
-            before: Some(current),
-            after: None,
-            commit_ts,
-            tx_id: commit_ts,
-        })?;
+        for (pk, current) in changes {
+            self.realtime.publish(NewChange {
+                tenant: principal.tenant.clone(),
+                database: self.database.clone(),
+                branch: self.branch.clone(),
+                table: table.to_string(),
+                op: Operation::Delete,
+                pk,
+                before: Some(current),
+                after: None,
+                commit_ts,
+                tx_id: commit_ts,
+            })?;
+        }
         self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
     }
@@ -741,6 +822,53 @@ mod tests {
             .put(&principal, "docs", b"k".to_vec(), vec![b'v'; MAX_VALUE_BYTES + 1])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_mutations_commit_atomically_and_share_commit_timestamp() {
+        let gateway = gateway();
+        let principal = owner();
+        let too_large = vec![b'x'; MAX_VALUE_BYTES + 1];
+        assert!(gateway
+            .put_many(
+                &principal,
+                "docs",
+                vec![(b"first".to_vec(), b"ok".to_vec()), (b"second".to_vec(), too_large)],
+            )
+            .await
+            .is_err());
+        assert!(gateway.get(&principal, "docs", b"first").unwrap().is_none());
+
+        gateway
+            .put_many(
+                &principal,
+                "docs",
+                vec![(b"first".to_vec(), b"one".to_vec()), (b"second".to_vec(), b"two".to_vec())],
+            )
+            .await
+            .unwrap();
+        assert!(gateway
+            .delete_many(&principal, "docs", vec![b"first".to_vec(), b"missing".to_vec()])
+            .await
+            .is_err());
+        assert!(gateway.get(&principal, "docs", b"first").unwrap().is_some());
+
+        let mut changes = gateway.realtime().subscribe("t", "d", "docs");
+        let commit = gateway
+            .put_many(
+                &principal,
+                "docs",
+                vec![
+                    (b"third".to_vec(), b"three".to_vec()),
+                    (b"fourth".to_vec(), b"four".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        let first = changes.recv().await.unwrap();
+        let second = changes.recv().await.unwrap();
+        assert_eq!(first.commit_ts, commit);
+        assert_eq!(second.commit_ts, commit);
     }
 
     #[tokio::test]

@@ -3516,7 +3516,7 @@ async fn rest_insert(
                 .filter(|field| !field.is_empty())
                 .map(str::to_string)
         });
-    let mut inserted = Vec::new();
+    let mut pending = Vec::with_capacity(rows.len());
     for (body, (mut key, value)) in rows {
         if let Some(field) = conflict_field.as_deref() {
             if let Some(expected) = body.fields.get(field) {
@@ -3533,16 +3533,19 @@ async fn rest_insert(
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
-        match gateway.put(&principal, &table, key.clone(), value.clone()).await {
-            Ok(commit) => {
-                record_meter(&state, Metric::WriteUnit, 1);
-                note_range_write(&state, &range_routing_key(&table, &key), 1);
-                inserted.push(rest_row_to_json(&key, &value));
-                let _ = commit;
-            }
-            Err(e) => return error_response(e),
-        }
+        pending.push((key, value));
     }
+    if let Err(e) = gateway.put_many(&principal, &table, pending.clone()).await {
+        return error_response(e);
+    }
+    let inserted = pending
+        .iter()
+        .map(|(key, value)| {
+            record_meter(&state, Metric::WriteUnit, 1);
+            note_range_write(&state, &range_routing_key(&table, key), 1);
+            rest_row_to_json(key, value)
+        })
+        .collect::<Vec<_>>();
     if rest_prefer(&headers, "return=minimal") {
         StatusCode::CREATED.into_response()
     } else {
@@ -3592,7 +3595,7 @@ async fn rest_upsert(
         Ok(keys) => keys,
         Err(e) => return error_response(e),
     };
-    let mut updated = Vec::with_capacity(keys.len());
+    let mut pending = Vec::with_capacity(keys.len());
     for key in keys {
         let Some(current) = (match gateway.get(&principal, &table, &key) {
             Ok(current) => current,
@@ -3616,16 +3619,21 @@ async fn rest_upsert(
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
-        match gateway.put(&principal, &table, key.clone(), value.clone()).await {
-            Ok(commit) => {
-                record_meter(&state, Metric::WriteUnit, 1);
-                note_range_write(&state, &range_routing_key(&table, &key), 1);
-                updated.push(rest_row_to_json(&key, &value));
-                let _ = commit;
-            }
-            Err(e) => return error_response(e),
+        pending.push((key, value));
+    }
+    if !pending.is_empty() {
+        if let Err(e) = gateway.put_many(&principal, &table, pending.clone()).await {
+            return error_response(e);
         }
     }
+    let updated = pending
+        .iter()
+        .map(|(key, value)| {
+            record_meter(&state, Metric::WriteUnit, 1);
+            note_range_write(&state, &range_routing_key(&table, key), 1);
+            rest_row_to_json(key, value)
+        })
+        .collect::<Vec<_>>();
     if rest_prefer(&headers, "return=minimal") {
         StatusCode::OK.into_response()
     } else {
@@ -3663,22 +3671,30 @@ async fn rest_delete(
         Ok(keys) => keys,
         Err(e) => return error_response(e),
     };
-    let mut deleted = 0u64;
-    let mut last_commit = 0u64;
-    for key in keys {
+    if keys.is_empty() {
+        if rest_prefer(&headers, "return=minimal") {
+            return StatusCode::OK.into_response();
+        }
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "commit": 0u64, "deleted": 0u64 })),
+        )
+            .into_response();
+    }
+    for key in &keys {
         if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {
             return error_response(e);
         }
-        match gateway.delete(&principal, &table, key.clone()).await {
-            Ok(commit) => {
-                record_meter(&state, Metric::WriteUnit, 1);
-                note_range_write(&state, &range_routing_key(&table, &key), 1);
-                deleted += 1;
-                last_commit = commit;
-            }
-            Err(e) => return error_response(e),
-        }
     }
+    let last_commit = match gateway.delete_many(&principal, &table, keys.clone()).await {
+        Ok(commit) => commit,
+        Err(e) => return error_response(e),
+    };
+    for key in &keys {
+        record_meter(&state, Metric::WriteUnit, 1);
+        note_range_write(&state, &range_routing_key(&table, key), 1);
+    }
+    let deleted = keys.len() as u64;
     if rest_prefer(&headers, "return=minimal") {
         StatusCode::OK.into_response()
     } else {

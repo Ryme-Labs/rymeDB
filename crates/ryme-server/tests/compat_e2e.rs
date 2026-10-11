@@ -181,6 +181,16 @@ async fn compat_rest_graphql_copy_explain() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains(r#""id":"p2""#), "{text}");
     assert!(text.contains(r#""id":"p3""#), "{text}");
+    let (status, _) = http_request(
+        http,
+        "POST /rest/v1/people",
+        br#"[{"id":"atomic","name":"first"},{"id":"atomic","name":"second"}]"#,
+    )
+    .await;
+    assert_eq!(status, 409);
+    let (status, body) = http_request(http, "GET /rest/v1/people?id=eq.atomic", b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8_lossy(&body), "[]");
     let (status, body, _) = http_request_headers(
         http,
         "POST /rest/v1/people",

@@ -77,6 +77,8 @@ and `on_conflict=<field>` resolves duplicate JSON rows by that field,
 partial updates,
 `DELETE /rest/v1/:table?<field>=eq.<value>` (including the legacy
 `key=eq.<id>` form).
+Bulk inserts, PATCH updates, and filtered deletes commit as one MVCC batch, so
+a validation or conflict error leaves the whole batch unchanged.
 Filtered reads continue across storage pages, and non-key `order` clauses
 scan the complete filtered result before sorting. PostgREST `Prefer:
 return=minimal` and `Prefer: count=exact` headers are supported for mutation

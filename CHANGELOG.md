@@ -6,6 +6,8 @@
   claims, `app_metadata.roles`, and `tenant_id` tenant claims.
 - JWT validation now enforces future `nbf` and `iat` claims with the verifier's
   configured clock-skew leeway.
+- REST bulk inserts, PATCH updates, and filtered deletes now use one MVCC
+  commit, preventing partial batches and sharing one realtime commit timestamp.
 - Hybrid PITR now restores the replicated tier through Raft and the current
   node's local shard set, with the response identifying the local replay scope.
 - Added a hosted CI workflow that checks formatting for core packages, runs
