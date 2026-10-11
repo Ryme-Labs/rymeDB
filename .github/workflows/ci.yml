@@ -51,7 +51,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler postgresql-client
+
+      - name: Verify PostgreSQL compatibility client
+        run: psql --version
 
       - name: Check formatting for core packages
         run: >-
