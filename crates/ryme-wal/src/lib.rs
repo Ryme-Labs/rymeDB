@@ -42,13 +42,16 @@ impl Wal {
             return Err(RymeError::InvalidArgument(String::from("payload too large")));
         }
         let lsn = self.next_lsn;
+        let next_lsn = lsn
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))?;
         let frame = encode_frame(lsn, commit_ts, payload);
         let active_len = self.active.metadata()?.len();
         if active_len + frame.len() as u64 > self.segment_size_bytes {
             self.rotate()?;
         }
         self.active.write_all(&frame)?;
-        self.next_lsn += 1;
+        self.next_lsn = next_lsn;
         Ok(WalRecord { lsn, commit_ts, payload: payload.to_vec() })
     }
 
@@ -62,6 +65,7 @@ impl Wal {
         ids.sort_unstable();
         let latest_id = ids.last().copied();
         let mut out = Vec::new();
+        let mut previous_lsn = None;
         for id in ids {
             let path = dir.join(segment_name(id));
             let mut file = File::open(&path)?;
@@ -72,6 +76,10 @@ impl Wal {
                 match decode_frame(cursor)? {
                     Some((record, consumed)) => {
                         cursor = &cursor[consumed..];
+                        if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                            return Err(RymeError::Corrupt(String::from("wal lsn order")));
+                        }
+                        previous_lsn = Some(record.lsn);
                         out.push(record);
                     }
                     None if Some(id) == latest_id => break,
@@ -79,7 +87,6 @@ impl Wal {
                 }
             }
         }
-        out.sort_by_key(|r| r.lsn);
         Ok(out)
     }
 
@@ -137,6 +144,9 @@ impl Wal {
     }
 
     fn rewrite(&mut self, records: &[WalRecord]) -> Result<()> {
+        if records.windows(2).any(|pair| pair[0].lsn >= pair[1].lsn) {
+            return Err(RymeError::InvalidArgument(String::from("wal lsn order")));
+        }
         let temporary = self.dir.join(".rewrite");
         if temporary.exists() {
             std::fs::remove_dir_all(&temporary)?;
@@ -229,6 +239,9 @@ fn recover_next_lsn(active: &mut File) -> Result<u64> {
         match decode_frame(cursor)? {
             Some((record, consumed)) => {
                 cursor = &cursor[consumed..];
+                if max.is_some_and(|previous| record.lsn <= previous) {
+                    return Err(RymeError::Corrupt(String::from("wal lsn order")));
+                }
                 max = Some(record.lsn);
             }
             None => {
@@ -242,7 +255,10 @@ fn recover_next_lsn(active: &mut File) -> Result<u64> {
         }
     }
     active.seek(SeekFrom::End(0))?;
-    Ok(max.map(|v| v + 1).unwrap_or(0))
+    max.map(|lsn| {
+        lsn.checked_add(1).ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
+    })
+    .unwrap_or(Ok(0))
 }
 
 fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Vec<u8> {
@@ -330,6 +346,45 @@ mod tests {
         std::fs::write(&path, &raw).unwrap();
         let result = Wal::read_all(&dir);
         assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_rejects_out_of_order_lsns() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-lsn-order-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut raw = encode_frame(2, 2, b"later");
+        raw.extend_from_slice(&encode_frame(1, 1, b"earlier"));
+        std::fs::write(dir.join(segment_name(0)), raw).unwrap();
+
+        assert!(matches!(Wal::read_all(&dir), Err(RymeError::Corrupt(_))));
+        assert!(matches!(Wal::open(&dir, 1024), Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacement_rejects_out_of_order_lsns_without_changing_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-replace-lsn-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 1024).unwrap();
+        wal.append(1, b"existing").unwrap();
+        wal.sync().unwrap();
+        let invalid = [
+            WalRecord { lsn: 2, commit_ts: 2, payload: b"later".to_vec() },
+            WalRecord { lsn: 1, commit_ts: 1, payload: b"earlier".to_vec() },
+        ];
+
+        assert!(matches!(wal.replace_records(&invalid), Err(RymeError::InvalidArgument(_))));
+        assert_eq!(Wal::read_all(&dir).unwrap()[0].payload, b"existing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
