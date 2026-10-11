@@ -107,7 +107,7 @@ async fn psql_smoke() {
     assert!(out.contains("messages|r"), "{out}");
     assert!(out.contains("id|2950|t"), "{out}");
     assert!(out.contains("uuid|2950"), "{out}");
-    assert!(out.contains("messages_id_pkey|p"), "{out}");
+    assert!(out.contains("messages_pkey|p"), "{out}");
     assert!(out.contains("fk_profiles_fkey_0|n|r"), "{out}");
     let (ok, out) = psql(
         addr,

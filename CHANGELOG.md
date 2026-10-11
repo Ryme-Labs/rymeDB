@@ -1,5 +1,8 @@
 # Changelog
 
+- PostgreSQL wire sessions now preserve startup user and database parameters
+  for `current_user`, `session_user`, `session_authorization`, and
+  `current_database()` compatibility probes.
 - Java, npm, and Rust SDK migration helpers now accept an optional branch and
   send `X-Ryme-Branch` so migration execution and ledger reads can target
   branch-local schema state.

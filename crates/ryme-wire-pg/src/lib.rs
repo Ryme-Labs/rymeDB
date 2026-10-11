@@ -213,6 +213,7 @@ impl ConnLimits {
 #[derive(Debug, Clone)]
 struct StartupParams {
     user: String,
+    database: Option<String>,
 }
 
 fn qos_now_nanos() -> u64 {
@@ -500,7 +501,17 @@ where
         send_backend_key_data(&mut socket, pid, secret).await?;
         send_ready(&mut socket).await?;
         let notifications = notification_sender(&limits.tenant, &limits.database).subscribe();
-        serve_loop(socket, executor, limits, cancellation, pid, notifications).await
+        serve_loop(
+            socket,
+            executor,
+            limits,
+            cancellation,
+            pid,
+            notifications,
+            startup.user,
+            startup.database,
+        )
+        .await
     }
     .await;
     unregister_backend(pid, secret);
@@ -617,7 +628,8 @@ fn parse_startup(payload: &[u8]) -> Result<StartupParams> {
         .remove("user")
         .filter(|user| !user.is_empty())
         .ok_or_else(|| RymeError::InvalidArgument(String::from("startup user")))?;
-    Ok(StartupParams { user })
+    let database = values.remove("database").filter(|database| !database.is_empty());
+    Ok(StartupParams { user, database })
 }
 
 async fn authenticate_startup<B, S>(
@@ -695,6 +707,8 @@ async fn serve_loop<B, S>(
     cancellation: Arc<AtomicBool>,
     pid: u32,
     mut notifications: broadcast::Receiver<PgNotification>,
+    user: String,
+    database: Option<String>,
 ) -> std::result::Result<(), RymeError>
 where
     B: TxnBackend,
@@ -703,7 +717,12 @@ where
     let mut statements: HashMap<String, String> = HashMap::new();
     let mut portals: HashMap<String, Portal> = HashMap::new();
     let mut prepared_cache: HashMap<String, (String, Statement)> = HashMap::new();
-    let mut session: HashMap<String, String> = HashMap::new();
+    let mut session = HashMap::from([
+        (String::from("current_user"), user.clone()),
+        (String::from("session_user"), user.clone()),
+        (String::from("session_authorization"), user),
+        (String::from("current_database"), database.unwrap_or_else(|| limits.database.clone())),
+    ]);
     let mut listening = HashSet::new();
     let mut copy_in: Option<CopyInState> = None;
     let mut active_transaction: Option<SessionTransaction> = None;
@@ -2694,7 +2713,10 @@ fn session_default(name: &str) -> Option<&'static str> {
         "transaction_isolation" => Some("serializable"),
         "default_transaction_isolation" => Some("serializable"),
         "application_name" => Some(""),
+        "current_database" => Some("default"),
+        "current_user" => Some("ryme"),
         "session_authorization" => Some("ryme"),
+        "session_user" => Some("ryme"),
         "is_superuser" => Some("off"),
         "max_identifier_length" => Some("63"),
         "search_path" => Some("public"),
@@ -3537,6 +3559,8 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
                 let names = [
                     "application_name",
                     "client_encoding",
+                    "current_database",
+                    "current_user",
                     "datestyle",
                     "integer_datetimes",
                     "search_path",
@@ -3546,6 +3570,7 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
                     "standard_conforming_strings",
                     "default_transaction_isolation",
                     "session_authorization",
+                    "session_user",
                     "is_superuser",
                     "max_identifier_length",
                     "timezone",
@@ -3795,8 +3820,17 @@ fn eval_select_item(item: &str, session: &HashMap<String, String>) -> Option<Str
     }
     match expression.to_ascii_lowercase().as_str() {
         "version()" | "pg_catalog.version()" => Some(String::from("PostgreSQL 16.0 on rymeDB")),
-        "current_database()" => Some(String::from("default")),
-        "current_user" | "current_user()" => Some(String::from("ryme")),
+        "current_database()" => {
+            session.get("current_database").cloned().or_else(|| Some(String::from("default")))
+        }
+        "current_user" | "current_user()" => {
+            session.get("current_user").cloned().or_else(|| Some(String::from("ryme")))
+        }
+        "session_user" | "session_authorization" => session
+            .get(expression.to_ascii_lowercase().as_str())
+            .cloned()
+            .or_else(|| session.get("session_user").cloned())
+            .or_else(|| Some(String::from("ryme"))),
         "current_schema()" => Some(String::from("public")),
         "current_catalog" => Some(String::from("default")),
         expression if expression.starts_with("current_setting(") && expression.ends_with(')') => {
@@ -4728,6 +4762,35 @@ mod tests {
         assert!(session_select("SELECT * FROM users", &session).is_none());
         let rows = session_select("SELECT pg_catalog.version()", &session).unwrap();
         assert_eq!(rows[0].1, "PostgreSQL 16.0 on rymeDB");
+    }
+
+    #[test]
+    fn startup_identity_is_available_to_session_probes() {
+        let mut payload = 196_608u32.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"user\0ada\0database\0chat\0\0");
+        let startup = parse_startup(&payload).unwrap();
+        assert_eq!(startup.user, "ada");
+        assert_eq!(startup.database.as_deref(), Some("chat"));
+
+        let session = HashMap::from([
+            (String::from("current_user"), startup.user.clone()),
+            (String::from("session_user"), startup.user.clone()),
+            (String::from("session_authorization"), startup.user),
+            (
+                String::from("current_database"),
+                startup.database.unwrap_or_else(|| String::from("default")),
+            ),
+        ]);
+        assert_eq!(
+            session_select("SELECT current_user, session_user, current_database()", &session,)
+                .unwrap(),
+            vec![
+                (String::from("current_user"), String::from("ada")),
+                (String::from("session_user"), String::from("ada")),
+                (String::from("current_database()"), String::from("chat")),
+            ]
+        );
+        assert!(session_command("SHOW session_authorization", &mut session.clone()).is_some());
     }
 
     #[test]
