@@ -790,9 +790,14 @@ impl ShardSet {
                 })
             })
             .collect();
-        let commit_ts =
-            managers.iter().map(|(_, manager)| manager.inner().latest_commit()).max().unwrap_or(0)
-                + 1;
+        let commit_ts = managers
+            .iter()
+            .map(|(_, manager)| manager.inner().latest_commit())
+            .max()
+            .unwrap_or(0)
+            .max(txn.read_ts)
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
         for (_, manager) in managers.iter() {
             manager.inner().validate_at(&txn, commit_ts)?;
         }
@@ -1790,6 +1795,47 @@ mod tests {
         assert_eq!(
             backend.get(&mut probe, &RecordKey::new("t", "d", &right, b"k")).unwrap(),
             Some(b"v-right".to_vec())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_phase_commit_uses_global_snapshot_timestamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-2pc-global-ts-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
+        let mut by_shard = BTreeMap::new();
+        for index in 0..128 {
+            let table = format!("global-ts-{index}");
+            by_shard.entry(backend.route(&TableRef::new("t", "d", &table))).or_insert(table);
+            if by_shard.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(by_shard.len(), 3);
+        let mut tables = by_shard.into_values();
+        let high_table = tables.next().unwrap();
+        let left_table = tables.next().unwrap();
+        let right_table = tables.next().unwrap();
+
+        commit_table(&backend, "t", "d", &high_table, writes(vec![("k", "high")]));
+        let mut txn = backend.begin();
+        backend.put(&mut txn, RecordKey::new("t", "d", &left_table, b"k"), b"left".to_vec());
+        backend.put(&mut txn, RecordKey::new("t", "d", &right_table, b"k"), b"right".to_vec());
+        futures_executor_block_on(backend.commit(txn)).unwrap();
+
+        let mut probe = backend.begin();
+        assert_eq!(
+            backend.get(&mut probe, &RecordKey::new("t", "d", &left_table, b"k")).unwrap(),
+            Some(b"left".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut probe, &RecordKey::new("t", "d", &right_table, b"k")).unwrap(),
+            Some(b"right".to_vec())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
