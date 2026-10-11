@@ -1,5 +1,10 @@
 # Changelog
 
+- Cross-range transaction prepare and resolve records now replicate through each
+  participating range group's quorum log and replay from the range WAL after
+  restart. The global Raft log remains the transaction decision authority, but a
+  range participant no longer relies on a leader-local intent record for its
+  prepare state.
 - Owner-routed cluster transactions now pin their snapshot at the first remote
   point read when the gateway's local range view is stale, then forward that
   timestamp for later reads and range scans. Existing transaction snapshots are

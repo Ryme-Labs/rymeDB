@@ -220,8 +220,9 @@ records before serving reads. A range heartbeat also reports the follower's
 last durable index; when a replica is behind, the current range leader streams
 the missing records in order and advances that follower's commit view only
 after the repaired prefix is acknowledged. This gives the current placement
-map a durable replica-repair and materialization path without claiming that
-range logs provide independent cross-range transaction coordination.
+map a durable replica-repair and materialization path; range transaction
+records use the same quorum log while the global log still coordinates the
+cross-range decision.
 If a promoted leader finds an uncommitted divergent suffix, the follower
 reports the conflict index and the leader retries from the common prefix. The
 affected range WAL is rewritten while unrelated range records are retained;
@@ -250,9 +251,10 @@ that write set through the existing CDC hook. Range records created as mirrors
 of a global-log commit do not carry the marker, preventing duplicate realtime
 events.
 Multi-owner transactions now run an explicit prepare phase at each configured
-range owner. Each participant writes a durable intent record before the
-coordinator appends the global Raft data decision, and commit/abort resolution
-cleans those records; unresolved records are recovered on participant restart.
+range owner. Each participant appends its prepare record through that range
+group's quorum log before the coordinator appends the global Raft data decision.
+Commit/abort resolution is also a committed range record, and unresolved
+records are recovered from the range WAL on participant restart.
 Prepared intents also reserve their conflict set: ordinary local or
 range-local commits that overlap a prepared transaction are rejected until the
 coordinator resolves it. This prevents a fast path from bypassing the
@@ -261,8 +263,9 @@ The coordinator also records each participant's commit or abort resolution in
 a separate WAL and retries unacknowledged resolutions from its main loop after
 restart. A lost resolution RPC therefore leaves recoverable work rather than
 an intent that can block the participant forever.
-The global Raft log is still the decision authority, so this is a durable
-participant protocol, not yet independent per-range Raft groups.
+The global Raft log is still the decision authority, so this is a range-durable
+participant protocol, not yet an independent per-range transaction coordinator
+or fully independent per-range Raft 2PC decision path.
 Cluster transactions also carry the range-topology generation observed at
 begin. Changing the configured range map invalidates an older transaction at
 commit, including write-only owner forwarding; the mesh returns a typed
