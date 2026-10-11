@@ -112,8 +112,10 @@ verification and ORM introspection.
 Persisted function and trigger metadata is also available through
 `pg_catalog.pg_proc` and `pg_catalog.pg_trigger`.
 Common `CREATE VIEW` and `CREATE OR REPLACE VIEW` definitions over supported
-read queries are persisted in schema snapshots and can be removed with
-`DROP VIEW [IF EXISTS]`. Views are exposed as `VIEW` rows through
+read queries are persisted in schema snapshots with their relation
+dependencies and can be removed with `DROP VIEW [IF EXISTS]` after dependent
+views are removed. Dropping a referenced table or view is rejected rather than
+leaving invalid view metadata. Views are exposed as `VIEW` rows through
 `information_schema.tables` and as `relkind = 'v'` in `pg_catalog.pg_class`.
 PostgreSQL sequences are also persisted and support `CREATE SEQUENCE`,
 `ALTER SEQUENCE ... RESTART/INCREMENT`, `DROP SEQUENCE`, and the common

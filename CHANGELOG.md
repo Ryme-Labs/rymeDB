@@ -1,5 +1,8 @@
 # Changelog
 
+- View definitions now persist their referenced relations, reject creation over
+  missing tables or views, and block `DROP TABLE`/`DROP VIEW` while dependents
+  exist instead of leaving broken schema metadata.
 - PostgreSQL sessions now support transaction-scoped `SET LOCAL` values,
   including savepoint rollback and automatic restoration at transaction end.
 - PostgreSQL sessions now enforce `statement_timeout` for queries and row

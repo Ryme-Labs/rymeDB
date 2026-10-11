@@ -4877,6 +4877,7 @@ mod tests {
             ViewDefinition {
                 name: String::from("active_messages"),
                 query: parse("SELECT * FROM messages").unwrap(),
+                dependencies: vec![String::from("messages")],
                 materialized: false,
                 rows: Vec::new(),
             },

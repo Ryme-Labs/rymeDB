@@ -641,9 +641,53 @@ pub struct ViewDefinition {
     pub name: String,
     pub query: Statement,
     #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
     pub materialized: bool,
     #[serde(default)]
     pub rows: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+fn relation_short_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name).trim_matches('"')
+}
+
+fn same_relation(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+        || relation_short_name(left).eq_ignore_ascii_case(relation_short_name(right))
+}
+
+fn collect_view_dependencies(statement: &Statement, dependencies: &mut BTreeSet<String>) {
+    match statement {
+        Statement::SelectByKey { table, .. }
+        | Statement::SelectScan { table, .. }
+        | Statement::SelectColumns { table, .. }
+        | Statement::Aggregate { table, .. }
+        | Statement::GroupBy { table, .. }
+        | Statement::CopyTo { table, .. } => {
+            dependencies.insert(table.clone());
+        }
+        Statement::Join { left, right, .. } => {
+            dependencies.insert(left.clone());
+            dependencies.insert(right.clone());
+        }
+        Statement::Returning { statement, .. }
+        | Statement::Explain { inner: statement, .. }
+        | Statement::Distinct { statement, .. } => {
+            collect_view_dependencies(statement, dependencies);
+        }
+        Statement::Union { left, right, .. } => {
+            collect_view_dependencies(left, dependencies);
+            collect_view_dependencies(right, dependencies);
+        }
+        _ => {}
+    }
+}
+
+fn view_dependencies(query: &Statement) -> Vec<String> {
+    let mut dependencies = BTreeSet::new();
+    collect_view_dependencies(query, &mut dependencies);
+    dependencies.into_iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7052,13 +7096,40 @@ where
     }
 
     fn install_view_definition(&self, definition: ViewDefinition, replace: bool) -> Result<()> {
+        let mut definition = definition;
+        definition.dependencies = view_dependencies(&definition.query);
+        for dependency in &definition.dependencies {
+            let table_exists = self
+                .catalog
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
+                .keys()
+                .any(|table| same_relation(table, dependency));
+            let view_exists = self.view_definition(dependency)?.is_some();
+            if !table_exists && !view_exists {
+                return Err(RymeError::NotFound(format!("relation {dependency}")));
+            }
+            if same_relation(&definition.name, dependency) {
+                return Err(RymeError::InvalidArgument(String::from("recursive view")));
+            }
+        }
         let mut views =
             self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
+        let mut pending = definition.dependencies.clone();
+        let mut visited = HashSet::new();
+        while let Some(dependency) = pending.pop() {
+            if !visited.insert(dependency.to_ascii_lowercase()) {
+                continue;
+            }
+            if same_relation(&definition.name, &dependency) {
+                return Err(RymeError::InvalidArgument(String::from("recursive view")));
+            }
+            if let Some(view) = views.values().find(|view| same_relation(&view.name, &dependency)) {
+                pending.extend(view.dependencies.iter().cloned());
+            }
+        }
         if !replace && views.contains_key(&definition.name) {
             return Err(RymeError::Conflict(format!("view {}", definition.name)));
-        }
-        if definition.name.eq_ignore_ascii_case(definition.query.table()) {
-            return Err(RymeError::InvalidArgument(String::from("recursive view")));
         }
         let object_name = definition.name.clone();
         views.insert(object_name.clone(), definition);
@@ -7094,18 +7165,29 @@ where
     }
 
     fn drop_view(&self, name: &str, if_exists: bool) -> Result<()> {
-        let removed = self
-            .views
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("view lock")))?
-            .remove(name)
-            .is_some();
-        if !removed && !if_exists {
+        let mut views =
+            self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
+        let Some(key) = views.keys().find(|candidate| same_relation(candidate, name)).cloned()
+        else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(RymeError::NotFound(format!("view {name}")));
+        };
+        if let Some(dependent) = views.values().find(|view| {
+            !same_relation(&view.name, &key)
+                && view.dependencies.iter().any(|dependency| same_relation(dependency, &key))
+        }) {
+            return Err(RymeError::Conflict(format!(
+                "view {} is referenced by view {}",
+                key, dependent.name
+            )));
+        }
+        if views.remove(&key).is_none() {
             return Err(RymeError::NotFound(format!("view {name}")));
         }
-        if removed {
-            self.schema_dirty.store(true, Ordering::SeqCst);
-        }
+        drop(views);
+        self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -7816,7 +7898,10 @@ where
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
         let functions = snapshot.functions;
         let triggers = snapshot.triggers;
-        let views = snapshot.views;
+        let mut views = snapshot.views;
+        for definition in views.values_mut() {
+            definition.dependencies = view_dependencies(&definition.query);
+        }
         let sequences = snapshot.sequences;
         let roles = snapshot.roles;
         let privileges = snapshot.privileges;
@@ -10662,6 +10747,20 @@ where
             }
             return Err(RymeError::NotFound(String::from("table")));
         }
+        if let Some(dependent) = self
+            .views
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("view lock")))?
+            .values()
+            .find(|view| {
+                view.dependencies.iter().any(|dependency| same_relation(dependency, &table))
+            })
+        {
+            return Err(RymeError::Conflict(format!(
+                "table {} is referenced by view {}",
+                table, dependent.name
+            )));
+        }
         if self
             .foreign_keys
             .lock()
@@ -11586,7 +11685,13 @@ where
             }
             Statement::CreateView { name, query, replace } => {
                 self.install_view(
-                    ViewDefinition { name, query: *query, materialized: false, rows: Vec::new() },
+                    ViewDefinition {
+                        name,
+                        query: *query,
+                        dependencies: Vec::new(),
+                        materialized: false,
+                        rows: Vec::new(),
+                    },
                     replace,
                 )?;
                 Ok((QueryResult::Ok, Vec::new()))
@@ -11599,7 +11704,13 @@ where
                     Vec::new()
                 };
                 self.install_view_definition(
-                    ViewDefinition { name, query, materialized: true, rows },
+                    ViewDefinition {
+                        name,
+                        query,
+                        dependencies: Vec::new(),
+                        materialized: true,
+                        rows,
+                    },
                     replace,
                 )?;
                 Ok((QueryResult::Ok, Vec::new()))
@@ -13809,7 +13920,13 @@ where
             }
             Statement::CreateView { name, query, replace } => {
                 self.install_view(
-                    ViewDefinition { name, query: *query, materialized: false, rows: Vec::new() },
+                    ViewDefinition {
+                        name,
+                        query: *query,
+                        dependencies: Vec::new(),
+                        materialized: false,
+                        rows: Vec::new(),
+                    },
                     replace,
                 )?;
                 Ok(QueryResult::Ok)
@@ -13823,7 +13940,13 @@ where
                     Vec::new()
                 };
                 self.install_view_definition(
-                    ViewDefinition { name, query, materialized: true, rows },
+                    ViewDefinition {
+                        name,
+                        query,
+                        dependencies: Vec::new(),
+                        materialized: true,
+                        rows,
+                    },
                     replace,
                 )?;
                 Ok(QueryResult::Ok)
@@ -15079,6 +15202,50 @@ mod tests {
         assert!(
             matches!(restored, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"hello".to_vec()]])
         );
+    }
+
+    #[tokio::test]
+    async fn views_validate_dependencies_and_protect_referenced_objects() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        assert!(matches!(
+            executor.execute(parse("CREATE VIEW missing_view AS SELECT * FROM missing_table").unwrap()).await,
+            Err(RymeError::NotFound(message)) if message.contains("missing_table")
+        ));
+
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE VIEW message_view AS SELECT * FROM messages").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE VIEW nested_view AS SELECT * FROM message_view").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            executor
+                .execute(parse("CREATE OR REPLACE VIEW message_view AS SELECT * FROM nested_view").unwrap())
+                .await,
+            Err(RymeError::InvalidArgument(message)) if message.contains("recursive view")
+        ));
+
+        let snapshot = executor.schema_snapshot();
+        assert_eq!(snapshot.views["message_view"].dependencies, vec![String::from("messages")]);
+        assert_eq!(snapshot.views["nested_view"].dependencies, vec![String::from("message_view")]);
+        assert!(matches!(
+            executor.execute(parse("DROP TABLE messages").unwrap()).await,
+            Err(RymeError::Conflict(message)) if message.contains("message_view")
+        ));
+        assert!(matches!(
+            executor.execute(parse("DROP VIEW message_view").unwrap()).await,
+            Err(RymeError::Conflict(message)) if message.contains("nested_view")
+        ));
+
+        executor.execute(parse("DROP VIEW nested_view").unwrap()).await.unwrap();
+        executor.execute(parse("DROP VIEW message_view").unwrap()).await.unwrap();
+        executor.execute(parse("DROP TABLE messages").unwrap()).await.unwrap();
     }
 
     #[tokio::test]

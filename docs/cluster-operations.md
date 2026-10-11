@@ -313,7 +313,8 @@ UPDATE FROM, DELETE USING, and INSERT SELECT now use those pages before
 staging their writes. Foreign-key checks and cascading delete/update actions
 now use the same owner-routed point-read and scan paths, stage all dependent
 changes in the transaction, and commit through the existing distributed
-coordinator. Schema-dependent views remain separate work. Main-branch
+coordinator. View relation dependencies are persisted with the schema snapshot,
+so dependent objects cannot be dropped into an invalid state. Main-branch
 autocommit schema changes now use a tagged global-Raft metadata entry: the
 leader must coordinate the new schema snapshot through quorum before the
 request succeeds, and every follower restores and persists that same snapshot
