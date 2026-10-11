@@ -6896,7 +6896,7 @@ where
     }
 
     pub fn schema_transaction_snapshot(&self) -> Option<SchemaSnapshot> {
-        self.schema_hook.as_ref().map(|_| self.schema_snapshot())
+        Some(self.schema_snapshot())
     }
 
     pub fn rollback_schema_transaction(&self, snapshot: Option<SchemaSnapshot>) -> Result<()> {
@@ -12926,7 +12926,7 @@ where
         let schema_changed = schema_after
             .as_ref()
             .is_some_and(|after| schema_before.as_ref().is_some_and(|before| before != after));
-        if schema_changed && !changes.is_empty() {
+        if schema_changed && !changes.is_empty() && self.schema_hook.is_some() {
             self.rollback_schema_transaction(schema_before)?;
             return Err(RymeError::InvalidArgument(String::from(
                 "schema changes and row changes cannot share a clustered transaction",

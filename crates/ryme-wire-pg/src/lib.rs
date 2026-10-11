@@ -2816,7 +2816,7 @@ where
                 *active = Some(SessionTransaction {
                     txn: executor.begin_transaction(isolation),
                     changes: Vec::new(),
-                    schema_before: executor.schema_transaction_snapshot(),
+                    schema_before: None,
                     notifications: Vec::new(),
                     listener_changes: Vec::new(),
                     failed: false,
@@ -2960,6 +2960,13 @@ where
             transaction.failed = true;
         }
         return denied;
+    }
+    if statement.is_schema_change() {
+        if let Some(transaction) = active.as_mut() {
+            if transaction.schema_before.is_none() {
+                transaction.schema_before = executor.schema_transaction_snapshot();
+            }
+        }
     }
     let write = statement.is_write();
     let table = statement.table().to_string();
