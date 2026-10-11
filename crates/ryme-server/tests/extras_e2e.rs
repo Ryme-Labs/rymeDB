@@ -937,7 +937,7 @@ async fn extras_oidc_flow() {
     std::env::set_var("RYME_API_KEY", KEY);
     std::env::set_var("RYME_OIDC_ISSUER", "https://auth.rymedb.test");
     std::env::set_var("RYME_OIDC_AUDIENCE", "rymedb-app");
-    std::env::set_var("RYME_OIDC_SECRET", "oidc-e2e-secret");
+    std::env::set_var("RYME_OIDC_SECRET", "oidc-e2e-secret!");
     std::env::set_var("RYME_OIDC_AUTH_ENDPOINT", "https://auth.rymedb.test/authorize");
     std::env::set_var("RYME_OIDC_CLIENT_ID", "rymedb-app");
     std::env::set_var("RYME_OIDC_REDIRECT_URIS", "https://app.test/callback");
@@ -1007,7 +1007,7 @@ async fn extras_oidc_flow() {
     );
     let payload_b64 = ryme_auth::base64_url_encode(payload.as_bytes());
     let input = format!("{header}.{payload_b64}");
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"oidc-e2e-secret").unwrap();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"oidc-e2e-secret!").unwrap();
     mac.update(input.as_bytes());
     use hmac::Mac;
     let id_token =
