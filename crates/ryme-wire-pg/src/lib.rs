@@ -56,6 +56,9 @@ enum DecodedCopy {
     Columns { columns: Vec<String>, rows: Vec<Vec<InsertValue>> },
 }
 
+const MAX_PREPARED_STATEMENTS: usize = 256;
+const MAX_PORTALS: usize = 256;
+
 struct SessionTransaction {
     txn: Transaction,
     changes: Vec<TransactionChange>,
@@ -1172,6 +1175,19 @@ where
             }
             b'P' => match parse_prepare(&payload) {
                 Ok((name, query)) => {
+                    if statements.len() >= MAX_PREPARED_STATEMENTS
+                        && !statements.contains_key(&name)
+                    {
+                        let response = encode_error_code(
+                            "54000",
+                            String::from("prepared statement limit exceeded"),
+                        );
+                        socket
+                            .write_all(&response)
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        continue;
+                    }
                     prepared_cache.remove(&name);
                     statements.insert(name, query);
                     socket
@@ -1186,6 +1202,15 @@ where
             },
             b'B' => match parse_bind(&payload) {
                 Ok((portal, statement, params)) => {
+                    if portals.len() >= MAX_PORTALS && !portals.contains_key(&portal) {
+                        let response =
+                            encode_error_code("54000", String::from("portal limit exceeded"));
+                        socket
+                            .write_all(&response)
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        continue;
+                    }
                     portals.insert(portal, Portal { statement, params, cached: None });
                     socket
                         .write_all(&frame(b'2', b""))
@@ -3339,6 +3364,12 @@ where
             if body.is_empty() || (parse(body).is_err() && session_select(body, session).is_none())
             {
                 return Some(encode_error_code("42601", format!("unsupported statement: {query}")));
+            }
+            if statements.len() >= MAX_PREPARED_STATEMENTS && !statements.contains_key(&name) {
+                return Some(encode_error_code(
+                    "54000",
+                    String::from("prepared statement limit exceeded"),
+                ));
             }
             prepared_cache.remove(&name);
             statements.insert(name, body.to_string());

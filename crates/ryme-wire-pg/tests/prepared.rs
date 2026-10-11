@@ -239,6 +239,35 @@ async fn prepared_portal_invalidation() {
 }
 
 #[tokio::test]
+async fn prepared_statements_and_portals_have_session_limits() {
+    let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+    let mut socket = startup(addr).await;
+
+    for index in 0..256 {
+        let response =
+            roundtrip(&mut socket, parse_msg(&format!("statement-{index}"), "SELECT 1")).await;
+        assert_eq!(response.first().map(|(tag, _)| *tag), Some(b'1'));
+    }
+    socket.write_all(&parse_msg("statement-over-limit", "SELECT 1")).await.unwrap();
+    let (_, body) = read_frame(&mut socket).await;
+    assert!(String::from_utf8_lossy(&body).contains("prepared statement limit exceeded"));
+
+    for index in 0..256 {
+        let response =
+            roundtrip(&mut socket, bind_msg(&format!("portal-{index}"), "statement-0", &[])).await;
+        assert_eq!(response.first().map(|(tag, _)| *tag), Some(b'2'));
+    }
+    socket.write_all(&bind_msg("portal-over-limit", "statement-0", &[])).await.unwrap();
+    let (_, body) = read_frame(&mut socket).await;
+    assert!(String::from_utf8_lossy(&body).contains("portal limit exceeded"));
+}
+
+#[tokio::test]
 async fn prepared_sql_execute_caches() {
     let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
