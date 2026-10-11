@@ -30,16 +30,7 @@ impl Wal {
         let active_id = latest_segment_id(dir)?;
         let path = dir.join(segment_name(active_id));
         let mut active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
-        recover_next_lsn(&mut active)?;
-        let next_lsn = Self::read_all(dir)?
-            .last()
-            .map(|record| {
-                record
-                    .lsn
-                    .checked_add(1)
-                    .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
-            })
-            .unwrap_or(Ok(0))?;
+        let next_lsn = recover_next_lsn(dir, active_id, &mut active)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             segment_size_bytes,
@@ -290,36 +281,47 @@ fn parse_segment_name(name: &str) -> Option<u64> {
     rest.parse::<u64>().ok()
 }
 
-fn recover_next_lsn(active: &mut File) -> Result<u64> {
-    active.seek(SeekFrom::Start(0))?;
-    let mut raw = Vec::new();
-    active.read_to_end(&mut raw)?;
-    let mut cursor = raw.as_slice();
-    let mut max: Option<u64> = None;
-    while !cursor.is_empty() {
-        match decode_frame(cursor)? {
-            Some((record, consumed)) => {
-                cursor = &cursor[consumed..];
-                if max.is_some_and(|previous| record.lsn <= previous) {
-                    return Err(RymeError::Corrupt(String::from("wal lsn order")));
+fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64> {
+    let mut ids = segment_ids(dir)?;
+    ids.sort_unstable();
+    let latest_id = ids.last().copied();
+    let mut previous_lsn = None;
+
+    for id in ids {
+        let mut raw = Vec::new();
+        if id == active_id {
+            active.seek(SeekFrom::Start(0))?;
+            active.read_to_end(&mut raw)?;
+        } else {
+            File::open(dir.join(segment_name(id)))?.read_to_end(&mut raw)?;
+        }
+        let mut cursor = raw.as_slice();
+        while !cursor.is_empty() {
+            match decode_frame(cursor)? {
+                Some((record, consumed)) => {
+                    cursor = &cursor[consumed..];
+                    if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                        return Err(RymeError::Corrupt(String::from("wal lsn order")));
+                    }
+                    previous_lsn = Some(record.lsn);
                 }
-                max = Some(record.lsn);
-            }
-            None => {
-                let valid_len = raw.len() - cursor.len();
-                if valid_len < raw.len() {
+                None if id == active_id && Some(id) == latest_id => {
+                    let valid_len = raw.len() - cursor.len();
                     active.set_len(valid_len as u64)?;
                     active.sync_data()?;
+                    break;
                 }
-                break;
+                None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
             }
         }
     }
+
     active.seek(SeekFrom::End(0))?;
-    max.map(|lsn| {
-        lsn.checked_add(1).ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
-    })
-    .unwrap_or(Ok(0))
+    previous_lsn
+        .map(|lsn| {
+            lsn.checked_add(1).ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
+        })
+        .unwrap_or(Ok(0))
 }
 
 fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Vec<u8> {
@@ -424,6 +426,22 @@ mod tests {
         std::fs::write(dir.join(segment_name(0)), raw).unwrap();
 
         assert!(matches!(Wal::read_all(&dir), Err(RymeError::Corrupt(_))));
+        assert!(matches!(Wal::open(&dir, 1024), Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_rejects_out_of_order_lsns_across_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-segment-lsn-order-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(segment_name(0)), encode_frame(2, 2, b"later")).unwrap();
+        std::fs::write(dir.join(segment_name(1)), encode_frame(1, 1, b"earlier")).unwrap();
+
         assert!(matches!(Wal::open(&dir, 1024), Err(RymeError::Corrupt(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
