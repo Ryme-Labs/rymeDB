@@ -3623,15 +3623,11 @@ fn record_meter(state: &SharedState, tenant: &str, metric: Metric, quantity: u64
         state.database.clone(),
         metric,
         quantity,
-        format!("{}-{}", state.node_id, now_secs_nanos()),
+        String::new(),
     );
     if let Ok(mut registry) = state.metering.lock() {
         registry.ingest(event);
     }
-}
-
-fn now_secs_nanos() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
 fn qos_now_nanos() -> u64 {

@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+const MAX_METER_NAME_BYTES: usize = 256;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const MAX_METER_TOTALS: usize = 1_000_000;
+const MAX_SEEN_IDEMPOTENCY_KEYS: usize = 1_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageEvent {
     pub tenant: String,
@@ -58,13 +63,32 @@ impl MeterRegistry {
     }
 
     pub fn ingest(&mut self, event: UsageEvent) -> bool {
+        if event.tenant.is_empty()
+            || event.tenant.len() > MAX_METER_NAME_BYTES
+            || event.database.is_empty()
+            || event.database.len() > MAX_METER_NAME_BYTES
+            || event.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES
+        {
+            return false;
+        }
+        let key = MeterKey {
+            tenant: event.tenant.clone(),
+            database: event.database.clone(),
+            metric: event.metric,
+        };
+        if !self.totals.contains_key(&key) && self.totals.len() >= MAX_METER_TOTALS {
+            return false;
+        }
         if event.idempotency_key.is_empty() {
             self.add(event);
             return true;
         }
-        if !self.seen.insert(event.idempotency_key.clone()) {
+        if self.seen.contains(&event.idempotency_key)
+            || self.seen.len() >= MAX_SEEN_IDEMPOTENCY_KEYS
+        {
             return false;
         }
+        self.seen.insert(event.idempotency_key.clone());
         self.add(event);
         true
     }
@@ -271,6 +295,30 @@ mod tests {
         let total = registry.total_for("t", "d", Metric::WriteUnit);
         assert_eq!(total.quantity, 2);
         assert_eq!(total.events, 1);
+    }
+
+    #[test]
+    fn rejects_unbounded_identity_fields() {
+        let mut registry = MeterRegistry::new();
+        let long_name = "t".repeat(MAX_METER_NAME_BYTES + 1);
+        assert!(!registry.ingest(UsageEvent::new(
+            long_name,
+            String::from("d"),
+            Metric::ReadUnit,
+            1,
+            String::new(),
+        )));
+        assert!(registry.is_empty());
+
+        let long_key = "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1);
+        assert!(!registry.ingest(UsageEvent::new(
+            String::from("t"),
+            String::from("d"),
+            Metric::ReadUnit,
+            1,
+            long_key,
+        )));
+        assert!(registry.is_empty());
     }
 
     #[test]
