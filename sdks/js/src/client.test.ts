@@ -460,8 +460,7 @@ function wsStub(
       const outgoing = connection++ === 0 ? frames : (options.reconnectFrames ?? frames);
       for (const frame of outgoing) {
         const payload = Buffer.from(frame, "utf8");
-        const header = Buffer.from([0x81, payload.length]);
-        socket.write(Buffer.concat([header, payload]));
+        socket.write(encodeWebSocketTextFrame(payload));
       }
       if (options.closeAfterFrames) setImmediate(() => socket.end());
     });
@@ -474,6 +473,24 @@ function wsStub(
       server.close();
     },
   };
+}
+
+function encodeWebSocketTextFrame(payload: Buffer): Buffer {
+  if (payload.length < 126) {
+    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  }
+  if (payload.length <= 0xffff) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+    return Buffer.concat([header, payload]);
+  }
+  const header = Buffer.alloc(10);
+  header[0] = 0x81;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(payload.length), 2);
+  return Buffer.concat([header, payload]);
 }
 
 async function waitFor(done: () => boolean): Promise<void> {
