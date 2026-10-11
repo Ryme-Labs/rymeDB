@@ -12,6 +12,29 @@ use std::sync::Arc;
 pub const MAX_KEY_BYTES: usize = 1024;
 pub const MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH_ROWS: usize = 10_000;
+pub const MAX_TABLE_BYTES: usize = 256;
+pub const MAX_SCAN_ROWS: usize = 1_000;
+
+fn validate_table(table: &str) -> Result<()> {
+    if table.is_empty() || table.len() > MAX_TABLE_BYTES || table.contains('\0') {
+        return Err(RymeError::InvalidArgument(String::from("table")));
+    }
+    Ok(())
+}
+
+fn validate_key(pk: &[u8]) -> Result<()> {
+    if pk.is_empty() || pk.len() > MAX_KEY_BYTES {
+        return Err(RymeError::InvalidArgument(String::from("key")));
+    }
+    Ok(())
+}
+
+fn validate_scan_limit(limit: usize) -> Result<()> {
+    if limit > MAX_SCAN_ROWS {
+        return Err(RymeError::Overload(String::from("scan limit")));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ttl {
@@ -319,6 +342,8 @@ where
     }
 
     pub fn get(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Option<Vec<u8>>> {
+        validate_table(table)?;
+        validate_key(pk)?;
         self.policies.predicate(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
         let mut txn = self.begin();
@@ -338,6 +363,8 @@ where
         table: &str,
         pk: &[u8],
     ) -> Result<Option<Vec<u8>>> {
+        validate_table(table)?;
+        validate_key(pk)?;
         let Some(reader) =
             self.remote_reader.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
         else {
@@ -378,7 +405,8 @@ where
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<u64> {
         self.reject_if_read_only()?;
-        if table.is_empty() || rows.is_empty() {
+        validate_table(table)?;
+        if rows.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("rows")));
         }
         if rows.len() > MAX_BATCH_ROWS {
@@ -434,12 +462,8 @@ where
         expires_at: Option<u64>,
     ) -> Result<u64> {
         self.reject_if_read_only()?;
-        if table.is_empty() {
-            return Err(RymeError::InvalidArgument(String::from("table")));
-        }
-        if pk.is_empty() || pk.len() > MAX_KEY_BYTES {
-            return Err(RymeError::InvalidArgument(String::from("key")));
-        }
+        validate_table(table)?;
+        validate_key(&pk)?;
         if value.len() > MAX_VALUE_BYTES {
             return Err(RymeError::Overload(String::from("value")));
         }
@@ -478,6 +502,8 @@ where
         expires_at: Option<u64>,
     ) -> Result<bool> {
         self.reject_if_read_only()?;
+        validate_table(table)?;
+        validate_key(&pk)?;
         self.policies.check_write(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.begin();
@@ -509,6 +535,8 @@ where
     }
 
     pub fn ttl_of(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Ttl> {
+        validate_table(table)?;
+        validate_key(pk)?;
         self.policies.predicate(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
         let mut txn = self.begin();
@@ -533,6 +561,8 @@ where
     }
 
     pub async fn ttl_of_async(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Ttl> {
+        validate_table(table)?;
+        validate_key(pk)?;
         let Some(reader) =
             self.remote_reader.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
         else {
@@ -571,8 +601,9 @@ where
         pks: Vec<Vec<u8>>,
     ) -> Result<u64> {
         self.reject_if_read_only()?;
+        validate_table(table)?;
         self.policies.check_write(principal, table)?;
-        if table.is_empty() || pks.is_empty() {
+        if pks.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("keys")));
         }
         if pks.len() > MAX_BATCH_ROWS {
@@ -582,9 +613,7 @@ where
         let mut seen = HashSet::with_capacity(pks.len());
         let mut changes = Vec::with_capacity(pks.len());
         for pk in pks {
-            if pk.is_empty() || pk.len() > MAX_KEY_BYTES {
-                return Err(RymeError::InvalidArgument(String::from("key")));
-            }
+            validate_key(&pk)?;
             if !seen.insert(pk.clone()) {
                 return Err(RymeError::Conflict(String::from("duplicate key")));
             }
@@ -631,6 +660,8 @@ where
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        validate_table(table)?;
+        validate_scan_limit(limit)?;
         self.policies.predicate(principal, table)?;
         let mut txn = self.begin();
         if !self.policies.has_table_policy(table) {
@@ -681,6 +712,8 @@ where
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        validate_table(table)?;
+        validate_scan_limit(limit)?;
         let Some(scanner) =
             self.remote_scanner.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
         else {
@@ -733,6 +766,8 @@ where
         start_after: Option<&[u8]>,
         limit: usize,
     ) -> Result<ScanPageResult> {
+        validate_table(table)?;
+        validate_scan_limit(limit)?;
         self.policies.predicate(principal, table)?;
         if limit == 0 {
             return Ok((Vec::new(), None));
@@ -771,6 +806,8 @@ where
         start_after: Option<&[u8]>,
         limit: usize,
     ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>)> {
+        validate_table(table)?;
+        validate_scan_limit(limit)?;
         let Some(scanner) =
             self.remote_scanner.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
         else {
@@ -876,6 +913,11 @@ mod tests {
         let gateway = gateway();
         let principal = owner();
         assert!(gateway.put(&principal, "", b"k".to_vec(), b"v".to_vec()).await.is_err());
+        assert!(gateway
+            .put(&principal, &"t".repeat(MAX_TABLE_BYTES + 1), b"k".to_vec(), b"v".to_vec())
+            .await
+            .is_err());
+        assert!(gateway.put(&principal, "bad\0table", b"k".to_vec(), b"v".to_vec()).await.is_err());
         assert!(gateway.put(&principal, "docs", Vec::new(), b"v".to_vec()).await.is_err());
         assert!(gateway
             .put(&principal, "docs", vec![b'k'; MAX_KEY_BYTES + 1], b"v".to_vec())
@@ -885,6 +927,19 @@ mod tests {
             .put(&principal, "docs", b"k".to_vec(), vec![b'v'; MAX_VALUE_BYTES + 1])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn reads_and_scans_reject_oversized_inputs_at_the_gateway_boundary() {
+        let gateway = gateway();
+        let principal = owner();
+        let oversized_key = vec![b'k'; MAX_KEY_BYTES + 1];
+
+        assert!(gateway.get(&principal, "docs", &oversized_key).is_err());
+        assert!(gateway.ttl_of(&principal, "docs", &oversized_key).is_err());
+        assert!(gateway.expire(&principal, "docs", oversized_key, None).await.is_err());
+        assert!(gateway.scan(&principal, "docs", MAX_SCAN_ROWS + 1).is_err());
+        assert!(gateway.scan_page(&principal, "docs", None, MAX_SCAN_ROWS + 1).is_err());
     }
 
     #[tokio::test]
