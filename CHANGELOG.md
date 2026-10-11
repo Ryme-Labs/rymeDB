@@ -1,5 +1,7 @@
 # Changelog
 
+- PostgreSQL sessions now support transaction-scoped `SET LOCAL` values,
+  including savepoint rollback and automatic restoration at transaction end.
 - PostgreSQL sessions now enforce `statement_timeout` for queries and row
   mutations, return SQLSTATE `57014` on expiry, parse common duration units,
   and expose the setting through `SHOW`/`SHOW ALL`.

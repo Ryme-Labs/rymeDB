@@ -135,6 +135,9 @@ setting for queries and row mutations. Values may be expressed in milliseconds
 or with `ms`, `s`, `min`, or `h` units; timed-out statements return SQLSTATE
 `57014`. Clustered schema DDL is excluded from the timeout wrapper so a
 cancelled request cannot leave Raft metadata coordination half-applied.
+`SET LOCAL` is supported inside explicit transactions for session settings
+such as `statement_timeout`, `search_path`, and `timezone`; the temporary
+values are restored by `COMMIT`, `ROLLBACK`, and `ROLLBACK TO SAVEPOINT`.
 Common `CREATE OR REPLACE FUNCTION` plus `CREATE TRIGGER` declarations are
 persisted in schema snapshots. `BEFORE` row triggers that assign
 `NEW.column = now()` (or the equivalent current-timestamp expressions) are

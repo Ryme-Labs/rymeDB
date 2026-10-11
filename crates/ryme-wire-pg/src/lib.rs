@@ -58,6 +58,7 @@ struct SessionTransaction {
     txn: Transaction,
     changes: Vec<TransactionChange>,
     schema_before: Option<SchemaSnapshot>,
+    local_settings: HashMap<String, Option<String>>,
     notifications: Vec<PgNotification>,
     listener_changes: Vec<ListenerChange>,
     failed: bool,
@@ -109,6 +110,8 @@ struct Savepoint {
     checkpoint: TransactionCheckpoint,
     changes_len: usize,
     schema_snapshot: Option<SchemaSnapshot>,
+    local_settings: HashMap<String, Option<String>>,
+    local_values: HashMap<String, Option<String>>,
     notifications_len: usize,
     listener_changes_len: usize,
 }
@@ -944,6 +947,7 @@ where
                         let response = handle_transaction_control_with_notifications(
                             control,
                             &executor,
+                            &mut session,
                             &mut active_transaction,
                             &mut listening,
                             &mut committed_notifications,
@@ -959,14 +963,18 @@ where
                             &limits.database,
                             &mut committed_notifications,
                         );
-                    } else if let Some(response) = session_command(trimmed, &mut session) {
+                    } else if let Some(response) = session_command_with_transaction(
+                        trimmed,
+                        &mut session,
+                        &mut active_transaction,
+                    ) {
                         out.extend_from_slice(&response);
                     } else if let Some(response) = prepared_command(
                         trimmed,
                         &mut statements,
                         &mut prepared_cache,
                         &executor,
-                        &session,
+                        &mut session,
                         &limits,
                         &mut active_transaction,
                         &mut listening,
@@ -1192,11 +1200,18 @@ where
                                 handle_transaction_control_with_notifications(
                                     control,
                                     &executor,
+                                    &mut session,
                                     &mut active_transaction,
                                     &mut listening,
                                     &mut committed_notifications,
                                 )
                                 .await
+                            } else if let Some(response) = session_command_with_transaction(
+                                trimmed,
+                                &mut session,
+                                &mut active_transaction,
+                            ) {
+                                response
                             } else {
                                 match parsed {
                                     Ok(statement) => {
@@ -2820,9 +2835,11 @@ where
 {
     let mut committed_notifications = Vec::new();
     let mut listening = HashSet::new();
+    let mut session = HashMap::new();
     handle_transaction_control_with_notifications(
         control,
         executor,
+        &mut session,
         active,
         &mut listening,
         &mut committed_notifications,
@@ -2833,6 +2850,7 @@ where
 async fn handle_transaction_control_with_notifications<B>(
     control: TransactionControl,
     executor: &Arc<Executor<B>>,
+    session: &mut HashMap<String, String>,
     active: &mut Option<SessionTransaction>,
     listening: &mut HashSet<String>,
     committed_notifications: &mut Vec<PgNotification>,
@@ -2849,6 +2867,7 @@ where
                     txn: executor.begin_transaction(isolation),
                     changes: Vec::new(),
                     schema_before: None,
+                    local_settings: HashMap::new(),
                     notifications: Vec::new(),
                     listener_changes: Vec::new(),
                     failed: false,
@@ -2862,6 +2881,7 @@ where
                 return command_complete("COMMIT");
             };
             if state.failed {
+                restore_local_settings(session, &state.local_settings);
                 return encode_error_code(
                     "25P02",
                     String::from("current transaction is aborted, commands ignored until end of transaction block"),
@@ -2872,18 +2892,23 @@ where
                 .await
             {
                 Ok(_) => {
+                    restore_local_settings(session, &state.local_settings);
                     for change in &state.listener_changes {
                         apply_listener_change(listening, change);
                     }
                     committed_notifications.extend(state.notifications);
                     command_complete("COMMIT")
                 }
-                Err(error) => encode_error_code(error_code(&error), error.to_string()),
+                Err(error) => {
+                    restore_local_settings(session, &state.local_settings);
+                    encode_error_code(error_code(&error), error.to_string())
+                }
             }
         }
         TransactionControl::Rollback => {
             if let Some(state) = active.take() {
                 let _ = executor.rollback_schema_transaction(state.schema_before);
+                restore_local_settings(session, &state.local_settings);
             }
             command_complete("ROLLBACK")
         }
@@ -2912,6 +2937,12 @@ where
                 checkpoint: state.txn.checkpoint(),
                 changes_len: state.changes.len(),
                 schema_snapshot: executor.schema_transaction_snapshot(),
+                local_settings: state.local_settings.clone(),
+                local_values: state
+                    .local_settings
+                    .keys()
+                    .map(|name| (name.clone(), session.get(name).cloned()))
+                    .collect(),
                 notifications_len: state.notifications.len(),
                 listener_changes_len: state.listener_changes.len(),
             });
@@ -2959,6 +2990,12 @@ where
                 return encode_error_code("XX000", String::from("schema savepoint restore failed"));
             }
             state.changes.truncate(savepoint.changes_len);
+            restore_local_settings_to(
+                session,
+                &mut state.local_settings,
+                &savepoint.local_settings,
+                &savepoint.local_values,
+            );
             state.notifications.truncate(savepoint.notifications_len);
             state.listener_changes.truncate(savepoint.listener_changes_len);
             state.savepoints.truncate(position + 1);
@@ -3144,7 +3181,7 @@ async fn prepared_command<B>(
     statements: &mut HashMap<String, String>,
     prepared_cache: &mut HashMap<String, (String, Statement)>,
     executor: &Arc<Executor<B>>,
-    session: &HashMap<String, String>,
+    session: &mut HashMap<String, String>,
     limits: &ConnLimits,
     active: &mut Option<SessionTransaction>,
     listening: &mut HashSet<String>,
@@ -3158,6 +3195,7 @@ where
             handle_transaction_control_with_notifications(
                 control,
                 executor,
+                session,
                 active,
                 listening,
                 committed_notifications,
@@ -3285,6 +3323,121 @@ fn apply_listener_change(listening: &mut HashSet<String>, change: &ListenerChang
             listening.clear();
         }
     }
+}
+
+fn restore_local_settings(
+    session: &mut HashMap<String, String>,
+    local_settings: &HashMap<String, Option<String>>,
+) {
+    for (name, value) in local_settings {
+        match value {
+            Some(value) => {
+                session.insert(name.clone(), value.clone());
+            }
+            None => {
+                session.remove(name);
+            }
+        }
+    }
+}
+
+fn restore_local_settings_to(
+    session: &mut HashMap<String, String>,
+    current: &mut HashMap<String, Option<String>>,
+    target: &HashMap<String, Option<String>>,
+    target_values: &HashMap<String, Option<String>>,
+) {
+    let mut names = current.keys().cloned().collect::<HashSet<_>>();
+    names.extend(target.keys().cloned());
+    for name in names {
+        let value = if target.contains_key(&name) {
+            target_values.get(&name).cloned().unwrap_or_else(|| session.get(&name).cloned())
+        } else {
+            current.get(&name).cloned().unwrap_or_else(|| session.get(&name).cloned())
+        };
+        match value {
+            Some(value) => {
+                session.insert(name, value);
+            }
+            None => {
+                session.remove(&name);
+            }
+        }
+    }
+    *current = target.clone();
+}
+
+fn session_setting_name(rest: &str) -> Option<String> {
+    let words = rest.split_whitespace().collect::<Vec<_>>();
+    if words.is_empty() {
+        return None;
+    }
+    if words[0].eq_ignore_ascii_case("SESSION")
+        && !words.get(1).is_some_and(|word| word.eq_ignore_ascii_case("CHARACTERISTICS"))
+    {
+        return session_setting_name(rest["SESSION".len()..].trim());
+    }
+    if words[0].eq_ignore_ascii_case("TIME")
+        && words.get(1).is_some_and(|word| word.eq_ignore_ascii_case("ZONE"))
+    {
+        return Some(String::from("timezone"));
+    }
+    if words[0].eq_ignore_ascii_case("NAMES") {
+        return Some(String::from("client_encoding"));
+    }
+    if words[0].eq_ignore_ascii_case("TRANSACTION") {
+        return Some(String::from("transaction_isolation"));
+    }
+    let name = rest
+        .split_once('=')
+        .map(|(name, _)| name.trim())
+        .or_else(|| {
+            let mut parts = rest.split_whitespace();
+            let name = parts.next()?;
+            let keyword = parts.next()?;
+            keyword.eq_ignore_ascii_case("TO").then_some(name)
+        })
+        .unwrap_or_else(|| words[0]);
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+fn session_command_with_transaction(
+    query: &str,
+    session: &mut HashMap<String, String>,
+    active: &mut Option<SessionTransaction>,
+) -> Option<Vec<u8>> {
+    let is_set =
+        query.split_whitespace().next().is_some_and(|word| word.eq_ignore_ascii_case("SET"));
+    if !is_set {
+        return session_command(query, session);
+    }
+    let rest = query[3..].trim().trim_end_matches(';').trim();
+    let words = rest.split_whitespace().collect::<Vec<_>>();
+    if words.first().is_some_and(|word| word.eq_ignore_ascii_case("LOCAL")) {
+        if active.is_none() {
+            return Some(encode_error_code(
+                "25001",
+                String::from("SET LOCAL can only be used in transaction blocks"),
+            ));
+        }
+        let inner = rest["LOCAL".len()..].trim();
+        let name = session_setting_name(inner)?;
+        let previous = session.get(&name).cloned();
+        let response = session_command(&format!("SET {inner}"), session)?;
+        if let Some(state) = active.as_mut() {
+            state.local_settings.entry(name).or_insert(previous);
+        }
+        return Some(response);
+    }
+
+    let name = session_setting_name(rest);
+    let response = session_command(query, session);
+    if response.is_some() {
+        if let (Some(name), Some(state)) = (name, active.as_mut()) {
+            state.local_settings.remove(&name);
+        }
+    }
+    response
 }
 
 fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option<Vec<u8>> {
@@ -4245,6 +4398,70 @@ mod tests {
         assert!(session_timeout(&session).is_none());
     }
 
+    #[tokio::test]
+    async fn set_local_restores_on_savepoint_rollback_and_commit() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut session = HashMap::new();
+        assert!(session_command("SET statement_timeout = '1s'", &mut session).is_some());
+        let mut active = None;
+        let mut listening = HashSet::new();
+        let mut notifications = Vec::new();
+
+        handle_transaction_control_with_notifications(
+            TransactionControl::Begin(Isolation::Serializable),
+            &executor,
+            &mut session,
+            &mut active,
+            &mut listening,
+            &mut notifications,
+        )
+        .await;
+        assert!(session_command_with_transaction(
+            "SET LOCAL statement_timeout = '2s'",
+            &mut session,
+            &mut active,
+        )
+        .is_some());
+        assert_eq!(session_timeout(&session), Some(std::time::Duration::from_secs(2)));
+
+        handle_transaction_control_with_notifications(
+            TransactionControl::Savepoint(String::from("settings")),
+            &executor,
+            &mut session,
+            &mut active,
+            &mut listening,
+            &mut notifications,
+        )
+        .await;
+        assert!(session_command_with_transaction(
+            "SET LOCAL statement_timeout = '3s'",
+            &mut session,
+            &mut active,
+        )
+        .is_some());
+        handle_transaction_control_with_notifications(
+            TransactionControl::RollbackToSavepoint(String::from("settings")),
+            &executor,
+            &mut session,
+            &mut active,
+            &mut listening,
+            &mut notifications,
+        )
+        .await;
+        assert_eq!(session_timeout(&session), Some(std::time::Duration::from_secs(2)));
+
+        handle_transaction_control_with_notifications(
+            TransactionControl::Commit,
+            &executor,
+            &mut session,
+            &mut active,
+            &mut listening,
+            &mut notifications,
+        )
+        .await;
+        assert_eq!(session_timeout(&session), Some(std::time::Duration::from_secs(1)));
+    }
+
     #[test]
     fn set_transaction_isolation() {
         let mut session = HashMap::new();
@@ -4303,6 +4520,7 @@ mod tests {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
             schema_before: executor.schema_transaction_snapshot(),
+            local_settings: HashMap::new(),
             notifications: Vec::new(),
             listener_changes: Vec::new(),
             failed: false,
@@ -4376,6 +4594,7 @@ mod tests {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
             schema_before: executor.schema_transaction_snapshot(),
+            local_settings: HashMap::new(),
             notifications: Vec::new(),
             listener_changes: Vec::new(),
             failed: false,
@@ -4397,6 +4616,7 @@ mod tests {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
             schema_before: executor.schema_transaction_snapshot(),
+            local_settings: HashMap::new(),
             notifications: Vec::new(),
             listener_changes: Vec::new(),
             failed: false,
@@ -4419,6 +4639,7 @@ mod tests {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
             schema_before: executor.schema_transaction_snapshot(),
+            local_settings: HashMap::new(),
             notifications: Vec::new(),
             listener_changes: Vec::new(),
             failed: false,
