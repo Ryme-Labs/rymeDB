@@ -7,9 +7,60 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
-static ACTIVE: LazyLock<Mutex<BTreeMap<u64, u64>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+#[derive(Debug, Default)]
+struct ActiveRegistry {
+    transactions: Mutex<BTreeMap<u64, u64>>,
+}
+
+impl ActiveRegistry {
+    fn insert(&self, id: u64, read_ts: u64) {
+        if let Ok(mut transactions) = self.transactions.lock() {
+            transactions.insert(id, read_ts);
+        }
+    }
+
+    fn remove(&self, id: u64) {
+        if let Ok(mut transactions) = self.transactions.lock() {
+            transactions.remove(&id);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.transactions.lock().map(|transactions| transactions.len()).unwrap_or(0)
+    }
+
+    fn oldest(&self) -> Option<u64> {
+        self.transactions.lock().ok().and_then(|transactions| transactions.values().copied().min())
+    }
+}
+
+static ACTIVE_REGISTRIES: LazyLock<Mutex<Vec<Weak<ActiveRegistry>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn register_active_registry(registry: &Arc<ActiveRegistry>) {
+    if let Ok(mut registries) = ACTIVE_REGISTRIES.lock() {
+        registries.retain(|registry| registry.strong_count() > 0);
+        registries.push(Arc::downgrade(registry));
+    }
+}
+
+fn active_registries() -> Vec<Arc<ActiveRegistry>> {
+    let Ok(mut registries) = ACTIVE_REGISTRIES.lock() else {
+        return Vec::new();
+    };
+    let mut live = Vec::with_capacity(registries.len());
+    registries.retain(|registry| {
+        if let Some(registry) = registry.upgrade() {
+            live.push(registry);
+            true
+        } else {
+            false
+        }
+    });
+    live
+}
 
 static COMMIT_WAITERS: LazyLock<Mutex<Vec<std::sync::mpsc::SyncSender<u64>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
@@ -45,6 +96,7 @@ struct TxnInner {
     committed: Mutex<BTreeMap<u64, Vec<RecordKey>>>,
     engine: RwLock<Engine>,
     commit: Mutex<()>,
+    active: Arc<ActiveRegistry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,13 +124,12 @@ static TXN_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 struct TxnPin {
     id: u64,
+    active: Arc<ActiveRegistry>,
 }
 
 impl Drop for TxnPin {
     fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.remove(&self.id);
-        }
+        self.active.remove(self.id);
     }
 }
 
@@ -158,16 +209,12 @@ impl Transaction {
         self.scanned.clone_from(&checkpoint.scanned);
         self.isolation = checkpoint.isolation;
         self.route_generation = checkpoint.route_generation;
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.insert(self.id, self.read_ts);
-        }
+        self.pin.active.insert(self.id, self.read_ts);
     }
 
     pub fn restamp(&mut self, read_ts: u64) {
         self.read_ts = read_ts;
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.insert(self.id, read_ts);
-        }
+        self.pin.active.insert(self.id, read_ts);
     }
 
     pub fn set_isolation(&mut self, isolation: Isolation) {
@@ -212,11 +259,11 @@ impl Transaction {
     }
 
     pub fn active_count() -> usize {
-        ACTIVE.lock().map(|active| active.len()).unwrap_or(0)
+        active_registries().iter().map(|registry| registry.len()).sum()
     }
 
     pub fn oldest_active() -> Option<u64> {
-        ACTIVE.lock().ok().and_then(|active| active.values().copied().min())
+        active_registries().iter().filter_map(|registry| registry.oldest()).min()
     }
 }
 
@@ -403,6 +450,8 @@ pub enum SyncPolicy {
 
 impl TxnManager {
     pub fn new() -> Self {
+        let active = Arc::new(ActiveRegistry::default());
+        register_active_registry(&active);
         Self {
             inner: Arc::new(TxnInner {
                 clock: AtomicU64::new(1),
@@ -410,19 +459,15 @@ impl TxnManager {
                 committed: Mutex::new(BTreeMap::new()),
                 engine: RwLock::new(Engine::new()),
                 commit: Mutex::new(()),
+                active,
             }),
         }
     }
 
     pub fn begin(&self) -> Transaction {
         let id = TXN_ID.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.insert(id, 0);
-        }
         let read_ts = self.inner.applied.load(Ordering::SeqCst);
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.insert(id, read_ts);
-        }
+        self.inner.active.insert(id, read_ts);
         Transaction {
             id,
             read_ts,
@@ -432,15 +477,13 @@ impl TxnManager {
             scanned: BTreeSet::new(),
             isolation: Isolation::Serializable,
             route_generation: None,
-            pin: Arc::new(TxnPin { id }),
+            pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
         }
     }
 
     pub fn from_state(&self, state: TransactionState) -> Transaction {
         let id = TXN_ID.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut active) = ACTIVE.lock() {
-            active.insert(id, state.read_ts);
-        }
+        self.inner.active.insert(id, state.read_ts);
         Transaction {
             id,
             read_ts: state.read_ts,
@@ -450,7 +493,7 @@ impl TxnManager {
             scanned: state.scanned.into_iter().collect(),
             isolation: state.isolation,
             route_generation: state.route_generation,
-            pin: Arc::new(TxnPin { id }),
+            pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
         }
     }
 
@@ -543,7 +586,7 @@ impl TxnManager {
             .committed
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        if let Some(floor) = Transaction::oldest_active() {
+        if let Some(floor) = self.inner.active.oldest() {
             committed.retain(|ts, _| *ts > floor);
         }
         for key in txn.writes.keys() {
@@ -959,7 +1002,7 @@ impl TxnManager {
     }
 
     pub fn gc_horizon(&self) -> u64 {
-        Transaction::oldest_active().unwrap_or_else(|| self.latest_commit())
+        self.inner.active.oldest().unwrap_or_else(|| self.latest_commit())
     }
 
     pub fn gc_oldest(&self) -> Result<u64> {
@@ -2062,6 +2105,19 @@ mod tests {
         let mut second = manager.begin();
         let value = manager.get(&mut second, &key).unwrap();
         assert_eq!(value, Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn active_transactions_are_scoped_to_their_manager() {
+        let first = TxnManager::new();
+        let _reader = first.begin();
+
+        let second = TxnManager::new();
+        let mut writer = second.begin();
+        second.put(&mut writer, RecordKey::new("t", "d", "s", b"k"), b"v".to_vec());
+        second.commit(writer).unwrap();
+
+        assert_eq!(second.gc_horizon(), second.latest_commit());
     }
 
     #[test]
