@@ -543,12 +543,13 @@ struct AuthAttemptLimiter {
 
 impl AuthAttemptLimiter {
     fn admit(&mut self, identity: &str, now: u64) -> ryme_error::Result<()> {
+        let identity = Self::identity_key(identity);
         Self::reset_if_expired(&mut self.global, now);
         if self.global.attempts >= AUTH_ATTEMPTS_GLOBAL {
             return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
         }
 
-        if !self.identities.contains_key(identity)
+        if !self.identities.contains_key(&identity)
             && self.identities.len() >= AUTH_LIMITER_MAX_IDENTITIES
         {
             let oldest = self
@@ -560,7 +561,7 @@ impl AuthAttemptLimiter {
                 self.identities.remove(&oldest);
             }
         }
-        let window = self.identities.entry(identity.to_string()).or_default();
+        let window = self.identities.entry(identity).or_default();
         Self::reset_if_expired(window, now);
         if window.attempts >= AUTH_ATTEMPTS_PER_IDENTITY {
             return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
@@ -571,7 +572,12 @@ impl AuthAttemptLimiter {
     }
 
     fn success(&mut self, identity: &str) {
-        self.identities.remove(identity);
+        self.identities.remove(&Self::identity_key(identity));
+    }
+
+    fn identity_key(identity: &str) -> String {
+        use sha2::{Digest, Sha256};
+        ryme_auth::base64_url_encode(&Sha256::digest(identity.as_bytes()))
     }
 
     fn reset_if_expired(window: &mut AuthAttemptWindow, now: u64) {
@@ -642,6 +648,15 @@ mod auth_attempt_limiter_tests {
             assert!(limiter.admit(&format!("password:user-{index}"), 100).is_ok());
         }
         assert!(limiter.admit("password:last", 100).is_err());
+    }
+
+    #[test]
+    fn identity_keys_have_fixed_size() {
+        let mut limiter = AuthAttemptLimiter::default();
+        let identity = format!("password:{}", "x".repeat(1_000_000));
+        assert!(limiter.admit(&identity, 100).is_ok());
+        assert_eq!(limiter.identities.len(), 1);
+        assert_eq!(limiter.identities.keys().next().map(String::len), Some(43));
     }
 }
 
