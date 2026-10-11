@@ -51,7 +51,6 @@ pub struct RangePlacement {
 #[derive(Debug)]
 struct ShardCtx {
     shard: Option<usize>,
-    read_ts: u64,
     tables: Vec<TableRef>,
     touched: Instant,
 }
@@ -652,7 +651,7 @@ impl ShardSet {
                 inner.side.retain(|_, ctx| ctx.touched.elapsed().as_secs() < 120);
             }
         }
-        let (shard, stamp) = {
+        let shard = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let shard = route_range(&inner.ranges, &range_key(key)).unwrap_or_else(|| {
                 inner
@@ -661,12 +660,11 @@ impl ShardSet {
                     .copied()
                     .unwrap_or_else(|| hash_table(&table, inner.shards.len()))
             });
-            (shard, inner.shards[shard].inner().latest_commit())
+            shard
         };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let entry = inner.side.entry(txn.id).or_insert_with(|| ShardCtx {
             shard: None,
-            read_ts: 0,
             tables: Vec::new(),
             touched: Instant::now(),
         });
@@ -676,7 +674,6 @@ impl ShardSet {
         }
         if entry.shard.is_none() {
             entry.shard = Some(shard);
-            entry.read_ts = stamp;
         }
         entry.shard.unwrap_or(shard)
     }
@@ -703,8 +700,6 @@ impl ShardSet {
             .get(shard)
             .cloned()
             .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
-        let mut txn = txn;
-        txn.restamp(ctx.read_ts);
         manager.commit(txn)
     }
 
@@ -740,12 +735,7 @@ impl ShardSet {
         }
         if cohort.len() < 2 {
             let shard = cohort.iter().next().copied().unwrap_or(0);
-            let ctx = ShardCtx {
-                shard: Some(shard),
-                read_ts: txn.read_ts,
-                tables: Vec::new(),
-                touched: Instant::now(),
-            };
+            let ctx = ShardCtx { shard: Some(shard), tables: Vec::new(), touched: Instant::now() };
             drop(_write);
             drop(inner);
             return self.commit_single(txn, ctx, shard);
@@ -1485,11 +1475,7 @@ mod tests {
             Some(b"last".to_vec())
         );
         let mut scan_txn = backend.begin();
-        backend.put(
-            &mut scan_txn,
-            RecordKey::new("t", "d", "users", b"b"),
-            b"middle".to_vec(),
-        );
+        backend.put(&mut scan_txn, RecordKey::new("t", "d", "users", b"b"), b"middle".to_vec());
         backend.delete(&mut scan_txn, RecordKey::new("t", "d", "users", b"a"));
         assert_eq!(
             backend.scan(&mut scan_txn, "t", "d", "users", 2).unwrap(),
@@ -1778,6 +1764,34 @@ mod tests {
             backend.get(&mut probe, &RecordKey::new("t", "d", &left, b"k")).unwrap(),
             Some(b"v2".to_vec())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_shard_commit_preserves_read_snapshot_after_later_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-single-shard-conflict-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
+        let key = RecordKey::new("t", "d", "users", b"k");
+        commit_table(&backend, "t", "d", "users", writes(vec![("k", "v1")]));
+
+        let mut reader = backend.begin();
+        assert_eq!(backend.get(&mut reader, &key).unwrap(), Some(b"v1".to_vec()));
+
+        let mut writer = backend.begin();
+        backend.put(&mut writer, key.clone(), b"v2".to_vec());
+        futures_executor_block_on(backend.commit(writer)).unwrap();
+
+        backend.put(&mut reader, key.clone(), b"v3".to_vec());
+        let result = futures_executor_block_on(backend.commit(reader));
+        assert!(matches!(result, Err(RymeError::Conflict(_))));
+
+        let mut probe = backend.begin();
+        assert_eq!(backend.get(&mut probe, &key).unwrap(), Some(b"v2".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
