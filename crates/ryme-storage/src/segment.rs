@@ -11,6 +11,7 @@ const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
@@ -331,6 +332,9 @@ impl ImmutableSegment {
     }
 
     pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() > MAX_SEGMENT_BYTES {
+            return Err(RymeError::Overload(String::from("segment")));
+        }
         const HEADER: usize = 4 + 2 + 2 + 8 + 4;
         if input.len() < HEADER + 4 {
             return Err(RymeError::Corrupt(String::from("segment header")));
@@ -466,6 +470,9 @@ impl SegmentStore {
         let temporary =
             self.dir.join(format!("{segment_name}.tmp", segment_name = segment_name(id)));
         let encoded = segment.encode()?;
+        if encoded.len() > MAX_SEGMENT_BYTES {
+            return Err(RymeError::Overload(String::from("segment")));
+        }
         {
             use std::io::Write;
             let mut file = std::fs::File::create(&temporary)?;
@@ -501,7 +508,7 @@ impl SegmentStore {
         let Some(path) = self.latest_path()? else {
             return Ok(None);
         };
-        let bytes = std::fs::read(path)?;
+        let bytes = read_segment_file(&path)?;
         Ok(Some(ImmutableSegment::decode(&bytes)?))
     }
 
@@ -512,12 +519,12 @@ impl SegmentStore {
             if let Some(segment) = cache.get(id) {
                 return Ok(segment);
             }
-            let bytes = std::fs::read(path)?;
+            let bytes = read_segment_file(path)?;
             let segment = Arc::new(ImmutableSegment::decode(&bytes)?);
             cache.insert(id, Arc::clone(&segment), bytes.len() as u64);
             Ok(segment)
         } else {
-            Ok(Arc::new(ImmutableSegment::decode(&std::fs::read(path)?)?))
+            Ok(Arc::new(ImmutableSegment::decode(&read_segment_file(path)?)?))
         }
     }
 
@@ -564,7 +571,7 @@ impl SegmentStore {
         let mut found = false;
         let mut max_commit_ts = 0;
         for path in paths {
-            let segment = ImmutableSegment::decode(&std::fs::read(path)?)?;
+            let segment = ImmutableSegment::decode(&read_segment_file(&path)?)?;
             if segment.is_snapshot() {
                 engine = segment.into_engine();
             } else {
@@ -579,7 +586,7 @@ impl SegmentStore {
     pub fn max_commit_ts(&self) -> Result<u64> {
         let mut max_commit_ts = 0;
         for path in self.segment_paths()? {
-            let segment = ImmutableSegment::decode(&std::fs::read(path)?)?;
+            let segment = ImmutableSegment::decode(&read_segment_file(&path)?)?;
             max_commit_ts = max_commit_ts.max(segment.meta.max_commit_ts);
         }
         Ok(max_commit_ts)
@@ -762,7 +769,7 @@ impl SegmentStore {
     pub fn prune(&self, keep: usize) -> Result<usize> {
         let mut segments = Vec::new();
         for path in self.segment_paths()? {
-            let segment = ImmutableSegment::decode(&std::fs::read(&path)?)?;
+            let segment = ImmutableSegment::decode(&read_segment_file(&path)?)?;
             segments.push((segment.meta.id, path, segment.is_snapshot()));
         }
         segments.sort_by_key(|(id, _, _)| *id);
@@ -801,6 +808,19 @@ impl SegmentStore {
         }
         Ok(removed)
     }
+}
+
+fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > MAX_SEGMENT_BYTES as u64 {
+            return Err(RymeError::Overload(String::from("segment")));
+        }
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.len() > MAX_SEGMENT_BYTES {
+        return Err(RymeError::Overload(String::from("segment")));
+    }
+    Ok(bytes)
 }
 
 fn discover_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1022,6 +1042,27 @@ mod tests {
         let segment = reopened.latest().unwrap().unwrap();
         assert_eq!(segment.meta().max_commit_ts, 42);
         assert_eq!(segment.get(&key, 42, 0).unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_store_rejects_oversized_segment_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let path = dir.join(segment_name(1));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_SEGMENT_BYTES + 1) as u64).unwrap();
+        std::fs::write(dir.join("latest"), segment_name(1)).unwrap();
+
+        assert!(matches!(
+            store.latest(),
+            Err(RymeError::Overload(message)) if message == "segment"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
