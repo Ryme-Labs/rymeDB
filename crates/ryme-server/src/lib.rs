@@ -741,6 +741,45 @@ fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("schema snapshot: {error}")))
 }
 
+fn validate_listener_auth(
+    config: &Config,
+    api_key: Option<&str>,
+    pg_password: Option<&str>,
+    resp_password: Option<&str>,
+) -> ryme_error::Result<()> {
+    let requires_api_key = [
+        Some(config.http_listen),
+        config.native_listen,
+        config.grpc_tls_listen,
+        config.grpc_listen,
+        config.native_tls_listen,
+        config.https_listen,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|listener| !listener.ip().is_loopback());
+    if requires_api_key && !matches!(api_key, Some(value) if !value.is_empty()) {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "RYME_API_KEY is required for non-loopback API listeners",
+        )));
+    }
+    if !config.pg_listen.ip().is_loopback()
+        && !matches!(pg_password, Some(value) if !value.is_empty())
+    {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "RYME_PG_PASSWORD is required for a non-loopback PostgreSQL listener",
+        )));
+    }
+    let resp_is_external = !config.resp_listen.ip().is_loopback()
+        || config.resp_tls_listen.is_some_and(|listener| !listener.ip().is_loopback());
+    if resp_is_external && !matches!(resp_password, Some(value) if !value.is_empty()) {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "RYME_RESP_PASSWORD is required for a non-loopback RESP listener",
+        )));
+    }
+    Ok(())
+}
+
 fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSnapshot> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -1223,6 +1262,15 @@ impl SharedState {
     }
 
     pub fn build(config: &Config) -> ryme_error::Result<Self> {
+        let configured_api_key = std::env::var("RYME_API_KEY").ok();
+        let configured_pg_password = std::env::var("RYME_PG_PASSWORD").ok();
+        let configured_resp_password = std::env::var("RYME_RESP_PASSWORD").ok();
+        validate_listener_auth(
+            config,
+            configured_api_key.as_deref(),
+            configured_pg_password.as_deref(),
+            configured_resp_password.as_deref(),
+        )?;
         std::fs::create_dir_all(&config.data_dir)?;
         let wal_dir = config.data_dir.join("wal");
         let policy = match config.durability.is_durable() {
@@ -1497,11 +1545,14 @@ impl SharedState {
             control.branches.persist(&branch_path)?;
         }
         let keys = ApiKeyStore::from_snapshot(auth_snapshot.api_keys);
-        let api_key =
-            std::env::var("RYME_API_KEY").unwrap_or_else(|_| String::from("ryme-dev-key"));
-        let mut roles = HashSet::new();
-        roles.insert(Role::Owner);
-        keys.insert(api_key, Principal { id: String::from("dev"), tenant: tenant.clone(), roles });
+        if let Some(api_key) = configured_api_key {
+            let mut roles = HashSet::new();
+            roles.insert(Role::Owner);
+            keys.insert(
+                api_key,
+                Principal { id: String::from("dev"), tenant: tenant.clone(), roles },
+            );
+        }
         let jwt = load_jwt_verifier()?;
         let archive = archive_target(&config.archive)?;
         let archive_replica = match config.archive_replica.clone() {
@@ -11463,6 +11514,37 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn public_listeners_require_explicit_protocol_credentials() {
+        let mut config = Config::default();
+        assert!(validate_listener_auth(&config, None, None, None).is_ok());
+
+        config.http_listen = "0.0.0.0:8080".parse().unwrap();
+        assert!(matches!(
+            validate_listener_auth(&config, None, None, None),
+            Err(ryme_error::RymeError::InvalidArgument(message))
+                if message.contains("RYME_API_KEY")
+        ));
+        assert!(validate_listener_auth(&config, Some("api-key"), None, None).is_ok());
+
+        config = Config::default();
+        config.pg_listen = "0.0.0.0:5433".parse().unwrap();
+        assert!(matches!(
+            validate_listener_auth(&config, Some("api-key"), None, None),
+            Err(ryme_error::RymeError::InvalidArgument(message))
+                if message.contains("RYME_PG_PASSWORD")
+        ));
+        assert!(validate_listener_auth(&config, Some("api-key"), Some("pg-password"), None).is_ok());
+
+        config = Config::default();
+        config.resp_listen = "0.0.0.0:6380".parse().unwrap();
+        assert!(matches!(
+            validate_listener_auth(&config, Some("api-key"), Some("pg-password"), None),
+            Err(ryme_error::RymeError::InvalidArgument(message))
+                if message.contains("RYME_RESP_PASSWORD")
+        ));
+    }
 
     #[test]
     fn supabase_broadcast_frames_preserve_payload_shapes_without_owned_clones() {

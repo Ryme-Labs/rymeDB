@@ -62,6 +62,11 @@ requires a Raft listener, server certificate/key, and client CA.
 Defaults are loopback-only. If you bind to `0.0.0.0`, enable TLS and
 authentication, restrict firewall access, and set `cluster.advertise_addr`
 explicitly for a cluster. Do not expose trust-mode development listeners.
+
+Startup fails closed for non-loopback listeners unless the matching credentials
+are configured: `RYME_API_KEY` for HTTP/native/gRPC APIs,
+`RYME_PG_PASSWORD` for PostgreSQL, and `RYME_RESP_PASSWORD` for RESP. There is
+no fixed fallback owner key.
 :::
 
 ## Cluster
