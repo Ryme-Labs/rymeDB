@@ -7146,8 +7146,8 @@ async fn durable_read(
     (StatusCode::OK, Json(items)).into_response()
 }
 
-fn index_space(state: &SharedState, table: &str) -> String {
-    format!("{}/{}/{}", state.tenant, state.database, table)
+fn index_space(tenant: &str, database: &str, table: &str) -> String {
+    format!("{tenant}/{database}/{table}")
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -7202,7 +7202,7 @@ async fn vector_upsert(
     if let Err(e) = admit_write(&state, &principal.tenant, (request.vector.len() * 4) as u64) {
         return error_response(e);
     }
-    let space = index_space(&state, &request.table);
+    let space = index_space(&principal.tenant, &state.database, &request.table);
     {
         let mut indexes = state.indexes.write().await;
         match indexes.vector_upsert(&space, request.id, request.vector) {
@@ -7234,7 +7234,7 @@ async fn vector_search(
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
-    let space = index_space(&state, &request.table);
+    let space = index_space(&principal.tenant, &state.database, &request.table);
     let indexes = state.indexes.read().await;
     match indexes.vector_search(&space, &request.vector, request.top_k.unwrap_or(10)) {
         Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
@@ -7269,7 +7269,7 @@ async fn vector_ann_search(
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
-    let space = index_space(&state, &request.table);
+    let space = index_space(&principal.tenant, &state.database, &request.table);
     let indexes = state.indexes.read().await;
     match indexes.ann_search(
         &space,
@@ -7294,7 +7294,7 @@ async fn vector_delete(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    let space = index_space(&state, &table);
+    let space = index_space(&principal.tenant, &state.database, &table);
     let mut indexes = state.indexes.write().await;
     let removed = indexes.vector_remove(&space, &id);
     (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
@@ -7322,7 +7322,7 @@ async fn text_index(
     if let Err(e) = admit_write(&state, &principal.tenant, request.text.len() as u64) {
         return error_response(e);
     }
-    let space = index_space(&state, &request.table);
+    let space = index_space(&principal.tenant, &state.database, &request.table);
     {
         let mut indexes = state.indexes.write().await;
         match indexes.text_index(&space, request.id, &request.text) {
@@ -7354,7 +7354,7 @@ async fn text_search(
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
-    let space = index_space(&state, &request.table);
+    let space = index_space(&principal.tenant, &state.database, &request.table);
     let indexes = state.indexes.read().await;
     let hits = indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10));
     (StatusCode::OK, Json(hits)).into_response()
@@ -7372,7 +7372,7 @@ async fn text_delete(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    let space = index_space(&state, &table);
+    let space = index_space(&principal.tenant, &state.database, &table);
     let mut indexes = state.indexes.write().await;
     let removed = indexes.text_remove(&space, &id);
     (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
@@ -11550,6 +11550,14 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn search_index_spaces_are_tenant_scoped() {
+        let tenant_a = index_space("tenant-a", "default", "embeddings");
+        let tenant_b = index_space("tenant-b", "default", "embeddings");
+        assert_ne!(tenant_a, tenant_b);
+        assert_eq!(tenant_a, "tenant-a/default/embeddings");
+    }
 
     #[test]
     fn realtime_change_records_mask_before_and_after_images() {
