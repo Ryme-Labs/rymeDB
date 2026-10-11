@@ -654,12 +654,24 @@ impl TxnManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
-        let previous = self
-            .inner
-            .clock
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |clock| clock.checked_add(1))
-            .map_err(|_| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
-        let commit_ts = previous + 1;
+        let mut commit_ts = self.inner.clock.load(Ordering::SeqCst);
+        loop {
+            let next_ts = commit_ts
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+            match self.inner.clock.compare_exchange_weak(
+                commit_ts,
+                next_ts,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    commit_ts = next_ts;
+                    break;
+                }
+                Err(observed) => commit_ts = observed,
+            }
+        }
         self.check_locked(txn, commit_ts)?;
         Ok(commit_ts)
     }

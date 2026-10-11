@@ -4189,7 +4189,7 @@ fn decode_copy_rows(
     if !columns.is_empty() {
         let mut rows = Vec::new();
         for raw_line in data.split(|byte| *byte == b'\n') {
-            let line = raw_line.strip_suffix(&[b'\r'][..]).unwrap_or(raw_line);
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
             if line.is_empty() || line == b"\\." {
                 continue;
             }
@@ -4219,7 +4219,7 @@ fn decode_copy_rows(
 
     let mut rows = Vec::new();
     for raw_line in data.split(|byte| *byte == b'\n') {
-        let line = raw_line.strip_suffix(&[b'\r'][..]).unwrap_or(raw_line);
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.is_empty() || line == b"\\." {
             continue;
         }

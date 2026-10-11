@@ -16,17 +16,12 @@ type ConflictClause = (Vec<String>, Vec<(String, InsertValue)>, bool, Vec<Predic
 type StandardInsertRows = Option<(Vec<String>, Vec<Vec<InsertValue>>)>;
 type ProjectionColumns = Option<(Vec<String>, Vec<Option<String>>)>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetOperation {
+    #[default]
     Union,
     Intersect,
     Except,
-}
-
-impl Default for SetOperation {
-    fn default() -> Self {
-        Self::Union
-    }
 }
 
 fn default_sequence_data_type() -> String {
@@ -730,18 +725,13 @@ pub struct ColumnDefinition {
     pub unique: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForeignKeyAction {
+    #[default]
     Restrict,
     Cascade,
     SetNull,
     SetDefault,
-}
-
-impl Default for ForeignKeyAction {
-    fn default() -> Self {
-        Self::Restrict
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1113,18 +1103,13 @@ pub enum Direction {
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
+    #[default]
     Inner,
     Left,
     Right,
     Full,
-}
-
-impl Default for JoinType {
-    fn default() -> Self {
-        Self::Inner
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

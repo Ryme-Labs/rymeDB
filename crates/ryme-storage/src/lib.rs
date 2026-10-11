@@ -6,17 +6,12 @@ use std::ops::Bound;
 mod segment;
 pub use segment::{ImmutableSegment, SegmentCacheStats, SegmentEntry, SegmentMeta, SegmentStore};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageMode {
+    #[default]
     Hot,
     Standard,
-}
-
-impl Default for StorageMode {
-    fn default() -> Self {
-        Self::Hot
-    }
 }
 
 #[derive(Debug, Clone)]

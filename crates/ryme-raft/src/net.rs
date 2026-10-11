@@ -346,19 +346,27 @@ enum IntentRecord {
     Resolve { transaction_id: u128, commit_ts: u64, committed: bool },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum RangeEntryKind {
+    #[default]
     Data,
-    Prepare { transaction_id: u128, state: Vec<u8> },
-    Resolve { transaction_id: u128, committed: bool },
-    Decision { transaction_id: u128, committed: bool, participants: Vec<ResolutionParticipant> },
-    Coordinate { transaction_id: u128, participants: Vec<ResolutionParticipant> },
-}
-
-impl Default for RangeEntryKind {
-    fn default() -> Self {
-        Self::Data
-    }
+    Prepare {
+        transaction_id: u128,
+        state: Vec<u8>,
+    },
+    Resolve {
+        transaction_id: u128,
+        committed: bool,
+    },
+    Decision {
+        transaction_id: u128,
+        committed: bool,
+        participants: Vec<ResolutionParticipant>,
+    },
+    Coordinate {
+        transaction_id: u128,
+        participants: Vec<ResolutionParticipant>,
+    },
 }
 
 #[derive(Debug, Clone)]

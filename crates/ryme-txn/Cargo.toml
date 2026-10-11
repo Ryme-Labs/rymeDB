@@ -9,3 +9,4 @@ ryme-error = { workspace = true }
 ryme-storage = { workspace = true }
 ryme-wal = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }
