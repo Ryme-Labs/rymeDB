@@ -1752,6 +1752,9 @@ impl SharedState {
                 Principal { id: String::from("dev"), tenant: tenant.clone(), roles },
             )?;
         }
+        let credentials = CredentialStore::from_snapshot(auth_snapshot.users)?;
+        let refresh_tokens = RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens)?;
+        let passkeys = PasskeyRegistry::from_snapshot(auth_snapshot.passkeys)?;
         let jwt = load_jwt_verifier()?;
         let archive = archive_target(&config.archive)?;
         let archive_replica = match config.archive_replica.clone() {
@@ -1860,11 +1863,11 @@ impl SharedState {
             dek_ring,
             indexes: Arc::new(RwLock::new(PartitionedIndex::new(config.index_partitions))),
             http_max_body_bytes: config.http_max_body_bytes,
-            credentials: Arc::new(Mutex::new(CredentialStore::from_snapshot(auth_snapshot.users))),
+            credentials: Arc::new(Mutex::new(credentials)),
             auth_attempts: Arc::new(Mutex::new(AuthAttemptLimiter::default())),
             oidc_states: Arc::new(Mutex::new(OidcStateStore::default())),
-            refresh_tokens: RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens),
-            passkeys: Arc::new(Mutex::new(PasskeyRegistry::from_snapshot(auth_snapshot.passkeys))),
+            refresh_tokens,
+            passkeys: Arc::new(Mutex::new(passkeys)),
             native_listen: config.native_listen,
             grpc_tls_listen: config.grpc_tls_listen,
             grpc_listen: config.grpc_listen,

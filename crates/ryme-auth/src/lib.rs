@@ -579,8 +579,11 @@ impl RefreshTokenStore {
             .map_err(|_| RymeError::Internal(String::from("auth lock")))
     }
 
-    pub fn from_snapshot(snapshot: HashMap<String, RefreshTokenRecord>) -> Self {
-        Self { inner: Arc::new(RwLock::new(snapshot)) }
+    pub fn from_snapshot(snapshot: HashMap<String, RefreshTokenRecord>) -> Result<Self> {
+        if snapshot.len() > MAX_REFRESH_SESSIONS {
+            return Err(RymeError::Corrupt(String::from("refresh token snapshot")));
+        }
+        Ok(Self { inner: Arc::new(RwLock::new(snapshot)) })
     }
 
     fn digest(token: &str) -> String {
@@ -613,6 +616,7 @@ const MAX_LEGACY_PASSWORD_ROUNDS: u32 = 1_000_000;
 pub const MAX_PASSWORD_LEN: usize = 256;
 pub const MAX_USER_LEN: usize = 256;
 pub const MAX_CHALLENGES: usize = 4096;
+const MAX_USERS: usize = 100_000;
 
 pub fn hash_password(password: &str) -> PasswordHash {
     let salt = random_bytes(16);
@@ -720,6 +724,7 @@ pub struct PasskeyCredential {
 }
 
 pub const PASSKEY_CHALLENGE_TTL_SECS: u64 = 300;
+const MAX_PASSKEY_CREDENTIALS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct PasskeyAssertion<'a> {
@@ -775,6 +780,9 @@ impl PasskeyRegistry {
         if self.credentials.contains_key(&credential_id) {
             return Err(RymeError::Conflict(String::from("credential")));
         }
+        if self.credentials.len() >= MAX_PASSKEY_CREDENTIALS {
+            return Err(RymeError::Overload(String::from("passkey credentials")));
+        }
         p256::AffinePoint::from_sec1_bytes(public_key)
             .map_err(|_| RymeError::InvalidArgument(String::from("public key")))?;
         self.credentials.insert(
@@ -796,8 +804,11 @@ impl PasskeyRegistry {
         self.credentials.clone()
     }
 
-    pub fn from_snapshot(credentials: HashMap<String, PasskeyCredential>) -> Self {
-        Self { challenges: HashMap::new(), credentials }
+    pub fn from_snapshot(credentials: HashMap<String, PasskeyCredential>) -> Result<Self> {
+        if credentials.len() > MAX_PASSKEY_CREDENTIALS {
+            return Err(RymeError::Corrupt(String::from("passkey snapshot")));
+        }
+        Ok(Self { challenges: HashMap::new(), credentials })
     }
 
     pub fn verify_assertion(&mut self, assertion: &PasskeyAssertion<'_>) -> Result<()> {
@@ -971,6 +982,9 @@ impl CredentialStore {
         if self.users.contains_key(&id) {
             return Err(RymeError::Conflict(String::from("user")));
         }
+        if self.users.len() >= MAX_USERS {
+            return Err(RymeError::Overload(String::from("users")));
+        }
         self.users.insert(
             id,
             StoredUser { tenant, roles, password: Some(hash_password(password)), otp_secret: None },
@@ -1050,8 +1064,11 @@ impl CredentialStore {
         self.users.clone()
     }
 
-    pub fn from_snapshot(users: HashMap<String, StoredUser>) -> Self {
-        Self { users }
+    pub fn from_snapshot(users: HashMap<String, StoredUser>) -> Result<Self> {
+        if users.len() > MAX_USERS {
+            return Err(RymeError::Corrupt(String::from("user snapshot")));
+        }
+        Ok(Self { users })
     }
 }
 
