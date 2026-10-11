@@ -51,11 +51,81 @@ pub const DURABLE_VALUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const DURABLE_READ_MAX_MESSAGES: usize = 1000;
 const MAX_DURABLE_TOPICS: usize = 100_000;
 const MAX_DURABLE_TOPICS_PER_TENANT: usize = 10_000;
+const MAX_TABLE_TOPICS: usize = 100_000;
+const MAX_TABLE_TOPICS_PER_TENANT: usize = 10_000;
+const MAX_BROADCAST_TOPICS: usize = 100_000;
+const MAX_BROADCAST_TOPICS_PER_TENANT: usize = 10_000;
+const MAX_PRESENCE_TOPICS: usize = 100_000;
+const MAX_PRESENCE_TOPICS_PER_TENANT: usize = 10_000;
+const MAX_PRESENCE_ROOMS: usize = 100_000;
+const MAX_PRESENCE_ROOMS_PER_TENANT: usize = 10_000;
 
 type BroadcastTopicShard = Mutex<HashMap<String, Arc<BroadcastTopic>>>;
 type PresenceTopicShard = Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>;
 type PresenceStateShard = Mutex<HashMap<String, HashMap<String, PresenceMember>>>;
 type DurableTopicShard = Mutex<HashMap<String, broadcast::Sender<DurableMsg>>>;
+
+#[derive(Debug, Default)]
+struct TopicCounts {
+    total: usize,
+    per_tenant: HashMap<String, usize>,
+}
+
+#[derive(Debug, Default)]
+struct TopicRegistry {
+    table: TopicCounts,
+    broadcast: TopicCounts,
+    presence_topics: TopicCounts,
+    presence_rooms: TopicCounts,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TopicKind {
+    Table,
+    Broadcast,
+    PresenceTopic,
+    PresenceRoom,
+}
+
+impl TopicRegistry {
+    fn admit(&mut self, kind: TopicKind, tenant: &str) -> Result<()> {
+        let (counts, global_limit, tenant_limit) = match kind {
+            TopicKind::Table => (&mut self.table, MAX_TABLE_TOPICS, MAX_TABLE_TOPICS_PER_TENANT),
+            TopicKind::Broadcast => {
+                (&mut self.broadcast, MAX_BROADCAST_TOPICS, MAX_BROADCAST_TOPICS_PER_TENANT)
+            }
+            TopicKind::PresenceTopic => {
+                (&mut self.presence_topics, MAX_PRESENCE_TOPICS, MAX_PRESENCE_TOPICS_PER_TENANT)
+            }
+            TopicKind::PresenceRoom => {
+                (&mut self.presence_rooms, MAX_PRESENCE_ROOMS, MAX_PRESENCE_ROOMS_PER_TENANT)
+            }
+        };
+        let tenant_count = counts.per_tenant.get(tenant).copied().unwrap_or(0);
+        if counts.total >= global_limit || tenant_count >= tenant_limit {
+            return Err(RymeError::Overload(String::from("realtime topic limit")));
+        }
+        counts.total += 1;
+        *counts.per_tenant.entry(tenant.to_string()).or_default() += 1;
+        Ok(())
+    }
+
+    fn release(&mut self, kind: TopicKind, tenant: &str) {
+        let counts = match kind {
+            TopicKind::Table => &mut self.table,
+            TopicKind::Broadcast => &mut self.broadcast,
+            TopicKind::PresenceTopic => &mut self.presence_topics,
+            TopicKind::PresenceRoom => &mut self.presence_rooms,
+        };
+        counts.total = counts.total.saturating_sub(1);
+        if let Some(count) = counts.per_tenant.get_mut(tenant) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.per_tenant.remove(tenant);
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct BroadcastTopic {
@@ -78,6 +148,7 @@ pub struct QueryUpdate {
 #[derive(Debug, Clone)]
 pub struct Realtime {
     inner: Arc<Mutex<RealtimeInner>>,
+    topic_registry: Arc<Mutex<TopicRegistry>>,
     changes: broadcast::Sender<ChangeRecord>,
     table_topics: Arc<Vec<Mutex<TableTopicShard>>>,
     broadcast_topics: Arc<Vec<BroadcastTopicShard>>,
@@ -110,6 +181,7 @@ struct TableTopicShard {
     topics: HashMap<String, broadcast::Sender<ChangeRecord>>,
     history: HashMap<String, std::collections::VecDeque<ChangeRecord>>,
     queries: HashMap<String, QueryTopic>,
+    tenants: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +328,7 @@ impl Realtime {
                 durable: HashMap::new(),
                 durable_topics_by_tenant: HashMap::new(),
             })),
+            topic_registry: Arc::new(Mutex::new(TopicRegistry::default())),
             changes,
             table_topics: Arc::new(
                 (0..TABLE_TOPIC_SHARDS).map(|_| Mutex::new(TableTopicShard::default())).collect(),
@@ -324,6 +397,51 @@ impl Realtime {
         (hasher.finish() as usize) % self.presence_topics.len()
     }
 
+    fn admit_topic(&self, kind: TopicKind, tenant: &str) -> Result<()> {
+        self.topic_registry
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("realtime topic registry lock")))?
+            .admit(kind, tenant)
+    }
+
+    fn release_topic(&self, kind: TopicKind, tenant: &str) {
+        if let Ok(mut registry) = self.topic_registry.lock() {
+            registry.release(kind, tenant);
+        }
+    }
+
+    fn ensure_table_topic(
+        &self,
+        topics: &mut TableTopicShard,
+        key: &str,
+        tenant: &str,
+    ) -> Result<()> {
+        if topics.topics.contains_key(key)
+            || topics.history.contains_key(key)
+            || topics.queries.contains_key(key)
+        {
+            return Ok(());
+        }
+        self.admit_topic(TopicKind::Table, tenant)?;
+        topics.tenants.insert(key.to_owned(), tenant.to_owned());
+        Ok(())
+    }
+
+    fn release_table_topic_if_empty(&self, topics: &mut TableTopicShard, key: &str) {
+        if topics.topics.contains_key(key)
+            || topics.history.contains_key(key)
+            || topics.queries.contains_key(key)
+        {
+            return;
+        }
+        if let Some(tenant) = topics.tenants.remove(key) {
+            self.release_topic(TopicKind::Table, &tenant);
+            if let Ok(mut sequences) = self.cdc_sequences.lock() {
+                sequences.remove(key);
+            }
+        }
+    }
+
     pub fn publish(&self, event: NewChange) -> Result<u64> {
         let key = branch_topic_key(&event.tenant, &event.database, &event.branch, &event.table);
         let shard = self.table_topic_shard(&key);
@@ -333,6 +451,7 @@ impl Realtime {
             .ok_or_else(|| RymeError::Internal(String::from("realtime topic shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("realtime topic lock")))?;
+        self.ensure_table_topic(&mut topics, &key, &event.tenant)?;
         let sequence = self.next_change_sequence(&key, event.commit_ts);
         let record = ChangeRecord {
             tenant: event.tenant,
@@ -429,6 +548,10 @@ impl Realtime {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
         };
+        if self.ensure_table_topic(&mut topics, &key, tenant).is_err() {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        }
         topics.topics.entry(key).or_insert_with(|| broadcast::channel(self.capacity).0).subscribe()
     }
 
@@ -613,6 +736,10 @@ impl Realtime {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
         };
+        if self.ensure_table_topic(&mut topic_shard, &key, tenant).is_err() {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        }
         let topic = topic_shard.queries.entry(key).or_insert_with(|| QueryTopic {
             sender: broadcast::channel(self.capacity).0,
             max_limit: limit,
@@ -726,6 +853,9 @@ impl Realtime {
             .ok_or_else(|| RymeError::Internal(String::from("presence state shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("presence state lock")))?;
+        if !presence.contains_key(&key) {
+            self.admit_topic(TopicKind::PresenceRoom, tenant)?;
+        }
         let members = presence.entry(key).or_insert_with(HashMap::new);
         let expired_members: Vec<String> = members
             .iter()
@@ -776,6 +906,7 @@ impl Realtime {
 
     pub fn prune_presence(&self, now_unix: u64) -> usize {
         let mut expired_events = Vec::new();
+        let mut expired_rooms = Vec::new();
         let mut removed = 0;
         for shard in self.presence_state.iter() {
             let Ok(mut presence) = shard.lock() else { continue };
@@ -798,8 +929,18 @@ impl Realtime {
                     }
                 }
                 removed += before - members.len();
-                !members.is_empty()
+                if members.is_empty() {
+                    expired_rooms.push(key.clone());
+                    false
+                } else {
+                    true
+                }
             });
+        }
+        for key in expired_rooms {
+            if let Some((tenant, _)) = split_scope_key(&key) {
+                self.release_topic(TopicKind::PresenceRoom, tenant);
+            }
         }
         for (tenant, channel, member, sequence) in expired_events {
             let _ = self.publish_presence(
@@ -821,29 +962,36 @@ impl Realtime {
         let mut removed = 0;
         for shard in self.table_topics.iter() {
             let Ok(mut topics) = shard.lock() else { continue };
-            let idle_topics: Vec<String> = topics
+            let keys: HashSet<String> = topics
                 .topics
-                .iter()
-                .filter(|(key, sender)| {
-                    sender.receiver_count() == 0
-                        && topics.history.get(*key).map(|log| log.is_empty()).unwrap_or(true)
-                })
-                .map(|(key, _)| key.clone())
+                .keys()
+                .chain(topics.history.keys())
+                .chain(topics.queries.keys())
+                .cloned()
                 .collect();
-            for key in idle_topics {
-                topics.topics.remove(&key);
-                topics.history.remove(&key);
-                removed += 1;
-            }
-            let idle_queries: Vec<String> = topics
-                .queries
-                .iter()
-                .filter(|(_, topic)| topic.sender.receiver_count() == 0)
-                .map(|(key, _)| key.clone())
-                .collect();
-            for key in idle_queries {
-                topics.queries.remove(&key);
-                removed += 1;
+            for key in keys {
+                let change_active =
+                    topics.topics.get(&key).is_some_and(|sender| sender.receiver_count() > 0);
+                let query_active =
+                    topics.queries.get(&key).is_some_and(|topic| topic.sender.receiver_count() > 0);
+                if !change_active && !query_active {
+                    if topics.topics.remove(&key).is_some() {
+                        removed += 1;
+                    }
+                    if topics.history.remove(&key).is_some() {
+                        removed += 1;
+                    }
+                    if topics.queries.remove(&key).is_some() {
+                        removed += 1;
+                    }
+                    self.release_table_topic_if_empty(&mut topics, &key);
+                } else if !change_active
+                    && topics.history.get(&key).map(|log| log.is_empty()).unwrap_or(true)
+                    && topics.topics.remove(&key).is_some()
+                {
+                    removed += 1;
+                    self.release_table_topic_if_empty(&mut topics, &key);
+                }
             }
         }
         for shard in self.broadcast_topics.iter() {
@@ -856,6 +1004,9 @@ impl Realtime {
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in idle_broadcast {
+                    if let Some((tenant, _)) = split_scope_key(&key) {
+                        self.release_topic(TopicKind::Broadcast, tenant);
+                    }
                     topics.remove(&key);
                     removed += 1;
                 }
@@ -869,6 +1020,9 @@ impl Realtime {
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in idle_topics {
+                    if let Some((tenant, _)) = split_scope_key(&key) {
+                        self.release_topic(TopicKind::PresenceTopic, tenant);
+                    }
                     topics.remove(&key);
                     removed += 1;
                 }
@@ -901,11 +1055,15 @@ impl Realtime {
             .map_err(|_| RymeError::Internal(String::from("presence state lock")))?;
         let removed =
             presence.get_mut(&key).map(|members| members.remove(member).is_some()).unwrap_or(false);
-        if presence.get(&key).is_some_and(HashMap::is_empty) {
+        let empty = presence.get(&key).is_some_and(HashMap::is_empty);
+        if empty {
             presence.remove(&key);
         }
         let sequence = removed.then(|| self.next_presence_sequence());
         drop(presence);
+        if empty {
+            self.release_topic(TopicKind::PresenceRoom, tenant);
+        }
         if removed {
             self.publish_presence(
                 tenant,
@@ -937,6 +1095,7 @@ impl Realtime {
         let sequence;
         let key = scope_key(tenant, channel);
         let shard = self.presence_shard(&key);
+        let mut emptied = false;
         if let Some(state_shard) = self.presence_state.get(shard) {
             if let Ok(mut presence) = state_shard.lock() {
                 if let Some(members) = presence.get_mut(&key) {
@@ -959,6 +1118,7 @@ impl Realtime {
                     }
                     if members.is_empty() {
                         presence.remove(&key);
+                        emptied = true;
                     }
                 }
                 let expired = expired
@@ -967,6 +1127,9 @@ impl Realtime {
                     .collect::<Vec<_>>();
                 sequence = self.presence_sequence.load(Ordering::Acquire);
                 drop(presence);
+                if emptied {
+                    self.release_topic(TopicKind::PresenceRoom, tenant);
+                }
                 for (member, sequence) in expired {
                     let _ = self.publish_presence(
                         tenant,
@@ -1000,6 +1163,11 @@ impl Realtime {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
         };
+        if !topics.contains_key(&key) && self.admit_topic(TopicKind::PresenceTopic, tenant).is_err()
+        {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        }
         topics
             .entry(key)
             .or_insert_with(|| broadcast::channel(self.broadcast_capacity).0)
@@ -1136,6 +1304,11 @@ impl Realtime {
             .ok_or_else(|| RymeError::Internal(String::from("broadcast shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+        if !topics.contains_key(&key) {
+            let (tenant, _) = split_scope_key(&key)
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("broadcast scope")))?;
+            self.admit_topic(TopicKind::Broadcast, tenant)?;
+        }
         Ok(topics
             .entry(key)
             .or_insert_with(|| {
@@ -1439,7 +1612,17 @@ impl Default for Realtime {
 }
 
 fn branch_topic_key(tenant: &str, database: &str, branch: &str, table: &str) -> String {
-    format!("{tenant}/{database}/{branch}/{table}")
+    format!(
+        "{}:{}{}:{}{}:{}{}:{}{}",
+        tenant.len(),
+        tenant,
+        database.len(),
+        database,
+        branch.len(),
+        branch,
+        table.len(),
+        table
+    )
 }
 
 fn scope_key(tenant: &str, name: &str) -> String {
@@ -1813,6 +1996,85 @@ mod tests {
         assert_eq!(realtime.prune_idle(), 0);
         drop(live);
         drop(kept_cast);
+    }
+
+    #[test]
+    fn prune_idle_reclaims_history_only_table_topics() {
+        let realtime = Realtime::new(64);
+        realtime
+            .publish(NewChange {
+                tenant: String::from("t"),
+                database: String::from("d"),
+                branch: String::from("main"),
+                table: String::from("history-only"),
+                op: Operation::Insert,
+                pk: b"one".to_vec(),
+                before: None,
+                after: Some(b"value".to_vec()),
+                commit_ts: 1,
+                tx_id: 1,
+            })
+            .unwrap();
+        assert_eq!(realtime.replay("t", "d", "history-only", 0, 10).len(), 1);
+        assert_eq!(realtime.prune_idle(), 1);
+        assert!(realtime.replay("t", "d", "history-only", 0, 10).is_empty());
+        assert_eq!(realtime.prune_idle(), 0);
+    }
+
+    #[test]
+    fn realtime_topic_registry_rejects_global_and_tenant_overflow() {
+        let realtime = Realtime::new(64);
+        {
+            let mut registry = realtime.topic_registry.lock().unwrap();
+            registry.table.total = MAX_TABLE_TOPICS;
+        }
+        let change = NewChange {
+            tenant: String::from("t"),
+            database: String::from("d"),
+            branch: String::from("main"),
+            table: String::from("docs"),
+            op: Operation::Insert,
+            pk: b"one".to_vec(),
+            before: None,
+            after: None,
+            commit_ts: 1,
+            tx_id: 1,
+        };
+        assert!(matches!(realtime.publish(change.clone()), Err(RymeError::Overload(_))));
+
+        {
+            let mut registry = realtime.topic_registry.lock().unwrap();
+            registry.table.total = 0;
+            registry.table.per_tenant.insert(String::from("t"), MAX_TABLE_TOPICS_PER_TENANT);
+        }
+        assert!(matches!(realtime.publish(change), Err(RymeError::Overload(_))));
+    }
+
+    #[test]
+    fn branch_topic_keys_keep_tenants_isolated_when_names_contain_separators() {
+        let realtime = Realtime::new(64);
+        let mut first = realtime.subscribe_branch("a/b", "c", "main", "docs");
+        let mut second = realtime.subscribe_branch("a", "b/c", "main", "docs");
+        for (tenant, database, pk) in [("a/b", "c", &b"first"[..]), ("a", "b/c", &b"second"[..])] {
+            realtime
+                .publish(NewChange {
+                    tenant: tenant.to_string(),
+                    database: database.to_string(),
+                    branch: String::from("main"),
+                    table: String::from("docs"),
+                    op: Operation::Insert,
+                    pk: pk.to_vec(),
+                    before: None,
+                    after: None,
+                    commit_ts: 1,
+                    tx_id: 1,
+                })
+                .unwrap();
+        }
+        assert_eq!(first.try_recv().unwrap().pk, b"first");
+        assert!(first.try_recv().is_err());
+        assert_eq!(second.try_recv().unwrap().pk, b"second");
+        assert!(second.try_recv().is_err());
     }
 
     #[test]
