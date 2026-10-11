@@ -1022,7 +1022,7 @@ async fn extras_oidc_flow() {
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed.get("tenant").and_then(|v| v.as_str()), Some("sso"));
     let key = parsed.get("key").and_then(|v| v.as_str()).unwrap().to_string();
-    let (status, _) = bearer_request(http, &key, "GET /v1/ranges", b"").await;
+    let (status, _) = bearer_request(http, &key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
     server.abort();
     std::env::remove_var("RYME_OIDC_ISSUER");
@@ -1828,7 +1828,7 @@ async fn extras_auth_token_issues_usable_keys() {
     let refreshed_key = refreshed.get("key").and_then(|v| v.as_str()).unwrap();
     let next_refresh = refreshed.get("refresh_token").and_then(|v| v.as_str()).unwrap();
     assert_ne!(next_refresh, refresh_token);
-    let (status, _) = bearer_request(http, refreshed_key, "GET /v1/ranges", b"").await;
+    let (status, _) = bearer_request(http, refreshed_key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
     let (status, _) = http_request(
         http,
@@ -1838,9 +1838,9 @@ async fn extras_auth_token_issues_usable_keys() {
     )
     .await;
     assert_eq!(status, 401);
-    let (status, body) = bearer_request(http, &key, "GET /v1/ranges", b"").await;
+    let (status, body) = bearer_request(http, &key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
-    assert!(body.is_array());
+    assert!(body.is_object());
     let (status, _) =
         http_request(http, "POST /v1/auth/token", b"{\"id\":\"tok\",\"password\":\"wrong-pass\"}")
             .await;
@@ -1954,7 +1954,7 @@ async fn extras_auth_state_survives_restart() {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let (status, _) = bearer_request(http, &key, "GET /v1/ranges", b"").await;
+    let (status, _) = bearer_request(http, &key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
     let (status, _) = http_request(
         http,
@@ -2073,7 +2073,7 @@ async fn extras_passkey_full_ceremony_issues_keys() {
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let key = parsed.get("key").and_then(|v| v.as_str()).unwrap().to_string();
     assert!(key.starts_with("ryme_"));
-    let (status, _) = bearer_request(http, &key, "GET /v1/ranges", b"").await;
+    let (status, _) = bearer_request(http, &key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
     let (status, _) = http_request(
         http,

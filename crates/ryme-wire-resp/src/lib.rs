@@ -21,6 +21,8 @@ use tokio::sync::broadcast;
 
 const KV_TABLE: &str = "_kv";
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
+type PubSubKey = (String, Vec<u8>);
+type PubSubCounts = Arc<Mutex<std::collections::HashMap<PubSubKey, usize>>>;
 
 pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
 
@@ -102,8 +104,8 @@ struct ClusterPubSubBroadcast {
 #[derive(Debug, Clone)]
 struct PubSubBus {
     sender: broadcast::Sender<PubSubMessage>,
-    counts: Arc<Mutex<std::collections::HashMap<(String, Vec<u8>), usize>>>,
-    pattern_counts: Arc<Mutex<std::collections::HashMap<(String, Vec<u8>), usize>>>,
+    counts: PubSubCounts,
+    pattern_counts: PubSubCounts,
     cluster_started: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
@@ -517,6 +519,10 @@ where
         };
         match authenticator(user, password) {
             Ok(principal) if !principal.tenant.is_empty() => {
+                let read_allowed = principal.can_read();
+                let write_allowed = principal.can_write();
+                let publish_allowed = principal.can_publish();
+                let tenant = principal.tenant;
                 for channel in &client.subscriptions {
                     self.pubsub.remove(&client.tenant, channel);
                 }
@@ -525,11 +531,11 @@ where
                 }
                 client.subscriptions.clear();
                 client.patterns.clear();
-                self.tenant = principal.tenant;
+                self.tenant = tenant;
                 client.tenant = self.tenant.clone();
-                self.read_allowed = principal.can_read();
-                self.write_allowed = principal.can_write();
-                self.publish_allowed = principal.can_publish();
+                self.read_allowed = read_allowed;
+                self.write_allowed = write_allowed;
+                self.publish_allowed = publish_allowed;
                 client.authenticated = true;
                 encode_simple("OK")
             }

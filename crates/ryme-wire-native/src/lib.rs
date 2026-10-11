@@ -835,7 +835,6 @@ mod tests {
     async fn native_sql_uses_configured_rls_executor() {
         use std::collections::{HashMap, HashSet};
         use ryme_storage::RecordKey;
-        use ryme_txn::TxnBackend;
 
         let gateway = Gateway::new(
             String::from("t"),

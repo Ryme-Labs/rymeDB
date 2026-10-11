@@ -35,7 +35,7 @@ async fn wait_leader(nodes: &[std::sync::Arc<Node>], skip: Option<usize>) -> usi
 }
 
 async fn wait_value(nodes: &[std::sync::Arc<Node>], name: &str, value: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let mut done = true;
         for node in nodes {

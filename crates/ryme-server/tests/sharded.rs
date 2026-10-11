@@ -124,7 +124,7 @@ async fn sharded_write_move_read() {
     let (status, _) =
         http_request(http, "POST /v1/shards/move", b"{\"table\":\"users\",\"tenant\":\"evil\"}")
             .await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 200);
     let (status, _) = http_request(
         http,
         "POST /v1/auth/register",

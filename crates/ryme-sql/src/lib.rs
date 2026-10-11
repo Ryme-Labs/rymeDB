@@ -7130,6 +7130,7 @@ where
         enabled: Option<bool>,
         forced: Option<bool>,
     ) -> Result<()> {
+        let forced = forced.or_else(|| enabled.filter(|enabled| !enabled).map(|_| false));
         if let Some(enabled) = enabled {
             let mut tables = self
                 .rls_enabled
@@ -16711,7 +16712,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("schema.json");
         let manager = TxnManager::new();
-        let executor =
+        let mut executor =
             Executor::with_manager(String::from("tenant-a"), String::from("d"), manager.clone());
         executor.set_schema_path(path.clone());
         executor
@@ -16751,7 +16752,7 @@ mod tests {
         assert!(snapshot.rls_forced.contains("messages"));
         assert!(snapshot.rls_policies.keys().any(|key| key.ends_with("\0own_messages")));
 
-        let restarted =
+        let mut restarted =
             Executor::with_manager(String::from("tenant-a"), String::from("d"), manager);
         restarted.set_schema_path(path.clone());
         restarted.restore_schema_snapshot(snapshot).unwrap();

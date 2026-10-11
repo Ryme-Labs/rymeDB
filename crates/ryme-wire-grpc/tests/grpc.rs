@@ -131,7 +131,7 @@ async fn grpc_sql_and_auth() {
 #[tokio::test]
 async fn grpc_sql_uses_configured_rls_executor() {
     use ryme_storage::RecordKey;
-    use ryme_txn::TxnBackend;
+    use ryme_wire_grpc::proto::ryme_server::Ryme;
     let gateway = Gateway::new(
         String::from("t"),
         String::from("d"),

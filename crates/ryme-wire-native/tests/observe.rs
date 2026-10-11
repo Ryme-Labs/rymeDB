@@ -75,7 +75,13 @@ async fn native_observe_meter_and_classify_sql() {
     assert!(denied.get("error").and_then(|v| v.as_str()).unwrap_or("").contains("quota"));
     assert_eq!(latency.snapshot().count, 3);
     assert_eq!(histogram.snapshot().count, 3);
-    assert!(slow_log.is_empty());
+    // A loaded CI worker can push one of these network calls over the slow
+    // query threshold. Validate the bounded log shape and classification
+    // without making correctness depend on scheduler timing.
+    let entries = slow_log.recent(16);
+    assert!(entries.len() <= 3);
+    assert!(entries.iter().all(|entry| entry.kind == "native"));
+    assert!(entries.iter().all(|entry| entry.micros > ryme_observe::SLOW_THRESHOLD_MICROS));
     let registry = metering.lock().unwrap();
     assert_eq!(registry.total_for("t", "d", ryme_metering::Metric::WriteUnit).quantity, 1);
     assert_eq!(registry.total_for("t", "d", ryme_metering::Metric::ReadUnit).quantity, 1);

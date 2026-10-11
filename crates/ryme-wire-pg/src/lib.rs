@@ -1,4 +1,4 @@
-use ryme_auth::{Principal, Role};
+use ryme_auth::Principal;
 use ryme_error::{Result, RymeError};
 pub use ryme_gateway::{RemoteRead, RemoteReader};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
@@ -4443,6 +4443,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryme_auth::Role;
     use ryme_sql::{
         DefaultPrivilegeGrant, FunctionDefinition, PrivilegeGrant, RlsPolicy, RoleDefinition,
         SchemaSnapshot, SequenceDefinition, TriggerDefinition, ViewDefinition,

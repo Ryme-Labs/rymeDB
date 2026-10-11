@@ -6416,6 +6416,7 @@ async fn supabase_presence_leave(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_supabase_change_forwarder(
     realtime: &Realtime,
     rls_executor: &Executor<BranchStorage>,
@@ -6437,32 +6438,24 @@ fn spawn_supabase_change_forwarder(
     let rls_executor = rls_executor.clone();
     let events = events.clone();
     tokio::spawn(async move {
-        loop {
-            match receiver.recv().await {
-                Ok(record) => {
-                    let Some(record) =
-                        realtime_change_for_executor(&rls_executor, &tenant, &branch, &record)
-                    else {
-                        continue;
-                    };
-                    if record.database != database || !supabase_change_matches(&subscription, &record)
-                    {
-                        continue;
-                    }
-                    if events
-                        .try_send(SupabaseRealtimeEvent::Change(
-                            topic.clone(),
-                            subscription.clone(),
-                            record,
-                        ))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
-                | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        while let Ok(record) = receiver.recv().await {
+            let Some(record) =
+                realtime_change_for_executor(&rls_executor, &tenant, &branch, &record)
+            else {
+                continue;
+            };
+            if record.database != database || !supabase_change_matches(&subscription, &record) {
+                continue;
+            }
+            if events
+                .try_send(SupabaseRealtimeEvent::Change(
+                    topic.clone(),
+                    subscription.clone(),
+                    record,
+                ))
+                .is_err()
+            {
+                break;
             }
         }
     })
@@ -11037,6 +11030,7 @@ fn realtime_change_for_executor<B: TxnBackend>(
     }
 }
 
+#[cfg(test)]
 fn realtime_change_allowed_by_executor<B: TxnBackend>(
     executor: &Executor<B>,
     tenant: &str,
