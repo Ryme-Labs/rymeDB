@@ -12,28 +12,58 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 #[derive(Debug, Default)]
 struct ActiveRegistry {
-    transactions: Mutex<BTreeMap<u64, u64>>,
+    transactions: Mutex<ActiveTransactions>,
+}
+
+#[derive(Debug, Default)]
+struct ActiveTransactions {
+    by_id: BTreeMap<u64, u64>,
+    by_read_ts: BTreeMap<u64, usize>,
 }
 
 impl ActiveRegistry {
     fn insert(&self, id: u64, read_ts: u64) {
         if let Ok(mut transactions) = self.transactions.lock() {
-            transactions.insert(id, read_ts);
+            if let Some(previous) = transactions.by_id.insert(id, read_ts) {
+                Self::remove_read_ts(&mut transactions.by_read_ts, previous);
+            }
+            *transactions.by_read_ts.entry(read_ts).or_default() += 1;
         }
     }
 
     fn remove(&self, id: u64) {
         if let Ok(mut transactions) = self.transactions.lock() {
-            transactions.remove(&id);
+            if let Some(read_ts) = transactions.by_id.remove(&id) {
+                Self::remove_read_ts(&mut transactions.by_read_ts, read_ts);
+            }
         }
     }
 
     fn len(&self) -> usize {
-        self.transactions.lock().map(|transactions| transactions.len()).unwrap_or(0)
+        self.transactions.lock().map(|transactions| transactions.by_id.len()).unwrap_or(0)
     }
 
     fn oldest(&self) -> Option<u64> {
-        self.transactions.lock().ok().and_then(|transactions| transactions.values().copied().min())
+        self.transactions
+            .lock()
+            .ok()
+            .and_then(|transactions| transactions.by_read_ts.first_key_value().map(|(ts, _)| *ts))
+    }
+
+    fn remove_read_ts(read_timestamps: &mut BTreeMap<u64, usize>, read_ts: u64) {
+        let remove = if let Some(count) = read_timestamps.get_mut(&read_ts) {
+            if *count == 1 {
+                true
+            } else {
+                *count -= 1;
+                false
+            }
+        } else {
+            false
+        };
+        if remove {
+            read_timestamps.remove(&read_ts);
+        }
     }
 }
 
@@ -2169,6 +2199,26 @@ fn segment_entries(commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_registry_tracks_oldest_timestamp_across_insert_remove_and_restamp() {
+        let registry = ActiveRegistry::default();
+        registry.insert(1, 5);
+        registry.insert(2, 3);
+        registry.insert(3, 5);
+        assert_eq!(registry.oldest(), Some(3));
+        assert_eq!(registry.len(), 3);
+
+        registry.insert(2, 8);
+        assert_eq!(registry.oldest(), Some(5));
+        registry.remove(1);
+        assert_eq!(registry.oldest(), Some(5));
+        registry.remove(3);
+        assert_eq!(registry.oldest(), Some(8));
+        registry.remove(2);
+        assert_eq!(registry.oldest(), None);
+        assert_eq!(registry.len(), 0);
+    }
 
     #[test]
     fn commit_index_retains_newer_key_and_table_versions_when_pruning() {
