@@ -22,6 +22,9 @@ const ELECTION_TIMEOUT_MIN_MS: u64 = 500;
 const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
 const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
 
+type RangeTableRows = BTreeMap<(String, String, String), Vec<(Vec<u8>, Vec<TableVersion>)>>;
+type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Rpc {
     VoteRequest {
@@ -970,12 +973,8 @@ impl Node {
                 IntentRecord::Prepare { transaction_id, commit_ts, state } => {
                     prepared.insert(transaction_id, PreparedIntent { commit_ts, state });
                 }
-                IntentRecord::Resolve { transaction_id, committed, .. } => {
-                    if committed {
-                        prepared.remove(&transaction_id);
-                    } else {
-                        prepared.remove(&transaction_id);
-                    }
+                IntentRecord::Resolve { transaction_id, .. } => {
+                    prepared.remove(&transaction_id);
                 }
             }
         }
@@ -1690,17 +1689,14 @@ impl Node {
         }
         for task in tasks {
             let Ok(Ok((response, replica))) = task.await else { continue };
-            match response {
-                Rpc::RangeVoteResponse { term: peer_term, granted } => {
-                    if peer_term > term {
-                        self.observe_range_term(&range.id, peer_term);
-                        return;
-                    }
-                    if granted && !votes.contains(&replica) {
-                        votes.push(replica);
-                    }
+            if let Rpc::RangeVoteResponse { term: peer_term, granted } = response {
+                if peer_term > term {
+                    self.observe_range_term(&range.id, peer_term);
+                    return;
                 }
-                _ => {}
+                if granted && !votes.contains(&replica) {
+                    votes.push(replica);
+                }
             }
         }
         if votes.len() < majority(range.replicas.len()) {
@@ -3704,6 +3700,7 @@ impl Node {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_range_entry(
         &self,
         group_id: &str,
@@ -3925,6 +3922,7 @@ impl Node {
         self.persist_range_meta()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn range_conflict_index(
         &self,
         group_id: &str,
@@ -3966,6 +3964,7 @@ impl Node {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn append_range_follower(
         &self,
         group_id: &str,
@@ -3993,6 +3992,7 @@ impl Node {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_range_follower_marked(
         &self,
         group_id: &str,
@@ -5327,6 +5327,7 @@ impl Node {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_range_snapshot_for(
         &self,
         peer: usize,
@@ -5394,8 +5395,7 @@ impl Node {
         if !purge.is_empty() {
             self.manager.purge_keys(&purge)?;
         }
-        let mut tables: BTreeMap<(String, String, String), Vec<(Vec<u8>, Vec<TableVersion>)>> =
-            BTreeMap::new();
+        let mut tables: RangeTableRows = BTreeMap::new();
         for row in &snapshot.rows {
             tables
                 .entry((row.tenant.clone(), row.database.clone(), row.table.clone()))
@@ -5594,11 +5594,7 @@ impl Node {
         }
     }
 
-    pub fn read_range_values(
-        &self,
-        keys: &[RecordKey],
-        read_ts: u64,
-    ) -> Result<Vec<(Option<Vec<u8>>, Option<u64>)>> {
+    pub fn read_range_values(&self, keys: &[RecordKey], read_ts: u64) -> Result<RangeReadValues> {
         if keys.len() > 1_024 {
             return Err(RymeError::Overload(String::from("range read batch")));
         }
@@ -5610,7 +5606,7 @@ impl Node {
         peer: usize,
         keys: Vec<RecordKey>,
         read_ts: u64,
-    ) -> Result<Vec<(Option<Vec<u8>>, Option<u64>)>> {
+    ) -> Result<RangeReadValues> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }

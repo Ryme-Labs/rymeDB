@@ -125,8 +125,11 @@ enum TransactionControl {
     RollbackToSavepoint(String),
 }
 
+type BackendCancellationMap = HashMap<(u32, u32), Weak<AtomicBool>>;
+type NotificationMap = HashMap<(String, String), broadcast::Sender<PgNotification>>;
+
 static NEXT_BACKEND_PID: AtomicU32 = AtomicU32::new(1);
-static BACKEND_CANCELLATIONS: LazyLock<Mutex<HashMap<(u32, u32), Weak<AtomicBool>>>> =
+static BACKEND_CANCELLATIONS: LazyLock<Mutex<BackendCancellationMap>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone)]
@@ -142,9 +145,8 @@ enum ListenerChange {
     Unlisten(Option<String>),
 }
 
-static PG_NOTIFICATIONS: LazyLock<
-    Mutex<HashMap<(String, String), broadcast::Sender<PgNotification>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static PG_NOTIFICATIONS: LazyLock<Mutex<NotificationMap>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn notification_sender(tenant: &str, database: &str) -> broadcast::Sender<PgNotification> {
     let key = (tenant.to_string(), database.to_string());
@@ -700,6 +702,7 @@ where
     Ok((tag, payload))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_loop<B, S>(
     mut socket: S,
     executor: Arc<Executor<B>>,
@@ -1814,7 +1817,7 @@ where
                     default.grantee.clone(),
                     String::from("="),
                     String::from(privilege),
-                    default.grant_option.then_some("*").unwrap_or("").to_string(),
+                    if default.grant_option { "*" } else { "" }.to_string(),
                     String::from("/"),
                     owner.to_string(),
                     String::from("}"),
@@ -2813,9 +2816,9 @@ fn transaction_control(
         || upper.starts_with("BEGIN ISOLATION LEVEL ")
         || upper.starts_with("START TRANSACTION ISOLATION LEVEL ")
     {
-        let isolation = if upper.contains("ISOLATION LEVEL SNAPSHOT") {
-            Isolation::Snapshot
-        } else if upper.contains("ISOLATION LEVEL READ COMMITTED") {
+        let isolation = if upper.contains("ISOLATION LEVEL SNAPSHOT")
+            || upper.contains("ISOLATION LEVEL READ COMMITTED")
+        {
             Isolation::Snapshot
         } else {
             session_isolation(session)
@@ -3198,6 +3201,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepared_command<B>(
     query: &str,
     statements: &mut HashMap<String, String>,

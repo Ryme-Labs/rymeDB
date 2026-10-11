@@ -3460,8 +3460,8 @@ fn order_rows(rows: Vec<(Vec<u8>, Vec<u8>)>, order: Option<&str>) -> Vec<(Vec<u8
         for (field, descending, nulls_first) in &specs {
             let left_value = left_row.get(*field);
             let right_value = right_row.get(*field);
-            let left_null = left_value.map_or(true, serde_json::Value::is_null);
-            let right_null = right_value.map_or(true, serde_json::Value::is_null);
+            let left_null = left_value.is_none_or(serde_json::Value::is_null);
+            let right_null = right_value.is_none_or(serde_json::Value::is_null);
             if left_null != right_null {
                 let nulls_first = nulls_first.unwrap_or(*descending);
                 return if left_null == nulls_first { Ordering::Less } else { Ordering::Greater };
@@ -5305,6 +5305,7 @@ struct SupabaseChangeSubscription {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum SupabaseRealtimeEvent {
     Broadcast(String, ryme_realtime::BroadcastMsg),
     Change(String, SupabaseChangeSubscription, ryme_realtime::ChangeRecord),
@@ -5723,6 +5724,7 @@ fn supabase_change_matches(
     supabase_filter_matches(subscription.filter.as_deref(), record, &value)
 }
 
+#[allow(clippy::while_let_loop)]
 fn spawn_supabase_broadcast_forwarder(
     realtime: &Realtime,
     tenant: &str,
@@ -5751,6 +5753,7 @@ fn spawn_supabase_broadcast_forwarder(
     })
 }
 
+#[allow(clippy::while_let_loop)]
 fn spawn_supabase_presence_forwarder(
     realtime: &Realtime,
     tenant: &str,
@@ -5890,6 +5893,7 @@ fn spawn_supabase_change_forwarder(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_supabase_realtime(
     socket: axum::extract::ws::WebSocket,
     state: SharedState,
@@ -8614,7 +8618,7 @@ async fn remote_scan_range_page(
             if row.table == table
                 && row.tenant == tenant
                 && row.database == database
-                && !start_after.as_deref().is_some_and(|after| row.pk.as_slice() <= after)
+                && start_after.as_deref().is_none_or(|after| row.pk.as_slice() > after)
             {
                 raw_rows.insert(row.pk.clone(), snapshot_live_value(&row, snapshot.snapshot_ts));
             }
@@ -9669,6 +9673,7 @@ async fn send_realtime_message_with_sink(
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_changes(
     socket: axum::extract::ws::WebSocket,
     realtime: Realtime,
@@ -10313,6 +10318,7 @@ fn scan_realtime_rows<B: TxnBackend>(
     visible
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_realtime_rows_with_executor<B: TxnBackend>(
     backend: &B,
     rls_executor: &Executor<BranchStorage>,
@@ -10364,6 +10370,7 @@ fn scan_realtime_rows_with_executor<B: TxnBackend>(
     visible
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn scan_realtime_rows_for_query<B: TxnBackend>(
     backend: &B,
     rls_executor: &Executor<BranchStorage>,
@@ -10400,6 +10407,7 @@ async fn scan_realtime_rows_for_query<B: TxnBackend>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_query_snapshot<B: TxnBackend>(
     outgoing: &RealtimeOutgoing,
     backend: &B,
@@ -10443,6 +10451,7 @@ async fn send_query_snapshot<B: TxnBackend>(
     (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_reactive_query_snapshot<B: TxnBackend>(
     outgoing: &RealtimeOutgoing,
     backend: &B,
@@ -10615,7 +10624,7 @@ fn load_jwks_verifier_bytes(
     issuer: Option<String>,
     audience: Option<String>,
 ) -> ryme_error::Result<JwtVerifier> {
-    let document: serde_json::Value = serde_json::from_slice(&raw)
+    let document: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks: {error}")))?;
     let keys = document
         .get("keys")
@@ -11052,6 +11061,7 @@ fn archive_target(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
 

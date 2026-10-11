@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
+type BranchChange = (Vec<u8>, Option<Vec<u8>>);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Branch {
     pub id: String,
@@ -412,7 +414,7 @@ where
         self.overlay.then_some(self.branch_database.as_str())
     }
 
-    pub fn changes(&self, tenant: &str, table: &str) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    pub fn changes(&self, tenant: &str, table: &str) -> Result<Vec<BranchChange>> {
         if !self.overlay {
             return Ok(Vec::new());
         }

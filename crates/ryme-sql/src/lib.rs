@@ -10,6 +10,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+type TableDefinitionParts =
+    (Vec<ColumnDefinition>, Vec<Vec<String>>, Vec<String>, Vec<ForeignKeyConstraint>);
+type ConflictClause = (Vec<String>, Vec<(String, InsertValue)>, bool, Vec<Predicate>);
+type StandardInsertRows = Option<(Vec<String>, Vec<Vec<InsertValue>>)>;
+type ProjectionColumns = Option<(Vec<String>, Vec<Option<String>>)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetOperation {
     Union,
@@ -1306,9 +1312,7 @@ impl Predicate {
             let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
                 return None;
             };
-            return Some(
-                json_column_value(column, &object).map_or(true, serde_json::Value::is_null),
-            );
+            return Some(json_column_value(column, &object).is_none_or(serde_json::Value::is_null));
         }
         Some(match self.field {
             Field::Key => is_null_bytes(pk),
@@ -1595,10 +1599,9 @@ fn parse_drop(tokens: &[String]) -> Result<Statement> {
         tokens.get(1).ok_or_else(|| RymeError::InvalidArgument(String::from("drop object")))?;
     let is_materialized = kind.eq_ignore_ascii_case("MATERIALIZED")
         && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("VIEW"));
-    let initial_object_pos = if is_materialized {
-        3
-    } else if kind.eq_ignore_ascii_case("INDEX")
-        && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("CONCURRENTLY"))
+    let initial_object_pos = if is_materialized
+        || (kind.eq_ignore_ascii_case("INDEX")
+            && tokens.get(2).is_some_and(|token| token.eq_ignore_ascii_case("CONCURRENTLY")))
     {
         3
     } else {
@@ -3423,9 +3426,7 @@ fn parse_column_definitions(raw: &str) -> Result<Vec<ColumnDefinition>> {
     parse_table_definition(raw).map(|(columns, _, _, _)| columns)
 }
 
-fn parse_table_definition(
-    raw: &str,
-) -> Result<(Vec<ColumnDefinition>, Vec<Vec<String>>, Vec<String>, Vec<ForeignKeyConstraint>)> {
+fn parse_table_definition(raw: &str) -> Result<TableDefinitionParts> {
     let Some(open) = raw.find('(') else {
         return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     };
@@ -3545,7 +3546,7 @@ fn parse_table_definition(
         }
         let Some(unique) = unique.first() else { continue };
         let Some(column) =
-            columns.iter_mut().find(|column| column.name.eq_ignore_ascii_case(&unique))
+            columns.iter_mut().find(|column| column.name.eq_ignore_ascii_case(unique))
         else {
             return Err(RymeError::InvalidArgument(format!("unknown unique column {unique}")));
         };
@@ -3619,7 +3620,7 @@ fn parse_references_target(
     let close = trimmed
         .find('(')
         .and_then(|open| matching_paren(trimmed, open))
-        .unwrap_or_else(|| referenced_table.len());
+        .unwrap_or(referenced_table.len());
     let suffix = trimmed.get(close + 1..).unwrap_or_default();
     let on_delete = parse_foreign_key_action(suffix, "ON DELETE")?;
     let on_update = parse_foreign_key_action(suffix, "ON UPDATE")?;
@@ -3916,9 +3917,7 @@ fn parse_insert_select(tokens: &[String], raw: &str, table: String) -> Result<Op
     }))
 }
 
-fn parse_conflict_clause(
-    raw: &str,
-) -> Result<(Vec<String>, Vec<(String, InsertValue)>, bool, Vec<Predicate>)> {
+fn parse_conflict_clause(raw: &str) -> Result<ConflictClause> {
     let upper = raw.to_ascii_uppercase();
     let conflict_pos = upper
         .find("ON CONFLICT")
@@ -3993,7 +3992,7 @@ fn parse_conflict_clause(
     Ok((target_columns, assignments, false, conflict_filter))
 }
 
-fn parse_standard_insert_rows(raw: &str) -> Result<Option<(Vec<String>, Vec<Vec<InsertValue>>)>> {
+fn parse_standard_insert_rows(raw: &str) -> Result<StandardInsertRows> {
     let upper = raw.to_ascii_uppercase();
     let Some(values_keyword) = upper.find("VALUES") else {
         return Ok(None);
@@ -4263,7 +4262,7 @@ fn parse_update_from(
         .ok_or_else(|| RymeError::InvalidArgument(String::from("update source table")))?;
     let source_alias = relation_alias(&source_tokens, &source_table);
     let target_alias = relation_alias(
-        &tokens
+        tokens
             .get(1..tokens.iter().position(|token| token.eq_ignore_ascii_case("SET")).unwrap_or(1))
             .unwrap_or_default(),
         &table,
@@ -4433,7 +4432,7 @@ fn parse_delete(tokens: &[String], raw: &str) -> Result<Statement> {
                 .ok_or_else(|| RymeError::InvalidArgument(String::from("delete using source")))?;
             let source_alias = relation_alias(&source_tokens, &source_table);
             let target_alias =
-                relation_alias(&tokens.get(from_pos + 1..using_pos).unwrap_or_default(), &table);
+                relation_alias(tokens.get(from_pos + 1..using_pos).unwrap_or_default(), &table);
             let where_end = returning_offset.unwrap_or(raw.len());
             let where_tokens = tokenize(&raw[where_offset + "WHERE".len()..where_end]);
             let (target_column, source_column, filter, source_filter) = parse_relation_conditions(
@@ -4695,10 +4694,7 @@ fn parse_select(tokens: &[String], raw: &str) -> Result<Statement> {
     Ok(Statement::SelectScan { table, limit, offset, order, filter })
 }
 
-fn parse_projection(
-    tokens: &[String],
-    raw: &str,
-) -> Result<Option<(Vec<String>, Vec<Option<String>>)>> {
+fn parse_projection(tokens: &[String], raw: &str) -> Result<ProjectionColumns> {
     let _from = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("FROM"))
@@ -5805,9 +5801,7 @@ fn substitute_excluded_predicate(predicate: &Predicate, incoming: &[u8]) -> Opti
     }
     let mut operands = Vec::with_capacity(predicate.operands.len());
     for operand in &predicate.operands {
-        let Some(value) = excluded_value_bytes(operand, incoming) else {
-            return None;
-        };
+        let value = excluded_value_bytes(operand, incoming)?;
         operands.push(value);
     }
     substituted.operands = operands;
@@ -7304,7 +7298,7 @@ where
         match operation {
             SequenceOperation::Nextval => {
                 let next = sequence.last_value.map_or(sequence.start, |last| {
-                    last.checked_add(sequence.increment).unwrap_or_else(|| {
+                    last.checked_add(sequence.increment).unwrap_or({
                         if sequence.increment < 0 {
                             sequence.min_value
                         } else {
@@ -7454,6 +7448,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_default_privilege_change(
         &self,
         grant: bool,
@@ -8796,6 +8791,7 @@ where
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_referencing_rows_async<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -9291,6 +9287,7 @@ where
             .map_err(|error| RymeError::Internal(error.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_update_from_in_transaction(
         &self,
         txn: &mut Transaction,
@@ -9372,6 +9369,7 @@ where
         Ok(changes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_delete_using_in_transaction(
         &self,
         txn: &mut Transaction,
@@ -9528,6 +9526,7 @@ where
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_columns_in_transaction(
         &self,
         txn: &mut Transaction,
@@ -10183,6 +10182,7 @@ where
         Ok(constraint)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_table(
         &self,
         table: String,
@@ -12510,6 +12510,7 @@ where
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_insert_conflict_in_transaction(
         &self,
         txn: &mut Transaction,
@@ -12659,6 +12660,7 @@ where
         Ok((target_columns, values))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_insert_rows_in_transaction(
         &self,
         txn: &mut Transaction,
@@ -12698,6 +12700,7 @@ where
         Ok(changes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_returning_rows_in_transaction(
         &self,
         txn: &mut Transaction,

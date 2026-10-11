@@ -251,7 +251,6 @@ async fn realtime_bench(config: RealtimeBench) {
     let latency_sample_limit = (1_000_000 / config.connections.max(1)).max(1);
     for mut stream in streams {
         let published_target = published_target.clone();
-        let benchmark_start = benchmark_start;
         readers.push(tokio::spawn(async move {
             let mut received = 0usize;
             let mut errors = 0usize;
@@ -676,7 +675,7 @@ async fn pg_connect(
                     password.ok_or_else(|| String::from("PostgreSQL password required"))?;
                 let length = u32::try_from(password.len() + 5)
                     .map_err(|_| String::from("password too large"))?;
-                stream.write_all(&[b'p']).await.map_err(|error| error.to_string())?;
+                stream.write_all(b"p").await.map_err(|error| error.to_string())?;
                 stream.write_all(&length.to_be_bytes()).await.map_err(|error| error.to_string())?;
                 stream.write_all(password.as_bytes()).await.map_err(|error| error.to_string())?;
                 stream.write_all(&[0]).await.map_err(|error| error.to_string())?;
@@ -692,7 +691,7 @@ async fn pg_connect(
 async fn pg_query(stream: &mut tokio::net::TcpStream, query: &str) -> Result<(), String> {
     let query = query.as_bytes();
     let length = u32::try_from(query.len() + 5).map_err(|_| String::from("query too large"))?;
-    stream.write_all(&[b'Q']).await.map_err(|error| error.to_string())?;
+    stream.write_all(b"Q").await.map_err(|error| error.to_string())?;
     stream.write_all(&length.to_be_bytes()).await.map_err(|error| error.to_string())?;
     stream.write_all(query).await.map_err(|error| error.to_string())?;
     stream.write_all(&[0]).await.map_err(|error| error.to_string())?;
@@ -781,10 +780,7 @@ async fn pg_execute_prepared(
 
 async fn run_sql_worker(task: SqlTask) -> (Vec<u64>, u64) {
     let mut stream =
-        match pg_connect(&task.addr, &task.user, &task.database, task.password.as_deref()).await {
-            Ok(stream) => Some(stream),
-            Err(_) => None,
-        };
+        (pg_connect(&task.addr, &task.user, &task.database, task.password.as_deref()).await).ok();
     let setup_ok = if let Some(stream) = stream.as_mut() {
         pg_query(
             stream,

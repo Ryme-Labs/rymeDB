@@ -55,6 +55,7 @@ type RemoteScanFn = Arc<
         + Send
         + Sync,
 >;
+type ScanPageResult = (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>);
 
 #[derive(Clone)]
 pub struct RemoteReader {
@@ -670,7 +671,7 @@ where
         table: &str,
         start_after: Option<&[u8]>,
         limit: usize,
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>)> {
+    ) -> Result<ScanPageResult> {
         self.policies.predicate(principal, table)?;
         if limit == 0 {
             return Ok((Vec::new(), None));

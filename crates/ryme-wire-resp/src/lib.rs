@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 const KV_TABLE: &str = "_kv";
+type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 
 pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
 
@@ -930,10 +931,7 @@ where
         lua_value_resp(&value)
     }
 
-    fn cdc_pending(
-        &self,
-        txn: &Transaction,
-    ) -> Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    fn cdc_pending(&self, txn: &Transaction) -> CdcPending {
         let Some(_realtime) = self.realtime.as_ref() else { return Vec::new() };
         let mut out = Vec::new();
         for (key, staged) in txn.writes() {
@@ -953,11 +951,7 @@ where
         out
     }
 
-    fn cdc_emit(
-        &self,
-        pending: Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>,
-        commit_ts: u64,
-    ) {
+    fn cdc_emit(&self, pending: CdcPending, commit_ts: u64) {
         let Some(realtime) = self.realtime.as_ref() else { return };
         for (key, op, before, after) in pending {
             let _ = realtime.publish(NewChange {
@@ -2727,7 +2721,7 @@ where
                 }
                 Some(current) => {
                     let update =
-                        !only_add && !(greater && score <= current) && !(less && score >= current);
+                        !(only_add || (greater && score <= current) || (less && score >= current));
                     if update {
                         set.insert(member, score);
                     }

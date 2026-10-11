@@ -274,6 +274,9 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+type ScanRows = Vec<(Vec<u8>, Vec<u8>)>;
+type TxnFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 pub trait TxnBackend: Clone + Send + Sync + 'static {
     fn begin(&self) -> Transaction;
     fn begin_with(&self, isolation: Isolation) -> Transaction {
@@ -286,7 +289,7 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
         &'a self,
         txn: &'a mut Transaction,
         key: &'a RecordKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>>> + Send + 'a>> {
+    ) -> TxnFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move { self.get(txn, key) })
     }
     fn scan_async<'a>(
@@ -296,7 +299,7 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
         database: &'a str,
         table: &'a str,
         limit: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>> {
+    ) -> TxnFuture<'a, ScanRows> {
         Box::pin(async move { self.scan(txn, tenant, database, table, limit) })
     }
     fn scan_after_async<'a>(
@@ -307,7 +310,7 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
         table: &'a str,
         start_after: &'a [u8],
         limit: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>> {
+    ) -> TxnFuture<'a, ScanRows> {
         Box::pin(async move { self.scan_after(txn, tenant, database, table, start_after, limit) })
     }
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>);
@@ -481,6 +484,7 @@ impl TxnManager {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_state(&self, state: TransactionState) -> Transaction {
         let id = TXN_ID.fetch_add(1, Ordering::SeqCst);
         self.inner.active.insert(id, state.read_ts);
@@ -955,6 +959,7 @@ impl TxnManager {
         Ok(engine.scan_after(tenant, database, table, txn.read_ts, now_unix(), start_after, limit))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn scan_after_with(
         &self,
         txn: &mut Transaction,

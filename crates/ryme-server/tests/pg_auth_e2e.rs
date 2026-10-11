@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
