@@ -6278,6 +6278,7 @@ async fn supabase_presence_leave(
 
 fn spawn_supabase_change_forwarder(
     realtime: &Realtime,
+    rls_executor: &Executor<BranchStorage>,
     tenant: &str,
     database: &str,
     branch: &str,
@@ -6293,16 +6294,21 @@ fn spawn_supabase_change_forwarder(
     let database = database.to_string();
     let branch = branch.to_string();
     let topic = topic.to_string();
+    let rls_executor = rls_executor.clone();
     let events = events.clone();
     tokio::spawn(async move {
         loop {
             match receiver.recv().await {
-                Ok(record)
-                    if record.tenant == tenant
-                        && record.database == database
-                        && record.branch == branch
-                        && supabase_change_matches(&subscription, &record) =>
-                {
+                Ok(record) => {
+                    let Some(record) =
+                        realtime_change_for_executor(&rls_executor, &tenant, &branch, &record)
+                    else {
+                        continue;
+                    };
+                    if record.database != database || !supabase_change_matches(&subscription, &record)
+                    {
+                        continue;
+                    }
                     if events
                         .try_send(SupabaseRealtimeEvent::Change(
                             topic.clone(),
@@ -6336,6 +6342,11 @@ async fn forward_supabase_realtime(
 ) {
     let (sink, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sink);
+    let rls_executor = state
+        .executor
+        .clone()
+        .with_tenant(tenant.clone())
+        .with_branch(String::from("main"));
     let (events, mut event_queue) =
         tokio::sync::mpsc::channel::<SupabaseRealtimeEvent>(REALTIME_OUTGOING_QUEUE_CAPACITY);
     let mut channels: HashMap<String, SupabaseChannelState> = HashMap::new();
@@ -6505,6 +6516,7 @@ async fn forward_supabase_realtime(
                             .map(|subscription| {
                                 spawn_supabase_change_forwarder(
                                     &realtime,
+                                    &rls_executor,
                                     &tenant,
                                     &database,
                                     "main",
@@ -10156,10 +10168,11 @@ async fn forward_changes(
     }
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
-        if !realtime_change_allowed_by_executor(&rls_executor, tenant, branch, record) {
+        let Some(record) = realtime_change_for_executor(&rls_executor, tenant, branch, record)
+        else {
             continue;
-        }
-        let masked = masked_change_record(&gateway, record);
+        };
+        let masked = masked_change_record(&gateway, &record);
         let text = serde_json::to_string(&masked).unwrap_or_else(|_| String::from("{}"));
         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
             return;
@@ -10187,14 +10200,11 @@ async fn forward_changes(
                             continue;
                         }
                         seen_sequence = seen_sequence.max(record.sequence);
-                        if !realtime_change_allowed_by_executor(
-                            &rls_executor,
-                            tenant,
-                            branch,
-                            &record,
-                        ) {
+                        let Some(record) =
+                            realtime_change_for_executor(&rls_executor, tenant, branch, &record)
+                        else {
                             continue;
-                        }
+                        };
                         let masked = masked_change_record(&gateway, &record);
                         let text = serde_json::to_string(&masked).unwrap_or_else(|_| String::from("{}"));
                         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
@@ -10232,14 +10242,14 @@ async fn forward_changes(
                                 continue;
                             }
                             seen_sequence = record.sequence;
-                            if !realtime_change_allowed_by_executor(
+                            let Some(record) = realtime_change_for_executor(
                                 &rls_executor,
                                 tenant,
                                 branch,
                                 &record,
-                            ) {
+                            ) else {
                                 continue;
-                            }
+                            };
                             let masked = masked_change_record(&gateway, &record);
                             let text = serde_json::to_string(&masked)
                                 .unwrap_or_else(|_| String::from("{}"));
@@ -10705,19 +10715,50 @@ fn realtime_change_allowed(
             .is_none_or(|value| rls_row_allowed(rls_tables, tenant, &record.table, value))
 }
 
+fn realtime_change_for_executor<B: TxnBackend>(
+    executor: &Executor<B>,
+    tenant: &str,
+    branch: &str,
+    record: &ryme_realtime::ChangeRecord,
+) -> Option<ryme_realtime::ChangeRecord> {
+    if record.tenant != tenant || record.branch != branch {
+        return None;
+    }
+    let before_allowed = record
+        .before
+        .as_deref()
+        .is_some_and(|value| executor.row_allowed_by_rls(&record.table, value));
+    let after_allowed = record
+        .after
+        .as_deref()
+        .is_some_and(|value| executor.row_allowed_by_rls(&record.table, value));
+    match record.op {
+        ryme_realtime::Operation::Insert if after_allowed => Some(record.clone()),
+        ryme_realtime::Operation::Delete if before_allowed => Some(record.clone()),
+        ryme_realtime::Operation::Update if before_allowed && after_allowed => {
+            Some(record.clone())
+        }
+        ryme_realtime::Operation::Update if before_allowed => Some(ryme_realtime::ChangeRecord {
+            op: ryme_realtime::Operation::Delete,
+            after: None,
+            ..record.clone()
+        }),
+        ryme_realtime::Operation::Update if after_allowed => Some(ryme_realtime::ChangeRecord {
+            op: ryme_realtime::Operation::Insert,
+            before: None,
+            ..record.clone()
+        }),
+        _ => None,
+    }
+}
+
 fn realtime_change_allowed_by_executor<B: TxnBackend>(
     executor: &Executor<B>,
     tenant: &str,
     branch: &str,
     record: &ryme_realtime::ChangeRecord,
 ) -> bool {
-    record.tenant == tenant
-        && record.branch == branch
-        && record
-            .after
-            .as_deref()
-            .or(record.before.as_deref())
-            .is_none_or(|value| executor.row_allowed_by_rls(&record.table, value))
+    realtime_change_for_executor(executor, tenant, branch, record).is_some()
 }
 
 #[cfg(test)]
@@ -11965,6 +12006,30 @@ mod realtime_policy_tests {
         };
         assert!(!realtime_change_allowed_by_executor(&executor, "tenant-a", "main", &hidden));
         assert!(realtime_change_allowed_by_executor(&executor, "tenant-a", "main", &visible));
+
+        let entering = ryme_realtime::ChangeRecord {
+            op: ryme_realtime::Operation::Update,
+            before: Some(br#"{"tenant_id":"tenant-b","secret":"hidden"}"#.to_vec()),
+            after: Some(br#"{"tenant_id":"tenant-a","body":"visible"}"#.to_vec()),
+            ..hidden.clone()
+        };
+        let filtered = realtime_change_for_executor(&executor, "tenant-a", "main", &entering)
+            .expect("visible update should become an insert");
+        assert_eq!(filtered.op, ryme_realtime::Operation::Insert);
+        assert!(filtered.before.is_none());
+        assert_eq!(filtered.after, entering.after);
+
+        let leaving = ryme_realtime::ChangeRecord {
+            op: ryme_realtime::Operation::Update,
+            before: Some(br#"{"tenant_id":"tenant-a","body":"visible"}"#.to_vec()),
+            after: Some(br#"{"tenant_id":"tenant-b","secret":"hidden"}"#.to_vec()),
+            ..hidden.clone()
+        };
+        let filtered = realtime_change_for_executor(&executor, "tenant-a", "main", &leaving)
+            .expect("visible update should become a delete");
+        assert_eq!(filtered.op, ryme_realtime::Operation::Delete);
+        assert_eq!(filtered.before, leaving.before);
+        assert!(filtered.after.is_none());
     }
 
     #[tokio::test]
