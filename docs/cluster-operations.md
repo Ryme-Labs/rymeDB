@@ -253,6 +253,10 @@ Multi-owner transactions now run an explicit prepare phase at each configured
 range owner. Each participant writes a durable intent record before the
 coordinator appends the global Raft data decision, and commit/abort resolution
 cleans those records; unresolved records are recovered on participant restart.
+Prepared intents also reserve their conflict set: ordinary local or
+range-local commits that overlap a prepared transaction are rejected until the
+coordinator resolves it. This prevents a fast path from bypassing the
+distributed prepare phase.
 The global Raft log is still the decision authority, so this is a durable
 participant protocol, not yet independent per-range Raft groups.
 Cluster transactions also carry the range-topology generation observed at

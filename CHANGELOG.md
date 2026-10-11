@@ -1,5 +1,9 @@
 # Changelog
 
+- Prepared participant intents now reserve their read/write set against
+  ordinary local and range-local commits. A conflicting write or serializable
+  read/write transaction is rejected until the coordinator resolves the
+  intent, closing a bypass around the distributed prepare phase.
 - Direct range commits now carry an explicit CDC publication marker through
   the range WAL and append RPCs. After a range quorum commits, the owner and
   acknowledged replicas emit the committed write set through the existing

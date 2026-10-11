@@ -2525,6 +2525,20 @@ impl Node {
         Ok(())
     }
 
+    fn reject_prepared_conflict(&self, txn: &ryme_txn::Transaction) -> Result<()> {
+        let prepared = self
+            .prepared
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("prepared transactions")))?;
+        for existing in prepared.values() {
+            let other = self.manager.from_state(existing.state.clone());
+            if transactions_conflict(txn, &other) {
+                return Err(RymeError::Conflict(String::from("prepared transaction conflict")));
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_intent(&self, transaction_id: u128, commit_ts: u64, committed: bool) -> Result<()> {
         let mut prepared = self
             .prepared
@@ -3093,6 +3107,7 @@ impl Node {
                 None => self.manager.delete(&mut txn, key.clone()),
             }
         }
+        self.reject_prepared_conflict(&txn)?;
         let commit_ts = self.manager.reserve(&txn)?;
         let (index, term, acknowledged) =
             match self.replicate_range_entry(group_id, commit_ts, encoded_writes, true).await {
@@ -3321,6 +3336,7 @@ impl Node {
             }
         }
         let _commit = self.txn_commit_lock.lock().await;
+        self.reject_prepared_conflict(&txn)?;
         if self.transaction_participants(&txn).len() > 1 {
             return self.commit_distributed_txn(txn).await;
         }
@@ -4504,6 +4520,24 @@ mod tests {
         assert_eq!(reopened.prepared.lock().unwrap().len(), 0);
         let mut probe = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn prepared_intent_rejects_conflicting_commit() {
+        let dir = temp_dir("intent-conflict");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let key = RecordKey::new("t", "d", "s", b"reserved");
+        let mut prepared = node.manager.begin();
+        node.manager.put(&mut prepared, key.clone(), b"prepared".to_vec());
+        node.prepare_intent(91, 2, prepared.state(), &prepared).unwrap();
+
+        let mut conflicting = node.manager.begin();
+        node.manager.put(&mut conflicting, key, b"other".to_vec());
+        assert!(matches!(
+            node.commit_txn(conflicting).await,
+            Err(RymeError::Conflict(message)) if message == "prepared transaction conflict"
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 
