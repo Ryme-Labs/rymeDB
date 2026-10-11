@@ -3,7 +3,7 @@ on:
   pull_request:
 jobs:
   preview-branch:
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
