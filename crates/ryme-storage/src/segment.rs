@@ -2,7 +2,7 @@ use super::{Engine, RecordKey};
 use ryme_error::{Result, RymeError};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 const SEGMENT_MAGIC: u32 = 0x5259_5347;
 const SEGMENT_VERSION: u16 = 1;
@@ -397,6 +397,7 @@ impl ImmutableSegment {
 pub struct SegmentStore {
     dir: PathBuf,
     cache: Arc<Mutex<SegmentReadCache>>,
+    paths: Arc<RwLock<Vec<PathBuf>>>,
 }
 
 impl SegmentStore {
@@ -406,9 +407,11 @@ impl SegmentStore {
 
     pub fn open_with_cache(dir: &Path, cache_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        let paths = discover_segment_paths(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             cache: Arc::new(Mutex::new(SegmentReadCache::new(cache_bytes))),
+            paths: Arc::new(RwLock::new(paths)),
         })
     }
 
@@ -471,6 +474,7 @@ impl SegmentStore {
             }
         }
         std::fs::rename(&temporary, &path)?;
+        self.remember_segment(path.clone());
         let latest = self.dir.join("latest");
         let latest_tmp = self.dir.join("latest.tmp");
         let name = path
@@ -517,12 +521,12 @@ impl SegmentStore {
     }
 
     fn newest_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut paths = self.segment_paths()?;
-        paths.sort_by_key(|path| {
-            std::cmp::Reverse(parse_segment_name(
-                path.file_name().and_then(|name| name.to_str()).unwrap_or(""),
-            ))
-        });
+        let mut paths = self
+            .paths
+            .read()
+            .map(|paths| paths.clone())
+            .map_err(|_| RymeError::Internal(String::from("segment paths lock")))?;
+        paths.reverse();
         Ok(paths)
     }
 
@@ -678,21 +682,44 @@ impl SegmentStore {
     }
 
     pub fn segment_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut paths = Vec::new();
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
-            Err(error) => return Err(error.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_file()
-                && parse_segment_name(&entry.file_name().to_string_lossy()).is_some()
-            {
-                paths.push(entry.path());
+        discover_segment_paths(&self.dir)
+    }
+
+    fn remember_segment(&self, path: PathBuf) {
+        let Ok(mut paths) = self.paths.write() else { return };
+        if paths.iter().any(|candidate| candidate == &path) {
+            return;
+        }
+        paths.push(path);
+        paths.sort_by_key(|candidate| {
+            parse_segment_name(candidate.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+        });
+    }
+
+    fn forget_segment(&self, path: &Path) {
+        if let Some(id) =
+            parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+        {
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remove(id);
             }
         }
-        Ok(paths)
+        if let Ok(mut paths) = self.paths.write() {
+            paths.retain(|candidate| candidate != path);
+        }
+    }
+
+    pub fn remove_except(&self, keep: &Path) -> Result<usize> {
+        let mut removed = 0;
+        for path in self.segment_paths()? {
+            if path == keep {
+                continue;
+            }
+            std::fs::remove_file(&path)?;
+            self.forget_segment(&path);
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub fn compact(&self) -> Result<Option<SegmentMeta>> {
@@ -700,19 +727,7 @@ impl SegmentStore {
             return Ok(None);
         };
         let (meta, newest) = self.write(max_commit_ts, &engine)?;
-        for path in self.segment_paths()? {
-            if path != newest {
-                let id = parse_segment_name(
-                    path.file_name().and_then(|name| name.to_str()).unwrap_or(""),
-                );
-                std::fs::remove_file(&path)?;
-                if let Some(id) = id {
-                    if let Ok(mut cache) = self.cache.lock() {
-                        cache.remove(id);
-                    }
-                }
-            }
-        }
+        self.remove_except(&newest)?;
         Ok(Some(meta))
     }
 
@@ -751,19 +766,34 @@ impl SegmentStore {
             if keep_paths.contains(&path) {
                 continue;
             }
-            let id =
-                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
             if std::fs::remove_file(&path).is_ok() {
-                if let Some(id) = id {
-                    if let Ok(mut cache) = self.cache.lock() {
-                        cache.remove(id);
-                    }
-                }
+                self.forget_segment(&path);
                 removed += 1;
             }
         }
         Ok(removed)
     }
+}
+
+fn discover_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && parse_segment_name(&entry.file_name().to_string_lossy()).is_some()
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort_by_key(|path| {
+        parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+    });
+    Ok(paths)
 }
 
 fn segment_name(id: u64) -> String {
@@ -1009,6 +1039,7 @@ mod tests {
         let compacted = store.compact().unwrap().unwrap();
         assert_eq!(compacted.max_commit_ts, 11);
         assert_eq!(store.segment_paths().unwrap().len(), 1);
+        assert_eq!(store.newest_paths().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

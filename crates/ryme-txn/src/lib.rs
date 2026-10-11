@@ -1834,11 +1834,7 @@ impl DurableManager {
         let removed = engine.purge_keys(keys);
         let max = engine.max_commit_ts();
         let (_, newest) = self.segments.write(max, &engine)?;
-        for path in self.segments.segment_paths()? {
-            if path != newest {
-                std::fs::remove_file(path)?;
-            }
-        }
+        self.segments.remove_except(&newest)?;
         self.inner.advance_to(max);
         Ok(removed)
     }
@@ -2058,11 +2054,7 @@ impl DurableManager {
         }
         let max = engine.max_commit_ts();
         let (meta, newest) = self.segments.write(max, &engine)?;
-        for path in self.segments.segment_paths()? {
-            if path != newest {
-                std::fs::remove_file(path)?;
-            }
-        }
+        self.segments.remove_except(&newest)?;
         Ok(Some(meta))
     }
 
@@ -2090,11 +2082,7 @@ impl DurableManager {
         let restored = Engine::decode_snapshot(&restored_raw)?;
         let restored_max = restored.max_commit_ts();
         let (_, newest) = self.segments.write(restored_max, &restored)?;
-        for segment in self.segments.segment_paths()? {
-            if segment != newest {
-                std::fs::remove_file(segment)?;
-            }
-        }
+        self.segments.remove_except(&newest)?;
         self.publish_restored_snapshot(restored_max, target, &restored_raw)?;
         {
             let mut wal =
