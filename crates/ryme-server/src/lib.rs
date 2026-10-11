@@ -3284,22 +3284,43 @@ fn branch_executor(
     let executor = state.executor.clone().with_tenant(tenant.to_string());
     match branch_snapshot(state, headers, tenant)? {
         Some((branch, base_commit_ts, storage_epoch)) => {
-            let manager = ryme_branch::BranchBackend::new(
-                state.backend.clone(),
-                state.database.clone(),
-                branch.clone(),
+            branch_executor_from_snapshot(
+                state,
+                executor,
+                tenant,
+                &branch,
                 base_commit_ts,
                 storage_epoch,
-            );
-            let schema_path = state.branch_schema_path(tenant, &branch);
-            let mut branch_executor = executor.with_isolated_schema(manager).with_branch(branch);
-            let snapshot = load_existing_schema_snapshot(&schema_path)?;
-            branch_executor.restore_schema_snapshot(snapshot)?;
-            branch_executor.set_schema_path(schema_path);
-            Ok(branch_executor)
+            )
         }
         None => Ok(executor),
     }
+}
+
+fn branch_executor_from_snapshot(
+    state: &SharedState,
+    executor: Executor<BranchStorage>,
+    tenant: &str,
+    branch: &str,
+    base_commit_ts: u64,
+    storage_epoch: u64,
+) -> ryme_error::Result<Executor<BranchStorage>> {
+    if branch == "main" {
+        return Ok(executor);
+    }
+    let manager = ryme_branch::BranchBackend::new(
+        state.backend.clone(),
+        state.database.clone(),
+        branch.to_string(),
+        base_commit_ts,
+        storage_epoch,
+    );
+    let schema_path = state.branch_schema_path(tenant, branch);
+    let mut branch_executor = executor.with_isolated_schema(manager).with_branch(branch.to_string());
+    let snapshot = load_existing_schema_snapshot(&schema_path)?;
+    branch_executor.restore_schema_snapshot(snapshot)?;
+    branch_executor.set_schema_path(schema_path);
+    Ok(branch_executor)
 }
 
 fn branch_executor_for_principal(
@@ -10334,7 +10355,7 @@ async fn stream(
         Ok(connection) => connection,
         Err(e) => return error_response(e),
     };
-    let (branch, _, _) = match branch_snapshot_selected(
+    let (branch, branch_commit, storage_epoch) = match branch_snapshot_selected(
         &state,
         &headers,
         &principal.tenant,
@@ -10352,8 +10373,17 @@ async fn stream(
     let from_sequence = query.from_sequence;
     let qos = state.qos.clone();
     let gateway = state.gateway.clone();
-    let rls_executor =
-        state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
+    let rls_executor = match branch_executor_from_snapshot(
+        &state,
+        state.executor.clone().with_tenant(tenant.clone()),
+        &tenant,
+        &branch,
+        branch_commit,
+        storage_epoch,
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     upgrade.on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_changes(
@@ -10688,8 +10718,17 @@ async fn query_stream(
     let table = query.table.clone();
     let qos = state.qos.clone();
     let gateway = state.gateway.clone();
-    let rls_executor =
-        state.executor.clone().with_tenant(tenant.clone()).with_branch(branch.clone());
+    let rls_executor = match branch_executor_from_snapshot(
+        &state,
+        state.executor.clone().with_tenant(tenant.clone()),
+        &tenant,
+        &branch,
+        branch_commit,
+        storage_epoch,
+    ) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     let dependencies =
         rls_executor.view_dependencies(&table).unwrap_or_else(|| vec![table.clone()]);
     let query_spec = ReactiveQuerySpec::from_query(&query);
@@ -12634,6 +12673,88 @@ mod realtime_policy_tests {
         assert!(!state.executor.catalog_tables().contains(&String::from("branch_only")));
         std::fs::remove_file(state.branch_schema_path("default", "preview")).unwrap();
         assert!(branch_executor(&state, &headers, "default").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn branch_stream_executor_uses_branch_rls_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-branch-stream-rls-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("branch-stream-rls");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse(
+                    "CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut control = state.control.lock().unwrap();
+            let mut branches = control.branches.clone();
+            branches
+                .create_child_for(
+                    "default",
+                    String::from("preview"),
+                    "main",
+                    state.backend.latest_commit(),
+                )
+                .unwrap();
+            branches.persist(&state.branch_path).unwrap();
+            control.branches = branches;
+        }
+        ryme_sql::persist_schema_snapshot(
+            &state.branch_schema_path("default", "preview"),
+            &state.executor.schema_snapshot(),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ryme-branch", axum::http::HeaderValue::from_static("preview"));
+        let branch = branch_executor(&state, &headers, "default").unwrap();
+        branch
+            .execute(
+                ryme_sql::parse(
+                    "CREATE POLICY own_messages ON messages FOR ALL USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        branch
+            .execute(ryme_sql::parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+
+        let selected = branch_snapshot_selected(&state, &headers, "default", None).unwrap().unwrap();
+        let streaming_executor = branch_executor_from_snapshot(
+            &state,
+            state.executor.clone().with_tenant(String::from("default")),
+            "default",
+            &selected.0,
+            selected.1,
+            selected.2,
+        )
+        .unwrap();
+        assert!(!streaming_executor.row_allowed_by_rls(
+            "messages",
+            br#"{"id":"hidden","tenant_id":"other"}"#,
+        ));
+        assert!(state.executor.row_allowed_by_rls(
+            "messages",
+            br#"{"id":"hidden","tenant_id":"other"}"#,
+        ));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
