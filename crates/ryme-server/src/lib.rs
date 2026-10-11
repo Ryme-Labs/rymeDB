@@ -4819,12 +4819,18 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
             },
             Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
         };
-        if let Ok(store) = credentials.lock() {
-            if store.otp_enrolled(&request.id) {
-                let code = request.code.as_deref().unwrap_or("");
-                if store.verify_otp(&request.id, code, now).is_err() {
-                    return Err(ryme_error::RymeError::Unauthorized);
-                }
+        let otp_enrolled = match credentials.lock() {
+            Ok(store) => store.otp_enrolled(&request.id),
+            Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
+        };
+        if otp_enrolled {
+            let code = request.code.as_deref().unwrap_or("");
+            let store = match credentials.lock() {
+                Ok(store) => store,
+                Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
+            };
+            if store.verify_otp(&request.id, code, now).is_err() {
+                return Err(ryme_error::RymeError::Unauthorized);
             }
         }
         let refresh_token = refresh_tokens.issue(principal.clone(), now)?;
