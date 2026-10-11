@@ -3881,6 +3881,7 @@ impl Node {
         commit_ts: u64,
         state: ryme_txn::TransactionState,
     ) -> Result<()> {
+        let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
         if owner == self.id {
             return self.prepare_range_group(group_id, transaction_id, commit_ts, state).await;
         }
@@ -3912,6 +3913,7 @@ impl Node {
         commit_ts: u64,
         committed: bool,
     ) -> Result<()> {
+        let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
         if owner == self.id {
             if group_id.is_empty() {
                 return self.resolve_intent(transaction_id, commit_ts, committed);
@@ -3976,11 +3978,15 @@ impl Node {
         committed: bool,
     ) -> Result<()> {
         for (group_id, range) in participants {
+            let participant = self
+                .range_owner_by_id(group_id)
+                .map(|current| current.owner)
+                .unwrap_or(range.owner);
             self.queue_resolution_for_group(
                 group_id,
                 transaction_id,
                 commit_ts,
-                range.owner,
+                participant,
                 committed,
             )?;
         }
@@ -5725,6 +5731,37 @@ mod tests {
 
         let mut probe = node.manager.begin();
         assert_eq!(node.manager.get(&mut probe, &key).unwrap(), Some(b"before".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolution_queue_uses_the_current_range_leader() {
+        let dir = temp_dir("resolution-current-owner");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        node.set_range_owners(vec![RangeOwner {
+            id: String::from("range-a"),
+            start: Vec::new(),
+            end: Vec::new(),
+            owner: 2,
+            replicas: vec![1, 2],
+            epoch: 4,
+        }]);
+        let mut participants = BTreeMap::new();
+        participants.insert(
+            String::from("range-a"),
+            RangeOwner {
+                id: String::from("range-a"),
+                start: Vec::new(),
+                end: Vec::new(),
+                owner: 1,
+                replicas: vec![1, 2],
+                epoch: 4,
+            },
+        );
+        node.queue_range_resolutions(55, 9, &participants, true).unwrap();
+        let pending = node.pending_resolutions_snapshot();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].participant, 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

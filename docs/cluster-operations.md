@@ -273,6 +273,9 @@ restart. The same pending resolution is published as a committed global Raft
 record, so every member can rebuild and retry participant work after coordinator
 loss or restart. A lost resolution RPC therefore leaves recoverable work rather
 than an intent that can block the participant forever.
+Prepare and resolve retries refresh the range leader from the current placement
+map, so a range election between transaction phases does not keep targeting the
+original owner.
 The global Raft log is still the decision authority, so this is a replicated
 resolution protocol, not yet an independent per-range transaction coordinator
 or fully independent per-range Raft 2PC decision path.
