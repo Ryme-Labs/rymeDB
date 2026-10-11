@@ -933,6 +933,16 @@ impl ShardSet {
         }
         Ok(MoveReport { table: table.clone(), from, to, rows: count, bytes, max_commit_ts: max })
     }
+
+    fn range_scan_managers(&self) -> Result<Option<Vec<DurableManager>>> {
+        let inner =
+            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        if inner.ranges.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(inner.shards.clone()))
+        }
+    }
 }
 
 impl TxnBackend for ShardSet {
@@ -1050,19 +1060,7 @@ impl TxnBackend for ShardSet {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
-        if !self
-            .inner
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
-            .ranges
-            .is_empty()
-        {
-            let managers = self
-                .inner
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("shard lock")))?
-                .shards
-                .clone();
+        if let Some(managers) = self.range_scan_managers()? {
             txn.record_scan(tenant, database, table);
             let scan_limit =
                 limit.saturating_add(txn.scan_overlay_count(tenant, database, table, None));
@@ -1072,7 +1070,6 @@ impl TxnBackend for ShardSet {
                 scan_txn.restamp(txn.read_ts);
                 rows.extend(manager.scan(&mut scan_txn, tenant, database, table, scan_limit)?);
             }
-            rows.sort_by(|left, right| left.0.cmp(&right.0));
             return Ok(txn.overlay_scan(rows, tenant, database, table, None, limit));
         }
         let shard = self.route(&TableRef::new(tenant, database, table));
@@ -1092,19 +1089,7 @@ impl TxnBackend for ShardSet {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
-        if !self
-            .inner
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
-            .ranges
-            .is_empty()
-        {
-            let managers = self
-                .inner
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("shard lock")))?
-                .shards
-                .clone();
+        if let Some(managers) = self.range_scan_managers()? {
             txn.record_scan(tenant, database, table);
             let scan_limit = limit.saturating_add(txn.scan_overlay_count(
                 tenant,
@@ -1125,7 +1110,6 @@ impl TxnBackend for ShardSet {
                     scan_limit,
                 )?);
             }
-            rows.sort_by(|left, right| left.0.cmp(&right.0));
             return Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit));
         }
         let shard = self.route(&TableRef::new(tenant, database, table));
