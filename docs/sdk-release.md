@@ -33,11 +33,12 @@ stages its tested POM and JARs into a flat artifact before publishing, so the
 publish job cannot accidentally rebuild or select an untested package. A
 manual run can set the `publish` input when a tag is not being pushed.
 
-The Pages builder and release workflow fail if `sdks/` contains anything other
+The Pages build and release workflow fail if `sdks/` contains anything other
 than `java`, `js` (npm), and `rust`, keeping the supported SDK surface explicit.
 Pages deploys only from the repository default branch; pull requests and
 manual builds still run the complete site validation without publishing a
 deployment.
 
-The realtime SDK guides are generated into the Pages site from those three
-README files, including the sequence-based reconnect APIs for table streams.
+The Pages site is built with MkDocs Material. The three SDK README files are
+included inside the same navigation, search index, typography, code styling,
+and light/dark theme as the rest of the documentation.

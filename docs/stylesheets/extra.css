@@ -1,0 +1,62 @@
+:root {
+  --ryme-ink: #172033;
+  --ryme-blue: #4355d6;
+  --ryme-cyan: #08a7bb;
+  --ryme-surface: #f7f9fc;
+}
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: var(--ryme-blue);
+  --md-primary-fg-color--light: #6372e0;
+  --md-primary-fg-color--dark: #303fa8;
+  --md-accent-fg-color: var(--ryme-cyan);
+  --md-default-bg-color: var(--ryme-surface);
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #7583f0;
+  --md-primary-fg-color--light: #9aa4fa;
+  --md-primary-fg-color--dark: #5565d8;
+  --md-accent-fg-color: #43d7e2;
+}
+
+.md-header__title,
+.md-nav__title {
+  font-weight: 700;
+}
+
+.md-content h1 {
+  letter-spacing: -0.025em;
+}
+
+.md-content h2 {
+  margin-top: 2em;
+}
+
+.md-content table:not([class]) {
+  display: table;
+  width: 100%;
+}
+
+.md-content table:not([class]) th {
+  background: color-mix(in srgb, var(--md-primary-fg-color) 10%, transparent);
+}
+
+.api-reference {
+  margin: 1rem -0.5rem 2rem;
+  min-height: 70vh;
+  padding: 0.5rem;
+  background: var(--md-default-bg-color);
+}
+
+.md-typeset .cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+@media screen and (max-width: 600px) {
+  .api-reference {
+    margin-inline: -0.25rem;
+  }
+}
