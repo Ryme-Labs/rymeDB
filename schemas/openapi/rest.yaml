@@ -700,14 +700,19 @@ paths:
           required: true
           schema:
             type: string
+            minLength: 1
+            maxLength: 256
         - name: from
           in: query
           schema:
             type: integer
+            minimum: 0
         - name: limit
           in: query
           schema:
             type: integer
+            minimum: 1
+            maximum: 1000
       responses:
         '200':
           description: messages from cursor
@@ -723,10 +728,13 @@ paths:
           required: true
           schema:
             type: string
+            minLength: 1
+            maxLength: 256
         - name: from
           in: query
           schema:
             type: integer
+            minimum: 0
         - name: api_key
           in: query
           schema:
@@ -2261,6 +2269,8 @@ components:
       properties:
         partition:
           type: string
+          minLength: 1
+          maxLength: 256
         key:
           type: string
         value:

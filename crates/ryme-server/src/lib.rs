@@ -7095,8 +7095,8 @@ async fn durable_stream(
     if !principal.can_read() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if partition.is_empty() || partition.contains('\0') || partition.len() > 256 {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("partition")));
+    if let Err(error) = ryme_realtime::validate_durable_partition(&partition) {
+        return error_response(error);
     }
     if let Err(e) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(e);
@@ -7109,6 +7109,9 @@ async fn durable_stream(
     let tenant = principal.tenant.clone();
     let qos = state.qos.clone();
     let from = query.from.unwrap_or(0);
+    if from > state.realtime.durable_cursor(&tenant, &partition) {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("cursor")));
+    }
     upgrade.on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_durable_topic(socket, realtime, qos, &tenant, &partition, from).await;
@@ -7146,9 +7149,13 @@ async fn forward_durable_topic(
     from: u64,
 ) {
     let mut receiver = realtime.durable_subscribe(tenant, partition);
-    let replayed = realtime.durable_read(tenant, partition, from, 1000);
     let (sender, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sender);
+    let current = realtime.durable_cursor(tenant, partition);
+    if from > current {
+        queue_cursor_ahead(&outgoing, "cursor", from, current);
+        return;
+    }
     if let Some((oldest, _)) = realtime.durable_cursor_bounds(tenant, partition) {
         if from < oldest {
             queue_cursor_expired(&outgoing, "cursor", from, oldest);
@@ -7156,10 +7163,40 @@ async fn forward_durable_topic(
         }
     }
     let mut next_cursor = from;
-    for message in &replayed {
-        next_cursor = next_cursor.max(message.cursor.saturating_add(1));
-        if !queue_durable_message(&outgoing, &qos, tenant, message) {
+    loop {
+        let replayed = realtime.durable_read(
+            tenant,
+            partition,
+            next_cursor,
+            ryme_realtime::DURABLE_READ_MAX_MESSAGES,
+        );
+        if replayed.is_empty() {
+            if let Some((oldest, _)) = realtime.durable_cursor_bounds(tenant, partition) {
+                if next_cursor < oldest {
+                    queue_cursor_expired(&outgoing, "cursor", next_cursor, oldest);
+                    return;
+                }
+            }
+            break;
+        }
+        if replayed[0].cursor > next_cursor {
+            queue_cursor_expired(&outgoing, "cursor", next_cursor, replayed[0].cursor);
             return;
+        }
+        for message in &replayed {
+            if message.cursor < next_cursor {
+                continue;
+            }
+            let Some(next) = message.cursor.checked_add(1) else {
+                return;
+            };
+            next_cursor = next;
+            if !queue_durable_message(&outgoing, &qos, tenant, message) {
+                return;
+            }
+        }
+        if replayed.len() < ryme_realtime::DURABLE_READ_MAX_MESSAGES {
+            break;
         }
     }
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -7186,20 +7223,45 @@ async fn forward_durable_topic(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let recovered = realtime.durable_read(tenant, partition, next_cursor, 1000);
-                        if recovered.first().map(|message| message.cursor > next_cursor).unwrap_or(false) {
-                            if let Some((oldest, _)) = realtime.durable_cursor_bounds(tenant, partition) {
-                                queue_cursor_expired(&outgoing, "cursor", next_cursor, oldest);
+                        loop {
+                            let recovered = realtime.durable_read(
+                                tenant,
+                                partition,
+                                next_cursor,
+                                ryme_realtime::DURABLE_READ_MAX_MESSAGES,
+                            );
+                            if recovered.is_empty() {
+                                if let Some((oldest, _)) = realtime.durable_cursor_bounds(tenant, partition) {
+                                    if next_cursor < oldest {
+                                        queue_cursor_expired(&outgoing, "cursor", next_cursor, oldest);
+                                        return;
+                                    }
+                                }
+                                break;
                             }
-                            break;
-                        }
-                        for message in recovered {
-                            if message.cursor < next_cursor {
-                                continue;
-                            }
-                            next_cursor = message.cursor.saturating_add(1);
-                            if !queue_durable_message(&outgoing, &qos, tenant, &message) {
+                            if recovered[0].cursor > next_cursor {
+                                queue_cursor_expired(
+                                    &outgoing,
+                                    "cursor",
+                                    next_cursor,
+                                    recovered[0].cursor,
+                                );
                                 return;
+                            }
+                            for message in recovered.iter() {
+                                if message.cursor < next_cursor {
+                                    continue;
+                                }
+                                let Some(next) = message.cursor.checked_add(1) else {
+                                    return;
+                                };
+                                next_cursor = next;
+                                if !queue_durable_message(&outgoing, &qos, tenant, message) {
+                                    return;
+                                }
+                            }
+                            if recovered.len() < ryme_realtime::DURABLE_READ_MAX_MESSAGES {
+                                break;
                             }
                         }
                     }
@@ -7240,11 +7302,8 @@ async fn durable_append(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if request.partition.is_empty() || request.partition.contains('\0') {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("partition")));
-    }
-    if request.partition.len() > 256 {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("partition")));
+    if let Err(error) = ryme_realtime::validate_durable_partition(&request.partition) {
+        return error_response(error);
     }
     if request.key.is_empty() || request.key.len() > ryme_gateway::MAX_KEY_BYTES {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("key")));
@@ -7315,10 +7374,31 @@ async fn durable_read(
     if !principal.can_read() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    if let Err(error) = ryme_realtime::validate_durable_partition(&query.partition) {
+        return error_response(error);
+    }
+    if query
+        .limit
+        .is_some_and(|limit| !(1..=ryme_realtime::DURABLE_READ_MAX_MESSAGES).contains(&limit))
+    {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("limit")));
+    }
+    let from = query.from.unwrap_or(0);
+    let current = state.realtime.durable_cursor(&principal.tenant, &query.partition);
+    if from > current {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("cursor")));
+    }
+    if let Some((oldest, _)) =
+        state.realtime.durable_cursor_bounds(&principal.tenant, &query.partition)
+    {
+        if from < oldest {
+            return error_response(ryme_error::RymeError::Conflict(String::from("cursor expired")));
+        }
+    }
     let messages = state.realtime.durable_read(
         &principal.tenant,
         &query.partition,
-        query.from.unwrap_or(0),
+        from,
         query.limit.unwrap_or(100),
     );
     let egress: u64 = messages.iter().map(|msg| (msg.key.len() + msg.value.len()) as u64).sum();
@@ -10257,6 +10337,23 @@ fn queue_cursor_expired(
         "cursor": cursor,
         "requested": requested,
         "oldest": oldest,
+    })
+    .to_string();
+    queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+}
+
+fn queue_cursor_ahead(
+    outgoing: &RealtimeOutgoing,
+    cursor: &str,
+    requested: u64,
+    current: u64,
+) -> bool {
+    let text = serde_json::json!({
+        "type": "error",
+        "error": "cursor_ahead",
+        "cursor": cursor,
+        "requested": requested,
+        "current": current,
     })
     .to_string();
     queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))

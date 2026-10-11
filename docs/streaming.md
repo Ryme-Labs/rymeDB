@@ -80,10 +80,14 @@ rymedb-cli stream broadcast lobby --count 1
 ```
 
 `POST /v1/topics/append` atomically persists a partition message and cursor.
-The topic stream replays from `from=<cursor>` and then follows live appends.
-Use it for chat delivery, agent jobs, or game events that must survive a
-disconnect. Retention is bounded; handle `cursor_expired` by taking a new
-application snapshot.
+The topic stream replays from `from=<cursor>` and then follows live appends,
+including all retained pages when the backlog exceeds 1,000 messages. Use it
+for chat delivery, agent jobs, or game events that must survive a disconnect.
+Retention is bounded; handle `cursor_expired` by taking a new application
+snapshot. REST reads return a conflict for an expired cursor, while WebSocket
+streams send `cursor_expired`. A cursor ahead of the current topic tail is
+rejected as `cursor_ahead` (or an invalid cursor for REST); retry from the last
+cursor returned by the server.
 
 ## Supabase Realtime
 
