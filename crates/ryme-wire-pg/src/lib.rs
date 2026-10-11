@@ -709,7 +709,8 @@ where
         }
     };
     let tenant = principal.tenant.clone();
-    let executor = Arc::new((*executor).clone().with_tenant(tenant.clone()));
+    let role = if principal.can_admin() { String::from("postgres") } else { startup.user.clone() };
+    let executor = Arc::new((*executor).clone().with_tenant(tenant.clone()).with_role(role));
     let mut limits = limits.with_tenant(tenant);
     limits.read_allowed = principal.can_read();
     limits.write_allowed = principal.can_write();

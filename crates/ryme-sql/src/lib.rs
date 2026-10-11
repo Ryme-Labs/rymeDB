@@ -658,6 +658,77 @@ fn same_relation(left: &str, right: &str) -> bool {
         || relation_short_name(left).eq_ignore_ascii_case(relation_short_name(right))
 }
 
+fn collect_table_privilege_requirements(
+    statement: &Statement,
+    required: &mut Vec<(String, &'static str)>,
+) {
+    let mut require = |table: &str, privilege| required.push((table.to_string(), privilege));
+    match statement {
+        Statement::Returning { statement, .. }
+        | Statement::Distinct { statement, .. }
+        | Statement::Explain { inner: statement, .. } => {
+            collect_table_privilege_requirements(statement, required);
+        }
+        Statement::Union { left, right, .. } => {
+            collect_table_privilege_requirements(left, required);
+            collect_table_privilege_requirements(right, required);
+        }
+        Statement::SelectByKey { table, .. }
+        | Statement::SelectScan { table, .. }
+        | Statement::SelectColumns { table, .. }
+        | Statement::Aggregate { table, .. }
+        | Statement::GroupBy { table, .. }
+        | Statement::CopyTo { table, .. } => require(table, "SELECT"),
+        Statement::Join { left, right, .. } => {
+            require(left, "SELECT");
+            require(right, "SELECT");
+        }
+        Statement::Insert { table, .. }
+        | Statement::InsertIgnore { table, .. }
+        | Statement::CopyFrom { table, .. } => require(table, "INSERT"),
+        Statement::InsertRow { table, upsert, conflict_update, .. }
+        | Statement::InsertRows { table, upsert, conflict_update, .. } => {
+            require(table, "INSERT");
+            if *upsert || !conflict_update.is_empty() {
+                require(table, "UPDATE");
+            }
+        }
+        Statement::InsertSelect { table, source_table, upsert, conflict_update, .. } => {
+            require(table, "INSERT");
+            require(source_table, "SELECT");
+            if *upsert || !conflict_update.is_empty() {
+                require(table, "UPDATE");
+            }
+        }
+        Statement::Upsert { table, .. } => {
+            require(table, "INSERT");
+            require(table, "UPDATE");
+        }
+        Statement::InsertConflict { table, assignments, .. } => {
+            require(table, "INSERT");
+            if !assignments.is_empty() {
+                require(table, "UPDATE");
+            }
+        }
+        Statement::Update { table, .. }
+        | Statement::UpdateRow { table, .. }
+        | Statement::UpdateWhere { table, .. } => require(table, "UPDATE"),
+        Statement::UpdateFrom { table, source_table, .. } => {
+            require(table, "UPDATE");
+            require(source_table, "SELECT");
+        }
+        Statement::Delete { table, .. } | Statement::DeleteWhere { table, .. } => {
+            require(table, "DELETE");
+        }
+        Statement::DeleteUsing { table, source_table, .. } => {
+            require(table, "DELETE");
+            require(source_table, "SELECT");
+        }
+        Statement::TruncateTable { table, .. } => require(table, "TRUNCATE"),
+        _ => {}
+    }
+}
+
 fn collect_view_dependencies(statement: &Statement, dependencies: &mut BTreeSet<String>) {
     match statement {
         Statement::SelectByKey { table, .. }
@@ -6760,6 +6831,7 @@ pub struct Executor<B = TxnManager> {
     tenant: String,
     database: String,
     branch: String,
+    role: String,
     manager: B,
     read_ts: Option<u64>,
     realtime: Option<Realtime>,
@@ -6817,6 +6889,7 @@ impl Executor<TxnManager> {
             tenant,
             database,
             branch: String::from("main"),
+            role: String::from("postgres"),
             manager: TxnManager::new(),
             read_ts: None,
             realtime: None,
@@ -6852,6 +6925,7 @@ impl Executor<TxnManager> {
             tenant,
             database,
             branch: String::from("main"),
+            role: String::from("postgres"),
             manager,
             read_ts: None,
             realtime: None,
@@ -6892,6 +6966,7 @@ where
             tenant,
             database,
             branch: String::from("main"),
+            role: String::from("postgres"),
             manager,
             read_ts: None,
             realtime: None,
@@ -7678,6 +7753,7 @@ where
             tenant: self.tenant,
             database: self.database,
             branch: self.branch,
+            role: self.role,
             manager,
             read_ts: None,
             realtime: self.realtime,
@@ -7728,6 +7804,12 @@ where
     /// the shared backend, catalog, indexes, and policy settings.
     pub fn with_tenant(mut self, tenant: String) -> Self {
         self.tenant = tenant;
+        self
+    }
+
+    /// Returns an executor that evaluates table privileges as the named SQL role.
+    pub fn with_role(mut self, role: String) -> Self {
+        self.role = role;
         self
     }
 
@@ -8057,6 +8139,7 @@ where
             tenant: self.tenant,
             database: self.database,
             branch: self.branch,
+            role: self.role,
             manager,
             read_ts: None,
             realtime: self.realtime,
@@ -8159,6 +8242,66 @@ where
 
     pub fn catalog_default_privileges(&self) -> Vec<DefaultPrivilegeGrant> {
         self.default_privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default()
+    }
+
+    fn role_is_superuser(&self) -> bool {
+        self.role.eq_ignore_ascii_case("postgres")
+            || self
+                .roles
+                .lock()
+                .ok()
+                .and_then(|roles| {
+                    roles.values().find(|role| role.name.eq_ignore_ascii_case(&self.role)).cloned()
+                })
+                .is_some_and(|role| role.superuser)
+    }
+
+    fn has_table_privilege(&self, table: &str, privilege: &str) -> bool {
+        let canonical = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
+        let canonical_schema = canonical.rsplit_once('.').map(|(schema, _)| schema);
+        self.privileges.lock().ok().is_some_and(|privileges| {
+            privileges.iter().any(|grant| {
+                if !grant.object_type.eq_ignore_ascii_case("TABLE")
+                    || !(grant.grantee.eq_ignore_ascii_case(&self.role)
+                        || grant.grantee.eq_ignore_ascii_case("PUBLIC"))
+                {
+                    return false;
+                }
+                let object_matches = if let Some(schema) = grant.object.strip_suffix(".*") {
+                    canonical_schema.is_some_and(|actual| schema.eq_ignore_ascii_case(actual))
+                } else {
+                    same_relation(&grant.object, &canonical)
+                };
+                object_matches
+                    && (grant.privilege.eq_ignore_ascii_case("ALL")
+                        || grant.privilege.eq_ignore_ascii_case(privilege))
+            })
+        })
+    }
+
+    fn enforce_statement_privileges(&self, statement: &Statement) -> Result<()> {
+        if self.role_is_superuser() {
+            return Ok(());
+        }
+        if matches!(
+            statement,
+            Statement::CreateRole { .. }
+                | Statement::DropRole { .. }
+                | Statement::PrivilegeChange { .. }
+                | Statement::DefaultPrivilegeChange { .. }
+        ) {
+            return Err(RymeError::Forbidden);
+        }
+        let mut required = Vec::new();
+        collect_table_privilege_requirements(statement, &mut required);
+        if required
+            .into_iter()
+            .all(|(table, privilege)| self.has_table_privilege(&table, privilege))
+        {
+            Ok(())
+        } else {
+            Err(RymeError::Forbidden)
+        }
     }
 
     pub fn catalog_columns(&self, table: &str) -> Vec<ColumnDefinition> {
@@ -11621,6 +11764,7 @@ where
         txn: &mut Transaction,
         statement: Statement,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
+        self.enforce_statement_privileges(&statement)?;
         match &statement {
             Statement::CreateSchema { .. }
             | Statement::CreateExtension { .. }
@@ -13494,6 +13638,7 @@ where
         statement: Statement,
         isolation: Isolation,
     ) -> Result<QueryResult> {
+        self.enforce_statement_privileges(&statement)?;
         let schema_statement = statement.is_schema_change();
         let previous_schema = schema_statement.then(|| self.schema_snapshot());
         match &statement {
@@ -14604,6 +14749,9 @@ where
 
     pub async fn bulk_upsert(&self, table: String, rows: Vec<(Vec<u8>, Vec<u8>)>) -> Result<usize> {
         self.reject_if_read_only()?;
+        if !self.role_is_superuser() && !self.has_table_privilege(&table, "INSERT") {
+            return Err(RymeError::Forbidden);
+        }
         if rows.len() > 10000 {
             return Err(RymeError::InvalidArgument(String::from("batch too large")));
         }
@@ -15531,6 +15679,53 @@ mod tests {
         executor.execute(parse("DROP ROLE app_reader").unwrap()).await.unwrap();
         executor.restore_schema_snapshot(snapshot).unwrap();
         assert!(executor.schema_snapshot().roles.contains_key("app_reader"));
+    }
+
+    #[tokio::test]
+    async fn table_privileges_gate_role_queries_and_mutations() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE public.messages (id TEXT PRIMARY KEY, body TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO public.messages (id, body) VALUES ('one', 'hello')").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor.execute(parse("CREATE ROLE app_reader LOGIN").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT SELECT, INSERT ON TABLE public.messages TO app_reader").unwrap())
+            .await
+            .unwrap();
+
+        let reader = executor.clone().with_role(String::from("app_reader"));
+        assert!(reader
+            .execute(parse("SELECT body FROM public.messages WHERE id = 'one'").unwrap())
+            .await
+            .is_ok());
+        reader
+            .execute(
+                parse("INSERT INTO public.messages (id, body) VALUES ('two', 'world')").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(reader
+            .execute(parse("UPDATE public.messages SET body = 'blocked' WHERE id = 'one'").unwrap())
+            .await
+            .is_err());
+
+        executor
+            .execute(parse("REVOKE SELECT ON TABLE public.messages FROM app_reader").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.execute(parse("SELECT * FROM public.messages").unwrap()).await,
+            Err(RymeError::Forbidden)
+        ));
     }
 
     #[tokio::test]
