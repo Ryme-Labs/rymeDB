@@ -280,7 +280,10 @@ where
         };
         match reader.read(key.clone()).await? {
             RemoteRead::Local => self.manager.get(txn, key),
-            RemoteRead::Value { value, .. } => Ok(value),
+            RemoteRead::Value { value, .. } => {
+                txn.record_read(key.clone(), value.is_some());
+                Ok(value)
+            }
         }
     }
 
@@ -954,6 +957,17 @@ mod tests {
         branch.put(&principal, "docs", b"k".to_vec(), b"updated".to_vec()).await.unwrap();
         let change = changes.recv().await.unwrap();
         assert_eq!(change.before, Some(b"branch-value".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn remote_write_reads_participate_in_occ() {
+        let gateway = gateway().with_remote_reader(RemoteReader::new(|_| async {
+            Ok(RemoteRead::Value { value: Some(b"remote".to_vec()), expires_at: Some(0) })
+        }));
+        let key = RecordKey::new("t", "d", "docs", b"k");
+        let mut txn = gateway.begin();
+        assert_eq!(gateway.read_for_write(&mut txn, &key).await.unwrap(), Some(b"remote".to_vec()));
+        assert!(txn.read_keys().contains(&key));
     }
 
     #[tokio::test]
