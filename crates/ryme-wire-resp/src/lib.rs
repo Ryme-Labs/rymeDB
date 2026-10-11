@@ -27,6 +27,7 @@ const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
 const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const RESP_MAX_PUBSUB_SUBSCRIPTIONS: usize = 1024;
 const RESP_MAX_PUBSUB_NAME_BYTES: usize = 4 * 1024;
+const RESP_MAX_CLUSTER_BRIDGES: usize = 10_000;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
@@ -206,13 +207,9 @@ impl PubSubBus {
     }
 
     fn start_cluster_bridge(&self, realtime: Realtime, tenant: String, database: String) {
-        let Ok(mut started) = self.cluster_started.lock() else {
-            return;
-        };
-        if !started.insert(tenant.clone()) {
+        if !self.reserve_cluster_bridge(&tenant) {
             return;
         }
-        drop(started);
         let topic = resp_pubsub_topic(&database);
         let mut receiver = realtime.broadcast_subscribe(&tenant, &topic);
         let sender = self.sender.clone();
@@ -236,6 +233,16 @@ impl PubSubBus {
                 }
             }
         });
+    }
+
+    fn reserve_cluster_bridge(&self, tenant: &str) -> bool {
+        let Ok(mut started) = self.cluster_started.lock() else {
+            return false;
+        };
+        if started.contains(tenant) || started.len() >= RESP_MAX_CLUSTER_BRIDGES {
+            return false;
+        }
+        started.insert(tenant.to_string())
     }
 }
 
@@ -6130,5 +6137,16 @@ mod tests {
             gateway.subscribe(&[vec![b'x'; RESP_MAX_PUBSUB_NAME_BYTES + 1]], &mut client),
             b"-ERR pubsub channel or pattern is too long\r\n"
         );
+    }
+
+    #[test]
+    fn cluster_bridge_registry_is_bounded() {
+        let bus = new_pubsub();
+        for index in 0..RESP_MAX_CLUSTER_BRIDGES {
+            assert!(bus.reserve_cluster_bridge(&format!("tenant-{index}")));
+        }
+        assert!(!bus.reserve_cluster_bridge("overflow"));
+        assert_eq!(bus.cluster_started.lock().unwrap().len(), RESP_MAX_CLUSTER_BRIDGES);
+        assert!(!bus.reserve_cluster_bridge("tenant-0"));
     }
 }
