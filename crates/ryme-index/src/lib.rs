@@ -1,6 +1,7 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{hash_map::Entry, BinaryHeap, HashMap, HashSet};
 
 pub const MAX_DIM: usize = 4096;
 pub const MAX_TOP_K: usize = 100;
@@ -25,6 +26,57 @@ pub struct VectorHit {
 pub struct TextHit {
     pub id: String,
     pub score: f64,
+}
+
+#[derive(Debug)]
+struct ScoredId {
+    id: String,
+    score: f64,
+}
+
+impl PartialEq for ScoredId {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.total_cmp(&other.score) == Ordering::Equal && self.id == other.id
+    }
+}
+
+impl Eq for ScoredId {}
+
+impl PartialOrd for ScoredId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap keeps the worst retained hit at the root: lower scores
+        // are worse, and for equal scores lexicographically larger IDs lose.
+        other.score.total_cmp(&self.score).then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+fn top_k_vector_hits<I>(hits: I, top_k: usize) -> Vec<VectorHit>
+where
+    I: IntoIterator<Item = VectorHit>,
+{
+    let limit = top_k.clamp(1, MAX_TOP_K);
+    let mut best = BinaryHeap::with_capacity(limit);
+    for hit in hits {
+        let candidate = ScoredId { id: hit.id, score: hit.score };
+        if best.len() < limit {
+            best.push(candidate);
+            continue;
+        }
+        if best.peek().is_some_and(|worst| candidate.cmp(worst) == Ordering::Less) {
+            best.pop();
+            best.push(candidate);
+        }
+    }
+    let mut selected: Vec<VectorHit> =
+        best.into_iter().map(|hit| VectorHit { id: hit.id, score: hit.score }).collect();
+    selected.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+    selected
 }
 
 #[derive(Debug, Default)]
@@ -330,18 +382,14 @@ impl VectorSpace {
             return Err(RymeError::InvalidArgument(String::from("zero vector")));
         }
         let normalized: Vec<f64> = query.iter().map(|v| (*v as f64) / norm).collect();
-        let mut hits: Vec<VectorHit> = self
-            .vectors
-            .iter()
-            .map(|(id, stored)| {
+        Ok(top_k_vector_hits(
+            self.vectors.iter().map(|(id, stored)| {
                 let score =
                     stored.iter().zip(normalized.iter()).map(|(a, b)| (*a as f64) * b).sum();
                 VectorHit { id: id.clone(), score }
-            })
-            .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        hits.truncate(top_k.clamp(1, MAX_TOP_K));
-        Ok(hits)
+            }),
+            top_k,
+        ))
     }
 
     fn ann_search(&self, query: &[f32], top_k: usize, ef: usize) -> Result<Vec<VectorHit>> {
@@ -693,9 +741,7 @@ impl PartitionedIndex {
                 Err(e) => return Err(e),
             }
         }
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        merged.truncate(top_k.clamp(1, MAX_TOP_K));
-        Ok(merged)
+        Ok(top_k_vector_hits(merged, top_k))
     }
 
     pub fn ann_search(
@@ -812,6 +858,23 @@ mod tests {
         let hits = registry.vector_search("s", &[0.9, 0.1], 2).unwrap();
         assert_eq!(hits[0].id, "a");
         assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn exact_vector_top_k_orders_equal_scores_deterministically() {
+        let mut registry = IndexRegistry::new();
+        for id in ["z", "a", "m"] {
+            registry.vector_upsert("s", id.to_string(), vec![1.0, 0.0]).unwrap();
+        }
+        let hits = registry.vector_search("s", &[1.0, 0.0], 2).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["a", "m"]);
+
+        let mut partitioned = PartitionedIndex::new(4);
+        for id in ["z", "a", "m"] {
+            partitioned.vector_upsert("s", id.to_string(), vec![1.0, 0.0]).unwrap();
+        }
+        let hits = partitioned.vector_search("s", &[1.0, 0.0], 2).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["a", "m"]);
     }
 
     #[test]
