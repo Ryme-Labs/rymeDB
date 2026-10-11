@@ -1547,6 +1547,7 @@ impl SharedState {
         let keys = ApiKeyStore::from_snapshot(auth_snapshot.api_keys);
         if let Some(api_key) = configured_api_key {
             let mut roles = HashSet::new();
+            roles.insert(Role::Superuser);
             roles.insert(Role::Owner);
             keys.insert(
                 api_key,
@@ -1864,13 +1865,31 @@ impl SharedState {
     }
 }
 
-fn require_admin(state: &SharedState, headers: &HeaderMap) -> ryme_error::Result<Principal> {
+fn require_platform_admin(
+    state: &SharedState,
+    headers: &HeaderMap,
+) -> ryme_error::Result<Principal> {
     let principal = state.principal(headers)?;
-    if principal.can_admin() {
+    if principal.can_platform_admin() {
         Ok(principal)
     } else {
         Err(ryme_error::RymeError::Forbidden)
     }
+}
+
+fn can_manage_user(state: &SharedState, principal: &Principal, user: &str) -> bool {
+    if principal.can_platform_admin() || principal.id == user {
+        return true;
+    }
+    if !principal.can_admin() {
+        return false;
+    }
+    state
+        .credentials
+        .lock()
+        .ok()
+        .and_then(|credentials| credentials.tenant_of(user).map(str::to_owned))
+        .is_some_and(|tenant| tenant == principal.tenant)
 }
 
 pub fn router(state: SharedState) -> axum::Router {
@@ -2046,7 +2065,7 @@ fn is_mutating(method: &axum::http::Method, path: &str) -> bool {
 }
 
 async fn regions(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     Json(serde_json::json!({
@@ -2862,7 +2881,7 @@ async fn ready(State(state): State<SharedState>) -> Json<serde_json::Value> {
 }
 
 async fn metrics(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let snapshot = state.latency.snapshot();
@@ -2884,7 +2903,7 @@ async fn metrics(State(state): State<SharedState>, headers: HeaderMap) -> Respon
 }
 
 async fn prometheus(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let histogram = state.histogram.snapshot();
@@ -2922,7 +2941,7 @@ async fn slow_log(
     headers: HeaderMap,
     Query(query): Query<SlowQuery>,
 ) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     (
@@ -2941,7 +2960,7 @@ async fn traces(
     headers: HeaderMap,
     Query(query): Query<TraceQuery>,
 ) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let spans = match state.traces.lock() {
@@ -4234,7 +4253,7 @@ async fn sql_explain(
 }
 
 async fn metering_snapshot(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let snapshot = match state.metering.lock() {
@@ -4259,7 +4278,7 @@ async fn metering_snapshot(State(state): State<SharedState>, headers: HeaderMap)
 }
 
 async fn billing_summary(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let bills = match state.metering.lock() {
@@ -4289,10 +4308,7 @@ async fn billing_invoice(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let tenant = query.tenant.unwrap_or_else(|| principal.tenant.clone());
-    if tenant != principal.tenant
-        && !principal.roles.contains(&Role::Owner)
-        && !principal.roles.contains(&Role::Admin)
-    {
+    if tenant != principal.tenant && !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let invoice = match state.metering.lock() {
@@ -4486,7 +4502,7 @@ async fn autoscale_advice(
     headers: HeaderMap,
     Query(query): Query<AutoscaleQuery>,
 ) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let control = match state.control.lock() {
@@ -4525,7 +4541,7 @@ pub struct QosTierRequest {
 }
 
 async fn qos_snapshot(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let snapshot = match state.qos.lock() {
@@ -4689,7 +4705,7 @@ async fn auth_register(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let tenant = request.tenant.unwrap_or_else(|| principal.tenant.clone());
-    if tenant != principal.tenant && !principal.can_admin() {
+    if tenant != principal.tenant && !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let roles = match parse_roles(request.roles) {
@@ -4853,7 +4869,9 @@ async fn auth_revoke(
     let Some(owner) = state.keys.owner_of(&request.key) else {
         return error_response(ryme_error::RymeError::NotFound(String::from("key")));
     };
-    if !principal.can_admin() && owner.id != principal.id {
+    if (owner.tenant != principal.tenant && !principal.can_platform_admin())
+        || (!principal.can_admin() && owner.id != principal.id)
+    {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if state.keys.remove(&request.key) {
@@ -4884,7 +4902,7 @@ async fn otp_setup(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if !principal.can_admin() && principal.id != request.id {
+    if !can_manage_user(&state, &principal, &request.id) {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let secret = ryme_auth::random_bytes(20);
@@ -4947,7 +4965,7 @@ async fn passkey_challenge(
     if request.user.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
     }
-    if !principal.can_admin() && principal.id != request.user {
+    if !can_manage_user(&state, &principal, &request.user) {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     match state.passkeys.lock() {
@@ -4976,7 +4994,7 @@ async fn passkey_register(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if !principal.can_admin() && principal.id != request.user {
+    if !can_manage_user(&state, &principal, &request.user) {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let public_key = match ryme_auth::base64_url_decode(&request.public_key) {
@@ -5157,7 +5175,7 @@ async fn mask_set(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if request.table.is_empty() {
@@ -7379,7 +7397,7 @@ async fn text_delete(
 }
 
 async fn index_stats(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let indexes = state.indexes.read().await;
@@ -8287,7 +8305,7 @@ async fn checkpoint_create(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let commit = state.backend.latest_commit();
@@ -8311,7 +8329,7 @@ async fn checkpoint_create(
 }
 
 async fn checkpoint_latest(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let control = match state.control.lock() {
@@ -8329,7 +8347,7 @@ async fn checkpoint_pitr(
     headers: HeaderMap,
     Query(query): Query<PitrQuery>,
 ) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let control = match state.control.lock() {
@@ -8347,7 +8365,7 @@ async fn snapshot_create(State(state): State<SharedState>, headers: HeaderMap) -
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     match snapshot_backend_files(&state).await {
@@ -8373,7 +8391,7 @@ async fn backup_restore(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if let Backend::Cluster(cluster) = &state.backend {
@@ -8455,7 +8473,7 @@ async fn backup_archive(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     match state.archive_now(request.backup_id).await {
@@ -8483,7 +8501,7 @@ async fn backup_archive(
 }
 
 async fn backup_archives(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let Some(target) = state.archive.clone() else {
@@ -8625,7 +8643,7 @@ async fn backup_copy(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(primary) = state.archive.clone() else {
@@ -8658,7 +8676,7 @@ async fn backup_verify(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(target) = state.archive.clone() else {
@@ -8692,7 +8710,7 @@ async fn backup_verify(
 }
 
 async fn drill_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let report = state.last_drill.lock().ok().and_then(|guard| guard.clone());
@@ -8703,7 +8721,7 @@ async fn drill_status(State(state): State<SharedState>, headers: HeaderMap) -> R
 }
 
 async fn shard_layout(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     match &state.backend {
@@ -8771,11 +8789,11 @@ async fn shard_move(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let tenant = request.tenant.unwrap_or_else(|| state.tenant.clone());
-    if !principal.can_admin() || tenant != principal.tenant {
+    if !principal.can_platform_admin() && tenant != principal.tenant {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let database = request.database.unwrap_or_else(|| state.database.clone());
@@ -8817,7 +8835,7 @@ async fn range_list(
     headers: HeaderMap,
     Query(lookup): Query<RangeLookup>,
 ) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let control = match state.control.lock() {
@@ -9223,7 +9241,7 @@ async fn commit_cluster_ranges(
 }
 
 async fn range_loads(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let control = match state.control.lock() {
@@ -9242,7 +9260,7 @@ async fn range_split(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let request: SplitRangeRequest = match serde_json::from_slice(&body) {
@@ -9318,7 +9336,7 @@ async fn range_merge(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let request: MergeRangesRequest = match serde_json::from_slice(&body) {
@@ -9419,7 +9437,7 @@ async fn range_autosplit(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let raft = state.raft_node();
@@ -9484,7 +9502,7 @@ async fn range_verify(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let request: VerifyRangeRequest = match serde_json::from_slice(&body) {
@@ -9611,7 +9629,7 @@ async fn range_transfer(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let request: TransferRangeRequest = match serde_json::from_slice(&body) {
@@ -9791,7 +9809,7 @@ async fn range_transfer(
 }
 
 async fn cluster_members(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(error) = require_admin(&state, &headers) {
+    if let Err(error) = require_platform_admin(&state, &headers) {
         return error_response(error);
     }
     let Some(node) = require_raft(&state) else {
@@ -9835,7 +9853,7 @@ async fn cluster_add_member(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(node) = require_raft(&state) else {
@@ -9859,7 +9877,7 @@ async fn cluster_remove_member(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(node) = require_raft(&state) else {
@@ -9884,7 +9902,7 @@ async fn cluster_transfer(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(node) = require_raft(&state) else {
@@ -9909,7 +9927,7 @@ async fn cluster_replace(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    if !principal.can_admin() {
+    if !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let Some(node) = require_raft(&state) else {
@@ -11128,7 +11146,7 @@ fn wire_tenant(
         return Ok(Principal {
             id: String::from("wire-password"),
             tenant: default_tenant.to_string(),
-            roles: [Role::Owner].into_iter().collect(),
+            roles: [Role::Superuser, Role::Owner].into_iter().collect(),
         });
     }
     if let Ok(principal) = keys.authenticate(password) {

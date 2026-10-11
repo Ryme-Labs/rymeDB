@@ -1484,6 +1484,23 @@ async fn extras_auth_privilege_boundaries() {
     )
     .await;
     assert_eq!(status, 201);
+    let (status, body) = http_request(
+        http,
+        "POST /v1/auth/token",
+        b"{\"id\":\"boss\",\"password\":\"correct-horse\"}",
+    )
+    .await;
+    assert_eq!(status, 201);
+    let owner_key = serde_json::from_slice::<serde_json::Value>(&body)
+        .unwrap()
+        .get("key")
+        .and_then(|value| value.as_str())
+        .unwrap()
+        .to_string();
+    for endpoint in ["GET /metrics", "GET /v1/regions", "GET /v1/ranges"] {
+        let (status, _) = bearer_request(http, &owner_key, endpoint, b"").await;
+        assert_eq!(status, 403, "{endpoint}");
+    }
     let (status, _) = http_request(
         http,
         "POST /v1/auth/register",

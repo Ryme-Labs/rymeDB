@@ -64,7 +64,7 @@ an external backup until the rollback window closes.
 
 ## Security operations
 
-Use secret managers for API/JWT/KMS material, rotate keys, limit owner/admin
+Use secret managers for API/JWT/KMS material, rotate keys, limit superuser
 credentials, and audit archive and membership routes. File permissions must
 protect `data_dir`; archive object policies should deny public access.
 

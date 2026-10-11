@@ -52,8 +52,8 @@ rymedb-cli backup latest
 rymedb-cli backup pitr 1760000000
 ```
 
-Archive and restore operations require an owner/admin principal. Listing and
-read-only inspection require a valid credential. Archives include schema,
+Archive and restore operations require a platform superuser. Listing and
+read-only inspection also require a platform superuser because archives include schema,
 branch, control-plane, auth, topic, placement, WAL, and immutable segment
 artifacts as applicable.
 

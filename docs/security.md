@@ -38,7 +38,8 @@ reproduction or a temporary test key.
 - Use HTTPS/WSS and TLS RESP/PostgreSQL/native listeners outside a trusted
   network.
 - Enable mutual TLS for the Raft mesh when peers cross trust boundaries.
-- Restrict owner/admin credentials and archive/membership routes.
+- Restrict superuser credentials and archive/membership routes; tenant
+  owner/admin roles are not platform operators.
 - Apply filesystem and object-store least privilege to `data_dir` and backups.
 - Run restore verification drills and rotate keys without publishing secrets.
 

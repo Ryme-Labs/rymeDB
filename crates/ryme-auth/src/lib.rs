@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    Superuser,
     Owner,
     Admin,
     Developer,
@@ -23,15 +24,22 @@ pub struct Principal {
 }
 
 impl Principal {
+    pub fn can_platform_admin(&self) -> bool {
+        self.roles.contains(&Role::Superuser)
+    }
+
     pub fn can_write(&self) -> bool {
-        self.roles.contains(&Role::Owner)
+        self.can_platform_admin()
+            || self.roles.contains(&Role::Owner)
             || self.roles.contains(&Role::Admin)
             || self.roles.contains(&Role::Developer)
             || self.roles.contains(&Role::ReadWrite)
     }
 
     pub fn can_admin(&self) -> bool {
-        self.roles.contains(&Role::Owner) || self.roles.contains(&Role::Admin)
+        self.can_platform_admin()
+            || self.roles.contains(&Role::Owner)
+            || self.roles.contains(&Role::Admin)
     }
 
     pub fn can_read(&self) -> bool {
@@ -411,7 +419,8 @@ fn claim_roles(claims: &serde_json::Value) -> HashSet<Role> {
 
 fn parse_role(name: &str) -> Option<Role> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "owner" | "service_role" => Some(Role::Owner),
+        "service_role" | "superuser" => Some(Role::Superuser),
+        "owner" => Some(Role::Owner),
         "admin" => Some(Role::Admin),
         "developer" => Some(Role::Developer),
         "readwrite" | "read_write" | "authenticated" => Some(Role::ReadWrite),
@@ -963,6 +972,10 @@ impl CredentialStore {
     pub fn principal(&self, id: &str) -> Result<Principal> {
         let user = self.users.get(id).ok_or(RymeError::Unauthorized)?;
         Ok(Principal { id: id.to_string(), tenant: user.tenant.clone(), roles: user.roles.clone() })
+    }
+
+    pub fn tenant_of(&self, id: &str) -> Option<&str> {
+        self.users.get(id).map(|user| user.tenant.as_str())
     }
 
     pub fn verify_otp(&self, id: &str, code: &str, now_secs: u64) -> Result<Principal> {

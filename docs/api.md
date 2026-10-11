@@ -29,7 +29,7 @@ require the appropriate principal. See [authentication](auth.md).
 
 | Group | Examples |
 | --- | --- |
-| Health | `/health`, `/ready`, `/metrics`, `/metrics/prometheus` (admin) |
+| Health | `/health`, `/ready`, `/metrics`, `/metrics/prometheus` (platform superuser) |
 | Data | `/v1/kv`, `/v1/sql`, `/v1/sql/copy`, `/v1/scan` |
 | Supabase-style | `/rest/v1/{table}`, `/graphql` |
 | Realtime | `/v1/stream`, `/v1/query-stream`, `/v1/broadcast`, `/v1/presence`, `/realtime/v1/websocket` |
@@ -40,7 +40,7 @@ require the appropriate principal. See [authentication](auth.md).
 
 `/health` and `/ready` are suitable for liveness/readiness probes. Metrics,
 region status, autoscaling advice, traces, and other operational inspection
-routes require an authenticated owner or admin principal.
+routes require an authenticated platform superuser.
 
 The operator CLI wraps these paths:
 
