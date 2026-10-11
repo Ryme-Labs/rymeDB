@@ -7151,7 +7151,7 @@ where
                 .map_err(|_| RymeError::Internal(String::from("RLS state lock")))?;
             if enabled {
                 tables.insert(table.to_string());
-            } else {
+            } else if !self.platform_rls_applies(table) {
                 tables.remove(table);
             }
         }
@@ -8491,7 +8491,8 @@ where
     }
 
     fn rls_is_enabled(&self, table: &str) -> bool {
-        self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table))
+        self.platform_rls_applies(table)
+            || self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table))
     }
 
     fn platform_rls_applies(&self, table: &str) -> bool {
@@ -16059,6 +16060,15 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(hidden, QueryResult::Rows { ref rows } if rows.is_empty()));
+
+        executor
+            .execute(parse("ALTER TABLE messages DISABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        let still_hidden =
+            executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(still_hidden, QueryResult::Rows { ref rows } if rows.len() == 1));
+        assert!(executor.schema_snapshot().rls_enabled.contains("messages"));
 
         let bad_insert = executor
             .execute(
