@@ -543,18 +543,39 @@ impl ShardSet {
             range.shard = assignments[&range.id];
         }
 
-        if old_ranges != ranges {
-            Self::rebalance_ranges_locked(&inner, &ranges)?;
-        }
+        let purges = Self::rebalance_ranges_locked(&inner, &ranges)?;
+        let previous_ranges = inner.ranges.clone();
+        let previous_assignments = inner.range_assignments.clone();
         inner.ranges = ranges;
         inner.range_assignments = assignments;
         if old_assignments != inner.range_assignments {
-            persist_range_assignments(&inner.range_placement_path, &inner.range_assignments)?;
+            if let Err(error) = persist_range_assignments(
+                &inner.range_placement_path,
+                &inner.range_assignments,
+            ) {
+                inner.ranges = previous_ranges;
+                inner.range_assignments = previous_assignments;
+                return Err(error);
+            }
+        }
+        for (source_index, keys) in purges {
+            let Some(source) = inner.shards.get(source_index) else {
+                continue;
+            };
+            // Routing is durable now. Cleanup is deliberately best effort:
+            // retaining a duplicate is safe, while deleting before routing is
+            // durable can make the old topology lose data.
+            if source.purge_keys(&keys).is_ok() {
+                let _ = source.write_snapshot();
+            }
         }
         Ok(())
     }
 
-    fn rebalance_ranges_locked(inner: &ShardInner, ranges: &[RangePlacement]) -> Result<()> {
+    fn rebalance_ranges_locked(
+        inner: &ShardInner,
+        ranges: &[RangePlacement],
+    ) -> Result<Vec<(usize, Vec<RecordKey>)>> {
         let mut tables = std::collections::BTreeSet::new();
         for shard in &inner.shards {
             tables.extend(shard.spaces()?);
@@ -579,6 +600,7 @@ impl ShardSet {
         }
 
         let mut changed = HashSet::new();
+        let mut purges = Vec::new();
         for ((source_index, target, table), rows) in moves {
             let destination = inner
                 .shards
@@ -590,18 +612,17 @@ impl ShardSet {
                 .collect();
             destination.import_table(&table.tenant, &table.database, &table.table, rows)?;
 
-            let source = inner
+            inner
                 .shards
                 .get(source_index)
                 .ok_or_else(|| RymeError::Unavailable(String::from("range shard")))?;
-            source.purge_keys(&keys)?;
-            changed.insert(source_index);
             changed.insert(target);
+            purges.push((source_index, keys));
         }
         for index in changed {
             inner.shards[index].write_snapshot()?;
         }
-        Ok(())
+        Ok(purges)
     }
 
     pub fn route_table(&self, tenant: &str, database: &str, table: &str) -> usize {
