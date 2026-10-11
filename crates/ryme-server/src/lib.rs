@@ -868,6 +868,11 @@ fn load_durable_snapshot(
 }
 
 fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::SchemaSnapshot> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > ryme_sql::MAX_SCHEMA_SNAPSHOT_BYTES as u64 {
+            return Err(ryme_error::RymeError::Overload(String::from("schema snapshot")));
+        }
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -875,6 +880,9 @@ fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::
         }
         Err(error) => return Err(error.into()),
     };
+    if bytes.len() > ryme_sql::MAX_SCHEMA_SNAPSHOT_BYTES {
+        return Err(ryme_error::RymeError::Overload(String::from("schema snapshot")));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -883,8 +891,10 @@ fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| ryme_error::RymeError::Corrupt(format!("schema snapshot: {error}")))
+    let snapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| ryme_error::RymeError::Corrupt(format!("schema snapshot: {error}")))?;
+    ryme_sql::validate_schema_snapshot(&snapshot)?;
+    Ok(snapshot)
 }
 
 fn load_existing_schema_snapshot(

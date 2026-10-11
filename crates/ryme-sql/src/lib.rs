@@ -902,6 +902,9 @@ pub struct SchemaSnapshot {
     pub rls_policies: BTreeMap<String, RlsPolicy>,
 }
 
+pub const MAX_SCHEMA_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SCHEMA_OBJECTS: usize = 100_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RlsPolicy {
     pub name: String,
@@ -921,6 +924,62 @@ fn default_rls_policy_command() -> String {
     String::from("ALL")
 }
 
+fn schema_snapshot_object_count(snapshot: &SchemaSnapshot) -> Result<usize> {
+    let mut count = 0usize;
+    let mut add = |amount: usize| {
+        count = count
+            .checked_add(amount)
+            .ok_or_else(|| RymeError::Overload(String::from("schema snapshot objects")))?;
+        if count > MAX_SCHEMA_OBJECTS {
+            return Err(RymeError::Overload(String::from("schema snapshot objects")));
+        }
+        Ok(())
+    };
+
+    for columns in snapshot.tables.values() {
+        add(1)?;
+        add(columns.len())?;
+    }
+    add(snapshot.indexes.len())?;
+    for checks in snapshot.checks.values() {
+        add(1 + checks.len())?;
+    }
+    for constraints in snapshot.foreign_keys.values() {
+        add(1 + constraints.len())?;
+    }
+    for constraints in snapshot.constraints.values() {
+        add(1 + constraints.len())?;
+    }
+    add(snapshot.functions.len())?;
+    add(snapshot.triggers.len())?;
+    add(snapshot.views.len())?;
+    add(snapshot.sequences.len())?;
+    add(snapshot.roles.len())?;
+    add(snapshot.privileges.len())?;
+    add(snapshot.default_privileges.len())?;
+    add(snapshot.rls_tables.len())?;
+    add(snapshot.rls_write_tables.len())?;
+    add(snapshot.rls_enabled.len())?;
+    add(snapshot.rls_forced.len())?;
+    add(snapshot.rls_policies.len())?;
+    Ok(count)
+}
+
+fn schema_snapshot_bytes(snapshot: &SchemaSnapshot) -> Result<Vec<u8>> {
+    validate_role_catalog(&snapshot.roles)?;
+    schema_snapshot_object_count(snapshot)?;
+    let bytes = serde_json::to_vec(snapshot)
+        .map_err(|error| RymeError::Internal(format!("schema snapshot: {error}")))?;
+    if bytes.len() > MAX_SCHEMA_SNAPSHOT_BYTES {
+        return Err(RymeError::Overload(String::from("schema snapshot")));
+    }
+    Ok(bytes)
+}
+
+pub fn validate_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<()> {
+    schema_snapshot_bytes(snapshot).map(|_| ())
+}
+
 #[cfg(unix)]
 fn sync_schema_directory(path: &Path) -> Result<()> {
     std::fs::File::open(path)?.sync_all()?;
@@ -936,8 +995,7 @@ pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec(snapshot)
-        .map_err(|error| RymeError::Internal(format!("schema snapshot: {error}")))?;
+    let bytes = schema_snapshot_bytes(snapshot)?;
     let temporary = path.with_extension("tmp");
     {
         use std::io::Write;
@@ -8175,7 +8233,7 @@ where
     }
 
     fn restore_schema_snapshot_inner(&self, snapshot: SchemaSnapshot) -> Result<()> {
-        validate_role_catalog(&snapshot.roles)?;
+        validate_schema_snapshot(&snapshot)?;
         let functions = snapshot.functions;
         let triggers = snapshot.triggers;
         let mut views = snapshot.views;
@@ -17292,6 +17350,18 @@ mod tests {
         assert!(matches!(statement, Statement::CreateTable { if_not_exists: true, .. }));
         executor.execute(statement).await.unwrap();
         assert_eq!(executor.catalog_columns("users")[0].data_type, "text");
+    }
+
+    #[test]
+    fn schema_snapshot_rejects_excessive_object_count() {
+        let mut snapshot = SchemaSnapshot::default();
+        for index in 0..=MAX_SCHEMA_OBJECTS {
+            snapshot.tables.insert(format!("table_{index}"), Vec::new());
+        }
+        assert!(matches!(
+            validate_schema_snapshot(&snapshot),
+            Err(RymeError::Overload(message)) if message == "schema snapshot objects"
+        ));
     }
 
     #[tokio::test]
