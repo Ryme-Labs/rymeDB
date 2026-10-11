@@ -8525,7 +8525,12 @@ where
     }
 
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
-        !self.rls_applies_to_role(table) || self.rls_policy_allows(table, value)
+        self.rls_allows_with_context(table, value, self.rls_applies_to_role(table))
+    }
+
+    #[inline]
+    fn rls_allows_with_context(&self, table: &str, value: &[u8], applies: bool) -> bool {
+        !applies || self.rls_policy_allows(table, value)
     }
 
     pub fn row_allowed_by_rls(&self, table: &str, value: &[u8]) -> bool {
@@ -9169,7 +9174,18 @@ where
     }
 
     fn filter_rls_rows(&self, table: &str, rows: impl IntoIterator<Item = Row>) -> Vec<Row> {
-        rows.into_iter().filter(|(_, value)| self.rls_allows(table, value)).collect()
+        self.filter_rls_rows_with_context(table, rows, self.rls_applies_to_role(table))
+    }
+
+    fn filter_rls_rows_with_context(
+        &self,
+        table: &str,
+        rows: impl IntoIterator<Item = Row>,
+        applies: bool,
+    ) -> Vec<Row> {
+        rows.into_iter()
+            .filter(|(_, value)| self.rls_allows_with_context(table, value, applies))
+            .collect()
     }
 
     fn materialize_insert_row(
@@ -10066,13 +10082,14 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
+        let rls_applies = self.rls_applies_to_role(table);
         if let Some(view) = self.view_definition(table)? {
             let mut rows = if view.materialized {
                 view.rows
             } else {
                 query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
             };
-            rows = self.filter_rls_rows(table, rows);
+            rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
             return Ok(rows);
@@ -10091,7 +10108,7 @@ where
                     }
                 }
                 return Ok(self
-                    .filter_rls_rows(table, rows)
+                    .filter_rls_rows_with_context(table, rows, rls_applies)
                     .into_iter()
                     .filter(|(pk, value)| {
                         filter.iter().all(|predicate| predicate.matches(pk, value))
@@ -10100,7 +10117,6 @@ where
                     .collect());
             }
         }
-        let rls_applies = self.rls_applies_to_role(table);
         if txn.writes().is_empty() && filter.is_empty() && !rls_applies {
             return self.manager.scan_async(txn, &self.tenant, &self.database, table, limit).await;
         }
@@ -10127,7 +10143,7 @@ where
                 let page_len = page.len();
                 let last = page.last().map(|(pk, _)| pk.clone());
                 matched.extend(page.into_iter().filter(|(pk, value)| {
-                    self.rls_allows(table, value)
+                    self.rls_allows_with_context(table, value, rls_applies)
                         && filter.iter().all(|predicate| predicate.matches(pk, value))
                 }));
                 if matched.len() >= limit || page_len < PAGE {
@@ -10179,7 +10195,7 @@ where
         Ok(base
             .into_iter()
             .filter(|(pk, value)| {
-                self.rls_allows(table, value)
+                self.rls_allows_with_context(table, value, rls_applies)
                     && filter.iter().all(|predicate| predicate.matches(pk, value))
             })
             .take(limit)
@@ -10193,18 +10209,18 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
+        let rls_applies = self.rls_applies_to_role(table);
         if let Some(view) = self.view_definition(table)? {
             let mut rows = if view.materialized {
                 view.rows
             } else {
                 query_result_rows(self.execute_read_in_transaction(txn, view.query)?)
             };
-            rows = self.filter_rls_rows(table, rows);
+            rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
             rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
             rows.truncate(limit);
             return Ok(rows);
         }
-        let rls_applies = self.rls_applies_to_role(table);
         if rls_applies {
             if limit == 0 {
                 return Ok(Vec::new());
@@ -10233,7 +10249,7 @@ where
                     let page_len = page.len();
                     let last = page.last().map(|(pk, _)| pk.clone());
                     visible.extend(page.into_iter().filter(|(pk, value)| {
-                        self.rls_allows(table, value)
+                        self.rls_allows_with_context(table, value, rls_applies)
                             && filter.iter().all(|predicate| predicate.matches(pk, value))
                     }));
                     if visible.len() >= limit || page_len < PAGE {
@@ -10287,7 +10303,7 @@ where
             return Ok(merged
                 .into_iter()
                 .filter(|(pk, value)| {
-                    self.rls_allows(table, value)
+                    self.rls_allows_with_context(table, value, rls_applies)
                         && filter.iter().all(|predicate| predicate.matches(pk, value))
                 })
                 .take(limit)
@@ -10302,7 +10318,7 @@ where
                         rows.push((pk, value));
                     }
                 }
-                return Ok(self.filter_rls_rows(table, rows));
+                return Ok(self.filter_rls_rows_with_context(table, rows, rls_applies));
             }
 
             if !filter.is_empty() {
