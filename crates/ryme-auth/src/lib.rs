@@ -357,9 +357,22 @@ impl JwtVerifier {
             }
         }
         let id = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("jwt").to_string();
-        let tenant = claims.get("tenant").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-        let mut roles = HashSet::new();
-        if let Some(list) = claims.get("roles").and_then(|v| v.as_array()) {
+        let tenant = claims
+            .get("tenant")
+            .or_else(|| claims.get("tenant_id"))
+            .or_else(|| claims.get("app_metadata").and_then(|v| v.get("tenant")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+        let roles = claim_roles(&claims);
+        Ok(Principal { id, tenant, roles })
+    }
+}
+
+fn claim_roles(claims: &serde_json::Value) -> HashSet<Role> {
+    let mut roles = HashSet::new();
+    let mut add = |value: &serde_json::Value| match value {
+        serde_json::Value::Array(list) => {
             for entry in list {
                 if let Some(name) = entry.as_str() {
                     if let Some(role) = parse_role(name) {
@@ -368,20 +381,35 @@ impl JwtVerifier {
                 }
             }
         }
-        if roles.is_empty() {
-            roles.insert(Role::ReadWrite);
+        serde_json::Value::String(name) => {
+            if let Some(role) = parse_role(name) {
+                roles.insert(role);
+            }
         }
-        Ok(Principal { id, tenant, roles })
+        _ => {}
+    };
+    if let Some(value) = claims.get("roles") {
+        add(value);
     }
+    if let Some(value) = claims.get("role") {
+        add(value);
+    }
+    if let Some(value) = claims.get("app_metadata").and_then(|metadata| metadata.get("roles")) {
+        add(value);
+    }
+    if roles.is_empty() {
+        roles.insert(Role::ReadWrite);
+    }
+    roles
 }
 
 fn parse_role(name: &str) -> Option<Role> {
-    match name {
-        "owner" => Some(Role::Owner),
+    match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "owner" | "service_role" => Some(Role::Owner),
         "admin" => Some(Role::Admin),
         "developer" => Some(Role::Developer),
-        "readwrite" => Some(Role::ReadWrite),
-        "readonly" => Some(Role::ReadOnly),
+        "readwrite" | "read_write" | "authenticated" => Some(Role::ReadWrite),
+        "readonly" | "read_only" | "anon" => Some(Role::ReadOnly),
         "realtime_publisher" => Some(Role::RealtimePublisher),
         "realtime_subscriber" => Some(Role::RealtimeSubscriber),
         _ => None,
@@ -1079,6 +1107,32 @@ mod tests {
         assert!(wrong_issuer.principal_from_token(&token, 1000).is_err());
         let open = JwtVerifier::new(b"issuer-secret".to_vec());
         assert!(open.principal_from_token(&token, 1000).is_ok());
+    }
+
+    #[test]
+    fn jwt_accepts_supabase_style_role_claims() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let payload = serde_json::json!({
+            "sub": "ada",
+            "tenant_id": "project-a",
+            "role": "authenticated",
+            "app_metadata": { "roles": ["realtime_subscriber"] },
+            "exp": 2000000000u64,
+        });
+        let header_b64 = base64_url_encode(br#"{"alg":"HS256"}"#);
+        let payload_b64 = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
+        let input = format!("{header_b64}.{payload_b64}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"supabase-secret").unwrap();
+        mac.update(input.as_bytes());
+        let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
+
+        let principal = JwtVerifier::new(b"supabase-secret".to_vec())
+            .principal_from_token(&token, 1000)
+            .unwrap();
+        assert_eq!(principal.tenant, "project-a");
+        assert!(principal.roles.contains(&Role::ReadWrite));
+        assert!(principal.roles.contains(&Role::RealtimeSubscriber));
     }
 
     fn oidc_test_config() -> OidcConfig {

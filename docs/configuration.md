@@ -104,6 +104,11 @@ rotation; `RYME_JWT_JWK_KID` can restrict the mounted set to one key. Set
 Use `RYME_JWT_JWKS_URL` instead when the provider exposes a reachable JWKS
 endpoint; the file setting takes precedence and the URL is fetched with a
 10-second timeout during startup.
+JWT principals accept both rymeDB claims (`tenant`, `roles`) and common
+Supabase-style claims: `tenant_id`, scalar `role` values such as `anon`,
+`authenticated`, and `service_role`, plus `app_metadata.roles`. Role names are
+case-insensitive; `anon` maps to read-only access, `authenticated` to read/write
+access, and `service_role` to the owner role.
 The `/v1/auth/oidc/token` exchange can use the same mounted file, or an
 explicit `RYME_OIDC_JWKS_FILE`/`RYME_OIDC_JWKS_URL` and optional
 `RYME_OIDC_JWK_KID`; its OIDC issuer and audience are taken from

@@ -1,5 +1,7 @@
 # Changelog
 
+- JWT auth now accepts case-insensitive roles, Supabase-style scalar `role`
+  claims, `app_metadata.roles`, and `tenant_id` tenant claims.
 - Hybrid PITR now restores the replicated tier through Raft and the current
   node's local shard set, with the response identifying the local replay scope.
 - Added a hosted CI workflow that checks formatting for core packages, runs
