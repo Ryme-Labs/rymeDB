@@ -8842,12 +8842,27 @@ fn branch_diff_data(
     }
 
     let mut changes = Vec::new();
-    let rls_executor = state.executor.clone().with_tenant(tenant.to_string());
+    let left_executor = branch_executor_from_snapshot(
+        state,
+        state.executor.clone().with_tenant(tenant.to_string()),
+        tenant,
+        &left.id,
+        left.base_commit_ts,
+        left.storage_epoch,
+    )?;
+    let right_executor = branch_executor_from_snapshot(
+        state,
+        state.executor.clone().with_tenant(tenant.to_string()),
+        tenant,
+        &right.id,
+        right.base_commit_ts,
+        right.storage_epoch,
+    )?;
     for table in tables {
         let mut left_rows = scan_branch_diff_rows(&left_backend, tenant, &state.database, &table)?;
         let mut right_rows = scan_branch_diff_rows(&right_backend, tenant, &state.database, &table)?;
-        left_rows.retain(|_, value| rls_executor.row_allowed_by_rls(&table, value));
-        right_rows.retain(|_, value| rls_executor.row_allowed_by_rls(&table, value));
+        left_rows.retain(|_, value| left_executor.row_allowed_by_rls(&table, value));
+        right_rows.retain(|_, value| right_executor.row_allowed_by_rls(&table, value));
         let keys: BTreeSet<Vec<u8>> = left_rows.keys().chain(right_rows.keys()).cloned().collect();
         for pk in keys {
             let left_value = left_rows.get(&pk);
@@ -13007,6 +13022,88 @@ mod realtime_policy_tests {
             br#"{"id":"hidden","tenant_id":"other"}"#,
         ));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn branch_diff_evaluates_each_side_with_its_schema_rls() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-branch-diff-rls-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("branch-diff-rls");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse(
+                    "CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse(
+                    "INSERT INTO messages KEY 'hidden' VALUE '{\"tenant_id\":\"other\"}'",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut control = state.control.lock().unwrap();
+            let mut branches = control.branches.clone();
+            branches
+                .create_child_for(
+                    "default",
+                    String::from("preview"),
+                    "main",
+                    state.backend.latest_commit(),
+                )
+                .unwrap();
+            branches.persist(&state.branch_path).unwrap();
+            control.branches = branches;
+        }
+        ryme_sql::persist_schema_snapshot(
+            &state.branch_schema_path("default", "preview"),
+            &state.executor.schema_snapshot(),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ryme-branch", axum::http::HeaderValue::from_static("preview"));
+        let branch = branch_executor(&state, &headers, "default").unwrap();
+        branch
+            .execute(
+                ryme_sql::parse(
+                    "CREATE POLICY own_messages ON messages FOR ALL USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        branch
+            .execute(ryme_sql::parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+
+        let branches = state.control.lock().unwrap().branches.clone();
+        let preview = branches.get_for("default", "preview").unwrap();
+        let main = branches.get_for("default", "main").unwrap();
+        let changes = branch_diff_data(&state, "default", &preview, &main).unwrap();
+        assert!(changes.iter().any(|change| {
+            change.table == "messages"
+                && change.pk == ryme_auth::base64_url_encode(b"hidden")
+                && change.left.is_none()
+                && change.right.is_some()
+        }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
