@@ -236,21 +236,29 @@ fn decode_decision(raw: &[u8]) -> Result<(u64, DecisionParts)> {
     }
     let commit_ts = u64::from_le_bytes(raw[1..9].try_into().map_err(|_| corrupt())?);
     let count = u32::from_le_bytes(raw[9..13].try_into().map_err(|_| corrupt())?) as usize;
+    let remaining = raw.len() - 13;
+    if count > remaining / 8 {
+        return Err(corrupt());
+    }
     let mut parts = Vec::with_capacity(count);
     let mut offset = 13;
     for _ in 0..count {
-        if offset + 8 > raw.len() {
+        let header_end = offset.checked_add(8).ok_or_else(corrupt)?;
+        if header_end > raw.len() {
             return Err(corrupt());
         }
         let shard = u32::from_le_bytes(raw[offset..offset + 4].try_into().map_err(|_| corrupt())?);
-        let len = u32::from_le_bytes(raw[offset + 4..offset + 8].try_into().map_err(|_| corrupt())?)
+        let len = u32::from_le_bytes(raw[offset + 4..header_end].try_into().map_err(|_| corrupt())?)
             as usize;
-        offset += 8;
-        if offset + len > raw.len() {
+        let payload_end = header_end.checked_add(len).ok_or_else(corrupt)?;
+        if payload_end > raw.len() {
             return Err(corrupt());
         }
-        parts.push((shard, raw[offset..offset + len].to_vec()));
-        offset += len;
+        parts.push((shard, raw[header_end..payload_end].to_vec()));
+        offset = payload_end;
+    }
+    if offset != raw.len() {
+        return Err(corrupt());
     }
     Ok((commit_ts, parts))
 }
@@ -1974,6 +1982,15 @@ mod tests {
         assert_eq!(commit_ts, 41);
         assert_eq!(back, parts);
         assert!(decode_decision(b"bogus").is_err());
+
+        let mut impossible_count = vec![1u8];
+        impossible_count.extend_from_slice(&41u64.to_le_bytes());
+        impossible_count.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_decision(&impossible_count).is_err());
+
+        let mut trailing = encode_decision(41, &[]);
+        trailing.push(0);
+        assert!(decode_decision(&trailing).is_err());
     }
 
     fn now_ms() -> u128 {
