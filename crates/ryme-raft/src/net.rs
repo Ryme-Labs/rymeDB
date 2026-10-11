@@ -15,6 +15,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
+// The heartbeat loop runs every 60 ms. Keep several heartbeat intervals in
+// the election window so TLS handshakes, disk syncs, and executor contention
+// cannot turn a healthy leader into a needless election under load.
+const ELECTION_TIMEOUT_MIN_MS: u64 = 500;
+const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
+const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Rpc {
     VoteRequest {
@@ -1297,7 +1304,7 @@ impl Node {
         *rng ^= *rng << 13;
         *rng ^= *rng >> 7;
         *rng ^= *rng << 17;
-        Duration::from_millis(180 + (*rng % 140))
+        Duration::from_millis(ELECTION_TIMEOUT_MIN_MS + (*rng % ELECTION_TIMEOUT_JITTER_MS))
     }
 
     pub fn spawn(self: &Arc<Self>, listener: TcpListener) -> Vec<tokio::task::JoinHandle<()>> {
@@ -5901,7 +5908,7 @@ fn now_ms() -> u64 {
 }
 
 fn recent_leader(contact_ms: u64) -> bool {
-    contact_ms != 0 && now_ms().saturating_sub(contact_ms) < 600
+    contact_ms != 0 && now_ms().saturating_sub(contact_ms) < LEADER_CONTACT_GRACE_MS
 }
 
 fn append_to_log(
