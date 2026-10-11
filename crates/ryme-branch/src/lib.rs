@@ -432,8 +432,8 @@ where
         if !self.overlay {
             return Ok(Vec::new());
         }
-        let txn = self.base.begin();
-        Ok(self.overlay_rows(&txn, tenant, table)?.into_iter().collect())
+        let mut txn = self.base.begin();
+        Ok(self.overlay_rows(&mut txn, tenant, table)?.into_iter().collect())
     }
 
     fn local_key(&self, key: &ryme_storage::RecordKey) -> ryme_storage::RecordKey {
@@ -473,25 +473,16 @@ where
 
     fn overlay_rows(
         &self,
-        txn: &ryme_txn::Transaction,
+        txn: &mut ryme_txn::Transaction,
         tenant: &str,
         table: &str,
     ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
         let mut rows = BTreeMap::new();
-        let mut local_txn = self.base.begin();
-        let local_rows =
-            self.scan_all(&mut local_txn, tenant, &self.branch_database, table, usize::MAX)?;
+        let local_rows = self.base.scan(txn, tenant, &self.branch_database, table, usize::MAX)?;
         for (pk, value) in local_rows {
             if let Some(decoded) = Self::decode(&value) {
                 rows.insert(pk, decoded);
             }
-        }
-        for (key, write) in txn.writes() {
-            if key.tenant != tenant || key.database != self.branch_database || key.table != table {
-                continue;
-            }
-            let value = write.value.as_deref().and_then(Self::decode).flatten();
-            rows.insert(key.pk.clone(), value);
         }
         Ok(rows)
     }
@@ -571,8 +562,7 @@ where
         if let Some(write) = txn.writes().get(&local) {
             return Ok(write.value.as_deref().and_then(Self::decode).flatten());
         }
-        let mut local_txn = self.base.begin();
-        if let Some(value) = self.base.get(&mut local_txn, &local)? {
+        if let Some(value) = self.base.get(txn, &local)? {
             return Ok(Self::decode(&value).flatten());
         }
         let mut parent_txn = self.parent_transaction();
@@ -916,5 +906,32 @@ mod tests {
 
         let mut base_read = base.begin();
         assert_eq!(base.get(&mut base_read, &parent_key).unwrap(), Some(b"from-parent".to_vec()));
+    }
+
+    #[test]
+    fn branch_reads_keep_the_transaction_snapshot_for_overlay_rows() {
+        let base = ryme_txn::TxnManager::new();
+        let parent_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"row");
+        let mut parent_write = base.begin();
+        base.put(&mut parent_write, parent_key.clone(), b"from-parent".to_vec());
+        let parent_commit = base.commit(parent_write).unwrap();
+        let branch = BranchBackend::new(
+            base.clone(),
+            String::from("default"),
+            String::from("preview"),
+            parent_commit,
+            0,
+        );
+
+        let mut reader = branch.begin();
+        let mut branch_write = branch.begin();
+        branch.put(&mut branch_write, parent_key.clone(), b"from-branch".to_vec());
+        base.commit(branch_write).unwrap();
+
+        assert_eq!(branch.get(&mut reader, &parent_key).unwrap(), Some(b"from-parent".to_vec()));
+        assert_eq!(
+            branch.scan(&mut reader, "tenant", "default", "docs", 10).unwrap(),
+            vec![(b"row".to_vec(), b"from-parent".to_vec())]
+        );
     }
 }
