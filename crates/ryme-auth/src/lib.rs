@@ -550,6 +550,10 @@ impl RefreshTokenStore {
         self.inner.read().map(|sessions| sessions.len()).unwrap_or(0)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn snapshot(&self) -> Result<HashMap<String, RefreshTokenRecord>> {
         self.inner
             .read()

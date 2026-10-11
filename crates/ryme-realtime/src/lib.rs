@@ -42,6 +42,10 @@ const TABLE_TOPIC_SHARDS: usize = 32;
 const PRESENCE_SHARDS: usize = 32;
 const STABLE_CDC_SEQUENCE_STRIDE: u64 = 1_000_000;
 
+type BroadcastTopicShard = Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>;
+type PresenceTopicShard = Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>;
+type DurableTopicShard = Mutex<HashMap<String, broadcast::Sender<DurableMsg>>>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryUpdate {
     pub tenant: String,
@@ -59,9 +63,9 @@ pub struct Realtime {
     inner: Arc<Mutex<RealtimeInner>>,
     changes: broadcast::Sender<ChangeRecord>,
     table_topics: Arc<Vec<Mutex<TableTopicShard>>>,
-    broadcast_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>>>,
-    presence_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>>>,
-    durable_topics: Arc<Vec<Mutex<HashMap<String, broadcast::Sender<DurableMsg>>>>>,
+    broadcast_topics: Arc<Vec<BroadcastTopicShard>>,
+    presence_topics: Arc<Vec<PresenceTopicShard>>,
+    durable_topics: Arc<Vec<DurableTopicShard>>,
     broadcast_capacity: usize,
     capacity: usize,
     sequence: Arc<AtomicU64>,
@@ -556,6 +560,7 @@ impl Realtime {
         self.publish_query_branch(tenant, database, "main", table, commit_ts, rows, limit)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_query_branch(
         &self,
         tenant: &str,
@@ -997,6 +1002,7 @@ impl Realtime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn durable_append_at(
         &self,
         tenant: &str,
@@ -1014,6 +1020,7 @@ impl Realtime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn durable_append_locked(
         &self,
         inner: &mut RealtimeInner,

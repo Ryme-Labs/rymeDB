@@ -42,6 +42,8 @@ pub struct SegmentCacheStats {
     pub misses: u64,
 }
 
+type VersionLookup = (u64, Option<Vec<u8>>, u64);
+
 #[derive(Debug)]
 struct SegmentReadCache {
     limit_bytes: u64,
@@ -272,7 +274,7 @@ impl ImmutableSegment {
         if crc32fast::hash(&input[..input.len() - 4]) != stored {
             return Err(RymeError::Corrupt(String::from("segment checksum")));
         }
-        let mut cursor = &input[..];
+        let mut cursor = input;
         let magic = take_u32(&mut cursor)?;
         let version = take_u16(&mut cursor)?;
         let kind = match take_u16(&mut cursor)? {
@@ -437,11 +439,7 @@ impl SegmentStore {
         Ok(value)
     }
 
-    pub fn version_at(
-        &self,
-        key: &RecordKey,
-        read_ts: u64,
-    ) -> Result<Option<(u64, Option<Vec<u8>>, u64)>> {
+    pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<VersionLookup>> {
         for path in self.newest_paths()? {
             let segment = self.read_segment(&path)?;
             let Some(version) = segment.version_at(key, read_ts) else {
@@ -497,6 +495,7 @@ impl SegmentStore {
         self.scan_from_segments(tenant, database, table, read_ts, now, None, limit)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn scan_after(
         &self,
         tenant: &str,
@@ -510,6 +509,7 @@ impl SegmentStore {
         self.scan_from_segments(tenant, database, table, read_ts, now, Some(start_after), limit)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_from_segments(
         &self,
         tenant: &str,
