@@ -41,7 +41,7 @@ async fn qos_throttles_writes_not_reads() {
     let metering = Arc::new(Mutex::new(ryme_metering::MeterRegistry::new()));
     {
         let mut registry = qos.lock().unwrap();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             ryme_qos::Quota { write_qps: 1, ..ryme_qos::Quota::for_tier(ryme_qos::Tier::Shared) },
             now_nanos(),
@@ -72,7 +72,7 @@ async fn qos_throttles_response_bytes() {
     let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
     {
         let mut registry = qos.lock().unwrap();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             ryme_qos::Quota {
                 egress_bytes_per_sec: 512,

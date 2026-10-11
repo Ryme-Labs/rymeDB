@@ -5235,10 +5235,10 @@ async fn qos_set_tier(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     match state.qos.lock() {
-        Ok(mut qos) => {
-            qos.set_tier(&request.tenant, request.tier, qos_now_nanos());
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
-        }
+        Ok(mut qos) => match qos.set_tier(&request.tenant, request.tier, qos_now_nanos()) {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+            Err(error) => error_response(error),
+        },
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     }
 }

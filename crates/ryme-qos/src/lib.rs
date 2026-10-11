@@ -2,6 +2,9 @@ use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const MAX_TENANTS: usize = 100_000;
+const MAX_TENANT_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
@@ -109,7 +112,8 @@ impl QosRegistry {
         Self { tenants: HashMap::new() }
     }
 
-    pub fn set_tier(&mut self, tenant: &str, tier: Tier, now_nanos: u64) {
+    pub fn set_tier(&mut self, tenant: &str, tier: Tier, now_nanos: u64) -> Result<()> {
+        self.ensure_tenant_slot(tenant)?;
         let quota = Quota::for_tier(tier);
         if let Some(state) = self.tenants.get_mut(tenant) {
             state.tier = tier;
@@ -133,9 +137,11 @@ impl QosRegistry {
                 },
             );
         }
+        Ok(())
     }
 
-    pub fn set_quota(&mut self, tenant: &str, quota: Quota, now_nanos: u64) {
+    pub fn set_quota(&mut self, tenant: &str, quota: Quota, now_nanos: u64) -> Result<()> {
+        self.ensure_tenant_slot(tenant)?;
         let entry = self.tenants.entry(tenant.to_string()).or_insert_with(|| TenantState {
             tier: Tier::Shared,
             quota,
@@ -151,10 +157,12 @@ impl QosRegistry {
         entry.write_bucket = Bucket::new(quota.write_qps, now_nanos);
         entry.egress_bucket = Bucket::new(quota.egress_bytes_per_sec, now_nanos);
         entry.realtime_bucket = Bucket::new(quota.realtime_msg_per_sec, now_nanos);
+        Ok(())
     }
 
-    fn state_mut(&mut self, tenant: &str, now_nanos: u64) -> &mut TenantState {
-        self.tenants.entry(tenant.to_string()).or_insert_with(|| {
+    fn state_mut(&mut self, tenant: &str, now_nanos: u64) -> Result<&mut TenantState> {
+        self.ensure_tenant_slot(tenant)?;
+        Ok(self.tenants.entry(tenant.to_string()).or_insert_with(|| {
             let quota = Quota::for_tier(Tier::Shared);
             TenantState {
                 tier: Tier::Shared,
@@ -166,11 +174,24 @@ impl QosRegistry {
                 active_connections: 0,
                 stored_bytes: 0,
             }
-        })
+        }))
+    }
+
+    fn ensure_tenant_slot(&self, tenant: &str) -> Result<()> {
+        if tenant.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("tenant")));
+        }
+        if tenant.len() > MAX_TENANT_BYTES {
+            return Err(RymeError::InvalidArgument(String::from("tenant length")));
+        }
+        if !self.tenants.contains_key(tenant) && self.tenants.len() >= MAX_TENANTS {
+            return Err(RymeError::Overload(String::from("tenant quota registry")));
+        }
+        Ok(())
     }
 
     pub fn admit_read(&mut self, tenant: &str, now_nanos: u64) -> Result<()> {
-        let state = self.state_mut(tenant, now_nanos);
+        let state = self.state_mut(tenant, now_nanos)?;
         if state.read_bucket.take(1.0, now_nanos) {
             Ok(())
         } else {
@@ -179,7 +200,7 @@ impl QosRegistry {
     }
 
     pub fn admit_write(&mut self, tenant: &str, bytes: u64, now_nanos: u64) -> Result<()> {
-        let state = self.state_mut(tenant, now_nanos);
+        let state = self.state_mut(tenant, now_nanos)?;
         if state.stored_bytes.saturating_add(bytes) > state.quota.max_storage_bytes {
             return Err(RymeError::Overload(String::from("storage quota")));
         }
@@ -194,7 +215,7 @@ impl QosRegistry {
     }
 
     pub fn admit_realtime(&mut self, tenant: &str, messages: u64, now_nanos: u64) -> Result<()> {
-        let state = self.state_mut(tenant, now_nanos);
+        let state = self.state_mut(tenant, now_nanos)?;
         if state.realtime_bucket.take(messages as f64, now_nanos) {
             Ok(())
         } else {
@@ -209,7 +230,7 @@ impl QosRegistry {
         egress_bytes: u64,
         now_nanos: u64,
     ) -> Result<()> {
-        let state = self.state_mut(tenant, now_nanos);
+        let state = self.state_mut(tenant, now_nanos)?;
         let mut realtime_bucket = state.realtime_bucket.clone();
         if !realtime_bucket.take(messages as f64, now_nanos) {
             return Err(RymeError::Overload(String::from("realtime quota")));
@@ -224,7 +245,7 @@ impl QosRegistry {
     }
 
     pub fn admit_egress(&mut self, tenant: &str, bytes: u64, now_nanos: u64) -> Result<()> {
-        let state = self.state_mut(tenant, now_nanos);
+        let state = self.state_mut(tenant, now_nanos)?;
         if state.egress_bucket.take(bytes as f64, now_nanos) {
             Ok(())
         } else {
@@ -238,7 +259,7 @@ impl QosRegistry {
         bytes: u64,
         now_nanos: u64,
     ) -> Result<()> {
-        let state = self.state_mut(tenant, now_nanos);
+        let state = self.state_mut(tenant, now_nanos)?;
         if !state.realtime_bucket.take(1.0, now_nanos) {
             return Err(RymeError::Overload(String::from("realtime quota")));
         }
@@ -249,7 +270,7 @@ impl QosRegistry {
     }
 
     pub fn connection_open(&mut self, tenant: &str, now_nanos: u64) -> Result<()> {
-        let state = self.state_mut(tenant, now_nanos);
+        let state = self.state_mut(tenant, now_nanos)?;
         if state.active_connections >= state.quota.max_connections {
             return Err(RymeError::Overload(String::from("connection quota")));
         }
@@ -309,7 +330,7 @@ mod tests {
     #[test]
     fn shared_write_throttle() {
         let mut registry = QosRegistry::new();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             Quota {
                 read_qps: 1000,
@@ -338,7 +359,7 @@ mod tests {
     #[test]
     fn egress_bytes_throttle() {
         let mut registry = QosRegistry::new();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             Quota {
                 read_qps: 1000,
@@ -358,7 +379,7 @@ mod tests {
     #[test]
     fn realtime_messages_throttle() {
         let mut registry = QosRegistry::new();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             Quota {
                 read_qps: 1000,
@@ -379,7 +400,7 @@ mod tests {
     #[test]
     fn realtime_delivery_checks_message_and_egress_buckets_together() {
         let mut registry = QosRegistry::new();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             Quota {
                 read_qps: 1000,
@@ -401,7 +422,7 @@ mod tests {
     #[test]
     fn rejected_fanout_does_not_consume_only_one_quota_bucket() {
         let mut registry = QosRegistry::new();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             Quota {
                 read_qps: 1000,
@@ -422,7 +443,7 @@ mod tests {
     #[test]
     fn connections_bounded() {
         let mut registry = QosRegistry::new();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             Quota {
                 read_qps: 1000,
@@ -448,7 +469,7 @@ mod reconcile_tests {
     #[test]
     fn stored_bytes_reconcile_unblocks_writes() {
         let mut registry = QosRegistry::new();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             Quota {
                 read_qps: 1000,
@@ -465,5 +486,38 @@ mod reconcile_tests {
         registry.set_stored_bytes("t", 10);
         assert!(registry.admit_write("t", 80, 0).is_ok());
         assert_eq!(registry.view("t").map(|v| v.stored_bytes), Some(90));
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    #[test]
+    fn tenant_registry_rejects_new_entries_at_capacity() {
+        let mut registry = QosRegistry::new();
+        for index in 0..MAX_TENANTS {
+            registry.admit_read(&format!("tenant-{index}"), 0).unwrap();
+        }
+
+        assert!(matches!(
+            registry.admit_read("overflow", 0),
+            Err(RymeError::Overload(message)) if message == "tenant quota registry"
+        ));
+        registry.set_tier("tenant-0", Tier::DedicatedShard, 0).unwrap();
+        assert!(registry.admit_read("tenant-0", 0).is_ok());
+    }
+
+    #[test]
+    fn tenant_names_are_bounded_before_registry_lookup() {
+        let mut registry = QosRegistry::new();
+        assert!(matches!(
+            registry.admit_read("", 0),
+            Err(RymeError::InvalidArgument(message)) if message == "tenant"
+        ));
+        assert!(matches!(
+            registry.admit_read(&"t".repeat(MAX_TENANT_BYTES + 1), 0),
+            Err(RymeError::InvalidArgument(message)) if message == "tenant length"
+        ));
     }
 }

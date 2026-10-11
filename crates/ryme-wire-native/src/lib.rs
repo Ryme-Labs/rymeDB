@@ -913,7 +913,7 @@ mod tests {
         let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
         {
             let mut registry = qos.lock().unwrap();
-            registry.set_quota(
+            let _ = registry.set_quota(
                 "t",
                 ryme_qos::Quota {
                     egress_bytes_per_sec: 512,

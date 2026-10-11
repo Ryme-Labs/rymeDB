@@ -47,7 +47,7 @@ async fn native_observe_meter_and_classify_sql() {
     let metering = Arc::new(Mutex::new(ryme_metering::MeterRegistry::new()));
     {
         let mut registry = qos.lock().unwrap();
-        registry.set_quota(
+        let _ = registry.set_quota(
             "t",
             ryme_qos::Quota { write_qps: 1, ..ryme_qos::Quota::for_tier(ryme_qos::Tier::Shared) },
             now_nanos(),
