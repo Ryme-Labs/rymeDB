@@ -1,5 +1,12 @@
 # Changelog
 
+- Multi-owner cluster transactions now run an explicit participant protocol:
+  range owners durably prepare transaction state in intent WALs before the
+  coordinator records the global Raft decision, then resolve those intents on
+  commit or abort. Prepared intents recover across node restart and conflicting
+  prepares return typed errors. The global Raft log remains the durable
+  decision record while independent per-range Raft groups are still future
+  work.
 - Cluster transactions now carry the range-topology generation they began
   against. Range-map changes invalidate stale commits, including write-only
   owner forwarding, and the mesh returns a typed conflict instead of dropping

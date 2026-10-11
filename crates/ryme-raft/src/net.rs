@@ -2,8 +2,9 @@ use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
 use ryme_storage::{RecordKey, TableVersion};
 use ryme_txn::{decode_writes, encode_writes, now_unix, TxnManager};
+use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -105,6 +106,24 @@ pub(crate) enum Rpc {
         commit_ts: Option<u64>,
         error: Option<RpcError>,
     },
+    PrepareTransaction {
+        transaction_id: u128,
+        commit_ts: u64,
+        payload: Vec<u8>,
+    },
+    PrepareTransactionResponse {
+        prepared: bool,
+        error: Option<RpcError>,
+    },
+    ResolveTransaction {
+        transaction_id: u128,
+        commit_ts: u64,
+        committed: bool,
+    },
+    ResolveTransactionResponse {
+        resolved: bool,
+        error: Option<RpcError>,
+    },
     AppendRequest {
         term: u64,
         leader: usize,
@@ -201,6 +220,18 @@ pub struct RangeOwner {
     pub end: Vec<u8>,
     pub owner: usize,
     pub epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum IntentRecord {
+    Prepare { transaction_id: u128, commit_ts: u64, state: ryme_txn::TransactionState },
+    Resolve { transaction_id: u128, commit_ts: u64, committed: bool },
+}
+
+#[derive(Debug, Clone)]
+struct PreparedIntent {
+    commit_ts: u64,
+    state: ryme_txn::TransactionState,
 }
 
 fn next_prefix(prefix: &[u8]) -> Vec<u8> {
@@ -617,6 +648,8 @@ pub struct Node {
     topic_hook: MetadataHookSlot,
     range_owners: std::sync::RwLock<Vec<RangeOwner>>,
     range_generation: AtomicU64,
+    prepared: std::sync::Mutex<BTreeMap<u128, PreparedIntent>>,
+    intent_wal: std::sync::Mutex<Wal>,
 }
 
 impl Node {
@@ -687,6 +720,25 @@ impl Node {
         let mut wal = ryme_wal::Wal::open(dir, 64 * 1024 * 1024)?;
         let _ = &mut wal;
         let records = ryme_wal::Wal::read_all(dir)?;
+        let intent_dir = dir.join("txn-intents");
+        let intent_wal = Wal::open(&intent_dir, 16 * 1024 * 1024)?;
+        let mut prepared = BTreeMap::new();
+        for record in Wal::read_all(&intent_dir)? {
+            let intent: IntentRecord = serde_json::from_slice(&record.payload)
+                .map_err(|error| RymeError::Corrupt(format!("transaction intent: {error}")))?;
+            match intent {
+                IntentRecord::Prepare { transaction_id, commit_ts, state } => {
+                    prepared.insert(transaction_id, PreparedIntent { commit_ts, state });
+                }
+                IntentRecord::Resolve { transaction_id, committed, .. } => {
+                    if committed {
+                        prepared.remove(&transaction_id);
+                    } else {
+                        prepared.remove(&transaction_id);
+                    }
+                }
+            }
+        }
         let manager = TxnManager::new();
         let mut log: Vec<LogEntry> = Vec::new();
         for record in records {
@@ -699,6 +751,7 @@ impl Node {
         }
         log.sort_by_key(|e| e.index);
         let mut applied = 0u64;
+        let mut replayed_commit_ts = BTreeSet::new();
         let mut replayed: Option<crate::ConfChange> = None;
         let mut replayed_joint: Option<Vec<Member>> = None;
         let mut metadata = None;
@@ -707,6 +760,7 @@ impl Node {
                 ApplyPayload::Data { commit_ts, writes } => {
                     let writes = decode_writes(&writes)?;
                     manager.replay_at(commit_ts, &writes)?;
+                    replayed_commit_ts.insert(commit_ts);
                 }
                 ApplyPayload::Conf { change } => {
                     replayed = Some(change);
@@ -773,7 +827,12 @@ impl Node {
             topic_hook: MetadataHookSlot::default(),
             range_owners: std::sync::RwLock::new(Vec::new()),
             range_generation: AtomicU64::new(0),
+            prepared: std::sync::Mutex::new(prepared),
+            intent_wal: std::sync::Mutex::new(intent_wal),
         });
+        for commit_ts in replayed_commit_ts {
+            node.clear_prepared_for_commit(commit_ts)?;
+        }
         Ok(node)
     }
 
@@ -1227,6 +1286,7 @@ impl Node {
                     if self.inner.lock().await.role != Role::Leader {
                         self.apply_data_hook(crate::encode_applied(commit_ts, &encoded_writes))?;
                     }
+                    self.clear_prepared_for_commit(commit_ts)?;
                 }
                 ApplyPayload::Conf { change } => {
                     self.apply_conf(change).await;
@@ -1469,6 +1529,27 @@ impl Node {
                     }),
                 }
             }
+            Rpc::PrepareTransaction { transaction_id, commit_ts, payload } => {
+                let state: ryme_txn::TransactionState = serde_json::from_slice(&payload)
+                    .map_err(|error| RymeError::Corrupt(format!("transaction prepare: {error}")))?;
+                let txn = self.manager.from_state(state.clone());
+                match self.prepare_intent(transaction_id, commit_ts, state, &txn) {
+                    Ok(()) => Ok(Rpc::PrepareTransactionResponse { prepared: true, error: None }),
+                    Err(error) => Ok(Rpc::PrepareTransactionResponse {
+                        prepared: false,
+                        error: Some(error.into()),
+                    }),
+                }
+            }
+            Rpc::ResolveTransaction { transaction_id, commit_ts, committed } => {
+                match self.resolve_intent(transaction_id, commit_ts, committed) {
+                    Ok(()) => Ok(Rpc::ResolveTransactionResponse { resolved: true, error: None }),
+                    Err(error) => Ok(Rpc::ResolveTransactionResponse {
+                        resolved: false,
+                        error: Some(error.into()),
+                    }),
+                }
+            }
             Rpc::RangeSnapshotRequest { start, end, read_ts, max_rows, tenant, database } => {
                 let snapshot = self.snapshot_range_for(
                     &start,
@@ -1568,6 +1649,12 @@ impl Node {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
             Rpc::ProposeTransactionResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
+            Rpc::PrepareTransactionResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
+            Rpc::ResolveTransactionResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
         }
@@ -1760,12 +1847,235 @@ impl Node {
         Ok(())
     }
 
+    fn intent_id(&self, txn: &ryme_txn::Transaction) -> u128 {
+        ((self.id as u128) << 64) | txn.id as u128
+    }
+
+    fn append_intent_record(&self, record: &IntentRecord, commit_ts: u64) -> Result<()> {
+        let payload = serde_json::to_vec(record)
+            .map_err(|error| RymeError::Internal(format!("transaction intent: {error}")))?;
+        let mut wal = self
+            .intent_wal
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("transaction intent wal")))?;
+        wal.append(commit_ts, &payload)?;
+        wal.sync()
+    }
+
+    fn prepare_intent(
+        &self,
+        transaction_id: u128,
+        commit_ts: u64,
+        state: ryme_txn::TransactionState,
+        txn: &ryme_txn::Transaction,
+    ) -> Result<()> {
+        if let Some(expected) = state.route_generation {
+            if self.range_generation() != expected {
+                return Err(RymeError::Conflict(String::from("range topology changed")));
+            }
+        }
+        let mut prepared = self
+            .prepared
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("prepared transactions")))?;
+        if let Some(existing) = prepared.get(&transaction_id) {
+            if existing.commit_ts == commit_ts && existing.state == state {
+                return Ok(());
+            }
+            return Err(RymeError::Conflict(String::from("transaction already prepared")));
+        }
+        for existing in prepared.values() {
+            let other = self.manager.from_state(existing.state.clone());
+            if transactions_conflict(txn, &other) {
+                return Err(RymeError::Conflict(String::from("prepared transaction conflict")));
+            }
+        }
+        self.manager.validate_at(txn, commit_ts)?;
+        self.append_intent_record(
+            &IntentRecord::Prepare { transaction_id, commit_ts, state: state.clone() },
+            commit_ts,
+        )?;
+        prepared.insert(transaction_id, PreparedIntent { commit_ts, state });
+        Ok(())
+    }
+
+    fn resolve_intent(&self, transaction_id: u128, commit_ts: u64, committed: bool) -> Result<()> {
+        let mut prepared = self
+            .prepared
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("prepared transactions")))?;
+        let Some(existing) = prepared.get(&transaction_id) else {
+            return Ok(());
+        };
+        if existing.commit_ts != commit_ts {
+            return Err(RymeError::Conflict(String::from("transaction timestamp changed")));
+        }
+        self.append_intent_record(
+            &IntentRecord::Resolve { transaction_id, commit_ts, committed },
+            commit_ts,
+        )?;
+        prepared.remove(&transaction_id);
+        Ok(())
+    }
+
+    fn clear_prepared_for_commit(&self, commit_ts: u64) -> Result<()> {
+        let ids: Vec<u128> = self
+            .prepared
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("prepared transactions")))?
+            .iter()
+            .filter_map(|(id, intent)| (intent.commit_ts == commit_ts).then_some(*id))
+            .collect();
+        for id in ids {
+            self.resolve_intent(id, commit_ts, true)?;
+        }
+        Ok(())
+    }
+
+    pub fn transaction_participants(&self, txn: &ryme_txn::Transaction) -> BTreeSet<usize> {
+        let ranges = self.range_owners();
+        if ranges.is_empty() {
+            return BTreeSet::new();
+        }
+        let mut participants = BTreeSet::new();
+        for key in txn.writes().keys().chain(txn.read_keys().iter()) {
+            if let Some(owner) = self.range_owner_key(key) {
+                participants.insert(owner);
+            }
+        }
+        for (tenant, database, table) in txn.scanned_tables() {
+            let mut prefix = Vec::with_capacity(table.len() + 1);
+            prefix.extend_from_slice(table.as_bytes());
+            prefix.push(0);
+            let end = next_prefix(&prefix);
+            for range in &ranges {
+                let starts_before_end = end.is_empty() || range.start.as_slice() < end.as_slice();
+                let ends_after_start =
+                    range.end.is_empty() || range.end.as_slice() > prefix.as_slice();
+                if starts_before_end && ends_after_start {
+                    let _ = (tenant, database);
+                    participants.insert(range.owner);
+                }
+            }
+        }
+        participants
+    }
+
+    async fn prepare_on(
+        self: &Arc<Self>,
+        owner: usize,
+        transaction_id: u128,
+        commit_ts: u64,
+        state: ryme_txn::TransactionState,
+    ) -> Result<()> {
+        if owner == self.id {
+            let txn = self.manager.from_state(state.clone());
+            return self.prepare_intent(transaction_id, commit_ts, state, &txn);
+        }
+        let pool = self
+            .pool_for(owner)
+            .ok_or_else(|| RymeError::Unavailable(String::from("range participant unavailable")))?;
+        let payload = serde_json::to_vec(&state)
+            .map_err(|error| RymeError::Internal(format!("transaction prepare: {error}")))?;
+        match pool
+            .roundtrip(&Rpc::PrepareTransaction { transaction_id, commit_ts, payload })
+            .await?
+        {
+            Rpc::PrepareTransactionResponse { prepared: true, error: None } => Ok(()),
+            Rpc::PrepareTransactionResponse { error: Some(error), .. } => Err(error.into()),
+            _ => Err(RymeError::Corrupt(String::from("transaction prepare rpc"))),
+        }
+    }
+
+    async fn resolve_on(
+        self: &Arc<Self>,
+        owner: usize,
+        transaction_id: u128,
+        commit_ts: u64,
+        committed: bool,
+    ) -> Result<()> {
+        if owner == self.id {
+            return self.resolve_intent(transaction_id, commit_ts, committed);
+        }
+        let pool = self
+            .pool_for(owner)
+            .ok_or_else(|| RymeError::Unavailable(String::from("range participant unavailable")))?;
+        match pool
+            .roundtrip(&Rpc::ResolveTransaction { transaction_id, commit_ts, committed })
+            .await?
+        {
+            Rpc::ResolveTransactionResponse { resolved: true, error: None } => Ok(()),
+            Rpc::ResolveTransactionResponse { error: Some(error), .. } => Err(error.into()),
+            _ => Err(RymeError::Corrupt(String::from("transaction resolve rpc"))),
+        }
+    }
+
+    async fn commit_txn_at(
+        self: &Arc<Self>,
+        txn: ryme_txn::Transaction,
+        commit_ts: u64,
+    ) -> Result<u64> {
+        self.manager
+            .commit_at_with(txn, commit_ts, |commit_ts, encoded| async move {
+                self.replicate_frame(commit_ts, encoded).await.map(|_| ())
+            })
+            .await
+    }
+
+    async fn commit_distributed_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
+        if txn.writes().is_empty() {
+            return Ok(txn.read_ts);
+        }
+        let participants = self.transaction_participants(&txn);
+        if participants.len() < 2 {
+            return self
+                .manager
+                .commit_with(txn, |commit_ts, encoded| async move {
+                    self.replicate_frame(commit_ts, encoded).await.map(|_| ())
+                })
+                .await;
+        }
+        let transaction_id = self.intent_id(&txn);
+        let commit_ts = self.manager.reserve(&txn)?;
+        let state = txn.state();
+        let mut prepared = Vec::new();
+        for owner in participants.iter().copied() {
+            match self.prepare_on(owner, transaction_id, commit_ts, state.clone()).await {
+                Ok(()) => prepared.push(owner),
+                Err(error) => {
+                    for participant in prepared {
+                        let _ =
+                            self.resolve_on(participant, transaction_id, commit_ts, false).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        match self.commit_txn_at(txn, commit_ts).await {
+            Ok(commit_ts) => {
+                for owner in participants {
+                    let _ = self.resolve_on(owner, transaction_id, commit_ts, true).await;
+                }
+                Ok(commit_ts)
+            }
+            Err(error) => {
+                for owner in prepared {
+                    let _ = self.resolve_on(owner, transaction_id, commit_ts, false).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub async fn commit_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
         if let Some(expected) = txn.route_generation() {
             let current = self.range_generation();
             if current != expected {
                 return Err(RymeError::Conflict(String::from("range topology changed")));
             }
+        }
+        if self.transaction_participants(&txn).len() > 1 {
+            return self.commit_distributed_txn(txn).await;
         }
         self.manager
             .commit_with(txn, |commit_ts, encoded| async move {
@@ -2571,6 +2881,33 @@ fn merge_scan_page(
     rows.into_iter().take(limit).collect()
 }
 
+fn key_matches_scan(key: &RecordKey, scans: &BTreeSet<(String, String, String)>) -> bool {
+    scans.iter().any(|(tenant, database, table)| {
+        key.tenant == *tenant && key.database == *database && key.table == *table
+    })
+}
+
+fn transactions_conflict(left: &ryme_txn::Transaction, right: &ryme_txn::Transaction) -> bool {
+    for key in left.writes().keys() {
+        if right.writes().contains_key(key)
+            || right.read_keys().contains(key)
+            || (right.isolation() == ryme_txn::Isolation::Serializable
+                && key_matches_scan(key, right.scanned_tables()))
+        {
+            return true;
+        }
+    }
+    for key in right.writes().keys() {
+        if left.read_keys().contains(key)
+            || (left.isolation() == ryme_txn::Isolation::Serializable
+                && key_matches_scan(key, left.scanned_tables()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterBackend {
     node: Arc<Node>,
@@ -2695,7 +3032,9 @@ impl ryme_txn::TxnBackend for ClusterBackend {
     ) -> impl std::future::Future<Output = Result<u64>> + Send {
         let node = self.node.clone();
         let route_generation = txn.route_generation();
-        let routed = if txn.read_keys().is_empty()
+        let distributed = node.transaction_participants(&txn).len() > 1;
+        let routed = if !distributed
+            && txn.read_keys().is_empty()
             && txn.scanned_tables().is_empty()
             && !txn.writes().is_empty()
         {
@@ -2858,6 +3197,57 @@ mod tests {
 
         let result = Node::open(0, Vec::new(), Vec::new(), &dir);
         assert!(matches!(result, Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepared_intents_survive_restart_until_resolution() {
+        let dir = temp_dir("intent");
+        let key = RecordKey::new("t", "d", "s", b"pending");
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            let mut txn = node.manager.begin();
+            node.manager.put(&mut txn, key.clone(), b"value".to_vec());
+            let state = txn.state();
+            node.prepare_intent(77, 2, state.clone(), &txn).unwrap();
+            assert_eq!(node.prepared.lock().unwrap().len(), 1);
+            let mut probe = node.manager.begin();
+            assert_eq!(node.manager.get(&mut probe, &key).unwrap(), None);
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        assert_eq!(reopened.prepared.lock().unwrap().len(), 1);
+        reopened.resolve_intent(77, 2, false).unwrap();
+        assert_eq!(reopened.prepared.lock().unwrap().len(), 0);
+        let mut probe = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn committed_data_log_clears_unresolved_intent_on_restart() {
+        let dir = temp_dir("intent-commit");
+        let key = RecordKey::new("t", "d", "s", b"committed");
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            let mut txn = node.manager.begin();
+            node.manager.put(&mut txn, key.clone(), b"value".to_vec());
+            node.prepare_intent(88, 2, txn.state(), &txn).unwrap();
+        }
+        let mut writes = BTreeMap::new();
+        writes.insert(key.clone(), ryme_txn::WriteOp::put(b"value".to_vec()));
+        let mut wal = Wal::open(&dir, 64 * 1024 * 1024).unwrap();
+        let apply = encode_applied(2, &encode_writes(&writes).unwrap());
+        wal.append(2, &encode_log_frame(1, 1, &apply)).unwrap();
+        wal.sync().unwrap();
+        let meta =
+            Meta { term: 1, voted_for: None, commit_index: 1, members: Vec::new(), joint: None };
+        std::fs::write(dir.join("raft-meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        assert_eq!(reopened.prepared.lock().unwrap().len(), 0);
+        let mut probe = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), Some(b"value".to_vec()));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

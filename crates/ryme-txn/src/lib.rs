@@ -794,6 +794,48 @@ impl TxnManager {
         }
     }
 
+    pub async fn commit_at_with<Fut>(
+        &self,
+        txn: Transaction,
+        commit_ts: u64,
+        replicate: impl FnOnce(u64, Vec<u8>) -> Fut,
+    ) -> Result<u64>
+    where
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        if txn.writes.is_empty() {
+            return Ok(txn.read_ts);
+        }
+        let payload = encode_writes(&txn.writes)?;
+        replicate(commit_ts, payload).await?;
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        self.check_locked(&txn, commit_ts)?;
+        match self.apply_locked(commit_ts, &txn.writes) {
+            Ok(()) => Ok(commit_ts),
+            Err(RymeError::Conflict(_)) => {
+                let engine = self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+                for (key, op) in txn.writes.iter() {
+                    match engine.exact(key, commit_ts) {
+                        Some((value, expiry)) if value == op.value && expiry == op.expires_at => {
+                            continue
+                        }
+                        _ => return Err(RymeError::Conflict(String::from("stale commit_ts"))),
+                    }
+                }
+                Ok(commit_ts)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn commit_durable(
         &self,
         txn: Transaction,

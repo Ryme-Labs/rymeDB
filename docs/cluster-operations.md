@@ -215,10 +215,16 @@ This does not yet delete source replicas or claim full shared-nothing storage
 scale. Single-owner write-only transactions now route through the configured
 owner and then the current Raft leader; read-dependent, multi-owner, and
 write-only multi-owner transactions use the current global log for atomic
-forwarding. This is not yet per-range 2PC, and read-dependent cross-range
+forwarding. This is not yet independent per-range Raft 2PC, and read-dependent cross-range
 transaction routing remains separate work. Transactions that include a read
 set now forward their snapshot and OCC metadata to the current leader, so a
 follower-started transaction can be validated against intervening commits.
+Multi-owner transactions now run an explicit prepare phase at each configured
+range owner. Each participant writes a durable intent record before the
+coordinator appends the global Raft data decision, and commit/abort resolution
+cleans those records; unresolved records are recovered on participant restart.
+The global Raft log is still the decision authority, so this is a durable
+participant protocol, not yet independent per-range Raft groups.
 Cluster transactions also carry the range-topology generation observed at
 begin. Changing the configured range map invalidates an older transaction at
 commit, including write-only owner forwarding; the mesh returns a typed
