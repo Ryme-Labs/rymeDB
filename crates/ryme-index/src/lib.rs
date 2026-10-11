@@ -135,8 +135,9 @@ impl HnswIndex {
         let mut best = dot(query, &self.nodes[start].vector);
         loop {
             let mut moved = false;
-            let neighbors = self.nodes[current].neighbors.get(layer).cloned().unwrap_or_default();
-            for neighbor in neighbors {
+            let neighbors =
+                self.nodes[current].neighbors.get(layer).map(Vec::as_slice).unwrap_or(&[]);
+            for &neighbor in neighbors {
                 if self.nodes[neighbor].tombstoned {
                     continue;
                 }
@@ -197,8 +198,8 @@ impl HnswIndex {
             if score < worst && results.len() >= ef {
                 break;
             }
-            let neighbors = self.nodes[pos].neighbors.get(layer).cloned().unwrap_or_default();
-            for neighbor in neighbors {
+            let neighbors = self.nodes[pos].neighbors.get(layer).map(Vec::as_slice).unwrap_or(&[]);
+            for &neighbor in neighbors {
                 if !visited.insert(neighbor) || self.nodes[neighbor].tombstoned {
                     continue;
                 }
