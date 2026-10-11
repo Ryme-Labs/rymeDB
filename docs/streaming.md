@@ -103,9 +103,10 @@ The unqualified `table` stream keeps the lower-overhead table update path.
 
 The `table` parameter may also name a SQL view. The initial snapshot and each
 subsequent update evaluate the view through the branch SQL executor. The stream
-subscribes to every persisted base-relation dependency, so a write to any
-source table refreshes the view result while writes that do not match the view
-still produce the same current filtered snapshot.
+subscribes to every persisted base-relation dependency, expanding nested views
+to their underlying tables, so a write to any source table refreshes the view
+result while writes that do not match the view still produce the same current
+filtered snapshot.
 
 Query streams use the same branch selection rules as change feeds. A branch
 snapshot reads the branch's copy-on-write view, and later updates come only

@@ -228,7 +228,8 @@ async fn live_view_query_updates_from_base_relation() {
 
     for sql in [
         "CREATE TABLE messages (id TEXT PRIMARY KEY, room TEXT, body TEXT)",
-        "CREATE VIEW lobby_messages AS SELECT * FROM messages WHERE room = 'lobby'",
+        "CREATE VIEW lobby_messages_base AS SELECT * FROM messages WHERE room = 'lobby'",
+        "CREATE VIEW lobby_messages AS SELECT * FROM lobby_messages_base",
         "INSERT INTO messages (id, room, body) VALUES ('a', 'lobby', 'hello')",
     ] {
         let body = serde_json::json!({"sql": sql}).to_string();

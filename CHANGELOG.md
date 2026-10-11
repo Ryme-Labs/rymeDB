@@ -1,7 +1,7 @@
 # Changelog
 
 - View-backed query streams now evaluate through the branch SQL executor and
-  refresh when any persisted base relation changes, with end-to-end coverage.
+  refresh when any persisted base relation changes, including nested views.
 - View definitions now persist their referenced relations, reject creation over
   missing tables or views, and block `DROP TABLE`/`DROP VIEW` while dependents
   exist instead of leaving broken schema metadata.

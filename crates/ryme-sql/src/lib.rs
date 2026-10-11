@@ -8112,7 +8112,22 @@ where
     }
 
     pub fn view_dependencies(&self, name: &str) -> Option<Vec<String>> {
-        self.view_definition(name).ok().flatten().map(|view| view.dependencies)
+        let view = self.view_definition(name).ok().flatten()?;
+        let mut pending = view.dependencies;
+        let mut leaves = BTreeSet::new();
+        let mut visited = HashSet::new();
+        while let Some(dependency) = pending.pop() {
+            let visit_key = dependency.to_ascii_lowercase();
+            if !visited.insert(visit_key) {
+                continue;
+            }
+            if let Some(dependency_view) = self.view_definition(&dependency).ok().flatten() {
+                pending.extend(dependency_view.dependencies);
+            } else {
+                leaves.insert(dependency);
+            }
+        }
+        Some(leaves.into_iter().collect())
     }
 
     pub async fn realtime_view_rows(
@@ -15253,6 +15268,7 @@ mod tests {
         let snapshot = executor.schema_snapshot();
         assert_eq!(snapshot.views["message_view"].dependencies, vec![String::from("messages")]);
         assert_eq!(snapshot.views["nested_view"].dependencies, vec![String::from("message_view")]);
+        assert_eq!(executor.view_dependencies("nested_view"), Some(vec![String::from("messages")]));
         assert!(matches!(
             executor.execute(parse("DROP TABLE messages").unwrap()).await,
             Err(RymeError::Conflict(message)) if message.contains("message_view")
