@@ -1128,15 +1128,39 @@ impl Realtime {
             }
         }
         for shard in self.durable_topics.iter() {
-            if let Ok(mut topics) = shard.lock() {
+            let idle_topics = if let Ok(mut topics) = shard.lock() {
                 let idle_topics: Vec<String> = topics
                     .iter()
                     .filter(|(_, sender)| sender.receiver_count() == 0)
                     .map(|(key, _)| key.clone())
                     .collect();
-                for key in idle_topics {
-                    topics.remove(&key);
+                for key in &idle_topics {
+                    topics.remove(key);
                     removed += 1;
+                }
+                idle_topics
+            } else {
+                Vec::new()
+            };
+            if let Ok(mut inner) = self.inner.lock() {
+                for key in idle_topics {
+                    let empty =
+                        inner.durable.get(&key).is_some_and(|topic| topic.messages.is_empty());
+                    if empty {
+                        if let Some((tenant, _)) = split_scope_key(&key) {
+                            inner.durable.remove(&key);
+                            let remove_tenant = inner
+                                .durable_topics_by_tenant
+                                .get_mut(tenant)
+                                .is_some_and(|count| {
+                                    *count = count.saturating_sub(1);
+                                    *count == 0
+                                });
+                            if remove_tenant {
+                                inner.durable_topics_by_tenant.remove(tenant);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1597,6 +1621,26 @@ impl Realtime {
             return receiver;
         }
         let key = durable_key(tenant, partition);
+        if let Ok(mut inner) = self.inner.lock() {
+            if !inner.durable.contains_key(&key) {
+                let tenant_topics =
+                    inner.durable_topics_by_tenant.get(tenant).copied().unwrap_or(0);
+                if inner.durable.len() >= MAX_DURABLE_TOPICS
+                    || tenant_topics >= MAX_DURABLE_TOPICS_PER_TENANT
+                {
+                    let (_, receiver) = broadcast::channel(16);
+                    return receiver;
+                }
+                inner.durable.insert(
+                    key.clone(),
+                    DurableTopic { messages: VecDeque::new(), next_cursor: 0, retention: 16 },
+                );
+                *inner.durable_topics_by_tenant.entry(tenant.to_string()).or_default() += 1;
+            }
+        } else {
+            let (_, receiver) = broadcast::channel(16);
+            return receiver;
+        }
         let shard = self.durable_topic_shard(&key);
         let Some(topics) = self.durable_topics.get(shard) else {
             let (_, receiver) = broadcast::channel(16);
@@ -2556,6 +2600,30 @@ mod tests {
         assert_eq!(live.try_recv().unwrap().cursor, first);
         assert_eq!(live.try_recv().unwrap().cursor, second);
         assert_eq!(realtime.durable_cursor_bounds("t", "orders"), Some((first, second)));
+    }
+
+    #[test]
+    fn durable_subscriptions_bound_and_reclaim_empty_topics() {
+        let realtime = Realtime::new(64);
+        let live = realtime.durable_subscribe("tenant", "orders");
+        assert_eq!(realtime.durable_snapshot().unwrap().len(), 1);
+        drop(live);
+        assert_eq!(realtime.prune_idle(), 1);
+        assert!(realtime.durable_snapshot().unwrap().is_empty());
+
+        realtime
+            .inner
+            .lock()
+            .unwrap()
+            .durable_topics_by_tenant
+            .insert(String::from("tenant"), MAX_DURABLE_TOPICS_PER_TENANT);
+        let mut rejected = realtime.durable_subscribe("tenant", "rejected");
+        assert!(matches!(rejected.try_recv(), Err(broadcast::error::TryRecvError::Closed)));
+        assert!(realtime
+            .durable_snapshot()
+            .unwrap()
+            .iter()
+            .all(|topic| topic.partition != "rejected"));
     }
 
     #[test]
