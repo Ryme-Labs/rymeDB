@@ -45,11 +45,19 @@ pub struct SegmentCacheStats {
 type VersionLookup = (u64, Option<Vec<u8>>, u64);
 
 #[derive(Debug)]
+struct CachedSegment {
+    segment: Arc<ImmutableSegment>,
+    bytes: u64,
+    generation: u64,
+}
+
+#[derive(Debug)]
 struct SegmentReadCache {
     limit_bytes: u64,
     used_bytes: u64,
-    entries: HashMap<u64, (Arc<ImmutableSegment>, u64)>,
-    order: VecDeque<u64>,
+    entries: HashMap<u64, CachedSegment>,
+    order: VecDeque<(u64, u64)>,
+    next_generation: u64,
     hits: u64,
     misses: u64,
 }
@@ -61,13 +69,14 @@ impl SegmentReadCache {
             used_bytes: 0,
             entries: HashMap::new(),
             order: VecDeque::new(),
+            next_generation: 0,
             hits: 0,
             misses: 0,
         }
     }
 
     fn get(&mut self, id: u64) -> Option<Arc<ImmutableSegment>> {
-        let segment = self.entries.get(&id).map(|(segment, _)| Arc::clone(segment));
+        let segment = self.entries.get(&id).map(|entry| Arc::clone(&entry.segment));
         if segment.is_some() {
             self.hits += 1;
             self.touch(id);
@@ -82,29 +91,77 @@ impl SegmentReadCache {
             return;
         }
         self.remove(id);
-        while self.used_bytes + bytes > self.limit_bytes {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
+        while self.used_bytes > self.limit_bytes.saturating_sub(bytes) {
+            let Some((oldest, generation)) = self.order.pop_front() else {
+                // Every live entry has one current queue entry. Refuse the
+                // insertion rather than violating the byte-budget invariant
+                // if that invariant is ever corrupted.
+                debug_assert!(self.entries.is_empty(), "segment cache order invariant");
+                return;
             };
-            if let Some((_, old_bytes)) = self.entries.remove(&oldest) {
-                self.used_bytes = self.used_bytes.saturating_sub(old_bytes);
+            let current =
+                self.entries.get(&oldest).is_some_and(|entry| entry.generation == generation);
+            if !current {
+                continue;
+            }
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
             }
         }
-        self.used_bytes += bytes;
-        self.entries.insert(id, (segment, bytes));
-        self.order.push_back(id);
+        let generation = self.allocate_generation();
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        self.entries.insert(id, CachedSegment { segment, bytes, generation });
+        self.order.push_back((id, generation));
+        self.compact_order_if_needed();
     }
 
     fn remove(&mut self, id: u64) {
-        if let Some((_, bytes)) = self.entries.remove(&id) {
-            self.used_bytes = self.used_bytes.saturating_sub(bytes);
+        if let Some(entry) = self.entries.remove(&id) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
         }
-        self.order.retain(|candidate| *candidate != id);
+        self.compact_order_if_needed();
     }
 
     fn touch(&mut self, id: u64) {
-        self.order.retain(|candidate| *candidate != id);
-        self.order.push_back(id);
+        let generation = self.allocate_generation();
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.generation = generation;
+            self.order.push_back((id, generation));
+            self.compact_order_if_needed();
+        }
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        if self.next_generation == u64::MAX {
+            self.compact_order();
+            self.next_generation = 0;
+            let live_ids: Vec<u64> = self.order.iter().map(|(id, _)| *id).collect();
+            self.order.clear();
+            for id in live_ids {
+                self.next_generation += 1;
+                let generation = self.next_generation;
+                if let Some(entry) = self.entries.get_mut(&id) {
+                    entry.generation = generation;
+                }
+                self.order.push_back((id, generation));
+            }
+        }
+        self.next_generation += 1;
+        self.next_generation
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        let threshold = self.entries.len().saturating_mul(2).saturating_add(32);
+        if self.order.len() > threshold {
+            self.compact_order();
+        }
+    }
+
+    fn compact_order(&mut self) {
+        let entries = &self.entries;
+        self.order.retain(|(id, generation)| {
+            entries.get(id).is_some_and(|entry| entry.generation == *generation)
+        });
     }
 
     fn stats(&self) -> SegmentCacheStats {
@@ -967,5 +1024,26 @@ mod tests {
         assert!(stats.used_bytes <= stats.limit_bytes);
         assert_eq!(stats.entries, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_cache_touch_preserves_lru_and_bounds_lazy_queue() {
+        let segment = Arc::new(ImmutableSegment::from_engine(1, &Engine::new()));
+        let mut cache = SegmentReadCache::new(2);
+        cache.insert(1, Arc::clone(&segment), 1);
+        cache.insert(2, Arc::clone(&segment), 1);
+
+        assert!(cache.get(1).is_some());
+        cache.insert(3, Arc::clone(&segment), 1);
+        assert!(cache.entries.contains_key(&1));
+        assert!(!cache.entries.contains_key(&2));
+        assert!(cache.entries.contains_key(&3));
+        assert_eq!(cache.used_bytes, 2);
+
+        for _ in 0..100 {
+            assert!(cache.get(1).is_some());
+        }
+        let queue_limit = cache.entries.len().saturating_mul(2).saturating_add(32);
+        assert!(cache.order.len() <= queue_limit);
     }
 }
