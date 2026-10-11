@@ -142,8 +142,13 @@ jobs:
           else
             current="$(tr -d '\r\n' < sdks/RELEASE_BASE_VERSION)"
           fi
+          baseline="$(tr -d '\r\n' < sdks/RELEASE_BASE_VERSION)"
           major="${current%%.*}"
-          [[ "$major" =~ ^[0-9]+$ ]]
+          baseline_major="${baseline%%.*}"
+          [[ "$major" =~ ^[0-9]+$ && "$baseline_major" =~ ^[0-9]+$ ]]
+          if (( baseline_major > major )); then
+            major="$baseline_major"
+          fi
           candidate_major=$((major + 1))
           while :; do
             version="${candidate_major}.0.0"
