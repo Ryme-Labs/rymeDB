@@ -176,9 +176,10 @@ jobs:
 
             crate_response="$RUNNER_TEMP/crates-io-$version.json"
             if ! crate_status="$(curl --retry 3 --retry-all-errors -sS \
+              -H 'Cache-Control: no-cache' \
               -H 'User-Agent: rymeDB (https://github.com/Ryme-Labs/rymeDB)' \
               --output "$crate_response" --write-out '%{http_code}' \
-              "https://crates.io/api/v1/crates/rymedb-client/$version")"; then
+              "https://crates.io/api/v1/crates/rymedb-client/$version?cacheBust=$GITHUB_RUN_ID-$candidate_major")"; then
               echo "Crates.io version lookup failed for rymedb-client@$version"
               exit 1
             fi
@@ -338,9 +339,10 @@ jobs:
           expected="$(sha256sum "${packages[0]}" | cut -d ' ' -f1)"
           metadata_file="$RUNNER_TEMP/crates-io-publish-$RELEASE_VERSION.json"
           if ! crate_status="$(curl --retry 3 --retry-all-errors -sS \
+            -H 'Cache-Control: no-cache' \
             -H 'User-Agent: rymeDB (https://github.com/Ryme-Labs/rymeDB)' \
             --output "$metadata_file" --write-out '%{http_code}' \
-            "https://crates.io/api/v1/crates/rymedb-client/$RELEASE_VERSION")"; then
+            "https://crates.io/api/v1/crates/rymedb-client/$RELEASE_VERSION?cacheBust=$GITHUB_RUN_ID")"; then
             echo "Crates.io lookup failed for rymedb-client@$RELEASE_VERSION"
             exit 1
           fi
