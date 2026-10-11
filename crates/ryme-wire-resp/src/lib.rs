@@ -20,6 +20,9 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 const KV_TABLE: &str = "_kv";
+const RESP_SCRIPT_MAX_BYTES: usize = 1024 * 1024;
+const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
+const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
 type PubSubCounts = Arc<Mutex<std::collections::HashMap<PubSubKey, usize>>>;
@@ -43,7 +46,7 @@ pub struct RespGateway<B = TxnManager> {
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
     pubsub: PubSubBus,
-    scripts: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    scripts: Arc<Mutex<std::collections::HashMap<(String, String), Vec<u8>>>>,
     next_client_id: Arc<AtomicU64>,
     read_only: bool,
     read_allowed: bool,
@@ -819,9 +822,16 @@ where
         match subcommand.to_ascii_uppercase().as_slice() {
             b"LOAD" if args.len() == 2 => {
                 let script = args[1].clone();
+                if script.len() > RESP_SCRIPT_MAX_BYTES {
+                    return encode_error(String::from("script exceeds the 1 MiB limit"));
+                }
                 let sha = script_sha1(&script);
                 if let Ok(mut scripts) = self.scripts.lock() {
-                    scripts.insert(sha.clone(), script);
+                    let key = (self.tenant.clone(), sha.clone());
+                    if !script_cache_has_capacity(&scripts, &key, script.len()) {
+                        return encode_error(String::from("script cache limit"));
+                    }
+                    scripts.insert(key, script);
                 } else {
                     return encode_error(String::from("script cache lock"));
                 }
@@ -835,9 +845,9 @@ where
                     args[1..]
                         .iter()
                         .map(|sha| {
-                            let exists = std::str::from_utf8(sha)
-                                .ok()
-                                .is_some_and(|sha| scripts.contains_key(sha));
+                            let exists = std::str::from_utf8(sha).ok().is_some_and(|sha| {
+                                scripts.contains_key(&(self.tenant.clone(), sha.to_string()))
+                            });
                             encode_integer(i64::from(exists))
                         })
                         .collect(),
@@ -850,7 +860,7 @@ where
                             || args[1].eq_ignore_ascii_case(b"ASYNC"))) =>
             {
                 if let Ok(mut scripts) = self.scripts.lock() {
-                    scripts.clear();
+                    scripts.retain(|(tenant, _), _| tenant != &self.tenant);
                     encode_simple("OK")
                 } else {
                     encode_error(String::from("script cache lock"))
@@ -873,7 +883,7 @@ where
             let Ok(scripts) = self.scripts.lock() else {
                 return encode_error(String::from("script cache lock"));
             };
-            let Some(script) = scripts.get(sha) else {
+            let Some(script) = scripts.get(&(self.tenant.clone(), sha.to_string())) else {
                 return encode_noscript();
             };
             script.clone()
@@ -885,7 +895,7 @@ where
             Some(count) if count <= args.len().saturating_sub(2) => count,
             _ => return encode_error(String::from("value is not an integer or out of range")),
         };
-        if script.len() > 1024 * 1024 {
+        if script.len() > RESP_SCRIPT_MAX_BYTES {
             return encode_error(String::from("script exceeds the 1 MiB limit"));
         }
         let keys = args[2..2 + key_count].to_vec();
@@ -893,7 +903,10 @@ where
         if command == "EVAL" {
             let sha = script_sha1(&script);
             if let Ok(mut scripts) = self.scripts.lock() {
-                scripts.insert(sha, script.clone());
+                let key = (self.tenant.clone(), sha);
+                if script_cache_has_capacity(&scripts, &key, script.len()) {
+                    scripts.insert(key, script.clone());
+                }
             }
         }
         match self.run_lua_script(txn, &script, &keys, &argv) {
@@ -5183,6 +5196,23 @@ fn script_sha1(script: &[u8]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn script_cache_has_capacity(
+    scripts: &std::collections::HashMap<(String, String), Vec<u8>>,
+    key: &(String, String),
+    script_bytes: usize,
+) -> bool {
+    if script_bytes > RESP_SCRIPT_MAX_BYTES {
+        return false;
+    }
+    let existing_bytes = scripts.get(key).map(Vec::len).unwrap_or(0);
+    let total_bytes =
+        scripts.values().fold(0usize, |total, script| total.saturating_add(script.len()));
+    let entry_count = if scripts.contains_key(key) { scripts.len() } else { scripts.len() + 1 };
+    entry_count <= RESP_SCRIPT_CACHE_MAX_ENTRIES
+        && total_bytes.saturating_sub(existing_bytes).saturating_add(script_bytes)
+            <= RESP_SCRIPT_CACHE_MAX_BYTES
+}
+
 #[derive(Debug, Default)]
 struct Multi {
     queue: Vec<RespCommand>,
@@ -5931,4 +5961,53 @@ fn slice_list(list: &[String], start: i64, stop: i64) -> Vec<Option<Vec<u8>>> {
         return Vec::new();
     }
     list[from as usize..=to as usize].iter().map(|v| Some(v.as_bytes().to_vec())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_cache_is_scoped_and_bounded() {
+        let alpha = RespGateway::new(String::from("alpha"), String::from("d"));
+        let mut beta = alpha.clone();
+        beta.tenant = String::from("beta");
+        let script = b"return 1".to_vec();
+        let sha = script_sha1(&script);
+
+        assert!(alpha.script_command(&[b"LOAD".to_vec(), script]).starts_with(b"$40\r\n"));
+        assert_eq!(
+            beta.script_command(&[b"EXISTS".to_vec(), sha.as_bytes().to_vec()]),
+            b"*1\r\n:0\r\n"
+        );
+        assert_eq!(
+            alpha.script_command(&[b"EXISTS".to_vec(), sha.as_bytes().to_vec()]),
+            b"*1\r\n:1\r\n"
+        );
+        assert_eq!(beta.script_command(&[b"FLUSH".to_vec()]), b"+OK\r\n");
+        assert_eq!(alpha.script_command(&[b"EXISTS".to_vec(), sha.into_bytes()]), b"*1\r\n:1\r\n");
+
+        for index in 0..RESP_SCRIPT_CACHE_MAX_ENTRIES.saturating_sub(1) {
+            let script = format!("return {}", index + 10_000).into_bytes();
+            assert!(alpha.script_command(&[b"LOAD".to_vec(), script]).starts_with(b"$"));
+        }
+        assert_eq!(
+            alpha.script_command(&[b"LOAD".to_vec(), b"return overflow".to_vec()]),
+            b"-ERR script cache limit\r\n"
+        );
+    }
+
+    #[test]
+    fn script_cache_rejects_excess_bytes() {
+        let mut scripts = std::collections::HashMap::new();
+        scripts.insert(
+            (String::from("alpha"), String::from("sha")),
+            vec![0; RESP_SCRIPT_CACHE_MAX_BYTES],
+        );
+        assert!(!script_cache_has_capacity(
+            &scripts,
+            &(String::from("alpha"), String::from("new")),
+            1
+        ));
+    }
 }
