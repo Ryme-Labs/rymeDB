@@ -71,8 +71,8 @@ enum Command {
     Realtime {
         #[arg(long, default_value = "127.0.0.1:3000")]
         addr: String,
-        #[arg(long, default_value = "ryme-dev-key")]
-        api_key: String,
+        #[arg(long)]
+        api_key: Option<String>,
         #[arg(long, default_value = "bench")]
         channel: String,
         #[arg(long, default_value_t = 1)]
@@ -164,7 +164,9 @@ async fn main() {
         }) => {
             realtime_bench(RealtimeBench {
                 addr,
-                api_key,
+                api_key: api_key
+                    .or_else(|| std::env::var("RYME_API_KEY").ok())
+                    .unwrap_or_default(),
                 channel,
                 channel_count,
                 connections,
@@ -221,6 +223,10 @@ struct RealtimePayloadSample {
 async fn realtime_bench(config: RealtimeBench) {
     if config.connections == 0 || config.messages == 0 || config.channel_count == 0 {
         eprintln!("connections, messages, and channel-count must be greater than zero");
+        return;
+    }
+    if config.api_key.is_empty() {
+        eprintln!("realtime benchmark requires --api-key or RYME_API_KEY");
         return;
     }
     let benchmark_start = Instant::now();
