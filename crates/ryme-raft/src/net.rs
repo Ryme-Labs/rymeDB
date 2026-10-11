@@ -22,6 +22,7 @@ const ELECTION_TIMEOUT_MIN_MS: u64 = 500;
 const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
 const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+const MAX_RAFT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
 type RangeTableRows = BTreeMap<(String, String, String), Vec<(Vec<u8>, Vec<TableVersion>)>>;
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
@@ -473,6 +474,23 @@ fn derived_range_id(start: &[u8], end: &[u8], epoch: u64) -> String {
     format!("range-{hash:016x}")
 }
 
+fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > MAX_RAFT_METADATA_BYTES as u64 {
+            return Err(RymeError::Overload(label.to_string()));
+        }
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() > MAX_RAFT_METADATA_BYTES {
+        return Err(RymeError::Overload(label.to_string()));
+    }
+    Ok(Some(bytes))
+}
+
 fn snapshot_live_value(row: &RangeSnapshotRow, snapshot_ts: u64) -> Option<Vec<u8>> {
     let mut value = None;
     for version in &row.versions {
@@ -821,6 +839,9 @@ impl Inner {
             joint: self.joint.clone(),
         };
         let raw = serde_json::to_vec(&meta).map_err(|e| RymeError::Internal(e.to_string()))?;
+        if raw.len() > MAX_RAFT_METADATA_BYTES {
+            return Err(RymeError::Overload(String::from("raft metadata")));
+        }
         let tmp = self.meta_path.with_extension("tmp");
         {
             use std::io::Write;
@@ -975,13 +996,12 @@ impl Node {
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(dir)?;
         let meta_path = dir.join("raft-meta.json");
-        let meta = match std::fs::read(&meta_path) {
-            Ok(raw) => serde_json::from_slice::<Meta>(&raw)
+        let meta = match read_bounded_metadata(&meta_path, "raft metadata")? {
+            Some(raw) => serde_json::from_slice::<Meta>(&raw)
                 .map_err(|error| RymeError::Corrupt(format!("raft metadata: {error}")))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            None => {
                 Meta { term: 0, voted_for: None, commit_index: 0, members: Vec::new(), joint: None }
             }
-            Err(e) => return Err(RymeError::from(e)),
         };
         let meta_fresh = meta.members.is_empty() && meta.joint.is_none();
         let mut members: Vec<Member> =
@@ -1077,11 +1097,10 @@ impl Node {
         }
         let range_meta_path = dir.join("range-meta.json");
         let mut range_groups: BTreeMap<String, RangeGroupState> =
-            match std::fs::read(&range_meta_path) {
-                Ok(raw) => serde_json::from_slice(&raw)
+            match read_bounded_metadata(&range_meta_path, "range metadata")? {
+                Some(raw) => serde_json::from_slice(&raw)
                     .map_err(|error| RymeError::Corrupt(format!("range metadata: {error}")))?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-                Err(error) => return Err(RymeError::from(error)),
+                None => BTreeMap::new(),
             };
         let manager = TxnManager::new();
         let mut log: Vec<LogEntry> = Vec::new();
@@ -3757,6 +3776,9 @@ impl Node {
             .clone();
         let raw = serde_json::to_vec(&states)
             .map_err(|error| RymeError::Internal(format!("range metadata: {error}")))?;
+        if raw.len() > MAX_RAFT_METADATA_BYTES {
+            return Err(RymeError::Overload(String::from("range metadata")));
+        }
         let temporary = self.range_meta_path.with_extension("json.tmp");
         {
             use std::io::Write;
@@ -6158,6 +6180,21 @@ mod tests {
             matches!(result, Err(RymeError::Corrupt(message)) if message.starts_with("raft metadata:"))
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_rejects_oversized_metadata_files() {
+        for (label, file) in [("raft", "raft-meta.json"), ("range", "range-meta.json")] {
+            let dir = temp_dir(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), vec![b'x'; MAX_RAFT_METADATA_BYTES + 1]).unwrap();
+
+            let result = Node::open(0, Vec::new(), Vec::new(), &dir);
+            assert!(
+                matches!(result, Err(RymeError::Overload(message)) if message == format!("{label} metadata"))
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
