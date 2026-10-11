@@ -10,6 +10,7 @@ on:
       - "apps/**"
       - "schemas/**"
       - "docs/**"
+      - "mkdocs.yml"
       - "sdks/**"
       - ".github/workflows/ci.yml"
       - ".github/workflows/pages.yml"
@@ -23,6 +24,7 @@ on:
       - "apps/**"
       - "schemas/**"
       - "docs/**"
+      - "mkdocs.yml"
       - "sdks/**"
       - ".github/workflows/ci.yml"
       - ".github/workflows/pages.yml"
@@ -89,14 +91,24 @@ jobs:
         run: python3 schemas/openapi/validate.py
 
       - name: Build Pages site
-        run: python3 docs/build-pages.py --out _site
+        run: mkdocs build --strict --site-dir _site
+
+      - name: Add OpenAPI artifacts and repository images
+        run: |
+          mkdir -p _site/openapi
+          cp schemas/openapi/rest.yaml _site/openapi/rest.yaml
+          cp -R images _site/images
+          python3 -c 'import json, pathlib, yaml; source=pathlib.Path("schemas/openapi/rest.yaml"); target=pathlib.Path("_site/openapi/rest.json"); target.write_text(json.dumps(yaml.safe_load(source.read_text()), indent=2) + "\n")'
 
       - name: Verify supported SDK surface
         run: |
           actual="$(find sdks -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)"
           test "$actual" = "java,js,rust"
-          test -f _site/sdks/java.html
-          test -f _site/sdks/js.html
-          test -f _site/sdks/rust.html
-          test "$(find _site/sdks -maxdepth 1 -type f -name '*.html' | wc -l)" -eq 3
-          test "$(find _site/sdks -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 0
+          test -f _site/index.html
+          test -f _site/api/index.html
+          test -f _site/openapi/rest.yaml
+          test -f _site/openapi/rest.json
+          test -f _site/sdk-java/index.html
+          test -f _site/sdk-js/index.html
+          test -f _site/sdk-rust/index.html
+          test ! -e _site/requirements-pages/index.html
