@@ -9836,6 +9836,39 @@ where
                 .scan_async(txn, &self.tenant, &self.database, table, limit)
                 .await;
         }
+        if txn.writes().is_empty() && !filter.is_empty() {
+            const PAGE: usize = 1024;
+            let mut matched = Vec::new();
+            let mut after = None;
+            loop {
+                let page = match after.as_deref() {
+                    Some(after) => self
+                        .manager
+                        .scan_after_async(txn, &self.tenant, &self.database, table, after, PAGE)
+                        .await?,
+                    None => {
+                        self.manager
+                            .scan_async(txn, &self.tenant, &self.database, table, PAGE)
+                            .await?
+                    }
+                };
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                let last = page.last().map(|(pk, _)| pk.clone());
+                matched.extend(page.into_iter().filter(|(pk, value)| {
+                    self.rls_allows(table, value)
+                        && filter.iter().all(|predicate| predicate.matches(pk, value))
+                }));
+                if matched.len() >= limit || page_len < PAGE {
+                    break;
+                }
+                after = last;
+            }
+            matched.truncate(limit);
+            return Ok(matched);
+        }
         const PAGE: usize = 1024;
         let mut base = BTreeMap::new();
         let mut after = None;
