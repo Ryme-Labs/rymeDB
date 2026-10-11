@@ -21,7 +21,17 @@ reproduction or a temporary test key.
 ## Deployment baseline
 
 - Use a non-root container or service account; the published image runs as
-  `rymedb-cli` and stores data under `/var/lib/rymedb`.
+  `ryme` and stores data under `/var/lib/rymedb`.
+- Verify the keyless Sigstore signature before deploying a GHCR image:
+
+  ```bash
+  cosign verify \
+    --certificate-identity-regexp '^https://github.com/Ryme-Labs/rymeDB/.github/workflows/docker.yml@refs/(heads/main|tags/v.*)$' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    ghcr.io/ryme-labs/rymedb:latest
+  ```
+
+  Pin deployments to the verified image digest after verification.
 - Keep API, JWT, password, KMS, and archive credentials in a secret manager.
 - Bind to loopback or a private interface until TLS and authentication are
   configured.

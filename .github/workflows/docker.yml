@@ -41,6 +41,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -80,6 +81,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/Ryme-labs/rymedb
 
       - name: Build and push ryme-server
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -96,3 +98,13 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign published image
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$REGISTRY/$IMAGE_NAME@$DIGEST"
