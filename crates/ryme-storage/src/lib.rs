@@ -91,9 +91,7 @@ impl Engine {
     pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Option<(u64, Option<Vec<u8>>, u64)> {
         self.inner.get(key).and_then(|versions| {
             versions
-                .iter()
-                .take_while(|version| version.commit_ts <= read_ts)
-                .last()
+                .get(Self::version_index_at(versions, read_ts)?)
                 .map(|version| (version.commit_ts, version.value.clone(), version.expires_at))
         })
     }
@@ -136,22 +134,18 @@ impl Engine {
         version.value.clone()
     }
 
+    fn version_index_at(versions: &[Version], read_ts: u64) -> Option<usize> {
+        versions.partition_point(|version| version.commit_ts <= read_ts).checked_sub(1)
+    }
+
     pub fn read(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
         let Some(versions) = self.inner.get(key) else {
             return Ok(None);
         };
-        let mut found: Option<Vec<u8>> = None;
-        for version in versions {
-            if version.commit_ts > read_ts {
-                break;
-            }
-            if version.value.is_none() {
-                found = None;
-            } else {
-                found = Self::visible(version, now);
-            }
-        }
-        Ok(found)
+        Ok(Self::version_index_at(versions, read_ts)
+            .and_then(|index| versions.get(index))
+            .filter(|version| version.value.is_some())
+            .and_then(|version| Self::visible(version, now)))
     }
 
     pub fn scan(
@@ -203,18 +197,11 @@ impl Engine {
             if key.tenant != tenant || key.database != database || key.table != table {
                 break;
             }
-            let mut current: Option<Vec<u8>> = None;
-            for version in versions {
-                if version.commit_ts > read_ts {
-                    break;
-                }
-                if version.value.is_none() {
-                    current = None;
-                } else {
-                    current = Self::visible(version, now);
-                }
-            }
-            if let Some(value) = current {
+            if let Some(value) = Self::version_index_at(versions, read_ts)
+                .and_then(|index| versions.get(index))
+                .filter(|version| version.value.is_some())
+                .and_then(|version| Self::visible(version, now))
+            {
                 out.push((key.pk.clone(), value));
                 if out.len() >= limit {
                     break;
@@ -374,18 +361,10 @@ impl Engine {
 
     pub fn expires_at(&self, key: &RecordKey, read_ts: u64) -> Option<u64> {
         let versions = self.inner.get(key)?;
-        let mut found: Option<u64> = None;
-        for version in versions {
-            if version.commit_ts > read_ts {
-                break;
-            }
-            if version.value.is_none() {
-                found = None;
-            } else {
-                found = Some(version.expires_at);
-            }
-        }
-        found
+        Self::version_index_at(versions, read_ts)
+            .and_then(|index| versions.get(index))
+            .filter(|version| version.value.is_some())
+            .map(|version| version.expires_at)
     }
 
     pub fn exact(&self, key: &RecordKey, commit_ts: u64) -> Option<(Option<Vec<u8>>, u64)> {
@@ -412,19 +391,17 @@ impl Engine {
         now: u64,
         limit: usize,
     ) -> Vec<Vec<u8>> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let start = RecordKey::new(tenant, database, table, &[]);
         let mut out = Vec::new();
-        for (key, versions) in &self.inner {
+        for (key, versions) in self.inner.range((Bound::Included(&start), Bound::Unbounded)) {
             if key.tenant != tenant || key.database != database || key.table != table {
-                continue;
+                break;
             }
-            let mut current: Option<&Version> = None;
-            for version in versions {
-                if version.commit_ts > read_ts {
-                    break;
-                }
-                current = Some(version);
-            }
-            if let Some(version) = current {
+            if let Some(index) = Self::version_index_at(versions, read_ts) {
+                let version = &versions[index];
                 if version.value.is_some() && version.expires_at != 0 && version.expires_at <= now {
                     out.push(key.pk.clone());
                     if out.len() >= limit {
@@ -447,18 +424,11 @@ impl Engine {
         let mut out = Vec::new();
         let iter = self.inner.range((Bound::Included(start), Bound::Excluded(end)));
         for (key, versions) in iter {
-            let mut current: Option<Vec<u8>> = None;
-            for version in versions {
-                if version.commit_ts > read_ts {
-                    break;
-                }
-                if version.value.is_none() {
-                    current = None;
-                } else {
-                    current = Self::visible(version, now);
-                }
-            }
-            if let Some(value) = current {
+            if let Some(value) = Self::version_index_at(versions, read_ts)
+                .and_then(|index| versions.get(index))
+                .filter(|version| version.value.is_some())
+                .and_then(|version| Self::visible(version, now))
+            {
                 out.push((key.clone(), value));
                 if out.len() >= limit {
                     break;
@@ -699,6 +669,24 @@ mod tests {
         engine.apply(key.clone(), 30, None).unwrap();
         assert_eq!(engine.read(&key, 30, 1000).unwrap(), None);
         assert_eq!(engine.read(&key, 25, 1000).unwrap(), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn version_lookup_uses_latest_version_not_after_snapshot() {
+        let mut engine = Engine::new();
+        let key = RecordKey::new("t", "d", "history", b"row");
+        for commit_ts in 1..=1_000 {
+            engine.apply(key.clone(), commit_ts, Some(commit_ts.to_be_bytes().to_vec())).unwrap();
+        }
+
+        assert_eq!(engine.read(&key, 0, 0).unwrap(), None);
+        assert_eq!(engine.read(&key, 1, 0).unwrap(), Some(1u64.to_be_bytes().to_vec()));
+        assert_eq!(engine.read(&key, 512, 0).unwrap(), Some(512u64.to_be_bytes().to_vec()));
+        assert_eq!(engine.read(&key, 999, 0).unwrap(), Some(999u64.to_be_bytes().to_vec()));
+        assert_eq!(
+            engine.version_at(&key, 512),
+            Some((512, Some(512u64.to_be_bytes().to_vec()), 0))
+        );
     }
 
     #[test]
