@@ -9,7 +9,12 @@ on:
       - "crates/**"
       - "apps/**"
       - "schemas/**"
+      - "docs/**"
+      - "sdks/**"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/pages.yml"
+      - ".github/workflows/sdk-release.yml"
+      - ".github/workflows/sdk-tag-release.yml"
   pull_request:
     paths:
       - "Cargo.toml"
@@ -17,7 +22,12 @@ on:
       - "crates/**"
       - "apps/**"
       - "schemas/**"
+      - "docs/**"
+      - "sdks/**"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/pages.yml"
+      - ".github/workflows/sdk-release.yml"
+      - ".github/workflows/sdk-tag-release.yml"
   workflow_dispatch:
 
 permissions:
@@ -59,3 +69,34 @@ jobs:
 
       - name: Compile the server
         run: cargo check --locked -p ryme-server
+
+  platform:
+    name: Validate API docs, Pages, and SDK surface
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install page builder dependencies
+        run: python -m pip install --disable-pip-version-check -r docs/requirements-pages.txt
+
+      - name: Validate OpenAPI
+        run: python3 schemas/openapi/validate.py
+
+      - name: Build Pages site
+        run: python3 docs/build-pages.py --out _site
+
+      - name: Verify supported SDK surface
+        run: |
+          actual="$(find sdks -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)"
+          test "$actual" = "java,js,rust"
+          test -f _site/sdks/java.html
+          test -f _site/sdks/js.html
+          test -f _site/sdks/rust.html
+          test "$(find _site/sdks -maxdepth 1 -type f -name '*.html' | wc -l)" -eq 3
+          test "$(find _site/sdks -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 0
