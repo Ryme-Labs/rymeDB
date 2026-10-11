@@ -9806,6 +9806,25 @@ where
             let _ = self.manager.scan_async(txn, &self.tenant, &self.database, table, 0).await?;
             return Ok(Vec::new());
         }
+        if txn.writes().is_empty() {
+            if let Some(candidates) = self.indexed_candidates(table, filter) {
+                let mut rows = Vec::with_capacity(candidates.len());
+                for pk in candidates {
+                    let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
+                    if let Some(value) = self.manager.get_async(txn, &key).await? {
+                        rows.push((pk, value));
+                    }
+                }
+                return Ok(self
+                    .filter_rls_rows(table, rows)
+                    .into_iter()
+                    .filter(|(pk, value)| {
+                        filter.iter().all(|predicate| predicate.matches(pk, value))
+                    })
+                    .take(limit)
+                    .collect());
+            }
+        }
         const PAGE: usize = 1024;
         let mut base = BTreeMap::new();
         let mut after = None;
@@ -17436,6 +17455,52 @@ mod tests {
             .execute(parse("INSERT INTO messages KEY '4' VALUE 'three'").unwrap())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn async_index_scan_applies_remaining_predicates_before_update() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE messages (id TEXT PRIMARY KEY, room TEXT, state TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse(
+                "INSERT INTO messages (id, room, state) VALUES ('1', 'lobby', 'unread'), ('2', 'lobby', 'read'), ('3', 'game', 'unread')",
+            ).unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX messages_room_idx ON messages (room)").unwrap())
+            .await
+            .unwrap();
+
+        executor
+            .execute(
+                parse(
+                    "UPDATE messages SET state = 'done' WHERE room = 'lobby' AND state = 'unread'",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(parse("SELECT id, state FROM messages ORDER BY id").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { ref rows, .. }
+                if rows == &vec![
+                    vec![b"1".to_vec(), b"done".to_vec()],
+                    vec![b"2".to_vec(), b"read".to_vec()],
+                    vec![b"3".to_vec(), b"unread".to_vec()],
+                ]
+        ));
     }
 
     #[tokio::test]
