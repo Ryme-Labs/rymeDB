@@ -191,13 +191,17 @@ impl Engine {
         start_after: Option<&[u8]>,
         limit: usize,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let start = RecordKey::new(tenant, database, table, start_after.unwrap_or_default());
+        let start_bound =
+            if start_after.is_some() { Bound::Excluded(&start) } else { Bound::Included(&start) };
         let mut out = Vec::new();
-        for (key, versions) in &self.inner {
+        for (key, versions) in self.inner.range((start_bound, Bound::Unbounded)) {
             if key.tenant != tenant || key.database != database || key.table != table {
-                continue;
-            }
-            if start_after.is_some_and(|after| key.pk.as_slice() <= after) {
-                continue;
+                break;
             }
             let mut current: Option<Vec<u8>> = None;
             for version in versions {
@@ -709,6 +713,37 @@ mod tests {
         assert_eq!(engine.read(&key, 20, 500).unwrap(), Some(b"b".to_vec()));
         assert_eq!(engine.scan("t", "d", "s", 20, 500, 10).len(), 1);
         assert_eq!(engine.scan("t", "d", "s", 10, 500, 10).len(), 0);
+    }
+
+    #[test]
+    fn table_scans_seek_to_scope_and_resume_exclusively() {
+        let mut engine = Engine::new();
+        for index in 0..128u16 {
+            let pk = index.to_be_bytes();
+            engine.apply(RecordKey::new("a", "d", "before", &pk), 1, Some(pk.to_vec())).unwrap();
+            engine.apply(RecordKey::new("a", "d", "messages", &pk), 1, Some(pk.to_vec())).unwrap();
+            engine.apply(RecordKey::new("a", "d", "users", &pk), 1, Some(pk.to_vec())).unwrap();
+        }
+
+        let first_page = engine.scan("a", "d", "messages", 1, 0, 3);
+        assert_eq!(
+            first_page.iter().map(|(pk, _)| pk.clone()).collect::<Vec<_>>(),
+            vec![
+                0u16.to_be_bytes().to_vec(),
+                1u16.to_be_bytes().to_vec(),
+                2u16.to_be_bytes().to_vec(),
+            ]
+        );
+        let next_page = engine.scan_after("a", "d", "messages", 1, 0, &first_page[2].0, 3);
+        assert_eq!(
+            next_page.iter().map(|(pk, _)| pk.clone()).collect::<Vec<_>>(),
+            vec![
+                3u16.to_be_bytes().to_vec(),
+                4u16.to_be_bytes().to_vec(),
+                5u16.to_be_bytes().to_vec(),
+            ]
+        );
+        assert!(engine.scan("a", "d", "messages", 1, 0, 0).is_empty());
     }
 
     #[test]
