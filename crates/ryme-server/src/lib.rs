@@ -522,6 +522,7 @@ pub struct SharedState {
     qos: Arc<Mutex<QosRegistry>>,
     dek_ring: Arc<Mutex<KeyRing>>,
     indexes: Arc<Mutex<PartitionedIndex>>,
+    http_max_body_bytes: u64,
     credentials: Arc<Mutex<CredentialStore>>,
     refresh_tokens: RefreshTokenStore,
     passkeys: Arc<Mutex<PasskeyRegistry>>,
@@ -1429,6 +1430,7 @@ impl SharedState {
             qos: Arc::new(Mutex::new(QosRegistry::new())),
             dek_ring,
             indexes: Arc::new(Mutex::new(PartitionedIndex::new(config.index_partitions))),
+            http_max_body_bytes: config.http_max_body_bytes,
             credentials: Arc::new(Mutex::new(CredentialStore::from_snapshot(auth_snapshot.users))),
             refresh_tokens: RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens),
             passkeys: Arc::new(Mutex::new(PasskeyRegistry::from_snapshot(auth_snapshot.passkeys))),
@@ -1641,6 +1643,7 @@ impl SharedState {
 }
 
 pub fn router(state: SharedState) -> axum::Router {
+    let body_limit = usize::try_from(state.http_max_body_bytes).unwrap_or(usize::MAX);
     axum::Router::new()
         .route("/health", get(health))
         .route("/dashboard", get(dashboard))
@@ -1735,7 +1738,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/regions", get(regions))
         .route("/v1/stream", get(stream))
         .route("/v1/query-stream", get(query_stream))
-        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_guard))
         .layer(axum::middleware::from_fn(cors_headers))
         .with_state(state)

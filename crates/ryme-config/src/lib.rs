@@ -42,6 +42,8 @@ pub struct Config {
     pub storage_mode: StorageMode,
     pub cache_bytes: u64,
     pub max_connections: u32,
+    #[serde(default = "default_http_max_body_bytes")]
+    pub http_max_body_bytes: u64,
     #[serde(default)]
     pub archive: ArchiveConfig,
     #[serde(default)]
@@ -80,6 +82,14 @@ fn default_autosplit_interval() -> u64 {
 
 fn default_region() -> String {
     String::from("local-1")
+}
+
+const fn default_http_max_body_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+
+const fn max_http_body_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_otel_service() -> String {
@@ -237,6 +247,7 @@ impl Default for Config {
             storage_mode: StorageMode::Hot,
             cache_bytes: 64 * 1024 * 1024,
             max_connections: 10000,
+            http_max_body_bytes: default_http_max_body_bytes(),
             archive: ArchiveConfig::default(),
             archive_replica: None,
             cluster: ClusterConfig::default(),
@@ -266,6 +277,9 @@ impl Config {
         }
         if self.max_connections == 0 {
             return Err(RymeError::InvalidArgument(String::from("max_connections")));
+        }
+        if self.http_max_body_bytes == 0 || self.http_max_body_bytes > max_http_body_bytes() {
+            return Err(RymeError::InvalidArgument(String::from("http_max_body_bytes")));
         }
         if self.shards == 0 || self.shards > 256 {
             return Err(RymeError::InvalidArgument(String::from("shards")));
@@ -329,6 +343,7 @@ mod tests {
         assert!(config.otel.endpoint.is_none());
         assert_eq!(config.otel.service, "rymedb");
         assert_eq!(config.otel.interval_secs, 30);
+        assert_eq!(config.http_max_body_bytes, 2 * 1024 * 1024);
     }
 
     #[test]
@@ -356,6 +371,19 @@ mod tests {
         for (partitions, valid) in [(0, false), (65, false), (8, true), (64, true)] {
             let config = Config { index_partitions: partitions, ..Config::default() };
             assert_eq!(config.validate().is_ok(), valid, "{partitions}");
+        }
+    }
+
+    #[test]
+    fn http_body_limit_is_bounded() {
+        for (limit, valid) in [
+            (0, false),
+            (2 * 1024 * 1024, true),
+            (64 * 1024 * 1024, true),
+            (64 * 1024 * 1024 + 1, false),
+        ] {
+            let config = Config { http_max_body_bytes: limit, ..Config::default() };
+            assert_eq!(config.validate().is_ok(), valid, "{limit}");
         }
     }
 

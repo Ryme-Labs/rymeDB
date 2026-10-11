@@ -1,5 +1,7 @@
 # Changelog
 
+- HTTP and HTTPS request-body limits are now configurable through
+  `http_max_body_bytes`, with validation from 1 byte through 64 MiB.
 - JWT auth now accepts case-insensitive roles, Supabase-style scalar `role`
   claims, `app_metadata.roles`, and `tenant_id` tenant claims.
 - Hybrid PITR now restores the replicated tier through Raft and the current

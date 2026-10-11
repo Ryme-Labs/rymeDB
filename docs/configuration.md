@@ -29,7 +29,7 @@ runs on every boot.
 | `storage_mode` | enum | `"hot"` | `hot` keeps the working set materialized in memory; `standard` starts from immutable NVMe segments, uses the bounded segment cache for point reads, and evicts committed rows from the resident engine after durable publication. |
 | `cache_bytes` | u64 | `67108864` (64 MiB) | Bounds the decoded immutable-segment read cache. Must be >= 1 MiB. Raise to 256 MiB–2 GiB on performance nodes. |
 | `max_connections` | u32 | `10000` | Must be non-zero. Excess PG/RESP connections get `53300` / `-ERR overloaded`; excess HTTP/HTTPS TCP connections are closed immediately; gRPC per-connection concurrency is capped at the same value. |
-| `http_max_body_bytes` | const | `2097152` (2 MiB) | Explicit `DefaultBodyLimit` on the HTTP router; oversize JSON bodies get `413`. Not yet operator-tunable in v1. |
+| `http_max_body_bytes` | u64 | `2097152` (2 MiB) | Explicit `DefaultBodyLimit` on HTTP and HTTPS routers; oversize JSON bodies get `413`. Must be between 1 byte and 64 MiB. |
 | `archive` | object | `{}` | See below. |
 | `archive_replica` | object / null | null | Second archive target (same shape as `archive`) for cross-region copies via `POST /v1/backups/copy`. |
 | `cluster` | object | `{}` | See below. Unset `raft_listen` means single-node. |
