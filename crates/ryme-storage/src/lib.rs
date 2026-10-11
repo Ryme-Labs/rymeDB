@@ -29,6 +29,7 @@ pub type TableRows = Vec<(Vec<u8>, Vec<TableVersion>)>;
 pub const LEGACY_ROUTING_VERSION: u8 = 0;
 pub const SCOPED_ROUTING_VERSION: u8 = 1;
 pub const CURRENT_ROUTING_VERSION: u8 = SCOPED_ROUTING_VERSION;
+pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
 pub fn validate_routing_version(version: u8) -> Result<()> {
     match version {
@@ -627,12 +628,18 @@ impl Engine {
                 out.extend_from_slice(&version.expires_at.to_be_bytes());
             }
         }
+        if out.len() > MAX_SNAPSHOT_BYTES.saturating_sub(4) {
+            return Err(RymeError::Overload(String::from("snapshot")));
+        }
         let crc = crc32fast::hash(&out);
         out.extend_from_slice(&crc.to_be_bytes());
         Ok(out)
     }
 
     pub fn decode_snapshot(input: &[u8]) -> Result<Self> {
+        if input.len() > MAX_SNAPSHOT_BYTES {
+            return Err(RymeError::Overload(String::from("snapshot")));
+        }
         if input.len() < 24 {
             return Err(RymeError::Corrupt(String::from("snapshot header")));
         }

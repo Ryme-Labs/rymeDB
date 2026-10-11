@@ -81,6 +81,9 @@ fn publish_snapshot_pointer(dir: &Path, name: &str) -> Result<()> {
 }
 
 fn write_snapshot_file(dir: &Path, commit_ts: u64, raw: &[u8]) -> Result<std::path::PathBuf> {
+    if raw.len() > ryme_storage::MAX_SNAPSHOT_BYTES {
+        return Err(RymeError::Overload(String::from("snapshot")));
+    }
     let name = snapshot_file_name(commit_ts);
     let path = dir.join(&name);
     let temporary = dir.join(format!(".{name}.tmp"));
@@ -93,6 +96,22 @@ fn write_snapshot_file(dir: &Path, commit_ts: u64, raw: &[u8]) -> Result<std::pa
     std::fs::rename(temporary, &path)?;
     sync_directory(dir)?;
     Ok(path)
+}
+
+fn read_snapshot_file(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > ryme_storage::MAX_SNAPSHOT_BYTES as u64 {
+        return Err(RymeError::Overload(String::from("snapshot")));
+    }
+    let mut raw = Vec::with_capacity(length as usize);
+    file.take(ryme_storage::MAX_SNAPSHOT_BYTES as u64 + 1).read_to_end(&mut raw)?;
+    if raw.len() > ryme_storage::MAX_SNAPSHOT_BYTES {
+        return Err(RymeError::Overload(String::from("snapshot")));
+    }
+    Ok(raw)
 }
 
 #[derive(Debug, Default)]
@@ -2306,7 +2325,7 @@ impl DurableManager {
         if !path.is_file() {
             return Err(RymeError::Corrupt(String::from("snapshot pointer")));
         }
-        let raw = std::fs::read(&path)?;
+        let raw = read_snapshot_file(&path)?;
         Ok(Some(self.inner.restore_snapshot(&raw)?))
     }
 
@@ -2454,7 +2473,7 @@ impl DurableManager {
         let path = self
             .newest_snapshot_at_or_below(target)?
             .ok_or_else(|| RymeError::NotFound(String::from("snapshot")))?;
-        let raw = std::fs::read(&path)?;
+        let raw = read_snapshot_file(&path)?;
         let snapshot = Engine::decode_snapshot(&raw)?;
         let base = snapshot.max_commit_ts();
         let records = Wal::read_all(&self.dir)?;
@@ -3529,6 +3548,28 @@ mod tests {
         assert!(matches!(
             DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always),
             Err(RymeError::Corrupt(message)) if message == "snapshot pointer"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_snapshot_file_is_rejected_before_reading() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-oversized-snapshot-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let snapshots = dir.join("snapshots");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&snapshots).unwrap();
+        let name = "snap-00000000000000000001.rsnap";
+        let file = std::fs::File::create(snapshots.join(name)).unwrap();
+        file.set_len(ryme_storage::MAX_SNAPSHOT_BYTES as u64 + 1).unwrap();
+        std::fs::write(snapshots.join("latest"), name).unwrap();
+
+        assert!(matches!(
+            DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always),
+            Err(RymeError::Overload(message)) if message == "snapshot"
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
