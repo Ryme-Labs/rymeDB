@@ -760,7 +760,14 @@ struct AuthSnapshot {
     passkeys: HashMap<String, ryme_auth::PasskeyCredential>,
 }
 
+const AUTH_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > AUTH_SNAPSHOT_MAX_BYTES as u64 {
+            return Err(ryme_error::RymeError::Overload(String::from("auth snapshot")));
+        }
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -768,6 +775,9 @@ fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot
         }
         Err(error) => return Err(error.into()),
     };
+    if bytes.len() > AUTH_SNAPSHOT_MAX_BYTES {
+        return Err(ryme_error::RymeError::Overload(String::from("auth snapshot")));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1379,6 +1389,9 @@ impl SharedState {
         };
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|error| ryme_error::RymeError::Internal(format!("auth snapshot: {error}")))?;
+        if bytes.len() > AUTH_SNAPSHOT_MAX_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("auth snapshot")));
+        }
         if let Some(parent) = self.auth_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -12895,6 +12908,23 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn auth_snapshot_rejects_oversized_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-auth-snapshot-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((AUTH_SNAPSHOT_MAX_BYTES + 1) as u64).unwrap();
+
+        assert!(matches!(
+            load_auth_snapshot(&path),
+            Err(ryme_error::RymeError::Overload(message)) if message == "auth snapshot"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn supabase_realtime_subscription_limits_are_bounded() {
