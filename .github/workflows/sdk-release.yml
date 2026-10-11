@@ -306,10 +306,29 @@ jobs:
           packages=("sdks/rust/target/package/"*.crate)
           test "${#packages[@]}" -eq 1
           expected="$(sha256sum "${packages[0]}" | cut -d ' ' -f1)"
-          metadata="$(curl --retry 3 --retry-all-errors -fsSL \
+          metadata_file="$RUNNER_TEMP/crates-io-publish-$RELEASE_VERSION.json"
+          if ! crate_status="$(curl --retry 3 --retry-all-errors -sS \
             -H 'User-Agent: rymeDB (https://github.com/Ryme-Labs/rymeDB)' \
-            "https://crates.io/api/v1/crates/rymedb-client/$RELEASE_VERSION" 2>/dev/null || true)"
-          published="$(jq -r '.version.checksum // empty' <<< "$metadata")"
+            --output "$metadata_file" --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/rymedb-client/$RELEASE_VERSION")"; then
+            echo "Crates.io lookup failed for rymedb-client@$RELEASE_VERSION"
+            exit 1
+          fi
+          case "$crate_status" in
+            200)
+              published="$(jq -er '.version.checksum // empty' "$metadata_file")" || {
+                echo "Crates.io returned an invalid response while checking rymedb-client@$RELEASE_VERSION"
+                exit 1
+              }
+              ;;
+            404)
+              published=""
+              ;;
+            *)
+              echo "Crates.io returned HTTP $crate_status while checking rymedb-client@$RELEASE_VERSION"
+              exit 1
+              ;;
+          esac
           if [[ -n "$published" ]]; then
             if [[ "$published" != "$expected" ]]; then
               echo "rymedb-client@$RELEASE_VERSION already exists with different contents"
