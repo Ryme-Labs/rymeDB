@@ -4,7 +4,7 @@ use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::ops::Bound::Excluded;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -388,13 +388,12 @@ impl Transaction {
         table: &str,
         start_after: Option<&[u8]>,
     ) -> usize {
+        let start = RecordKey::new(tenant, database, table, start_after.unwrap_or_default());
+        let start_bound = start_after.map(|_| Excluded(&start)).unwrap_or(Included(&start));
         self.writes
-            .keys()
-            .filter(|key| {
-                key.tenant == tenant
-                    && key.database == database
-                    && key.table == table
-                    && start_after.is_none_or(|start| key.pk.as_slice() > start)
+            .range((start_bound, Unbounded))
+            .take_while(|(key, _)| {
+                key.tenant == tenant && key.database == database && key.table == table
             })
             .count()
     }
@@ -413,14 +412,11 @@ impl Transaction {
         }
         let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = rows.into_iter().collect();
         let now = now_unix();
-        for (key, op) in &self.writes {
-            if key.tenant != tenant
-                || key.database != database
-                || key.table != table
-                || start_after.is_some_and(|start| key.pk.as_slice() <= start)
-            {
-                continue;
-            }
+        let start = RecordKey::new(tenant, database, table, start_after.unwrap_or_default());
+        let start_bound = start_after.map(|_| Excluded(&start)).unwrap_or(Included(&start));
+        for (key, op) in self.writes.range((start_bound, Unbounded)).take_while(|(key, _)| {
+            key.tenant == tenant && key.database == database && key.table == table
+        }) {
             let visible = op.expires_at == 0 || op.expires_at > now;
             match (visible, op.value.as_ref()) {
                 (true, Some(value)) => {
@@ -2520,6 +2516,23 @@ mod tests {
         );
         let last = manager.scan_after(&mut txn, "t", "d", "items", b"4", 2).unwrap();
         assert_eq!(last, vec![(b"9".to_vec(), b"nine".to_vec())]);
+    }
+
+    #[test]
+    fn staged_scan_overlay_is_bounded_to_table_and_cursor() {
+        let manager = TxnManager::new();
+        let mut txn = manager.begin();
+        manager.put(&mut txn, RecordKey::new("t", "d", "items", b"a"), b"a".to_vec());
+        manager.put(&mut txn, RecordKey::new("t", "d", "items", b"b"), b"b".to_vec());
+        manager.put(&mut txn, RecordKey::new("t", "d", "other", b"z"), b"z".to_vec());
+        manager.put(&mut txn, RecordKey::new("other", "d", "items", b"z"), b"z".to_vec());
+
+        assert_eq!(txn.scan_overlay_count("t", "d", "items", None), 2);
+        assert_eq!(txn.scan_overlay_count("t", "d", "items", Some(b"a")), 1);
+        assert_eq!(
+            txn.overlay_scan(Vec::new(), "t", "d", "items", Some(b"a"), 10),
+            vec![(b"b".to_vec(), b"b".to_vec())]
+        );
     }
 
     #[test]
