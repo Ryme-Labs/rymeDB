@@ -711,6 +711,7 @@ pub struct SharedState {
     tenant: String,
     database: String,
     branch_path: std::path::PathBuf,
+    promotion_path: std::path::PathBuf,
     auth_path: std::path::PathBuf,
     control_path: std::path::PathBuf,
     durable_path: std::path::PathBuf,
@@ -764,6 +765,30 @@ struct ControlSnapshot {
 struct DurableSnapshot {
     #[serde(default)]
     topics: Vec<ryme_realtime::DurableTopicSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BranchPromotionPhase {
+    Prepared,
+    SchemaInstalled,
+    DataCommitted,
+    MetadataPersisted,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BranchPromotionJournal {
+    tenant: String,
+    branch: String,
+    base_commit_ts: u64,
+    previous_schema: ryme_sql::SchemaSnapshot,
+    child_schema: ryme_sql::SchemaSnapshot,
+    old_branches: ryme_branch::BranchManager,
+    new_branches: ryme_branch::BranchManager,
+    old_main_ledger: ryme_migrate::Ledger,
+    new_main_ledger: ryme_migrate::Ledger,
+    writes: Vec<(ryme_storage::RecordKey, ryme_txn::WriteOp)>,
+    phase: BranchPromotionPhase,
 }
 
 fn load_durable_snapshot(
@@ -1327,6 +1352,61 @@ impl SharedState {
         Ok(())
     }
 
+    fn persist_branch_promotion_journal(
+        &self,
+        journal: &BranchPromotionJournal,
+    ) -> ryme_error::Result<()> {
+        let bytes = serde_json::to_vec(journal).map_err(|error| {
+            ryme_error::RymeError::Internal(format!("branch promotion journal: {error}"))
+        })?;
+        if let Some(parent) = self.promotion_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self.promotion_path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(temporary, &self.promotion_path)?;
+        if let Some(parent) = self.promotion_path.parent() {
+            sync_metadata_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn load_branch_promotion_journal(
+        &self,
+    ) -> ryme_error::Result<Option<BranchPromotionJournal>> {
+        let bytes = match std::fs::read(&self.promotion_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let journal = serde_json::from_slice(&bytes).map_err(|error| {
+            ryme_error::RymeError::Corrupt(format!("branch promotion journal: {error}"))
+        })?;
+        Ok(Some(journal))
+    }
+
+    fn clear_branch_promotion_journal(&self) -> ryme_error::Result<()> {
+        match std::fs::remove_file(&self.promotion_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(parent) = self.promotion_path.parent() {
+            sync_metadata_directory(parent)?;
+        }
+        Ok(())
+    }
+
     fn persist_durable_topics(&self) -> ryme_error::Result<()> {
         let snapshot = DurableSnapshot { topics: self.realtime.durable_snapshot()? };
         let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
@@ -1795,10 +1875,185 @@ impl SharedState {
             tenant,
             database,
             branch_path,
+            promotion_path: config.data_dir.join("branch-promotion.json"),
             auth_path,
             control_path,
             durable_path,
         })
+    }
+
+    fn validate_branch_promotion_journal(
+        &self,
+        journal: &BranchPromotionJournal,
+    ) -> ryme_error::Result<()> {
+        if journal.tenant.is_empty() || journal.branch.is_empty() {
+            return Err(ryme_error::RymeError::Corrupt(String::from(
+                "branch promotion identity",
+            )));
+        }
+        let old_child = journal.old_branches.get_for(&journal.tenant, &journal.branch)?;
+        let new_main = journal.new_branches.get_for(&journal.tenant, "main")?;
+        if old_child.parent_id.as_deref() != Some("main")
+            || old_child.base_commit_ts != journal.base_commit_ts
+            || new_main.parent_id.is_some()
+        {
+            return Err(ryme_error::RymeError::Corrupt(String::from(
+                "branch promotion metadata",
+            )));
+        }
+        if journal.writes.iter().any(|(key, _)| {
+            key.tenant != journal.tenant || key.database != self.database
+        }) {
+            return Err(ryme_error::RymeError::Corrupt(String::from(
+                "branch promotion write scope",
+            )));
+        }
+        Ok(())
+    }
+
+    fn promotion_data_state(
+        &self,
+        journal: &BranchPromotionJournal,
+    ) -> ryme_error::Result<bool> {
+        let mut base_txn = self.backend.begin();
+        base_txn.restamp(journal.base_commit_ts);
+        let mut current_txn = self.backend.begin();
+        let mut applied = 0usize;
+        let mut pending = 0usize;
+        for (key, operation) in &journal.writes {
+            let base = self.backend.get(&mut base_txn, key)?;
+            let current = self.backend.get(&mut current_txn, key)?;
+            if current == operation.value {
+                applied += 1;
+            } else if base == current {
+                pending += 1;
+            } else {
+                return Err(ryme_error::RymeError::Conflict(format!(
+                    "branch promotion changed concurrently on {}/{}",
+                    key.table,
+                    String::from_utf8_lossy(&key.pk)
+                )));
+            }
+        }
+        if applied > 0 && pending > 0 {
+            return Err(ryme_error::RymeError::Corrupt(String::from(
+                "partial branch promotion data",
+            )));
+        }
+        Ok(pending == 0)
+    }
+
+    async fn commit_branch_promotion_data(
+        &self,
+        journal: &BranchPromotionJournal,
+        prepared: Option<ryme_txn::Transaction>,
+    ) -> ryme_error::Result<()> {
+        if let Some(transaction) = prepared {
+            return self.backend.commit(transaction).await.map(|_| ());
+        }
+        if self.promotion_data_state(journal)? {
+            return Ok(());
+        }
+        let mut transaction = self.backend.begin();
+        transaction.restamp(journal.base_commit_ts);
+        for (key, operation) in &journal.writes {
+            match &operation.value {
+                Some(value) => self.backend.put(&mut transaction, key.clone(), value.clone()),
+                None => self.backend.delete(&mut transaction, key.clone()),
+            }
+        }
+        self.backend.commit(transaction).await.map(|_| ())
+    }
+
+    fn apply_branch_promotion_metadata(
+        &self,
+        journal: &BranchPromotionJournal,
+    ) -> ryme_error::Result<()> {
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+        journal.new_branches.persist(&self.branch_path)?;
+        let old_branches = control.branches.clone();
+        let old_ledger = control.migration_ledger(&journal.tenant, "main");
+        control.branches = journal.new_branches.clone();
+        control.set_migration_ledger(&journal.tenant, "main", journal.new_main_ledger.clone());
+        if let Err(error) = self.persist_control_locked(&control) {
+            control.branches = old_branches;
+            control.set_migration_ledger(&journal.tenant, "main", old_ledger);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn rollback_branch_promotion(
+        &self,
+        journal: &BranchPromotionJournal,
+    ) -> ryme_error::Result<()> {
+        install_promoted_schema(self, &journal.previous_schema)?;
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+        journal.old_branches.persist(&self.branch_path)?;
+        control.branches = journal.old_branches.clone();
+        control.set_migration_ledger(&journal.tenant, "main", journal.old_main_ledger.clone());
+        self.persist_control_locked(&control)?;
+        self.clear_branch_promotion_journal()
+    }
+
+    async fn complete_branch_promotion(
+        &self,
+        mut journal: BranchPromotionJournal,
+        prepared: Option<ryme_txn::Transaction>,
+    ) -> ryme_error::Result<()> {
+        self.validate_branch_promotion_journal(&journal)?;
+        if matches!(journal.phase, BranchPromotionPhase::Prepared) {
+            install_promoted_schema(self, &journal.child_schema)?;
+            journal.phase = BranchPromotionPhase::SchemaInstalled;
+            self.persist_branch_promotion_journal(&journal)?;
+        }
+        if matches!(journal.phase, BranchPromotionPhase::SchemaInstalled) {
+            if let Err(error) = self
+                .commit_branch_promotion_data(&journal, prepared)
+                .await
+            {
+                match self.promotion_data_state(&journal) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.rollback_branch_promotion(&journal)?;
+                        return Err(error);
+                    }
+                    Err(state_error) => {
+                        return Err(ryme_error::RymeError::Internal(format!(
+                            "branch promotion data recovery: {error}; {state_error}"
+                        )));
+                    }
+                }
+            }
+            journal.phase = BranchPromotionPhase::DataCommitted;
+            self.persist_branch_promotion_journal(&journal)?;
+        }
+        if matches!(journal.phase, BranchPromotionPhase::DataCommitted) {
+            self.apply_branch_promotion_metadata(&journal)?;
+            journal.phase = BranchPromotionPhase::MetadataPersisted;
+            self.persist_branch_promotion_journal(&journal)?;
+        }
+        self.clear_branch_promotion_journal()
+    }
+
+    async fn recover_branch_promotion(&self) -> ryme_error::Result<()> {
+        let Some(journal) = self.load_branch_promotion_journal()? else {
+            return Ok(());
+        };
+        match self.complete_branch_promotion(journal, None).await {
+            Ok(()) => Ok(()),
+            Err(error) if self.load_branch_promotion_journal()?.is_none() => {
+                tracing::error!("aborted incomplete branch promotion during recovery: {error}");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn apply_mesh_tls(
@@ -2202,6 +2457,7 @@ pub async fn serve(
     http_listener: TcpListener,
 ) -> ryme_error::Result<()> {
     let state = SharedState::build(&config)?;
+    state.recover_branch_promotion().await?;
     serve_state(
         state,
         config.archive.interval_secs,
@@ -2244,6 +2500,7 @@ pub async fn serve_with_optional(
     extra: OptionalListeners,
 ) -> ryme_error::Result<()> {
     let state = SharedState::build(&config)?;
+    state.recover_branch_promotion().await?;
     serve_state(
         state,
         config.archive.interval_secs,
@@ -2281,6 +2538,7 @@ pub async fn serve_cluster(
     raft_listener: TcpListener,
 ) -> ryme_error::Result<ClusterHandle> {
     let state = SharedState::build(&config)?;
+    state.recover_branch_promotion().await?;
     let node = match state.backend.clone() {
         Backend::Cluster(backend) => backend.node().clone(),
         Backend::Hybrid(hybrid) => hybrid.raft().node().clone(),
@@ -8448,11 +8706,7 @@ async fn branch_promote(
         Ok(prepared) => prepared,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = install_promoted_schema(&state, &child_schema) {
-        return error_response(e);
-    }
-
-    let (old_branches, new_branches, old_main_ledger) = {
+    let (old_branches, new_branches, old_main_ledger, new_main_ledger) = {
         let mut control = match state.control.lock() {
             Ok(guard) => guard,
             Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
@@ -8460,48 +8714,45 @@ async fn branch_promote(
         let old_branches = control.branches.clone();
         let mut new_branches = old_branches.clone();
         if let Err(error) = new_branches.promote_for(&principal.tenant, &id) {
-            let _ = install_promoted_schema(&state, &previous_schema);
-            return error_response(error);
-        }
-        if let Err(error) = new_branches.persist(&state.branch_path) {
-            let _ = install_promoted_schema(&state, &previous_schema);
             return error_response(error);
         }
         let old_main_ledger = control.migration_ledger(&principal.tenant, "main");
-        control.clone_migration_scope(&principal.tenant, &id, "main");
-        if let Err(error) = state.persist_control_locked(&control) {
-            control.set_migration_ledger(&principal.tenant, "main", old_main_ledger.clone());
-            let _ = old_branches.persist(&state.branch_path);
-            let _ = install_promoted_schema(&state, &previous_schema);
-            return error_response(error);
-        }
-        (old_branches, new_branches, old_main_ledger)
+        let new_main_ledger = control.migration_ledger(&principal.tenant, &id);
+        (old_branches, new_branches, old_main_ledger, new_main_ledger)
     };
 
-    if let Err(error) = state.backend.commit(write_txn).await {
-        let schema_rollback = install_promoted_schema(&state, &previous_schema).err();
-        let branch_rollback = old_branches.persist(&state.branch_path).err();
-        let control_rollback = match state.control.lock() {
-            Ok(mut control) => {
-                control.set_migration_ledger(&principal.tenant, "main", old_main_ledger);
-                state.persist_control_locked(&control)
-            }
-            Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
-        };
-        if schema_rollback.is_some() || branch_rollback.is_some() || control_rollback.is_err() {
-            return error_response(ryme_error::RymeError::Internal(format!(
-                "branch promotion failed: {error}; rollback incomplete"
-            )));
-        }
+    let journal = BranchPromotionJournal {
+        tenant: principal.tenant.clone(),
+        branch: id,
+        base_commit_ts: child.base_commit_ts,
+        previous_schema,
+        child_schema,
+        old_branches,
+        new_branches,
+        old_main_ledger,
+        new_main_ledger,
+        writes: write_txn
+            .writes()
+            .iter()
+            .map(|(key, operation)| (key.clone(), operation.clone()))
+            .collect(),
+        phase: BranchPromotionPhase::Prepared,
+    };
+    if let Err(error) = state.persist_branch_promotion_journal(&journal) {
+        return error_response(error);
+    }
+    if let Err(error) = state.complete_branch_promotion(journal, Some(write_txn)).await {
         return error_response(error);
     }
 
-    let mut control = match state.control.lock() {
+    let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
-    control.branches = new_branches;
-    let promoted = control.branches.get_for(&principal.tenant, "main").unwrap_or(child);
+    let promoted = control
+        .branches
+        .get_for(&principal.tenant, "main")
+        .unwrap_or(child);
     (StatusCode::OK, Json(promoted)).into_response()
 }
 
@@ -11876,6 +12127,7 @@ fn archive_metadata_files(
     for name in [
         "schema.json",
         "branches.json",
+        "branch-promotion.json",
         "control.json",
         "topics.json",
         "auth.json",
@@ -12811,6 +13063,120 @@ mod realtime_policy_tests {
         assert!(state.executor.catalog_tables().contains(&String::from("branch_only")));
         let persisted = load_schema_snapshot(&dir.join("schema.json")).unwrap();
         assert!(persisted.tables.contains_key("branch_only"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn branch_promotion_journal_finishes_after_data_commit_on_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-branch-promotion-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("branch-promotion-journal");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .executor
+            .execute(ryme_sql::parse("INSERT INTO messages KEY 'm1' VALUE 'main'").unwrap())
+            .await
+            .unwrap();
+
+        {
+            let mut control = state.control.lock().unwrap();
+            let mut branches = control.branches.clone();
+            branches
+                .create_child_for(
+                    "default",
+                    String::from("preview"),
+                    "main",
+                    state.backend.latest_commit(),
+                )
+                .unwrap();
+            branches.persist(&state.branch_path).unwrap();
+            control.branches = branches;
+        }
+        ryme_sql::persist_schema_snapshot(
+            &state.branch_schema_path("default", "preview"),
+            &state.executor.schema_snapshot(),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ryme-branch", axum::http::HeaderValue::from_static("preview"));
+        branch_executor(&state, &headers, "default")
+            .unwrap()
+            .execute(ryme_sql::parse("UPSERT INTO messages KEY 'm2' VALUE 'branch'").unwrap())
+            .await
+            .unwrap();
+
+        let child_schema = load_existing_schema_snapshot(&state.branch_schema_path("default", "preview"))
+            .unwrap();
+        let previous_schema = state.executor.schema_snapshot();
+        install_promoted_schema(&state, &child_schema).unwrap();
+        let (child, write_txn) = prepare_branch_promotion(&state, "default", "preview")
+            .await
+            .unwrap();
+        let (old_branches, new_branches, old_main_ledger, new_main_ledger) = {
+            let control = state.control.lock().unwrap();
+            let old_branches = control.branches.clone();
+            let mut new_branches = old_branches.clone();
+            new_branches.promote_for("default", "preview").unwrap();
+            (
+                old_branches,
+                new_branches,
+                control.migration_ledger("default", "main"),
+                control.migration_ledger("default", "preview"),
+            )
+        };
+        let journal = BranchPromotionJournal {
+            tenant: String::from("default"),
+            branch: String::from("preview"),
+            base_commit_ts: child.base_commit_ts,
+            previous_schema,
+            child_schema,
+            old_branches,
+            new_branches,
+            old_main_ledger,
+            new_main_ledger,
+            writes: write_txn
+                .writes()
+                .iter()
+                .map(|(key, operation)| (key.clone(), operation.clone()))
+                .collect(),
+            phase: BranchPromotionPhase::DataCommitted,
+        };
+        state.backend.commit(write_txn).await.unwrap();
+        state.persist_branch_promotion_journal(&journal).unwrap();
+        drop(state);
+
+        let restarted = SharedState::build(&config).unwrap();
+        restarted.recover_branch_promotion().await.unwrap();
+        assert!(!restarted.promotion_path.exists());
+        assert_eq!(
+            restarted
+                .control
+                .lock()
+                .unwrap()
+                .branches
+                .get_for("default", "main")
+                .unwrap()
+                .manifest_id,
+            journal.new_branches.get_for("default", "main").unwrap().manifest_id
+        );
+        let key = ryme_storage::RecordKey::new("default", "default", "messages", b"m2");
+        let mut txn = restarted.backend.begin();
+        assert_eq!(restarted.backend.get(&mut txn, &key).unwrap(), Some(b"branch".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
