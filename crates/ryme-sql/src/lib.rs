@@ -7117,6 +7117,7 @@ where
                 tables.remove(table);
             }
         }
+        self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -7732,7 +7733,9 @@ where
         }
         policies.insert(key, policy);
         drop(policies);
-        self.rebuild_rls_policy_maps()
+        self.rebuild_rls_policy_maps()?;
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn drop_policy(&self, name: &str, table: &str, if_exists: bool) -> Result<()> {
@@ -7748,6 +7751,7 @@ where
         }
         if removed {
             self.rebuild_rls_policy_maps()?;
+            self.schema_dirty.store(true, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -16618,6 +16622,76 @@ mod tests {
         let isolated = restored.clone().with_isolated_schema(TxnManager::new());
         isolated.execute(parse("CREATE TABLE branch_only").unwrap()).await.unwrap();
         assert!(!restored.catalog_tables().contains(&String::from("branch_only")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rls_policy_state_survives_executor_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-rls-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("schema.json");
+        let manager = TxnManager::new();
+        let executor =
+            Executor::with_manager(String::from("tenant-a"), String::from("d"), manager.clone());
+        executor.set_schema_path(path.clone());
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, tenant_id) VALUES ('visible', 'tenant-a'), ('hidden', 'tenant-b')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE POLICY own_messages ON messages FOR ALL USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE messages FORCE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+
+        let snapshot: SchemaSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(snapshot.rls_enabled.contains("messages"));
+        assert!(snapshot.rls_forced.contains("messages"));
+        assert!(snapshot.rls_policies.keys().any(|key| key.ends_with("\0own_messages")));
+
+        let restarted =
+            Executor::with_manager(String::from("tenant-a"), String::from("d"), manager);
+        restarted.set_schema_path(path.clone());
+        restarted.restore_schema_snapshot(snapshot).unwrap();
+        let visible = restarted.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(visible, QueryResult::Rows { ref rows } if rows.len() == 1));
+        assert!(restarted.schema_snapshot().rls_forced.contains("messages"));
+
+        restarted.execute(parse("DROP POLICY own_messages ON messages").unwrap()).await.unwrap();
+        restarted
+            .execute(parse("ALTER TABLE messages DISABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        let after: SchemaSnapshot = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!after.rls_enabled.contains("messages"));
+        assert!(!after.rls_forced.contains("messages"));
+        assert!(!after.rls_policies.keys().any(|key| key.ends_with("\0own_messages")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
