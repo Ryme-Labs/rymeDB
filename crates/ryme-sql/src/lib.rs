@@ -6892,6 +6892,7 @@ pub struct Executor<B = TxnManager> {
     rls_write_tables: Arc<RwLock<HashMap<String, String>>>,
     rls_enabled: Arc<RwLock<HashSet<String>>>,
     rls_forced: Arc<RwLock<HashSet<String>>>,
+    platform_rls_tables: Arc<RwLock<HashSet<String>>>,
     rls_policies: Arc<RwLock<HashMap<String, RlsPolicy>>>,
     checks: Arc<Mutex<HashMap<String, Vec<String>>>>,
     foreign_keys: Arc<Mutex<HashMap<String, Vec<ForeignKeyConstraint>>>>,
@@ -6950,6 +6951,7 @@ impl Executor<TxnManager> {
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
+            platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
             rls_policies: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
@@ -6986,6 +6988,7 @@ impl Executor<TxnManager> {
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
+            platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
             rls_policies: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
@@ -7027,6 +7030,7 @@ where
             rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
+            platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
             rls_policies: Arc::new(RwLock::new(HashMap::new())),
             checks: Arc::new(Mutex::new(HashMap::new())),
             foreign_keys: Arc::new(Mutex::new(HashMap::new())),
@@ -7093,11 +7097,20 @@ where
                 .map(|tables| tables.keys().cloned().collect())
                 .unwrap_or_default(),
         ));
+        self.platform_rls_tables = Arc::new(RwLock::new(
+            self.rls_tables
+                .read()
+                .map(|tables| tables.keys().cloned().collect())
+                .unwrap_or_default(),
+        ));
         self.rls_policies = Arc::new(RwLock::new(policies));
         self
     }
 
     pub fn set_rls_tables(&mut self, rls_tables: HashMap<String, String>) {
+        if let Ok(mut platform_tables) = self.platform_rls_tables.write() {
+            platform_tables.extend(rls_tables.keys().cloned());
+        }
         if let Ok(mut configured) = self.rls_tables.write() {
             configured.extend(rls_tables.clone());
         }
@@ -7824,6 +7837,7 @@ where
             rls_write_tables: self.rls_write_tables,
             rls_enabled: self.rls_enabled,
             rls_forced: self.rls_forced,
+            platform_rls_tables: self.platform_rls_tables,
             rls_policies: self.rls_policies,
             checks: self.checks,
             foreign_keys: self.foreign_keys,
@@ -8229,6 +8243,7 @@ where
             rls_write_tables: self.rls_write_tables,
             rls_enabled: self.rls_enabled,
             rls_forced: self.rls_forced,
+            platform_rls_tables: self.platform_rls_tables,
             rls_policies: self.rls_policies,
             checks: Arc::new(Mutex::new(checks)),
             foreign_keys: Arc::new(Mutex::new(foreign_keys)),
@@ -8475,10 +8490,22 @@ where
             .unwrap_or_default()
     }
 
-    fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
-        if !self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table)) {
-            return true;
-        }
+    fn rls_is_enabled(&self, table: &str) -> bool {
+        self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table))
+    }
+
+    fn platform_rls_applies(&self, table: &str) -> bool {
+        self.platform_rls_tables.read().ok().is_some_and(|tables| tables.contains(table))
+    }
+
+    fn rls_applies_to_role(&self, table: &str) -> bool {
+        self.rls_is_enabled(table)
+            && (self.platform_rls_applies(table)
+                || !self.role_is_superuser()
+                || self.rls_forced.read().ok().is_some_and(|tables| tables.contains(table)))
+    }
+
+    fn rls_policy_allows(&self, table: &str, value: &[u8]) -> bool {
         let Some(column) = self.rls_tables.read().ok().and_then(|rls| rls.get(table).cloned())
         else {
             return false;
@@ -8496,12 +8523,19 @@ where
             .is_some_and(|tenant| tenant == self.tenant)
     }
 
+    fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
+        !self.rls_applies_to_role(table) || self.rls_policy_allows(table, value)
+    }
+
     pub fn row_allowed_by_rls(&self, table: &str, value: &[u8]) -> bool {
-        self.rls_allows(table, value)
+        // Realtime and branch diff consumers are platform trust boundaries. They
+        // must keep filtering rows even when their internal executor uses the
+        // postgres role to inspect committed storage.
+        !self.rls_is_enabled(table) || self.rls_policy_allows(table, value)
     }
 
     fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
-        if !self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table)) {
+        if !self.rls_applies_to_role(table) {
             return Ok(());
         }
         let Some(column) =
@@ -10065,8 +10099,8 @@ where
                     .collect());
             }
         }
-        let rls_enabled = self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table));
-        if txn.writes().is_empty() && filter.is_empty() && !rls_enabled {
+        let rls_applies = self.rls_applies_to_role(table);
+        if txn.writes().is_empty() && filter.is_empty() && !rls_applies {
             return self.manager.scan_async(txn, &self.tenant, &self.database, table, limit).await;
         }
         if txn.writes().is_empty() && !filter.is_empty() {
@@ -10169,8 +10203,8 @@ where
             rows.truncate(limit);
             return Ok(rows);
         }
-        let rls_enabled = self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table));
-        if rls_enabled {
+        let rls_applies = self.rls_applies_to_role(table);
+        if rls_applies {
             if limit == 0 {
                 return Ok(Vec::new());
             }
@@ -16091,10 +16125,15 @@ mod tests {
                 .execute(parse(&format!("ALTER TABLE {view} ENABLE ROW LEVEL SECURITY")).unwrap())
                 .await
                 .unwrap();
+            executor
+                .execute(parse(&format!("GRANT SELECT ON TABLE {view} TO authenticated")).unwrap())
+                .await
+                .unwrap();
+            let user = executor.clone().with_role(String::from("authenticated"));
             let result =
-                executor.execute(parse(&format!("SELECT * FROM {view}")).unwrap()).await.unwrap();
+                user.execute(parse(&format!("SELECT * FROM {view}")).unwrap()).await.unwrap();
             assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
-            let realtime_rows = executor.realtime_view_rows(view, None).await.unwrap().unwrap();
+            let realtime_rows = user.realtime_view_rows(view, None).await.unwrap().unwrap();
             assert_eq!(realtime_rows.len(), 1);
         }
     }
@@ -16139,7 +16178,12 @@ mod tests {
             Statement::AlterTableRls { enabled: Some(true), forced: None, .. }
         ));
         executor.execute(enable).await.unwrap();
-        let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT SELECT, INSERT ON TABLE messages TO authenticated").unwrap())
+            .await
+            .unwrap();
+        let user = executor.clone().with_role(String::from("authenticated"));
+        let result = user.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
         let force = parse("ALTER TABLE messages FORCE ROW LEVEL SECURITY").unwrap();
         assert!(matches!(
@@ -16153,7 +16197,7 @@ mod tests {
             Statement::AlterTableRls { enabled: None, forced: Some(false), .. }
         ));
         executor.execute(no_force).await.unwrap();
-        let rejected = executor
+        let rejected = user
             .execute(
                 parse(
                     "INSERT INTO messages (id, tenant_id, body) VALUES ('blocked', 'tenant-b', 'nope')",
@@ -16168,8 +16212,82 @@ mod tests {
         assert_eq!(snapshot.rls_write_tables.get("messages"), Some(&String::from("tenant_id")));
         assert!(snapshot.rls_enabled.contains("messages"));
         executor.restore_schema_snapshot(snapshot).unwrap();
-        let result = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        let user = executor.with_role(String::from("authenticated"));
+        let result = user.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn sql_rls_superuser_bypasses_unforced_policy_but_force_restores_it() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO messages (id, tenant_id) VALUES ('mine', 'tenant-a'), ('other', 'tenant-b')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE POLICY own_messages ON messages FOR ALL USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT SELECT, INSERT ON TABLE messages TO authenticated").unwrap())
+            .await
+            .unwrap();
+
+        let ordinary = executor.clone().with_role(String::from("authenticated"));
+        let ordinary_rows =
+            ordinary.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(ordinary_rows, QueryResult::Rows { ref rows } if rows.len() == 1));
+
+        let superuser_rows =
+            executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(superuser_rows, QueryResult::Rows { ref rows } if rows.len() == 2));
+
+        executor
+            .execute(parse("ALTER TABLE messages FORCE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        let forced_rows = executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(forced_rows, QueryResult::Rows { ref rows } if rows.len() == 1));
+        let forced_write = executor
+            .execute(
+                parse("INSERT INTO messages (id, tenant_id) VALUES ('blocked', 'tenant-b')")
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(forced_write, Err(RymeError::Forbidden)));
+
+        executor
+            .execute(parse("ALTER TABLE messages NO FORCE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        let unforced_rows =
+            executor.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        assert!(matches!(unforced_rows, QueryResult::Rows { ref rows } if rows.len() == 2));
+        executor
+            .execute(
+                parse("INSERT INTO messages (id, tenant_id) VALUES ('allowed', 'tenant-b')")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -16262,9 +16380,14 @@ mod tests {
             .await
             .unwrap();
 
-        let result = executor.execute(parse("SELECT * FROM private_rows").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT SELECT, INSERT ON TABLE private_rows TO authenticated").unwrap())
+            .await
+            .unwrap();
+        let user = executor.clone().with_role(String::from("authenticated"));
+        let result = user.execute(parse("SELECT * FROM private_rows").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.is_empty()));
-        let rejected = executor
+        let rejected = user
             .execute(
                 parse("INSERT INTO private_rows (id, tenant_id) VALUES ('two', 'tenant-a')")
                     .unwrap(),
@@ -16279,9 +16402,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = executor.execute(parse("SELECT * FROM private_rows").unwrap()).await.unwrap();
+        let result = user.execute(parse("SELECT * FROM private_rows").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
-        let rejected = executor
+        let rejected = user
             .execute(
                 parse("INSERT INTO private_rows (id, tenant_id) VALUES ('three', 'tenant-a')")
                     .unwrap(),
@@ -16317,19 +16440,24 @@ mod tests {
             .execute(parse("ALTER TABLE policy_rows ENABLE ROW LEVEL SECURITY").unwrap())
             .await
             .unwrap();
-        let visible = executor.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT SELECT ON TABLE policy_rows TO authenticated").unwrap())
+            .await
+            .unwrap();
+        let user = executor.clone().with_role(String::from("authenticated"));
+        let visible = user.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
         assert!(matches!(visible, QueryResult::Rows { ref rows } if rows.len() == 1));
 
         let drop = parse("DROP POLICY IF EXISTS own_rows ON policy_rows").unwrap();
         assert!(matches!(drop, Statement::DropPolicy { ref name, ref table, if_exists: true }
             if name == "own_rows" && table == "policy_rows"));
         executor.execute(drop).await.unwrap();
-        let hidden = executor.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
+        let hidden = user.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
         assert!(matches!(hidden, QueryResult::Rows { ref rows } if rows.is_empty()));
         let snapshot = executor.schema_snapshot();
         assert!(!snapshot.rls_policies.keys().any(|key| key.ends_with("\0own_rows")));
         executor.restore_schema_snapshot(snapshot).unwrap();
-        let hidden = executor.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
+        let hidden = user.execute(parse("SELECT * FROM policy_rows").unwrap()).await.unwrap();
         assert!(matches!(hidden, QueryResult::Rows { ref rows } if rows.is_empty()));
     }
 
@@ -16976,6 +17104,10 @@ mod tests {
             .execute(parse("ALTER TABLE messages FORCE ROW LEVEL SECURITY").unwrap())
             .await
             .unwrap();
+        executor
+            .execute(parse("GRANT SELECT ON TABLE messages TO authenticated").unwrap())
+            .await
+            .unwrap();
 
         let snapshot: SchemaSnapshot =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -16987,7 +17119,8 @@ mod tests {
             Executor::with_manager(String::from("tenant-a"), String::from("d"), manager);
         restarted.set_schema_path(path.clone());
         restarted.restore_schema_snapshot(snapshot).unwrap();
-        let visible = restarted.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
+        let user = restarted.clone().with_role(String::from("authenticated"));
+        let visible = user.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
         assert!(matches!(visible, QueryResult::Rows { ref rows } if rows.len() == 1));
         assert!(restarted.schema_snapshot().rls_forced.contains("messages"));
 
