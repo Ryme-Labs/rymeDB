@@ -243,7 +243,7 @@ where
             tenant: self.tenant,
             database: self.database,
             branch: self.branch,
-            read_ts: None,
+            read_ts: self.read_ts,
             read_only: self.read_only,
             remote_reader: self.remote_reader,
             remote_scanner: self.remote_scanner,
@@ -897,6 +897,21 @@ mod tests {
             gateway.ttl_of_async(&principal, "docs", b"k").await.unwrap(),
             Ttl::Seconds(seconds) if seconds > 0 && seconds <= 60
         ));
+    }
+
+    #[tokio::test]
+    async fn backend_wrapping_preserves_historical_reads() {
+        let gateway = gateway();
+        let principal = owner();
+        let first_commit =
+            gateway.put(&principal, "docs", b"k".to_vec(), b"old".to_vec()).await.unwrap();
+        gateway.put(&principal, "docs", b"k".to_vec(), b"new".to_vec()).await.unwrap();
+
+        let historical = gateway
+            .clone()
+            .with_read_ts(first_commit)
+            .with_backend_manager(gateway.manager_clone());
+        assert_eq!(historical.get(&principal, "docs", b"k").unwrap(), Some(b"old".to_vec()));
     }
 
     #[tokio::test]

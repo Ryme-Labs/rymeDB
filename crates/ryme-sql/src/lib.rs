@@ -7814,7 +7814,7 @@ where
             branch: self.branch,
             role: self.role,
             manager,
-            read_ts: None,
+            read_ts: self.read_ts,
             realtime: self.realtime,
             read_only: self.read_only,
             isolation: self.isolation,
@@ -8201,7 +8201,7 @@ where
             branch: self.branch,
             role: self.role,
             manager,
-            read_ts: None,
+            read_ts: self.read_ts,
             realtime: self.realtime,
             read_only: self.read_only,
             isolation: self.isolation,
@@ -16564,6 +16564,22 @@ mod tests {
         executor.execute(parse("DELETE FROM users WHERE id = '1'").unwrap()).await.unwrap();
         let gone = executor.execute(parse("SELECT * FROM users WHERE id = '1'").unwrap()).await;
         assert!(matches!(gone, Ok(QueryResult::Rows { rows }) if rows.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn backend_wrapping_preserves_historical_reads() {
+        let manager = TxnManager::new();
+        let executor =
+            Executor::with_manager(String::from("t"), String::from("d"), manager.clone());
+        executor.execute(parse("INSERT INTO docs KEY 'k' VALUE 'old'").unwrap()).await.unwrap();
+        let first_commit = manager.latest_commit();
+        executor.execute(parse("UPSERT INTO docs KEY 'k' VALUE 'new'").unwrap()).await.unwrap();
+
+        let historical = executor.clone().with_read_ts(first_commit).with_backend_manager(manager);
+        assert!(matches!(
+            historical.execute(parse("SELECT * FROM docs KEY 'k'").unwrap()).await,
+            Ok(QueryResult::Row { value, .. }) if value == b"old"
+        ));
     }
 
     #[tokio::test]
