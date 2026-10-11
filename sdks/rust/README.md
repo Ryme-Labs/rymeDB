@@ -60,3 +60,7 @@ while let Some(frame) = channel.recv().await? {
 Supabase-style REST CRUD is available through `rest_insert`, `rest_upsert`,
 `rest_update`, and `rest_delete_where`, using `serde_json::Value` request
 bodies and PostgREST query strings.
+
+Migration helpers default to `main`. Use `migrate_apply_on_branch` and
+`migrate_ledger_on_branch` with `Some("preview")` (or another branch name) to
+send the request with `X-Ryme-Branch`.

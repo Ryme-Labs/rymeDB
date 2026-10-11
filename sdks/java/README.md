@@ -60,3 +60,7 @@ For a table subscription that reconnects automatically and advances its
 sequence cursor, use `subscribeTableResumable`. The returned
 `RealtimeSubscription` implements `AutoCloseable` and stops retrying when
 `close()` is called.
+
+Migration helpers use `main` by default. Call `migrateApply(id, sql, author,
+branch)` or `migrateLedger(branch)` to select a branch; the overloads send the
+`X-Ryme-Branch` header.

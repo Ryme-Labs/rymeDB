@@ -1,5 +1,8 @@
 # Changelog
 
+- Java, npm, and Rust SDK migration helpers now accept an optional branch and
+  send `X-Ryme-Branch` so migration execution and ledger reads can target
+  branch-local schema state.
 - Migration ledgers are now isolated by tenant and branch. Migration execution
   honors `X-Ryme-Branch`, and branch ledger state is copied, persisted, and
   exposed through the selected ledger endpoint.

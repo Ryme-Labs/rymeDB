@@ -134,9 +134,10 @@ export class RymeHttpClient {
     this.apiKey = options.apiKey ?? process.env["RYME_API_KEY"] ?? "";
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, branch?: string): Promise<T> {
     const headers: Record<string, string> = {};
     if (this.apiKey) headers["authorization"] = `Bearer ${this.apiKey}`;
+    if (branch !== undefined) headers["x-ryme-branch"] = branch;
     const payload = body === undefined ? undefined : JSON.stringify(body);
     if (payload !== undefined) headers["content-type"] = "application/json";
     const response = await fetch(`${this.base}${path}`, { method, headers, body: payload });
@@ -305,16 +306,16 @@ export class RymeHttpClient {
     return this.request<unknown>("POST", "/v1/migrate/neon", { branches });
   }
 
-  migrateApply(id: string, sql: string, author?: string): Promise<unknown> {
+  migrateApply(id: string, sql: string, author?: string, branch?: string): Promise<unknown> {
     return this.request<unknown>("POST", "/v1/migrate/apply", {
       id,
       sql,
       author: author ?? null,
-    });
+    }, branch);
   }
 
-  migrateLedger(): Promise<unknown> {
-    return this.request<unknown>("GET", "/v1/migrate/ledger");
+  migrateLedger(branch?: string): Promise<unknown> {
+    return this.request<unknown>("GET", "/v1/migrate/ledger", undefined, branch);
   }
 
   indexStats(): Promise<unknown> {

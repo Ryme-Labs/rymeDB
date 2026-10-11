@@ -58,6 +58,8 @@ Notes:
   load.
 - `RymeClient` (in the same package) is the legacy RESP client (`GET`/`SET`
   over TCP); prefer `RymeHttpClient` for new code.
+- `migrateApply(id, sql, author?, branch?)` and `migrateLedger(branch?)`
+  select a branch with the `X-Ryme-Branch` header; omit `branch` for `main`.
 
 Method coverage mirrors the server: kv get/put/delete/ttl, sql, scan,
 branches, checkpoint/latest/pitr/snapshot/restore/archive/archives, shards

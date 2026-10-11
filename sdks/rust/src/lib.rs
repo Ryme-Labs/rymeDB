@@ -805,8 +805,22 @@ impl RymeClient {
         path: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
+        self.post_json_on_branch(path, body, None).await
+    }
+
+    async fn post_json_on_branch(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        branch: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let request = self.http.post(format!("{}{}", self.base, path));
+        let request = match branch {
+            Some(branch) => request.header("x-ryme-branch", branch),
+            None => request,
+        };
         let response = self
-            .auth(self.http.post(format!("{}{}", self.base, path)))
+            .auth(request)
             .json(&body)
             .send()
             .await
@@ -838,8 +852,21 @@ impl RymeClient {
     }
 
     async fn get_path(&self, path: &str) -> Result<serde_json::Value, ClientError> {
+        self.get_path_on_branch(path, None).await
+    }
+
+    async fn get_path_on_branch(
+        &self,
+        path: &str,
+        branch: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let request = self.http.get(format!("{}{}", self.base, path));
+        let request = match branch {
+            Some(branch) => request.header("x-ryme-branch", branch),
+            None => request,
+        };
         let response = self
-            .auth(self.http.get(format!("{}{}", self.base, path)))
+            .auth(request)
             .send()
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
@@ -1218,15 +1245,33 @@ impl RymeClient {
         sql: &str,
         author: Option<&str>,
     ) -> Result<serde_json::Value, ClientError> {
-        self.post_json(
+        self.migrate_apply_on_branch(id, sql, author, None).await
+    }
+
+    pub async fn migrate_apply_on_branch(
+        &self,
+        id: &str,
+        sql: &str,
+        author: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_json_on_branch(
             "/v1/migrate/apply",
             serde_json::json!({ "id": id, "sql": sql, "author": author }),
+            branch,
         )
         .await
     }
 
     pub async fn migrate_ledger(&self) -> Result<serde_json::Value, ClientError> {
-        self.get_path("/v1/migrate/ledger").await
+        self.migrate_ledger_on_branch(None).await
+    }
+
+    pub async fn migrate_ledger_on_branch(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.get_path_on_branch("/v1/migrate/ledger", branch).await
     }
 
     pub async fn vector_ann_search(
@@ -1322,6 +1367,7 @@ mod tests {
     struct Seen {
         method: String,
         path: String,
+        branch: String,
         body: String,
     }
 
@@ -1356,10 +1402,14 @@ mod tests {
                     let method = parts.next().unwrap_or("").to_string();
                     let path = parts.next().unwrap_or("").to_string();
                     let mut length = 0usize;
+                    let mut branch = String::new();
                     for line in text.lines().skip(1).take_while(|line| !line.is_empty()) {
                         if let Some((name, value)) = line.split_once(':') {
                             if name.trim().eq_ignore_ascii_case("content-length") {
                                 length = value.trim().parse().unwrap_or(0);
+                            }
+                            if name.trim().eq_ignore_ascii_case("x-ryme-branch") {
+                                branch = value.trim().to_string();
                             }
                         }
                     }
@@ -1377,6 +1427,7 @@ mod tests {
                         *guard = Seen {
                             method,
                             path,
+                        branch,
                             body: String::from_utf8_lossy(&body).into_owned(),
                         };
                     }
@@ -1640,5 +1691,18 @@ mod tests {
         client.migrate_ledger().await.unwrap();
         let got = seen(&state);
         assert_eq!((got.method.as_str(), got.path.as_str()), ("GET", "/v1/migrate/ledger"));
+        client
+            .migrate_apply_on_branch(
+                "m2",
+                "INSERT INTO docs KEY 'k2' VALUE 'v2'",
+                None,
+                Some("preview"),
+            )
+            .await
+            .unwrap();
+        let got = seen(&state);
+        assert_eq!(got.branch, "preview");
+        client.migrate_ledger_on_branch(Some("preview")).await.unwrap();
+        assert_eq!(seen(&state).branch, "preview");
     }
 }

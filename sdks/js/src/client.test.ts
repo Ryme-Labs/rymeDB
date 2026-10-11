@@ -16,6 +16,7 @@ interface Seen {
   method: string;
   url: string;
   auth: string;
+  branch: string;
   body: string;
 }
 
@@ -31,6 +32,7 @@ function stub(handler: (seen: Seen) => { status: number; body: string }) {
         method: req.method ?? "",
         url: req.url ?? "",
         auth: String(req.headers["authorization"] ?? ""),
+        branch: String(req.headers["x-ryme-branch"] ?? ""),
         body,
       };
       const out = handler(last);
@@ -253,9 +255,12 @@ describe("RymeHttpClient", () => {
     });
     await client.migrateApply("m1", "INSERT INTO docs KEY 'k1' VALUE 'v1'", "ada");
     assert.deepEqual(JSON.parse(seen().body).author, "ada");
-    await client.migrateLedger();
+    await client.migrateApply("m2", "INSERT INTO docs KEY 'k2' VALUE 'v2'", undefined, "preview");
+    assert.equal(seen().branch, "preview");
+    await client.migrateLedger("preview");
     assert.equal(seen().method, "GET");
     assert.equal(seen().url, "/v1/migrate/ledger");
+    assert.equal(seen().branch, "preview");
     server.close();
   });
 

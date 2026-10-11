@@ -313,12 +313,22 @@ public final class RymeClient {
     }
 
     public String migrateApply(String id, String sql, String author) {
+        return migrateApply(id, sql, author, null);
+    }
+
+    /** Apply a migration on the selected branch; {@code null} uses {@code main}. */
+    public String migrateApply(String id, String sql, String author, String branch) {
         return request("POST", "/v1/migrate/apply", "{\"id\":" + json(id)
-                + ",\"sql\":" + json(sql) + ",\"author\":" + nullableJson(author) + "}");
+                + ",\"sql\":" + json(sql) + ",\"author\":" + nullableJson(author) + "}", branch);
     }
 
     public String migrateLedger() {
-        return request("GET", "/v1/migrate/ledger", null);
+        return migrateLedger(null);
+    }
+
+    /** Read the migration ledger for a branch; {@code null} uses {@code main}. */
+    public String migrateLedger(String branch) {
+        return request("GET", "/v1/migrate/ledger", null, branch);
     }
 
     public String indexStats() {
@@ -830,10 +840,15 @@ public final class RymeClient {
     }
 
     private String request(String method, String path, String body) {
+        return request(method, path, body, null);
+    }
+
+    private String request(String method, String path, String body, String branch) {
         HttpRequest.Builder builder = HttpRequest.newBuilder(uri(path))
                 .timeout(Duration.ofSeconds(30))
                 .header("Accept", "application/json");
         if (!apiKey.isEmpty()) builder.header("Authorization", "Bearer " + apiKey);
+        if (branch != null && !branch.isEmpty()) builder.header("X-Ryme-Branch", branch);
         if (body == null) {
             builder.method(method, HttpRequest.BodyPublishers.noBody());
         } else {
