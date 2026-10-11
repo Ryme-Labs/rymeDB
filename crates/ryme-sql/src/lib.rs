@@ -8566,6 +8566,14 @@ where
         self.has_object_privilege("TABLE", table, privilege)
     }
 
+    pub fn can_select_table(&self, table: &str) -> bool {
+        self.role_is_superuser() || self.has_table_privilege(table, "SELECT")
+    }
+
+    pub fn can_select_all_tables(&self) -> bool {
+        self.role_is_superuser()
+    }
+
     fn canonical_sequence_name(&self, sequence: &str) -> Option<String> {
         self.sequences.lock().ok().and_then(|sequences| {
             sequences.get_key_value(sequence).map(|(name, _)| name.clone()).or_else(|| {

@@ -6231,7 +6231,7 @@ async fn supabase_realtime_stream(
         Err(error) => return error_response(error),
     };
     let rls_executor = match branch_executor(&state, &headers, &principal.tenant) {
-        Ok(executor) => executor,
+        Ok(executor) => executor.with_role(principal.sql_role().to_string()),
         Err(error) => return error_response(error),
     };
     let connection = match open_realtime_connection(&state, &principal.tenant) {
@@ -6650,6 +6650,21 @@ fn supabase_subscription_config(
         subscriptions.push(SupabaseChangeSubscription { id, event, schema, table, filter, select });
     }
     Ok(subscriptions)
+}
+
+fn authorize_supabase_subscriptions<B: TxnBackend>(
+    executor: &Executor<B>,
+    subscriptions: &[SupabaseChangeSubscription],
+) -> Result<(), String> {
+    for subscription in subscriptions {
+        match subscription.table.as_deref() {
+            Some(table) if executor.can_select_table(table) => {}
+            Some(_) => return Err(String::from("postgres_changes table permission denied")),
+            None if executor.can_select_all_tables() => {}
+            None => return Err(String::from("postgres_changes table is required")),
+        }
+    }
+    Ok(())
 }
 
 fn supabase_presence_config(payload: &serde_json::Value) -> Result<Option<String>, String> {
@@ -7084,6 +7099,13 @@ fn spawn_supabase_change_forwarder(
     let events = events.clone();
     tokio::spawn(async move {
         while let Ok(record) = receiver.recv().await {
+            if subscription
+                .table
+                .as_deref()
+                .is_some_and(|table| !rls_executor.can_select_table(table))
+            {
+                break;
+            }
             let Some(record) =
                 realtime_change_for_executor(&rls_executor, &tenant, &branch, &record)
             else {
@@ -7288,6 +7310,24 @@ async fn forward_supabase_realtime(
                                 continue;
                             }
                         };
+                        if let Err(reason) =
+                            authorize_supabase_subscriptions(&rls_executor, &subscriptions)
+                        {
+                            task.abort();
+                            let reply = supabase_reply(
+                                &frame,
+                                "error",
+                                serde_json::json!({ "reason": reason }),
+                                array_protocol,
+                            );
+                            if !queue_realtime_message(
+                                &outgoing,
+                                axum::extract::ws::Message::Text(reply),
+                            ) {
+                                break;
+                            }
+                            continue;
+                        }
                         let presence_key = match supabase_presence_config(&frame.payload) {
                             Ok(key) => key,
                             Err(reason) => {
@@ -11097,9 +11137,12 @@ async fn stream(
         branch_commit,
         storage_epoch,
     ) {
-        Ok(executor) => executor,
+        Ok(executor) => executor.with_role(principal.sql_role().to_string()),
         Err(e) => return error_response(e),
     };
+    if !rls_executor.can_select_table(&table) {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     upgrade.on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_changes(
@@ -11229,6 +11272,9 @@ async fn forward_changes(
     from: u64,
     from_sequence: Option<u64>,
 ) {
+    if !rls_executor.can_select_table(table) {
+        return;
+    }
     let mut receiver = realtime.subscribe_branch(tenant, database, branch, table);
     let replayed = match from_sequence {
         Some(sequence) => realtime.replay_after_sequence_branch(
@@ -11442,9 +11488,12 @@ async fn query_stream(
         branch_commit,
         storage_epoch,
     ) {
-        Ok(executor) => executor,
+        Ok(executor) => executor.with_role(principal.sql_role().to_string()),
         Err(e) => return error_response(e),
     };
+    if !rls_executor.can_select_table(&table) {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
     let dependencies =
         rls_executor.view_dependencies(&table).unwrap_or_else(|| vec![table.clone()]);
     let query_spec = ReactiveQuerySpec::from_query(&query);
@@ -11544,6 +11593,9 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
             message = receiver.recv() => {
                 match message {
                     Ok(update) => {
+                        if !rls_executor.can_select_table(table) {
+                            break;
+                        }
                         if update.commit_ts <= snapshot_commit {
                             continue;
                         }
@@ -12014,6 +12066,9 @@ async fn send_query_snapshot<B: TxnBackend>(
     limit: usize,
     commit: u64,
 ) -> (u64, bool) {
+    if !rls_executor.can_select_table(table) {
+        return (commit, false);
+    }
     let rows = scan_realtime_rows_for_query(
         backend,
         rls_executor,
@@ -12061,6 +12116,9 @@ async fn send_reactive_query_snapshot<B: TxnBackend>(
     spec: &ReactiveQuerySpec,
     kind: &str,
 ) -> (u64, bool) {
+    if !rls_executor.can_select_table(table) {
+        return (commit, false);
+    }
     let rows = scan_realtime_rows_for_query(
         backend,
         rls_executor,
@@ -13006,6 +13064,44 @@ mod realtime_policy_tests {
             }
         });
         assert!(supabase_subscription_config(&columns).is_err());
+    }
+
+    #[tokio::test]
+    async fn supabase_realtime_subscriptions_require_table_select_privileges() {
+        let executor = Executor::new(String::from("tenant"), String::from("database"));
+        executor
+            .execute(
+                parse("CREATE TABLE public.messages (id TEXT PRIMARY KEY, body TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        let subscription = SupabaseChangeSubscription {
+            id: 1,
+            event: String::from("*"),
+            schema: String::from("public"),
+            table: Some(String::from("messages")),
+            filter: None,
+            select: None,
+        };
+        let subscriber = executor.clone().with_role(String::from("realtime_subscriber"));
+        assert!(authorize_supabase_subscriptions(&subscriber, std::slice::from_ref(&subscription))
+            .is_err());
+
+        executor
+            .execute(parse("GRANT SELECT ON TABLE public.messages TO realtime_subscriber").unwrap())
+            .await
+            .unwrap();
+        assert!(authorize_supabase_subscriptions(&subscriber, std::slice::from_ref(&subscription))
+            .is_ok());
+
+        let wildcard = SupabaseChangeSubscription { table: None, ..subscription };
+        assert!(
+            authorize_supabase_subscriptions(&subscriber, std::slice::from_ref(&wildcard)).is_err()
+        );
+        let superuser = executor.with_role(String::from("postgres"));
+        assert!(
+            authorize_supabase_subscriptions(&superuser, std::slice::from_ref(&wildcard)).is_ok()
+        );
     }
 
     #[test]
