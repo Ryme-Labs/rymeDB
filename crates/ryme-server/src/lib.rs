@@ -10194,7 +10194,7 @@ fn apply_replicated_broadcast(state: &SharedState, payload: &[u8]) -> ryme_error
 fn apply_replicated_presence(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
     let event: ClusterPresence = serde_json::from_slice(payload)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("presence event: {error}")))?;
-    match event {
+    let (operation, tenant, channel, result) = match event {
         ClusterPresence::Join {
             tenant,
             channel,
@@ -10202,14 +10202,28 @@ fn apply_replicated_presence(state: &SharedState, payload: &[u8]) -> ryme_error:
             state: member_state,
             expires_unix,
             now_unix,
-        } => state
-            .realtime
-            .presence_join_at(&tenant, &channel, member, member_state, expires_unix, now_unix)
-            .map(|_| ()),
-        ClusterPresence::Leave { tenant, channel, member } => {
-            state.realtime.presence_leave(&tenant, &channel, &member).map(|_| ())
+        } => {
+            let result = state
+                .realtime
+                .presence_join_at(&tenant, &channel, member, member_state, expires_unix, now_unix)
+                .map(|_| ());
+            ("join", tenant, channel, result)
         }
+        ClusterPresence::Leave { tenant, channel, member } => {
+            let result = state.realtime.presence_leave(&tenant, &channel, &member).map(|_| ());
+            ("leave", tenant, channel, result)
+        }
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            operation,
+            tenant = %tenant,
+            channel = %channel,
+            %error,
+            "replicated presence delivery skipped after commit"
+        );
     }
+    Ok(())
 }
 
 fn apply_replicated_topic(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
