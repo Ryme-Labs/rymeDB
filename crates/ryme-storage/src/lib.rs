@@ -547,6 +547,9 @@ impl Engine {
         now: u64,
         limit: usize,
     ) -> Vec<(RecordKey, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let iter = self.inner.range((Bound::Included(start), Bound::Excluded(end)));
         for (key, versions) in iter {
@@ -997,6 +1000,17 @@ mod tests {
             ]
         );
         assert!(engine.scan("a", "d", "messages", 1, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn ranges_honor_zero_limit() {
+        let mut engine = Engine::new();
+        engine.apply(RecordKey::new("t", "d", "items", b"b"), 1, Some(b"value".to_vec())).unwrap();
+        let start = RecordKey::new("t", "d", "items", b"a");
+        let end = RecordKey::new("t", "d", "items", b"z");
+
+        assert!(engine.range(&start, &end, 1, 0, 0).is_empty());
+        assert_eq!(engine.range(&start, &end, 1, 0, 1).len(), 1);
     }
 
     #[test]
