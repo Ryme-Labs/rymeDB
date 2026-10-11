@@ -58,6 +58,14 @@ type RemoteScanFn = Arc<
 >;
 type ScanPageResult = (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>);
 
+fn remote_value_if_live(value: Option<Vec<u8>>, expires_at: Option<u64>) -> Option<Vec<u8>> {
+    if expires_at.is_some_and(|expires_at| expires_at != 0 && expires_at <= ryme_txn::now_unix()) {
+        None
+    } else {
+        value
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteReader {
     single: RemoteReadFn,
@@ -280,7 +288,8 @@ where
         };
         match reader.read(key.clone()).await? {
             RemoteRead::Local => self.manager.get(txn, key),
-            RemoteRead::Value { value, .. } => {
+            RemoteRead::Value { value, expires_at } => {
+                let value = remote_value_if_live(value, expires_at);
                 txn.record_read(key.clone(), value.is_some());
                 Ok(value)
             }
@@ -337,12 +346,14 @@ where
         let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
         match reader.read(key).await? {
             RemoteRead::Local => self.get(principal, table, pk),
-            RemoteRead::Value { value, .. } => match value {
-                Some(value) if self.policies.row_allowed(principal, table, &value)? => {
-                    Ok(Some(value))
+            RemoteRead::Value { value, expires_at } => {
+                match remote_value_if_live(value, expires_at) {
+                    Some(value) if self.policies.row_allowed(principal, table, &value)? => {
+                        Ok(Some(value))
+                    }
+                    _ => Ok(None),
                 }
-                _ => Ok(None),
-            },
+            }
         }
     }
 
@@ -1152,6 +1163,22 @@ mod tests {
             gateway.ttl_of_async(&principal, "messages", b"hidden").await.unwrap(),
             Ttl::Missing
         );
+    }
+
+    #[tokio::test]
+    async fn async_remote_reads_hide_expired_values_before_reads_and_writes() {
+        let gateway = gateway().with_remote_reader(RemoteReader::new(|_| async {
+            Ok(RemoteRead::Value {
+                value: Some(b"expired".to_vec()),
+                expires_at: Some(ryme_txn::now_unix().saturating_sub(1)),
+            })
+        }));
+        let principal = owner();
+
+        assert_eq!(gateway.get_async(&principal, "docs", b"k").await.unwrap(), None);
+        let mut changes = gateway.realtime().subscribe("t", "d", "docs");
+        gateway.put(&principal, "docs", b"k".to_vec(), b"replacement".to_vec()).await.unwrap();
+        assert_eq!(changes.recv().await.unwrap().op, Operation::Insert);
     }
 
     #[tokio::test]
