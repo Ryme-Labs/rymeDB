@@ -283,11 +283,11 @@ same transaction read set. Filtered scans, joins that depend on remote rows,
 and read-only aggregate queries now fan out bounded range pages, merge them by
 primary key, and preserve the transaction snapshot. Scan-based UPDATE/DELETE,
 UPDATE FROM, DELETE USING, and INSERT SELECT now use those pages before
-staging their writes. Primary-key foreign-key checks on asynchronous inserts
-and updates now use the same owner-routed point-read path. Constraint cascades
-that require additional remote reads, non-primary-key foreign-key checks,
-schema-dependent views, and per-range 2PC remain separate work, so this is not
-yet complete owner-aware transaction routing.
+staging their writes. Foreign-key checks and cascading delete/update actions
+now use the same owner-routed point-read and scan paths, stage all dependent
+changes in the transaction, and commit through the existing distributed
+coordinator. Schema-dependent views and per-range 2PC remain separate work,
+so this is not yet complete owner-aware transaction routing.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

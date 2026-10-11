@@ -1,9 +1,10 @@
 # Changelog
 
-- Cluster SQL inserts and updates now validate primary-key foreign keys through
-  the configured range owner, preserving the transaction snapshot instead of
-  treating a remote parent row as missing. Non-primary-key lookups and remote
-  foreign-key cascades remain separate work.
+- Cluster SQL mutations now validate foreign keys and execute cascading
+  delete/update actions through the configured range owners, preserving the
+  transaction snapshot instead of treating remote rows as missing. The
+  cascade work is staged in the same transaction and participates in the
+  existing distributed commit path.
 - Cross-range transaction prepare and resolve records now replicate through each
   participating range group's quorum log and replay from the range WAL after
   restart. The global Raft log remains the transaction decision authority, but a

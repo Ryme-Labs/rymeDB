@@ -8263,250 +8263,272 @@ where
         Ok(())
     }
 
-    fn delete_row_with_references(
-        &self,
-        txn: &mut Transaction,
-        table: &str,
-        pk: &[u8],
-        value: &[u8],
-        changes: &mut Vec<TransactionChange>,
-        visited: &mut BTreeSet<(String, Vec<u8>)>,
-    ) -> Result<()> {
-        let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
-        if !visited.insert((table.clone(), pk.to_vec())) {
-            return Ok(());
-        }
-        let constraints = self
-            .foreign_keys
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
-            .iter()
-            .flat_map(|(child_table, constraints)| {
-                constraints.iter().map(move |constraint| (child_table.clone(), constraint.clone()))
-            })
-            .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(&table))
-            .collect::<Vec<_>>();
-        for (child_table, constraint) in constraints {
-            let referenced_columns = if constraint.referenced_columns.is_empty() {
-                self.catalog_columns(&table)
-                    .into_iter()
-                    .filter(|definition| definition.primary_key)
-                    .map(|definition| definition.name)
-                    .collect::<Vec<_>>()
-            } else {
-                constraint.referenced_columns.clone()
-            };
-            let Some(parent_values) = referenced_columns
+    fn delete_row_with_references_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        table: &'a str,
+        pk: &'a [u8],
+        value: &'a [u8],
+        changes: &'a mut Vec<TransactionChange>,
+        visited: &'a mut BTreeSet<(String, Vec<u8>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
+            if !visited.insert((table.clone(), pk.to_vec())) {
+                return Ok(());
+            }
+            let constraints = self
+                .foreign_keys
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
                 .iter()
-                .map(|column| self.row_column_value(&table, pk, value, column))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            let child_rows = self.scan_all_rows_in_transaction(txn, &child_table)?;
-            for (child_pk, child_value) in child_rows {
-                let matches_parent =
-                    constraint.columns.iter().zip(&parent_values).all(|(column, expected)| {
-                        self.row_column_value(&child_table, &child_pk, &child_value, column)
-                            .is_some_and(|actual| actual == *expected)
-                    });
-                if !matches_parent {
+                .flat_map(|(child_table, constraints)| {
+                    constraints
+                        .iter()
+                        .map(move |constraint| (child_table.clone(), constraint.clone()))
+                })
+                .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(&table))
+                .collect::<Vec<_>>();
+            for (child_table, constraint) in constraints {
+                let referenced_columns = if constraint.referenced_columns.is_empty() {
+                    self.catalog_columns(&table)
+                        .into_iter()
+                        .filter(|definition| definition.primary_key)
+                        .map(|definition| definition.name)
+                        .collect::<Vec<_>>()
+                } else {
+                    constraint.referenced_columns.clone()
+                };
+                let Some(parent_values) = referenced_columns
+                    .iter()
+                    .map(|column| self.row_column_value(&table, pk, value, column))
+                    .collect::<Option<Vec<_>>>()
+                else {
                     continue;
-                }
-                match constraint.on_delete {
-                    ForeignKeyAction::Restrict => {
-                        return Err(RymeError::Conflict(format!(
-                            "foreign key constraint failed: referenced row in {table} is still used"
-                        )));
+                };
+                let child_rows = self.scan_all_rows_in_transaction_async(txn, &child_table).await?;
+                for (child_pk, child_value) in child_rows {
+                    let matches_parent =
+                        constraint.columns.iter().zip(&parent_values).all(|(column, expected)| {
+                            self.row_column_value(&child_table, &child_pk, &child_value, column)
+                                .is_some_and(|actual| actual == *expected)
+                        });
+                    if !matches_parent {
+                        continue;
                     }
-                    ForeignKeyAction::Cascade => {
-                        let child_identity = (child_table.clone(), child_pk.clone());
-                        if visited.contains(&child_identity) {
-                            continue;
+                    match constraint.on_delete {
+                        ForeignKeyAction::Restrict => {
+                            return Err(RymeError::Conflict(format!(
+                                "foreign key constraint failed: referenced row in {table} is still used"
+                            )));
                         }
-                        self.delete_row_with_references(
-                            txn,
-                            &child_table,
-                            &child_pk,
-                            &child_value,
-                            changes,
-                            visited,
-                        )?;
-                        self.manager.delete(
-                            txn,
-                            RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
-                        );
-                        changes.push(TransactionChange {
-                            table: child_table.clone(),
-                            pk: child_pk,
-                            previous_pk: None,
-                            op: Operation::Delete,
-                            before: Some(child_value),
-                            after: None,
-                        });
-                    }
-                    ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
-                        let assignment = match constraint.on_delete {
-                            ForeignKeyAction::SetNull => InsertValue::Null,
-                            ForeignKeyAction::SetDefault => InsertValue::Default,
-                            ForeignKeyAction::Restrict | ForeignKeyAction::Cascade => {
-                                unreachable!()
+                        ForeignKeyAction::Cascade => {
+                            let child_identity = (child_table.clone(), child_pk.clone());
+                            if visited.contains(&child_identity) {
+                                continue;
                             }
-                        };
-                        let assignments = constraint
-                            .columns
-                            .iter()
-                            .cloned()
-                            .map(|column| (column, assignment.clone()))
-                            .collect();
-                        let after = self.materialize_update_row(
-                            &child_table,
-                            &child_pk,
-                            assignments,
-                            &child_value,
-                        )?;
-                        self.enforce_checks(&child_table, &child_pk, &after)?;
-                        self.enforce_foreign_keys(txn, &child_table, &child_pk, &after)?;
-                        self.check_unique(&child_table, &child_pk, &after)?;
-                        self.manager.put(
-                            txn,
-                            RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
-                            after.clone(),
-                        );
-                        changes.push(TransactionChange {
-                            table: child_table.clone(),
-                            pk: child_pk,
-                            previous_pk: None,
-                            op: Operation::Update,
-                            before: Some(child_value),
-                            after: Some(after),
-                        });
+                            self.delete_row_with_references_async(
+                                txn,
+                                &child_table,
+                                &child_pk,
+                                &child_value,
+                                changes,
+                                visited,
+                            )
+                            .await?;
+                            self.manager.delete(
+                                txn,
+                                RecordKey::new(
+                                    &self.tenant,
+                                    &self.database,
+                                    &child_table,
+                                    &child_pk,
+                                ),
+                            );
+                            changes.push(TransactionChange {
+                                table: child_table.clone(),
+                                pk: child_pk,
+                                previous_pk: None,
+                                op: Operation::Delete,
+                                before: Some(child_value),
+                                after: None,
+                            });
+                        }
+                        ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
+                            let assignment = match constraint.on_delete {
+                                ForeignKeyAction::SetNull => InsertValue::Null,
+                                ForeignKeyAction::SetDefault => InsertValue::Default,
+                                ForeignKeyAction::Restrict | ForeignKeyAction::Cascade => {
+                                    unreachable!()
+                                }
+                            };
+                            let assignments = constraint
+                                .columns
+                                .iter()
+                                .cloned()
+                                .map(|column| (column, assignment.clone()))
+                                .collect();
+                            let after = self.materialize_update_row(
+                                &child_table,
+                                &child_pk,
+                                assignments,
+                                &child_value,
+                            )?;
+                            self.enforce_checks(&child_table, &child_pk, &after)?;
+                            self.enforce_foreign_keys_async(txn, &child_table, &child_pk, &after)
+                                .await?;
+                            self.check_unique(&child_table, &child_pk, &after)?;
+                            self.manager.put(
+                                txn,
+                                RecordKey::new(
+                                    &self.tenant,
+                                    &self.database,
+                                    &child_table,
+                                    &child_pk,
+                                ),
+                                after.clone(),
+                            );
+                            changes.push(TransactionChange {
+                                table: child_table.clone(),
+                                pk: child_pk,
+                                previous_pk: None,
+                                op: Operation::Update,
+                                before: Some(child_value),
+                                after: Some(after),
+                            });
+                        }
                     }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
-    fn update_referencing_rows(
-        &self,
-        txn: &mut Transaction,
-        table: &str,
-        pk: &[u8],
-        before: &[u8],
-        after: &[u8],
-        changes: &mut Vec<TransactionChange>,
-        visited: &mut BTreeSet<(String, Vec<u8>)>,
-    ) -> Result<()> {
-        let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
-        let identity = (table.clone(), pk.to_vec());
-        if !visited.insert(identity.clone()) {
-            return Ok(());
-        }
-        let constraints = self
-            .foreign_keys
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
-            .iter()
-            .flat_map(|(child_table, constraints)| {
-                constraints.iter().map(move |constraint| (child_table.clone(), constraint.clone()))
-            })
-            .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(&table))
-            .collect::<Vec<_>>();
-        for (child_table, constraint) in constraints {
-            let referenced_columns = if constraint.referenced_columns.is_empty() {
-                self.catalog_columns(&table)
-                    .into_iter()
-                    .filter(|definition| definition.primary_key)
-                    .map(|definition| definition.name)
-                    .collect::<Vec<_>>()
-            } else {
-                constraint.referenced_columns.clone()
-            };
-            let old_values = referenced_columns
-                .iter()
-                .map(|column| self.row_column_value(&table, pk, before, column))
-                .collect::<Vec<_>>();
-            let new_values = referenced_columns
-                .iter()
-                .map(|column| self.row_column_value(&table, pk, after, column))
-                .collect::<Vec<_>>();
-            if old_values == new_values || old_values.iter().any(Option::is_none) {
-                continue;
+    fn update_referencing_rows_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        table: &'a str,
+        pk: &'a [u8],
+        before: &'a [u8],
+        after: &'a [u8],
+        changes: &'a mut Vec<TransactionChange>,
+        visited: &'a mut BTreeSet<(String, Vec<u8>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
+            let identity = (table.clone(), pk.to_vec());
+            if !visited.insert(identity.clone()) {
+                return Ok(());
             }
-            let child_rows = self.scan_all_rows_in_transaction(txn, &child_table)?;
-            for (child_pk, child_value) in child_rows {
-                let matches_old =
-                    constraint.columns.iter().zip(&old_values).all(|(column, expected)| {
-                        self.row_column_value(&child_table, &child_pk, &child_value, column)
-                            .is_some_and(|actual| {
-                                expected.as_ref().is_some_and(|expected| actual == *expected)
-                            })
-                    });
-                if !matches_old {
-                    continue;
-                }
-                if constraint.on_update == ForeignKeyAction::Restrict {
-                    return Err(RymeError::Conflict(format!(
-                        "foreign key constraint failed: referenced key in {table} is still used"
-                    )));
-                }
-                let child_identity = (child_table.clone(), child_pk.clone());
-                if visited.contains(&child_identity) {
-                    continue;
-                }
-                let assignment = match constraint.on_update {
-                    ForeignKeyAction::Cascade => None,
-                    ForeignKeyAction::SetNull => Some(InsertValue::Null),
-                    ForeignKeyAction::SetDefault => Some(InsertValue::Default),
-                    ForeignKeyAction::Restrict => unreachable!(),
+            let constraints = self
+                .foreign_keys
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+                .iter()
+                .flat_map(|(child_table, constraints)| {
+                    constraints
+                        .iter()
+                        .map(move |constraint| (child_table.clone(), constraint.clone()))
+                })
+                .filter(|(_, constraint)| constraint.referenced_table.eq_ignore_ascii_case(&table))
+                .collect::<Vec<_>>();
+            for (child_table, constraint) in constraints {
+                let referenced_columns = if constraint.referenced_columns.is_empty() {
+                    self.catalog_columns(&table)
+                        .into_iter()
+                        .filter(|definition| definition.primary_key)
+                        .map(|definition| definition.name)
+                        .collect::<Vec<_>>()
+                } else {
+                    constraint.referenced_columns.clone()
                 };
-                let assignments = constraint
-                    .columns
+                let old_values = referenced_columns
                     .iter()
-                    .zip(&new_values)
-                    .map(|(column, value)| {
-                        let value = assignment.clone().unwrap_or_else(|| {
-                            value.clone().map(InsertValue::Value).unwrap_or(InsertValue::Null)
+                    .map(|column| self.row_column_value(&table, pk, before, column))
+                    .collect::<Vec<_>>();
+                let new_values = referenced_columns
+                    .iter()
+                    .map(|column| self.row_column_value(&table, pk, after, column))
+                    .collect::<Vec<_>>();
+                if old_values == new_values || old_values.iter().any(Option::is_none) {
+                    continue;
+                }
+                let child_rows = self.scan_all_rows_in_transaction_async(txn, &child_table).await?;
+                for (child_pk, child_value) in child_rows {
+                    let matches_old =
+                        constraint.columns.iter().zip(&old_values).all(|(column, expected)| {
+                            self.row_column_value(&child_table, &child_pk, &child_value, column)
+                                .is_some_and(|actual| {
+                                    expected.as_ref().is_some_and(|expected| actual == *expected)
+                                })
                         });
-                        (column.clone(), value)
-                    })
-                    .collect();
-                let child_after = self.materialize_update_row(
-                    &child_table,
-                    &child_pk,
-                    assignments,
-                    &child_value,
-                )?;
-                self.enforce_checks(&child_table, &child_pk, &child_after)?;
-                self.enforce_foreign_keys(txn, &child_table, &child_pk, &child_after)?;
-                self.check_unique(&child_table, &child_pk, &child_after)?;
-                self.manager.put(
-                    txn,
-                    RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
-                    child_after.clone(),
-                );
-                self.update_referencing_rows(
-                    txn,
-                    &child_table,
-                    &child_pk,
-                    &child_value,
-                    &child_after,
-                    changes,
-                    visited,
-                )?;
-                changes.push(TransactionChange {
-                    table: child_table.clone(),
-                    pk: child_pk,
-                    previous_pk: None,
-                    op: Operation::Update,
-                    before: Some(child_value),
-                    after: Some(child_after),
-                });
+                    if !matches_old {
+                        continue;
+                    }
+                    if constraint.on_update == ForeignKeyAction::Restrict {
+                        return Err(RymeError::Conflict(format!(
+                            "foreign key constraint failed: referenced key in {table} is still used"
+                        )));
+                    }
+                    let child_identity = (child_table.clone(), child_pk.clone());
+                    if visited.contains(&child_identity) {
+                        continue;
+                    }
+                    let assignment = match constraint.on_update {
+                        ForeignKeyAction::Cascade => None,
+                        ForeignKeyAction::SetNull => Some(InsertValue::Null),
+                        ForeignKeyAction::SetDefault => Some(InsertValue::Default),
+                        ForeignKeyAction::Restrict => unreachable!(),
+                    };
+                    let assignments = constraint
+                        .columns
+                        .iter()
+                        .zip(&new_values)
+                        .map(|(column, value)| {
+                            let value = assignment.clone().unwrap_or_else(|| {
+                                value.clone().map(InsertValue::Value).unwrap_or(InsertValue::Null)
+                            });
+                            (column.clone(), value)
+                        })
+                        .collect();
+                    let child_after = self.materialize_update_row(
+                        &child_table,
+                        &child_pk,
+                        assignments,
+                        &child_value,
+                    )?;
+                    self.enforce_checks(&child_table, &child_pk, &child_after)?;
+                    self.enforce_foreign_keys_async(txn, &child_table, &child_pk, &child_after)
+                        .await?;
+                    self.check_unique(&child_table, &child_pk, &child_after)?;
+                    self.manager.put(
+                        txn,
+                        RecordKey::new(&self.tenant, &self.database, &child_table, &child_pk),
+                        child_after.clone(),
+                    );
+                    self.update_referencing_rows_async(
+                        txn,
+                        &child_table,
+                        &child_pk,
+                        &child_value,
+                        &child_after,
+                        changes,
+                        visited,
+                    )
+                    .await?;
+                    changes.push(TransactionChange {
+                        table: child_table.clone(),
+                        pk: child_pk,
+                        previous_pk: None,
+                        op: Operation::Update,
+                        before: Some(child_value),
+                        after: Some(child_after),
+                    });
+                }
             }
-        }
-        visited.remove(&identity);
-        Ok(())
+            visited.remove(&identity);
+            Ok(())
+        })
     }
 
     fn filter_rls_rows(&self, table: &str, rows: impl IntoIterator<Item = Row>) -> Vec<Row> {
@@ -8917,7 +8939,7 @@ where
             let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
             self.enforce_rls(&table, &after)?;
             self.enforce_checks(&table, &new_pk, &after)?;
-            self.enforce_foreign_keys(txn, &table, &new_pk, &after)?;
+            self.enforce_foreign_keys_async(txn, &table, &new_pk, &after).await?;
             self.check_unique_excluding(&table, &new_pk, &after, Some(&pk))?;
             if new_pk != pk
                 && self
@@ -8936,7 +8958,7 @@ where
                 RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
                 after.clone(),
             );
-            self.update_referencing_rows(
+            self.update_referencing_rows_async(
                 txn,
                 &table,
                 &pk,
@@ -8944,7 +8966,8 @@ where
                 &after,
                 &mut changes,
                 &mut BTreeSet::new(),
-            )?;
+            )
+            .await?;
             changes.push(TransactionChange {
                 table: table.clone(),
                 previous_pk: (new_pk != pk).then_some(pk),
@@ -8986,14 +9009,15 @@ where
             if !matched {
                 continue;
             }
-            self.delete_row_with_references(
+            self.delete_row_with_references_async(
                 txn,
                 &table,
                 &pk,
                 &value,
                 &mut changes,
                 &mut BTreeSet::new(),
-            )?;
+            )
+            .await?;
             self.manager.delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
             changes.push(TransactionChange {
                 table: table.clone(),
@@ -11581,7 +11605,7 @@ where
                 self.manager.put(txn, key, value.clone());
                 let mut changes = Vec::new();
                 if let Some(before_value) = before.as_deref() {
-                    self.update_referencing_rows(
+                    self.update_referencing_rows_async(
                         txn,
                         &table,
                         &pk,
@@ -11589,7 +11613,8 @@ where
                         &value,
                         &mut changes,
                         &mut BTreeSet::new(),
-                    )?;
+                    )
+                    .await?;
                 }
                 changes.push(TransactionChange {
                     table,
@@ -11649,7 +11674,7 @@ where
                         RecordKey::new(&self.tenant, &self.database, &table, &new_pk),
                         after.clone(),
                     );
-                    self.update_referencing_rows(
+                    self.update_referencing_rows_async(
                         txn,
                         &table,
                         &pk,
@@ -11657,7 +11682,8 @@ where
                         &after,
                         &mut changes,
                         &mut BTreeSet::new(),
-                    )?;
+                    )
+                    .await?;
                     changes.push(TransactionChange {
                         table: table.clone(),
                         previous_pk: (new_pk != pk).then_some(pk),
@@ -11729,7 +11755,7 @@ where
                 );
                 let mut changes = Vec::new();
                 if let Some(before_value) = before.as_deref() {
-                    self.update_referencing_rows(
+                    self.update_referencing_rows_async(
                         txn,
                         &table,
                         &pk,
@@ -11737,7 +11763,8 @@ where
                         &value,
                         &mut changes,
                         &mut BTreeSet::new(),
-                    )?;
+                    )
+                    .await?;
                 }
                 changes.push(TransactionChange {
                     table,
@@ -11758,14 +11785,15 @@ where
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
                 let mut changes = Vec::new();
-                self.delete_row_with_references(
+                self.delete_row_with_references_async(
                     txn,
                     &table,
                     &pk,
                     before.as_deref().unwrap_or_default(),
                     &mut changes,
                     &mut BTreeSet::new(),
-                )?;
+                )
+                .await?;
                 self.manager.delete(txn, key);
                 changes.push(TransactionChange {
                     table,
@@ -11783,14 +11811,15 @@ where
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, before) in rows {
                     self.enforce_rls(&table, &before)?;
-                    self.delete_row_with_references(
+                    self.delete_row_with_references_async(
                         txn,
                         &table,
                         &pk,
                         &before,
                         &mut changes,
                         &mut BTreeSet::new(),
-                    )?;
+                    )
+                    .await?;
                     self.manager
                         .delete(txn, RecordKey::new(&self.tenant, &self.database, &table, &pk));
                     changes.push(TransactionChange {
@@ -13911,20 +13940,21 @@ where
                 self.reject_if_read_only()?;
                 let mut txn = self.begin_with(isolation);
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(&mut txn, &key)?;
+                let before = self.manager.get_async(&mut txn, &key).await?;
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
                 self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
                 let mut changes = Vec::new();
-                self.delete_row_with_references(
+                self.delete_row_with_references_async(
                     &mut txn,
                     &table,
                     &pk,
                     before.as_deref().unwrap_or_default(),
                     &mut changes,
                     &mut BTreeSet::new(),
-                )?;
+                )
+                .await?;
                 self.manager.delete(&mut txn, key);
                 changes.push(TransactionChange {
                     table,

@@ -824,6 +824,46 @@ async fn async_foreign_key_checks_read_parent_rows_from_range_owner() {
         .await;
     assert!(result.is_ok(), "cross-range foreign key insert failed: {result:?}");
 
+    executor
+        .execute(ryme_sql::parse(
+            "CREATE TABLE cascade_children (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parents(id) ON DELETE CASCADE)",
+        )
+        .unwrap())
+        .await
+        .unwrap();
+    executor
+        .execute(ryme_sql::parse("INSERT INTO parents (id) VALUES ('p2')").unwrap())
+        .await
+        .unwrap();
+    executor
+        .execute(
+            ryme_sql::parse("INSERT INTO cascade_children (id, parent_id) VALUES ('c2', 'p2')")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    executor
+        .execute(ryme_sql::parse("DELETE FROM parents WHERE id = 'p2'").unwrap())
+        .await
+        .unwrap();
+    let cascade_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut probe = backends[client].begin();
+        if backends[client]
+            .get_async(&mut probe, &RecordKey::new("t", "d", "cascade_children", b"c2"))
+            .await
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < cascade_deadline,
+            "remote cascade child was not deleted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     for (node, task) in nodes.iter().zip(tasks) {
         node.shutdown(task);
     }
