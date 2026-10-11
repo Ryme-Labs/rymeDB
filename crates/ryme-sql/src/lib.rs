@@ -14947,6 +14947,7 @@ where
         if rows.len() > 10000 {
             return Err(RymeError::InvalidArgument(String::from("batch too large")));
         }
+        self.ensure_table(&table);
         for chunk in rows.chunks(500) {
             let mut txn = self.begin_with(self.isolation);
             let mut staged: Vec<TransactionChange> = Vec::new();
@@ -14985,6 +14986,7 @@ where
                 }
             }
         }
+        self.persist_schema_if_configured()?;
         Ok(rows.len())
     }
 
@@ -19053,6 +19055,31 @@ mod tests {
         assert_eq!(count, 2);
         let parsed = parse("COPY docs FROM stdin").unwrap();
         assert!(matches!(parsed, Statement::CopyFrom { table, .. } if table == "docs"));
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_persists_implicit_table_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-bulk-schema-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut executor = Executor::new(String::from("t"), String::from("d"));
+        executor.set_schema_path(path.clone());
+
+        executor
+            .bulk_upsert(String::from("events"), vec![(b"e1".to_vec(), b"ok".to_vec())])
+            .await
+            .unwrap();
+
+        let snapshot: SchemaSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(snapshot.tables.contains_key("events"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
