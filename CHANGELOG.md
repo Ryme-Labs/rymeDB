@@ -1,5 +1,8 @@
 # Changelog
 
+- Range PITR restore now durably aborts prepared intents that fall within
+  the restored log prefix, so an interrupted transaction cannot block writes
+  after restart.
 - Cluster PITR restore now works with active range ownership. Each range
   replica rebuilds its historical state, trims post-target range WAL, and
   reopens with the restored point-in-time state.

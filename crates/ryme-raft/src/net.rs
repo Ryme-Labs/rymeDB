@@ -2120,7 +2120,7 @@ impl Node {
         }
     }
 
-    async fn apply_ready(&self) -> Result<()> {
+    async fn apply_ready(self: &Arc<Self>) -> Result<()> {
         let entries = {
             let inner = self.inner.lock().await;
             inner
@@ -2933,9 +2933,9 @@ impl Node {
         Ok(index)
     }
 
-    async fn restore_to(&self, target: u64) -> Result<u64> {
+    async fn restore_to(self: &Arc<Self>, target: u64) -> Result<u64> {
         if !self.range_owners().is_empty() {
-            return self.restore_active_ranges_to(target);
+            return self.restore_active_ranges_to(target).await;
         }
         let entries = {
             let inner = self.inner.lock().await;
@@ -2953,7 +2953,7 @@ impl Node {
         self.manager.restore_with_replay(Engine::default(), &replay)
     }
 
-    fn restore_active_ranges_to(&self, target: u64) -> Result<u64> {
+    async fn restore_active_ranges_to(self: &Arc<Self>, target: u64) -> Result<u64> {
         let ranges = self.range_owners();
         let mut restored = 0u64;
         for range in ranges {
@@ -2969,7 +2969,7 @@ impl Node {
                 .unwrap_or_default();
             let mut replacement = Engine::default();
             let mut keep_through = 0u64;
-            let mut prepared = BTreeMap::<u128, ryme_txn::TransactionState>::new();
+            let mut prepared = BTreeMap::<u128, (u64, ryme_txn::TransactionState)>::new();
             for (index, record) in &entries {
                 if record.commit_ts > target {
                     continue;
@@ -2991,10 +2991,10 @@ impl Node {
                             .map_err(|error| {
                                 RymeError::Corrupt(format!("range transaction prepare: {error}"))
                             })?;
-                        prepared.insert(*transaction_id, state);
+                        prepared.insert(*transaction_id, (record.commit_ts, state));
                     }
                     RangeEntryKind::Resolve { transaction_id, committed } => {
-                        if let Some(state) = prepared.remove(transaction_id) {
+                        if let Some((_, state)) = prepared.remove(transaction_id) {
                             if *committed {
                                 for (key, op) in state.writes {
                                     replacement.apply_with_expiry(
@@ -3034,6 +3034,18 @@ impl Node {
                 state.applied_index = state.applied_index.min(keep_through);
             }
             self.truncate_range_suffix(&range.id, keep_through)?;
+            if !prepared.is_empty()
+                && self.range_owner_by_id(&range.id).is_some_and(|current| current.owner == self.id)
+            {
+                for (transaction_id, (commit_ts, _)) in prepared {
+                    self.commit_range_record(
+                        &range.id,
+                        commit_ts,
+                        RangeEntryKind::Resolve { transaction_id, committed: false },
+                    )
+                    .await?;
+                }
+            }
             restored = restored.max(target);
         }
         self.persist_range_meta()?;
@@ -6369,6 +6381,75 @@ mod tests {
         let mut restored = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut restored, &key).unwrap(), Some(b"before".to_vec()));
         assert_eq!(reopened.range_last_index("range-a"), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn range_restore_aborts_prepared_intents_before_restart() {
+        let dir = temp_dir("range-restore-prepared");
+        let key = RecordKey::new("t", "d", "s", b"prepared-restore");
+        let range = RangeOwner {
+            id: String::from("range-a"),
+            start: Vec::new(),
+            end: Vec::new(),
+            owner: 0,
+            replicas: vec![0],
+            epoch: 1,
+        };
+        let transaction_id = 991u128;
+        let transaction_state = {
+            let manager = TxnManager::new();
+            let mut txn = manager.begin();
+            manager.put(&mut txn, key.clone(), b"pending".to_vec());
+            txn.state()
+        };
+        let encoded_state = serde_json::to_vec(&transaction_state).unwrap();
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            node.set_range_owners(vec![range.clone()]);
+            node.append_range_follower_marked(
+                "range-a",
+                1,
+                0,
+                0,
+                0,
+                1,
+                5,
+                &encode_writes(&BTreeMap::new()).unwrap(),
+                0,
+                false,
+                RangeEntryKind::Prepare { transaction_id, state: encoded_state },
+            )
+            .unwrap();
+            node.append_range_follower_marked(
+                "range-a",
+                1,
+                0,
+                1,
+                1,
+                0,
+                0,
+                &[],
+                1,
+                false,
+                RangeEntryKind::Data,
+            )
+            .unwrap();
+            assert_eq!(node.range_prepared.lock().unwrap().len(), 1);
+            node.restore_to(5).await.unwrap();
+            assert_eq!(node.range_resolution("range-a", transaction_id, 5), Some(false));
+            assert!(node.range_prepared.lock().unwrap().is_empty());
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        reopened.set_range_owners(vec![range]);
+        assert!(reopened.range_prepared.lock().unwrap().is_empty());
+        assert!(matches!(
+            reopened
+                .prepare_range_group("range-a", transaction_id, 5, transaction_state)
+                .await,
+            Err(RymeError::Conflict(message)) if message == "transaction already aborted"
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 
