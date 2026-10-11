@@ -142,7 +142,7 @@ impl Wal {
                             break;
                         }
                     }
-                    None => break,
+                    None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
                 }
             }
             if !keep {
@@ -561,6 +561,27 @@ mod tests {
 
         assert!(matches!(wal.replace_records(&invalid), Err(RymeError::Corrupt(_))));
         assert_eq!(Wal::read_all(&dir).unwrap()[0].payload, b"existing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_rejects_truncated_sealed_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-truncated-sealed-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 64).unwrap();
+        wal.append(1, b"first").unwrap();
+        wal.append(2, b"second").unwrap();
+        wal.sync().unwrap();
+
+        let path = dir.join(segment_name(0));
+        let raw = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 1]).unwrap();
+        assert!(matches!(wal.truncate_below(2), Err(RymeError::Corrupt(_))));
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
