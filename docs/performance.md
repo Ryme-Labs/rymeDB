@@ -60,6 +60,9 @@ ryme-bench sql --addr 127.0.0.1:5433 --user postgres --database postgres \
 Use `--password` or `PGPASSWORD` when the PostgreSQL endpoint requires
 cleartext startup authentication.
 
+Add `--prepared` to measure PostgreSQL extended `Parse`/`Bind`/`Execute`
+requests; mixed runs prepare separate indexed read and upsert statements.
+
 Run the same command against PostgreSQL, Neon-compatible compute, and rymeDB.
 The result identifies the protocol and includes the same percentile and
 histogram fields as the RESP harness; report durability, schema/index state,

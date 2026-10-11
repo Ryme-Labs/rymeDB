@@ -1,5 +1,7 @@
 # Changelog
 
+- The PostgreSQL-wire benchmark now supports extended prepared statements
+  and labels simple versus prepared results separately.
 - Added a PostgreSQL-wire SQL benchmark driver for comparable simple-query
   runs against rymeDB, PostgreSQL, and Neon-compatible endpoints.
 - RESP and realtime benchmark JSON now records host/CPU metadata and

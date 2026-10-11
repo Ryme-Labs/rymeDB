@@ -66,6 +66,8 @@ enum Command {
         #[arg(long, default_value = "mixed")]
         workload: String,
         #[arg(long)]
+        prepared: bool,
+        #[arg(long)]
         json: bool,
     },
     Realtime {
@@ -123,7 +125,17 @@ async fn main() {
             })
             .await;
         }
-        Some(Command::Sql { addr, user, database, password, ops, concurrency, workload, json }) => {
+        Some(Command::Sql {
+            addr,
+            user,
+            database,
+            password,
+            ops,
+            concurrency,
+            workload,
+            prepared,
+            json,
+        }) => {
             sql_bench(SqlBench {
                 addr,
                 user,
@@ -132,6 +144,7 @@ async fn main() {
                 ops,
                 concurrency,
                 workload,
+                prepared,
                 json,
             })
             .await;
@@ -601,6 +614,7 @@ struct SqlBench {
     ops: usize,
     concurrency: usize,
     workload: String,
+    prepared: bool,
     json: bool,
 }
 
@@ -612,6 +626,7 @@ struct SqlTask {
     ops: usize,
     worker: usize,
     workload: String,
+    prepared: bool,
     ready_gate: Arc<tokio::sync::Barrier>,
     start_gate: Arc<tokio::sync::Barrier>,
 }
@@ -692,6 +707,78 @@ async fn pg_query(stream: &mut tokio::net::TcpStream, query: &str) -> Result<(),
     }
 }
 
+fn pg_frame(kind: u8, body: &[u8]) -> Result<Vec<u8>, String> {
+    let length = u32::try_from(body.len() + 4).map_err(|_| String::from("message too large"))?;
+    let mut frame = Vec::with_capacity(body.len() + 5);
+    frame.push(kind);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+fn pg_cstring(body: &mut Vec<u8>, value: &str) {
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+}
+
+async fn pg_prepare(
+    stream: &mut tokio::net::TcpStream,
+    name: &str,
+    query: &str,
+) -> Result<(), String> {
+    let mut parse = Vec::new();
+    pg_cstring(&mut parse, name);
+    pg_cstring(&mut parse, query);
+    parse.extend_from_slice(&0u16.to_be_bytes());
+    let mut frame = pg_frame(b'P', &parse)?;
+    frame.extend_from_slice(&pg_frame(b'S', &[])?);
+    stream.write_all(&frame).await.map_err(|error| error.to_string())?;
+    let mut failed = None;
+    loop {
+        let (kind, _) = pg_message(stream).await?;
+        match kind {
+            b'E' => failed = Some(String::from("PostgreSQL prepare failed")),
+            b'Z' => return failed.map_or(Ok(()), Err),
+            _ => {}
+        }
+    }
+}
+
+async fn pg_execute_prepared(
+    stream: &mut tokio::net::TcpStream,
+    name: &str,
+    parameter: &str,
+) -> Result<(), String> {
+    let mut bind = Vec::new();
+    pg_cstring(&mut bind, "");
+    pg_cstring(&mut bind, name);
+    bind.extend_from_slice(&1u16.to_be_bytes());
+    bind.extend_from_slice(&0u16.to_be_bytes());
+    bind.extend_from_slice(&1u16.to_be_bytes());
+    let parameter = parameter.as_bytes();
+    let length = i32::try_from(parameter.len()).map_err(|_| String::from("parameter too large"))?;
+    bind.extend_from_slice(&length.to_be_bytes());
+    bind.extend_from_slice(parameter);
+    bind.extend_from_slice(&0u16.to_be_bytes());
+
+    let mut execute = Vec::new();
+    pg_cstring(&mut execute, "");
+    execute.extend_from_slice(&0u32.to_be_bytes());
+    let mut frame = pg_frame(b'B', &bind)?;
+    frame.extend_from_slice(&pg_frame(b'E', &execute)?);
+    frame.extend_from_slice(&pg_frame(b'S', &[])?);
+    stream.write_all(&frame).await.map_err(|error| error.to_string())?;
+    let mut failed = None;
+    loop {
+        let (kind, _) = pg_message(stream).await?;
+        match kind {
+            b'E' => failed = Some(String::from("PostgreSQL prepared query failed")),
+            b'Z' => return failed.map_or(Ok(()), Err),
+            _ => {}
+        }
+    }
+}
+
 async fn run_sql_worker(task: SqlTask) -> (Vec<u64>, u64) {
     let mut stream =
         match pg_connect(&task.addr, &task.user, &task.database, task.password.as_deref()).await {
@@ -716,6 +803,22 @@ async fn run_sql_worker(task: SqlTask) -> (Vec<u64>, u64) {
     if !setup_ok {
         return (Vec::new(), task.ops as u64);
     }
+    let prepared_queries = if task.prepared {
+        for (name, query) in [
+            ("ryme_bench_select", "SELECT payload FROM ryme_bench_sql WHERE id = $1"),
+            (
+                "ryme_bench_insert",
+                "INSERT INTO ryme_bench_sql (id, payload) VALUES ($1, 'payload') ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload",
+            ),
+        ] {
+            if pg_prepare(&mut stream, name, query).await.is_err() {
+                return (Vec::new(), task.ops as u64);
+            }
+        }
+        true
+    } else {
+        false
+    };
     let mut latencies = Vec::with_capacity(task.ops);
     let mut errors = 0u64;
     for index in 0..task.ops {
@@ -733,7 +836,17 @@ async fn run_sql_worker(task: SqlTask) -> (Vec<u64>, u64) {
             ),
         };
         let started = Instant::now();
-        if pg_query(&mut stream, &query).await.is_ok() {
+        let query_result = if prepared_queries {
+            let name = if task.workload == "select" || index.is_multiple_of(2) {
+                "ryme_bench_select"
+            } else {
+                "ryme_bench_insert"
+            };
+            pg_execute_prepared(&mut stream, name, &key).await
+        } else {
+            pg_query(&mut stream, &query).await
+        };
+        if query_result.is_ok() {
             latencies.push(started.elapsed().as_micros() as u64);
         } else {
             errors = errors.saturating_add(1);
@@ -756,6 +869,7 @@ async fn sql_bench(config: SqlBench) {
             ops: worker_ops(config.ops, workers, worker),
             worker,
             workload: config.workload.clone(),
+            prepared: config.prepared,
             ready_gate: ready_gate.clone(),
             start_gate: start_gate.clone(),
         })));
@@ -781,9 +895,14 @@ async fn sql_bench(config: SqlBench) {
     };
     let output = serde_json::json!({
         "target": config.addr,
-        "protocol": "postgres-simple-query",
+        "protocol": if config.prepared {
+            "postgres-extended-prepared"
+        } else {
+            "postgres-simple-query"
+        },
         "database": config.database,
         "workload": config.workload,
+        "prepared": config.prepared,
         "machine": machine_metadata(),
         "requested_ops": config.ops,
         "successful_ops": count,
@@ -802,9 +921,11 @@ async fn sql_bench(config: SqlBench) {
         println!("{output}");
     } else {
         println!(
-            "target={} protocol=postgres-simple-query workload={} requested_ops={} successful_ops={} failed_ops={} qps={:.0} p50={}us p99={}us max={}us",
+            "target={} protocol={} workload={} prepared={} requested_ops={} successful_ops={} failed_ops={} qps={:.0} p50={}us p99={}us max={}us",
             output["target"].as_str().unwrap_or(""),
+            output["protocol"].as_str().unwrap_or(""),
             output["workload"].as_str().unwrap_or(""),
+            config.prepared,
             config.ops,
             count,
             errors,
