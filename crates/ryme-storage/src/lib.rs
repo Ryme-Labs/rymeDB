@@ -449,7 +449,12 @@ impl Engine {
                 }
             }
             if keep_from > 0 {
-                versions.drain(0..keep_from);
+                let reclaimed = versions
+                    .drain(0..keep_from)
+                    .filter_map(|version| version.value)
+                    .map(|value| value.len() as u64)
+                    .sum::<u64>();
+                self.bytes_held = self.bytes_held.saturating_sub(reclaimed);
             }
         }
     }
@@ -687,6 +692,23 @@ mod tests {
             engine.version_at(&key, 512),
             Some((512, Some(512u64.to_be_bytes().to_vec()), 0))
         );
+    }
+
+    #[test]
+    fn gc_reclaims_bytes_for_discarded_mvcc_versions() {
+        let mut engine = Engine::new();
+        let key = RecordKey::new("t", "d", "history", b"row");
+        engine.apply(key.clone(), 1, Some(b"old".to_vec())).unwrap();
+        engine.apply(key.clone(), 2, Some(b"older".to_vec())).unwrap();
+        engine.apply(key.clone(), 3, Some(b"anchor".to_vec())).unwrap();
+        engine.apply(key.clone(), 4, Some(b"new".to_vec())).unwrap();
+
+        assert_eq!(engine.bytes_held(), 3 + 5 + 6 + 3);
+        engine.gc(3);
+
+        assert_eq!(engine.bytes_held(), 6 + 3);
+        assert_eq!(engine.read(&key, 3, 0).unwrap(), Some(b"anchor".to_vec()));
+        assert_eq!(engine.read(&key, 4, 0).unwrap(), Some(b"new".to_vec()));
     }
 
     #[test]
