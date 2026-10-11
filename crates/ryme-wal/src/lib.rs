@@ -22,6 +22,7 @@ pub struct Wal {
     segment_size_bytes: u64,
     active_id: u64,
     active: File,
+    active_len: u64,
     next_lsn: u64,
     poisoned: bool,
 }
@@ -34,11 +35,13 @@ impl Wal {
         let path = dir.join(segment_name(active_id));
         let mut active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
         let next_lsn = recover_next_lsn(dir, active_id, &mut active)?;
+        let active_len = active.metadata()?.len();
         Ok(Self {
             dir: dir.to_path_buf(),
             segment_size_bytes,
             active_id,
             active,
+            active_len,
             next_lsn,
             poisoned: false,
         })
@@ -62,22 +65,21 @@ impl Wal {
             .checked_add(1)
             .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))?;
         let frame = encode_frame(lsn, commit_ts, payload);
-        let mut active_len = self.active.metadata()?.len();
-        if active_len.saturating_add(frame.len() as u64) > self.segment_size_bytes {
+        if self.active_len.saturating_add(frame.len() as u64) > self.segment_size_bytes {
             if let Err(error) = self.rotate() {
                 self.poisoned = true;
                 return Err(error);
             }
-            active_len = 0;
         }
         let write_result =
-            write_frame_with_rollback(&mut self.active, &frame, active_len, |file, frame| {
+            write_frame_with_rollback(&mut self.active, &frame, self.active_len, |file, frame| {
                 file.write_all(frame)
             });
         if let Err(error) = write_result {
             self.poisoned = true;
             return Err(error.into());
         }
+        self.active_len = self.active_len.saturating_add(frame.len() as u64);
         self.next_lsn = next_lsn;
         Ok(WalRecord { lsn, commit_ts, payload: payload.to_vec() })
     }
@@ -214,6 +216,7 @@ impl Wal {
         self.active_id = latest_segment_id(&self.dir)?;
         let active_path = self.dir.join(segment_name(self.active_id));
         self.active = OpenOptions::new().create(true).read(true).append(true).open(active_path)?;
+        self.active_len = self.active.metadata()?.len();
         self.next_lsn = next_lsn;
         self.poisoned = false;
         Ok(())
@@ -230,6 +233,7 @@ impl Wal {
         sync_directory(&self.dir)?;
         self.active = next;
         self.active_id = next_id;
+        self.active_len = 0;
         Ok(())
     }
 }
@@ -570,13 +574,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut wal = Wal::open(&dir, 1024).unwrap();
         wal.append(1, b"first").unwrap();
+        assert_eq!(wal.active_len, wal.active.metadata().unwrap().len());
         wal.sync().unwrap();
         wal.rotate().unwrap();
+        assert_eq!(wal.active_len, 0);
         drop(wal);
 
         let mut reopened = Wal::open(&dir, 1024).unwrap();
         assert_eq!(reopened.next_lsn(), 1);
+        assert_eq!(reopened.active_len, reopened.active.metadata().unwrap().len());
         reopened.append(2, b"second").unwrap();
+        assert_eq!(reopened.active_len, reopened.active.metadata().unwrap().len());
         reopened.sync().unwrap();
         let records = Wal::read_all(&dir).unwrap();
         assert_eq!(records.iter().map(|record| record.lsn).collect::<Vec<_>>(), vec![0, 1]);
