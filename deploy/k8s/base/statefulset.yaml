@@ -73,7 +73,7 @@ spec:
     spec:
       containers:
         - name: ryme-server
-          image: rymelabs/rymedb:0.1.0
+          image: ghcr.io/ryme-labs/rymedb:0.1.0
           imagePullPolicy: IfNotPresent
           env:
             - name: RYME_API_KEY

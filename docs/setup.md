@@ -114,7 +114,33 @@ Build the image locally:
 docker buildx build --load -f deploy/docker/Dockerfile.server -t rymeDB:local .
 ```
 
-## 6. Install a client
+## 6. Kubernetes
+
+The plain manifest runs one node. Apply it after creating the API-key secret:
+
+```bash
+kubectl apply -f deploy/k8s/base/statefulset.yaml
+kubectl -n rymedb create secret generic rymedb-api-key \
+  --from-literal=api-key=local-dev-key --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n rymedb rollout status statefulset/rymedb
+kubectl -n rymedb get pods -w
+```
+
+For the peer-aware three-node Raft chart, install Helm and set the image to
+the tag you want to run:
+
+```bash
+helm upgrade --install rymedb deploy/k8s/helm/rymeDB \
+  --namespace rymedb --create-namespace \
+  --set image.repository=ghcr.io/ryme-labs/rymedb \
+  --set image.tag=0.1.0
+```
+
+Create the `rymedb-api-key` secret before the pods start if the chart is being
+installed into an existing namespace. Keep the database volume attached to a
+single pod and use a storage class that supports the requested durability.
+
+## 7. Install a client
 
 | Client | Local checkout | Published package |
 | --- | --- | --- |

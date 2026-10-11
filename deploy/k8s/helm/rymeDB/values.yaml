@@ -1,6 +1,6 @@
 replicaCount: 3
 image:
-  repository: rymelabs/rymedb
+  repository: ghcr.io/ryme-labs/rymedb
   tag: 0.1.0
   pullPolicy: IfNotPresent
 service:
