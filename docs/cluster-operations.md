@@ -268,6 +268,12 @@ begin. Changing the configured range map invalidates an older transaction at
 commit, including write-only owner forwarding; the mesh returns a typed
 `conflict: range topology changed` response so callers can retry against the
 new placement.
+Owner-routed point reads and scans carry the transaction's MVCC read timestamp
+to the range owner. If a transaction has not performed any operation yet and
+the gateway's local range view is stale, its first remote point read establishes
+the snapshot from the owner; subsequent reads and scans keep that timestamp.
+An existing transaction snapshot is never silently replaced by the owner's
+latest state.
 Point reads and point mutations in the PostgreSQL transaction path can now
 fetch missing rows from their configured range owner and add the result to the
 same transaction read set. Filtered scans, joins that depend on remote rows,

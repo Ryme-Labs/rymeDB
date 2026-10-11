@@ -1,5 +1,9 @@
 # Changelog
 
+- Owner-routed cluster transactions now pin their snapshot at the first remote
+  point read when the gateway's local range view is stale, then forward that
+  timestamp for later reads and range scans. Existing transaction snapshots are
+  never silently replaced by the owner's latest state.
 - Cross-range transaction decisions now persist participant-resolution work in a
   separate WAL. Lost commit/abort RPCs are retried from memory and after node
   restart until each participant acknowledges the resolution, preventing a

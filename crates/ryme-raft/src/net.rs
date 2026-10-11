@@ -83,6 +83,8 @@ pub(crate) enum Rpc {
     RangeReadResponse {
         value: Option<Vec<u8>>,
         expires_at: Option<u64>,
+        #[serde(default)]
+        read_ts: u64,
     },
     RangeReadBatchRequest {
         keys: Vec<RecordKey>,
@@ -2179,7 +2181,9 @@ impl Node {
             }
             Rpc::RangeReadRequest { key, read_ts } => {
                 let (value, expires_at) = self.read_range_value(&key, read_ts)?;
-                Ok(Rpc::RangeReadResponse { value, expires_at })
+                let effective_read_ts =
+                    if read_ts == 0 { self.manager.latest_commit() } else { read_ts };
+                Ok(Rpc::RangeReadResponse { value, expires_at, read_ts: effective_read_ts })
             }
             Rpc::RangeReadBatchRequest { keys, read_ts } => {
                 let values = self.read_range_values(&keys, read_ts)?;
@@ -4232,9 +4236,21 @@ impl Node {
         key: RecordKey,
         read_ts: u64,
     ) -> Result<(Option<Vec<u8>>, Option<u64>)> {
+        let (value, expires_at, _) = self.fetch_range_value_with_ts(peer, key, read_ts).await?;
+        Ok((value, expires_at))
+    }
+
+    pub async fn fetch_range_value_with_ts(
+        &self,
+        peer: usize,
+        key: RecordKey,
+        read_ts: u64,
+    ) -> Result<(Option<Vec<u8>>, Option<u64>, u64)> {
         let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
         match pool.roundtrip(&Rpc::RangeReadRequest { key, read_ts }).await? {
-            Rpc::RangeReadResponse { value, expires_at } => Ok((value, expires_at)),
+            Rpc::RangeReadResponse { value, expires_at, read_ts } => {
+                Ok((value, expires_at, read_ts))
+            }
             _ => Err(RymeError::Corrupt(String::from("range read rpc"))),
         }
     }
@@ -4388,7 +4404,15 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             // The routing replica may observe the global commit after the client
             // replica does. Ask the range owner for its current durable view so a
             // successful write is immediately visible through a routed read.
-            let (value, _) = node.fetch_range_value(owner, key.clone(), 0).await?;
+            let establish_snapshot = txn.read_keys().is_empty()
+                && txn.writes().is_empty()
+                && txn.scanned_tables().is_empty();
+            let read_ts = if establish_snapshot { 0 } else { txn.read_ts };
+            let (value, _, observed_read_ts) =
+                node.fetch_range_value_with_ts(owner, key.clone(), read_ts).await?;
+            if establish_snapshot && observed_read_ts != 0 {
+                txn.restamp(observed_read_ts);
+            }
             txn.record_read(key.clone(), value.is_some());
             Ok(value)
         })
@@ -4405,7 +4429,8 @@ impl ryme_txn::TxnBackend for ClusterBackend {
     {
         let node = self.node.clone();
         Box::pin(async move {
-            let page = node.scan_range_page(tenant, database, table, None, 0, limit).await?;
+            let page =
+                node.scan_range_page(tenant, database, table, None, txn.read_ts, limit).await?;
             let Some(page) = page else {
                 return node.manager().scan(txn, tenant, database, table, limit);
             };
@@ -4426,8 +4451,9 @@ impl ryme_txn::TxnBackend for ClusterBackend {
     {
         let node = self.node.clone();
         Box::pin(async move {
-            let page =
-                node.scan_range_page(tenant, database, table, Some(start_after), 0, limit).await?;
+            let page = node
+                .scan_range_page(tenant, database, table, Some(start_after), txn.read_ts, limit)
+                .await?;
             let Some(page) = page else {
                 return node.manager().scan_after(txn, tenant, database, table, start_after, limit);
             };
@@ -4788,6 +4814,26 @@ mod tests {
             reopened_again.manager.get(&mut probe, &key).unwrap(),
             Some(b"pending".to_vec())
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn range_snapshot_honors_transaction_read_timestamp() {
+        let dir = temp_dir("range-snapshot-ts");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let key = RecordKey::new("t", "d", "docs", b"row");
+        let mut first = BTreeMap::new();
+        first.insert(key.clone(), ryme_txn::WriteOp::put(b"old".to_vec()));
+        node.manager.replay_at(10, &first).unwrap();
+        let mut second = BTreeMap::new();
+        second.insert(key, ryme_txn::WriteOp::put(b"new".to_vec()));
+        node.manager.replay_at(20, &second).unwrap();
+
+        let snapshot =
+            node.snapshot_range_for(b"docs\0", b"docs\0\xff", 10, 100, None, None).unwrap();
+        assert_eq!(snapshot.snapshot_ts, 10);
+        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(snapshot.rows[0].versions[0].value, Some(b"old".to_vec()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
