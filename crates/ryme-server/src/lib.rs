@@ -732,6 +732,7 @@ pub struct SharedState {
     tenant: String,
     database: String,
     branch_path: std::path::PathBuf,
+    branch_metadata_path: std::path::PathBuf,
     promotion_path: std::path::PathBuf,
     auth_path: std::path::PathBuf,
     control_path: std::path::PathBuf,
@@ -811,6 +812,28 @@ struct BranchPromotionJournal {
     writes: Vec<(ryme_storage::RecordKey, ryme_txn::WriteOp)>,
     phase: BranchPromotionPhase,
 }
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BranchMetadataPhase {
+    Prepared,
+    SchemaPersisted,
+    BranchesPersisted,
+    ControlPersisted,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BranchMetadataJournal {
+    tenant: String,
+    branch: String,
+    old_branches: ryme_branch::BranchManager,
+    new_branches: ryme_branch::BranchManager,
+    new_scope: Option<ryme_migrate::Ledger>,
+    new_schema: Option<ryme_sql::SchemaSnapshot>,
+    phase: BranchMetadataPhase,
+}
+
+const BRANCH_METADATA_JOURNAL_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 fn load_durable_snapshot(
     path: &std::path::Path,
@@ -1418,6 +1441,161 @@ impl SharedState {
         Ok(())
     }
 
+    fn persist_branch_metadata_journal(
+        &self,
+        journal: &BranchMetadataJournal,
+    ) -> ryme_error::Result<()> {
+        let bytes = serde_json::to_vec(journal).map_err(|error| {
+            ryme_error::RymeError::Internal(format!("branch metadata journal: {error}"))
+        })?;
+        if bytes.len() > BRANCH_METADATA_JOURNAL_MAX_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("branch metadata journal")));
+        }
+        if let Some(parent) = self.branch_metadata_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self.branch_metadata_path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_data()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(temporary, &self.branch_metadata_path)?;
+        if let Some(parent) = self.branch_metadata_path.parent() {
+            sync_metadata_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn load_branch_metadata_journal(&self) -> ryme_error::Result<Option<BranchMetadataJournal>> {
+        let bytes = match std::fs::read(&self.branch_metadata_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if bytes.len() > BRANCH_METADATA_JOURNAL_MAX_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("branch metadata journal")));
+        }
+        let journal = serde_json::from_slice(&bytes).map_err(|error| {
+            ryme_error::RymeError::Corrupt(format!("branch metadata journal: {error}"))
+        })?;
+        Ok(Some(journal))
+    }
+
+    fn clear_branch_metadata_journal(&self) -> ryme_error::Result<()> {
+        match std::fs::remove_file(&self.branch_metadata_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(parent) = self.branch_metadata_path.parent() {
+            sync_metadata_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn remove_branch_schema(&self, tenant: &str, branch: &str) -> ryme_error::Result<()> {
+        let path = self.branch_schema_path(tenant, branch);
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(parent) = self.branch_schema_path(tenant, branch).parent() {
+            sync_metadata_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn validate_branch_metadata_journal(
+        &self,
+        journal: &BranchMetadataJournal,
+    ) -> ryme_error::Result<()> {
+        if journal.tenant.is_empty() || journal.branch.is_empty() {
+            return Err(ryme_error::RymeError::Corrupt(String::from("branch metadata identity")));
+        }
+        if journal.new_schema.is_some() {
+            if journal.new_branches.get_for(&journal.tenant, &journal.branch).is_err()
+                || journal.old_branches.get_for(&journal.tenant, &journal.branch).is_ok()
+                || journal.new_scope.is_none()
+            {
+                return Err(ryme_error::RymeError::Corrupt(String::from("branch metadata create")));
+            }
+        } else if journal.old_branches.get_for(&journal.tenant, &journal.branch).is_err()
+            || journal.new_branches.get_for(&journal.tenant, &journal.branch).is_ok()
+            || journal.new_scope.is_some()
+        {
+            return Err(ryme_error::RymeError::Corrupt(String::from("branch metadata delete")));
+        }
+        Ok(())
+    }
+
+    fn complete_branch_metadata(
+        &self,
+        mut journal: BranchMetadataJournal,
+    ) -> ryme_error::Result<()> {
+        self.validate_branch_metadata_journal(&journal)?;
+        if matches!(journal.phase, BranchMetadataPhase::Prepared) {
+            match &journal.new_schema {
+                Some(schema) => {
+                    ryme_sql::persist_schema_snapshot(
+                        &self.branch_schema_path(&journal.tenant, &journal.branch),
+                        schema,
+                    )?;
+                }
+                None => self.remove_branch_schema(&journal.tenant, &journal.branch)?,
+            }
+            journal.phase = BranchMetadataPhase::SchemaPersisted;
+            self.persist_branch_metadata_journal(&journal)?;
+        }
+        if matches!(journal.phase, BranchMetadataPhase::SchemaPersisted) {
+            journal.new_branches.persist(&self.branch_path)?;
+            journal.phase = BranchMetadataPhase::BranchesPersisted;
+            self.persist_branch_metadata_journal(&journal)?;
+        }
+        if matches!(journal.phase, BranchMetadataPhase::BranchesPersisted) {
+            let mut control = self
+                .control
+                .lock()
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+            let previous_branches = control.branches.clone();
+            let had_scope = control.has_migration_scope(&journal.tenant, &journal.branch);
+            let previous_scope = control.migration_ledger(&journal.tenant, &journal.branch);
+            control.branches = journal.new_branches.clone();
+            match &journal.new_scope {
+                Some(scope) => {
+                    control.set_migration_ledger(&journal.tenant, &journal.branch, scope.clone())
+                }
+                None => control.remove_migration_scope(&journal.tenant, &journal.branch),
+            }
+            if let Err(error) = self.persist_control_locked(&control) {
+                control.branches = previous_branches;
+                if had_scope {
+                    control.set_migration_ledger(&journal.tenant, &journal.branch, previous_scope);
+                } else {
+                    control.remove_migration_scope(&journal.tenant, &journal.branch);
+                }
+                return Err(error);
+            }
+            journal.phase = BranchMetadataPhase::ControlPersisted;
+            self.persist_branch_metadata_journal(&journal)?;
+        }
+        self.clear_branch_metadata_journal()
+    }
+
+    async fn recover_branch_metadata(&self) -> ryme_error::Result<()> {
+        let Some(journal) = self.load_branch_metadata_journal()? else {
+            return Ok(());
+        };
+        self.complete_branch_metadata(journal)
+    }
+
     fn load_branch_promotion_journal(&self) -> ryme_error::Result<Option<BranchPromotionJournal>> {
         let bytes = match std::fs::read(&self.promotion_path) {
             Ok(bytes) => bytes,
@@ -1905,6 +2083,7 @@ impl SharedState {
             tenant,
             database,
             branch_path,
+            branch_metadata_path: config.data_dir.join("branch-metadata.json"),
             promotion_path: config.data_dir.join("branch-promotion.json"),
             auth_path,
             control_path,
@@ -2483,6 +2662,7 @@ pub async fn serve(
     http_listener: TcpListener,
 ) -> ryme_error::Result<()> {
     let state = SharedState::build(&config)?;
+    state.recover_branch_metadata().await?;
     state.recover_branch_promotion().await?;
     serve_state(
         state,
@@ -2526,6 +2706,7 @@ pub async fn serve_with_optional(
     extra: OptionalListeners,
 ) -> ryme_error::Result<()> {
     let state = SharedState::build(&config)?;
+    state.recover_branch_metadata().await?;
     state.recover_branch_promotion().await?;
     serve_state(
         state,
@@ -2564,6 +2745,7 @@ pub async fn serve_cluster(
     raft_listener: TcpListener,
 ) -> ryme_error::Result<ClusterHandle> {
     let state = SharedState::build(&config)?;
+    state.recover_branch_metadata().await?;
     state.recover_branch_promotion().await?;
     let node = match state.backend.clone() {
         Backend::Cluster(backend) => backend.node().clone(),
@@ -8573,20 +8755,24 @@ async fn branch_create(
         base_commit_ts,
     ) {
         Ok(()) => {
-            let schema_path = state.branch_schema_path(&principal.tenant, &branch_id);
-            if let Err(e) = ryme_sql::persist_schema_snapshot(&schema_path, &parent_schema) {
-                return error_response(e);
+            let old_branches = control.branches.clone();
+            let new_scope = control.migration_ledger(&principal.tenant, &request.parent);
+            drop(control);
+            let journal = BranchMetadataJournal {
+                tenant: principal.tenant.clone(),
+                branch: branch_id,
+                old_branches,
+                new_branches: branches,
+                new_scope: Some(new_scope),
+                new_schema: Some(parent_schema),
+                phase: BranchMetadataPhase::Prepared,
+            };
+            if let Err(error) = state.persist_branch_metadata_journal(&journal) {
+                return error_response(error);
             }
-            control.clone_migration_scope(&principal.tenant, &request.parent, &branch_id);
-            match branches.persist(&state.branch_path) {
-                Ok(()) => {
-                    control.branches = branches;
-                    if let Err(e) = state.persist_control_locked(&control) {
-                        return error_response(e);
-                    }
-                    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
-                }
-                Err(e) => error_response(e),
+            match state.complete_branch_metadata(journal) {
+                Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+                Err(error) => error_response(error),
             }
         }
         Err(e) => error_response(e),
@@ -8634,18 +8820,27 @@ async fn branch_delete(
     };
     let mut branches = control.branches.clone();
     match branches.delete_for(&principal.tenant, &id) {
-        Ok(garbage) => match branches.persist(&state.branch_path) {
-            Ok(()) => {
-                control.branches = branches;
-                control.remove_migration_scope(&principal.tenant, &id);
-                if let Err(e) = state.persist_control_locked(&control) {
-                    return error_response(e);
-                }
-                let _ = std::fs::remove_file(state.branch_schema_path(&principal.tenant, &id));
-                (StatusCode::OK, Json(serde_json::json!({ "garbage": garbage }))).into_response()
+        Ok(garbage) => {
+            let old_branches = control.branches.clone();
+            drop(control);
+            let journal = BranchMetadataJournal {
+                tenant: principal.tenant.clone(),
+                branch: id,
+                old_branches,
+                new_branches: branches,
+                new_scope: None,
+                new_schema: None,
+                phase: BranchMetadataPhase::Prepared,
+            };
+            if let Err(error) = state.persist_branch_metadata_journal(&journal) {
+                return error_response(error);
             }
-            Err(e) => error_response(e),
-        },
+            match state.complete_branch_metadata(journal) {
+                Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "garbage": garbage })))
+                    .into_response(),
+                Err(error) => error_response(error),
+            }
+        }
         Err(e) => error_response(e),
     }
 }
@@ -13455,6 +13650,56 @@ mod realtime_policy_tests {
         let key = ryme_storage::RecordKey::new("default", "default", "messages", b"m2");
         let mut txn = restarted.backend.begin();
         assert_eq!(restarted.backend.get(&mut txn, &key).unwrap(), Some(b"branch".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn branch_metadata_journal_finishes_create_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-branch-metadata-journal-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("branch-metadata-journal");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        let (old_branches, new_branches, new_scope) = {
+            let control = state.control.lock().unwrap();
+            let old_branches = control.branches.clone();
+            let mut new_branches = old_branches.clone();
+            new_branches
+                .create_child_for(
+                    "default",
+                    String::from("preview"),
+                    "main",
+                    state.backend.latest_commit(),
+                )
+                .unwrap();
+            let new_scope = control.migration_ledger("default", "main");
+            (old_branches, new_branches, new_scope)
+        };
+        state
+            .persist_branch_metadata_journal(&BranchMetadataJournal {
+                tenant: String::from("default"),
+                branch: String::from("preview"),
+                old_branches,
+                new_branches,
+                new_scope: Some(new_scope),
+                new_schema: Some(state.executor.schema_snapshot()),
+                phase: BranchMetadataPhase::Prepared,
+            })
+            .unwrap();
+        drop(state);
+
+        let restarted = SharedState::build(&config).unwrap();
+        restarted.recover_branch_metadata().await.unwrap();
+        assert!(restarted.control.lock().unwrap().branches.get_for("default", "preview").is_ok());
+        assert!(restarted.control.lock().unwrap().has_migration_scope("default", "preview"));
+        assert!(load_existing_schema_snapshot(&restarted.branch_schema_path("default", "preview"))
+            .is_ok());
+        assert!(!restarted.branch_metadata_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
