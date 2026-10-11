@@ -8404,9 +8404,12 @@ fn branch_diff_data(
     }
 
     let mut changes = Vec::new();
+    let rls_executor = state.executor.clone().with_tenant(tenant.to_string());
     for table in tables {
-        let left_rows = scan_branch_diff_rows(&left_backend, tenant, &state.database, &table)?;
-        let right_rows = scan_branch_diff_rows(&right_backend, tenant, &state.database, &table)?;
+        let mut left_rows = scan_branch_diff_rows(&left_backend, tenant, &state.database, &table)?;
+        let mut right_rows = scan_branch_diff_rows(&right_backend, tenant, &state.database, &table)?;
+        left_rows.retain(|_, value| rls_executor.row_allowed_by_rls(&table, value));
+        right_rows.retain(|_, value| rls_executor.row_allowed_by_rls(&table, value));
         let keys: BTreeSet<Vec<u8>> = left_rows.keys().chain(right_rows.keys()).cloned().collect();
         for pk in keys {
             let left_value = left_rows.get(&pk);
@@ -8417,8 +8420,12 @@ fn branch_diff_data(
             changes.push(BranchRowDiff {
                 table: table.clone(),
                 pk: ryme_auth::base64_url_encode(&pk),
-                left: left_value.map(|value| ryme_auth::base64_url_encode(value)),
-                right: right_value.map(|value| ryme_auth::base64_url_encode(value)),
+                left: left_value.map(|value| {
+                    ryme_auth::base64_url_encode(&state.gateway.masked(&table, value.clone()))
+                }),
+                right: right_value.map(|value| {
+                    ryme_auth::base64_url_encode(&state.gateway.masked(&table, value.clone()))
+                }),
             });
         }
     }
