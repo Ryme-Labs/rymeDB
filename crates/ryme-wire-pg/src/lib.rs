@@ -1,5 +1,5 @@
+use ryme_auth::{Principal, Role};
 use ryme_error::{Result, RymeError};
-use ryme_auth::Principal;
 pub use ryme_gateway::{RemoteRead, RemoteReader};
 use ryme_metering::{MeterRegistry, Metric, UsageEvent};
 use ryme_observe::{
@@ -510,7 +510,7 @@ where
     B: TxnBackend,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (executor, limits) =
+    let (executor, limits, user) =
         authenticate_startup(&mut socket, executor, limits, &startup, authenticator.as_ref())
             .await?;
     let (pid, secret, cancellation) = register_backend();
@@ -527,7 +527,7 @@ where
             cancellation,
             pid,
             notifications,
-            startup.user,
+            user,
             startup.database,
         )
         .await
@@ -657,13 +657,13 @@ async fn authenticate_startup<B, S>(
     limits: ConnLimits,
     startup: &StartupParams,
     authenticator: Option<&PgAuthenticator>,
-) -> Result<(Arc<Executor<B>>, ConnLimits)>
+) -> Result<(Arc<Executor<B>>, ConnLimits, String)>
 where
     B: TxnBackend,
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let Some(authenticator) = authenticator else {
-        return Ok((executor, limits));
+        return Ok((executor, limits, startup.user.clone()));
     };
     send_auth_cleartext_password(socket).await?;
     let (tag, payload) = read_client_message(socket).await?;
@@ -702,13 +702,26 @@ where
         }
     };
     let tenant = principal.tenant.clone();
-    let role = if principal.can_admin() { String::from("postgres") } else { startup.user.clone() };
-    let executor = Arc::new((*executor).clone().with_tenant(tenant.clone()).with_role(role));
+    let role = sql_role_for_principal(&principal);
+    let executor =
+        Arc::new((*executor).clone().with_tenant(tenant.clone()).with_role(role.clone()));
     let mut limits = limits.with_tenant(tenant);
     limits.read_allowed = principal.can_read();
     limits.write_allowed = principal.can_write();
     limits.admin_allowed = principal.can_admin();
-    Ok((executor, limits))
+    Ok((executor, limits, role))
+}
+
+fn sql_role_for_principal(principal: &Principal) -> String {
+    if principal.can_admin() {
+        String::from("postgres")
+    } else if principal.can_write() {
+        String::from("authenticated")
+    } else if principal.roles.contains(&Role::ReadOnly) {
+        String::from("anon")
+    } else {
+        String::from("realtime_subscriber")
+    }
 }
 
 async fn read_client_message<S>(socket: &mut S) -> Result<(u8, Vec<u8>)>
@@ -4542,6 +4555,30 @@ mod tests {
             assert!(admit_statement(&limits, &statement, sql.len() as u64).is_none(), "{sql}");
             limits.admin_allowed = false;
         }
+    }
+
+    #[test]
+    fn sql_role_is_derived_from_authenticated_capabilities() {
+        let read_write = Principal {
+            id: String::from("postgres"),
+            tenant: String::from("tenant"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        assert_eq!(sql_role_for_principal(&read_write), "authenticated");
+
+        let read_only = Principal {
+            id: String::from("postgres"),
+            tenant: String::from("tenant"),
+            roles: [Role::ReadOnly].into_iter().collect(),
+        };
+        assert_eq!(sql_role_for_principal(&read_only), "anon");
+
+        let admin = Principal {
+            id: String::from("untrusted-id"),
+            tenant: String::from("tenant"),
+            roles: [Role::Admin].into_iter().collect(),
+        };
+        assert_eq!(sql_role_for_principal(&admin), "postgres");
     }
 
     #[test]

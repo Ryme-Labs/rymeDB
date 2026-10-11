@@ -171,6 +171,59 @@ async fn password_authenticates_and_routes_the_session_tenant() {
 }
 
 #[tokio::test]
+async fn authenticated_user_cannot_impersonate_postgres_startup_role() {
+    let manager = ryme_txn::TxnManager::new();
+    let executor =
+        ryme_sql::Executor::with_manager(String::from("default"), String::from("d"), manager);
+    let gateway = ryme_wire_pg::PgGateway::with_executor(executor.clone()).with_authenticator(
+        |_, password| {
+            (password == "secret")
+                .then(|| ryme_auth::Principal {
+                    id: String::from("alice"),
+                    tenant: String::from("default"),
+                    roles: [ryme_auth::Role::ReadWrite].into_iter().collect(),
+                })
+                .ok_or(ryme_error::RymeError::Unauthorized)
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket.write_all(&startup_packet("postgres", "postgres")).await.unwrap();
+    let (tag, body) = read_frame(&mut socket).await;
+    assert_eq!(tag, b'R');
+    assert_eq!(u32::from_be_bytes(body[..4].try_into().unwrap()), 3);
+    socket.write_all(&password_packet("secret")).await.unwrap();
+    loop {
+        let (tag, _) = read_frame(&mut socket).await;
+        if tag == b'Z' {
+            break;
+        }
+    }
+
+    socket
+        .write_all(&frame(b'Q', b"CREATE TABLE public.escalated (id TEXT PRIMARY KEY)\0"))
+        .await
+        .unwrap();
+    let mut error = Vec::new();
+    loop {
+        let (tag, body) = read_frame(&mut socket).await;
+        if tag == b'E' {
+            error = body;
+        }
+        if tag == b'Z' {
+            break;
+        }
+    }
+    assert!(String::from_utf8_lossy(&error).contains("42501"));
+    assert!(!executor.schema_snapshot().tables.contains_key("public.escalated"));
+}
+
+#[tokio::test]
 async fn password_authentication_rejects_invalid_credentials() {
     let gateway = ryme_wire_pg::PgGateway::new(String::from("default"), String::from("d"))
         .with_authenticator(|_, password| {
