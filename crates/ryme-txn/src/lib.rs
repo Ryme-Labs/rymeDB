@@ -329,6 +329,59 @@ impl Transaction {
         &self.scanned
     }
 
+    pub fn scan_overlay_count(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start_after: Option<&[u8]>,
+    ) -> usize {
+        self.writes
+            .keys()
+            .filter(|key| {
+                key.tenant == tenant
+                    && key.database == database
+                    && key.table == table
+                    && start_after.is_none_or(|start| key.pk.as_slice() > start)
+            })
+            .count()
+    }
+
+    pub fn overlay_scan(
+        &self,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = rows.into_iter().collect();
+        let now = now_unix();
+        for (key, op) in &self.writes {
+            if key.tenant != tenant
+                || key.database != database
+                || key.table != table
+                || start_after.is_some_and(|start| key.pk.as_slice() <= start)
+            {
+                continue;
+            }
+            let visible = op.expires_at == 0 || op.expires_at > now;
+            match (visible, op.value.as_ref()) {
+                (true, Some(value)) => {
+                    merged.insert(key.pk.clone(), value.clone());
+                }
+                _ => {
+                    merged.remove(&key.pk);
+                }
+            }
+        }
+        merged.into_iter().take(limit).collect()
+    }
+
     pub fn isolation(&self) -> Isolation {
         self.isolation
     }
@@ -1020,12 +1073,15 @@ impl TxnManager {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        let scan_limit =
+            limit.saturating_add(txn.scan_overlay_count(tenant, database, table, None));
         let engine = self
             .inner
             .engine
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        Ok(engine.scan(tenant, database, table, txn.read_ts, now_unix(), limit))
+        let rows = engine.scan(tenant, database, table, txn.read_ts, now_unix(), scan_limit);
+        Ok(txn.overlay_scan(rows, tenant, database, table, None, limit))
     }
 
     pub fn scan_with(
@@ -1034,11 +1090,14 @@ impl TxnManager {
         tenant: &str,
         database: &str,
         table: &str,
-        _limit: usize,
-        fallback: impl FnOnce() -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
+        limit: usize,
+        fallback: impl FnOnce(usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        fallback()
+        let scan_limit =
+            limit.saturating_add(txn.scan_overlay_count(tenant, database, table, None));
+        let rows = fallback(scan_limit)?;
+        Ok(txn.overlay_scan(rows, tenant, database, table, None, limit))
     }
 
     pub fn scan_after(
@@ -1051,12 +1110,27 @@ impl TxnManager {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        let scan_limit = limit.saturating_add(txn.scan_overlay_count(
+            tenant,
+            database,
+            table,
+            Some(start_after),
+        ));
         let engine = self
             .inner
             .engine
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        Ok(engine.scan_after(tenant, database, table, txn.read_ts, now_unix(), start_after, limit))
+        let rows = engine.scan_after(
+            tenant,
+            database,
+            table,
+            txn.read_ts,
+            now_unix(),
+            start_after,
+            scan_limit,
+        );
+        Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1066,12 +1140,19 @@ impl TxnManager {
         tenant: &str,
         database: &str,
         table: &str,
-        _start_after: &[u8],
-        _limit: usize,
-        fallback: impl FnOnce() -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
+        start_after: &[u8],
+        limit: usize,
+        fallback: impl FnOnce(usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        fallback()
+        let scan_limit = limit.saturating_add(txn.scan_overlay_count(
+            tenant,
+            database,
+            table,
+            Some(start_after),
+        ));
+        let rows = fallback(scan_limit)?;
+        Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit))
     }
 
     pub fn advance_to(&self, commit_ts: u64) {
@@ -2091,8 +2172,8 @@ impl DurableManager {
         match self.mode {
             StorageMode::Hot => self.inner.scan(txn, tenant, database, table, limit),
             StorageMode::Standard => {
-                self.inner.scan_with(txn, tenant, database, table, limit, || {
-                    self.segments.scan(tenant, database, table, read_ts, now_unix(), limit)
+                self.inner.scan_with(txn, tenant, database, table, limit, |scan_limit| {
+                    self.segments.scan(tenant, database, table, read_ts, now_unix(), scan_limit)
                 })
             }
         }
@@ -2112,8 +2193,14 @@ impl DurableManager {
             StorageMode::Hot => {
                 self.inner.scan_after(txn, tenant, database, table, start_after, limit)
             }
-            StorageMode::Standard => {
-                self.inner.scan_after_with(txn, tenant, database, table, start_after, limit, || {
+            StorageMode::Standard => self.inner.scan_after_with(
+                txn,
+                tenant,
+                database,
+                table,
+                start_after,
+                limit,
+                |scan_limit| {
                     self.segments.scan_after(
                         tenant,
                         database,
@@ -2121,10 +2208,10 @@ impl DurableManager {
                         read_ts,
                         now_unix(),
                         start_after,
-                        limit,
+                        scan_limit,
                     )
-                })
-            }
+                },
+            ),
         }
     }
 
@@ -2305,6 +2392,39 @@ mod tests {
         let mut probe = manager.begin();
         assert_eq!(manager.get(&mut probe, &first).unwrap(), Some(b"one".to_vec()));
         assert_eq!(manager.get(&mut probe, &second).unwrap(), None);
+    }
+
+    #[test]
+    fn scans_include_staged_writes_without_skipping_pages() {
+        let manager = TxnManager::new();
+        for (pk, value) in [
+            (b"1".as_slice(), b"one".as_slice()),
+            (b"2".as_slice(), b"two".as_slice()),
+            (b"3".as_slice(), b"three".as_slice()),
+            (b"4".as_slice(), b"four".as_slice()),
+        ] {
+            let mut seed = manager.begin();
+            manager.put(&mut seed, RecordKey::new("t", "d", "items", pk), value.to_vec());
+            manager.commit(seed).unwrap();
+        }
+
+        let mut txn = manager.begin();
+        manager.put(&mut txn, RecordKey::new("t", "d", "items", b"0"), b"zero".to_vec());
+        manager.delete(&mut txn, RecordKey::new("t", "d", "items", b"1"));
+        manager.put(&mut txn, RecordKey::new("t", "d", "items", b"9"), b"nine".to_vec());
+
+        let first = manager.scan(&mut txn, "t", "d", "items", 2).unwrap();
+        assert_eq!(
+            first,
+            vec![(b"0".to_vec(), b"zero".to_vec()), (b"2".to_vec(), b"two".to_vec())]
+        );
+        let second = manager.scan_after(&mut txn, "t", "d", "items", b"2", 2).unwrap();
+        assert_eq!(
+            second,
+            vec![(b"3".to_vec(), b"three".to_vec()), (b"4".to_vec(), b"four".to_vec())]
+        );
+        let last = manager.scan_after(&mut txn, "t", "d", "items", b"4", 2).unwrap();
+        assert_eq!(last, vec![(b"9".to_vec(), b"nine".to_vec())]);
     }
 
     #[test]
@@ -2736,6 +2856,35 @@ mod tests {
         assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"two".to_vec()));
         assert_eq!(reopened.resident_bytes().unwrap(), 0);
         assert!(reopened.segment_cache_stats().misses > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_mode_scans_include_staged_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-scan-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut seed = manager.begin();
+        manager.put(&mut seed, RecordKey::new("t", "d", "items", b"1"), b"one".to_vec());
+        manager.commit(seed).unwrap();
+
+        let mut txn = manager.begin();
+        manager.put(&mut txn, RecordKey::new("t", "d", "items", b"2"), b"two".to_vec());
+        assert_eq!(
+            manager.scan(&mut txn, "t", "d", "items", 10).unwrap(),
+            vec![(b"1".to_vec(), b"one".to_vec()), (b"2".to_vec(), b"two".to_vec())]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1063,13 +1063,17 @@ impl TxnBackend for ShardSet {
                 .map_err(|_| RymeError::Internal(String::from("shard lock")))?
                 .shards
                 .clone();
+            txn.record_scan(tenant, database, table);
+            let scan_limit =
+                limit.saturating_add(txn.scan_overlay_count(tenant, database, table, None));
             let mut rows = Vec::new();
             for manager in managers {
-                rows.extend(manager.scan(txn, tenant, database, table, limit)?);
+                let mut scan_txn = manager.begin();
+                scan_txn.restamp(txn.read_ts);
+                rows.extend(manager.scan(&mut scan_txn, tenant, database, table, scan_limit)?);
             }
             rows.sort_by(|left, right| left.0.cmp(&right.0));
-            rows.truncate(limit);
-            return Ok(rows);
+            return Ok(txn.overlay_scan(rows, tenant, database, table, None, limit));
         }
         let shard = self.route(&TableRef::new(tenant, database, table));
         let manager =
@@ -1101,20 +1105,28 @@ impl TxnBackend for ShardSet {
                 .map_err(|_| RymeError::Internal(String::from("shard lock")))?
                 .shards
                 .clone();
+            txn.record_scan(tenant, database, table);
+            let scan_limit = limit.saturating_add(txn.scan_overlay_count(
+                tenant,
+                database,
+                table,
+                Some(start_after),
+            ));
             let mut rows = Vec::new();
             for manager in managers {
+                let mut scan_txn = manager.begin();
+                scan_txn.restamp(txn.read_ts);
                 rows.extend(manager.scan_after(
-                    txn,
+                    &mut scan_txn,
                     tenant,
                     database,
                     table,
                     start_after,
-                    limit,
+                    scan_limit,
                 )?);
             }
             rows.sort_by(|left, right| left.0.cmp(&right.0));
-            rows.truncate(limit);
-            return Ok(rows);
+            return Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit));
         }
         let shard = self.route(&TableRef::new(tenant, database, table));
         let manager =
@@ -1487,6 +1499,17 @@ mod tests {
         assert_eq!(
             backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
             Some(b"last".to_vec())
+        );
+        let mut scan_txn = backend.begin();
+        backend.put(
+            &mut scan_txn,
+            RecordKey::new("t", "d", "users", b"b"),
+            b"middle".to_vec(),
+        );
+        backend.delete(&mut scan_txn, RecordKey::new("t", "d", "users", b"a"));
+        assert_eq!(
+            backend.scan(&mut scan_txn, "t", "d", "users", 2).unwrap(),
+            vec![(b"b".to_vec(), b"middle".to_vec()), (b"z".to_vec(), b"last".to_vec())]
         );
         let left = backend.shard_manager(0).unwrap();
         let right = backend.shard_manager(1).unwrap();
