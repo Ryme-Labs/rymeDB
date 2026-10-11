@@ -147,9 +147,10 @@ jobs:
             version="${candidate_major}.0.0"
             npm_response="$RUNNER_TEMP/npm-$version.json"
             if ! npm_status="$(curl --retry 3 --retry-all-errors -sS \
+              -H 'Cache-Control: no-cache' \
               -H 'Accept: application/json' \
               --output "$npm_response" --write-out '%{http_code}' \
-              "https://registry.npmjs.org/@rymelabs%2frymedb/$version")"; then
+              "https://registry.npmjs.org/@rymelabs%2frymedb/$version?cacheBust=$GITHUB_RUN_ID-$candidate_major")"; then
               echo "npm version lookup failed for @rymelabs/rymedb@$version"
               exit 1
             fi
@@ -261,17 +262,30 @@ jobs:
           packages=("$RUNNER_TEMP/npm/"*.tgz)
           test "${#packages[@]}" -eq 1
           expected="sha512-$(openssl dgst -sha512 -binary "${packages[0]}" | openssl base64 -A)"
-          if npm_response="$(npm view "@rymelabs/rymedb@$RELEASE_VERSION" dist.integrity --json 2>/dev/null)"; then
-            published="$(jq -er 'if type == "string" then . else empty end' <<< "$npm_response")" || {
-              echo "npm returned an invalid response while checking @rymelabs/rymedb@$RELEASE_VERSION"
-              exit 1
-            }
-          elif jq -e '.error.code == "E404"' <<< "$npm_response" >/dev/null 2>&1; then
-            published=""
-          else
+          metadata_file="$RUNNER_TEMP/npm-publish-$RELEASE_VERSION.json"
+          if ! npm_status="$(curl --retry 3 --retry-all-errors -sS \
+            -H 'Cache-Control: no-cache' \
+            -H 'Accept: application/json' \
+            --output "$metadata_file" --write-out '%{http_code}' \
+            "https://registry.npmjs.org/@rymelabs%2frymedb/$RELEASE_VERSION?cacheBust=$GITHUB_RUN_ID")"; then
             echo "npm package lookup failed for @rymelabs/rymedb@$RELEASE_VERSION"
             exit 1
           fi
+          case "$npm_status" in
+            200)
+              published="$(jq -er '.dist.integrity // empty' "$metadata_file")" || {
+                echo "npm returned invalid metadata while checking @rymelabs/rymedb@$RELEASE_VERSION"
+                exit 1
+              }
+              ;;
+            404)
+              published=""
+              ;;
+            *)
+              echo "npm registry returned HTTP $npm_status while checking @rymelabs/rymedb@$RELEASE_VERSION"
+              exit 1
+              ;;
+          esac
           if [[ -n "$published" && "$published" != "undefined" && "$published" != "null" ]]; then
             if [[ "$published" != "$expected" ]]; then
               echo "@rymelabs/rymedb@$RELEASE_VERSION already exists with different contents"
