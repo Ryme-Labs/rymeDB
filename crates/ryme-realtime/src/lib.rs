@@ -130,6 +130,8 @@ pub struct BroadcastMsg {
     #[serde(skip)]
     json_cache: Arc<OnceLock<String>>,
     #[serde(skip)]
+    encoded_frames: Arc<[OnceLock<(String, Arc<str>)>; 2]>,
+    #[serde(skip)]
     fanout_quota_pre_admitted: bool,
 }
 
@@ -152,6 +154,33 @@ impl BroadcastMsg {
 
     pub fn fanout_quota_pre_admitted(&self) -> bool {
         self.fanout_quota_pre_admitted
+    }
+
+    /// Reuse a protocol-specific frame for subscribers receiving the same
+    /// broadcast. The cache is capped at two variants to keep per-message
+    /// memory bounded (normally one topic in each of two wire formats).
+    pub fn cached_text_frame(
+        &self,
+        topic: &str,
+        protocol: u8,
+        encode: impl FnOnce() -> String,
+    ) -> Arc<str> {
+        let Some(cache) = self.encoded_frames.get(usize::from(protocol)) else {
+            return Arc::from(encode());
+        };
+        if let Some((cached_topic, frame)) = cache.get() {
+            return if cached_topic == topic { Arc::clone(frame) } else { Arc::from(encode()) };
+        }
+
+        let frame: Arc<str> = Arc::from(encode());
+        if cache.set((topic.to_owned(), Arc::clone(&frame))).is_err() {
+            if let Some((cached_topic, cached_frame)) = cache.get() {
+                if cached_topic == topic {
+                    return Arc::clone(cached_frame);
+                }
+            }
+        }
+        frame
     }
 }
 
@@ -984,6 +1013,7 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
+            encoded_frames: Arc::new(std::array::from_fn(|_| OnceLock::new())),
             fanout_quota_pre_admitted: false,
         };
         let _ = topic.sender.send(Arc::new(message));
@@ -1014,6 +1044,7 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
+            encoded_frames: Arc::new(std::array::from_fn(|_| OnceLock::new())),
             fanout_quota_pre_admitted: true,
         };
         let receiver_count = topic.sender.receiver_count();
@@ -1046,6 +1077,7 @@ impl Realtime {
             commit_ts,
             sequence,
             json_cache: Arc::new(OnceLock::new()),
+            encoded_frames: Arc::new(std::array::from_fn(|_| OnceLock::new())),
             fanout_quota_pre_admitted: false,
         };
         let _ = topic.sender.send(Arc::new(message));
@@ -1694,6 +1726,50 @@ mod tests {
         let first = first.try_recv().unwrap();
         let second = second.try_recv().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn broadcast_reuses_bounded_protocol_frames() {
+        let realtime = Realtime::new(64);
+        let mut receiver = realtime.broadcast_subscribe("t", "lobby");
+        realtime
+            .broadcast("t", "lobby", String::from("ada"), serde_json::json!({"x": 1}), 3)
+            .unwrap();
+        let message = receiver.try_recv().unwrap();
+        let encodes = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = message.cached_text_frame("room:lobby", 0, || {
+            encodes.fetch_add(1, Ordering::Relaxed);
+            String::from("encoded")
+        });
+        let second = message.cached_text_frame("room:lobby", 0, || {
+            encodes.fetch_add(1, Ordering::Relaxed);
+            String::from("unexpected re-encode")
+        });
+        let array_frame = message.cached_text_frame("room:lobby", 1, || {
+            encodes.fetch_add(1, Ordering::Relaxed);
+            String::from("array encoded")
+        });
+        let repeated_array_frame = message.cached_text_frame("room:lobby", 1, || {
+            encodes.fetch_add(1, Ordering::Relaxed);
+            String::from("unexpected array re-encode")
+        });
+        let other_topic_frame = message.cached_text_frame("other:lobby", 0, || {
+            encodes.fetch_add(1, Ordering::Relaxed);
+            String::from("other topic")
+        });
+        let repeated_other_topic = message.cached_text_frame("other:lobby", 0, || {
+            encodes.fetch_add(1, Ordering::Relaxed);
+            String::from("other topic again")
+        });
+
+        assert_eq!(first.as_ref(), "encoded");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(array_frame.as_ref(), "array encoded");
+        assert!(Arc::ptr_eq(&array_frame, &repeated_array_frame));
+        assert_eq!(other_topic_frame.as_ref(), "other topic");
+        assert_eq!(repeated_other_topic.as_ref(), "other topic again");
+        assert_eq!(encodes.load(Ordering::Relaxed), 4);
     }
 
     #[test]

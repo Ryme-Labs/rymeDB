@@ -6065,11 +6065,15 @@ async fn forward_supabase_realtime(
                         }
                         let event_pre_admitted = record.fanout_quota_pre_admitted();
                         let pre_admitted_bytes = record.json_len();
-                        let text = encode_supabase_broadcast_frame(
-                            &topic,
-                            &record.payload,
-                            array_protocol,
-                        );
+                        let text = record
+                            .cached_text_frame(&topic, u8::from(array_protocol), || {
+                                encode_supabase_broadcast_frame(
+                                    &topic,
+                                    &record.payload,
+                                    array_protocol,
+                                )
+                            })
+                            .to_string();
                         (text, event_pre_admitted, pre_admitted_bytes)
                     }
                     SupabaseRealtimeEvent::Change(topic, subscription, record) => {
