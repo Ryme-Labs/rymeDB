@@ -1739,6 +1739,7 @@ dependencies = [
  "ryme-error",
  "ryme-storage",
  "ryme-txn",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.21.0",

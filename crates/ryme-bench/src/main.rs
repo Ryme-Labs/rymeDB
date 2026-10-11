@@ -2,10 +2,8 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use ryme_storage::RecordKey;
 use ryme_txn::TxnManager;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -205,6 +203,16 @@ struct RealtimeResult {
     total_seconds: f64,
 }
 
+#[derive(Deserialize)]
+struct RealtimeEventSample {
+    payload: RealtimePayloadSample,
+}
+
+#[derive(Deserialize)]
+struct RealtimePayloadSample {
+    sent_ns: u64,
+}
+
 async fn realtime_bench(config: RealtimeBench) {
     if config.connections == 0 || config.messages == 0 {
         eprintln!("connections and messages must be greater than zero");
@@ -246,43 +254,42 @@ async fn realtime_bench(config: RealtimeBench) {
     }
     tokio::time::sleep(std::time::Duration::from_millis(config.warmup_ms)).await;
 
-    let published_target = Arc::new(AtomicUsize::new(usize::MAX));
+    let (published_target, published_target_rx) = tokio::sync::watch::channel(None::<usize>);
+    let (readers_start, reader_start_rx) = tokio::sync::watch::channel(false);
     let mut readers = Vec::with_capacity(streams.len());
     let latency_sample_limit = (1_000_000 / config.connections.max(1)).max(1);
     for mut stream in streams {
-        let published_target = published_target.clone();
+        let mut published_target_rx = published_target_rx.clone();
+        let mut reader_start_rx = reader_start_rx.clone();
         readers.push(tokio::spawn(async move {
+            let _ = reader_start_rx.wait_for(|started| *started).await;
+            let reader_start = Instant::now();
             let mut received = 0usize;
             let mut errors = 0usize;
             let mut latency_micros = Vec::with_capacity(latency_sample_limit);
             loop {
-                let target = published_target.load(Ordering::Acquire);
-                if target == usize::MAX {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                if received >= target {
+                if published_target_rx.borrow().is_some_and(|target| received >= target) {
                     break;
                 }
-                match tokio::time::timeout(std::time::Duration::from_secs(60), stream.next()).await
-                {
+                let next_message = tokio::select! {
+                    _ = published_target_rx.changed() => continue,
+                    message = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        stream.next(),
+                    ) => message,
+                };
+                match next_message {
                     Ok(Some(Ok(Message::Text(text)))) => {
                         received += 1;
                         if latency_micros.len() < latency_sample_limit {
                             if let Ok(event) =
-                                serde_json::from_str::<serde_json::Value>(text.as_ref())
+                                serde_json::from_str::<RealtimeEventSample>(text.as_ref())
                             {
-                                if let Some(sent_ns) = event
-                                    .get("payload")
-                                    .and_then(|payload| payload.get("sent_ns"))
-                                    .and_then(serde_json::Value::as_u64)
-                                {
-                                    let now_ns =
-                                        benchmark_start.elapsed().as_nanos().min(u64::MAX as u128)
-                                            as u64;
-                                    if now_ns >= sent_ns {
-                                        latency_micros.push((now_ns - sent_ns) / 1_000);
-                                    }
+                                let now_ns =
+                                    benchmark_start.elapsed().as_nanos().min(u64::MAX as u128)
+                                        as u64;
+                                if now_ns >= event.payload.sent_ns {
+                                    latency_micros.push((now_ns - event.payload.sent_ns) / 1_000);
                                 }
                             }
                         }
@@ -300,11 +307,11 @@ async fn realtime_bench(config: RealtimeBench) {
                     }
                 }
             }
-            let _ = stream.close(None).await;
-            (received, errors, latency_micros)
+            (received, errors, latency_micros, reader_start.elapsed().as_micros())
         }));
     }
 
+    readers_start.send_replace(true);
     let payload = serde_json::json!({"data": "x".repeat(config.payload_bytes)});
     let client = reqwest::Client::new();
     let publish_url = format!("http://{}/v1/broadcast", config.addr);
@@ -340,24 +347,28 @@ async fn realtime_bench(config: RealtimeBench) {
     let publish_seconds = publish_start.elapsed().as_secs_f64().max(0.000001);
     let published = publish_results.iter().filter(|ok| **ok).count();
     let publish_errors = config.messages - published;
-    published_target.store(published, Ordering::Release);
+    published_target.send_replace(Some(published));
 
-    let receive_start = Instant::now();
     let mut received = 0usize;
     let mut receive_errors = 0usize;
     let mut latency_micros = Vec::new();
+    let mut slowest_reader_micros = 0u128;
+    let mut min_reader_received = usize::MAX;
+    let mut max_reader_received = 0usize;
     for reader in readers {
         match reader.await {
-            Ok((count, errors, mut samples)) => {
+            Ok((count, errors, mut samples, reader_micros)) => {
                 received += count;
                 receive_errors += errors;
                 latency_micros.append(&mut samples);
+                slowest_reader_micros = slowest_reader_micros.max(reader_micros);
+                min_reader_received = min_reader_received.min(count);
+                max_reader_received = max_reader_received.max(count);
             }
             Err(_) => receive_errors += 1,
         }
     }
     let total_seconds = publish_start.elapsed().as_secs_f64().max(0.000001);
-    let receive_seconds = receive_start.elapsed().as_secs_f64().max(0.000001);
     latency_micros.sort_unstable();
     let latency_percentile = |percentile: f64| -> u64 {
         if latency_micros.is_empty() {
@@ -394,10 +405,13 @@ async fn realtime_bench(config: RealtimeBench) {
         "publish_errors": result.publish_errors,
         "received": result.received,
         "receive_errors": result.receive_errors,
+        "slowest_reader_ms": (slowest_reader_micros as f64 / 1000.0).round() / 1000.0,
+        "min_reader_messages": min_reader_received,
+        "max_reader_messages": max_reader_received,
         "delivery_percent": (delivery_percent * 100.0).round() / 100.0,
         "publish_qps": (result.published as f64 / result.publish_seconds).round() as u64,
         "fanout_deliveries_per_second":
-            (result.received as f64 / receive_seconds).round() as u64,
+            (result.received as f64 / result.total_seconds).round() as u64,
         "latency_samples": latency_samples,
         "publish_to_client_p50_us": latency_p50,
         "publish_to_client_p95_us": latency_p95,
@@ -419,7 +433,7 @@ async fn realtime_bench(config: RealtimeBench) {
             result.received,
             result.receive_errors,
             (result.published as f64 / result.publish_seconds).round() as u64,
-            (result.received as f64 / receive_seconds).round() as u64,
+            (result.received as f64 / result.total_seconds).round() as u64,
             latency_samples,
             latency_p50,
             latency_p95,
@@ -571,11 +585,7 @@ fn frame_len(buffer: &[u8]) -> Option<usize> {
                 return Some(end + 2);
             }
             let total = end + 2 + length as usize + 2;
-            if buffer.len() >= total {
-                Some(total)
-            } else {
-                None
-            }
+            if buffer.len() >= total { Some(total) } else { None }
         }
         b'*' => {
             let end = buffer.windows(2).position(|w| w == b"\r\n")?;
