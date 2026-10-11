@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1327,6 +1327,8 @@ impl Realtime {
     pub fn restore_durable_snapshot(&self, snapshots: Vec<DurableTopicSnapshot>) -> Result<()> {
         let mut inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
+        let mut pending = Vec::with_capacity(snapshots.len());
+        let mut seen = HashSet::with_capacity(snapshots.len());
         for snapshot in snapshots {
             if snapshot.tenant.is_empty() {
                 return Err(RymeError::Corrupt(String::from("durable topic identity")));
@@ -1359,13 +1361,16 @@ impl Realtime {
             }
             let next_cursor = snapshot.next_cursor;
             let key = durable_key(&snapshot.tenant, &snapshot.partition);
-            if inner.durable.contains_key(&key) {
+            if inner.durable.contains_key(&key) || !seen.insert(key.clone()) {
                 return Err(RymeError::Corrupt(String::from("duplicate durable topic")));
             }
-            inner.durable.insert(
+            pending.push((
                 key,
                 DurableTopic { messages: messages.into_iter().collect(), next_cursor, retention },
-            );
+            ));
+        }
+        for (key, topic) in pending {
+            inner.durable.insert(key, topic);
         }
         Ok(())
     }
@@ -2100,6 +2105,32 @@ mod tests {
             realtime.restore_durable_snapshot(vec![snapshot]),
             Err(RymeError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn durable_snapshot_restore_is_atomic_on_late_validation_failure() {
+        let realtime = Realtime::new(64);
+        let valid = DurableTopicSnapshot {
+            tenant: String::from("tenant"),
+            partition: String::from("orders"),
+            messages: Vec::new(),
+            next_cursor: 0,
+            retention: 16,
+        };
+        let invalid = DurableTopicSnapshot {
+            tenant: String::from("tenant"),
+            partition: String::new(),
+            messages: Vec::new(),
+            next_cursor: 0,
+            retention: 16,
+        };
+
+        assert!(matches!(
+            realtime.restore_durable_snapshot(vec![valid, invalid]),
+            Err(RymeError::Corrupt(_))
+        ));
+        assert_eq!(realtime.durable_cursor("tenant", "orders"), 0);
+        assert!(realtime.durable_read("tenant", "orders", 0, 10).is_empty());
     }
 
     #[test]
