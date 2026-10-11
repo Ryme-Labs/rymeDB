@@ -135,3 +135,47 @@ jobs:
           test -f _site/sdk-js/index.html
           test -f _site/sdk-rust/index.html
           test ! -e _site/requirements-pages/index.html
+
+  sdks:
+    name: Verify Java, npm, and Rust SDKs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install npm workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and test npm SDK
+        run: |
+          pnpm --filter @rymelabs/rymedb build
+          pnpm --filter @rymelabs/rymedb test
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test and package Rust SDK
+        run: |
+          cargo test --manifest-path sdks/rust/Cargo.toml --locked
+          cargo package --manifest-path sdks/rust/Cargo.toml --locked
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      - name: Verify Java SDK package
+        run: mvn --batch-mode --update-snapshots -f sdks/java/pom.xml verify
