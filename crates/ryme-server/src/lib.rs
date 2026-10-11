@@ -1427,11 +1427,9 @@ impl SharedState {
             gateway = gateway.with_remote_reader(reader.clone());
             remote_reader = Some(reader);
             let scan_node = range_reader_node.clone();
-            let scan_tenant = tenant.clone();
             let scan_database = database.clone();
-            let scanner = RemoteScanner::new(move |table, start_after, limit, read_ts| {
+            let scanner = RemoteScanner::new(move |tenant, table, start_after, limit, read_ts| {
                 let node = scan_node.clone();
-                let tenant = scan_tenant.clone();
                 let database = scan_database.clone();
                 async move {
                     remote_scan_range_page(

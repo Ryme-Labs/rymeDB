@@ -48,6 +48,7 @@ type RemoteReadManyFn = Arc<
 type RemoteScanFn = Arc<
     dyn Fn(
             String,
+            String,
             Option<Vec<u8>>,
             usize,
             u64,
@@ -111,22 +112,23 @@ impl std::fmt::Debug for RemoteScanner {
 impl RemoteScanner {
     pub fn new<F, Fut>(scanner: F) -> Self
     where
-        F: Fn(String, Option<Vec<u8>>, usize, u64) -> Fut + Send + Sync + 'static,
+        F: Fn(String, String, Option<Vec<u8>>, usize, u64) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RemoteScan>> + Send + 'static,
     {
-        Self(Arc::new(move |table, start_after, limit, read_ts| {
-            Box::pin(scanner(table, start_after, limit, read_ts))
+        Self(Arc::new(move |tenant, table, start_after, limit, read_ts| {
+            Box::pin(scanner(tenant, table, start_after, limit, read_ts))
         }))
     }
 
     pub async fn scan(
         &self,
+        tenant: String,
         table: String,
         start_after: Option<Vec<u8>>,
         limit: usize,
         read_ts: u64,
     ) -> Result<RemoteScan> {
-        (self.0)(table, start_after, limit, read_ts).await
+        (self.0)(tenant, table, start_after, limit, read_ts).await
     }
 }
 
@@ -639,7 +641,13 @@ where
         let mut start_after = None;
         loop {
             let page = match scanner
-                .scan(table.to_string(), start_after.clone(), limit, self.read_ts.unwrap_or(0))
+                .scan(
+                    principal.tenant.clone(),
+                    table.to_string(),
+                    start_after.clone(),
+                    limit,
+                    self.read_ts.unwrap_or(0),
+                )
                 .await?
             {
                 RemoteScan::Local => return self.scan(principal, table, limit),
@@ -721,6 +729,7 @@ where
         }
         let page = match scanner
             .scan(
+                principal.tenant.clone(),
                 table.to_string(),
                 start_after.map(ToOwned::to_owned),
                 limit,
@@ -920,7 +929,8 @@ mod tests {
     #[tokio::test]
     async fn async_scan_uses_remote_pages_and_cursors() {
         let gateway = gateway().with_remote_scanner(RemoteScanner::new(
-            |table, start_after, limit, _read_ts| async move {
+            |tenant, table, start_after, limit, _read_ts| async move {
+                assert_eq!(tenant, "t");
                 assert_eq!(table, "docs");
                 assert_eq!(limit, 3);
                 let page = if start_after.is_none() {
