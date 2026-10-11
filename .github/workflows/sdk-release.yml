@@ -23,8 +23,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sdk-release-${{ github.ref }}
-  cancel-in-progress: true
+  # Registry versions are immutable. Serialize manual releases so a canceled
+  # run cannot race a newer run after both select the same version.
+  group: ${{ github.event_name == 'workflow_dispatch' && 'sdk-release-publish-main' || format('sdk-release-check-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 permissions:
   contents: read
