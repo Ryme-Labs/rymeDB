@@ -8,6 +8,8 @@
   configured clock-skew leeway.
 - REST bulk inserts, PATCH updates, and filtered deletes now use one MVCC
   commit, preventing partial batches and sharing one realtime commit timestamp.
+- RESP mutations now remain in replayable CDC history even when no live stream
+  subscriber is connected.
 - Hybrid PITR now restores the replicated tier through Raft and the current
   node's local shard set, with the response identifying the local replay scope.
 - Added a hosted CI workflow that checks formatting for core packages, runs

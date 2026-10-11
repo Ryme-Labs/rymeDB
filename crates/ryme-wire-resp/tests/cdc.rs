@@ -111,3 +111,21 @@ async fn cdc_emits_exec_batch() {
         assert_eq!(record.pk, want);
     }
 }
+
+#[tokio::test]
+async fn cdc_replay_retains_resp_writes_without_live_subscriber() {
+    let realtime = ryme_realtime::Realtime::new(64);
+    let gateway = ryme_wire_resp::RespGateway::new(String::from("t"), String::from("d"))
+        .with_realtime(realtime.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    assert_eq!(command(addr, &["SET", "offline", "value"]).await, "+OK");
+    let replay = realtime.replay("t", "d", "_kv", 0, 10);
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].pk, b"offline");
+    assert_eq!(replay[0].after, Some(b"value".to_vec()));
+}

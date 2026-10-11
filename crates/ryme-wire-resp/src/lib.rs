@@ -934,12 +934,9 @@ where
         &self,
         txn: &Transaction,
     ) -> Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)> {
-        let Some(realtime) = self.realtime.as_ref() else { return Vec::new() };
+        let Some(_realtime) = self.realtime.as_ref() else { return Vec::new() };
         let mut out = Vec::new();
         for (key, staged) in txn.writes() {
-            if !realtime.has_subscribers(&key.tenant, &key.database, &key.table) {
-                continue;
-            }
             let mut before_txn = self.manager.begin();
             before_txn.restamp(txn.read_ts);
             let before = self.manager.get(&mut before_txn, key).ok().flatten();

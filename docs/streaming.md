@@ -40,9 +40,9 @@ administrative role). Each frame is a `ChangeRecord`
   is a server-wide strictly increasing counter, so watermarks are exact.
   Retention is the per-topic ring (server `Realtime::new` capacity);
   changes committed while disconnected beyond retention cannot be
-  replayed. REST/SQL/native/gRPC writes always publish; RESP only
-  publishes while the table has subscribers (a throughput optimization),
-  so RESP-only writes made with zero subscribers are absent from replay.
+  replayed. REST/SQL/native/gRPC/RESP writes all publish to the same
+  replayable CDC history, so reconnecting clients do not miss RESP mutations
+  made while no live subscriber was connected.
 - For exact reconnects, use `?from_sequence=<sequence>` from the last
   delivered `ChangeRecord`. This distinguishes multiple writes sharing one
   commit timestamp and uses the same retained ring for recovery. The
