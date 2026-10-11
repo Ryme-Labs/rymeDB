@@ -222,6 +222,10 @@ the missing records in order and advances that follower's commit view only
 after the repaired prefix is acknowledged. This gives the current placement
 map a durable replica-repair and materialization path without claiming that
 range logs provide independent cross-range transaction coordination.
+If a promoted leader finds an uncommitted divergent suffix, the follower
+reports the conflict index and the leader retries from the common prefix. The
+affected range WAL is rewritten while unrelated range records are retained;
+committed or already-applied range entries are never overwritten.
 Range replicas also maintain their own election term and heartbeat deadline.
 If the configured range leader fails, a surviving replica can win a majority
 of that range's replica set and become the routed owner without changing the

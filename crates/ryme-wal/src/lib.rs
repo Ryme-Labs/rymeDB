@@ -130,6 +130,10 @@ impl Wal {
         Ok(removed)
     }
 
+    pub fn replace_records(&mut self, records: &[WalRecord]) -> Result<()> {
+        self.rewrite(records)
+    }
+
     fn rewrite(&mut self, records: &[WalRecord]) -> Result<()> {
         let temporary = self.dir.join(".rewrite");
         if temporary.exists() {

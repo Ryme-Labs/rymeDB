@@ -1,5 +1,9 @@
 # Changelog
 
+- Range replica repair now handles divergent uncommitted suffixes as well as
+  missing entries. Followers report the first conflicting index, leaders retry
+  from the common prefix, and the affected range WAL is rewritten atomically;
+  committed or applied entries cannot be overwritten.
 - Range leaders now repair lagging replicas from the range WAL before advancing
   their commit view. Heartbeats report follower log positions, missing entries
   are streamed in order, and a follower is committed only after the repaired
