@@ -304,6 +304,18 @@ async fn tenants_share_no_presence_or_partitions() {
         bearer_request(http, &alpha, "GET /v1/topics/read?partition=orders&from=0", b"").await;
     assert_eq!(status, 200);
     assert_eq!(body.as_array().map(Vec::len), Some(1));
+
+    for (token, tenant) in [(alpha.as_str(), "alpha"), (beta.as_str(), "beta")] {
+        let (status, invoice) = bearer_request(http, token, "GET /v1/billing/invoice", b"").await;
+        assert_eq!(status, 200);
+        assert_eq!(invoice.get("tenant").and_then(|value| value.as_str()), Some(tenant));
+        assert!(invoice
+            .get("lines")
+            .and_then(|value| value.as_array())
+            .is_some_and(|lines| !lines.is_empty()),
+            "{tenant} invoice should contain that tenant's usage: {invoice}"
+        );
+    }
     std::env::remove_var("RYME_JWT_SECRET");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -3010,9 +3010,9 @@ pub async fn export_traces_once(
     Ok(spans.len())
 }
 
-fn record_meter(state: &SharedState, metric: Metric, quantity: u64) {
+fn record_meter(state: &SharedState, tenant: &str, metric: Metric, quantity: u64) {
     let event = UsageEvent::new(
-        state.tenant.clone(),
+        tenant.to_string(),
         state.database.clone(),
         metric,
         quantity,
@@ -3367,7 +3367,7 @@ async fn rest_list(
     } else {
         format!("{}-{}/{}", offset, offset + items.len() - 1, total)
     };
-    record_meter(&state, Metric::ReadUnit, items.len() as u64);
+    record_meter(&state, &principal.tenant, Metric::ReadUnit, items.len() as u64);
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);
     state.histogram.record(micros);
@@ -3821,7 +3821,7 @@ async fn rest_insert(
     let inserted = pending
         .iter()
         .map(|(key, value)| {
-            record_meter(&state, Metric::WriteUnit, 1);
+            record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
             note_range_write(&state, &range_routing_key(&table, key), 1);
             rest_row_to_json(key, value)
         })
@@ -3909,7 +3909,7 @@ async fn rest_upsert(
     let updated = pending
         .iter()
         .map(|(key, value)| {
-            record_meter(&state, Metric::WriteUnit, 1);
+            record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
             note_range_write(&state, &range_routing_key(&table, key), 1);
             rest_row_to_json(key, value)
         })
@@ -3971,7 +3971,7 @@ async fn rest_delete(
         Err(e) => return error_response(e),
     };
     for key in &keys {
-        record_meter(&state, Metric::WriteUnit, 1);
+        record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
         note_range_write(&state, &range_routing_key(&table, key), 1);
     }
     let deleted = keys.len() as u64;
@@ -4205,7 +4205,7 @@ async fn sql_copy(
     };
     match executor.bulk_upsert(request.table.clone(), rows.clone()).await {
         Ok(count) => {
-            record_meter(&state, Metric::WriteUnit, count as u64);
+            record_meter(&state, &principal.tenant, Metric::WriteUnit, count as u64);
             for (key, _) in rows.iter().take(count) {
                 note_range_write(&state, &range_routing_key(&request.table, key), 1);
             }
@@ -7238,7 +7238,7 @@ async fn vector_upsert(
         let mut indexes = state.indexes.write().await;
         match indexes.vector_upsert(&space, request.id, request.vector) {
             Ok(()) => {
-                record_meter(&state, Metric::WriteUnit, 1);
+                record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
             }
             Err(e) => error_response(e),
@@ -7358,7 +7358,7 @@ async fn text_index(
         let mut indexes = state.indexes.write().await;
         match indexes.text_index(&space, request.id, &request.text) {
             Ok(terms) => {
-                record_meter(&state, Metric::WriteUnit, 1);
+                record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "terms": terms }))).into_response()
             }
             Err(e) => error_response(e),
@@ -7434,7 +7434,6 @@ async fn kv_get(
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);
     state.histogram.record(micros);
-    record_meter(&state, Metric::ReadUnit, 1);
     record_span(&state, "kv_get", &[("table", table.as_str())], micros);
     result
 }
@@ -7452,6 +7451,7 @@ async fn inner_kv_get(
     if let Err(e) = admit_read(state, &principal.tenant) {
         return error_response(e);
     }
+    record_meter(state, &principal.tenant, Metric::ReadUnit, 1);
     let gateway = match branch_gateway(state, headers, &principal.tenant) {
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
@@ -7510,7 +7510,6 @@ async fn kv_put(
             at_unix: now_secs(),
         });
     }
-    record_meter(&state, Metric::WriteUnit, 1);
     record_span(&state, "kv_put", &[("table", table.as_str())], micros);
     result
 }
@@ -7546,6 +7545,7 @@ async fn inner_kv_put(
     if let Err(e) = admit_write(state, &principal.tenant, value.len() as u64) {
         return error_response(e);
     }
+    record_meter(state, &principal.tenant, Metric::WriteUnit, 1);
     let gateway = match branch_gateway(state, headers, &principal.tenant) {
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
@@ -7630,7 +7630,7 @@ async fn kv_delete(
     let micros = elapsed_micros(start);
     state.latency.observe_micros(micros);
     state.histogram.record(micros);
-    record_meter(&state, Metric::WriteUnit, 1);
+    record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
     result
 }
 
@@ -7799,7 +7799,12 @@ async fn sql_exec(
             at_unix: now_secs(),
         });
     }
-    record_meter(&state, Metric::ReadUnit, 1);
+    record_meter(
+        &state,
+        &principal.tenant,
+        if write_statement { Metric::WriteUnit } else { Metric::ReadUnit },
+        1,
+    );
     record_span(&state, "sql_exec", &[("table", table_name.as_str())], micros);
     result
 }
