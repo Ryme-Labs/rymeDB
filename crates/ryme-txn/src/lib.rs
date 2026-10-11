@@ -94,10 +94,63 @@ pub struct TxnManager {
 struct TxnInner {
     clock: AtomicU64,
     applied: AtomicU64,
-    committed: Mutex<BTreeMap<u64, Vec<RecordKey>>>,
+    committed: Mutex<CommitIndex>,
     engine: RwLock<Engine>,
     commit: Mutex<()>,
     active: Arc<ActiveRegistry>,
+}
+
+#[derive(Debug, Default)]
+struct CommitIndex {
+    by_timestamp: BTreeMap<u64, Vec<RecordKey>>,
+    by_key: BTreeMap<RecordKey, BTreeSet<u64>>,
+    by_table: BTreeMap<(String, String, String), BTreeSet<u64>>,
+}
+
+impl CommitIndex {
+    fn record(&mut self, commit_ts: u64, keys: Vec<RecordKey>) {
+        for key in &keys {
+            self.by_key.entry(key.clone()).or_default().insert(commit_ts);
+            self.by_table
+                .entry((key.tenant.clone(), key.database.clone(), key.table.clone()))
+                .or_default()
+                .insert(commit_ts);
+        }
+        if !keys.is_empty() {
+            self.by_timestamp.entry(commit_ts).or_default().extend(keys);
+        }
+    }
+
+    fn prune_through(&mut self, floor: u64) {
+        while self.by_timestamp.first_key_value().is_some_and(|(ts, _)| *ts <= floor) {
+            let Some((commit_ts, keys)) = self.by_timestamp.pop_first() else {
+                break;
+            };
+            for key in keys {
+                let remove_key = self.by_key.get_mut(&key).is_some_and(|timestamps| {
+                    timestamps.remove(&commit_ts);
+                    timestamps.is_empty()
+                });
+                if remove_key {
+                    self.by_key.remove(&key);
+                }
+                let table = (key.tenant, key.database, key.table);
+                let remove_table = self.by_table.get_mut(&table).is_some_and(|timestamps| {
+                    timestamps.remove(&commit_ts);
+                    timestamps.is_empty()
+                });
+                if remove_table {
+                    self.by_table.remove(&table);
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_timestamp.clear();
+        self.by_key.clear();
+        self.by_table.clear();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,7 +513,7 @@ impl TxnManager {
             inner: Arc::new(TxnInner {
                 clock: AtomicU64::new(1),
                 applied: AtomicU64::new(1),
-                committed: Mutex::new(BTreeMap::new()),
+                committed: Mutex::new(CommitIndex::default()),
                 engine: RwLock::new(Engine::new()),
                 commit: Mutex::new(()),
                 active,
@@ -602,27 +655,28 @@ impl TxnManager {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         if let Some(floor) = self.inner.active.oldest() {
-            committed.retain(|ts, _| *ts > floor);
+            committed.prune_through(floor);
         }
         for key in txn.writes.keys() {
-            let mut cursor = committed.range((Excluded(txn.read_ts), Excluded(commit_ts)));
-            if cursor.any(|(_, keys)| keys.contains(key)) {
+            let conflicts = committed.by_key.get(key).is_some_and(|timestamps| {
+                timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
+            });
+            if conflicts {
                 return Err(RymeError::Conflict(String::from("write-write conflict")));
             }
         }
         if txn.isolation == Isolation::Serializable {
             for key in txn.read_set.iter() {
-                let mut cursor = committed.range((Excluded(txn.read_ts), Excluded(commit_ts)));
-                if cursor.any(|(_, keys)| keys.contains(key)) {
+                let conflicts = committed.by_key.get(key).is_some_and(|timestamps| {
+                    timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
+                });
+                if conflicts {
                     return Err(RymeError::Conflict(String::from("read-write conflict")));
                 }
             }
             for table in txn.scanned.iter() {
-                let mut cursor = committed.range((Excluded(txn.read_ts), Excluded(commit_ts)));
-                let phantom = cursor.any(|(_, keys)| {
-                    keys.iter().any(|key| {
-                        key.tenant == table.0 && key.database == table.1 && key.table == table.2
-                    })
+                let phantom = committed.by_table.get(table).is_some_and(|timestamps| {
+                    timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
                 });
                 if phantom {
                     return Err(RymeError::Conflict(String::from("phantom conflict")));
@@ -738,7 +792,7 @@ impl TxnManager {
             let keys = committed_keys
                 .map(|keys| keys.to_vec())
                 .unwrap_or_else(|| fresh.keys().cloned().collect());
-            committed.insert(commit_ts, keys);
+            committed.record(commit_ts, keys);
         } else if let Some(keys) = committed_keys {
             if !keys.is_empty() {
                 let mut committed = self
@@ -746,7 +800,7 @@ impl TxnManager {
                     .committed
                     .lock()
                     .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-                committed.insert(commit_ts, keys.to_vec());
+                committed.record(commit_ts, keys.to_vec());
             }
         }
         let visible_ts = commit_ts.saturating_add(1);
@@ -789,7 +843,7 @@ impl TxnManager {
                 .committed
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-            committed.insert(commit_ts, writes.keys().cloned().collect());
+            committed.record(commit_ts, writes.keys().cloned().collect());
         }
         let visible_ts = commit_ts.saturating_add(1);
         self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
@@ -2115,6 +2169,25 @@ fn segment_entries(commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_index_retains_newer_key_and_table_versions_when_pruning() {
+        let mut index = CommitIndex::default();
+        let key = RecordKey::new("t", "d", "messages", b"1");
+        index.record(3, vec![key.clone()]);
+        index.record(2, vec![key.clone()]);
+
+        index.prune_through(2);
+        assert_eq!(index.by_key.get(&key), Some(&BTreeSet::from([3])));
+        assert_eq!(
+            index.by_table.get(&(String::from("t"), String::from("d"), String::from("messages"),)),
+            Some(&BTreeSet::from([3]))
+        );
+
+        index.prune_through(3);
+        assert!(!index.by_key.contains_key(&key));
+        assert!(index.by_table.is_empty());
+    }
 
     #[test]
     fn single_shard_read_write() {
