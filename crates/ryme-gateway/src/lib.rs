@@ -282,6 +282,20 @@ where
         }
     }
 
+    fn reject_hidden_existing(
+        &self,
+        principal: &Principal,
+        table: &str,
+        before: Option<&Vec<u8>>,
+    ) -> Result<()> {
+        if let Some(before) = before {
+            if !self.policies.row_allowed(principal, table, before)? {
+                return Err(RymeError::NotFound(String::from("row")));
+            }
+        }
+        Ok(())
+    }
+
     fn reject_if_read_only(&self) -> Result<()> {
         if self.read_only {
             return Err(RymeError::ReadOnly(String::from("read-only follower")));
@@ -365,6 +379,7 @@ where
             self.policies.check_write_row(principal, table, &value)?;
             let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
             let before = self.read_for_write(&mut txn, &key).await?;
+            self.reject_hidden_existing(principal, table, before.as_ref())?;
             let op = if before.is_some() { Operation::Update } else { Operation::Insert };
             self.manager.put(&mut txn, key, value.clone());
             changes.push((pk, before, value, op));
@@ -410,6 +425,7 @@ where
         let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
         let mut txn = self.begin();
         let before = self.read_for_write(&mut txn, &key).await?;
+        self.reject_hidden_existing(principal, table, before.as_ref())?;
         match expires_at {
             Some(ts) => self.manager.put_with_ttl(&mut txn, key, value.clone(), ts),
             None => self.manager.put(&mut txn, key, value.clone()),
@@ -473,7 +489,14 @@ where
     pub fn ttl_of(&self, principal: &Principal, table: &str, pk: &[u8]) -> Result<Ttl> {
         self.policies.predicate(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
-        match self.manager.expires_at(&key)? {
+        let mut txn = self.begin();
+        let Some(value) = self.manager.get(&mut txn, &key)? else {
+            return Ok(Ttl::Missing);
+        };
+        if !self.policies.row_allowed(principal, table, &value)? {
+            return Ok(Ttl::Missing);
+        }
+        match self.manager.expires_at_at(&key, txn.read_ts)? {
             None => Ok(Ttl::Missing),
             Some(0) => Ok(Ttl::Persistent),
             Some(ts) => {
@@ -496,7 +519,10 @@ where
         match reader.read(key).await? {
             RemoteRead::Local => self.ttl_of(principal, table, pk),
             RemoteRead::Value { value, expires_at } => {
-                if value.is_none() {
+                let Some(value) = value else {
+                    return Ok(Ttl::Missing);
+                };
+                if !self.policies.row_allowed(principal, table, &value)? {
                     return Ok(Ttl::Missing);
                 }
                 match expires_at.unwrap_or(0) {
@@ -1011,13 +1037,39 @@ mod tests {
 
         let manager = gateway.manager_clone();
         let mut txn = manager.begin();
-        manager.put(
+        manager.put_with_ttl(
             &mut txn,
             RecordKey::new("tenant-a", "d", "messages", b"hidden"),
             br#"{"tenant_id":"tenant-b","body":"secret"}"#.to_vec(),
+            ryme_txn::now_unix() + 60,
         );
         manager.commit(txn).unwrap();
         assert!(gateway.get(&principal, "messages", b"hidden").unwrap().is_none());
+        assert_eq!(gateway.ttl_of(&principal, "messages", b"hidden").unwrap(), Ttl::Missing);
+        assert!(matches!(
+            gateway
+                .put_with_ttl(
+                    &principal,
+                    "messages",
+                    b"hidden".to_vec(),
+                    br#"{"tenant_id":"tenant-a","body":"overwrite"}"#.to_vec(),
+                    Some(ryme_txn::now_unix() + 60),
+                )
+                .await,
+            Err(RymeError::NotFound(_))
+        ));
+        assert!(gateway
+            .put_many(
+                &principal,
+                "messages",
+                vec![
+                    (b"batch-new".to_vec(), br#"{"tenant_id":"tenant-a"}"#.to_vec()),
+                    (b"hidden".to_vec(), br#"{"tenant_id":"tenant-a"}"#.to_vec()),
+                ],
+            )
+            .await
+            .is_err());
+        assert!(gateway.get(&principal, "messages", b"batch-new").unwrap().is_none());
         let rows = gateway.scan(&principal, "messages", 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, b"visible");
@@ -1027,6 +1079,34 @@ mod tests {
             roles: [ryme_auth::Role::ReadOnly].into_iter().collect(),
         };
         assert!(gateway.get(&other_tenant, "messages", b"visible").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_ttl_hides_rows_rejected_by_row_policy() {
+        let mut policies = PolicyEngine::new();
+        policies.allow_table(String::from("messages"), String::from("tenant_id"));
+        let gateway = Gateway::new(
+            String::from("tenant-a"),
+            String::from("d"),
+            String::from("main"),
+            policies,
+            Realtime::new(16),
+        )
+        .with_remote_reader(RemoteReader::new(|_| async {
+            Ok(RemoteRead::Value {
+                value: Some(br#"{"tenant_id":"tenant-b"}"#.to_vec()),
+                expires_at: Some(ryme_txn::now_unix() + 60),
+            })
+        }));
+        let principal = Principal {
+            id: String::from("ada"),
+            tenant: String::from("tenant-a"),
+            roles: [ryme_auth::Role::ReadWrite].into_iter().collect(),
+        };
+        assert_eq!(
+            gateway.ttl_of_async(&principal, "messages", b"hidden").await.unwrap(),
+            Ttl::Missing
+        );
     }
 
     #[tokio::test]
