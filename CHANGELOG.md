@@ -4,6 +4,9 @@
   before preparing participants. Restart recovery aborts unresolved prepares
   when no commit decision exists, preventing coordinator crashes from leaving
   range intents permanently blocked.
+- Range-leader promotion now scans committed coordination markers and aborts
+  unresolved transactions before serving the recovered range, covering leader
+  loss without requiring a process restart.
 - Multi-owner transactions now persist their commit decision in a coordinator
   range quorum instead of the global data log. Each range resolves and
   materializes only its local prepared writes, with range-WAL recovery and

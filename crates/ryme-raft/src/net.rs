@@ -1720,6 +1720,54 @@ impl Node {
         }
         let _ = self.persist_range_meta();
         let _ = self.range_heartbeat(&range.id).await;
+        self.recover_range_coordinations_for_group(&range.id).await;
+    }
+
+    async fn recover_range_coordinations_for_group(self: &Arc<Self>, group_id: &str) {
+        let Some(range) = self.range_owner_by_id(group_id) else {
+            return;
+        };
+        if range.owner != self.id {
+            return;
+        }
+        let commit_index = self
+            .range_groups
+            .lock()
+            .ok()
+            .and_then(|groups| groups.get(group_id).map(|state| state.commit_index))
+            .unwrap_or(0);
+        let entries = self
+            .range_entries
+            .lock()
+            .ok()
+            .and_then(|groups| groups.get(group_id).cloned())
+            .unwrap_or_default();
+        let mut pending = BTreeMap::new();
+        for record in entries.values().filter(|record| record.index <= commit_index) {
+            match &record.kind {
+                RangeEntryKind::Coordinate { transaction_id, participants } => {
+                    pending.insert((*transaction_id, record.commit_ts), participants.clone());
+                }
+                RangeEntryKind::Decision { transaction_id, .. } => {
+                    pending.remove(&(*transaction_id, record.commit_ts));
+                }
+                _ => {}
+            }
+        }
+        for ((transaction_id, commit_ts), participants) in pending {
+            if let Err(error) = self
+                .record_range_decision(group_id, transaction_id, commit_ts, false, participants)
+                .await
+            {
+                tracing::error!(
+                    group_id,
+                    transaction_id,
+                    commit_ts,
+                    %error,
+                    "range leader recovery abort failed"
+                );
+            }
+        }
     }
 
     fn handle_range_vote(
@@ -5986,6 +6034,28 @@ mod tests {
         let mut probe = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut probe, &left).unwrap(), None);
         assert_eq!(reopened.manager.get(&mut probe, &right).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn promoted_range_leader_aborts_unresolved_coordinator_marker() {
+        let dir = temp_dir("range-leader-recovery");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        node.set_range_owners(vec![RangeOwner {
+            id: String::from("range-a"),
+            start: Vec::new(),
+            end: Vec::new(),
+            owner: 0,
+            replicas: vec![0],
+            epoch: 1,
+        }]);
+        let participants =
+            vec![ResolutionParticipant { participant: 0, group_id: String::from("range-a") }];
+        node.record_range_coordination("range-a", 414, 8, participants.clone()).await.unwrap();
+        node.recover_range_coordinations_for_group("range-a").await;
+        node.retry_pending_range_decisions().await;
+        assert!(node.range_decisions.lock().unwrap().is_empty());
+        assert!(node.range_recovery_coordinations.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

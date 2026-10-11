@@ -267,7 +267,9 @@ write set, so each range materializes its own portion of the transaction.
 Before preparing participants, the coordinator persists a coordination marker
 in its range quorum. If a node restarts after prepares but before a decision,
 recovery appends an abort decision and drives cleanup; a committed decision
-always takes precedence when one is already present.
+always takes precedence when one is already present. The same scan runs when a
+replica is promoted to range leader, so a range-leader failure does not require
+the whole process to restart before unresolved coordination is recovered.
 Prepared intents also reserve their conflict set: ordinary local or
 range-local commits that overlap a prepared transaction are rejected until the
 coordinator resolves it. This prevents a fast path from bypassing the
