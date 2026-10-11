@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 pub const MAX_DIM: usize = 4096;
 pub const MAX_TOP_K: usize = 100;
@@ -444,7 +444,15 @@ impl IndexRegistry {
         if space.is_empty() || id.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("vector target")));
         }
-        self.vectors.entry(space.to_string()).or_default().upsert(id, vector)
+        match self.vectors.entry(space.to_string()) {
+            Entry::Occupied(mut entry) => entry.get_mut().upsert(id, vector),
+            Entry::Vacant(entry) => {
+                let mut vectors = VectorSpace::default();
+                vectors.upsert(id, vector)?;
+                entry.insert(vectors);
+                Ok(())
+            }
+        }
     }
 
     pub fn vector_remove(&mut self, space: &str, id: &str) -> bool {
@@ -732,6 +740,7 @@ mod tests {
     fn rejected_first_vector_does_not_lock_dimension() {
         let mut registry = PartitionedIndex::new(4);
         assert!(registry.vector_upsert("s", String::from("bad"), vec![0.0, 0.0]).is_err());
+        assert!(registry.partitions.iter().all(|partition| !partition.vectors.contains_key("s")));
         registry.vector_upsert("s", String::from("good"), vec![1.0, 0.0, 0.0]).unwrap();
         assert_eq!(registry.vector_search("s", &[1.0, 0.0, 0.0], 1).unwrap()[0].id, "good");
     }
