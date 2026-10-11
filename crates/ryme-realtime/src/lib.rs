@@ -40,6 +40,8 @@ pub struct QueryRow {
 
 pub const PRESENCE_MAX_MEMBERS: usize = 1000;
 pub const PRESENCE_MAX_TTL_SECS: u64 = 86400;
+pub const PRESENCE_MAX_MEMBER_BYTES: usize = 256;
+pub const PRESENCE_MAX_STATE_BYTES: usize = 64 * 1024;
 const BROADCAST_SHARDS: usize = 32;
 const TABLE_TOPIC_SHARDS: usize = 32;
 const PRESENCE_SHARDS: usize = 32;
@@ -845,6 +847,14 @@ impl Realtime {
         expires_unix: u64,
         now_unix: u64,
     ) -> Result<usize> {
+        if member.is_empty() || member.len() > PRESENCE_MAX_MEMBER_BYTES {
+            return Err(RymeError::InvalidArgument(String::from("presence member")));
+        }
+        let state_bytes = serde_json::to_vec(&state)
+            .map_err(|_| RymeError::InvalidArgument(String::from("presence state")))?;
+        if state_bytes.len() > PRESENCE_MAX_STATE_BYTES {
+            return Err(RymeError::Overload(String::from("presence state")));
+        }
         let key = scope_key(tenant, channel);
         let shard = self.presence_shard(&key);
         let mut presence = self
@@ -1045,6 +1055,9 @@ impl Realtime {
     }
 
     pub fn presence_leave(&self, tenant: &str, channel: &str, member: &str) -> Result<bool> {
+        if member.is_empty() || member.len() > PRESENCE_MAX_MEMBER_BYTES {
+            return Err(RymeError::InvalidArgument(String::from("presence member")));
+        }
         let key = scope_key(tenant, channel);
         let shard = self.presence_shard(&key);
         let mut presence = self
@@ -1978,6 +1991,34 @@ mod tests {
             .presence_join("t", "far", String::from("a"), serde_json::json!(null), u64::MAX, 1000)
             .unwrap();
         assert!(realtime.presence_list("t", "far", 1000 + PRESENCE_MAX_TTL_SECS + 1).is_empty());
+    }
+
+    #[test]
+    fn presence_rejects_oversized_member_and_state() {
+        let realtime = Realtime::new(64);
+        assert!(matches!(
+            realtime.presence_join(
+                "t",
+                "room",
+                "m".repeat(PRESENCE_MAX_MEMBER_BYTES + 1),
+                serde_json::Value::Null,
+                60,
+                1000,
+            ),
+            Err(RymeError::InvalidArgument(message)) if message == "presence member"
+        ));
+        assert!(matches!(
+            realtime.presence_join(
+                "t",
+                "room",
+                String::from("member"),
+                serde_json::Value::String("x".repeat(PRESENCE_MAX_STATE_BYTES)),
+                60,
+                1000,
+            ),
+            Err(RymeError::Overload(message)) if message == "presence state"
+        ));
+        assert!(realtime.presence_list("t", "room", 1000).is_empty());
     }
 
     #[test]
