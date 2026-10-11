@@ -6267,6 +6267,11 @@ async fn publish_broadcast(
     channel: String,
     payload: serde_json::Value,
 ) -> ryme_error::Result<u64> {
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|error| ryme_error::RymeError::Internal(error.to_string()))?;
+    if payload_bytes.len() > REALTIME_MAX_BROADCAST_PAYLOAD_BYTES {
+        return Err(ryme_error::RymeError::Overload(String::from("broadcast payload")));
+    }
     let commit = state.backend.latest_commit();
     if let Some(node) = state.raft_node() {
         admit_realtime(state, tenant, 1)?;
