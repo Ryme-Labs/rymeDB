@@ -8036,6 +8036,142 @@ where
         Ok(rows)
     }
 
+    async fn scan_all_rows_in_transaction_async(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+    ) -> Result<Vec<Row>> {
+        const PAGE: usize = 10_000;
+        let mut rows =
+            self.manager.scan_async(&mut *txn, &self.tenant, &self.database, table, PAGE).await?;
+        loop {
+            if rows.len() < PAGE {
+                break;
+            }
+            let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
+            let next = self
+                .manager
+                .scan_after_async(&mut *txn, &self.tenant, &self.database, table, &last, PAGE)
+                .await?;
+            if next.is_empty() {
+                break;
+            }
+            rows.extend(next);
+        }
+        if !txn.writes().is_empty() {
+            let mut merged = rows.into_iter().collect::<BTreeMap<_, _>>();
+            for (key, write) in txn.writes() {
+                if key.tenant != self.tenant || key.database != self.database || key.table != table
+                {
+                    continue;
+                }
+                match write.value.as_ref() {
+                    Some(value) => {
+                        merged.insert(key.pk.clone(), value.clone());
+                    }
+                    None => {
+                        merged.remove(&key.pk);
+                    }
+                }
+            }
+            return Ok(merged.into_iter().collect());
+        }
+        Ok(rows)
+    }
+
+    async fn enforce_foreign_keys_async(
+        &self,
+        txn: &mut Transaction,
+        table: &str,
+        pk: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let constraints = self
+            .foreign_keys
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        for constraint in constraints {
+            let Some(local_values) = constraint
+                .columns
+                .iter()
+                .map(|column| self.row_column_value(table, pk, value, column))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let referenced_columns = if constraint.referenced_columns.is_empty() {
+                self.catalog_columns(&constraint.referenced_table)
+                    .into_iter()
+                    .filter(|definition| definition.primary_key)
+                    .map(|definition| definition.name)
+                    .collect::<Vec<_>>()
+            } else {
+                constraint.referenced_columns.clone()
+            };
+            if referenced_columns.len() != local_values.len() || referenced_columns.is_empty() {
+                return Err(RymeError::InvalidArgument(String::from("foreign key column count")));
+            }
+            let parent_columns = self.catalog_columns(&constraint.referenced_table);
+            let parent_primary = parent_columns
+                .iter()
+                .filter(|definition| definition.primary_key)
+                .map(|definition| definition.name.clone())
+                .collect::<Vec<_>>();
+            let references_primary = referenced_columns.len() == parent_primary.len()
+                && referenced_columns
+                    .iter()
+                    .zip(&parent_primary)
+                    .all(|(referenced, primary)| referenced.eq_ignore_ascii_case(primary));
+            let exists = if references_primary {
+                let parent_pk = if local_values.len() == 1 {
+                    local_values[0].clone()
+                } else {
+                    encode_key_parts(&local_values).ok_or_else(|| {
+                        RymeError::InvalidArgument(String::from("foreign key value"))
+                    })?
+                };
+                self.manager
+                    .get_async(
+                        txn,
+                        &RecordKey::new(
+                            &self.tenant,
+                            &self.database,
+                            &constraint.referenced_table,
+                            &parent_pk,
+                        ),
+                    )
+                    .await?
+                    .is_some()
+            } else {
+                self.scan_all_rows_in_transaction_async(txn, &constraint.referenced_table)
+                    .await?
+                    .iter()
+                    .any(|(parent_pk, parent_value)| {
+                        referenced_columns.iter().zip(&local_values).all(|(column, expected)| {
+                            self.row_column_value(
+                                &constraint.referenced_table,
+                                parent_pk,
+                                parent_value,
+                                column,
+                            )
+                            .is_some_and(|actual| actual == *expected)
+                        })
+                    })
+            };
+            if !exists {
+                return Err(RymeError::Conflict(format!(
+                    "foreign key constraint failed: {} references {}",
+                    constraint.columns.join(", "),
+                    constraint.referenced_table
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn enforce_foreign_keys(
         &self,
         txn: &mut Transaction,
@@ -11359,7 +11495,7 @@ where
                 let value = self.apply_before_triggers(&table, "INSERT", &value)?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
-                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
+                self.enforce_foreign_keys_async(txn, &table, &pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get_async(txn, &key).await?;
                 if before.is_some() {
@@ -11384,7 +11520,7 @@ where
                 let value = self.apply_before_triggers(&table, "INSERT", &value)?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
-                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
+                self.enforce_foreign_keys_async(txn, &table, &pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 if self.manager.get_async(txn, &key).await?.is_some() {
                     return Ok((QueryResult::Ok, Vec::new()));
@@ -11435,7 +11571,7 @@ where
                 let value = self.apply_before_triggers(&table, "INSERT", &value)?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
-                self.enforce_foreign_keys(txn, &table, &pk, &value)?;
+                self.enforce_foreign_keys_async(txn, &table, &pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get_async(txn, &key).await?;
                 if let Some(before) = before.as_deref() {
@@ -11490,7 +11626,7 @@ where
                     let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
                     self.enforce_rls(&table, &after)?;
                     self.enforce_checks(&table, &new_pk, &after)?;
-                    self.enforce_foreign_keys(txn, &table, &new_pk, &after)?;
+                    self.enforce_foreign_keys_async(txn, &table, &new_pk, &after).await?;
                     self.check_unique_excluding(&table, &new_pk, &after, Some(&pk))?;
                     if new_pk != pk
                         && self
@@ -11563,7 +11699,7 @@ where
                 let new_pk = self.primary_key_for_row(&table, &pk, &value)?;
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &new_pk, &value)?;
-                self.enforce_foreign_keys(txn, &table, &new_pk, &value)?;
+                self.enforce_foreign_keys_async(txn, &table, &new_pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get_async(txn, &key).await?;
                 if before.is_none() {
@@ -13544,9 +13680,9 @@ where
                 self.enforce_rls(&table, &value)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
-                self.enforce_foreign_keys(&mut txn, &table, &pk, &value)?;
+                self.enforce_foreign_keys_async(&mut txn, &table, &pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
-                let before = self.manager.get(&mut txn, &key)?;
+                let before = self.manager.get_async(&mut txn, &key).await?;
                 if before.is_some() {
                     return Err(RymeError::Conflict(String::from("exists")));
                 }

@@ -714,6 +714,122 @@ async fn follower_transaction_forwarding_preserves_read_conflicts() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn async_foreign_key_checks_read_parent_rows_from_range_owner() {
+    let root = std::env::temp_dir().join(format!(
+        "ryme-cross-range-fk-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut listeners = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    let mut tasks = Vec::new();
+    for id in 0..3 {
+        let peers: Vec<String> = addrs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, _)| *index != id)
+            .map(|(_, address)| address.to_string())
+            .collect();
+        let peer_ids: Vec<usize> = (0..3).filter(|index| *index != id).collect();
+        let node = Node::open(id, peers, peer_ids, &root.join(format!("n{id}"))).unwrap();
+        tasks.push(node.spawn(listeners.remove(0)));
+        nodes.push(node);
+    }
+    let backends: Vec<ClusterBackend> = nodes.iter().cloned().map(ClusterBackend::new).collect();
+    let leader = wait_leader(&nodes, None).await;
+    let parent_owner = (leader + 1) % nodes.len();
+    let client = (leader + 2) % nodes.len();
+    let mut parent_start = b"parents".to_vec();
+    parent_start.push(0);
+    let placement = vec![
+        RangeOwner {
+            id: String::from("before-parents"),
+            start: Vec::new(),
+            end: parent_start.clone(),
+            owner: leader,
+            replicas: vec![leader, parent_owner],
+            epoch: 1,
+        },
+        RangeOwner {
+            id: String::from("parents-and-after"),
+            start: parent_start,
+            end: Vec::new(),
+            owner: parent_owner,
+            replicas: vec![leader, parent_owner],
+            epoch: 1,
+        },
+    ];
+    for node in &nodes {
+        node.set_range_owners(placement.clone());
+    }
+
+    let executor = ryme_sql::Executor::with_backend(
+        String::from("t"),
+        String::from("d"),
+        backends[client].clone(),
+    );
+    executor
+        .execute(ryme_sql::parse("CREATE TABLE parents (id TEXT PRIMARY KEY)").unwrap())
+        .await
+        .unwrap();
+    executor
+        .execute(ryme_sql::parse(
+            "CREATE TABLE children (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parents(id))",
+        )
+        .unwrap())
+        .await
+        .unwrap();
+    assert_eq!(executor.catalog_foreign_keys("children").len(), 1);
+    executor
+        .execute(ryme_sql::parse("INSERT INTO parents (id) VALUES ('p1')").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        nodes[client].range_owner(b"parents\0p1").map(|(owner, _)| owner),
+        Some(parent_owner)
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if nodes[parent_owner]
+            .read_latest(&RecordKey::new("t", "d", "parents", b"p1"))
+            .await
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "parent did not reach range owner");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut remote_probe = backends[client].begin();
+    assert!(backends[client]
+        .get_async(&mut remote_probe, &RecordKey::new("t", "d", "parents", b"p1"),)
+        .await
+        .unwrap()
+        .is_some());
+
+    let result = executor
+        .execute(
+            ryme_sql::parse("INSERT INTO children (id, parent_id) VALUES ('c1', 'p1')").unwrap(),
+        )
+        .await;
+    assert!(result.is_ok(), "cross-range foreign key insert failed: {result:?}");
+
+    for (node, task) in nodes.iter().zip(tasks) {
+        node.shutdown(task);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
