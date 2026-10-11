@@ -1000,9 +1000,7 @@ impl TxnManager {
                 .engine
                 .read()
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-            let has_version = engine.version_at(key, txn.read_ts).is_some();
-            let value = has_version.then(|| engine.read(key, txn.read_ts, now)).transpose()?;
-            (has_version, value.flatten())
+            engine.read_with_presence(key, txn.read_ts, now)?
         };
         let value = if has_version { value } else { fallback()? };
         txn.record_read(key.clone(), value.is_some())?;

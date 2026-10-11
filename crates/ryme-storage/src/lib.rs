@@ -157,6 +157,29 @@ impl Engine {
         })
     }
 
+    /// Return whether a version exists at the snapshot and its visible value.
+    ///
+    /// The existence bit is independent of TTL and tombstones so callers that
+    /// merge immutable segments do not fall through to an older version when a
+    /// newer version intentionally hides the value.
+    pub fn read_with_presence(
+        &self,
+        key: &RecordKey,
+        read_ts: u64,
+        now: u64,
+    ) -> Result<(bool, Option<Vec<u8>>)> {
+        let Some(versions) = self.inner.get(key) else {
+            return Ok((false, None));
+        };
+        let Some(version) =
+            Self::version_index_at(versions, read_ts).and_then(|index| versions.get(index))
+        else {
+            return Ok((false, None));
+        };
+        let value = if version.value.is_some() { Self::visible(version, now) } else { None };
+        Ok((true, value))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -200,13 +223,7 @@ impl Engine {
     }
 
     pub fn read(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
-        let Some(versions) = self.inner.get(key) else {
-            return Ok(None);
-        };
-        Ok(Self::version_index_at(versions, read_ts)
-            .and_then(|index| versions.get(index))
-            .filter(|version| version.value.is_some())
-            .and_then(|version| Self::visible(version, now)))
+        self.read_with_presence(key, read_ts, now).map(|(_, value)| value)
     }
 
     pub fn scan(
@@ -848,6 +865,35 @@ mod tests {
         assert_eq!(
             engine.version_at(&key, 512),
             Some((512, Some(512u64.to_be_bytes().to_vec()), 0))
+        );
+    }
+
+    #[test]
+    fn read_with_presence_keeps_hidden_versions_from_falling_back() {
+        let mut engine = Engine::new();
+        let value_key = RecordKey::new("t", "d", "presence", b"value");
+        let tombstone_key = RecordKey::new("t", "d", "presence", b"deleted");
+        let expired_key = RecordKey::new("t", "d", "presence", b"expired");
+        engine.apply(value_key.clone(), 1, Some(b"value".to_vec())).unwrap();
+        engine.apply(tombstone_key.clone(), 1, Some(b"old".to_vec())).unwrap();
+        engine.apply(tombstone_key.clone(), 2, None).unwrap();
+        engine.apply_with_expiry(expired_key.clone(), 1, Some(b"expired".to_vec()), 10).unwrap();
+
+        assert_eq!(
+            engine.read_with_presence(&value_key, 1, 0).unwrap(),
+            (true, Some(b"value".to_vec()))
+        );
+        assert_eq!(engine.read_with_presence(&tombstone_key, 2, 0).unwrap(), (true, None));
+        assert_eq!(engine.read_with_presence(&expired_key, 1, 10).unwrap(), (true, None));
+        assert_eq!(
+            engine
+                .read_with_presence(&RecordKey::new("t", "d", "presence", b"missing"), 1, 0)
+                .unwrap(),
+            (false, None)
+        );
+        assert_eq!(
+            engine.read_with_presence(&tombstone_key, 1, 0).unwrap(),
+            (true, Some(b"old".to_vec()))
         );
     }
 

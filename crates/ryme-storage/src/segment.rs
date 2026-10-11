@@ -402,7 +402,7 @@ impl ImmutableSegment {
 pub struct SegmentStore {
     dir: PathBuf,
     cache: Arc<Mutex<SegmentReadCache>>,
-    paths: Arc<RwLock<Vec<PathBuf>>>,
+    paths: Arc<RwLock<Arc<Vec<PathBuf>>>>,
 }
 
 impl SegmentStore {
@@ -416,7 +416,7 @@ impl SegmentStore {
         Ok(Self {
             dir: dir.to_path_buf(),
             cache: Arc::new(Mutex::new(SegmentReadCache::new(cache_bytes))),
-            paths: Arc::new(RwLock::new(paths)),
+            paths: Arc::new(RwLock::new(Arc::new(paths))),
         })
     }
 
@@ -528,14 +528,11 @@ impl SegmentStore {
         }
     }
 
-    fn newest_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut paths = self
-            .paths
+    fn newest_paths(&self) -> Result<Arc<Vec<PathBuf>>> {
+        self.paths
             .read()
-            .map(|paths| paths.clone())
-            .map_err(|_| RymeError::Internal(String::from("segment paths lock")))?;
-        paths.reverse();
-        Ok(paths)
+            .map(|paths| Arc::clone(&paths))
+            .map_err(|_| RymeError::Internal(String::from("segment paths lock")))
     }
 
     pub fn get(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
@@ -549,8 +546,9 @@ impl SegmentStore {
     }
 
     pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<VersionLookup>> {
-        for path in self.newest_paths()? {
-            let segment = self.read_segment(&path)?;
+        let paths = self.newest_paths()?;
+        for path in paths.iter().rev() {
+            let segment = self.read_segment(path)?;
             let Some(version) = segment.version_at(key, read_ts) else {
                 if segment.is_snapshot() {
                     return Ok(None);
@@ -633,8 +631,9 @@ impl SegmentStore {
             return Ok(Vec::new());
         }
         let mut selected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        for path in self.newest_paths()? {
-            let segment = self.read_segment(&path)?;
+        let paths = self.newest_paths()?;
+        for path in paths.iter().rev() {
+            let segment = self.read_segment(path)?;
             let scope_start = segment
                 .keys
                 .partition_point(|key| scope_order(key, tenant, database, table) == Ordering::Less);
@@ -725,10 +724,12 @@ impl SegmentStore {
         if paths.iter().any(|candidate| candidate == &path) {
             return;
         }
-        paths.push(path);
-        paths.sort_by_key(|candidate| {
+        let mut updated = (**paths).clone();
+        updated.push(path);
+        updated.sort_by_key(|candidate| {
             parse_segment_name(candidate.file_name().and_then(|name| name.to_str()).unwrap_or(""))
         });
+        *paths = Arc::new(updated);
     }
 
     fn forget_segment(&self, path: &Path) {
@@ -740,7 +741,9 @@ impl SegmentStore {
             }
         }
         if let Ok(mut paths) = self.paths.write() {
-            paths.retain(|candidate| candidate != path);
+            let mut updated = (**paths).clone();
+            updated.retain(|candidate| candidate != path);
+            *paths = Arc::new(updated);
         }
     }
 
