@@ -25,6 +25,8 @@ use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
 use ryme_sql::{bind, parse, Executor, QueryResult, Statement};
 use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -5404,30 +5406,110 @@ fn encode_supabase_frame(frame: &SupabaseFrame, array_protocol: bool) -> String 
     }
 }
 
-fn supabase_broadcast_parts(payload: &serde_json::Value) -> (String, serde_json::Value) {
-    match payload {
+enum SupabaseBroadcastDataRef<'a> {
+    Value(&'a serde_json::Value),
+    ObjectWithoutEvent(&'a serde_json::Map<String, serde_json::Value>),
+}
+
+impl Serialize for SupabaseBroadcastDataRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::ObjectWithoutEvent(object) => {
+                let entry_count = if object.contains_key("event") {
+                    object.len() - 1
+                } else {
+                    object.len()
+                };
+                let mut map = serializer.serialize_map(Some(entry_count))?;
+                for (key, value) in *object {
+                    if key != "event" {
+                        map.serialize_entry(key, value)?;
+                    }
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+struct SupabaseBroadcastPayloadRef<'a> {
+    event: &'a str,
+    data: SupabaseBroadcastDataRef<'a>,
+}
+
+impl Serialize for SupabaseBroadcastPayloadRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("event", self.event)?;
+        map.serialize_entry("payload", &self.data)?;
+        map.serialize_entry("type", "broadcast")?;
+        map.end()
+    }
+}
+
+struct SupabaseBroadcastFrameRef<'a> {
+    topic: &'a str,
+    payload: SupabaseBroadcastPayloadRef<'a>,
+    array_protocol: bool,
+}
+
+impl Serialize for SupabaseBroadcastFrameRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.array_protocol {
+            let mut sequence = serializer.serialize_seq(Some(5))?;
+            sequence.serialize_element(&Option::<&str>::None)?;
+            sequence.serialize_element(&Option::<&str>::None)?;
+            sequence.serialize_element(self.topic)?;
+            sequence.serialize_element("broadcast")?;
+            sequence.serialize_element(&self.payload)?;
+            sequence.end()
+        } else {
+            let mut map = serializer.serialize_map(Some(5))?;
+            map.serialize_entry("join_ref", &Option::<&str>::None)?;
+            map.serialize_entry("ref", &Option::<&str>::None)?;
+            map.serialize_entry("topic", self.topic)?;
+            map.serialize_entry("event", "broadcast")?;
+            map.serialize_entry("payload", &self.payload)?;
+            map.end()
+        }
+    }
+}
+
+fn encode_supabase_broadcast_frame(
+    topic: &str,
+    payload: &serde_json::Value,
+    array_protocol: bool,
+) -> String {
+    let (event, data) = match payload {
         serde_json::Value::Object(object) => {
             let event = object
                 .get("event")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("message")
-                .to_string();
-            let payload = match object.get("payload") {
-                Some(payload) => payload.clone(),
-                None => {
-                    let mut remainder = serde_json::Map::new();
-                    for (key, value) in object {
-                        if key != "event" {
-                            remainder.insert(key.clone(), value.clone());
-                        }
-                    }
-                    serde_json::Value::Object(remainder)
-                }
+                .unwrap_or("message");
+            let data = match object.get("payload") {
+                Some(payload) => SupabaseBroadcastDataRef::Value(payload),
+                None => SupabaseBroadcastDataRef::ObjectWithoutEvent(object),
             };
-            (event, payload)
+            (event, data)
         }
-        payload => (String::from("message"), payload.clone()),
-    }
+        value => ("message", SupabaseBroadcastDataRef::Value(value)),
+    };
+    serde_json::to_string(&SupabaseBroadcastFrameRef {
+        topic,
+        payload: SupabaseBroadcastPayloadRef { event, data },
+        array_protocol,
+    })
+    .unwrap_or_else(|_| String::from("{}"))
 }
 
 fn supabase_reply(
@@ -5983,19 +6065,9 @@ async fn forward_supabase_realtime(
                         }
                         let event_pre_admitted = record.fanout_quota_pre_admitted();
                         let pre_admitted_bytes = record.json_len();
-                        let (event_name, payload) = supabase_broadcast_parts(&record.payload);
-                        let text = encode_supabase_frame(
-                            &SupabaseFrame {
-                                join_ref: None,
-                                reference: None,
-                                topic: topic.clone(),
-                                event: String::from("broadcast"),
-                                payload: serde_json::json!({
-                                    "event": event_name,
-                                    "payload": payload,
-                                    "type": "broadcast",
-                                }),
-                            },
+                        let text = encode_supabase_broadcast_frame(
+                            &topic,
+                            &record.payload,
                             array_protocol,
                         );
                         (text, event_pre_admitted, pre_admitted_bytes)
@@ -11105,26 +11177,51 @@ mod realtime_policy_tests {
     use super::*;
 
     #[test]
-    fn supabase_broadcast_parts_only_clone_the_forwarded_payload() {
-        let (event, payload) = supabase_broadcast_parts(&serde_json::json!({
+    fn supabase_broadcast_frames_preserve_payload_shapes_without_owned_clones() {
+        let payload = serde_json::json!({
             "event": "updated",
             "payload": {"id": 7},
             "unused": {"large": [1, 2, 3]},
-        }));
-        assert_eq!(event, "updated");
-        assert_eq!(payload, serde_json::json!({"id": 7}));
+        });
+        let frame: serde_json::Value =
+            serde_json::from_str(&encode_supabase_broadcast_frame("room:lobby", &payload, false))
+                .unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "join_ref": null,
+                "ref": null,
+                "topic": "room:lobby",
+                "event": "broadcast",
+                "payload": {"event": "updated", "payload": {"id": 7}, "type": "broadcast"},
+            })
+        );
 
-        let (event, payload) = supabase_broadcast_parts(&serde_json::json!({
+        let fallback_payload = serde_json::json!({
             "event": "updated",
             "id": 7,
-        }));
-        assert_eq!(event, "updated");
-        assert_eq!(payload, serde_json::json!({"id": 7}));
+        });
+        let array_frame: serde_json::Value = serde_json::from_str(
+            &encode_supabase_broadcast_frame("room:lobby", &fallback_payload, true),
+        )
+        .unwrap();
+        assert_eq!(
+            array_frame,
+            serde_json::json!([
+                null,
+                null,
+                "room:lobby",
+                "broadcast",
+                {"event": "updated", "payload": {"id": 7}, "type": "broadcast"},
+            ])
+        );
 
         let original = serde_json::json!([1, 2, 3]);
-        let (event, payload) = supabase_broadcast_parts(&original);
-        assert_eq!(event, "message");
-        assert_eq!(payload, original);
+        let frame: serde_json::Value =
+            serde_json::from_str(&encode_supabase_broadcast_frame("room:lobby", &original, false))
+                .unwrap();
+        assert_eq!(frame["payload"]["event"], "message");
+        assert_eq!(frame["payload"]["payload"], original);
     }
 
     #[tokio::test]
