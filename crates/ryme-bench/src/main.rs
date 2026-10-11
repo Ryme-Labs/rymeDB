@@ -75,6 +75,8 @@ enum Command {
         api_key: String,
         #[arg(long, default_value = "bench")]
         channel: String,
+        #[arg(long, default_value_t = 1)]
+        channel_count: usize,
         #[arg(long, default_value_t = 100)]
         connections: usize,
         #[arg(long, default_value_t = 10000)]
@@ -151,6 +153,7 @@ async fn main() {
             addr,
             api_key,
             channel,
+            channel_count,
             connections,
             messages,
             payload_bytes,
@@ -163,6 +166,7 @@ async fn main() {
                 addr,
                 api_key,
                 channel,
+                channel_count,
                 connections,
                 messages,
                 payload_bytes,
@@ -183,6 +187,7 @@ struct RealtimeBench {
     addr: String,
     api_key: String,
     channel: String,
+    channel_count: usize,
     connections: usize,
     messages: usize,
     payload_bytes: usize,
@@ -214,32 +219,41 @@ struct RealtimePayloadSample {
 }
 
 async fn realtime_bench(config: RealtimeBench) {
-    if config.connections == 0 || config.messages == 0 {
-        eprintln!("connections and messages must be greater than zero");
+    if config.connections == 0 || config.messages == 0 || config.channel_count == 0 {
+        eprintln!("connections, messages, and channel-count must be greater than zero");
         return;
     }
     let benchmark_start = Instant::now();
-    let ws_url =
-        format!("ws://{}/v1/broadcast/{}?api_key={}", config.addr, config.channel, config.api_key);
     let connection_results = futures_util::stream::iter(0..config.connections)
-        .map(|_| {
-            let ws_url = ws_url.clone();
+        .map(|connection| {
+            let topic = connection % config.channel_count;
+            let ws_url = format!(
+                "ws://{}/v1/broadcast/{}?api_key={}",
+                config.addr,
+                realtime_channel(&config.channel, config.channel_count, topic),
+                config.api_key
+            );
             async move {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(15),
                     tokio_tungstenite::connect_async(ws_url),
                 )
                 .await
+                .map(|result| (topic, result))
             }
         })
         .buffer_unordered(config.connection_concurrency.max(1))
         .collect::<Vec<_>>()
         .await;
     let mut streams = Vec::with_capacity(config.connections);
+    let mut subscribers_per_channel = vec![0usize; config.channel_count];
     for result in connection_results {
         match result {
-            Ok(Ok((stream, _))) => streams.push(stream),
-            Ok(Err(error)) => {
+            Ok((topic, Ok((stream, _)))) => {
+                subscribers_per_channel[topic] += 1;
+                streams.push((topic, stream));
+            }
+            Ok((_, Err(error))) => {
                 eprintln!(
                     "realtime connection failed after {} connections: {error}",
                     streams.len()
@@ -254,11 +268,11 @@ async fn realtime_bench(config: RealtimeBench) {
     }
     tokio::time::sleep(std::time::Duration::from_millis(config.warmup_ms)).await;
 
-    let (published_target, published_target_rx) = tokio::sync::watch::channel(None::<usize>);
+    let (published_target, published_target_rx) = tokio::sync::watch::channel(None::<Vec<usize>>);
     let (readers_start, reader_start_rx) = tokio::sync::watch::channel(false);
     let mut readers = Vec::with_capacity(streams.len());
     let latency_sample_limit = (1_000_000 / config.connections.max(1)).max(1);
-    for mut stream in streams {
+    for (topic, mut stream) in streams {
         let mut published_target_rx = published_target_rx.clone();
         let mut reader_start_rx = reader_start_rx.clone();
         readers.push(tokio::spawn(async move {
@@ -268,7 +282,11 @@ async fn realtime_bench(config: RealtimeBench) {
             let mut errors = 0usize;
             let mut latency_micros = Vec::with_capacity(latency_sample_limit);
             loop {
-                if published_target_rx.borrow().is_some_and(|target| received >= target) {
+                if published_target_rx
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|targets| received >= targets[topic])
+                {
                     break;
                 }
                 let next_message = tokio::select! {
@@ -318,10 +336,11 @@ async fn realtime_bench(config: RealtimeBench) {
     let publish_start = Instant::now();
     let publish_results = futures_util::stream::iter(0..config.messages)
         .map(|index| {
+            let topic = index % config.channel_count;
             let client = client.clone();
             let publish_url = publish_url.clone();
             let api_key = config.api_key.clone();
-            let channel = config.channel.clone();
+            let channel = realtime_channel(&config.channel, config.channel_count, topic);
             let payload = payload.clone();
             async move {
                 client
@@ -339,15 +358,20 @@ async fn realtime_bench(config: RealtimeBench) {
                     .await
                     .map(|response| response.status().is_success())
                     .unwrap_or(false)
+                    .then_some(topic)
             }
         })
         .buffer_unordered(config.publish_concurrency.max(1))
         .collect::<Vec<_>>()
         .await;
     let publish_seconds = publish_start.elapsed().as_secs_f64().max(0.000001);
-    let published = publish_results.iter().filter(|ok| **ok).count();
+    let mut published_per_channel = vec![0usize; config.channel_count];
+    for topic in publish_results.iter().flatten() {
+        published_per_channel[*topic] += 1;
+    }
+    let published = publish_results.iter().flatten().count();
     let publish_errors = config.messages - published;
-    published_target.send_replace(Some(published));
+    published_target.send_replace(Some(published_per_channel.clone()));
 
     let mut received = 0usize;
     let mut receive_errors = 0usize;
@@ -392,12 +416,13 @@ async fn realtime_bench(config: RealtimeBench) {
         publish_seconds,
         total_seconds,
     };
-    let expected = result.connections * result.published;
+    let expected = expected_fanout(&subscribers_per_channel, &published_per_channel);
     let delivery_percent =
         if expected == 0 { 0.0 } else { result.received as f64 * 100.0 / expected as f64 };
     let output = serde_json::json!({
         "target": config.addr,
         "channel": config.channel,
+        "channel_count": config.channel_count,
         "machine": machine_metadata(),
         "connections": result.connections,
         "messages": result.messages,
@@ -424,9 +449,10 @@ async fn realtime_bench(config: RealtimeBench) {
         println!("{output}");
     } else {
         println!(
-            "target={} connections={} messages={} published={} publish_errors={} received={} receive_errors={} delivery={delivery_percent:.2}% publish_qps={} fanout_deliveries_per_second={} latency_samples={} publish_to_client_p50={}us publish_to_client_p95={}us publish_to_client_p99={}us publish_to_client_max={}us total_seconds={:.3}",
+            "target={} connections={} channels={} messages={} published={} publish_errors={} received={} receive_errors={} delivery={delivery_percent:.2}% publish_qps={} fanout_deliveries_per_second={} latency_samples={} publish_to_client_p50={}us publish_to_client_p95={}us publish_to_client_p99={}us publish_to_client_max={}us total_seconds={:.3}",
             config.addr,
             result.connections,
+            config.channel_count,
             result.messages,
             result.published,
             result.publish_errors,
@@ -475,6 +501,18 @@ fn local_bench(ops: usize, value_bytes: usize) {
         let probe_micros = probe_start.elapsed().as_micros().max(1);
         println!("probe_hits={hits} probe_mean_micros={}", probe_micros / probe_ops as u128);
     }
+}
+
+fn realtime_channel(base: &str, channel_count: usize, topic: usize) -> String {
+    if channel_count == 1 { base.to_owned() } else { format!("{base}-{topic}") }
+}
+
+fn expected_fanout(subscribers: &[usize], published: &[usize]) -> usize {
+    subscribers
+        .iter()
+        .zip(published)
+        .map(|(subscribers, published)| subscribers.saturating_mul(*published))
+        .fold(0usize, usize::saturating_add)
 }
 
 fn machine_metadata() -> serde_json::Value {
@@ -1170,7 +1208,20 @@ async fn resp_bench(config: RespBench) {
 
 #[cfg(test)]
 mod tests {
-    use super::{latency_histogram, worker_ops};
+    use super::{expected_fanout, latency_histogram, realtime_channel, worker_ops};
+
+    #[test]
+    fn realtime_channel_names_preserve_single_channel_compatibility() {
+        assert_eq!(realtime_channel("bench", 1, 0), "bench");
+        assert_eq!(realtime_channel("bench", 3, 0), "bench-0");
+        assert_eq!(realtime_channel("bench", 3, 2), "bench-2");
+    }
+
+    #[test]
+    fn realtime_expected_delivery_accounts_for_channel_distribution() {
+        assert_eq!(expected_fanout(&[2, 1, 0], &[3, 4, 5]), 10);
+        assert_eq!(expected_fanout(&[0], &[100]), 0);
+    }
 
     #[test]
     fn worker_split_preserves_requested_operations() {

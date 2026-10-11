@@ -69,6 +69,13 @@ ryme-bench realtime --addr 127.0.0.1:8080 --api-key local-dev-key \
   --payload-bytes 128 --json
 ```
 
+By default, all subscribers and publishes use the single `bench` channel (a
+hot-topic test). Set `--channel-count 10` to spread both connections and
+publishes round-robin over `bench-0` through `bench-9`, approximating a uniform
+multi-topic workload. Delivery percentage is calculated from the subscribers
+and successful publishes on each channel, so channels with no subscribers do
+not inflate the expected-delivery count.
+
 The cached-envelope run used 20 connections, 64 connection concurrency, 1,000
 messages, and 32 concurrent publishers:
 
