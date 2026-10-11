@@ -3,6 +3,7 @@ use ryme_branch::BranchManager;
 use ryme_error::{Result, RymeError};
 use ryme_router::{Range, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 fn split_midpoint(start: &[u8], end: &[u8]) -> Result<Vec<u8>> {
     if start.is_empty() && end.is_empty() {
@@ -58,6 +59,7 @@ pub struct ControlPlane {
     pub backups: BackupLog,
     pub router: Router,
     pub migrations: ryme_migrate::Ledger,
+    migration_scopes: HashMap<String, ryme_migrate::Ledger>,
 }
 
 pub const AUTO_SPLIT_MAX_RANGES: usize = 256;
@@ -65,6 +67,61 @@ pub const AUTO_SPLIT_MAX_RANGES: usize = 256;
 impl ControlPlane {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn migration_scope_key(tenant: &str, branch: &str) -> String {
+        format!("{tenant}\0{branch}")
+    }
+
+    pub fn restore_migration_scopes(
+        &mut self,
+        legacy: ryme_migrate::Ledger,
+        scopes: HashMap<String, ryme_migrate::Ledger>,
+    ) {
+        self.migrations = legacy;
+        self.migration_scopes = scopes;
+    }
+
+    pub fn migration_ledger(&self, tenant: &str, branch: &str) -> ryme_migrate::Ledger {
+        self.migration_scopes
+            .get(&Self::migration_scope_key(tenant, branch))
+            .cloned()
+            .unwrap_or_else(|| {
+                if tenant == "default" && branch == "main" {
+                    self.migrations.clone()
+                } else {
+                    ryme_migrate::Ledger::new()
+                }
+            })
+    }
+
+    pub fn set_migration_ledger(
+        &mut self,
+        tenant: &str,
+        branch: &str,
+        ledger: ryme_migrate::Ledger,
+    ) {
+        if tenant == "default" && branch == "main" {
+            self.migrations = ledger.clone();
+        }
+        self.migration_scopes.insert(Self::migration_scope_key(tenant, branch), ledger);
+    }
+
+    pub fn clone_migration_scope(&mut self, tenant: &str, parent: &str, child: &str) {
+        let ledger = self.migration_ledger(tenant, parent);
+        self.set_migration_ledger(tenant, child, ledger);
+    }
+
+    pub fn remove_migration_scope(&mut self, tenant: &str, branch: &str) {
+        self.migration_scopes.remove(&Self::migration_scope_key(tenant, branch));
+    }
+
+    pub fn migration_scope_snapshots(&self) -> HashMap<String, ryme_migrate::Ledger> {
+        self.migration_scopes.clone()
+    }
+
+    pub fn has_migration_scope(&self, tenant: &str, branch: &str) -> bool {
+        self.migration_scopes.contains_key(&Self::migration_scope_key(tenant, branch))
     }
 
     pub fn add_range(&mut self, range: Range) {
@@ -483,5 +540,24 @@ mod tests {
             .restore_ranges(vec![ranged("gap", &[], b"m"), ranged("tail", b"z", &[])])
             .unwrap_err();
         assert!(matches!(error, RymeError::Corrupt(_)));
+    }
+
+    #[test]
+    fn migration_ledgers_are_isolated_by_tenant_and_branch() {
+        let mut plane = ControlPlane::new();
+        let mut main = ryme_migrate::Ledger::new();
+        main.apply(String::from("initial"), "CREATE TABLE docs", String::from("owner"), 1).unwrap();
+        plane.set_migration_ledger("alpha", "main", main.clone());
+        plane.clone_migration_scope("alpha", "main", "preview");
+
+        let mut preview = plane.migration_ledger("alpha", "preview");
+        preview
+            .apply(String::from("preview-only"), "CREATE TABLE draft", String::from("owner"), 2)
+            .unwrap();
+        plane.set_migration_ledger("alpha", "preview", preview);
+
+        assert_eq!(plane.migration_ledger("alpha", "main").len(), 1);
+        assert_eq!(plane.migration_ledger("alpha", "preview").len(), 2);
+        assert!(plane.migration_ledger("beta", "main").is_empty());
     }
 }

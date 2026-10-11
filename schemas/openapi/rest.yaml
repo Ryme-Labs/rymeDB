@@ -242,7 +242,7 @@ paths:
   /v1/migrate/apply:
     post:
       tags: [migrate]
-      description: "Execute one write SQL statement and record it in the hash-chained migration ledger. Read-only statements get 400; duplicate ids get 409 before anything runs twice."
+      description: "Execute one write SQL statement on the selected branch and record it in the tenant-and-branch-scoped hash-chained migration ledger. Select a branch with X-Ryme-Branch; read-only statements get 400 and duplicate ids get 409 within that scope."
       requestBody:
         required: true
         content:
@@ -267,7 +267,7 @@ paths:
   /v1/migrate/ledger:
     get:
       tags: [migrate]
-      description: "Migration ledger entries in apply order with the schema version and chain validity."
+      description: "The selected tenant and branch migration ledger in apply order with its schema version and chain validity. Select a branch with X-Ryme-Branch."
       responses:
         '200':
           description: ledger state
@@ -275,8 +275,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [entries, version, valid]
+                required: [branch, entries, version, valid]
                 properties:
+                  branch:
+                    type: string
                   entries:
                     type: array
                     items:

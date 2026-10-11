@@ -1,5 +1,8 @@
 # Changelog
 
+- Migration ledgers are now isolated by tenant and branch. Migration execution
+  honors `X-Ryme-Branch`, and branch ledger state is copied, persisted, and
+  exposed through the selected ledger endpoint.
 - View-backed query streams now evaluate through the branch SQL executor and
   refresh when any persisted base relation changes, including nested views.
 - View definitions now persist their referenced relations, reject creation over

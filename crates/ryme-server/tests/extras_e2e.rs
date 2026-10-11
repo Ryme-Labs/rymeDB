@@ -47,6 +47,50 @@ async fn http_request(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> (u
     (status, body)
 }
 
+async fn http_request_branch(
+    addr: std::net::SocketAddr,
+    branch: &str,
+    head: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {KEY}\r\nx-ryme-branch: {branch}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    socket.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse::<u16>()
+        .unwrap_or(0);
+    let body = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|index| raw[index + 4..].to_vec())
+        .unwrap_or_default();
+    (status, body)
+}
+
 async fn http_status_no_auth(addr: std::net::SocketAddr, head: &str) -> u16 {
     let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
     let request = format!(
@@ -1040,6 +1084,27 @@ async fn extras_migrate_apply_executes_and_records() {
     .to_string();
     let (status, setup_body) = http_request(http, "POST /v1/migrate/apply", setup.as_bytes()).await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&setup_body));
+    let branch = serde_json::json!({
+        "id": "preview",
+        "parent": "main",
+        "base_commit_ts": 0
+    })
+    .to_string();
+    let (status, branch_body) = http_request(http, "POST /v1/branches", branch.as_bytes()).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&branch_body));
+    let branch_apply =
+        serde_json::json!({"id": "m1", "sql": "INSERT INTO docs KEY 'branch' VALUE 'preview'"})
+            .to_string();
+    let (status, branch_applied) =
+        http_request_branch(http, "preview", "POST /v1/migrate/apply", branch_apply.as_bytes())
+            .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&branch_applied));
+    let (status, branch_ledger) =
+        http_request_branch(http, "preview", "GET /v1/migrate/ledger", b"").await;
+    assert_eq!(status, 200);
+    let branch_ledger = String::from_utf8_lossy(&branch_ledger).into_owned();
+    assert!(branch_ledger.contains("\"branch\":\"preview\""), "{branch_ledger}");
+    assert!(branch_ledger.contains("\"migration_id\":\"m1\""), "{branch_ledger}");
     let apply =
         serde_json::json!({"id": "m1", "sql": "INSERT INTO docs KEY 'k1' VALUE 'v1'"}).to_string();
     let (status, applied) = http_request(http, "POST /v1/migrate/apply", apply.as_bytes()).await;
@@ -1049,6 +1114,11 @@ async fn extras_migrate_apply_executes_and_records() {
     assert!(applied.contains("\"result_schema_version\":2"), "{applied}");
     let (status, row) = http_request(http, "GET /v1/kv/docs/k1", b"").await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&row));
+    let (status, main_branch_row) = http_request(http, "GET /v1/kv/docs/branch", b"").await;
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&main_branch_row));
+    let (status, preview_row) =
+        http_request_branch(http, "preview", "GET /v1/kv/docs/branch", b"").await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&preview_row));
     let (status, body) = http_request(http, "GET /v1/migrate/ledger", b"").await;
     assert_eq!(status, 200);
     let text = String::from_utf8_lossy(&body).into_owned();
@@ -1080,6 +1150,12 @@ async fn extras_migrate_apply_executes_and_records() {
     let text = String::from_utf8_lossy(&body).into_owned();
     assert!(text.contains("\"migration_id\":\"m1\""), "{text}");
     assert!(text.contains("\"version\":2"), "{text}");
+    let (status, body) =
+        http_request_branch(http, "preview", "GET /v1/migrate/ledger", b"").await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains("\"branch\":\"preview\""), "{text}");
+    assert!(text.contains("\"migration_id\":\"m1\""), "{text}");
     let (status, _) = http_request(http, "POST /v1/migrate/apply", apply.as_bytes()).await;
     assert_eq!(status, 409);
     let (status, _) =

@@ -3,15 +3,17 @@
 ## Ledger
 
 `POST /v1/migrate/apply` executes one SQL statement and records it in the
-control-plane hash-chained ledger (`{id, sql, author, checksum,
-parent_checksum, schema_version}`); duplicate ids get `409` before anything
-runs twice. Migration applications are serialized per server process, so
-concurrent requests cannot execute the same id before the ledger is updated.
-`GET /v1/migrate/ledger` returns entries in apply order
-with the schema version and chain validity. Branch metadata is persisted under
-`data_dir/branches.json`, while the migration ledger and backup checkpoints are
-persisted under `data_dir/control.json`; snapshots and archives cover data,
-not the migration ledger.
+tenant-and-branch-scoped control-plane hash-chained ledger (`{id, sql, author,
+checksum, parent_checksum, schema_version}`); duplicate ids get `409` before
+anything runs twice within that scope. The selected branch comes from
+`X-Ryme-Branch` (the default is `main`), and the SQL plus schema snapshot are
+applied to that branch. Migration applications are serialized per server
+process, so concurrent requests cannot execute the same id before the ledger
+is updated. `GET /v1/migrate/ledger` returns the selected branch, entries in
+apply order, schema version, and chain validity. Branch metadata, scoped
+migration ledgers, and backup checkpoints are persisted under
+`data_dir/control.json`/`data_dir/branches.json`; snapshots and archives cover
+data, not the migration ledger.
 
 ## PostgreSQL
 

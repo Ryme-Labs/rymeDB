@@ -594,6 +594,8 @@ struct ControlSnapshot {
     #[serde(default)]
     migrations: ryme_migrate::Ledger,
     #[serde(default)]
+    migration_scopes: HashMap<String, ryme_migrate::Ledger>,
+    #[serde(default)]
     ranges: Vec<Range>,
 }
 
@@ -658,9 +660,15 @@ fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSn
         .migrations
         .verify()
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("control ledger: {error}")))?;
+    for (scope, ledger) in &snapshot.migration_scopes {
+        ledger.verify().map_err(|error| {
+            ryme_error::RymeError::Corrupt(format!("control migration ledger {scope}: {error}"))
+        })?;
+    }
     Ok(ControlSnapshot {
         backups: ryme_backup::BackupLog::from_checkpoints(snapshot.backups.checkpoints().to_vec()),
         migrations: snapshot.migrations,
+        migration_scopes: snapshot.migration_scopes,
         ranges: snapshot.ranges,
     })
 }
@@ -1050,6 +1058,7 @@ impl SharedState {
         let snapshot = ControlSnapshot {
             backups: control.backups.clone(),
             migrations: control.migrations.clone(),
+            migration_scopes: control.migration_scope_snapshots(),
             ranges: control.ranges(),
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
@@ -1317,7 +1326,14 @@ impl SharedState {
         let has_persisted_ranges = !control_snapshot.ranges.is_empty();
         let mut control = ControlPlane::new();
         control.backups = control_snapshot.backups;
-        control.migrations = control_snapshot.migrations;
+        control.restore_migration_scopes(
+            control_snapshot.migrations,
+            control_snapshot.migration_scopes,
+        );
+        if !control.has_migration_scope(&tenant, "main") {
+            let legacy_main = control.migrations.clone();
+            control.set_migration_ledger(&tenant, "main", legacy_main);
+        }
         control.branches = ryme_branch::BranchManager::load(&branch_path)?;
         if control_snapshot.ranges.is_empty() {
             control.add_range(Range::new(
@@ -4135,25 +4151,30 @@ async fn migrate_neon(
 async fn apply_migration_locked(
     state: &SharedState,
     tenant: String,
+    branch: String,
+    executor: Executor<BranchStorage>,
     request: MigrateApplyRequest,
     statement: ryme_sql::Statement,
     author: String,
 ) -> ryme_error::Result<ryme_migrate::LedgerEntry> {
     let _migration_guard = state.migration_lock.lock().await;
     let duplicate = match state.control.lock() {
-        Ok(control) => {
-            control.migrations.entries().iter().any(|entry| entry.migration_id == request.id)
-        }
+        Ok(control) => control
+            .migration_ledger(&tenant, &branch)
+            .entries()
+            .iter()
+            .any(|entry| entry.migration_id == request.id),
         Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     if duplicate {
         return Err(ryme_error::RymeError::Conflict(String::from("migration")));
     }
-    let executor = state.executor.clone().with_tenant(tenant);
     executor.execute(statement).await?;
     let mut control =
         state.control.lock().map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
-    let applied = control.migrations.apply(request.id, &request.sql, author, now_secs())?;
+    let mut ledger = control.migration_ledger(&tenant, &branch);
+    let applied = ledger.apply(request.id, &request.sql, author, now_secs())?;
+    control.set_migration_ledger(&tenant, &branch, ledger);
     drop(control);
     state.persist_control()?;
     Ok(applied)
@@ -4184,27 +4205,54 @@ async fn migrate_apply(
             "read-only migration",
         )));
     }
+    let branch = match branch_snapshot(&state, &headers, &principal.tenant) {
+        Ok(Some((branch, _, _))) => branch,
+        Ok(None) => String::from("main"),
+        Err(e) => return error_response(e),
+    };
+    let executor = match branch_executor(&state, &headers, &principal.tenant) {
+        Ok(executor) => executor,
+        Err(e) => return error_response(e),
+    };
     let author = request.author.clone().unwrap_or_else(|| principal.id.clone());
-    match apply_migration_locked(&state, principal.tenant, request, statement, author).await {
+    match apply_migration_locked(
+        &state,
+        principal.tenant,
+        branch,
+        executor,
+        request,
+        statement,
+        author,
+    )
+    .await
+    {
         Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
         Err(e) => error_response(e),
     }
 }
 
 async fn migrate_ledger(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if state.principal(&headers).is_err() {
-        return error_response(ryme_error::RymeError::Unauthorized);
-    }
+    let principal = match state.principal(&headers) {
+        Ok(principal) => principal,
+        Err(e) => return error_response(e),
+    };
+    let branch = match branch_snapshot(&state, &headers, &principal.tenant) {
+        Ok(Some((branch, _, _))) => branch,
+        Ok(None) => String::from("main"),
+        Err(e) => return error_response(e),
+    };
     let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
+    let ledger = control.migration_ledger(&principal.tenant, &branch);
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "entries": control.migrations.entries(),
-            "version": control.migrations.schema_version(),
-            "valid": control.migrations.verify().is_ok(),
+            "branch": branch,
+            "entries": ledger.entries(),
+            "version": ledger.schema_version(),
+            "valid": ledger.verify().is_ok(),
         })),
     )
         .into_response()
@@ -7452,9 +7500,13 @@ async fn branch_create(
             if let Err(e) = ryme_sql::persist_schema_snapshot(&schema_path, &parent_schema) {
                 return error_response(e);
             }
+            control.clone_migration_scope(&principal.tenant, &request.parent, &branch_id);
             match branches.persist(&state.branch_path) {
                 Ok(()) => {
                     control.branches = branches;
+                    if let Err(e) = state.persist_control_locked(&control) {
+                        return error_response(e);
+                    }
                     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
                 }
                 Err(e) => error_response(e),
@@ -7504,6 +7556,10 @@ async fn branch_delete(
         Ok(garbage) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
+                control.remove_migration_scope(&principal.tenant, &id);
+                if let Err(e) = state.persist_control_locked(&control) {
+                    return error_response(e);
+                }
                 let _ = std::fs::remove_file(state.branch_schema_path(&principal.tenant, &id));
                 (StatusCode::OK, Json(serde_json::json!({ "garbage": garbage }))).into_response()
             }
@@ -7665,6 +7721,10 @@ async fn branch_promote(
         Ok(branch) => match branches.persist(&state.branch_path) {
             Ok(()) => {
                 control.branches = branches;
+                control.clone_migration_scope(&principal.tenant, &id, "main");
+                if let Err(e) = state.persist_control_locked(&control) {
+                    return error_response(e);
+                }
                 (StatusCode::OK, Json(branch)).into_response()
             }
             Err(e) => error_response(e),
@@ -11337,6 +11397,8 @@ mod realtime_policy_tests {
         let left = apply_migration_locked(
             &state,
             String::from("default"),
+            String::from("main"),
+            state.executor.clone(),
             request.clone(),
             statement.clone(),
             String::from("test"),
@@ -11344,6 +11406,8 @@ mod realtime_policy_tests {
         let right = apply_migration_locked(
             &state,
             String::from("default"),
+            String::from("main"),
+            state.executor.clone(),
             request,
             statement,
             String::from("test"),
