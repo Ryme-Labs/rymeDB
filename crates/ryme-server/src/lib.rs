@@ -6328,6 +6328,12 @@ const REALTIME_MAX_POSTGRES_SUBSCRIPTIONS_PER_CHANNEL: usize = 32;
 const REALTIME_MAX_SELECT_COLUMNS: usize = 128;
 const REALTIME_MAX_FILTER_BYTES: usize = 1024;
 const REALTIME_MAX_BROADCAST_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_JWKS_DOCUMENT_BYTES: usize = 1024 * 1024;
+const MAX_JWKS_KEYS: usize = 64;
+const MAX_JWK_KID_BYTES: usize = 256;
+const MIN_RSA_MODULUS_BYTES: usize = 256;
+const MAX_RSA_MODULUS_BYTES: usize = 1024;
+const MAX_RSA_EXPONENT_BYTES: usize = 8;
 
 #[derive(Debug, Clone)]
 struct SupabaseChangeSubscription {
@@ -12220,6 +12226,36 @@ mod jwt_config_tests {
         assert!(validate_jwks_url_transport("http://issuer.example/jwks").is_err());
         assert!(validate_jwks_url_transport("https://user:pass@issuer.example/jwks").is_err());
     }
+
+    #[test]
+    fn jwks_documents_and_rsa_material_are_bounded() {
+        assert!(load_jwks_verifier_bytes(
+            &vec![b' '; MAX_JWKS_DOCUMENT_BYTES + 1],
+            None,
+            None,
+            None,
+        )
+        .is_err());
+
+        let too_many_keys = serde_json::json!({
+            "keys": (0..=MAX_JWKS_KEYS)
+                .map(|_| serde_json::json!({"kty": "EC"}))
+                .collect::<Vec<_>>()
+        });
+        let too_many_keys = serde_json::to_vec(&too_many_keys).unwrap();
+        assert!(load_jwks_verifier_bytes(&too_many_keys, None, None, None).is_err());
+
+        let oversized_modulus = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "alg": "RS256",
+                "n": ryme_auth::base64_url_encode(&vec![0; MAX_RSA_MODULUS_BYTES + 1]),
+                "e": "AQAB"
+            }]
+        });
+        let oversized_modulus = serde_json::to_vec(&oversized_modulus).unwrap();
+        assert!(load_jwks_verifier_bytes(&oversized_modulus, None, None, None).is_err());
+    }
 }
 
 fn load_jwks_verifier_url(
@@ -12231,6 +12267,7 @@ fn load_jwks_verifier_url(
     validate_jwks_url_transport(url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| {
             ryme_error::RymeError::InvalidArgument(format!("jwt jwks client: {error}"))
@@ -12239,8 +12276,11 @@ fn load_jwks_verifier_url(
         client.get(url).send().and_then(|response| response.error_for_status()).map_err(
             |error| ryme_error::RymeError::Unavailable(format!("jwt jwks url: {error}")),
         )?;
-    let raw = response
-        .bytes()
+    use std::io::Read;
+    let mut raw = Vec::new();
+    response
+        .take((MAX_JWKS_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks url body: {error}")))?;
     load_jwks_verifier_bytes(&raw, requested_kid, issuer, audience)
 }
@@ -12273,9 +12313,16 @@ fn load_jwks_verifier(
     issuer: Option<String>,
     audience: Option<String>,
 ) -> ryme_error::Result<JwtVerifier> {
-    let raw = std::fs::read(path).map_err(|error| {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|error| {
         ryme_error::RymeError::InvalidArgument(format!("jwt jwks file {}: {error}", path.display()))
     })?;
+    let mut raw = Vec::new();
+    file.take((MAX_JWKS_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .map_err(|error| {
+            ryme_error::RymeError::Corrupt(format!("jwt jwks file {}: {error}", path.display()))
+        })?;
     load_jwks_verifier_bytes(&raw, requested_kid, issuer, audience)
 }
 
@@ -12285,12 +12332,18 @@ fn load_jwks_verifier_bytes(
     issuer: Option<String>,
     audience: Option<String>,
 ) -> ryme_error::Result<JwtVerifier> {
+    if raw.len() > MAX_JWKS_DOCUMENT_BYTES {
+        return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks document")));
+    }
     let document: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks: {error}")))?;
     let keys = document
         .get("keys")
         .and_then(|value| value.as_array())
         .ok_or_else(|| ryme_error::RymeError::Corrupt(String::from("jwt jwks keys")))?;
+    if keys.len() > MAX_JWKS_KEYS {
+        return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks key count")));
+    }
     let selected_keys = keys
         .iter()
         .filter(|key| key.get("kty").and_then(|value| value.as_str()) == Some("RSA"))
@@ -12308,6 +12361,9 @@ fn load_jwks_verifier_bytes(
         })
         .map(|key| {
             let kid = key.get("kid").and_then(|value| value.as_str()).map(String::from);
+            if kid.as_ref().is_some_and(|kid| kid.len() > MAX_JWK_KID_BYTES) {
+                return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks kid")));
+            }
             let modulus = key
                 .get("n")
                 .and_then(|value| value.as_str())
@@ -12317,6 +12373,9 @@ fn load_jwks_verifier_bytes(
                         ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus"))
                     })
                 })?;
+            if !(MIN_RSA_MODULUS_BYTES..=MAX_RSA_MODULUS_BYTES).contains(&modulus.len()) {
+                return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks modulus")));
+            }
             let exponent = key
                 .get("e")
                 .and_then(|value| value.as_str())
@@ -12326,6 +12385,9 @@ fn load_jwks_verifier_bytes(
                         ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent"))
                     })
                 })?;
+            if exponent.is_empty() || exponent.len() > MAX_RSA_EXPONENT_BYTES {
+                return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks exponent")));
+            }
             Ok(RsaJwk { kid, modulus, exponent })
         })
         .collect::<ryme_error::Result<Vec<_>>>()?;
