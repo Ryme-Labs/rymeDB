@@ -1199,7 +1199,9 @@ impl Realtime {
     ) -> Result<u64> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
-        let topic = self.broadcast_topic(shard, key)?;
+        let Some(topic) = self.existing_broadcast_topic(shard, &key)? else {
+            return Ok(self.next_sequence());
+        };
         let _publish = topic
             .publish_lock
             .lock()
@@ -1230,7 +1232,21 @@ impl Realtime {
     ) -> Result<u64> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
-        let topic = self.broadcast_topic(shard, key)?;
+        let Some(topic) = self.existing_broadcast_topic(shard, &key)? else {
+            let sequence = self.next_sequence();
+            let message = BroadcastMsg {
+                channel: channel.to_string(),
+                from,
+                payload,
+                commit_ts,
+                sequence,
+                json_cache: Arc::new(OnceLock::new()),
+                encoded_frames: Arc::new(std::array::from_fn(|_| tokio::sync::OnceCell::new())),
+                fanout_quota_pre_admitted: true,
+            };
+            admit(0, message.json_len() as u64)?;
+            return Ok(sequence);
+        };
         let _publish = topic
             .publish_lock
             .lock()
@@ -1263,7 +1279,10 @@ impl Realtime {
     ) -> Result<u64> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
-        let topic = self.broadcast_topic(shard, key)?;
+        let Some(topic) = self.existing_broadcast_topic(shard, &key)? else {
+            self.sequence.fetch_max(sequence, Ordering::Relaxed);
+            return Ok(sequence);
+        };
         let _publish = topic
             .publish_lock
             .lock()
@@ -1295,6 +1314,20 @@ impl Realtime {
             return receiver;
         };
         topic.sender.subscribe()
+    }
+
+    fn existing_broadcast_topic(
+        &self,
+        shard: usize,
+        key: &str,
+    ) -> Result<Option<Arc<BroadcastTopic>>> {
+        let topics = self
+            .broadcast_topics
+            .get(shard)
+            .ok_or_else(|| RymeError::Internal(String::from("broadcast shard")))?
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+        Ok(topics.get(key).cloned())
     }
 
     fn broadcast_topic(&self, shard: usize, key: String) -> Result<Arc<BroadcastTopic>> {
@@ -2090,6 +2123,21 @@ mod tests {
             assert_eq!(msg.channel, "lobby");
             assert_eq!(msg.commit_ts, 3);
         }
+    }
+
+    #[test]
+    fn broadcast_without_subscribers_does_not_create_ephemeral_topic() {
+        let realtime = Realtime::new(64);
+        realtime
+            .broadcast("t", "unobserved", String::from("ada"), serde_json::json!({"x": 1}), 1)
+            .unwrap();
+        assert!(realtime.broadcast_topics.iter().all(|shard| shard.lock().unwrap().is_empty()));
+
+        let mut receiver = realtime.broadcast_subscribe("t", "unobserved");
+        realtime
+            .broadcast("t", "unobserved", String::from("ada"), serde_json::json!({"x": 2}), 2)
+            .unwrap();
+        assert_eq!(receiver.try_recv().unwrap().commit_ts, 2);
     }
 
     #[test]
