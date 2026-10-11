@@ -623,7 +623,12 @@ impl SegmentStore {
         let mut selected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         for path in self.newest_paths()? {
             let segment = self.read_segment(&path)?;
-            for key in segment.engine.record_keys() {
+            // `keys` is the segment's already-sorted key directory. Reusing
+            // it avoids cloning every key into a temporary Vec on every scan.
+            // The key is known to be present in this segment, so going
+            // directly to the engine also avoids repeating the bloom filter
+            // and binary-search checks performed by the public lookup path.
+            for key in &segment.keys {
                 if key.tenant != tenant
                     || key.database != database
                     || key.table != table
@@ -631,7 +636,7 @@ impl SegmentStore {
                 {
                     continue;
                 }
-                let Some((_, value, expires_at)) = segment.version_at(&key, read_ts) else {
+                let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts) else {
                     continue;
                 };
                 let value = if expires_at != 0 && expires_at <= now { None } else { value };
