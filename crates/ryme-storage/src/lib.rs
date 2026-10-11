@@ -295,33 +295,30 @@ impl Engine {
     }
 
     pub fn drop_table(&mut self, tenant: &str, database: &str, table: &str) -> usize {
-        let keys: Vec<RecordKey> = self
-            .inner
-            .keys()
-            .filter(|key| key.tenant == tenant && key.database == database && key.table == table)
-            .cloned()
-            .collect();
-        let count = keys.len();
-        for key in keys {
-            self.inner.remove(&key);
-        }
+        let before = self.inner.len();
+        let mut reclaimed = 0u64;
+        self.inner.retain(|key, versions| {
+            let keep = key.tenant != tenant || key.database != database || key.table != table;
+            if !keep {
+                reclaimed = reclaimed.saturating_add(version_payload_bytes(versions));
+            }
+            keep
+        });
+        self.bytes_held = self.bytes_held.saturating_sub(reclaimed);
+        let count = before - self.inner.len();
         count
     }
 
     pub fn purge_keys(&mut self, keys: &[RecordKey]) -> usize {
         let mut removed = 0;
+        let mut reclaimed = 0u64;
         for key in keys {
-            if self.inner.remove(key).is_some() {
+            if let Some(versions) = self.inner.remove(key) {
                 removed += 1;
+                reclaimed = reclaimed.saturating_add(version_payload_bytes(&versions));
             }
         }
-        self.bytes_held = self
-            .inner
-            .values()
-            .flat_map(|versions| versions.iter())
-            .filter_map(|version| version.value.as_ref())
-            .map(|value| value.len() as u64)
-            .sum();
+        self.bytes_held = self.bytes_held.saturating_sub(reclaimed);
         removed
     }
 
@@ -582,6 +579,13 @@ impl Engine {
     }
 }
 
+fn version_payload_bytes(versions: &[Version]) -> u64 {
+    versions
+        .iter()
+        .filter_map(|version| version.value.as_ref())
+        .fold(0u64, |total, value| total.saturating_add(value.len() as u64))
+}
+
 fn push_field(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     if bytes.len() > u16::MAX as usize {
         return Err(RymeError::InvalidArgument(String::from("snapshot field")));
@@ -709,6 +713,24 @@ mod tests {
         assert_eq!(engine.bytes_held(), 6 + 3);
         assert_eq!(engine.read(&key, 3, 0).unwrap(), Some(b"anchor".to_vec()));
         assert_eq!(engine.read(&key, 4, 0).unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn removing_rows_reclaims_bytes_without_scanning_other_tables() {
+        let mut engine = Engine::new();
+        let dropped = RecordKey::new("t", "d", "messages", b"drop");
+        let purged = RecordKey::new("t", "d", "sessions", b"purge");
+        let retained = RecordKey::new("t", "d", "users", b"keep");
+        engine.apply(dropped.clone(), 1, Some(b"old".to_vec())).unwrap();
+        engine.apply(dropped.clone(), 2, Some(b"new".to_vec())).unwrap();
+        engine.apply(purged.clone(), 3, Some(b"remove-me".to_vec())).unwrap();
+        engine.apply(retained.clone(), 4, Some(b"retain".to_vec())).unwrap();
+
+        assert_eq!(engine.drop_table("t", "d", "messages"), 1);
+        assert_eq!(engine.bytes_held(), b"remove-me".len() as u64 + b"retain".len() as u64);
+        assert_eq!(engine.purge_keys(&[purged.clone(), purged]), 1);
+        assert_eq!(engine.bytes_held(), b"retain".len() as u64);
+        assert_eq!(engine.read(&retained, 4, 0).unwrap(), Some(b"retain".to_vec()));
     }
 
     #[test]
