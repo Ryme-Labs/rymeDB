@@ -27,6 +27,7 @@ const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
 const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const RESP_MAX_PUBSUB_SUBSCRIPTIONS: usize = 1024;
 const RESP_MAX_PUBSUB_NAME_BYTES: usize = 4 * 1024;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
 type PubSubCounts = Arc<Mutex<std::collections::HashMap<PubSubKey, usize>>>;
@@ -1063,15 +1064,7 @@ where
     }
 
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {
-        self.start_realtime_pubsub();
-        loop {
-            let (socket, _) = listener.accept().await.map_err(|e| RymeError::Io(e.to_string()))?;
-            socket.set_nodelay(true).map_err(|e| RymeError::Io(e.to_string()))?;
-            let service = self.clone();
-            tokio::spawn(async move {
-                let _ = service.handle(socket).await;
-            });
-        }
+        self.serve_limited(listener, DEFAULT_MAX_CONNECTIONS).await
     }
 
     pub async fn serve_limited(&self, listener: TcpListener, max_connections: usize) -> Result<()> {

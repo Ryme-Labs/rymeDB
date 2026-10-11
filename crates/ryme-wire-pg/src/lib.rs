@@ -26,6 +26,9 @@ use tokio::sync::broadcast;
 
 pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
 
+/// Default admission limit for the convenience `serve` method.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
 pub struct PgGateway<B = TxnManager> {
     executor: Arc<Executor<B>>,
     tls: Option<ryme_wire_native::TlsAcceptor>,
@@ -617,17 +620,7 @@ where
     where
         B: Send + Sync + 'static,
     {
-        loop {
-            let (socket, _) = listener.accept().await.map_err(|e| RymeError::Io(e.to_string()))?;
-            socket.set_nodelay(true).map_err(|e| RymeError::Io(e.to_string()))?;
-            let executor = self.executor.clone();
-            let tls = self.tls.clone();
-            let limits = self.limits();
-            let authenticator = self.authenticator.clone();
-            tokio::spawn(async move {
-                let _ = handle_connection(socket, executor, tls, limits, authenticator).await;
-            });
-        }
+        self.serve_limited(listener, DEFAULT_MAX_CONNECTIONS).await
     }
 
     pub async fn serve_limited(&self, listener: TcpListener, max_connections: usize) -> Result<()>

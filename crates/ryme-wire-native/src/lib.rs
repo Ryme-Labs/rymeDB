@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 pub const MAX_FRAME: usize = 4 * 1024 * 1024 + 1024;
 pub const VERSION: &str = "ryme-native/1";
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 pub use ryme_tls::TlsAcceptor;
 
@@ -227,14 +228,7 @@ where
     }
 
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {
-        loop {
-            let (socket, _) = listener.accept().await.map_err(|e| RymeError::Io(e.to_string()))?;
-            socket.set_nodelay(true).map_err(|e| RymeError::Io(e.to_string()))?;
-            let service = self.clone();
-            tokio::spawn(async move {
-                let _ = service.handle(socket).await;
-            });
-        }
+        self.serve_limited(listener, DEFAULT_MAX_CONNECTIONS).await
     }
 
     pub async fn serve_limited(&self, listener: TcpListener, max_connections: usize) -> Result<()> {

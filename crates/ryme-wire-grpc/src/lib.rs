@@ -8,7 +8,13 @@ use ryme_observe::{
 };
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 #[allow(clippy::result_large_err)]
@@ -17,6 +23,74 @@ pub mod proto {
 }
 
 pub const VERSION: &str = "ryme-grpc/1";
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+struct LimitedTcpStream {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for LimitedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for LimitedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+impl tonic::transport::server::Connected for LimitedTcpStream {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        tonic::transport::server::Connected::connect_info(&self.stream)
+    }
+}
+
+fn limited_incoming(
+    listener: tokio::net::TcpListener,
+    max_connections: usize,
+) -> impl tokio_stream::Stream<Item = std::io::Result<LimitedTcpStream>> {
+    let permits = Arc::new(Semaphore::new(max_connections.max(1)));
+    tokio_stream::wrappers::TcpListenerStream::new(listener).filter_map(move |result| {
+        let permits = permits.clone();
+        async move {
+            let stream = match result {
+                Ok(stream) => stream,
+                Err(error) => return Some(Err(error)),
+            };
+            let Ok(permit) = permits.try_acquire_owned() else {
+                return None;
+            };
+            Some(Ok(LimitedTcpStream { stream, _permit: permit }))
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct GrpcGateway<B = ryme_txn::TxnManager> {
@@ -116,11 +190,9 @@ where
     }
 
     pub async fn serve(self, addr: std::net::SocketAddr) -> Result<()> {
-        tonic::transport::Server::builder()
-            .add_service(proto::ryme_server::RymeServer::new(self))
-            .serve(addr)
-            .await
-            .map_err(|e| RymeError::Io(e.to_string()))
+        let listener =
+            tokio::net::TcpListener::bind(addr).await.map_err(|e| RymeError::Io(e.to_string()))?;
+        self.serve_with_incoming_limited(listener, DEFAULT_MAX_CONNECTIONS).await
     }
 
     pub async fn serve_with_incoming(self, listener: tokio::net::TcpListener) -> Result<()> {
@@ -132,9 +204,9 @@ where
         listener: tokio::net::TcpListener,
         max_connections: usize,
     ) -> Result<()> {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let incoming = limited_incoming(listener, max_connections);
         tonic::transport::Server::builder()
-            .concurrency_limit_per_connection(max_connections.max(1))
+            .concurrency_limit_per_connection(1024)
             .add_service(proto::ryme_server::RymeServer::new(self))
             .serve_with_incoming(incoming)
             .await
@@ -157,9 +229,9 @@ where
     ) -> Result<()> {
         let (cert, key) = acceptor.identity();
         let identity = tonic::transport::Identity::from_pem(cert, key);
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let incoming = limited_incoming(listener, max_connections);
         tonic::transport::Server::builder()
-            .concurrency_limit_per_connection(max_connections.max(1))
+            .concurrency_limit_per_connection(1024)
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
             .map_err(|e| RymeError::Io(e.to_string()))?
             .add_service(proto::ryme_server::RymeServer::new(self))
