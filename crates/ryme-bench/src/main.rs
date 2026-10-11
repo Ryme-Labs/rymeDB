@@ -344,6 +344,7 @@ async fn realtime_bench(config: RealtimeBench) {
     let output = serde_json::json!({
         "target": config.addr,
         "channel": config.channel,
+        "machine": machine_metadata(),
         "connections": result.connections,
         "messages": result.messages,
         "published": result.published,
@@ -359,6 +360,7 @@ async fn realtime_bench(config: RealtimeBench) {
         "publish_to_client_p95_us": latency_p95,
         "publish_to_client_p99_us": latency_p99,
         "publish_to_client_max_us": latency_max,
+        "publish_to_client_latency_histogram_us": latency_histogram(&latency_micros),
         "total_seconds": (result.total_seconds * 1000.0).round() / 1000.0,
     });
     if config.json {
@@ -416,6 +418,55 @@ fn local_bench(ops: usize, value_bytes: usize) {
         let probe_micros = probe_start.elapsed().as_micros().max(1);
         println!("probe_hits={hits} probe_mean_micros={}", probe_micros / probe_ops as u128);
     }
+}
+
+fn machine_metadata() -> serde_json::Value {
+    let logical_cpus = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1);
+    let mut metadata = serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "logical_cpus": logical_cpus,
+    });
+    if let Ok(host) = std::env::var("RYME_BENCH_HOST") {
+        metadata["host"] = serde_json::Value::String(host);
+    }
+    if let Ok(model) = std::fs::read_to_string("/proc/cpuinfo") {
+        if let Some(model) = model.lines().find_map(|line| {
+            line.strip_prefix("model name")
+                .and_then(|value| value.strip_prefix(':'))
+                .map(|value| value.trim().to_string())
+        }) {
+            metadata["cpu_model"] = serde_json::Value::String(model);
+        }
+    }
+    metadata
+}
+
+fn latency_histogram(samples: &[u64]) -> Vec<serde_json::Value> {
+    const UPPER_BOUNDS: [u64; 14] =
+        [10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, u64::MAX];
+    let mut counts = vec![0u64; UPPER_BOUNDS.len()];
+    for sample in samples {
+        let bucket = UPPER_BOUNDS
+            .iter()
+            .position(|upper| *sample <= *upper)
+            .unwrap_or(UPPER_BOUNDS.len() - 1);
+        counts[bucket] = counts[bucket].saturating_add(1);
+    }
+    UPPER_BOUNDS
+        .into_iter()
+        .zip(counts)
+        .map(|(upper, count)| {
+            serde_json::json!({
+                "le_us": if upper == u64::MAX {
+                    serde_json::Value::String(String::from("+Inf"))
+                } else {
+                    serde_json::Value::from(upper)
+                },
+                "count": count,
+            })
+        })
+        .collect()
 }
 
 fn pick_key(counter: u64, keyspace: usize, hotspot_percent: u64, worker: usize) -> String {
@@ -695,6 +746,7 @@ async fn resp_bench(config: RespBench) {
     let mean = if count == 0 { 0 } else { all.iter().sum::<u64>() / count as u64 };
     let result = serde_json::json!({
         "target": config.addr,
+        "machine": machine_metadata(),
         "workload": config.workload,
         "pipeline": config.pipeline,
         "ops": count,
@@ -712,6 +764,7 @@ async fn resp_bench(config: RespBench) {
         "p999_us": percentile(99.9),
         "max_us": all.last().copied().unwrap_or(0),
         "mean_us": mean,
+        "latency_histogram_us": latency_histogram(&all),
     });
     if config.json {
         println!("{result}");
@@ -736,7 +789,7 @@ async fn resp_bench(config: RespBench) {
 
 #[cfg(test)]
 mod tests {
-    use super::worker_ops;
+    use super::{latency_histogram, worker_ops};
 
     #[test]
     fn worker_split_preserves_requested_operations() {
@@ -750,5 +803,13 @@ mod tests {
                 assert!(counts.windows(2).all(|pair| pair[0].abs_diff(pair[1]) <= 1));
             }
         }
+    }
+
+    #[test]
+    fn latency_histogram_covers_each_sample_once() {
+        let histogram = latency_histogram(&[1, 10, 11, 100_000, 100_001]);
+        let total: u64 = histogram.iter().map(|bucket| bucket["count"].as_u64().unwrap()).sum();
+        assert_eq!(total, 5);
+        assert_eq!(histogram.last().unwrap()["count"], 1);
     }
 }

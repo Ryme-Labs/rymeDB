@@ -1,5 +1,7 @@
 # Changelog
 
+- RESP and realtime benchmark JSON now records host/CPU metadata and
+  cumulative upper-bound latency histograms alongside percentile summaries.
 - Range PITR restore now durably aborts prepared intents that fall within
   the restored log prefix, so an interrupted transaction cannot block writes
   after restart.

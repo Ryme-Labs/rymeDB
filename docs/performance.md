@@ -28,7 +28,11 @@ The RESP harness establishes all client connections before starting its timed
 window and divides the requested operation count exactly across workers. JSON
 results retain the legacy `ops` field for successful operations and also report
 `requested_ops`, `successful_ops`, `failed_ops`, and `attempted_qps`; a run is
-only comparable when `failed_ops=0` and `successful_ops=requested_ops`.
+only comparable when `failed_ops=0` and `successful_ops=requested_ops`. JSON
+results also include `machine` metadata and a cumulative
+`latency_histogram_us` with explicit upper-bound buckets. Realtime results use
+the same shape for publisher-to-client delivery latency. Set `RYME_BENCH_HOST`
+when recording a named machine in a result artifact.
 
 ## Fresh run (2026-10-02, durable local WAL, single node)
 
