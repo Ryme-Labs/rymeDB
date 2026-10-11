@@ -15444,7 +15444,10 @@ where
 
     pub async fn bulk_upsert(&self, table: String, rows: Vec<(Vec<u8>, Vec<u8>)>) -> Result<usize> {
         self.reject_if_read_only()?;
-        if !self.role_is_superuser() && !self.has_table_privilege(&table, "INSERT") {
+        if !self.role_is_superuser()
+            && (!self.has_table_privilege(&table, "INSERT")
+                || !self.has_table_privilege(&table, "UPDATE"))
+        {
             return Err(RymeError::Forbidden);
         }
         if rows.len() > 10000 {
@@ -16474,6 +16477,21 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            reader
+                .bulk_upsert(
+                    String::from("public.messages"),
+                    vec![(b"one".to_vec(), b"blocked".to_vec())],
+                )
+                .await,
+            Err(RymeError::Forbidden)
+        ));
+        assert!(matches!(
+            reader
+                .execute(parse("SELECT body FROM public.messages WHERE id = 'one'").unwrap())
+                .await,
+            Ok(QueryResult::Table { ref rows, .. }) if rows == &vec![vec![b"hello".to_vec()]]
+        ));
         assert!(reader
             .execute(parse("UPDATE public.messages SET body = 'blocked' WHERE id = 'one'").unwrap())
             .await
