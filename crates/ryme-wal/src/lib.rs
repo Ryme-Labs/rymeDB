@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 pub const WAL_MAGIC: u32 = 0x52594D45;
 pub const WAL_VERSION: u16 = 1;
+const REWRITE_DIR: &str = ".rewrite";
+const REWRITE_MARKER: &str = ".rewrite-in-progress";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
@@ -27,6 +29,7 @@ pub struct Wal {
 impl Wal {
     pub fn open(dir: &Path, segment_size_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        recover_rewrite(dir)?;
         let active_id = latest_segment_id(dir)?;
         let path = dir.join(segment_name(active_id));
         let mut active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
@@ -177,7 +180,7 @@ impl Wal {
                     .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
             })
             .unwrap_or(Ok(0))?;
-        let temporary = self.dir.join(".rewrite");
+        let temporary = self.dir.join(REWRITE_DIR);
         if temporary.exists() {
             std::fs::remove_dir_all(&temporary)?;
         }
@@ -198,15 +201,12 @@ impl Wal {
         }
         file.sync_data()?;
         drop(file);
-
-        for id in segment_ids(&self.dir)? {
-            std::fs::remove_file(self.dir.join(segment_name(id)))?;
+        sync_directory(&temporary)?;
+        create_rewrite_marker(&self.dir)?;
+        if let Err(error) = install_rewrite(&self.dir) {
+            self.poisoned = true;
+            return Err(error);
         }
-        for entry in std::fs::read_dir(&temporary)? {
-            let entry = entry?;
-            std::fs::rename(entry.path(), self.dir.join(entry.file_name()))?;
-        }
-        std::fs::remove_dir(&temporary)?;
 
         self.active_id = latest_segment_id(&self.dir)?;
         let active_path = self.dir.join(segment_name(self.active_id));
@@ -223,6 +223,73 @@ impl Wal {
         self.active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
         Ok(())
     }
+}
+
+fn create_rewrite_marker(dir: &Path) -> Result<()> {
+    let marker = dir.join(REWRITE_MARKER);
+    let file = OpenOptions::new().write(true).create_new(true).open(marker)?;
+    file.sync_all()?;
+    sync_directory(dir)
+}
+
+fn recover_rewrite(dir: &Path) -> Result<()> {
+    if dir.join(REWRITE_MARKER).exists() {
+        install_rewrite(dir)?;
+    }
+    Ok(())
+}
+
+// Once the marker is durable, the staged generation is authoritative. Copying
+// (rather than moving) makes installation idempotent if the process crashes.
+fn install_rewrite(dir: &Path) -> Result<()> {
+    let temporary = dir.join(REWRITE_DIR);
+    let mut staged = Vec::new();
+    for entry in std::fs::read_dir(&temporary)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(id) = parse_segment_name(&name) {
+            staged.push((id, entry.path(), name));
+        }
+    }
+    staged.sort_unstable_by_key(|(id, _, _)| *id);
+    if staged.is_empty() {
+        return Err(RymeError::Corrupt(String::from("empty WAL rewrite")));
+    }
+
+    let mut previous_lsn = None;
+    for (_, path, name) in &staged {
+        let raw = std::fs::read(path)?;
+        let mut cursor = raw.as_slice();
+        while !cursor.is_empty() {
+            let Some((record, consumed)) = decode_frame(cursor)? else {
+                return Err(RymeError::Corrupt(String::from("truncated rewrite segment")));
+            };
+            if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                return Err(RymeError::Corrupt(String::from("rewrite lsn order")));
+            }
+            previous_lsn = Some(record.lsn);
+            cursor = &cursor[consumed..];
+        }
+        std::fs::copy(path, dir.join(name))?;
+        File::open(dir.join(name))?.sync_all()?;
+    }
+    sync_directory(dir)?;
+
+    for id in segment_ids(dir)? {
+        if staged.binary_search_by_key(&id, |(staged_id, _, _)| *staged_id).is_err() {
+            std::fs::remove_file(dir.join(segment_name(id)))?;
+        }
+    }
+    sync_directory(dir)?;
+    std::fs::remove_file(dir.join(REWRITE_MARKER))?;
+    sync_directory(dir)?;
+    std::fs::remove_dir_all(temporary)?;
+    Ok(())
+}
+
+fn sync_directory(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 fn write_frame_with_rollback<F>(
@@ -574,6 +641,43 @@ mod tests {
         assert_eq!(records.len(), 4);
         assert!(records.iter().all(|record| record.commit_ts <= 4));
         assert_eq!(wal.next_lsn(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_finishes_interrupted_rewrite_installation() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-rewrite-recovery-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 64).unwrap();
+        for ts in 1..=8u64 {
+            wal.append(ts, b"old-generation").unwrap();
+        }
+        wal.sync().unwrap();
+        let replacement =
+            [WalRecord { lsn: 0, commit_ts: 99, payload: b"new-generation".to_vec() }];
+        let staging = dir.join(REWRITE_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(segment_name(0)), encode_frame(0, 99, b"new-generation"))
+            .unwrap();
+        sync_directory(&staging).unwrap();
+        create_rewrite_marker(&dir).unwrap();
+        // Simulate a crash after old segments were removed but before the stage
+        // was installed. Recovery must be safe to repeat after any partial copy.
+        for id in segment_ids(&dir).unwrap() {
+            std::fs::remove_file(dir.join(segment_name(id))).unwrap();
+        }
+        drop(wal);
+
+        let mut recovered = Wal::open(&dir, 64).unwrap();
+        assert_eq!(Wal::read_all(&dir).unwrap(), replacement);
+        assert_eq!(recovered.next_lsn(), 1);
+        recovered.append(100, b"after-recovery").unwrap();
+        assert_eq!(Wal::read_all(&dir).unwrap().len(), 2);
+        assert!(!dir.join(REWRITE_MARKER).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
