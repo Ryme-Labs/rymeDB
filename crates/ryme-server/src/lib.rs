@@ -5912,6 +5912,15 @@ async fn supabase_realtime_stream(
     if let Err(error) = admit_realtime(&state, &principal.tenant, 1) {
         return error_response(error);
     }
+    let branch = match branch_snapshot(&state, &headers, &principal.tenant) {
+        Ok(Some((branch, _, _))) => branch,
+        Ok(None) => String::from("main"),
+        Err(error) => return error_response(error),
+    };
+    let rls_executor = match branch_executor(&state, &headers, &principal.tenant) {
+        Ok(executor) => executor,
+        Err(error) => return error_response(error),
+    };
     let connection = match open_realtime_connection(&state, &principal.tenant) {
         Ok(connection) => connection,
         Err(error) => return error_response(error),
@@ -5931,6 +5940,8 @@ async fn supabase_realtime_stream(
             qos,
             tenant,
             database,
+            branch,
+            rls_executor,
             sender,
             can_publish,
             array_protocol,
@@ -6779,14 +6790,14 @@ async fn forward_supabase_realtime(
     qos: Arc<Mutex<QosRegistry>>,
     tenant: String,
     database: String,
+    branch: String,
+    rls_executor: Executor<BranchStorage>,
     sender: String,
     can_publish: bool,
     array_protocol: bool,
 ) {
     let (sink, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sink);
-    let rls_executor =
-        state.executor.clone().with_tenant(tenant.clone()).with_branch(String::from("main"));
     let (events, mut event_queue) =
         tokio::sync::mpsc::channel::<SupabaseRealtimeEvent>(REALTIME_OUTGOING_QUEUE_CAPACITY);
     let mut channels: HashMap<String, SupabaseChannelState> = HashMap::new();
@@ -6979,7 +6990,7 @@ async fn forward_supabase_realtime(
                                     &rls_executor,
                                     &tenant,
                                     &database,
-                                    "main",
+                                    &branch,
                                     &frame.topic,
                                     subscription,
                                     &events,
