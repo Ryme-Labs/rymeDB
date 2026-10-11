@@ -707,24 +707,22 @@ impl TxnManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
-        let mut commit_ts = self.inner.clock.load(Ordering::SeqCst);
-        loop {
-            let next_ts = commit_ts
+        let mut observed = self.inner.clock.load(Ordering::SeqCst);
+        let commit_ts = loop {
+            let base = observed.max(txn.read_ts);
+            let next_ts = base
                 .checked_add(1)
                 .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
             match self.inner.clock.compare_exchange_weak(
-                commit_ts,
+                observed,
                 next_ts,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => {
-                    commit_ts = next_ts;
-                    break;
-                }
-                Err(observed) => commit_ts = observed,
+                Ok(_) => break next_ts,
+                Err(current) => observed = current,
             }
-        }
+        };
         self.check_locked(txn, commit_ts)?;
         Ok(commit_ts)
     }
@@ -1118,12 +1116,7 @@ impl TxnManager {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        let overlay_count = txn.scan_overlay_count(
-            tenant,
-            database,
-            table,
-            Some(start_after),
-        );
+        let overlay_count = txn.scan_overlay_count(tenant, database, table, Some(start_after));
         let scan_limit = limit.saturating_add(overlay_count);
         let engine = self
             .inner
@@ -1158,12 +1151,7 @@ impl TxnManager {
         fallback: impl FnOnce(usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        let overlay_count = txn.scan_overlay_count(
-            tenant,
-            database,
-            table,
-            Some(start_after),
-        );
+        let overlay_count = txn.scan_overlay_count(tenant, database, table, Some(start_after));
         let scan_limit = limit.saturating_add(overlay_count);
         let rows = fallback(scan_limit)?;
         if overlay_count == 0 {
@@ -2376,6 +2364,17 @@ mod tests {
         let mut second = manager.begin();
         let value = manager.get(&mut second, &key).unwrap();
         assert_eq!(value, Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn commit_advances_clock_past_an_older_manager_snapshot() {
+        let manager = TxnManager::new();
+        let mut txn = manager.begin();
+        txn.restamp(100);
+        manager.put(&mut txn, RecordKey::new("t", "d", "s", b"k"), b"v".to_vec());
+
+        assert_eq!(manager.commit(txn).unwrap(), 101);
+        assert_eq!(manager.latest_commit(), 102);
     }
 
     #[test]
