@@ -10172,17 +10172,23 @@ fn install_cluster_topic_replication(
 fn apply_replicated_broadcast(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
     let event: ClusterBroadcast = serde_json::from_slice(payload)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("realtime event: {error}")))?;
-    state
-        .realtime
-        .broadcast_with_sequence(
-            &event.tenant,
-            &event.channel,
-            event.from,
-            event.payload,
-            event.commit_ts,
-            event.sequence,
-        )
-        .map(|_| ())
+    if let Err(error) = state.realtime.broadcast_with_sequence(
+        &event.tenant,
+        &event.channel,
+        event.from,
+        event.payload,
+        event.commit_ts,
+        event.sequence,
+    ) {
+        tracing::warn!(
+            tenant = %event.tenant,
+            channel = %event.channel,
+            sequence = event.sequence,
+            %error,
+            "replicated broadcast delivery skipped after commit"
+        );
+    }
+    Ok(())
 }
 
 fn apply_replicated_presence(state: &SharedState, payload: &[u8]) -> ryme_error::Result<()> {
