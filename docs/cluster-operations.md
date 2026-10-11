@@ -257,6 +257,10 @@ Prepared intents also reserve their conflict set: ordinary local or
 range-local commits that overlap a prepared transaction are rejected until the
 coordinator resolves it. This prevents a fast path from bypassing the
 distributed prepare phase.
+The coordinator also records each participant's commit or abort resolution in
+a separate WAL and retries unacknowledged resolutions from its main loop after
+restart. A lost resolution RPC therefore leaves recoverable work rather than
+an intent that can block the participant forever.
 The global Raft log is still the decision authority, so this is a durable
 participant protocol, not yet independent per-range Raft groups.
 Cluster transactions also carry the range-topology generation observed at

@@ -290,6 +290,20 @@ struct PreparedIntent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+enum ResolutionRecord {
+    Pending { transaction_id: u128, commit_ts: u64, participant: usize, committed: bool },
+    Complete { transaction_id: u128, commit_ts: u64, participant: usize },
+}
+
+#[derive(Debug, Clone)]
+struct PendingResolution {
+    transaction_id: u128,
+    commit_ts: u64,
+    participant: usize,
+    committed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RangeLogRecord {
     group_id: String,
     index: u64,
@@ -739,6 +753,8 @@ pub struct Node {
     txn_commit_lock: Arc<Mutex<()>>,
     prepared: std::sync::Mutex<BTreeMap<u128, PreparedIntent>>,
     intent_wal: std::sync::Mutex<Wal>,
+    pending_resolutions: std::sync::Mutex<BTreeMap<(u128, u64, usize), PendingResolution>>,
+    resolution_wal: std::sync::Mutex<Wal>,
     range_logs: std::sync::Mutex<BTreeMap<String, u64>>,
     range_entries: std::sync::Mutex<BTreeMap<String, BTreeMap<u64, RangeLogRecord>>>,
     range_groups: std::sync::Mutex<BTreeMap<String, RangeGroupState>>,
@@ -831,6 +847,24 @@ impl Node {
                     } else {
                         prepared.remove(&transaction_id);
                     }
+                }
+            }
+        }
+        let resolution_dir = dir.join("txn-resolutions");
+        let resolution_wal = Wal::open(&resolution_dir, 16 * 1024 * 1024)?;
+        let mut pending_resolutions = BTreeMap::new();
+        for record in Wal::read_all(&resolution_dir)? {
+            let resolution: ResolutionRecord = serde_json::from_slice(&record.payload)
+                .map_err(|error| RymeError::Corrupt(format!("transaction resolution: {error}")))?;
+            match resolution {
+                ResolutionRecord::Pending { transaction_id, commit_ts, participant, committed } => {
+                    pending_resolutions.insert(
+                        (transaction_id, commit_ts, participant),
+                        PendingResolution { transaction_id, commit_ts, participant, committed },
+                    );
+                }
+                ResolutionRecord::Complete { transaction_id, commit_ts, participant } => {
+                    pending_resolutions.remove(&(transaction_id, commit_ts, participant));
                 }
             }
         }
@@ -969,6 +1003,8 @@ impl Node {
             txn_commit_lock: Arc::new(Mutex::new(())),
             prepared: std::sync::Mutex::new(prepared),
             intent_wal: std::sync::Mutex::new(intent_wal),
+            pending_resolutions: std::sync::Mutex::new(pending_resolutions),
+            resolution_wal: std::sync::Mutex::new(resolution_wal),
             range_logs: std::sync::Mutex::new(range_logs),
             range_entries: std::sync::Mutex::new(range_entries),
             range_groups: std::sync::Mutex::new(range_groups),
@@ -1455,6 +1491,7 @@ impl Node {
     async fn main_loop(self: Arc<Self>) {
         loop {
             self.range_tick().await;
+            self.retry_pending_resolutions().await;
             if self.take_campaign().await {
                 self.campaign(true).await;
                 continue;
@@ -2027,6 +2064,7 @@ impl Node {
                 }
             }
             Rpc::PrepareTransaction { transaction_id, commit_ts, payload } => {
+                let _commit = self.txn_commit_lock.lock().await;
                 let state: ryme_txn::TransactionState = serde_json::from_slice(&payload)
                     .map_err(|error| RymeError::Corrupt(format!("transaction prepare: {error}")))?;
                 let txn = self.manager.from_state(state.clone());
@@ -2039,6 +2077,7 @@ impl Node {
                 }
             }
             Rpc::ResolveTransaction { transaction_id, commit_ts, committed } => {
+                let _commit = self.txn_commit_lock.lock().await;
                 match self.resolve_intent(transaction_id, commit_ts, committed) {
                     Ok(()) => Ok(Rpc::ResolveTransactionResponse { resolved: true, error: None }),
                     Err(error) => Ok(Rpc::ResolveTransactionResponse {
@@ -2486,6 +2525,69 @@ impl Node {
             .map_err(|_| RymeError::Internal(String::from("transaction intent wal")))?;
         wal.append(commit_ts, &payload)?;
         wal.sync()
+    }
+
+    fn queue_resolution(
+        &self,
+        transaction_id: u128,
+        commit_ts: u64,
+        participant: usize,
+        committed: bool,
+    ) -> Result<()> {
+        let key = (transaction_id, commit_ts, participant);
+        let mut pending = self
+            .pending_resolutions
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("transaction resolutions")))?;
+        if pending.contains_key(&key) {
+            return Ok(());
+        }
+        let record =
+            ResolutionRecord::Pending { transaction_id, commit_ts, participant, committed };
+        let payload = serde_json::to_vec(&record)
+            .map_err(|error| RymeError::Internal(format!("transaction resolution: {error}")))?;
+        let mut wal = self
+            .resolution_wal
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("transaction resolution wal")))?;
+        wal.append(commit_ts, &payload)?;
+        wal.sync()?;
+        pending
+            .insert(key, PendingResolution { transaction_id, commit_ts, participant, committed });
+        Ok(())
+    }
+
+    fn complete_resolution(&self, resolution: &PendingResolution) -> Result<()> {
+        let key = (resolution.transaction_id, resolution.commit_ts, resolution.participant);
+        let mut pending = self
+            .pending_resolutions
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("transaction resolutions")))?;
+        if !pending.contains_key(&key) {
+            return Ok(());
+        }
+        let record = ResolutionRecord::Complete {
+            transaction_id: resolution.transaction_id,
+            commit_ts: resolution.commit_ts,
+            participant: resolution.participant,
+        };
+        let payload = serde_json::to_vec(&record)
+            .map_err(|error| RymeError::Internal(format!("transaction resolution: {error}")))?;
+        let mut wal = self
+            .resolution_wal
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("transaction resolution wal")))?;
+        wal.append(resolution.commit_ts, &payload)?;
+        wal.sync()?;
+        pending.remove(&key);
+        Ok(())
+    }
+
+    fn pending_resolutions_snapshot(&self) -> Vec<PendingResolution> {
+        self.pending_resolutions
+            .lock()
+            .map(|pending| pending.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn prepare_intent(
@@ -3252,6 +3354,44 @@ impl Node {
         }
     }
 
+    async fn retry_pending_resolutions(self: &Arc<Self>) {
+        for resolution in self.pending_resolutions_snapshot() {
+            if self
+                .resolve_on(
+                    resolution.participant,
+                    resolution.transaction_id,
+                    resolution.commit_ts,
+                    resolution.committed,
+                )
+                .await
+                .is_ok()
+            {
+                if let Err(error) = self.complete_resolution(&resolution) {
+                    tracing::error!(
+                        transaction_id = resolution.transaction_id,
+                        commit_ts = resolution.commit_ts,
+                        participant = resolution.participant,
+                        %error,
+                        "transaction resolution checkpoint failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn queue_resolutions(
+        &self,
+        transaction_id: u128,
+        commit_ts: u64,
+        participants: &BTreeSet<usize>,
+        committed: bool,
+    ) -> Result<()> {
+        for participant in participants {
+            self.queue_resolution(transaction_id, commit_ts, *participant, committed)?;
+        }
+        Ok(())
+    }
+
     async fn commit_global_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
         let writes = txn.writes().clone();
         let result = self
@@ -3299,30 +3439,30 @@ impl Node {
         let transaction_id = self.intent_id(&txn);
         let commit_ts = self.manager.reserve(&txn)?;
         let state = txn.state();
-        let mut prepared = Vec::new();
+        let participant_ids = participants.clone();
         for owner in participants.iter().copied() {
             match self.prepare_on(owner, transaction_id, commit_ts, state.clone()).await {
-                Ok(()) => prepared.push(owner),
+                Ok(()) => {}
                 Err(error) => {
-                    for participant in prepared {
-                        let _ =
-                            self.resolve_on(participant, transaction_id, commit_ts, false).await;
-                    }
+                    self.queue_resolutions(transaction_id, commit_ts, &participant_ids, false)?;
+                    self.retry_pending_resolutions().await;
                     return Err(error);
                 }
             }
         }
         match self.commit_txn_at(txn, commit_ts).await {
             Ok(commit_ts) => {
-                for owner in participants {
-                    let _ = self.resolve_on(owner, transaction_id, commit_ts, true).await;
+                if let Err(error) =
+                    self.queue_resolutions(transaction_id, commit_ts, &participant_ids, true)
+                {
+                    tracing::error!(transaction_id, commit_ts, %error, "transaction resolution queue failed");
                 }
+                self.retry_pending_resolutions().await;
                 Ok(commit_ts)
             }
             Err(error) => {
-                for owner in prepared {
-                    let _ = self.resolve_on(owner, transaction_id, commit_ts, false).await;
-                }
+                self.queue_resolutions(transaction_id, commit_ts, &participant_ids, false)?;
+                self.retry_pending_resolutions().await;
                 Err(error)
             }
         }
@@ -4520,6 +4660,28 @@ mod tests {
         assert_eq!(reopened.prepared.lock().unwrap().len(), 0);
         let mut probe = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut probe, &key).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolution_queue_survives_restart_until_acknowledged() {
+        let dir = temp_dir("resolution-queue");
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            node.queue_resolution(77, 2, 3, false).unwrap();
+            assert_eq!(node.pending_resolutions_snapshot().len(), 1);
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let pending = reopened.pending_resolutions_snapshot();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].participant, 3);
+        assert!(!pending[0].committed);
+        reopened.complete_resolution(&pending[0]).unwrap();
+        assert!(reopened.pending_resolutions_snapshot().is_empty());
+
+        let reopened_again = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        assert!(reopened_again.pending_resolutions_snapshot().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

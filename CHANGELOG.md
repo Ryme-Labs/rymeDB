@@ -1,5 +1,9 @@
 # Changelog
 
+- Cross-range transaction decisions now persist participant-resolution work in a
+  separate WAL. Lost commit/abort RPCs are retried from memory and after node
+  restart until each participant acknowledges the resolution, preventing a
+  durable prepared intent from blocking the range indefinitely.
 - Prepared participant intents now reserve their read/write set against
   ordinary local and range-local commits. A conflicting write or serializable
   read/write transaction is rejected until the coordinator resolves the
