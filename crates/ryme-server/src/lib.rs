@@ -783,6 +783,8 @@ struct ControlSnapshot {
     ranges: Vec<Range>,
 }
 
+const CONTROL_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct DurableSnapshot {
     #[serde(default)]
@@ -930,6 +932,11 @@ fn validate_listener_auth(
 }
 
 fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSnapshot> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > CONTROL_SNAPSHOT_MAX_BYTES as u64 {
+            return Err(ryme_error::RymeError::Overload(String::from("control snapshot")));
+        }
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -937,6 +944,9 @@ fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSn
         }
         Err(error) => return Err(error.into()),
     };
+    if bytes.len() > CONTROL_SNAPSHOT_MAX_BYTES {
+        return Err(ryme_error::RymeError::Overload(String::from("control snapshot")));
+    }
     let snapshot: ControlSnapshot = serde_json::from_slice(&bytes)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("control snapshot: {error}")))?;
     snapshot
@@ -1390,6 +1400,9 @@ impl SharedState {
         let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
             ryme_error::RymeError::Internal(format!("control snapshot: {error}"))
         })?;
+        if bytes.len() > CONTROL_SNAPSHOT_MAX_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("control snapshot")));
+        }
         if let Some(parent) = self.control_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -5036,16 +5049,13 @@ async fn apply_migration_locked(
     author: String,
 ) -> ryme_error::Result<ryme_migrate::LedgerEntry> {
     let _migration_guard = state.migration_lock.lock().await;
-    let duplicate = match state.control.lock() {
-        Ok(control) => control
-            .migration_ledger(&tenant, &branch)
-            .entries()
-            .iter()
-            .any(|entry| entry.migration_id == request.id),
+    match state.control.lock() {
+        Ok(control) => control.migration_ledger(&tenant, &branch).validate_next(
+            &request.id,
+            &request.sql,
+            &author,
+        )?,
         Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
-    if duplicate {
-        return Err(ryme_error::RymeError::Conflict(String::from("migration")));
     }
     executor.execute(statement).await?;
     let mut control =

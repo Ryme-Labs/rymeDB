@@ -1,5 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportRow {
@@ -471,6 +472,12 @@ pub struct LedgerEntry {
     pub author: String,
 }
 
+pub const MAX_LEDGER_ENTRIES: usize = 100_000;
+pub const MAX_MIGRATION_ID_BYTES: usize = 256;
+pub const MAX_MIGRATION_SQL_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MIGRATION_AUTHOR_BYTES: usize = 256;
+const MAX_LEDGER_CHECKSUM_BYTES: usize = 128;
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Ledger {
     #[serde(default)]
@@ -490,6 +497,26 @@ impl Ledger {
         self.entries.last().map(|e| e.result_schema_version).unwrap_or(0)
     }
 
+    pub fn validate_next(&self, migration_id: &str, sql: &str, author: &str) -> Result<()> {
+        if migration_id.is_empty()
+            || migration_id.len() > MAX_MIGRATION_ID_BYTES
+            || migration_id.contains('\0')
+            || sql.is_empty()
+            || sql.len() > MAX_MIGRATION_SQL_BYTES
+            || author.len() > MAX_MIGRATION_AUTHOR_BYTES
+            || author.contains('\0')
+        {
+            return Err(RymeError::InvalidArgument(String::from("migration")));
+        }
+        if self.entries.iter().any(|e| e.migration_id == migration_id) {
+            return Err(RymeError::Conflict(String::from("migration")));
+        }
+        if self.entries.len() >= MAX_LEDGER_ENTRIES {
+            return Err(RymeError::Overload(String::from("migrations")));
+        }
+        Ok(())
+    }
+
     pub fn apply(
         &mut self,
         migration_id: String,
@@ -497,12 +524,7 @@ impl Ledger {
         author: String,
         applied_unix: u64,
     ) -> Result<LedgerEntry> {
-        if migration_id.is_empty() || sql.is_empty() {
-            return Err(RymeError::InvalidArgument(String::from("migration")));
-        }
-        if self.entries.iter().any(|e| e.migration_id == migration_id) {
-            return Err(RymeError::Conflict(String::from("migration")));
-        }
+        self.validate_next(&migration_id, sql, &author)?;
         let parent = self.head_checksum();
         let checksum = checksum_of(&parent, &migration_id, sql);
         let entry = LedgerEntry {
@@ -518,9 +540,27 @@ impl Ledger {
     }
 
     pub fn verify(&self) -> Result<()> {
+        if self.entries.len() > MAX_LEDGER_ENTRIES {
+            return Err(RymeError::Overload(String::from("migrations")));
+        }
         let mut parent = String::new();
         let mut version = 0u64;
+        let mut migration_ids = HashSet::with_capacity(self.entries.len());
         for entry in &self.entries {
+            if entry.migration_id.is_empty()
+                || entry.migration_id.len() > MAX_MIGRATION_ID_BYTES
+                || entry.migration_id.contains('\0')
+                || entry.author.len() > MAX_MIGRATION_AUTHOR_BYTES
+                || entry.author.contains('\0')
+                || entry.checksum.is_empty()
+                || entry.checksum.len() > MAX_LEDGER_CHECKSUM_BYTES
+                || entry.checksum.contains('\0')
+                || entry.parent_checksum.len() > MAX_LEDGER_CHECKSUM_BYTES
+                || entry.parent_checksum.contains('\0')
+                || !migration_ids.insert(&entry.migration_id)
+            {
+                return Err(RymeError::Corrupt(String::from("ledger entry")));
+            }
             if entry.parent_checksum != parent {
                 return Err(RymeError::Corrupt(String::from("ledger chain")));
             }
@@ -658,5 +698,51 @@ mod tests {
     fn ledger_rejects_empty() {
         let mut ledger = Ledger::new();
         assert!(ledger.apply(String::from(""), "SELECT 1", String::from("ada"), 1).is_err());
+    }
+
+    #[test]
+    fn ledger_rejects_oversized_fields_and_capacity_exhaustion() {
+        let mut ledger = Ledger::new();
+        assert!(ledger
+            .apply("m".repeat(MAX_MIGRATION_ID_BYTES + 1), "SELECT 1", String::from("ada"), 1,)
+            .is_err());
+        assert!(ledger
+            .apply(
+                String::from("m1"),
+                &"x".repeat(MAX_MIGRATION_SQL_BYTES + 1),
+                String::from("ada"),
+                1,
+            )
+            .is_err());
+
+        ledger.entries = vec![
+            LedgerEntry {
+                migration_id: String::from("existing"),
+                checksum: String::from("checksum"),
+                parent_checksum: String::new(),
+                applied_unix: 0,
+                result_schema_version: 1,
+                author: String::from("ada"),
+            };
+            MAX_LEDGER_ENTRIES
+        ];
+        assert!(matches!(
+            ledger.apply(String::from("next"), "SELECT 1", String::from("ada"), 1),
+            Err(RymeError::Overload(message)) if message == "migrations"
+        ));
+    }
+
+    #[test]
+    fn ledger_verification_rejects_duplicate_ids() {
+        let entry = LedgerEntry {
+            migration_id: String::from("same"),
+            checksum: String::from("checksum"),
+            parent_checksum: String::new(),
+            applied_unix: 0,
+            result_schema_version: 1,
+            author: String::from("ada"),
+        };
+        let duplicate = LedgerEntry { result_schema_version: 2, ..entry.clone() };
+        assert!(Ledger::from_entries(vec![entry, duplicate]).is_err());
     }
 }
