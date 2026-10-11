@@ -1073,15 +1073,19 @@ impl TxnManager {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        let scan_limit =
-            limit.saturating_add(txn.scan_overlay_count(tenant, database, table, None));
+        let overlay_count = txn.scan_overlay_count(tenant, database, table, None);
+        let scan_limit = limit.saturating_add(overlay_count);
         let engine = self
             .inner
             .engine
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
         let rows = engine.scan(tenant, database, table, txn.read_ts, now_unix(), scan_limit);
-        Ok(txn.overlay_scan(rows, tenant, database, table, None, limit))
+        if overlay_count == 0 {
+            Ok(rows)
+        } else {
+            Ok(txn.overlay_scan(rows, tenant, database, table, None, limit))
+        }
     }
 
     pub fn scan_with(
@@ -1094,10 +1098,14 @@ impl TxnManager {
         fallback: impl FnOnce(usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        let scan_limit =
-            limit.saturating_add(txn.scan_overlay_count(tenant, database, table, None));
+        let overlay_count = txn.scan_overlay_count(tenant, database, table, None);
+        let scan_limit = limit.saturating_add(overlay_count);
         let rows = fallback(scan_limit)?;
-        Ok(txn.overlay_scan(rows, tenant, database, table, None, limit))
+        if overlay_count == 0 {
+            Ok(rows)
+        } else {
+            Ok(txn.overlay_scan(rows, tenant, database, table, None, limit))
+        }
     }
 
     pub fn scan_after(
@@ -1110,12 +1118,13 @@ impl TxnManager {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        let scan_limit = limit.saturating_add(txn.scan_overlay_count(
+        let overlay_count = txn.scan_overlay_count(
             tenant,
             database,
             table,
             Some(start_after),
-        ));
+        );
+        let scan_limit = limit.saturating_add(overlay_count);
         let engine = self
             .inner
             .engine
@@ -1130,7 +1139,11 @@ impl TxnManager {
             start_after,
             scan_limit,
         );
-        Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit))
+        if overlay_count == 0 {
+            Ok(rows)
+        } else {
+            Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1145,14 +1158,19 @@ impl TxnManager {
         fallback: impl FnOnce(usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
-        let scan_limit = limit.saturating_add(txn.scan_overlay_count(
+        let overlay_count = txn.scan_overlay_count(
             tenant,
             database,
             table,
             Some(start_after),
-        ));
+        );
+        let scan_limit = limit.saturating_add(overlay_count);
         let rows = fallback(scan_limit)?;
-        Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit))
+        if overlay_count == 0 {
+            Ok(rows)
+        } else {
+            Ok(txn.overlay_scan(rows, tenant, database, table, Some(start_after), limit))
+        }
     }
 
     pub fn advance_to(&self, commit_ts: u64) {
