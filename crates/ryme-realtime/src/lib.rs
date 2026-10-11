@@ -1343,8 +1343,8 @@ impl Realtime {
             if messages.windows(2).any(|pair| pair[0].cursor >= pair[1].cursor) {
                 return Err(RymeError::Corrupt(String::from("durable topic cursor order")));
             }
-            while messages.len() > retention {
-                messages.remove(0);
+            if messages.len() > retention {
+                messages = messages.split_off(messages.len() - retention);
             }
             let required_next = messages
                 .last()
@@ -2131,6 +2131,34 @@ mod tests {
         ));
         assert_eq!(realtime.durable_cursor("tenant", "orders"), 0);
         assert!(realtime.durable_read("tenant", "orders", 0, 10).is_empty());
+    }
+
+    #[test]
+    fn durable_snapshot_restore_trims_retention_in_linear_time() {
+        let messages = (0..32u64)
+            .map(|cursor| DurableMsg {
+                partition: String::from("orders"),
+                cursor,
+                key: cursor.to_be_bytes().to_vec(),
+                value: vec![cursor as u8],
+                commit_ts: cursor,
+            })
+            .collect();
+        let realtime = Realtime::new(64);
+        realtime
+            .restore_durable_snapshot(vec![DurableTopicSnapshot {
+                tenant: String::from("tenant"),
+                partition: String::from("orders"),
+                messages,
+                next_cursor: 32,
+                retention: 16,
+            }])
+            .unwrap();
+
+        let retained = realtime.durable_read("tenant", "orders", 0, 100);
+        assert_eq!(retained.len(), 16);
+        assert_eq!(retained.first().map(|message| message.cursor), Some(16));
+        assert_eq!(realtime.durable_cursor("tenant", "orders"), 32);
     }
 
     #[test]
