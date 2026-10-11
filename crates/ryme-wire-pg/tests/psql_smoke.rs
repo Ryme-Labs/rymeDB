@@ -99,18 +99,19 @@ async fn psql_smoke() {
     assert!(out.contains("hello"), "{out}");
     let (ok, out) = psql(
         addr,
-        "CREATE TABLE public.fk_users (id TEXT PRIMARY KEY); CREATE TABLE public.fk_profiles (id TEXT PRIMARY KEY, user_id TEXT REFERENCES public.fk_users (id) ON DELETE SET NULL); SELECT nspname, oid FROM pg_catalog.pg_namespace WHERE nspname = 'public'; SELECT relname, relkind FROM pg_catalog.pg_class WHERE relname = 'messages'; SELECT attname, atttypid, attnotnull FROM pg_catalog.pg_attribute WHERE relname = 'messages' ORDER BY attnum; SELECT typname, oid FROM pg_catalog.pg_type WHERE typname = 'uuid'; SELECT conname, contype FROM pg_catalog.pg_constraint WHERE relname = 'messages'; SELECT conname, confdeltype, confupdtype FROM pg_catalog.pg_constraint WHERE relname = 'fk_profiles'; SELECT indexrelid, indrelid, indisunique, indisprimary FROM pg_catalog.pg_index WHERE relname = 'messages'; SELECT indexname, tablename FROM pg_catalog.pg_indexes WHERE tablename = 'messages';",
+        "CREATE TABLE public.fk_users (id TEXT PRIMARY KEY); CREATE TABLE public.fk_profiles (id TEXT PRIMARY KEY, user_id TEXT REFERENCES public.fk_users (id) ON DELETE SET NULL); SELECT nspname, oid FROM pg_catalog.pg_namespace WHERE nspname = 'public'; SELECT relname, relkind, relhasindex FROM pg_catalog.pg_class WHERE relname = 'messages'; SELECT attname, atttypid, attnotnull FROM pg_catalog.pg_attribute WHERE relname = 'messages' ORDER BY attnum; SELECT typname, oid FROM pg_catalog.pg_type WHERE typname = 'uuid'; SELECT conname, contype FROM pg_catalog.pg_constraint WHERE relname = 'messages'; SELECT conname, confdeltype, confupdtype FROM pg_catalog.pg_constraint WHERE relname = 'fk_profiles'; SELECT indexrelid, indrelid, indisunique, indisprimary FROM pg_catalog.pg_index WHERE relname = 'messages'; SELECT indexname, tablename FROM pg_catalog.pg_indexes WHERE tablename = 'messages'; SELECT oid, relkind FROM pg_catalog.pg_class WHERE relname = 'messages_pkey';",
     )
     .await;
     assert!(ok, "{out}");
     assert!(out.contains("public|2200"), "{out}");
-    assert!(out.contains("messages|r"), "{out}");
+    assert!(out.contains("messages|r|t"), "{out}");
     assert!(out.contains("id|2950|t"), "{out}");
     assert!(out.contains("uuid|2950"), "{out}");
     assert!(out.contains("messages_pkey|p"), "{out}");
     assert!(out.contains("fk_profiles_fkey_0|n|r"), "{out}");
     assert!(out.lines().any(|line| line.ends_with("|t|t")), "{out}");
     assert!(out.contains("messages_pkey|messages"), "{out}");
+    assert!(out.lines().any(|line| line.ends_with("|i")), "{out}");
     let (ok, constraint_index_oid) =
         psql(addr, "SELECT conindid FROM pg_catalog.pg_constraint WHERE relname = 'messages';")
             .await;
@@ -119,6 +120,10 @@ async fn psql_smoke() {
         psql(addr, "SELECT indexrelid FROM pg_catalog.pg_index WHERE relname = 'messages';").await;
     assert!(ok, "{primary_index_oid}");
     assert_eq!(constraint_index_oid, primary_index_oid);
+    let (ok, class_index_oid) =
+        psql(addr, "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'messages_pkey';").await;
+    assert!(ok, "{class_index_oid}");
+    assert_eq!(primary_index_oid, class_index_oid);
     let (ok, out) = psql(
         addr,
         "CREATE TABLE public.projection (id TEXT PRIMARY KEY, payload TEXT, count INTEGER); INSERT INTO public.projection (id, payload, count) VALUES ('p1', 'hello', 3); SELECT payload, count FROM public.projection WHERE id = 'p1'; UPDATE public.projection SET payload = 'changed', count = 4 WHERE id = 'p1' RETURNING id, payload, count;",

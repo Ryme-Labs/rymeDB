@@ -2054,21 +2054,42 @@ where
 
     if upper.contains("PG_CATALOG.PG_CLASS") {
         let filter = sql_literal_after(query, "RELNAME");
-        let mut relations: Vec<(String, u8)> =
-            executor.catalog_tables().into_iter().map(|table| (table, b'r')).collect();
-        relations.extend(executor.catalog_views().into_iter().map(|view| (view, b'v')));
+        let mut relations: Vec<(String, u8, Option<u32>, bool)> = Vec::new();
+        for table in executor.catalog_tables() {
+            let definitions = executor.catalog_columns(&table);
+            let has_primary_key = definitions.iter().any(|definition| definition.primary_key);
+            let indexes = executor.catalog_indexes(&table);
+            relations.push((table.clone(), b'r', None, has_primary_key || !indexes.is_empty()));
+            let (_, table_name) = catalog_table_parts(&table);
+            if has_primary_key {
+                relations.push((
+                    format!("{table_name}_pkey"),
+                    b'i',
+                    Some(catalog_index_oid(&format!("constraint:{table}"))),
+                    false,
+                ));
+            }
+            relations.extend(indexes.into_iter().map(|index| {
+                (index.name.clone(), b'i', Some(catalog_index_oid(&index.name)), false)
+            }));
+        }
         relations
-            .extend(executor.catalog_sequences().into_iter().map(|sequence| (sequence.name, b'S')));
+            .extend(executor.catalog_views().into_iter().map(|view| (view, b'v', None, false)));
+        relations.extend(
+            executor
+                .catalog_sequences()
+                .into_iter()
+                .map(|sequence| (sequence.name, b'S', None, false)),
+        );
         let rows: Vec<Vec<Vec<u8>>> = relations
             .into_iter()
             .filter(|table| {
                 let (_, table_name) = catalog_table_parts(&table.0);
                 filter.as_ref().is_none_or(|want| want == &table.0 || want == table_name)
             })
-            .map(|(table, relkind)| {
+            .map(|(table, relkind, relation_oid, has_index)| {
                 let (schema, table_name) = catalog_table_parts(&table);
-                let oid = catalog_relation_oid(&table);
-                let has_index = !executor.catalog_indexes(&table).is_empty();
+                let oid = relation_oid.unwrap_or_else(|| catalog_relation_oid(&table));
                 columns
                     .iter()
                     .map(|column| match column.as_str() {
