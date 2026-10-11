@@ -104,7 +104,7 @@ async fn pubsub_isolated_between_authenticated_tenants() {
 
     let mut alpha_publisher = tokio::net::TcpStream::connect(address).await.unwrap();
     alpha_publisher.write_all(
-        b"*2\r\n$4\r\nAUTH\r\n$12\r\nalpha-secret\r\n*3\r\n$7\r\nPUBLISH\r\n$4\r\nroom\r\n$2\r\nyes\r\n",
+        b"*2\r\n$4\r\nAUTH\r\n$12\r\nalpha-secret\r\n*3\r\n$7\r\nPUBLISH\r\n$4\r\nroom\r\n$3\r\nyes\r\n",
     ).await.unwrap();
     alpha_publisher.read_exact(&mut auth_reply).await.unwrap();
     assert_eq!(&auth_reply, b"+OK\r\n");

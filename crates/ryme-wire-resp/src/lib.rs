@@ -537,6 +537,7 @@ where
                 self.write_allowed = write_allowed;
                 self.publish_allowed = publish_allowed;
                 client.authenticated = true;
+                self.start_realtime_pubsub();
                 encode_simple("OK")
             }
             Ok(_) | Err(_) => {
