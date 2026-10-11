@@ -11317,6 +11317,25 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+fn hmac_jwt_verifier(
+    secret: Vec<u8>,
+    issuer: Option<String>,
+    audience: Option<String>,
+) -> ryme_error::Result<JwtVerifier> {
+    if secret.len() < 16 {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "jwt secret must contain at least 16 bytes",
+        )));
+    }
+    match (issuer, audience) {
+        (Some(issuer), Some(audience)) => Ok(JwtVerifier::with_issuer(secret, issuer, audience)),
+        (None, None) => Ok(JwtVerifier::new(secret)),
+        _ => Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "jwt issuer and audience must be configured together",
+        ))),
+    }
+}
+
 fn admit_auth_attempt(state: &SharedState, identity: &str) -> ryme_error::Result<()> {
     state
         .auth_attempts
@@ -11335,12 +11354,7 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
     let issuer = std::env::var("RYME_JWT_ISSUER").ok();
     let audience = std::env::var("RYME_JWT_AUDIENCE").ok();
     if let Ok(secret) = std::env::var("RYME_JWT_SECRET") {
-        return Ok(Some(match (issuer, audience) {
-            (Some(issuer), Some(audience)) => {
-                JwtVerifier::with_issuer(secret.into_bytes(), issuer, audience)
-            }
-            _ => JwtVerifier::new(secret.into_bytes()),
-        }));
+        return hmac_jwt_verifier(secret.into_bytes(), issuer, audience).map(Some);
     }
 
     let Some(path) = std::env::var_os("RYME_JWT_JWKS_FILE") else {
@@ -11362,6 +11376,29 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
         audience,
     )?;
     Ok(Some(verifier))
+}
+
+#[cfg(test)]
+mod jwt_config_tests {
+    use super::*;
+
+    #[test]
+    fn hmac_jwt_rejects_weak_secrets() {
+        assert!(hmac_jwt_verifier(b"too-short".to_vec(), None, None).is_err());
+        assert!(hmac_jwt_verifier(vec![b'x'; 16], None, None).is_ok());
+    }
+
+    #[test]
+    fn hmac_jwt_requires_issuer_and_audience_together() {
+        assert!(hmac_jwt_verifier(vec![b'x'; 16], Some(String::from("issuer")), None).is_err());
+        assert!(hmac_jwt_verifier(vec![b'x'; 16], None, Some(String::from("audience"))).is_err());
+        assert!(hmac_jwt_verifier(
+            vec![b'x'; 16],
+            Some(String::from("issuer")),
+            Some(String::from("audience")),
+        )
+        .is_ok());
+    }
 }
 
 fn load_jwks_verifier_url(

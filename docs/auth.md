@@ -60,6 +60,10 @@ export RYME_JWT_JWK_KID=current
 ```
 
 Use either a secret or a JWKS source. Configure issuer and audience together.
+HMAC JWT secrets must contain at least 16 bytes; production deployments should
+use a randomly generated secret of substantially greater length. If only one
+of issuer or audience is configured, startup fails rather than silently
+disabling claim validation.
 Expired, not-yet-valid, and future-issued tokens are rejected with clock-skew
 checks. Mount secrets read-only and rotate them through your deployment
 system.
