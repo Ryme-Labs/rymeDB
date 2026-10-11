@@ -145,12 +145,41 @@ jobs:
           candidate_major=$((major + 1))
           while :; do
             version="${candidate_major}.0.0"
-            npm_version="$(npm view "@rymelabs/rymedb@$version" version --json 2>/dev/null \
-              | jq -r 'if type == "string" then . else empty end' || true)"
-            crate_version="$(curl --retry 3 --retry-all-errors -fsSL \
+            if npm_response="$(npm view "@rymelabs/rymedb@$version" version --json 2>/dev/null)"; then
+              npm_version="$(jq -er 'if type == "string" then . else empty end' <<< "$npm_response")" || {
+                echo "npm returned an invalid response while checking @rymelabs/rymedb@$version"
+                exit 1
+              }
+            elif jq -e '.error.code == "E404"' <<< "$npm_response" >/dev/null 2>&1; then
+              npm_version=""
+            else
+              echo "npm version lookup failed for @rymelabs/rymedb@$version"
+              exit 1
+            fi
+
+            crate_response="$RUNNER_TEMP/crates-io-$version.json"
+            if ! crate_status="$(curl --retry 3 --retry-all-errors -sS \
               -H 'User-Agent: rymeDB (https://github.com/Ryme-Labs/rymeDB)' \
-              "https://crates.io/api/v1/crates/rymedb-client/$version" 2>/dev/null \
-              | jq -r '.version.num // empty' || true)"
+              --output "$crate_response" --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/rymedb-client/$version")"; then
+              echo "Crates.io version lookup failed for rymedb-client@$version"
+              exit 1
+            fi
+            case "$crate_status" in
+              200)
+                crate_version="$(jq -er '.version.num // empty' "$crate_response")" || {
+                  echo "Crates.io returned an invalid response while checking rymedb-client@$version"
+                  exit 1
+                }
+                ;;
+              404)
+                crate_version=""
+                ;;
+              *)
+                echo "Crates.io returned HTTP $crate_status while checking rymedb-client@$version"
+                exit 1
+                ;;
+            esac
             if [[ -z "$npm_version" && -z "$crate_version" ]]; then
               break
             fi
@@ -216,8 +245,17 @@ jobs:
           packages=("$RUNNER_TEMP/npm/"*.tgz)
           test "${#packages[@]}" -eq 1
           expected="sha512-$(openssl dgst -sha512 -binary "${packages[0]}" | openssl base64 -A)"
-          published="$(npm view "@rymelabs/rymedb@$RELEASE_VERSION" dist.integrity --json 2>/dev/null \
-            | jq -r 'if type == "string" then . else empty end' || true)"
+          if npm_response="$(npm view "@rymelabs/rymedb@$RELEASE_VERSION" dist.integrity --json 2>/dev/null)"; then
+            published="$(jq -er 'if type == "string" then . else empty end' <<< "$npm_response")" || {
+              echo "npm returned an invalid response while checking @rymelabs/rymedb@$RELEASE_VERSION"
+              exit 1
+            }
+          elif jq -e '.error.code == "E404"' <<< "$npm_response" >/dev/null 2>&1; then
+            published=""
+          else
+            echo "npm package lookup failed for @rymelabs/rymedb@$RELEASE_VERSION"
+            exit 1
+          fi
           if [[ -n "$published" && "$published" != "undefined" && "$published" != "null" ]]; then
             if [[ "$published" != "$expected" ]]; then
               echo "@rymelabs/rymedb@$RELEASE_VERSION already exists with different contents"
