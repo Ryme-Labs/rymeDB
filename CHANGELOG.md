@@ -1,5 +1,9 @@
 # Changelog
 
+- PostgreSQL explicit transactions now restore schema changes on rollback and
+  coordinate schema-only DDL through the clustered Raft metadata hook at commit;
+  mixed schema-and-row transactions are rejected until one atomic protocol can
+  cover both logs.
 - Main-branch autocommit schema changes in clustered deployments now coordinate
   through tagged Raft metadata, with local schema rollback if quorum coordination
   fails. Branch schemas remain isolated.

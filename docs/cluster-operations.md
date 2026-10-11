@@ -319,8 +319,10 @@ leader must coordinate the new schema snapshot through quorum before the
 request succeeds, and every follower restores and persists that same snapshot
 before applying later requests. A failed proposal restores the leader's
 previous schema locally. Branch executors clear this hook and keep branch DDL
-local. Explicit SQL transaction DDL still requires transaction-level schema
-coordination and is not covered by this autocommit path.
+local. PostgreSQL explicit transactions capture a schema snapshot at `BEGIN`,
+restore it on `ROLLBACK` and savepoint rollback, and coordinate schema-only
+DDL at `COMMIT`; transactions that mix schema changes with row changes are
+rejected until one atomic protocol can cover both logs.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

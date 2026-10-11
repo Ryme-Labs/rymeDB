@@ -6895,6 +6895,18 @@ where
         self
     }
 
+    pub fn schema_transaction_snapshot(&self) -> Option<SchemaSnapshot> {
+        self.schema_hook.as_ref().map(|_| self.schema_snapshot())
+    }
+
+    pub fn rollback_schema_transaction(&self, snapshot: Option<SchemaSnapshot>) -> Result<()> {
+        let Some(snapshot) = snapshot else { return Ok(()) };
+        if self.schema_snapshot() != snapshot {
+            self.restore_schema_snapshot(snapshot)?;
+        }
+        Ok(())
+    }
+
     pub fn with_rls_tables(mut self, rls_tables: HashMap<String, String>) -> Self {
         let policies = rls_tables
             .iter()
@@ -12900,8 +12912,45 @@ where
         txn: Transaction,
         changes: Vec<TransactionChange>,
     ) -> Result<u64> {
+        self.commit_transaction_with_schema(txn, changes, None).await
+    }
+
+    pub async fn commit_transaction_with_schema(
+        &self,
+        txn: Transaction,
+        changes: Vec<TransactionChange>,
+        schema_before: Option<SchemaSnapshot>,
+    ) -> Result<u64> {
         self.check_transaction_uniqueness(&changes)?;
-        let commit_ts = self.manager.commit(txn).await?;
+        let schema_after = schema_before.as_ref().map(|_| self.schema_snapshot());
+        let schema_changed = schema_after
+            .as_ref()
+            .is_some_and(|after| schema_before.as_ref().is_some_and(|before| before != after));
+        if schema_changed && !changes.is_empty() {
+            self.rollback_schema_transaction(schema_before)?;
+            return Err(RymeError::InvalidArgument(String::from(
+                "schema changes and row changes cannot share a clustered transaction",
+            )));
+        }
+        let commit_ts = match self.manager.commit(txn).await {
+            Ok(commit_ts) => commit_ts,
+            Err(error) => {
+                if schema_changed {
+                    self.rollback_schema_transaction(schema_before)?;
+                }
+                return Err(error);
+            }
+        };
+        if schema_changed {
+            if let (Some(hook), Some(before), Some(after)) =
+                (self.schema_hook.clone(), schema_before, schema_after)
+            {
+                if let Err(error) = hook(before.clone(), after).await {
+                    self.rollback_schema_transaction(Some(before))?;
+                    return Err(error);
+                }
+            }
+        }
         for change in changes {
             self.apply_index_change(&change);
             self.emit(&change.table, change.pk, change.op, change.before, change.after, commit_ts)?;

@@ -9,7 +9,7 @@ use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
     bind, parse, Executor, Field, ForeignKeyAction, InsertValue, QueryResult, ReturningField,
-    RoleDefinition, Statement, TransactionChange, SQL_NULL_SENTINEL,
+    RoleDefinition, SchemaSnapshot, Statement, TransactionChange, SQL_NULL_SENTINEL,
 };
 use ryme_txn::{Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager};
 use std::collections::{HashMap, HashSet};
@@ -57,6 +57,7 @@ enum DecodedCopy {
 struct SessionTransaction {
     txn: Transaction,
     changes: Vec<TransactionChange>,
+    schema_before: Option<SchemaSnapshot>,
     notifications: Vec<PgNotification>,
     listener_changes: Vec<ListenerChange>,
     failed: bool,
@@ -107,6 +108,7 @@ struct Savepoint {
     name: String,
     checkpoint: TransactionCheckpoint,
     changes_len: usize,
+    schema_snapshot: Option<SchemaSnapshot>,
     notifications_len: usize,
     listener_changes_len: usize,
 }
@@ -2814,6 +2816,7 @@ where
                 *active = Some(SessionTransaction {
                     txn: executor.begin_transaction(isolation),
                     changes: Vec::new(),
+                    schema_before: executor.schema_transaction_snapshot(),
                     notifications: Vec::new(),
                     listener_changes: Vec::new(),
                     failed: false,
@@ -2832,7 +2835,10 @@ where
                     String::from("current transaction is aborted, commands ignored until end of transaction block"),
                 );
             }
-            match executor.commit_transaction(state.txn, state.changes).await {
+            match executor
+                .commit_transaction_with_schema(state.txn, state.changes, state.schema_before)
+                .await
+            {
                 Ok(_) => {
                     for change in &state.listener_changes {
                         apply_listener_change(listening, change);
@@ -2844,7 +2850,9 @@ where
             }
         }
         TransactionControl::Rollback => {
-            active.take();
+            if let Some(state) = active.take() {
+                let _ = executor.rollback_schema_transaction(state.schema_before);
+            }
             command_complete("ROLLBACK")
         }
         TransactionControl::Savepoint(name) => {
@@ -2871,6 +2879,7 @@ where
                 name,
                 checkpoint: state.txn.checkpoint(),
                 changes_len: state.changes.len(),
+                schema_snapshot: executor.schema_transaction_snapshot(),
                 notifications_len: state.notifications.len(),
                 listener_changes_len: state.listener_changes.len(),
             });
@@ -2913,6 +2922,10 @@ where
             };
             let savepoint = &state.savepoints[position];
             state.txn.restore_checkpoint(&savepoint.checkpoint);
+            if executor.rollback_schema_transaction(savepoint.schema_snapshot.clone()).is_err() {
+                state.failed = true;
+                return encode_error_code("XX000", String::from("schema savepoint restore failed"));
+            }
             state.changes.truncate(savepoint.changes_len);
             state.notifications.truncate(savepoint.notifications_len);
             state.listener_changes.truncate(savepoint.listener_changes_len);
@@ -4190,6 +4203,7 @@ mod tests {
         let mut active = Some(SessionTransaction {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
+            schema_before: executor.schema_transaction_snapshot(),
             notifications: Vec::new(),
             listener_changes: Vec::new(),
             failed: false,
@@ -4237,6 +4251,143 @@ mod tests {
             executor.execute(parse("SELECT id, body FROM messages").unwrap()).await.unwrap(),
             QueryResult::Table { rows, .. }
                 if rows == vec![vec![b"first".to_vec(), b"kept".to_vec()]]
+        ));
+    }
+
+    #[tokio::test]
+    async fn clustered_schema_transactions_restore_on_rollback_and_commit_on_commit() {
+        let coordinated = Arc::new(Mutex::new(Vec::new()));
+        let captured = coordinated.clone();
+        let executor =
+            Arc::new(Executor::new(String::from("tenant"), String::from("db")).with_schema_hook(
+                Arc::new(move |before, after| {
+                    let captured = captured.clone();
+                    Box::pin(async move {
+                        captured.lock().unwrap().push((before, after));
+                        Ok(())
+                    })
+                }),
+            ));
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+
+        let mut active = Some(SessionTransaction {
+            txn: executor.begin_transaction(Isolation::Serializable),
+            changes: Vec::new(),
+            schema_before: executor.schema_transaction_snapshot(),
+            notifications: Vec::new(),
+            listener_changes: Vec::new(),
+            failed: false,
+            savepoints: Vec::new(),
+        });
+        let state = active.as_mut().unwrap();
+        let (_, changes) = executor
+            .execute_in_transaction(
+                &mut state.txn,
+                parse("CREATE TABLE rolled_back (id TEXT PRIMARY KEY)").unwrap(),
+            )
+            .await
+            .unwrap();
+        state.changes.extend(changes);
+        handle_transaction_control(TransactionControl::Rollback, &executor, &mut active).await;
+        assert!(!executor.catalog_tables().contains(&String::from("rolled_back")));
+
+        let mut active = Some(SessionTransaction {
+            txn: executor.begin_transaction(Isolation::Serializable),
+            changes: Vec::new(),
+            schema_before: executor.schema_transaction_snapshot(),
+            notifications: Vec::new(),
+            listener_changes: Vec::new(),
+            failed: false,
+            savepoints: Vec::new(),
+        });
+        let state = active.as_mut().unwrap();
+        let (_, changes) = executor
+            .execute_in_transaction(
+                &mut state.txn,
+                parse("CREATE TABLE committed (id TEXT PRIMARY KEY)").unwrap(),
+            )
+            .await
+            .unwrap();
+        state.changes.extend(changes);
+        handle_transaction_control(TransactionControl::Commit, &executor, &mut active).await;
+        assert!(executor.catalog_tables().contains(&String::from("committed")));
+        assert_eq!(coordinated.lock().unwrap().len(), 2);
+
+        let mut active = Some(SessionTransaction {
+            txn: executor.begin_transaction(Isolation::Serializable),
+            changes: Vec::new(),
+            schema_before: executor.schema_transaction_snapshot(),
+            notifications: Vec::new(),
+            listener_changes: Vec::new(),
+            failed: false,
+            savepoints: Vec::new(),
+        });
+        handle_transaction_control(
+            TransactionControl::Savepoint(String::from("before_ddl")),
+            &executor,
+            &mut active,
+        )
+        .await;
+        let state = active.as_mut().unwrap();
+        let (_, changes) = executor
+            .execute_in_transaction(
+                &mut state.txn,
+                parse("CREATE TABLE savepoint_only (id TEXT PRIMARY KEY)").unwrap(),
+            )
+            .await
+            .unwrap();
+        state.changes.extend(changes);
+        handle_transaction_control(
+            TransactionControl::RollbackToSavepoint(String::from("before_ddl")),
+            &executor,
+            &mut active,
+        )
+        .await;
+        handle_transaction_control(TransactionControl::Commit, &executor, &mut active).await;
+        assert!(!executor.catalog_tables().contains(&String::from("savepoint_only")));
+        assert_eq!(coordinated.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn clustered_schema_transactions_reject_mixed_row_changes() {
+        let executor = Arc::new(
+            Executor::new(String::from("tenant"), String::from("db"))
+                .with_schema_hook(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+        );
+        executor
+            .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let before = executor.schema_transaction_snapshot();
+        let (_, mut changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("CREATE TABLE migration (id TEXT PRIMARY KEY)").unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, row_changes) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO messages (id) VALUES ('one')").unwrap(),
+            )
+            .await
+            .unwrap();
+        changes.extend(row_changes);
+        let result = executor.commit_transaction_with_schema(txn, changes, before).await;
+        assert!(matches!(
+            result,
+            Err(RymeError::InvalidArgument(message))
+                if message.contains("schema changes and row changes")
+        ));
+        assert!(!executor.catalog_tables().contains(&String::from("migration")));
+        assert!(matches!(
+            executor.execute(parse("SELECT * FROM messages").unwrap()).await,
+            Ok(QueryResult::Rows { ref rows }) if rows.is_empty()
         ));
     }
 
