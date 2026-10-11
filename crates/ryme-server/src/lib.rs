@@ -3683,7 +3683,11 @@ fn rest_matching_keys(
     let mut keys = Vec::new();
     loop {
         let (page, next) = gateway.scan_page(principal, table, cursor.as_deref(), 256)?;
-        keys.extend(rest_list_filtered(page, raw).into_iter().map(|(key, _)| key));
+        let matches = rest_list_filtered(page, raw);
+        if matches.len() > ryme_gateway::MAX_BATCH_ROWS.saturating_sub(keys.len()) {
+            return Err(ryme_error::RymeError::Overload(String::from("rows")));
+        }
+        keys.extend(matches.into_iter().map(|(key, _)| key));
         let Some(next_cursor) = next else { break };
         cursor = Some(next_cursor);
     }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub const MAX_KEY_BYTES: usize = 1024;
 pub const MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH_ROWS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ttl {
@@ -380,6 +381,9 @@ where
         if table.is_empty() || rows.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("rows")));
         }
+        if rows.len() > MAX_BATCH_ROWS {
+            return Err(RymeError::Overload(String::from("rows")));
+        }
         self.policies.check_write(principal, table)?;
         let mut txn = self.begin();
         let mut seen = HashSet::with_capacity(rows.len());
@@ -570,6 +574,9 @@ where
         self.policies.check_write(principal, table)?;
         if table.is_empty() || pks.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("keys")));
+        }
+        if pks.len() > MAX_BATCH_ROWS {
+            return Err(RymeError::Overload(String::from("keys")));
         }
         let mut txn = self.begin();
         let mut seen = HashSet::with_capacity(pks.len());
@@ -925,6 +932,25 @@ mod tests {
         let second = changes.recv().await.unwrap();
         assert_eq!(first.commit_ts, commit);
         assert_eq!(second.commit_ts, commit);
+    }
+
+    #[tokio::test]
+    async fn batch_mutations_reject_oversized_input_before_allocating_transaction_state() {
+        let gateway = gateway();
+        let principal = owner();
+        let rows = (0..=MAX_BATCH_ROWS)
+            .map(|index| (index.to_string().into_bytes(), b"value".to_vec()))
+            .collect();
+        assert!(matches!(
+            gateway.put_many(&principal, "docs", rows).await,
+            Err(RymeError::Overload(_))
+        ));
+
+        let keys = (0..=MAX_BATCH_ROWS).map(|index| index.to_string().into_bytes()).collect();
+        assert!(matches!(
+            gateway.delete_many(&principal, "docs", keys).await,
+            Err(RymeError::Overload(_))
+        ));
     }
 
     #[tokio::test]
