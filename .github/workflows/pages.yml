@@ -62,6 +62,11 @@ jobs:
           mkdir -p _site/openapi
           cp schemas/openapi/rest.yaml _site/openapi/rest.yaml
           cp -R images _site/images
+          for asset in rymedb-banner.png rymedb-black.png rymedb-transparent.png rymedb-white.png; do
+            test -s "_site/images/$asset"
+          done
+          grep -q 'images/rymedb-banner.png' _site/index.html
+          grep -q 'images/rymedb-transparent.png' _site/index.html
           python3 -c 'import json, pathlib, yaml; source=pathlib.Path("schemas/openapi/rest.yaml"); target=pathlib.Path("_site/openapi/rest.json"); target.write_text(json.dumps(yaml.safe_load(source.read_text()), indent=2) + "\n")'
 
       - name: Verify generated site
