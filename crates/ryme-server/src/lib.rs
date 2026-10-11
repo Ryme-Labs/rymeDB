@@ -11462,6 +11462,14 @@ mod jwt_config_tests {
         assert!(validate_jwt_claim_configuration(Some(""), Some("audience"), true, "jwt").is_err());
         assert!(validate_jwt_claim_configuration(Some("issuer"), Some(""), true, "jwt").is_err());
     }
+
+    #[test]
+    fn jwks_url_requires_https_except_for_loopback() {
+        assert!(validate_jwks_url_transport("https://issuer.example/jwks").is_ok());
+        assert!(validate_jwks_url_transport("http://127.0.0.1:8080/jwks").is_ok());
+        assert!(validate_jwks_url_transport("http://issuer.example/jwks").is_err());
+        assert!(validate_jwks_url_transport("https://user:pass@issuer.example/jwks").is_err());
+    }
 }
 
 fn load_jwks_verifier_url(
@@ -11470,6 +11478,7 @@ fn load_jwks_verifier_url(
     issuer: Option<String>,
     audience: Option<String>,
 ) -> ryme_error::Result<JwtVerifier> {
+    validate_jwks_url_transport(url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -11484,6 +11493,32 @@ fn load_jwks_verifier_url(
         .bytes()
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("jwt jwks url body: {error}")))?;
     load_jwks_verifier_bytes(&raw, requested_kid, issuer, audience)
+}
+
+fn validate_jwks_url_transport(url: &str) -> ryme_error::Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| ryme_error::RymeError::InvalidArgument(String::from("jwt jwks url")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ryme_error::RymeError::InvalidArgument(String::from("jwt jwks url")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "jwt jwks url",
+        )));
+    }
+    if parsed.scheme() == "https"
+        || (parsed.scheme() == "http"
+            && (host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|address| address.is_loopback())
+                    .unwrap_or(false)))
+    {
+        return Ok(());
+    }
+    Err(ryme_error::RymeError::InvalidArgument(String::from(
+        "jwt jwks url must use https",
+    )))
 }
 
 fn load_jwks_verifier(

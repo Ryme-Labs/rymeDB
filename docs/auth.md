@@ -60,6 +60,8 @@ export RYME_JWT_JWK_KID=current
 ```
 
 Use either a secret or a JWKS source. Configure issuer and audience together.
+JWKS URLs must use HTTPS; loopback HTTP is accepted only for local development
+and test fixtures.
 HMAC JWT secrets must contain at least 16 bytes; production deployments should
 use a randomly generated secret of substantially greater length. If only one
 of issuer or audience is configured, startup fails rather than silently
