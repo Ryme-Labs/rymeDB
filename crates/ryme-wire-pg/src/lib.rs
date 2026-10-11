@@ -63,18 +63,142 @@ const MAX_PREPARED_STATEMENTS: usize = 256;
 const MAX_PORTALS: usize = 256;
 const MAX_SAVEPOINTS: usize = 256;
 const MAX_SAVEPOINT_NAME_BYTES: usize = 256;
+const MAX_TRANSACTION_CHANGES: usize = 100_000;
+const MAX_TRANSACTION_CHANGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRANSACTION_NOTIFICATIONS: usize = 4_096;
+const MAX_TRANSACTION_NOTIFICATION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TRANSACTION_LISTENER_CHANGES: usize = 4_096;
+const MAX_TRANSACTION_LISTENER_BYTES: usize = 256 * 1024;
+const MAX_SESSION_SETTINGS: usize = 256;
+const MAX_SESSION_SETTING_BYTES: usize = 1024 * 1024;
+const MAX_SESSION_SETTING_VALUE_BYTES: usize = 64 * 1024;
+const MAX_LISTENING_CHANNELS: usize = 4_096;
 const MAX_NOTIFICATION_CHANNEL_BYTES: usize = 63;
 const MAX_NOTIFICATION_PAYLOAD_BYTES: usize = 8_000;
 
 struct SessionTransaction {
     txn: Transaction,
     changes: Vec<TransactionChange>,
+    changes_bytes: usize,
     schema_before: Option<SchemaSnapshot>,
     local_settings: HashMap<String, Option<String>>,
     notifications: Vec<PgNotification>,
+    notification_bytes: usize,
     listener_changes: Vec<ListenerChange>,
+    listener_changes_bytes: usize,
     failed: bool,
     savepoints: Vec<Savepoint>,
+}
+
+fn transaction_change_bytes(change: &TransactionChange) -> usize {
+    128usize
+        .saturating_add(change.table.len())
+        .saturating_add(change.pk.len())
+        .saturating_add(change.previous_pk.as_ref().map_or(0, Vec::len))
+        .saturating_add(change.before.as_ref().map_or(0, Vec::len))
+        .saturating_add(change.after.as_ref().map_or(0, Vec::len))
+}
+
+fn notification_bytes(notification: &PgNotification) -> usize {
+    16usize.saturating_add(notification.channel.len()).saturating_add(notification.payload.len())
+}
+
+fn listener_change_bytes(change: &ListenerChange) -> usize {
+    16usize.saturating_add(match change {
+        ListenerChange::Listen(channel) | ListenerChange::Unlisten(Some(channel)) => channel.len(),
+        ListenerChange::Unlisten(None) => 0,
+    })
+}
+
+impl SessionTransaction {
+    fn append_changes(&mut self, changes: Vec<TransactionChange>) -> Result<()> {
+        let added_bytes = changes
+            .iter()
+            .map(transaction_change_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .ok_or_else(|| RymeError::Overload(String::from("transaction changes")))?;
+        let next_count = self.changes.len().saturating_add(changes.len());
+        let next_bytes = self
+            .changes_bytes
+            .checked_add(added_bytes)
+            .ok_or_else(|| RymeError::Overload(String::from("transaction change bytes")))?;
+        if next_count > MAX_TRANSACTION_CHANGES {
+            return Err(RymeError::Overload(String::from("transaction changes")));
+        }
+        if next_bytes > MAX_TRANSACTION_CHANGE_BYTES {
+            return Err(RymeError::Overload(String::from("transaction change bytes")));
+        }
+        self.changes.extend(changes);
+        self.changes_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn queue_notification(&mut self, notification: PgNotification) -> Result<()> {
+        let next_count = self.notifications.len().saturating_add(1);
+        let next_bytes = self
+            .notification_bytes
+            .checked_add(notification_bytes(&notification))
+            .ok_or_else(|| RymeError::Overload(String::from("transaction notification bytes")))?;
+        if next_count > MAX_TRANSACTION_NOTIFICATIONS {
+            return Err(RymeError::Overload(String::from("transaction notifications")));
+        }
+        if next_bytes > MAX_TRANSACTION_NOTIFICATION_BYTES {
+            return Err(RymeError::Overload(String::from("transaction notification bytes")));
+        }
+        self.notifications.push(notification);
+        self.notification_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn queue_listener_change(
+        &mut self,
+        change: ListenerChange,
+        listening: &HashSet<String>,
+    ) -> Result<()> {
+        let next_count = self.listener_changes.len().saturating_add(1);
+        let next_bytes = self
+            .listener_changes_bytes
+            .checked_add(listener_change_bytes(&change))
+            .ok_or_else(|| RymeError::Overload(String::from("transaction listener bytes")))?;
+        if next_count > MAX_TRANSACTION_LISTENER_CHANGES {
+            return Err(RymeError::Overload(String::from("transaction listener changes")));
+        }
+        if next_bytes > MAX_TRANSACTION_LISTENER_BYTES {
+            return Err(RymeError::Overload(String::from("transaction listener bytes")));
+        }
+        let mut projected = listening.clone();
+        for existing in &self.listener_changes {
+            apply_listener_change(&mut projected, existing);
+        }
+        apply_listener_change(&mut projected, &change);
+        if projected.len() > MAX_LISTENING_CHANNELS {
+            return Err(RymeError::Overload(String::from("listening channels")));
+        }
+        self.listener_changes.push(change);
+        self.listener_changes_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn restore_metadata_lengths(&mut self, changes_len: usize, notifications_len: usize, listener_changes_len: usize) {
+        self.changes.truncate(changes_len);
+        self.changes_bytes = self
+            .changes
+            .iter()
+            .map(transaction_change_bytes)
+            .fold(0usize, usize::saturating_add);
+        self.notifications.truncate(notifications_len);
+        self.notification_bytes = self
+            .notifications
+            .iter()
+            .map(notification_bytes)
+            .fold(0usize, usize::saturating_add);
+        self.listener_changes.truncate(listener_changes_len);
+        self.listener_changes_bytes = self
+            .listener_changes
+            .iter()
+            .map(listener_change_bytes)
+            .fold(0usize, usize::saturating_add);
+    }
 }
 
 fn note_range_changes(
@@ -888,28 +1012,39 @@ where
                                         .await
                                     {
                                         Ok((_result, changes)) => {
-                                            note_range_changes(
-                                                &limits.range_hook,
-                                                &limits.tenant,
-                                                &limits.database,
-                                                &table,
-                                                &changes,
-                                                count.max(1) as u64,
-                                            );
-                                            transaction.changes.extend(changes);
-                                            observe_statement(&limits, true);
-                                            let fingerprint = limits.slow_log.as_ref().map(|_| {
-                                                query_fingerprint(&format!(
-                                                    "COPY {table} FROM STDIN"
-                                                ))
-                                            });
-                                            record_timing(
-                                                &limits,
-                                                fingerprint,
-                                                table,
-                                                start.elapsed().as_micros() as u64,
-                                            );
-                                            copy_complete(count)
+                                            let change_start = transaction.changes.len();
+                                            match transaction.append_changes(changes) {
+                                                Ok(()) => {
+                                                    note_range_changes(
+                                                        &limits.range_hook,
+                                                        &limits.tenant,
+                                                        &limits.database,
+                                                        &table,
+                                                        &transaction.changes[change_start..],
+                                                        count.max(1) as u64,
+                                                    );
+                                                    observe_statement(&limits, true);
+                                                    let fingerprint = limits.slow_log.as_ref().map(|_| {
+                                                        query_fingerprint(&format!(
+                                                            "COPY {table} FROM STDIN"
+                                                        ))
+                                                    });
+                                                    record_timing(
+                                                        &limits,
+                                                        fingerprint,
+                                                        table,
+                                                        start.elapsed().as_micros() as u64,
+                                                    );
+                                                    copy_complete(count)
+                                                }
+                                                Err(error) => {
+                                                    transaction.failed = true;
+                                                    encode_error_code(
+                                                        error_code(&error),
+                                                        error.to_string(),
+                                                    )
+                                                }
+                                            }
                                         }
                                         Err(error) => {
                                             transaction.failed = true;
@@ -3024,10 +3159,13 @@ where
                 *active = Some(SessionTransaction {
                     txn: executor.begin_transaction(isolation),
                     changes: Vec::new(),
+                    changes_bytes: 0,
                     schema_before: None,
                     local_settings: HashMap::new(),
                     notifications: Vec::new(),
+                    notification_bytes: 0,
                     listener_changes: Vec::new(),
+                    listener_changes_bytes: 0,
                     failed: false,
                     savepoints: Vec::new(),
                 });
@@ -3163,15 +3301,17 @@ where
                 state.failed = true;
                 return encode_error_code("XX000", String::from("schema savepoint restore failed"));
             }
-            state.changes.truncate(savepoint.changes_len);
             restore_local_settings_to(
                 session,
                 &mut state.local_settings,
                 &savepoint.local_settings,
                 &savepoint.local_values,
             );
-            state.notifications.truncate(savepoint.notifications_len);
-            state.listener_changes.truncate(savepoint.listener_changes_len);
+            state.restore_metadata_lengths(
+                savepoint.changes_len,
+                savepoint.notifications_len,
+                savepoint.listener_changes_len,
+            );
             state.savepoints.truncate(position + 1);
             state.failed = false;
             command_complete("ROLLBACK")
@@ -3289,20 +3429,28 @@ where
     if let Some(transaction) = active.as_mut() {
         match executor.execute_in_transaction(&mut transaction.txn, statement).await {
             Ok((result, changes)) => {
-                if write {
-                    note_range_changes(
-                        &limits.range_hook,
-                        &limits.tenant,
-                        &limits.database,
-                        &table,
-                        &changes,
-                        changes.len().max(1) as u64,
-                    );
+                let change_start = transaction.changes.len();
+                match transaction.append_changes(changes) {
+                Ok(()) => {
+                    if write {
+                        note_range_changes(
+                            &limits.range_hook,
+                            &limits.tenant,
+                            &limits.database,
+                            &table,
+                            &transaction.changes[change_start..],
+                            transaction.changes[change_start..].len().max(1) as u64,
+                        );
+                    }
+                    observe_statement(limits, write);
+                    record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
+                    encode_result(result)
                 }
-                transaction.changes.extend(changes);
-                observe_statement(limits, write);
-                record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
-                encode_result(result)
+                Err(error) => {
+                    transaction.failed = true;
+                    encode_error_code(error_code(&error), error.to_string())
+                }
+                }
             }
             Err(error) => {
                 transaction.failed = true;
@@ -3345,9 +3493,12 @@ where
             return Err(RymeError::InvalidArgument(String::from("current transaction is aborted")));
         }
         match executor.execute_in_transaction(&mut transaction.txn, statement).await {
-            Ok((result, changes)) => {
-                transaction.changes.extend(changes);
-                Ok(result)
+            Ok((result, changes)) => match transaction.append_changes(changes) {
+                Ok(()) => Ok(result),
+                Err(error) => {
+                    transaction.failed = true;
+                    Err(error)
+                }
             }
             Err(error) => {
                 transaction.failed = true;
@@ -3591,6 +3742,35 @@ fn session_setting_name(rest: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_ascii_lowercase())
 }
 
+fn set_session_value(
+    session: &mut HashMap<String, String>,
+    name: String,
+    value: String,
+) -> Result<()> {
+    if value.len() > MAX_SESSION_SETTING_VALUE_BYTES {
+        return Err(RymeError::Overload(String::from("session setting value")));
+    }
+    let old_bytes = session
+        .get(&name)
+        .map(|old| old.len().saturating_add(name.len()).saturating_add(32))
+        .unwrap_or(0);
+    let new_bytes = name.len().saturating_add(value.len()).saturating_add(32);
+    let current_bytes = session
+        .iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()).saturating_add(32))
+        .fold(0usize, usize::saturating_add);
+    let next_count = session.len().saturating_add(usize::from(!session.contains_key(&name)));
+    let next_bytes = current_bytes.saturating_sub(old_bytes).saturating_add(new_bytes);
+    if next_count > MAX_SESSION_SETTINGS {
+        return Err(RymeError::Overload(String::from("session settings")));
+    }
+    if next_bytes > MAX_SESSION_SETTING_BYTES {
+        return Err(RymeError::Overload(String::from("session setting bytes")));
+    }
+    session.insert(name, value);
+    Ok(())
+}
+
 fn session_command_with_transaction(
     query: &str,
     session: &mut HashMap<String, String>,
@@ -3664,7 +3844,13 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
             };
             if let Some(isolation_words) = isolation_words {
                 let normalized = normalize_isolation_level(isolation_words)?;
-                session.insert(String::from("transaction_isolation"), String::from(normalized));
+                if let Err(error) = set_session_value(
+                    session,
+                    String::from("transaction_isolation"),
+                    String::from(normalized),
+                ) {
+                    return Some(encode_error_code(error_code(&error), error.to_string()));
+                }
                 return Some(command_complete("SET"));
             }
             if words.len() >= 3
@@ -3675,10 +3861,10 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
                 if value.is_empty() {
                     return None;
                 }
-                session.insert(
-                    String::from("timezone"),
-                    unquote_literal(value.trim_start_matches('=').trim()),
-                );
+                let value = unquote_literal(value.trim_start_matches('=').trim());
+                if let Err(error) = set_session_value(session, String::from("timezone"), value) {
+                    return Some(encode_error_code(error_code(&error), error.to_string()));
+                }
                 return Some(command_complete("SET"));
             }
             if words.len() >= 2 && words[0].eq_ignore_ascii_case("NAMES") {
@@ -3686,10 +3872,12 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
                 if value.is_empty() {
                     return None;
                 }
-                session.insert(
-                    String::from("client_encoding"),
-                    unquote_literal(value.trim_start_matches('=').trim()),
-                );
+                let value = unquote_literal(value.trim_start_matches('=').trim());
+                if let Err(error) =
+                    set_session_value(session, String::from("client_encoding"), value)
+                {
+                    return Some(encode_error_code(error_code(&error), error.to_string()));
+                }
                 return Some(command_complete("SET"));
             }
             let (name, value) = rest
@@ -3715,7 +3903,9 @@ fn session_command(query: &str, session: &mut HashMap<String, String>) -> Option
             {
                 return None;
             }
-            session.insert(name.to_ascii_lowercase(), value);
+            if let Err(error) = set_session_value(session, name.to_ascii_lowercase(), value) {
+                return Some(encode_error_code(error_code(&error), error.to_string()));
+            }
             Some(command_complete("SET"))
         }
         "SHOW" => {
@@ -3812,11 +4002,21 @@ fn notification_command(
         if channel.is_empty() {
             return None;
         }
-        let change = ListenerChange::Listen(channel);
         if let Some(transaction) = active.as_mut() {
-            transaction.listener_changes.push(change);
+            if let Err(error) =
+                transaction.queue_listener_change(ListenerChange::Listen(channel), listening)
+            {
+                transaction.failed = true;
+                return Some(encode_error_code(error_code(&error), error.to_string()));
+            }
         } else {
-            apply_listener_change(listening, &change);
+            if listening.len() >= MAX_LISTENING_CHANNELS && !listening.contains(&channel) {
+                return Some(encode_error_code(
+                    "53200",
+                    String::from("listening channel limit exceeded"),
+                ));
+            }
+            apply_listener_change(listening, &ListenerChange::Listen(channel));
         }
         return Some(command_complete("LISTEN"));
     }
@@ -3829,7 +4029,10 @@ fn notification_command(
             ListenerChange::Unlisten(Some(channel))
         };
         if let Some(transaction) = active.as_mut() {
-            transaction.listener_changes.push(change);
+            if let Err(error) = transaction.queue_listener_change(change, listening) {
+                transaction.failed = true;
+                return Some(encode_error_code(error_code(&error), error.to_string()));
+            }
         } else {
             apply_listener_change(listening, &change);
         }
@@ -3851,7 +4054,10 @@ fn notification_command(
         }
         let notification = PgNotification { channel, payload, pid };
         if let Some(transaction) = active.as_mut() {
-            transaction.notifications.push(notification);
+            if let Err(error) = transaction.queue_notification(notification) {
+                transaction.failed = true;
+                return Some(encode_error_code(error_code(&error), error.to_string()));
+            }
         } else {
             let _ = notification_sender(tenant, database).send(notification);
         }
@@ -4594,6 +4800,25 @@ mod tests {
     }
 
     #[test]
+    fn session_setting_memory_is_bounded() {
+        let mut session = HashMap::new();
+        assert!(set_session_value(
+            &mut session,
+            String::from("oversized"),
+            "x".repeat(MAX_SESSION_SETTING_VALUE_BYTES + 1),
+        )
+        .is_err());
+        for index in 0..MAX_SESSION_SETTINGS {
+            set_session_value(&mut session, format!("setting_{index}"), String::from("value"))
+                .unwrap();
+        }
+        assert!(set_session_value(&mut session, String::from("overflow"), String::from("value"))
+            .is_err());
+        set_session_value(&mut session, String::from("setting_0"), String::from("updated"))
+            .unwrap();
+    }
+
+    #[test]
     fn authorization_catalog_changes_require_admin_access() {
         let mut limits = ConnLimits {
             tenant: String::from("tenant"),
@@ -4790,10 +5015,13 @@ mod tests {
         let mut active = Some(SessionTransaction {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
+            changes_bytes: 0,
             schema_before: None,
             local_settings: HashMap::new(),
             notifications: Vec::new(),
+            notification_bytes: 0,
             listener_changes: Vec::new(),
+            listener_changes_bytes: 0,
             failed: false,
             savepoints: Vec::new(),
         });
@@ -4816,6 +5044,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_change_metadata_is_bounded() {
+        let executor = Executor::new(String::from("tenant"), String::from("db"));
+        executor
+            .execute(parse("CREATE TABLE items (id TEXT PRIMARY KEY, value TEXT)").unwrap())
+            .await
+            .unwrap();
+        let mut txn = executor.begin_transaction(Isolation::Serializable);
+        let (_, mut seed) = executor
+            .execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO items (id, value) VALUES ('seed', 'value')").unwrap(),
+            )
+            .await
+            .unwrap();
+        let template = seed.pop().unwrap();
+        let mut state = SessionTransaction {
+            txn: executor.begin_transaction(Isolation::Serializable),
+            changes: Vec::new(),
+            changes_bytes: 0,
+            schema_before: None,
+            local_settings: HashMap::new(),
+            notifications: Vec::new(),
+            notification_bytes: 0,
+            listener_changes: Vec::new(),
+            listener_changes_bytes: 0,
+            failed: false,
+            savepoints: Vec::new(),
+        };
+        let changes = (0..=MAX_TRANSACTION_CHANGES)
+            .map(|_| template.clone())
+            .collect();
+        assert!(matches!(
+            state.append_changes(changes),
+            Err(RymeError::Overload(message)) if message == "transaction changes"
+        ));
+        assert!(state.changes.is_empty());
+        assert_eq!(state.changes_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn savepoint_rollback_discards_only_later_changes() {
         let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
         executor
@@ -4825,10 +5093,13 @@ mod tests {
         let mut active = Some(SessionTransaction {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
+            changes_bytes: 0,
             schema_before: executor.schema_transaction_snapshot(),
             local_settings: HashMap::new(),
             notifications: Vec::new(),
+            notification_bytes: 0,
             listener_changes: Vec::new(),
+            listener_changes_bytes: 0,
             failed: false,
             savepoints: Vec::new(),
         });
@@ -4842,7 +5113,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            state.changes.extend(changes);
+            state.append_changes(changes).unwrap();
         }
         handle_transaction_control(
             TransactionControl::Savepoint(String::from("after_first")),
@@ -4860,7 +5131,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            state.changes.extend(changes);
+            state.append_changes(changes).unwrap();
         }
         handle_transaction_control(
             TransactionControl::RollbackToSavepoint(String::from("after_first")),
@@ -4899,10 +5170,13 @@ mod tests {
         let mut active = Some(SessionTransaction {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
+            changes_bytes: 0,
             schema_before: executor.schema_transaction_snapshot(),
             local_settings: HashMap::new(),
             notifications: Vec::new(),
+            notification_bytes: 0,
             listener_changes: Vec::new(),
+            listener_changes_bytes: 0,
             failed: false,
             savepoints: Vec::new(),
         });
@@ -4914,17 +5188,20 @@ mod tests {
             )
             .await
             .unwrap();
-        state.changes.extend(changes);
+        state.append_changes(changes).unwrap();
         handle_transaction_control(TransactionControl::Rollback, &executor, &mut active).await;
         assert!(!executor.catalog_tables().contains(&String::from("rolled_back")));
 
         let mut active = Some(SessionTransaction {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
+            changes_bytes: 0,
             schema_before: executor.schema_transaction_snapshot(),
             local_settings: HashMap::new(),
             notifications: Vec::new(),
+            notification_bytes: 0,
             listener_changes: Vec::new(),
+            listener_changes_bytes: 0,
             failed: false,
             savepoints: Vec::new(),
         });
@@ -4936,7 +5213,7 @@ mod tests {
             )
             .await
             .unwrap();
-        state.changes.extend(changes);
+        state.append_changes(changes).unwrap();
         handle_transaction_control(TransactionControl::Commit, &executor, &mut active).await;
         assert!(executor.catalog_tables().contains(&String::from("committed")));
         assert_eq!(coordinated.lock().unwrap().len(), 2);
@@ -4944,10 +5221,13 @@ mod tests {
         let mut active = Some(SessionTransaction {
             txn: executor.begin_transaction(Isolation::Serializable),
             changes: Vec::new(),
+            changes_bytes: 0,
             schema_before: executor.schema_transaction_snapshot(),
             local_settings: HashMap::new(),
             notifications: Vec::new(),
+            notification_bytes: 0,
             listener_changes: Vec::new(),
+            listener_changes_bytes: 0,
             failed: false,
             savepoints: Vec::new(),
         });
@@ -4965,7 +5245,7 @@ mod tests {
             )
             .await
             .unwrap();
-        state.changes.extend(changes);
+        state.append_changes(changes).unwrap();
         handle_transaction_control(
             TransactionControl::RollbackToSavepoint(String::from("before_ddl")),
             &executor,
