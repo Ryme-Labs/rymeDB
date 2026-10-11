@@ -43,10 +43,16 @@ const PRESENCE_SHARDS: usize = 32;
 const STABLE_CDC_SEQUENCE_STRIDE: u64 = 1_000_000;
 const BROADCAST_BUFFER_CAPACITY: usize = 16_384;
 
-type BroadcastTopicShard = Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>;
+type BroadcastTopicShard = Mutex<HashMap<String, Arc<BroadcastTopic>>>;
 type PresenceTopicShard = Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>;
 type PresenceStateShard = Mutex<HashMap<String, HashMap<String, PresenceMember>>>;
 type DurableTopicShard = Mutex<HashMap<String, broadcast::Sender<DurableMsg>>>;
+
+#[derive(Debug)]
+struct BroadcastTopic {
+    sender: broadcast::Sender<BroadcastMsg>,
+    publish_lock: Mutex<()>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryUpdate {
@@ -784,7 +790,9 @@ impl Realtime {
             if let Ok(mut topics) = shard.lock() {
                 let idle_broadcast: Vec<String> = topics
                     .iter()
-                    .filter(|(_, sender)| sender.receiver_count() == 0)
+                    .filter(|(_, topic)| {
+                        topic.sender.receiver_count() == 0 && Arc::strong_count(topic) == 1
+                    })
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in idle_broadcast {
@@ -963,15 +971,12 @@ impl Realtime {
     ) -> Result<u64> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
-        let mut topics = self
-            .broadcast_topics
-            .get(shard)
-            .expect("broadcast shard")
+        let topic = self.broadcast_topic(shard, key)?;
+        let _publish = topic
+            .publish_lock
             .lock()
-            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+            .map_err(|_| RymeError::Internal(String::from("broadcast topic lock")))?;
         let sequence = self.next_sequence();
-        let sender =
-            topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
         let message = BroadcastMsg {
             channel: channel.to_string(),
             from,
@@ -981,7 +986,7 @@ impl Realtime {
             json_cache: Arc::new(OnceLock::new()),
             fanout_quota_pre_admitted: false,
         };
-        let _ = sender.send(message);
+        let _ = topic.sender.send(message);
         Ok(sequence)
     }
 
@@ -996,14 +1001,11 @@ impl Realtime {
     ) -> Result<u64> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
-        let mut topics = self
-            .broadcast_topics
-            .get(shard)
-            .expect("broadcast shard")
+        let topic = self.broadcast_topic(shard, key)?;
+        let _publish = topic
+            .publish_lock
             .lock()
-            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
-        let sender =
-            topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
+            .map_err(|_| RymeError::Internal(String::from("broadcast topic lock")))?;
         let sequence = self.next_sequence();
         let message = BroadcastMsg {
             channel: channel.to_string(),
@@ -1014,9 +1016,9 @@ impl Realtime {
             json_cache: Arc::new(OnceLock::new()),
             fanout_quota_pre_admitted: true,
         };
-        let receiver_count = sender.receiver_count();
+        let receiver_count = topic.sender.receiver_count();
         admit(receiver_count, message.json_len() as u64)?;
-        let _ = sender.send(message);
+        let _ = topic.sender.send(message);
         Ok(sequence)
     }
 
@@ -1031,15 +1033,12 @@ impl Realtime {
     ) -> Result<u64> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
-        let mut topics = self
-            .broadcast_topics
-            .get(shard)
-            .expect("broadcast shard")
+        let topic = self.broadcast_topic(shard, key)?;
+        let _publish = topic
+            .publish_lock
             .lock()
-            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+            .map_err(|_| RymeError::Internal(String::from("broadcast topic lock")))?;
         self.sequence.fetch_max(sequence, Ordering::Relaxed);
-        let sender =
-            topics.entry(key).or_insert_with(|| broadcast::channel(self.broadcast_capacity).0);
         let message = BroadcastMsg {
             channel: channel.to_string(),
             from,
@@ -1049,7 +1048,7 @@ impl Realtime {
             json_cache: Arc::new(OnceLock::new()),
             fanout_quota_pre_admitted: false,
         };
-        let _ = sender.send(message);
+        let _ = topic.sender.send(message);
         Ok(sequence)
     }
 
@@ -1060,15 +1059,29 @@ impl Realtime {
     ) -> broadcast::Receiver<BroadcastMsg> {
         let key = scope_key(tenant, channel);
         let shard = self.broadcast_shard(&key);
-        let Ok(mut topics) = self.broadcast_topics.get(shard).expect("broadcast shard").lock()
-        else {
+        let Ok(topic) = self.broadcast_topic(shard, key) else {
             let (_, receiver) = broadcast::channel(16);
             return receiver;
         };
-        topics
+        topic.sender.subscribe()
+    }
+
+    fn broadcast_topic(&self, shard: usize, key: String) -> Result<Arc<BroadcastTopic>> {
+        let mut topics = self
+            .broadcast_topics
+            .get(shard)
+            .ok_or_else(|| RymeError::Internal(String::from("broadcast shard")))?
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("broadcast lock")))?;
+        Ok(topics
             .entry(key)
-            .or_insert_with(|| broadcast::channel(self.broadcast_capacity).0)
-            .subscribe()
+            .or_insert_with(|| {
+                Arc::new(BroadcastTopic {
+                    sender: broadcast::channel(self.broadcast_capacity).0,
+                    publish_lock: Mutex::new(()),
+                })
+            })
+            .clone())
     }
 
     pub fn durable_append(
@@ -1694,6 +1707,58 @@ mod tests {
         );
         assert!(error.is_err());
         assert!(matches!(receiver.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn broadcast_admission_does_not_block_other_topics_in_the_same_shard() {
+        let realtime = Realtime::new(64);
+        let blocked_channel = "blocked";
+        let blocked_key = scope_key("t", blocked_channel);
+        let shard = realtime.broadcast_shard(&blocked_key);
+        let other_channel = (0..10_000)
+            .map(|index| format!("other-{index}"))
+            .find(|channel| realtime.broadcast_shard(&scope_key("t", channel)) == shard)
+            .expect("find a channel that hashes to the same shard");
+
+        let entered_admission = Arc::new(std::sync::Barrier::new(2));
+        let release_admission = Arc::new(std::sync::Barrier::new(2));
+        let publisher_realtime = realtime.clone();
+        let publisher_entered = entered_admission.clone();
+        let publisher_release = release_admission.clone();
+        let publisher = std::thread::spawn(move || {
+            publisher_realtime.broadcast_with_admission(
+                "t",
+                blocked_channel,
+                String::from("publisher"),
+                serde_json::Value::Null,
+                1,
+                |_, _| {
+                    publisher_entered.wait();
+                    publisher_release.wait();
+                    Ok(())
+                },
+            )
+        });
+        entered_admission.wait();
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let other_realtime = realtime.clone();
+        let other_publisher = std::thread::spawn(move || {
+            let result = other_realtime.broadcast(
+                "t",
+                &other_channel,
+                String::from("publisher"),
+                serde_json::Value::Null,
+                1,
+            );
+            result_tx.send(result).unwrap();
+        });
+        let other_result = result_rx.recv_timeout(std::time::Duration::from_secs(1));
+
+        release_admission.wait();
+        publisher.join().unwrap().unwrap();
+        other_publisher.join().unwrap();
+        assert!(other_result.expect("unrelated topic publish was blocked").is_ok());
     }
 
     #[test]
