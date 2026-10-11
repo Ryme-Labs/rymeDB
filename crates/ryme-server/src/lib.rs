@@ -3673,6 +3673,23 @@ fn rest_list_filtered(rows: Vec<(Vec<u8>, Vec<u8>)>, raw: &str) -> Vec<(Vec<u8>,
     filter_rows_by_query(rows, raw)
 }
 
+const REST_SCAN_PAGE_ROWS: usize = 16;
+const REST_MAX_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
+
+fn retain_rest_row(
+    rows: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    row: (Vec<u8>, Vec<u8>),
+    materialized_bytes: &mut usize,
+) -> ryme_error::Result<()> {
+    let row_bytes = row.0.len().saturating_add(row.1.len());
+    if row_bytes > REST_MAX_MATERIALIZED_BYTES.saturating_sub(*materialized_bytes) {
+        return Err(ryme_error::RymeError::Overload(String::from("result")));
+    }
+    *materialized_bytes += row_bytes;
+    rows.push(row);
+    Ok(())
+}
+
 fn rest_matching_keys(
     gateway: &Gateway<BranchStorage>,
     principal: &Principal,
@@ -3682,7 +3699,8 @@ fn rest_matching_keys(
     let mut cursor = None;
     let mut keys = Vec::new();
     loop {
-        let (page, next) = gateway.scan_page(principal, table, cursor.as_deref(), 256)?;
+        let (page, next) =
+            gateway.scan_page(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)?;
         let matches = rest_list_filtered(page, raw);
         if matches.len() > ryme_gateway::MAX_BATCH_ROWS.saturating_sub(keys.len()) {
             return Err(ryme_error::RymeError::Overload(String::from("rows")));
@@ -3703,7 +3721,8 @@ fn rest_conflict_key(
 ) -> ryme_error::Result<Option<Vec<u8>>> {
     let mut cursor = None;
     loop {
-        let (page, next) = gateway.scan_page(principal, table, cursor.as_deref(), 256)?;
+        let (page, next) =
+            gateway.scan_page(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)?;
         for (key, value) in page {
             let row = rest_row_to_json(&key, &value);
             if row.get(field) == Some(expected) {
@@ -3743,9 +3762,11 @@ async fn rest_list(
     let count_exact = rest_prefer(&headers, "count=exact");
     let target = limit.saturating_add(offset);
     let full_order_scan = rest_order_requires_full_scan(query.order.as_deref());
-    let page_limit = if full_order_scan { 256 } else { target.clamp(1, 1000) };
+    let page_limit = REST_SCAN_PAGE_ROWS;
     let mut cursor = None;
     let mut filtered = Vec::new();
+    let mut materialized_bytes = 0usize;
+    let mut total = 0usize;
     loop {
         let (page, next) = match gateway
             .scan_page_async(&principal, &table, cursor.as_deref(), page_limit)
@@ -3754,13 +3775,30 @@ async fn rest_list(
             Ok(page) => page,
             Err(e) => return error_response(e),
         };
-        filtered.extend(rest_list_filtered(page, raw));
+        let matches = rest_list_filtered(page, raw);
+        total = total.saturating_add(matches.len());
+        if full_order_scan {
+            for row in matches {
+                if let Err(e) = retain_rest_row(&mut filtered, row, &mut materialized_bytes) {
+                    return error_response(e);
+                }
+            }
+        } else {
+            let remaining = target.saturating_sub(filtered.len());
+            for row in matches.into_iter().take(remaining) {
+                if let Err(e) = retain_rest_row(&mut filtered, row, &mut materialized_bytes) {
+                    return error_response(e);
+                }
+            }
+        }
         if (!full_order_scan && !count_exact && filtered.len() >= target) || next.is_none() {
             break;
         }
         cursor = next;
     }
-    let total = filtered.len();
+    if !count_exact && !full_order_scan {
+        total = filtered.len();
+    }
     let ordered = order_rows(filtered, query.order.as_deref());
     let paged: Vec<(Vec<u8>, Vec<u8>)> = ordered.into_iter().skip(offset).take(limit).collect();
     let egress: u64 = paged.iter().map(|(pk, value)| (pk.len() + value.len()) as u64).sum();
