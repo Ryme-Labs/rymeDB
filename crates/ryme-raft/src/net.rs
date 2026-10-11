@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 const ELECTION_TIMEOUT_MIN_MS: u64 = 500;
 const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
 const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
 type RangeTableRows = BTreeMap<(String, String, String), Vec<(Vec<u8>, Vec<TableVersion>)>>;
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
@@ -1346,16 +1347,29 @@ impl Node {
     }
 
     pub fn spawn(self: &Arc<Self>, listener: TcpListener) -> Vec<tokio::task::JoinHandle<()>> {
+        self.spawn_limited(listener, DEFAULT_MAX_CONNECTIONS)
+    }
+
+    pub fn spawn_limited(
+        self: &Arc<Self>,
+        listener: TcpListener,
+        max_connections: usize,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let accept = self.clone();
         let connections = self.conn_tasks.clone();
+        let limit = Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
         let accept_task = tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
+                let Ok(permit) = limit.clone().try_acquire_owned() else {
+                    continue;
+                };
                 let _ = socket.set_nodelay(true);
                 let node = accept.clone();
                 let task = tokio::spawn(async move {
+                    let _permit = permit;
                     if let Some(transport) =
                         node.mesh_tls.lock().ok().and_then(|guard| guard.clone())
                     {
@@ -1367,7 +1381,9 @@ impl Node {
                     }
                     let _ = node.serve_connection(socket).await;
                 });
-                connections.lock().unwrap_or_else(|e| e.into_inner()).push(task);
+                let mut connections = connections.lock().unwrap_or_else(|e| e.into_inner());
+                connections.retain(|task| !task.is_finished());
+                connections.push(task);
             }
         });
         let main = self.clone();

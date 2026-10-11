@@ -2575,7 +2575,7 @@ pub async fn serve_cluster(
     install_cluster_presence_replication(&state, &node)?;
     install_cluster_topic_replication(&state, &node)?;
     node.replay_topics().await?;
-    let mut tasks = node.spawn(raft_listener);
+    let mut tasks = node.spawn_limited(raft_listener, config.max_connections as usize);
     tasks.extend(
         spawn_gateways(
             state,
