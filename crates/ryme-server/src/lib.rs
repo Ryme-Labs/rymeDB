@@ -9081,29 +9081,46 @@ struct BranchRowDiff {
     right: Option<String>,
 }
 
+const BRANCH_DIFF_MAX_ROWS: usize = 100_000;
+const BRANCH_DIFF_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 fn scan_branch_diff_rows<B: TxnBackend>(
     backend: &B,
     tenant: &str,
     database: &str,
     table: &str,
 ) -> ryme_error::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-    const PAGE: usize = 1024;
+    const PAGE: usize = 16;
     let mut rows = BTreeMap::new();
     let mut txn = backend.begin();
     let mut start_after = None;
+    let mut bytes = 0usize;
     loop {
+        let remaining = BRANCH_DIFF_MAX_ROWS + 1 - rows.len();
+        let limit = remaining.min(PAGE);
         let page = match start_after.as_deref() {
             Some(start_after) => {
-                backend.scan_after(&mut txn, tenant, database, table, start_after, PAGE)?
+                backend.scan_after(&mut txn, tenant, database, table, start_after, limit)?
             }
-            None => backend.scan(&mut txn, tenant, database, table, PAGE)?,
+            None => backend.scan(&mut txn, tenant, database, table, limit)?,
         };
+        if page.is_empty() {
+            break;
+        }
+        let page_bytes =
+            page.iter().map(|(pk, value)| pk.len().saturating_add(value.len())).sum::<usize>();
+        bytes = bytes.saturating_add(page_bytes);
+        if rows.len().saturating_add(page.len()) > BRANCH_DIFF_MAX_ROWS
+            || bytes > BRANCH_DIFF_MAX_BYTES
+        {
+            return Err(ryme_error::RymeError::Overload(String::from("branch diff")));
+        }
         let count = page.len();
         if let Some((last, _)) = page.last() {
             start_after = Some(last.clone());
         }
         rows.extend(page);
-        if count < PAGE {
+        if count < limit {
             break;
         }
     }
@@ -9154,6 +9171,7 @@ fn branch_diff_data(
     }
 
     let mut changes = Vec::new();
+    let mut change_bytes = 0usize;
     let left_executor = branch_executor_from_snapshot(
         state,
         state.executor.clone().with_tenant(tenant.to_string()),
@@ -9182,6 +9200,15 @@ fn branch_diff_data(
             let right_value = right_rows.get(&pk);
             if left_value == right_value {
                 continue;
+            }
+            let row_bytes = table
+                .len()
+                .saturating_add(pk.len())
+                .saturating_add(left_value.map_or(0, Vec::len))
+                .saturating_add(right_value.map_or(0, Vec::len));
+            change_bytes = change_bytes.saturating_add(row_bytes);
+            if changes.len() >= BRANCH_DIFF_MAX_ROWS || change_bytes > BRANCH_DIFF_MAX_BYTES {
+                return Err(ryme_error::RymeError::Overload(String::from("branch diff")));
             }
             changes.push(BranchRowDiff {
                 table: table.clone(),
