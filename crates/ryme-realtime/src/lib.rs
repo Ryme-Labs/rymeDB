@@ -347,10 +347,14 @@ impl Realtime {
             tx_id: event.tx_id,
             sequence,
         };
-        let sender =
-            topics.topics.entry(key.clone()).or_insert_with(|| broadcast::channel(self.capacity).0);
-        let _ = sender.send(record.clone());
-        let _ = self.changes.send(record.clone());
+        if let Some(sender) = topics.topics.get(&key) {
+            if sender.receiver_count() > 0 {
+                let _ = sender.send(record.clone());
+            }
+        }
+        if self.changes.receiver_count() > 0 {
+            let _ = self.changes.send(record.clone());
+        }
         let log = topics.history.entry(key).or_default();
         while log.len() >= self.capacity {
             log.pop_front();
