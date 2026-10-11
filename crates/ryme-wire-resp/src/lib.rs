@@ -24,6 +24,8 @@ const RESP_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RESP_SCRIPT_MAX_BYTES: usize = 1024 * 1024;
 const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
 const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const RESP_MAX_PUBSUB_SUBSCRIPTIONS: usize = 1024;
+const RESP_MAX_PUBSUB_NAME_BYTES: usize = 4 * 1024;
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
 type PubSubCounts = Arc<Mutex<std::collections::HashMap<PubSubKey, usize>>>;
@@ -676,6 +678,11 @@ where
         if channels.is_empty() {
             return encode_error(String::from("wrong args"));
         }
+        if let Some(error) =
+            validate_pubsub_subscriptions(&client.subscriptions, client.patterns.len(), channels)
+        {
+            return encode_error(error.to_string());
+        }
         let mut replies = Vec::with_capacity(channels.len());
         for channel in channels {
             if client.subscriptions.insert(channel.clone()) {
@@ -720,6 +727,11 @@ where
     fn psubscribe(&self, patterns: &[Vec<u8>], client: &mut ClientState) -> Vec<u8> {
         if patterns.is_empty() {
             return encode_error(String::from("wrong args"));
+        }
+        if let Some(error) =
+            validate_pubsub_subscriptions(&client.patterns, client.subscriptions.len(), patterns)
+        {
+            return encode_error(error.to_string());
         }
         let mut replies = Vec::with_capacity(patterns.len());
         for pattern in patterns {
@@ -5530,6 +5542,29 @@ fn subscription_count(client: &ClientState) -> usize {
     client.subscriptions.len().saturating_add(client.patterns.len())
 }
 
+fn validate_pubsub_subscriptions(
+    current: &std::collections::BTreeSet<Vec<u8>>,
+    other_count: usize,
+    requested: &[Vec<u8>],
+) -> Option<&'static str> {
+    let mut additions = std::collections::BTreeSet::new();
+    for name in requested {
+        if name.len() > RESP_MAX_PUBSUB_NAME_BYTES {
+            return Some("pubsub channel or pattern is too long");
+        }
+        if !current.contains(name) {
+            additions.insert(name.clone());
+        }
+    }
+    if current.len().saturating_add(other_count).saturating_add(additions.len())
+        > RESP_MAX_PUBSUB_SUBSCRIPTIONS
+    {
+        Some("pubsub subscription limit exceeded")
+    } else {
+        None
+    }
+}
+
 fn decode_command(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
     if input.is_empty() {
         return Ok(None);
@@ -6046,5 +6081,24 @@ mod tests {
             &(String::from("alpha"), String::from("new")),
             1
         ));
+    }
+
+    #[test]
+    fn pubsub_subscriptions_are_bounded_per_connection() {
+        let gateway = RespGateway::new(String::from("tenant"), String::from("database"));
+        let mut client = gateway.fresh_client();
+        let channels = (0..RESP_MAX_PUBSUB_SUBSCRIPTIONS)
+            .map(|index| format!("channel-{index}").into_bytes())
+            .collect::<Vec<_>>();
+        assert!(!gateway.subscribe(&channels, &mut client).starts_with(b"-ERR"));
+        assert_eq!(client.subscriptions.len(), RESP_MAX_PUBSUB_SUBSCRIPTIONS);
+        assert_eq!(
+            gateway.subscribe(&[b"one-more".to_vec()], &mut client),
+            b"-ERR pubsub subscription limit exceeded\r\n"
+        );
+        assert_eq!(
+            gateway.subscribe(&[vec![b'x'; RESP_MAX_PUBSUB_NAME_BYTES + 1]], &mut client),
+            b"-ERR pubsub channel or pattern is too long\r\n"
+        );
     }
 }
