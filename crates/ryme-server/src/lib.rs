@@ -6465,6 +6465,12 @@ async fn forward_durable_topic(
     let replayed = realtime.durable_read(tenant, partition, from, 1000);
     let (sender, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sender);
+    if let Some((oldest, _)) = realtime.durable_cursor_bounds(tenant, partition) {
+        if from < oldest {
+            queue_cursor_expired(&outgoing, "cursor", from, oldest);
+            return;
+        }
+    }
     let mut next_cursor = from;
     for message in &replayed {
         next_cursor = next_cursor.max(message.cursor.saturating_add(1));
@@ -6498,6 +6504,9 @@ async fn forward_durable_topic(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let recovered = realtime.durable_read(tenant, partition, next_cursor, 1000);
                         if recovered.first().map(|message| message.cursor > next_cursor).unwrap_or(false) {
+                            if let Some((oldest, _)) = realtime.durable_cursor_bounds(tenant, partition) {
+                                queue_cursor_expired(&outgoing, "cursor", next_cursor, oldest);
+                            }
                             break;
                         }
                         for message in recovered {
@@ -9408,6 +9417,23 @@ fn queue_realtime_message(
     outgoing.try_send(message).is_ok()
 }
 
+fn queue_cursor_expired(
+    outgoing: &RealtimeOutgoing,
+    cursor: &str,
+    requested: u64,
+    oldest: u64,
+) -> bool {
+    let text = serde_json::json!({
+        "type": "error",
+        "error": "cursor_expired",
+        "cursor": cursor,
+        "requested": requested,
+        "oldest": oldest,
+    })
+    .to_string();
+    queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+}
+
 async fn send_realtime_message_with_sink(
     sender: &mut RealtimeSink,
     message: axum::extract::ws::Message,
@@ -9452,6 +9478,22 @@ async fn forward_changes(
     let mut seen_sequence = from_sequence.unwrap_or(0);
     let (sender, mut incoming) = socket.split();
     let outgoing = start_realtime_writer(sender);
+    if let Some(sequence) = from_sequence {
+        if let Some((oldest, _)) = realtime.change_sequence_bounds(tenant, database, branch, table)
+        {
+            if sequence.saturating_add(1) < oldest {
+                queue_cursor_expired(&outgoing, "sequence", sequence, oldest);
+                return;
+            }
+        }
+    } else if from != u64::MAX {
+        if let Some((oldest, _)) = realtime.change_commit_bounds(tenant, database, branch, table) {
+            if from < oldest.saturating_sub(1) {
+                queue_cursor_expired(&outgoing, "commit", from, oldest);
+                return;
+            }
+        }
+    }
     for record in &replayed {
         seen_sequence = seen_sequence.max(record.sequence);
         if !realtime_change_allowed_by_executor(&rls_executor, tenant, branch, record) {
@@ -9516,6 +9558,11 @@ async fn forward_changes(
                         // every skipped topic event, close instead of silently
                         // delivering a permanently incomplete change stream.
                         if recovered.len() < skipped as usize {
+                            if let Some((oldest, _)) =
+                                realtime.change_sequence_bounds(tenant, database, branch, table)
+                            {
+                                queue_cursor_expired(&outgoing, "sequence", seen_sequence, oldest);
+                            }
                             break;
                         }
                         for record in recovered {

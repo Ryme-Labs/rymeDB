@@ -409,6 +409,41 @@ impl Realtime {
         log.iter().filter(|record| record.sequence > after_sequence).take(limit).cloned().collect()
     }
 
+    /// Return the oldest and newest retained sequence for a table topic.
+    /// Consumers can use this to distinguish an empty replay from a cursor
+    /// that has fallen out of the bounded history ring.
+    pub fn change_sequence_bounds(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+    ) -> Option<(u64, u64)> {
+        let key = branch_topic_key(tenant, database, branch, table);
+        let shard = self.table_topic_shard(&key);
+        self.table_topics.get(shard).and_then(|topics| topics.lock().ok()).and_then(|topics| {
+            let history = topics.history.get(&key)?;
+            Some((history.front()?.sequence, history.back()?.sequence))
+        })
+    }
+
+    /// Return the oldest and newest retained commit timestamp for a table
+    /// topic. This is useful for validating the legacy commit watermark.
+    pub fn change_commit_bounds(
+        &self,
+        tenant: &str,
+        database: &str,
+        branch: &str,
+        table: &str,
+    ) -> Option<(u64, u64)> {
+        let key = branch_topic_key(tenant, database, branch, table);
+        let shard = self.table_topic_shard(&key);
+        self.table_topics.get(shard).and_then(|topics| topics.lock().ok()).and_then(|topics| {
+            let history = topics.history.get(&key)?;
+            Some((history.front()?.commit_ts, history.back()?.commit_ts))
+        })
+    }
+
     pub fn latest_change_commit_branch(
         &self,
         tenant: &str,
@@ -1066,6 +1101,15 @@ impl Realtime {
             .unwrap_or(0)
     }
 
+    /// Return the oldest and newest retained cursor for a durable partition.
+    pub fn durable_cursor_bounds(&self, tenant: &str, partition: &str) -> Option<(u64, u64)> {
+        self.inner.lock().ok().and_then(|inner| {
+            inner.durable.get(&durable_key(tenant, partition)).and_then(|topic| {
+                Some((topic.messages.front()?.cursor, topic.messages.back()?.cursor))
+            })
+        })
+    }
+
     pub fn durable_snapshot(&self) -> Result<Vec<DurableTopicSnapshot>> {
         let inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
@@ -1180,6 +1224,8 @@ mod tests {
         let by_sequence = realtime.replay_after_sequence("t", "d", "docs", all[0].sequence, 10);
         assert_eq!(by_sequence.len(), 2);
         assert_eq!(by_sequence[0].commit_ts, 20);
+        assert_eq!(realtime.change_sequence_bounds("t", "d", "main", "docs"), Some((1, 3)));
+        assert_eq!(realtime.change_commit_bounds("t", "d", "main", "docs"), Some((10, 30)));
     }
 
     #[test]
@@ -1507,6 +1553,7 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(live.try_recv().unwrap().cursor, first);
         assert_eq!(live.try_recv().unwrap().cursor, second);
+        assert_eq!(realtime.durable_cursor_bounds("t", "orders"), Some((first, second)));
     }
 
     #[test]
@@ -1520,6 +1567,41 @@ mod tests {
         let messages = restored.durable_read("tenant", "orders", 0, 10);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].key, b"k");
+    }
+
+    #[test]
+    fn retained_cursor_bounds_expose_expired_replays() {
+        let realtime = Realtime::new(16);
+        for cursor in 0..20u64 {
+            realtime
+                .publish(NewChange {
+                    tenant: String::from("t"),
+                    database: String::from("d"),
+                    branch: String::from("main"),
+                    table: String::from("docs"),
+                    op: Operation::Insert,
+                    pk: cursor.to_be_bytes().to_vec(),
+                    before: None,
+                    after: None,
+                    commit_ts: cursor + 1,
+                    tx_id: cursor + 1,
+                })
+                .unwrap();
+            realtime
+                .durable_append(
+                    "t",
+                    "orders",
+                    cursor.to_be_bytes().to_vec(),
+                    b"value".to_vec(),
+                    cursor + 1,
+                    16,
+                )
+                .unwrap();
+        }
+        assert_eq!(realtime.change_sequence_bounds("t", "d", "main", "docs"), Some((5, 20)));
+        assert_eq!(realtime.durable_cursor_bounds("t", "orders"), Some((4, 19)));
+        assert_eq!(realtime.replay_after_sequence("t", "d", "docs", 0, 100)[0].sequence, 5);
+        assert_eq!(realtime.durable_read("t", "orders", 0, 100)[0].cursor, 4);
     }
 
     #[test]

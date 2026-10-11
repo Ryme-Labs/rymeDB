@@ -1,5 +1,9 @@
 # Changelog
 
+- Realtime table and durable-topic streams now validate reconnect cursors
+  against retained history and return an explicit `cursor_expired` frame before
+  closing when a replay would be incomplete. The SQL foreign-key cascade
+  futures are also `Send`, keeping native and gRPC gateway tasks spawnable.
 - Distributed transaction resolution records now replicate through the global
   Raft log. Every member rebuilds pending participant-resolution work from
   committed entries after restart, while the local resolution WAL keeps the

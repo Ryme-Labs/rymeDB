@@ -8271,7 +8271,7 @@ where
         value: &'a [u8],
         changes: &'a mut Vec<TransactionChange>,
         visited: &'a mut BTreeSet<(String, Vec<u8>)>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
             if !visited.insert((table.clone(), pk.to_vec())) {
@@ -8413,7 +8413,7 @@ where
         after: &'a [u8],
         changes: &'a mut Vec<TransactionChange>,
         visited: &'a mut BTreeSet<(String, Vec<u8>)>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let table = self.canonical_table_name(table).unwrap_or_else(|| table.to_string());
             let identity = (table.clone(), pk.to_vec());

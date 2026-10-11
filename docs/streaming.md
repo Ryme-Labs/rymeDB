@@ -51,6 +51,12 @@ administrative role). Each frame is a `ChangeRecord`
   Server-backed streams use a deterministic commit-derived sequence, so the
   same committed write has the same cursor on every gateway in a cluster;
   reconnecting through another gateway does not change the watermark.
+- If a requested commit or sequence cursor has fallen out of the retained
+  topic ring, the server sends one error frame such as
+  `{"type":"error","error":"cursor_expired","cursor":"sequence","requested":1,"oldest":42}`
+  and closes the socket. Resynchronize from a current snapshot, then reconnect
+  without the expired cursor; the server never silently presents an incomplete
+  replay.
 - Streams default to the `main` branch. Set `?branch=<id>` for browser
   WebSocket clients, or send `X-Ryme-Branch: <id>` from clients that can set
   headers. The query parameter and header must agree when both are present.
@@ -270,8 +276,9 @@ to prevent an unbounded restart snapshot.
 It replays retained messages at or after `from`, then follows new committed
 appends. The same cursor is emitted in every frame, and the connection uses
 the standard heartbeat, QoS accounting, bounded outgoing queue, and lag
-recovery behavior; a cursor gap outside retention closes the stream so a
-client cannot silently lose messages.
+recovery behavior. If `from` is older than the retained cursor window, the
+server sends a `cursor_expired` error frame with the oldest available cursor
+and closes the stream so a client cannot silently lose messages.
 
 In cluster mode, appends are accepted only by the current Raft leader and are
 committed through the durable Raft log before the cursor is returned. Every
