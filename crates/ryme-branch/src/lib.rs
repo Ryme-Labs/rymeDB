@@ -36,6 +36,16 @@ pub struct Manifest {
     pub wal_start: u64,
 }
 
+pub const MAX_BRANCHES_PER_TENANT: usize = 1_024;
+pub const MAX_BRANCHES: usize = 100_000;
+pub const MAX_BRANCH_ID_BYTES: usize = 128;
+pub const MAX_TENANT_BYTES: usize = 256;
+pub const MAX_MANIFESTS: usize = 100_000;
+pub const MAX_MANIFEST_ID_BYTES: usize = 256;
+pub const MAX_MANIFEST_SEGMENTS: usize = 100_000;
+pub const MAX_SEGMENT_ID_BYTES: usize = 512;
+pub const MAX_BRANCH_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BranchManager {
     branches: HashMap<String, Branch>,
@@ -51,11 +61,19 @@ impl BranchManager {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.len() > MAX_BRANCH_METADATA_BYTES as u64 {
+                return Err(RymeError::Overload(String::from("branch metadata")));
+            }
+        }
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
             Err(error) => return Err(error.into()),
         };
+        if bytes.len() > MAX_BRANCH_METADATA_BYTES {
+            return Err(RymeError::Overload(String::from("branch metadata")));
+        }
         let mut manager: Self = serde_json::from_slice(&bytes)
             .map_err(|error| RymeError::Corrupt(format!("branch metadata: {error}")))?;
         let mut normalized = HashMap::with_capacity(manager.branches.len());
@@ -89,6 +107,9 @@ impl BranchManager {
         }
         let bytes = serde_json::to_vec(self)
             .map_err(|error| RymeError::Internal(format!("branch metadata: {error}")))?;
+        if bytes.len() > MAX_BRANCH_METADATA_BYTES {
+            return Err(RymeError::Overload(String::from("branch metadata")));
+        }
         let temporary = path.with_extension("tmp");
         {
             use std::io::Write;
@@ -126,15 +147,42 @@ impl BranchManager {
     }
 
     fn validate_branches(&self) -> Result<()> {
+        if self.branches.len() > MAX_BRANCHES || self.manifests.len() > MAX_MANIFESTS {
+            return Err(RymeError::Corrupt(String::from("branch metadata capacity")));
+        }
+        let mut tenant_counts = HashMap::new();
+        for (manifest_id, manifest) in &self.manifests {
+            if manifest_id != &manifest.id
+                || manifest.id.is_empty()
+                || manifest.id.len() > MAX_MANIFEST_ID_BYTES
+                || manifest.id.contains('\0')
+                || manifest.segments.len() > MAX_MANIFEST_SEGMENTS
+                || manifest.segments.iter().any(|segment| {
+                    segment.is_empty()
+                        || segment.len() > MAX_SEGMENT_ID_BYTES
+                        || segment.contains('\0')
+                })
+            {
+                return Err(RymeError::Corrupt(String::from("branch manifest")));
+            }
+        }
         for (key, branch) in &self.branches {
+            let count = tenant_counts.entry(branch.tenant.as_str()).or_insert(0usize);
+            *count += 1;
             if key != &scoped_key(&branch.tenant, &branch.id)
                 || branch.id.is_empty()
-                || branch.id.len() > 128
+                || branch.id.len() > MAX_BRANCH_ID_BYTES
                 || branch.id.contains('/')
                 || branch.id.contains("..")
                 || branch.id.contains('\0')
+                || branch.tenant.is_empty()
+                || branch.tenant.len() > MAX_TENANT_BYTES
+                || branch.tenant.contains('\0')
             {
                 return Err(RymeError::Corrupt(String::from("branch identity")));
+            }
+            if *count > MAX_BRANCHES_PER_TENANT {
+                return Err(RymeError::Corrupt(String::from("branch tenant capacity")));
             }
             if !self.manifests.contains_key(&branch.manifest_id) {
                 return Err(RymeError::Corrupt(String::from("branch manifest")));
@@ -144,6 +192,47 @@ impl BranchManager {
                     return Err(RymeError::Corrupt(String::from("branch parent")));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_new_identity(tenant: &str, id: &str) -> Result<()> {
+        if tenant.is_empty() || tenant.len() > MAX_TENANT_BYTES || tenant.contains('\0') {
+            return Err(RymeError::InvalidArgument(String::from("tenant")));
+        }
+        if id.is_empty()
+            || id.len() > MAX_BRANCH_ID_BYTES
+            || id.contains('/')
+            || id.contains("..")
+            || id.contains('\0')
+        {
+            return Err(RymeError::InvalidArgument(String::from("branch")));
+        }
+        Ok(())
+    }
+
+    fn validate_manifest_input(manifest: &Manifest) -> Result<()> {
+        if manifest.id.is_empty()
+            || manifest.id.len() > MAX_MANIFEST_ID_BYTES
+            || manifest.id.contains('\0')
+            || manifest.segments.len() > MAX_MANIFEST_SEGMENTS
+            || manifest.segments.iter().any(|segment| {
+                segment.is_empty() || segment.len() > MAX_SEGMENT_ID_BYTES || segment.contains('\0')
+            })
+        {
+            return Err(RymeError::InvalidArgument(String::from("manifest")));
+        }
+        Ok(())
+    }
+
+    fn ensure_branch_capacity(&self, tenant: &str) -> Result<()> {
+        if self.branches.len() >= MAX_BRANCHES {
+            return Err(RymeError::Overload(String::from("branches")));
+        }
+        if self.branches.values().filter(|branch| branch.tenant == tenant).count()
+            >= MAX_BRANCHES_PER_TENANT
+        {
+            return Err(RymeError::Overload(String::from("tenant branches")));
         }
         Ok(())
     }
@@ -162,17 +251,15 @@ impl BranchManager {
     }
 
     pub fn create_root_for(&mut self, tenant: &str, id: String, manifest: Manifest) -> Result<()> {
-        if id.is_empty()
-            || id.len() > 128
-            || id.contains('/')
-            || id.contains("..")
-            || id.contains('\0')
-        {
-            return Err(RymeError::InvalidArgument(String::from("branch")));
-        }
+        Self::validate_new_identity(tenant, &id)?;
+        Self::validate_manifest_input(&manifest)?;
         let key = scoped_key(tenant, &id);
         if self.branches.contains_key(&key) {
             return Err(RymeError::Conflict(String::from("branch")));
+        }
+        self.ensure_branch_capacity(tenant)?;
+        if self.manifests.contains_key(&manifest.id) {
+            return Err(RymeError::Conflict(String::from("manifest")));
         }
         self.refs.insert(manifest.id.clone(), 1);
         self.manifests.insert(manifest.id.clone(), manifest.clone());
@@ -202,14 +289,7 @@ impl BranchManager {
         parent: &str,
         base_commit_ts: u64,
     ) -> Result<()> {
-        if id.is_empty()
-            || id.len() > 128
-            || id.contains('/')
-            || id.contains("..")
-            || id.contains('\0')
-        {
-            return Err(RymeError::InvalidArgument(String::from("branch")));
-        }
+        Self::validate_new_identity(tenant, &id)?;
         let key = scoped_key(tenant, &id);
         if self.branches.contains_key(&key) {
             return Err(RymeError::Conflict(String::from("branch")));
@@ -222,6 +302,7 @@ impl BranchManager {
         if parent_branch.parent_id.is_some() {
             return Err(RymeError::InvalidArgument(String::from("nested branch parent")));
         }
+        self.ensure_branch_capacity(tenant)?;
         let storage_epoch = self.allocate_storage_epoch()?;
         let manifest_id = parent_branch.manifest_id.clone();
         *self.refs.entry(manifest_id.clone()).or_insert(0) += 1;
@@ -1015,10 +1096,40 @@ mod tests {
     fn child_rejects_bad_ids() {
         let mut manager = root_manager();
         assert!(manager.create_child(String::new(), "main", 1).is_err());
-        assert!(manager.create_child("a".repeat(129), "main", 1).is_err());
+        assert!(manager.create_child("a".repeat(MAX_BRANCH_ID_BYTES + 1), "main", 1).is_err());
         assert!(manager.create_child(String::from("a/b"), "main", 1).is_err());
         assert!(manager.create_child(String::from("a..b"), "main", 1).is_err());
-        assert!(manager.create_child("a".repeat(128), "main", 1).is_ok());
+        assert!(manager.create_child("a".repeat(MAX_BRANCH_ID_BYTES), "main", 1).is_ok());
+    }
+
+    #[test]
+    fn branch_capacity_is_bounded_and_reclaimed_on_delete() {
+        let mut manager = root_manager();
+        for index in 0..MAX_BRANCHES_PER_TENANT - 1 {
+            manager.create_child(format!("preview-{index}"), "main", index as u64).unwrap();
+        }
+        assert!(matches!(
+            manager.create_child(String::from("full"), "main", 0),
+            Err(RymeError::Overload(message)) if message == "tenant branches"
+        ));
+        assert_eq!(manager.get("main").unwrap().id, "main");
+        manager.delete("preview-0").unwrap();
+        manager.create_child(String::from("replacement"), "main", 0).unwrap();
+    }
+
+    #[test]
+    fn root_rejects_duplicate_manifest_ids_without_mutating_state() {
+        let mut manager = root_manager();
+        let before: Vec<String> = manager.list().into_iter().map(|branch| branch.id).collect();
+        assert!(matches!(
+            manager.create_root(
+                String::from("other"),
+                Manifest { id: String::from("genesis"), segments: Vec::new(), wal_start: 0 },
+            ),
+            Err(RymeError::Conflict(message)) if message == "manifest"
+        ));
+        let after: Vec<String> = manager.list().into_iter().map(|branch| branch.id).collect();
+        assert_eq!(after, before);
     }
 
     #[test]
