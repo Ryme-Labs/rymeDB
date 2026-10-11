@@ -6343,10 +6343,10 @@ async fn forward_broadcast(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if !queue_realtime_message(
+                if !queue_realtime_message_wait(
                     &outgoing,
                     axum::extract::ws::Message::Ping(Vec::new()),
-                ) {
+                ).await {
                     break;
                 }
             }
@@ -6357,10 +6357,10 @@ async fn forward_broadcast(
                         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
                             break;
                         }
-                        if !queue_realtime_message(
+                        if !queue_realtime_message_wait(
                             &outgoing,
                             axum::extract::ws::Message::Text(text),
-                        ) {
+                        ).await {
                             break;
                         }
                     }
@@ -6372,10 +6372,10 @@ async fn forward_broadcast(
                 match next {
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
                     Some(Ok(axum::extract::ws::Message::Ping(payload))) => {
-                        if !queue_realtime_message(
+                        if !queue_realtime_message_wait(
                             &outgoing,
                             axum::extract::ws::Message::Pong(payload),
-                        ) {
+                        ).await {
                             break;
                         }
                     }
@@ -9635,6 +9635,13 @@ fn queue_realtime_message(
     outgoing.try_send(message).is_ok()
 }
 
+async fn queue_realtime_message_wait(
+    outgoing: &RealtimeOutgoing,
+    message: axum::extract::ws::Message,
+) -> bool {
+    matches!(tokio::time::timeout(REALTIME_SEND_TIMEOUT, outgoing.send(message)).await, Ok(Ok(())))
+}
+
 fn queue_cursor_expired(
     outgoing: &RealtimeOutgoing,
     cursor: &str,
@@ -11123,6 +11130,20 @@ mod realtime_policy_tests {
         assert!(!queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
 
         assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));
+    }
+
+    #[tokio::test]
+    async fn realtime_broadcast_waits_for_a_temporarily_full_queue() {
+        let (outgoing, mut queued) = tokio::sync::mpsc::channel(1);
+        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
+
+        let sender = outgoing.clone();
+        let pending = tokio::spawn(async move {
+            queue_realtime_message_wait(&sender, axum::extract::ws::Message::Ping(vec![])).await
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));
+        assert!(pending.await.unwrap());
     }
 
     #[test]

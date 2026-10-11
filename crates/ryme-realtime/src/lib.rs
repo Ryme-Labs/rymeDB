@@ -41,6 +41,7 @@ const BROADCAST_SHARDS: usize = 32;
 const TABLE_TOPIC_SHARDS: usize = 32;
 const PRESENCE_SHARDS: usize = 32;
 const STABLE_CDC_SEQUENCE_STRIDE: u64 = 1_000_000;
+const BROADCAST_BUFFER_CAPACITY: usize = 16_384;
 
 type BroadcastTopicShard = Mutex<HashMap<String, broadcast::Sender<BroadcastMsg>>>;
 type PresenceTopicShard = Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>;
@@ -182,7 +183,7 @@ impl Realtime {
             durable_topics: Arc::new(
                 (0..BROADCAST_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             ),
-            broadcast_capacity: capacity,
+            broadcast_capacity: capacity.max(BROADCAST_BUFFER_CAPACITY),
             capacity,
             sequence: Arc::new(AtomicU64::new(0)),
             presence_sequence: Arc::new(AtomicU64::new(0)),
