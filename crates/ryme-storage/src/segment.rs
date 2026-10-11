@@ -1,5 +1,6 @@
 use super::{Engine, RecordKey};
 use ryme_error::{Result, RymeError};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -627,17 +628,26 @@ impl SegmentStore {
         let mut selected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         for path in self.newest_paths()? {
             let segment = self.read_segment(&path)?;
+            let scope_start = segment
+                .keys
+                .partition_point(|key| scope_order(key, tenant, database, table) == Ordering::Less);
+            let scope_end = segment.keys[scope_start..].partition_point(|key| {
+                scope_order(key, tenant, database, table) != Ordering::Greater
+            }) + scope_start;
+            let scan_start = start_after
+                .map(|after| {
+                    segment.keys[scope_start..scope_end]
+                        .partition_point(|key| key.pk.as_slice() <= after)
+                        + scope_start
+                })
+                .unwrap_or(scope_start);
             // `keys` is the segment's already-sorted key directory. Reusing
             // it avoids cloning every key into a temporary Vec on every scan.
             // The key is known to be present in this segment, so going
             // directly to the engine also avoids repeating the bloom filter
             // and binary-search checks performed by the public lookup path.
-            for key in &segment.keys {
-                if key.tenant != tenant
-                    || key.database != database
-                    || key.table != table
-                    || selected.contains_key(&key.pk)
-                {
+            for key in &segment.keys[scan_start..scope_end] {
+                if selected.contains_key(&key.pk) {
                     continue;
                 }
                 let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts) else {
@@ -794,6 +804,14 @@ fn discover_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
         parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
     });
     Ok(paths)
+}
+
+fn scope_order(key: &RecordKey, tenant: &str, database: &str, table: &str) -> Ordering {
+    key.tenant
+        .as_str()
+        .cmp(tenant)
+        .then_with(|| key.database.as_str().cmp(database))
+        .then_with(|| key.table.as_str().cmp(table))
 }
 
 fn segment_name(id: u64) -> String {
@@ -1077,6 +1095,38 @@ mod tests {
         assert_eq!(store.get(&first, 11, 0).unwrap(), Some(b"one".to_vec()));
         assert_eq!(store.get(&first, 12, 0).unwrap(), None);
         assert_eq!(store.get(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_store_scans_only_the_requested_scope_and_cursor() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let mut engine = Engine::new();
+        for (key, value) in [
+            (RecordKey::new("other", "db", "items", b"a"), b"other-tenant".to_vec()),
+            (RecordKey::new("tenant", "db", "before", b"a"), b"other-table".to_vec()),
+            (RecordKey::new("tenant", "db", "items", b"a"), b"one".to_vec()),
+            (RecordKey::new("tenant", "db", "items", b"b"), b"two".to_vec()),
+            (RecordKey::new("tenant", "db", "later", b"a"), b"later-table".to_vec()),
+        ] {
+            engine.apply(key, 10, Some(value)).unwrap();
+        }
+        store.write(10, &engine).unwrap();
+
+        assert_eq!(
+            store.scan("tenant", "db", "items", 10, 0, 10).unwrap(),
+            vec![(b"a".to_vec(), b"one".to_vec()), (b"b".to_vec(), b"two".to_vec())]
+        );
+        assert_eq!(
+            store.scan_after("tenant", "db", "items", 10, 0, b"a", 10).unwrap(),
+            vec![(b"b".to_vec(), b"two".to_vec())]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
