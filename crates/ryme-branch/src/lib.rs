@@ -515,6 +515,23 @@ where
         Ok(rows)
     }
 
+    async fn overlay_rows_async(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        table: &str,
+    ) -> Result<BTreeMap<Vec<u8>, Option<Vec<u8>>>> {
+        let mut rows = BTreeMap::new();
+        let local_rows =
+            self.scan_all_async(txn, tenant, &self.branch_database, table, usize::MAX).await?;
+        for (pk, value) in local_rows {
+            if let Some(decoded) = Self::decode(&value) {
+                rows.insert(pk, decoded);
+            }
+        }
+        Ok(rows)
+    }
+
     fn scan_all(
         &self,
         txn: &mut ryme_txn::Transaction,
@@ -561,6 +578,64 @@ where
             let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
             let next_limit = (limit - rows.len()).min(PAGE);
             let next = self.base.scan_after(txn, tenant, database, table, &last, next_limit)?;
+            if next.is_empty() {
+                break;
+            }
+            rows.extend(next);
+        }
+        Ok(rows)
+    }
+
+    async fn scan_all_async(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        const PAGE: usize = 1024;
+        let page_limit = limit.min(PAGE);
+        let mut rows = self.base.scan_async(txn, tenant, database, table, page_limit).await?;
+        while rows.len() < limit && rows.len() >= page_limit && !rows.is_empty() {
+            let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
+            let next_limit = (limit - rows.len()).min(PAGE);
+            let next =
+                self.base.scan_after_async(txn, tenant, database, table, &last, next_limit).await?;
+            if next.is_empty() {
+                break;
+            }
+            rows.extend(next);
+        }
+        Ok(rows)
+    }
+
+    async fn scan_all_after_async(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start_after: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        const PAGE: usize = 1024;
+        let page_limit = limit.min(PAGE);
+        let mut rows = self
+            .base
+            .scan_after_async(txn, tenant, database, table, start_after, page_limit)
+            .await?;
+        while rows.len() < limit && rows.len() >= page_limit && !rows.is_empty() {
+            let Some(last) = rows.last().map(|(pk, _)| pk.clone()) else { break };
+            let next_limit = (limit - rows.len()).min(PAGE);
+            let next =
+                self.base.scan_after_async(txn, tenant, database, table, &last, next_limit).await?;
             if next.is_empty() {
                 break;
             }
@@ -625,6 +700,96 @@ where
             let mut parent_txn = base.begin();
             parent_txn.restamp(base_commit_ts);
             base.get_async(&mut parent_txn, key).await
+        })
+    }
+
+    fn scan_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+    > {
+        if !self.overlay {
+            return self.base.scan_async(txn, tenant, database, table, limit);
+        }
+        let base_commit_ts = self.base_commit_ts;
+        Box::pin(async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let overlay_rows = self.overlay_rows_async(txn, tenant, table).await?;
+            let parent_limit = limit.saturating_add(overlay_rows.len());
+            let mut parent_txn = self.base.begin();
+            parent_txn.restamp(base_commit_ts);
+            let parent =
+                self.scan_all_async(&mut parent_txn, tenant, database, table, parent_limit).await?;
+            let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = parent.into_iter().collect();
+            for (pk, value) in overlay_rows {
+                match value {
+                    Some(value) => {
+                        merged.insert(pk, value);
+                    }
+                    None => {
+                        merged.remove(&pk);
+                    }
+                }
+            }
+            Ok(merged.into_iter().take(limit).collect())
+        })
+    }
+
+    fn scan_after_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+        start_after: &'a [u8],
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<(Vec<u8>, Vec<u8>)>>> + Send + 'a>,
+    > {
+        if !self.overlay {
+            return self.base.scan_after_async(txn, tenant, database, table, start_after, limit);
+        }
+        let base_commit_ts = self.base_commit_ts;
+        Box::pin(async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let overlay_rows = self.overlay_rows_async(txn, tenant, table).await?;
+            let parent_limit = limit.saturating_add(overlay_rows.len());
+            let mut parent_txn = self.base.begin();
+            parent_txn.restamp(base_commit_ts);
+            let parent = self
+                .scan_all_after_async(
+                    &mut parent_txn,
+                    tenant,
+                    database,
+                    table,
+                    start_after,
+                    parent_limit,
+                )
+                .await?;
+            let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = parent.into_iter().collect();
+            for (pk, value) in overlay_rows {
+                if pk.as_slice() <= start_after {
+                    continue;
+                }
+                match value {
+                    Some(value) => {
+                        merged.insert(pk, value);
+                    }
+                    None => {
+                        merged.remove(&pk);
+                    }
+                }
+            }
+            Ok(merged.into_iter().take(limit).collect())
         })
     }
 
@@ -1017,6 +1182,8 @@ mod tests {
         );
         let mut branch_txn = branch.begin();
         branch.put(&mut branch_txn, parent_key.clone(), b"from-branch".to_vec());
+        let child_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"child");
+        branch.put(&mut branch_txn, child_key, b"from-child".to_vec());
         base.commit(branch_txn).unwrap();
 
         let mut reader = branch.begin();
@@ -1026,6 +1193,18 @@ mod tests {
         );
         let missing_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"missing");
         assert_eq!(branch.get_async(&mut reader, &missing_key).await.unwrap(), None);
+        assert_eq!(
+            branch.scan_async(&mut reader, "tenant", "default", "docs", 10).await.unwrap(),
+            vec![
+                (b"child".to_vec(), b"from-child".to_vec()),
+                (b"parent".to_vec(), b"from-branch".to_vec()),
+            ]
+        );
+        assert!(branch
+            .scan_after_async(&mut reader, "tenant", "default", "docs", b"parent", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
