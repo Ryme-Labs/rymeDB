@@ -248,9 +248,8 @@ remain separate operational work. Single-owner write-only transactions now
 route directly to the current range leader, replicate through that range's
 quorum log, validate/apply locally,
 and then advance the range commit index. Read-dependent, multi-owner, and
-write-only multi-owner transactions use the current global log for atomic
-forwarding. This is not yet independent per-range Raft 2PC, and read-dependent cross-range
-transaction routing remains separate work. Transactions that include a read
+write-only multi-owner transactions use the current range leaders for atomic
+forwarding. Transactions that include a read
 set now forward their snapshot and OCC metadata to the current leader, so a
 follower-started transaction can be validated against intervening commits.
 Direct range commits carry a publication marker in the range WAL. Once the
@@ -260,25 +259,29 @@ of a global-log commit do not carry the marker, preventing duplicate realtime
 events.
 Multi-owner transactions now run an explicit prepare phase at each configured
 range owner. Each participant appends its prepare record through that range
-group's quorum log before the coordinator appends the global Raft data decision.
-Commit/abort resolution is also a committed range record, and unresolved
-records are recovered from the range WAL on participant restart.
+group's quorum log before the coordinator appends a durable decision to its
+own range quorum. Commit/abort resolution is also a committed range record,
+and unresolved records are recovered from the range WAL on participant
+restart. A committed resolution applies only that participant's prepared
+write set, so each range materializes its own portion of the transaction.
 Prepared intents also reserve their conflict set: ordinary local or
 range-local commits that overlap a prepared transaction are rejected until the
 coordinator resolves it. This prevents a fast path from bypassing the
 distributed prepare phase.
 The coordinator also records each participant's commit or abort resolution in
 a separate WAL and retries unacknowledged resolutions from its main loop after
-restart. The same pending resolution is published as a committed global Raft
-record, so every member can rebuild and retry participant work after coordinator
-loss or restart. A lost resolution RPC therefore leaves recoverable work rather
-than an intent that can block the participant forever.
+restart. The coordinator's committed range decision also rebuilds the
+participant list after coordinator restart, so a lost resolution RPC leaves
+recoverable work rather than an intent that can block the participant forever.
 Prepare and resolve retries refresh the range leader from the current placement
 map, so a range election between transaction phases does not keep targeting the
 original owner.
-The global Raft log is still the decision authority, so this is a replicated
-resolution protocol, not yet an independent per-range transaction coordinator
-or fully independent per-range Raft 2PC decision path.
+The global Raft log is no longer the decision authority for multi-owner range
+transactions; it remains the control-plane log for membership and metadata.
+The per-range decision record is replicated before the commit result is
+returned, and participant materialization can finish asynchronously after a
+leader loss or restart. Transactions without active range ownership continue
+to use the global data log.
 Cluster transactions also carry the range-topology generation observed at
 begin. Changing the configured range map invalidates an older transaction at
 commit, including write-only owner forwarding; the mesh returns a typed
@@ -299,8 +302,9 @@ UPDATE FROM, DELETE USING, and INSERT SELECT now use those pages before
 staging their writes. Foreign-key checks and cascading delete/update actions
 now use the same owner-routed point-read and scan paths, stage all dependent
 changes in the transaction, and commit through the existing distributed
-coordinator. Schema-dependent views and per-range 2PC remain separate work,
-so this is not yet complete owner-aware transaction routing.
+coordinator. Schema-dependent views and cross-range schema-change
+coordination remain separate work, so this is not yet complete owner-aware
+transaction routing.
 
 Broadcast realtime is separate from durable Raft data: `POST /v1/broadcast`
 must reach the current leader, which fans the event over the cluster mesh to

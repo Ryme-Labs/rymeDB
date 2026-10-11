@@ -154,6 +154,17 @@ pub(crate) enum Rpc {
         resolved: bool,
         error: Option<RpcError>,
     },
+    RangeDecisionTransaction {
+        group_id: String,
+        transaction_id: u128,
+        commit_ts: u64,
+        committed: bool,
+        participants: Vec<ResolutionParticipant>,
+    },
+    RangeDecisionTransactionResponse {
+        recorded: bool,
+        error: Option<RpcError>,
+    },
     RangeVoteRequest {
         group_id: String,
         term: u64,
@@ -320,6 +331,7 @@ pub(crate) enum RangeEntryKind {
     Data,
     Prepare { transaction_id: u128, state: Vec<u8> },
     Resolve { transaction_id: u128, committed: bool },
+    Decision { transaction_id: u128, committed: bool, participants: Vec<ResolutionParticipant> },
 }
 
 impl Default for RangeEntryKind {
@@ -359,8 +371,8 @@ enum ResolutionRecord {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ResolutionParticipant {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ResolutionParticipant {
     participant: usize,
     group_id: String,
 }
@@ -372,6 +384,15 @@ struct PendingResolution {
     participant: usize,
     committed: bool,
     group_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRangeDecision {
+    group_id: String,
+    transaction_id: u128,
+    commit_ts: u64,
+    committed: bool,
+    participants: Vec<ResolutionParticipant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -834,6 +855,7 @@ pub struct Node {
     pending_resolutions: std::sync::Mutex<BTreeMap<(String, u128, u64, usize), PendingResolution>>,
     resolution_wal: std::sync::Mutex<Wal>,
     range_prepared: std::sync::Mutex<BTreeMap<(String, u128), PreparedIntent>>,
+    range_decisions: std::sync::Mutex<BTreeMap<(String, u128, u64), PendingRangeDecision>>,
     range_logs: std::sync::Mutex<BTreeMap<String, u64>>,
     range_entries: std::sync::Mutex<BTreeMap<String, BTreeMap<u64, RangeLogRecord>>>,
     range_groups: std::sync::Mutex<BTreeMap<String, RangeGroupState>>,
@@ -1077,6 +1099,7 @@ impl Node {
         let mut range_logs = BTreeMap::new();
         let mut range_entries: BTreeMap<String, BTreeMap<u64, RangeLogRecord>> = BTreeMap::new();
         let mut range_prepared = BTreeMap::new();
+        let mut range_decisions = BTreeMap::new();
         for range_record in range_records {
             let group_id = range_record.group_id.clone();
             range_entries
@@ -1114,8 +1137,32 @@ impl Node {
                             );
                         }
                     }
-                    RangeEntryKind::Resolve { transaction_id, .. } => {
-                        range_prepared.remove(&(group_id.clone(), *transaction_id));
+                    RangeEntryKind::Resolve { transaction_id, committed } => {
+                        if *committed {
+                            if let Some(existing) =
+                                range_prepared.remove(&(group_id.clone(), *transaction_id))
+                            {
+                                let writes =
+                                    existing.state.writes.into_iter().collect::<BTreeMap<_, _>>();
+                                if !writes.is_empty() {
+                                    manager.replay_at(record.commit_ts, &writes)?;
+                                }
+                            }
+                        } else {
+                            range_prepared.remove(&(group_id.clone(), *transaction_id));
+                        }
+                    }
+                    RangeEntryKind::Decision { transaction_id, committed, participants } => {
+                        range_decisions.insert(
+                            (group_id.clone(), *transaction_id, record.commit_ts),
+                            PendingRangeDecision {
+                                group_id: group_id.clone(),
+                                transaction_id: *transaction_id,
+                                commit_ts: record.commit_ts,
+                                committed: *committed,
+                                participants: participants.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -1183,6 +1230,7 @@ impl Node {
             pending_resolutions: std::sync::Mutex::new(pending_resolutions),
             resolution_wal: std::sync::Mutex::new(resolution_wal),
             range_prepared: std::sync::Mutex::new(range_prepared),
+            range_decisions: std::sync::Mutex::new(range_decisions),
             range_logs: std::sync::Mutex::new(range_logs),
             range_entries: std::sync::Mutex::new(range_entries),
             range_groups: std::sync::Mutex::new(range_groups),
@@ -2346,6 +2394,33 @@ impl Node {
                     }),
                 }
             }
+            Rpc::RangeDecisionTransaction {
+                group_id,
+                transaction_id,
+                commit_ts,
+                committed,
+                participants,
+            } => {
+                let _commit = self.txn_commit_lock.lock().await;
+                match self
+                    .record_range_decision(
+                        &group_id,
+                        transaction_id,
+                        commit_ts,
+                        committed,
+                        participants,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        Ok(Rpc::RangeDecisionTransactionResponse { recorded: true, error: None })
+                    }
+                    Err(error) => Ok(Rpc::RangeDecisionTransactionResponse {
+                        recorded: false,
+                        error: Some(error.into()),
+                    }),
+                }
+            }
             Rpc::RangeVoteRequest { group_id, term, candidate, last_term, last_index } => {
                 let (term, granted) =
                     self.handle_range_vote(&group_id, term, candidate, last_term, last_index);
@@ -2544,6 +2619,9 @@ impl Node {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
             Rpc::RangeResolveTransactionResponse { .. } => {
+                Err(RymeError::InvalidArgument(String::from("rpc direction")))
+            }
+            Rpc::RangeDecisionTransactionResponse { .. } => {
                 Err(RymeError::InvalidArgument(String::from("rpc direction")))
             }
             Rpc::RangeVoteResponse { .. } => {
@@ -2770,32 +2848,6 @@ impl Node {
             }
         }
         self.manager.restore_with_replay(Engine::default(), &replay)
-    }
-
-    async fn propose_resolutions(
-        self: &Arc<Self>,
-        transaction_id: u128,
-        commit_ts: u64,
-        participants: &BTreeMap<String, RangeOwner>,
-        committed: bool,
-    ) -> Result<u64> {
-        let participants = participants
-            .iter()
-            .map(|(group_id, range)| ResolutionParticipant {
-                participant: range.owner,
-                group_id: group_id.clone(),
-            })
-            .collect();
-        let payload = serde_json::to_vec(&ResolutionRecord::Batch {
-            transaction_id,
-            commit_ts,
-            committed,
-            participants,
-        })
-        .map_err(|error| RymeError::Internal(format!("resolution: {error}")))?;
-        let index = self.propose_frame(crate::encode_resolution(&payload)?).await?;
-        self.wait_applied(index).await?;
-        Ok(index)
     }
 
     pub async fn propose_topic(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
@@ -3074,7 +3126,11 @@ impl Node {
         }
         self.manager.validate_at(&txn, commit_ts)?;
         self.range_prepare_conflict(group_id, transaction_id, commit_ts, &txn, &state)?;
-        let encoded = serde_json::to_vec(&state)
+        let mut local_state = state.clone();
+        local_state.writes.retain(|(key, _)| {
+            self.range_for_record(key).map(|range| range.id == group_id).unwrap_or(true)
+        });
+        let encoded = serde_json::to_vec(&local_state)
             .map_err(|error| RymeError::Internal(format!("range transaction prepare: {error}")))?;
         self.commit_range_record(
             group_id,
@@ -3115,6 +3171,86 @@ impl Node {
             RangeEntryKind::Resolve { transaction_id, committed },
         )
         .await
+    }
+
+    async fn record_range_decision(
+        self: &Arc<Self>,
+        group_id: &str,
+        transaction_id: u128,
+        commit_ts: u64,
+        committed: bool,
+        participants: Vec<ResolutionParticipant>,
+    ) -> Result<()> {
+        let range = self
+            .range_owner_by_id(group_id)
+            .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
+        if range.owner != self.id {
+            return Err(RymeError::Unavailable(String::from("not range leader")));
+        }
+        self.commit_range_record(
+            group_id,
+            commit_ts,
+            RangeEntryKind::Decision { transaction_id, committed, participants },
+        )
+        .await
+    }
+
+    async fn record_range_decision_on(
+        self: &Arc<Self>,
+        group_id: &str,
+        owner: usize,
+        transaction_id: u128,
+        commit_ts: u64,
+        committed: bool,
+        participants: Vec<ResolutionParticipant>,
+    ) -> Result<()> {
+        for attempt in 0..3 {
+            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let result = if owner == self.id {
+                self.record_range_decision(
+                    group_id,
+                    transaction_id,
+                    commit_ts,
+                    committed,
+                    participants.clone(),
+                )
+                .await
+            } else {
+                match self.pool_for(owner) {
+                    Some(pool) => match pool
+                        .roundtrip(&Rpc::RangeDecisionTransaction {
+                            group_id: group_id.to_string(),
+                            transaction_id,
+                            commit_ts,
+                            committed,
+                            participants: participants.clone(),
+                        })
+                        .await
+                    {
+                        Ok(Rpc::RangeDecisionTransactionResponse {
+                            recorded: true,
+                            error: None,
+                        }) => Ok(()),
+                        Ok(Rpc::RangeDecisionTransactionResponse {
+                            error: Some(error), ..
+                        }) => Err(error.into()),
+                        Ok(_) => Err(RymeError::Corrupt(String::from("range decision rpc"))),
+                        Err(error) => Err(error),
+                    },
+                    None => {
+                        Err(RymeError::Unavailable(String::from("range participant unavailable")))
+                    }
+                }
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt < 2 && matches!(&error, RymeError::Unavailable(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(RymeError::Unavailable(String::from("range participant unavailable")))
     }
 
     fn resolve_intent(&self, transaction_id: u128, commit_ts: u64, committed: bool) -> Result<()> {
@@ -3390,11 +3526,47 @@ impl Node {
                             PreparedIntent { commit_ts: record.commit_ts, state },
                         );
                 }
-                RangeEntryKind::Resolve { transaction_id, .. } => {
-                    self.range_prepared
+                RangeEntryKind::Resolve { transaction_id, committed } => {
+                    let existing = self
+                        .range_prepared
                         .lock()
                         .map_err(|_| RymeError::Internal(String::from("range prepared")))?
                         .remove(&(group_id.to_string(), transaction_id));
+                    if committed {
+                        if let Some(existing) = existing {
+                            let writes =
+                                existing.state.writes.into_iter().collect::<BTreeMap<_, _>>();
+                            if !writes.is_empty() {
+                                self.manager.replay_at(record.commit_ts, &writes)?;
+                                let encoded_writes = encode_writes(&writes)?;
+                                let is_owner = self
+                                    .range_owner_by_id(group_id)
+                                    .map(|range| range.owner == self.id)
+                                    .unwrap_or(false);
+                                if is_owner {
+                                    self.apply_data_hook(crate::encode_applied(
+                                        record.commit_ts,
+                                        &encoded_writes,
+                                    ))?;
+                                }
+                            }
+                        }
+                    }
+                }
+                RangeEntryKind::Decision { transaction_id, committed, participants } => {
+                    self.range_decisions
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("range decisions")))?
+                        .insert(
+                            (group_id.to_string(), transaction_id, record.commit_ts),
+                            PendingRangeDecision {
+                                group_id: group_id.to_string(),
+                                transaction_id,
+                                commit_ts: record.commit_ts,
+                                committed,
+                                participants,
+                            },
+                        );
                 }
             }
         }
@@ -4015,6 +4187,57 @@ impl Node {
                 }
             }
         }
+        self.retry_pending_range_decisions().await;
+    }
+
+    fn pending_range_decisions_snapshot(&self) -> Vec<PendingRangeDecision> {
+        self.range_decisions
+            .lock()
+            .map(|decisions| decisions.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    async fn retry_pending_range_decisions(self: &Arc<Self>) {
+        for decision in self.pending_range_decisions_snapshot() {
+            let Some(range) = self.range_owner_by_id(&decision.group_id) else {
+                continue;
+            };
+            if range.owner != self.id {
+                continue;
+            }
+            let mut complete = true;
+            for participant in &decision.participants {
+                if self
+                    .resolve_on(
+                        &participant.group_id,
+                        participant.participant,
+                        decision.transaction_id,
+                        decision.commit_ts,
+                        decision.committed,
+                    )
+                    .await
+                    .is_err()
+                {
+                    complete = false;
+                    let _ = self.queue_resolution_for_group(
+                        &participant.group_id,
+                        decision.transaction_id,
+                        decision.commit_ts,
+                        participant.participant,
+                        decision.committed,
+                    );
+                }
+            }
+            if complete {
+                if let Ok(mut decisions) = self.range_decisions.lock() {
+                    decisions.remove(&(
+                        decision.group_id.clone(),
+                        decision.transaction_id,
+                        decision.commit_ts,
+                    ));
+                }
+            }
+        }
     }
 
     fn queue_range_resolutions(
@@ -4040,43 +4263,11 @@ impl Node {
         Ok(())
     }
 
-    async fn replicate_range_resolutions(
-        self: &Arc<Self>,
-        transaction_id: u128,
-        commit_ts: u64,
-        participants: &BTreeMap<String, RangeOwner>,
-        committed: bool,
-    ) -> Result<()> {
-        self.propose_resolutions(transaction_id, commit_ts, participants, committed)
-            .await
-            .map(|_| ())
-    }
-
     async fn commit_global_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
         let writes = txn.writes().clone();
         let result = self
             .manager
             .commit_with(txn, |commit_ts, encoded| async move {
-                self.replicate_frame(commit_ts, encoded).await.map(|_| ())
-            })
-            .await;
-        if let Ok(commit_ts) = result {
-            if let Err(error) = self.publish_range_writes(commit_ts, &writes).await {
-                tracing::error!(commit_ts, %error, "range replica publish failed after global commit");
-            }
-        }
-        result
-    }
-
-    async fn commit_txn_at(
-        self: &Arc<Self>,
-        txn: ryme_txn::Transaction,
-        commit_ts: u64,
-    ) -> Result<u64> {
-        let writes = txn.writes().clone();
-        let result = self
-            .manager
-            .commit_at_with(txn, commit_ts, |commit_ts, encoded| async move {
                 self.replicate_frame(commit_ts, encoded).await.map(|_| ())
             })
             .await;
@@ -4100,6 +4291,16 @@ impl Node {
         let commit_ts = self.manager.reserve(&txn)?;
         let state = txn.state();
         let participant_ids = participants.clone();
+        let decision_participants = participants
+            .iter()
+            .map(|(group_id, range)| ResolutionParticipant {
+                participant: self
+                    .range_owner_by_id(group_id)
+                    .map(|current| current.owner)
+                    .unwrap_or(range.owner),
+                group_id: group_id.clone(),
+            })
+            .collect::<Vec<_>>();
         for (group_id, range) in &participants {
             match self
                 .prepare_on(group_id, range.owner, transaction_id, commit_ts, state.clone())
@@ -4115,64 +4316,43 @@ impl Node {
                     ) {
                         tracing::error!(transaction_id, commit_ts, %queue_error, "transaction abort resolution queue failed");
                     }
-                    if let Err(resolution_error) = self
-                        .replicate_range_resolutions(
-                            transaction_id,
-                            commit_ts,
-                            &participant_ids,
-                            false,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            transaction_id,
-                            commit_ts,
-                            %resolution_error,
-                            "transaction abort resolution replication failed"
-                        );
-                    }
                     self.retry_pending_resolutions().await;
                     return Err(error);
                 }
             }
         }
-        match self.commit_txn_at(txn, commit_ts).await {
-            Ok(commit_ts) => {
-                if let Err(error) =
-                    self.queue_range_resolutions(transaction_id, commit_ts, &participant_ids, true)
-                {
-                    tracing::error!(transaction_id, commit_ts, %error, "transaction resolution queue failed");
-                }
-                if let Err(error) = self
-                    .replicate_range_resolutions(transaction_id, commit_ts, &participant_ids, true)
-                    .await
-                {
-                    tracing::error!(transaction_id, commit_ts, %error, "transaction resolution replication failed");
-                }
-                self.retry_pending_resolutions().await;
-                Ok(commit_ts)
+        let (coordinator_group, coordinator_owner) = decision_participants
+            .first()
+            .map(|participant| (participant.group_id.clone(), participant.participant))
+            .ok_or_else(|| {
+                RymeError::Internal(String::from("distributed transaction coordinator"))
+            })?;
+        if let Err(error) = self
+            .record_range_decision_on(
+                &coordinator_group,
+                coordinator_owner,
+                transaction_id,
+                commit_ts,
+                true,
+                decision_participants.clone(),
+            )
+            .await
+        {
+            if let Err(queue_error) =
+                self.queue_range_resolutions(transaction_id, commit_ts, &participant_ids, false)
+            {
+                tracing::error!(transaction_id, commit_ts, %queue_error, "transaction abort resolution queue failed");
             }
-            Err(error) => {
-                if let Err(queue_error) =
-                    self.queue_range_resolutions(transaction_id, commit_ts, &participant_ids, false)
-                {
-                    tracing::error!(transaction_id, commit_ts, %queue_error, "transaction abort resolution queue failed");
-                }
-                if let Err(resolution_error) = self
-                    .replicate_range_resolutions(transaction_id, commit_ts, &participant_ids, false)
-                    .await
-                {
-                    tracing::error!(
-                        transaction_id,
-                        commit_ts,
-                        %resolution_error,
-                        "transaction abort resolution replication failed"
-                    );
-                }
-                self.retry_pending_resolutions().await;
-                Err(error)
-            }
+            self.retry_pending_resolutions().await;
+            return Err(error);
         }
+        if let Err(error) =
+            self.queue_range_resolutions(transaction_id, commit_ts, &participant_ids, true)
+        {
+            tracing::error!(transaction_id, commit_ts, %error, "transaction resolution queue failed");
+        }
+        self.retry_pending_resolutions().await;
+        Ok(commit_ts)
     }
 
     pub async fn commit_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
@@ -5483,6 +5663,57 @@ mod tests {
 
         let reopened_again = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
         assert!(reopened_again.range_prepared.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn distributed_range_decision_commits_each_participant_without_global_data() {
+        let dir = temp_dir("range-distributed-commit");
+        let configure = |node: &Node| {
+            node.set_range_owners(vec![
+                RangeOwner {
+                    id: String::from("range-a"),
+                    start: Vec::new(),
+                    end: b"m\0".to_vec(),
+                    owner: 0,
+                    replicas: vec![0],
+                    epoch: 1,
+                },
+                RangeOwner {
+                    id: String::from("range-b"),
+                    start: b"m\0".to_vec(),
+                    end: Vec::new(),
+                    owner: 0,
+                    replicas: vec![0],
+                    epoch: 1,
+                },
+            ]);
+        };
+        let left = RecordKey::new("t", "d", "a", b"left");
+        let right = RecordKey::new("t", "d", "z", b"right");
+        {
+            let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            configure(&node);
+            let mut txn = node.manager.begin();
+            node.manager.put(&mut txn, left.clone(), b"one".to_vec());
+            node.manager.put(&mut txn, right.clone(), b"two".to_vec());
+            let commit_ts = node.commit_txn(txn).await.unwrap();
+            assert!(commit_ts > 0);
+            let mut probe = node.manager.begin();
+            assert_eq!(node.manager.get(&mut probe, &left).unwrap(), Some(b"one".to_vec()));
+            assert_eq!(node.manager.get(&mut probe, &right).unwrap(), Some(b"two".to_vec()));
+            assert!(node.range_prepared.lock().unwrap().is_empty());
+            assert!(node.range_decisions.lock().unwrap().is_empty());
+            assert!(node.inner.lock().await.log.is_empty());
+        }
+
+        let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        configure(&reopened);
+        reopened.retry_pending_range_decisions().await;
+        let mut probe = reopened.manager.begin();
+        assert_eq!(reopened.manager.get(&mut probe, &left).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reopened.manager.get(&mut probe, &right).unwrap(), Some(b"two".to_vec()));
+        assert!(reopened.range_decisions.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

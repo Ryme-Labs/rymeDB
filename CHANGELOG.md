@@ -1,5 +1,9 @@
 # Changelog
 
+- Multi-owner transactions now persist their commit decision in a coordinator
+  range quorum instead of the global data log. Each range resolves and
+  materializes only its local prepared writes, with range-WAL recovery and
+  asynchronous retry after participant or leader failure.
 - Range transfers now copy from the current range owner, replace the old owner
   in the replica set, and safely purge the source's materialized rows after
   epoch-fenced verification. Concurrent source changes defer cleanup instead
