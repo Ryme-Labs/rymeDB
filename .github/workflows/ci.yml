@@ -142,7 +142,7 @@ jobs:
       - name: Verify supported SDK surface
         run: |
           actual="$(find sdks -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | paste -sd, -)"
-          test "$actual" = "java,js,rust"
+          test "$actual" = "js,rust"
           test -f _site/index.html
           test -f _site/api/index.html
           grep -q 'SwaggerUIBundle' _site/api/index.html
@@ -150,13 +150,12 @@ jobs:
           grep -q '../openapi/rest.yaml' _site/api/index.html
           test -f _site/openapi/rest.yaml
           test -f _site/openapi/rest.json
-          test -f _site/sdk-java/index.html
           test -f _site/sdk-js/index.html
           test -f _site/sdk-rust/index.html
           test -f _site/api-guide/index.html
 
   sdks:
-    name: Verify Java, npm, and Rust SDKs
+    name: Verify npm and Rust SDKs
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -188,13 +187,3 @@ jobs:
         run: |
           cargo test --manifest-path sdks/rust/Cargo.toml --locked
           cargo package --manifest-path sdks/rust/Cargo.toml --locked
-
-      - name: Set up Java
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: 17
-          cache: maven
-
-      - name: Verify Java SDK package
-        run: mvn --batch-mode --update-snapshots -f sdks/java/pom.xml verify

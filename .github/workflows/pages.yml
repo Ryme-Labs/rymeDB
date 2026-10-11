@@ -100,7 +100,6 @@ jobs:
           grep -q '../openapi/rest.yaml' _site/api/index.html
           test -f _site/openapi/rest.yaml
           test -f _site/openapi/rest.json
-          test -f _site/sdk-java/index.html
           test -f _site/sdk-js/index.html
           test -f _site/sdk-rust/index.html
 
