@@ -49,6 +49,8 @@ pub const DURABLE_PARTITION_MAX_BYTES: usize = 256;
 pub const DURABLE_KEY_MAX_BYTES: usize = 1024;
 pub const DURABLE_VALUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const DURABLE_READ_MAX_MESSAGES: usize = 1000;
+const MAX_DURABLE_TOPICS: usize = 100_000;
+const MAX_DURABLE_TOPICS_PER_TENANT: usize = 10_000;
 
 type BroadcastTopicShard = Mutex<HashMap<String, Arc<BroadcastTopic>>>;
 type PresenceTopicShard = Mutex<HashMap<String, broadcast::Sender<PresenceEvent>>>;
@@ -100,6 +102,7 @@ struct QueryTopic {
 #[derive(Debug)]
 struct RealtimeInner {
     durable: HashMap<String, DurableTopic>,
+    durable_topics_by_tenant: HashMap<String, usize>,
 }
 
 #[derive(Debug, Default)]
@@ -249,7 +252,10 @@ impl Realtime {
         let capacity = capacity.clamp(16, 100000);
         let (changes, _) = broadcast::channel(capacity);
         Self {
-            inner: Arc::new(Mutex::new(RealtimeInner { durable: HashMap::new() })),
+            inner: Arc::new(Mutex::new(RealtimeInner {
+                durable: HashMap::new(),
+                durable_topics_by_tenant: HashMap::new(),
+            })),
             changes,
             table_topics: Arc::new(
                 (0..TABLE_TOPIC_SHARDS).map(|_| Mutex::new(TableTopicShard::default())).collect(),
@@ -1199,11 +1205,23 @@ impl Realtime {
             return Err(RymeError::Overload(String::from("value")));
         }
         let topic_key = durable_key(tenant, partition);
+        let is_new_topic = !inner.durable.contains_key(&topic_key);
+        if is_new_topic {
+            let tenant_topics = inner.durable_topics_by_tenant.get(tenant).copied().unwrap_or(0);
+            if inner.durable.len() >= MAX_DURABLE_TOPICS
+                || tenant_topics >= MAX_DURABLE_TOPICS_PER_TENANT
+            {
+                return Err(RymeError::Overload(String::from("durable topics")));
+            }
+        }
         let topic = inner.durable.entry(topic_key.clone()).or_insert_with(|| DurableTopic {
             messages: VecDeque::new(),
             next_cursor: 0,
             retention: retention.clamp(16, 100000),
         });
+        if is_new_topic {
+            *inner.durable_topics_by_tenant.entry(tenant.to_string()).or_default() += 1;
+        }
         if cursor < topic.next_cursor {
             if let Some(existing) = topic.messages.iter().find(|message| message.cursor == cursor) {
                 if existing.partition != partition
@@ -1337,6 +1355,7 @@ impl Realtime {
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("realtime lock")))?;
         let mut pending = Vec::with_capacity(snapshots.len());
         let mut seen = HashSet::with_capacity(snapshots.len());
+        let mut pending_topics_by_tenant = HashMap::<String, usize>::new();
         for snapshot in snapshots {
             if snapshot.tenant.is_empty() {
                 return Err(RymeError::Corrupt(String::from("durable topic identity")));
@@ -1379,13 +1398,31 @@ impl Realtime {
             if inner.durable.contains_key(&key) || !seen.insert(key.clone()) {
                 return Err(RymeError::Corrupt(String::from("duplicate durable topic")));
             }
+            let tenant_topics = inner
+                .durable_topics_by_tenant
+                .get(&snapshot.tenant)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(
+                    pending_topics_by_tenant.get(&snapshot.tenant).copied().unwrap_or(0),
+                );
+            if inner.durable.len().saturating_add(pending.len()) > MAX_DURABLE_TOPICS
+                || tenant_topics > MAX_DURABLE_TOPICS_PER_TENANT
+            {
+                return Err(RymeError::Corrupt(String::from("durable topic limit")));
+            }
+            *pending_topics_by_tenant.entry(snapshot.tenant.clone()).or_default() += 1;
             pending.push((
                 key,
                 DurableTopic { messages: messages.into_iter().collect(), next_cursor, retention },
             ));
         }
         for (key, topic) in pending {
+            let Some((tenant, _)) = split_scope_key(&key) else {
+                return Err(RymeError::Corrupt(String::from("durable topic scope")));
+            };
             inner.durable.insert(key, topic);
+            *inner.durable_topics_by_tenant.entry(tenant.to_string()).or_default() += 1;
         }
         Ok(())
     }
