@@ -13,7 +13,10 @@ use ryme_sql::{
     ReturningField, RoleDefinition, SchemaSnapshot, Statement, TransactionChange,
     BUILTIN_SQL_ROLES, SQL_NULL_SENTINEL,
 };
-use ryme_txn::{Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager};
+use ryme_txn::{
+    Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager,
+    MAX_TRANSACTION_STATE_BYTES,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -58,6 +61,8 @@ enum DecodedCopy {
 
 const MAX_PREPARED_STATEMENTS: usize = 256;
 const MAX_PORTALS: usize = 256;
+const MAX_SAVEPOINTS: usize = 256;
+const MAX_SAVEPOINT_NAME_BYTES: usize = 256;
 const MAX_NOTIFICATION_CHANNEL_BYTES: usize = 63;
 const MAX_NOTIFICATION_PAYLOAD_BYTES: usize = 8_000;
 
@@ -2968,6 +2973,8 @@ fn normalize_savepoint_name(value: &str) -> Option<String> {
     let name = unquote_literal(value);
     if name.is_empty() {
         None
+    } else if name.as_bytes().len() > MAX_SAVEPOINT_NAME_BYTES {
+        None
     } else if value.starts_with('"') && value.ends_with('"') {
         Some(name)
     } else {
@@ -3078,9 +3085,25 @@ where
                     ),
                 );
             }
-            if let Some(position) =
-                state.savepoints.iter().position(|savepoint| savepoint.name == name)
-            {
+            let position = state.savepoints.iter().position(|savepoint| savepoint.name == name);
+            let retained_bytes = state
+                .savepoints
+                .iter()
+                .take(position.unwrap_or(state.savepoints.len()))
+                .map(|savepoint| savepoint.checkpoint.state_bytes())
+                .try_fold(0usize, usize::checked_add);
+            let next_count = position.unwrap_or(state.savepoints.len()).saturating_add(1);
+            let next_bytes = retained_bytes
+                .and_then(|bytes| bytes.checked_add(state.txn.state_bytes()))
+                .unwrap_or(usize::MAX);
+            if next_count > MAX_SAVEPOINTS || next_bytes > MAX_TRANSACTION_STATE_BYTES {
+                state.failed = true;
+                return encode_error_code(
+                    "54000",
+                    String::from("transaction savepoint memory limit exceeded"),
+                );
+            }
+            if let Some(position) = position {
                 state.savepoints.truncate(position);
             }
             state.savepoints.push(Savepoint {
@@ -4757,6 +4780,39 @@ mod tests {
             transaction_control("SAVEPOINT \"CaseSensitive\"", &session),
             Some(TransactionControl::Savepoint(name)) if name == "CaseSensitive"
         ));
+        let oversized = "x".repeat(MAX_SAVEPOINT_NAME_BYTES + 1);
+        assert!(transaction_control(&format!("SAVEPOINT {oversized}"), &session).is_none());
+    }
+
+    #[tokio::test]
+    async fn savepoint_depth_is_bounded() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let mut active = Some(SessionTransaction {
+            txn: executor.begin_transaction(Isolation::Serializable),
+            changes: Vec::new(),
+            schema_before: None,
+            local_settings: HashMap::new(),
+            notifications: Vec::new(),
+            listener_changes: Vec::new(),
+            failed: false,
+            savepoints: Vec::new(),
+        });
+        for index in 0..MAX_SAVEPOINTS {
+            handle_transaction_control(
+                TransactionControl::Savepoint(format!("sp_{index}")),
+                &executor,
+                &mut active,
+            )
+            .await;
+        }
+        assert_eq!(active.as_ref().map(|state| state.savepoints.len()), Some(MAX_SAVEPOINTS));
+        handle_transaction_control(
+            TransactionControl::Savepoint(String::from("overflow")),
+            &executor,
+            &mut active,
+        )
+        .await;
+        assert!(active.as_ref().is_some_and(|state| state.failed));
     }
 
     #[tokio::test]

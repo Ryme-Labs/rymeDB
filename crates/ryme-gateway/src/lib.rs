@@ -314,7 +314,7 @@ where
             RemoteRead::Local => self.manager.get(txn, key),
             RemoteRead::Value { value, expires_at } => {
                 let value = remote_value_if_live(value, expires_at);
-                txn.record_read(key.clone(), value.is_some());
+                txn.record_read(key.clone(), value.is_some())?;
                 Ok(value)
             }
         }
@@ -431,7 +431,7 @@ where
             let before = self.read_for_write(&mut txn, &key).await?;
             self.reject_hidden_existing(principal, table, before.as_ref())?;
             let op = if before.is_some() { Operation::Update } else { Operation::Insert };
-            self.manager.put(&mut txn, key, value.clone());
+            self.manager.try_put(&mut txn, key, value.clone())?;
             changes.push((pk, before, value, op));
         }
         let commit_ts = self.manager.commit(txn).await?;
@@ -473,8 +473,8 @@ where
         let before = self.read_for_write(&mut txn, &key).await?;
         self.reject_hidden_existing(principal, table, before.as_ref())?;
         match expires_at {
-            Some(ts) => self.manager.put_with_ttl(&mut txn, key, value.clone(), ts),
-            None => self.manager.put(&mut txn, key, value.clone()),
+            Some(ts) => self.manager.try_put_with_ttl(&mut txn, key, value.clone(), ts)?,
+            None => self.manager.try_put(&mut txn, key, value.clone())?,
         }
         let commit_ts = self.manager.commit(txn).await?;
         let op = if before.is_some() { Operation::Update } else { Operation::Insert };
@@ -514,8 +514,8 @@ where
             return Ok(false);
         }
         match expires_at {
-            Some(ts) => self.manager.put_with_ttl(&mut txn, key, current.clone(), ts),
-            None => self.manager.put(&mut txn, key, current.clone()),
+            Some(ts) => self.manager.try_put_with_ttl(&mut txn, key, current.clone(), ts)?,
+            None => self.manager.try_put(&mut txn, key, current.clone())?,
         }
         let commit_ts = self.manager.commit(txn).await?;
         self.realtime.publish(NewChange {
@@ -624,7 +624,7 @@ where
             if !self.policies.row_allowed(principal, table, &current)? {
                 return Err(RymeError::NotFound(String::from("row")));
             }
-            self.manager.delete(&mut txn, key);
+            self.manager.try_delete(&mut txn, key)?;
             changes.push((pk, current));
         }
         let commit_ts = self.manager.commit(txn).await?;

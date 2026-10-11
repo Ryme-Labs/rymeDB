@@ -10,6 +10,39 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
+pub const MAX_TRANSACTION_WRITE_ENTRIES: usize = 100_000;
+pub const MAX_TRANSACTION_READ_KEYS: usize = 100_000;
+pub const MAX_TRANSACTION_SCANNED_TABLES: usize = 10_000;
+pub const MAX_TRANSACTION_CONSTRAINT_SCANS: usize = 10_000;
+pub const MAX_TRANSACTION_STATE_BYTES: usize = 64 * 1024 * 1024;
+
+const TRANSACTION_ENTRY_OVERHEAD: usize = 64;
+
+fn transaction_key_bytes(key: &RecordKey) -> usize {
+    TRANSACTION_ENTRY_OVERHEAD
+        .saturating_add(key.tenant.len())
+        .saturating_add(key.database.len())
+        .saturating_add(key.table.len())
+        .saturating_add(key.pk.len())
+}
+
+fn transaction_scope_bytes(tenant: &str, database: &str, table: &str) -> usize {
+    TRANSACTION_ENTRY_OVERHEAD
+        .saturating_add(tenant.len())
+        .saturating_add(database.len())
+        .saturating_add(table.len())
+}
+
+fn transaction_write_bytes(key: &RecordKey, op: &WriteOp) -> usize {
+    transaction_key_bytes(key)
+        .saturating_add(16)
+        .saturating_add(op.value.as_ref().map_or(0, Vec::len))
+}
+
+fn transaction_overload(kind: &str) -> RymeError {
+    RymeError::Overload(format!("transaction {kind}"))
+}
+
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     std::fs::File::open(path)?.sync_all()?;
@@ -289,6 +322,8 @@ pub struct Transaction {
     constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
     route_generation: Option<u64>,
+    state_bytes: usize,
+    resource_error: Option<RymeError>,
     #[allow(dead_code)]
     pin: Arc<TxnPin>,
 }
@@ -317,6 +352,14 @@ pub struct TransactionCheckpoint {
     constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
     route_generation: Option<u64>,
+    state_bytes: usize,
+    resource_error: Option<RymeError>,
+}
+
+impl TransactionCheckpoint {
+    pub fn state_bytes(&self) -> usize {
+        self.state_bytes
+    }
 }
 
 impl Transaction {
@@ -330,7 +373,13 @@ impl Transaction {
             constraint_scanned: self.constraint_scanned.clone(),
             isolation: self.isolation,
             route_generation: self.route_generation,
+            state_bytes: self.state_bytes,
+            resource_error: self.resource_error.clone(),
         }
+    }
+
+    pub fn state_bytes(&self) -> usize {
+        self.state_bytes
     }
 
     pub fn state(&self) -> TransactionState {
@@ -355,6 +404,8 @@ impl Transaction {
         self.constraint_scanned.clone_from(&checkpoint.constraint_scanned);
         self.isolation = checkpoint.isolation;
         self.route_generation = checkpoint.route_generation;
+        self.state_bytes = checkpoint.state_bytes;
+        self.resource_error.clone_from(&checkpoint.resource_error);
         self.pin.active.insert(self.id, self.read_ts);
     }
 
@@ -387,21 +438,114 @@ impl Transaction {
         self.observed.get(key).copied()
     }
 
-    pub fn record_read(&mut self, key: RecordKey, existed: bool) {
-        self.read_set.insert(key.clone());
-        self.observed.entry(key).or_insert(existed);
+    pub fn record_read(&mut self, key: RecordKey, existed: bool) -> Result<()> {
+        let add_read = !self.read_set.contains(&key);
+        let add_observed = !self.observed.contains_key(&key);
+        let added_bytes = add_read
+            .then(|| transaction_key_bytes(&key))
+            .unwrap_or(0)
+            .saturating_add(
+                add_observed
+                    .then(|| transaction_key_bytes(&key).saturating_add(1))
+                    .unwrap_or(0),
+            );
+        let read_count = self.read_set.len().saturating_add(usize::from(add_read));
+        let observed_count = self.observed.len().saturating_add(usize::from(add_observed));
+        self.ensure_growth(
+            read_count <= MAX_TRANSACTION_READ_KEYS
+                && observed_count <= MAX_TRANSACTION_READ_KEYS,
+            added_bytes,
+            "read set",
+        )?;
+        if add_read {
+            self.read_set.insert(key.clone());
+        }
+        if add_observed {
+            self.observed.insert(key, existed);
+        }
+        self.state_bytes = self.state_bytes.saturating_add(added_bytes);
+        Ok(())
     }
 
-    pub fn record_scan(&mut self, tenant: &str, database: &str, table: &str) {
-        self.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+    pub fn record_scan(&mut self, tenant: &str, database: &str, table: &str) -> Result<()> {
+        let scope = (tenant.to_string(), database.to_string(), table.to_string());
+        if self.scanned.contains(&scope) {
+            return Ok(());
+        }
+        self.ensure_growth(
+            self.scanned.len() < MAX_TRANSACTION_SCANNED_TABLES,
+            transaction_scope_bytes(tenant, database, table),
+            "scan set",
+        )?;
+        self.scanned.insert(scope);
+        self.state_bytes = self
+            .state_bytes
+            .saturating_add(transaction_scope_bytes(tenant, database, table));
+        Ok(())
     }
 
-    pub fn record_constraint_scan(&mut self, tenant: &str, database: &str, table: &str) {
-        self.constraint_scanned.insert((
-            tenant.to_string(),
-            database.to_string(),
-            table.to_string(),
-        ));
+    pub fn record_constraint_scan(&mut self, tenant: &str, database: &str, table: &str) -> Result<()> {
+        let scope = (tenant.to_string(), database.to_string(), table.to_string());
+        if self.constraint_scanned.contains(&scope) {
+            return Ok(());
+        }
+        self.ensure_growth(
+            self.constraint_scanned.len() < MAX_TRANSACTION_CONSTRAINT_SCANS,
+            transaction_scope_bytes(tenant, database, table),
+            "constraint scan set",
+        )?;
+        self.constraint_scanned.insert(scope);
+        self.state_bytes = self
+            .state_bytes
+            .saturating_add(transaction_scope_bytes(tenant, database, table));
+        Ok(())
+    }
+
+    fn ensure_growth(&mut self, count_ok: bool, added_bytes: usize, kind: &str) -> Result<()> {
+        if let Some(error) = self.resource_error.clone() {
+            return Err(error);
+        }
+        if !count_ok {
+            let error = transaction_overload(kind);
+            self.resource_error = Some(error.clone());
+            return Err(error);
+        }
+        if self.state_bytes.saturating_add(added_bytes) > MAX_TRANSACTION_STATE_BYTES {
+            let error = transaction_overload("state bytes");
+            self.resource_error = Some(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn ensure_healthy(&self) -> Result<()> {
+        self.resource_error.clone().map_or(Ok(()), Err)
+    }
+
+    fn stage_write(&mut self, key: RecordKey, op: WriteOp) -> Result<()> {
+        if let Some(error) = self.resource_error.clone() {
+            return Err(error);
+        }
+        let old_bytes = self.writes.get(&key).map(|old| transaction_write_bytes(&key, old)).unwrap_or(0);
+        let new_bytes = transaction_write_bytes(&key, &op);
+        let next_bytes = self
+            .state_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        let next_count = self.writes.len().saturating_add(usize::from(!self.writes.contains_key(&key)));
+        if next_count > MAX_TRANSACTION_WRITE_ENTRIES {
+            let error = transaction_overload("write set");
+            self.resource_error = Some(error.clone());
+            return Err(error);
+        }
+        if next_bytes > MAX_TRANSACTION_STATE_BYTES {
+            let error = transaction_overload("state bytes");
+            self.resource_error = Some(error.clone());
+            return Err(error);
+        }
+        self.writes.insert(key, op);
+        self.state_bytes = next_bytes;
+        Ok(())
     }
 
     pub fn scanned_tables(&self) -> &BTreeSet<(String, String, String)> {
@@ -517,8 +661,32 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
         Box::pin(async move { self.scan_after(txn, tenant, database, table, start_after, limit) })
     }
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>);
-    fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64);
+    fn put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    );
     fn delete(&self, txn: &mut Transaction, key: RecordKey);
+    fn try_put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) -> Result<()> {
+        self.put(txn, key, value);
+        txn.ensure_healthy()
+    }
+    fn try_put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) -> Result<()> {
+        self.put_with_ttl(txn, key, value, expires_at);
+        txn.ensure_healthy()
+    }
+    fn try_delete(&self, txn: &mut Transaction, key: RecordKey) -> Result<()> {
+        self.delete(txn, key);
+        txn.ensure_healthy()
+    }
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>>;
     fn expires_at_at(&self, key: &RecordKey, _read_ts: u64) -> Result<Option<u64>> {
         self.expires_at(key)
@@ -553,15 +721,21 @@ impl TxnBackend for TxnManager {
     }
 
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
-        TxnManager::put(self, txn, key, value);
+        TxnManager::put(self, txn, key, value)
     }
 
-    fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
-        TxnManager::put_with_ttl(self, txn, key, value, expires_at);
+    fn put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        TxnManager::put_with_ttl(self, txn, key, value, expires_at)
     }
 
     fn delete(&self, txn: &mut Transaction, key: RecordKey) {
-        TxnManager::delete(self, txn, key);
+        TxnManager::delete(self, txn, key)
     }
 
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
@@ -611,15 +785,21 @@ impl TxnBackend for DurableManager {
     }
 
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
-        DurableManager::put(self, txn, key, value);
+        DurableManager::put(self, txn, key, value)
     }
 
-    fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
-        DurableManager::put_with_ttl(self, txn, key, value, expires_at);
+    fn put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        DurableManager::put_with_ttl(self, txn, key, value, expires_at)
     }
 
     fn delete(&self, txn: &mut Transaction, key: RecordKey) {
-        DurableManager::delete(self, txn, key);
+        DurableManager::delete(self, txn, key)
     }
 
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
@@ -696,43 +876,88 @@ impl TxnManager {
             constraint_scanned: BTreeSet::new(),
             isolation: Isolation::Serializable,
             route_generation: None,
+            state_bytes: 0,
+            resource_error: None,
             pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
         }
     }
 
     #[allow(clippy::wrong_self_convention)]
-    pub fn from_state(&self, state: TransactionState) -> Transaction {
+    pub fn from_state(&self, state: TransactionState) -> Result<Transaction> {
+        if state.writes.len() > MAX_TRANSACTION_WRITE_ENTRIES {
+            return Err(transaction_overload("write set"));
+        }
+        if state.read_set.len() > MAX_TRANSACTION_READ_KEYS
+            || state.observed.len() > MAX_TRANSACTION_READ_KEYS
+        {
+            return Err(transaction_overload("read set"));
+        }
+        if state.scanned.len() > MAX_TRANSACTION_SCANNED_TABLES {
+            return Err(transaction_overload("scan set"));
+        }
+        if state.constraint_scanned.len() > MAX_TRANSACTION_CONSTRAINT_SCANS {
+            return Err(transaction_overload("constraint scan set"));
+        }
+        let writes: BTreeMap<_, _> = state.writes.into_iter().collect();
+        let read_set: BTreeSet<_> = state.read_set.into_iter().collect();
+        let observed: BTreeMap<_, _> = state.observed.into_iter().collect();
+        let scanned: BTreeSet<_> = state.scanned.into_iter().collect();
+        let constraint_scanned: BTreeSet<_> = state.constraint_scanned.into_iter().collect();
+        let state_bytes = writes
+            .iter()
+            .map(|(key, op)| transaction_write_bytes(key, op))
+            .chain(read_set.iter().map(transaction_key_bytes))
+            .chain(observed.keys().map(|key| transaction_key_bytes(key).saturating_add(1)))
+            .chain(scanned.iter().map(|(tenant, database, table)| {
+                transaction_scope_bytes(tenant, database, table)
+            }))
+            .chain(constraint_scanned.iter().map(|(tenant, database, table)| {
+                transaction_scope_bytes(tenant, database, table)
+            }))
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+            .ok_or_else(|| transaction_overload("state bytes"))?;
+        if writes.len() > MAX_TRANSACTION_WRITE_ENTRIES
+            || read_set.len() > MAX_TRANSACTION_READ_KEYS
+            || observed.len() > MAX_TRANSACTION_READ_KEYS
+            || scanned.len() > MAX_TRANSACTION_SCANNED_TABLES
+            || constraint_scanned.len() > MAX_TRANSACTION_CONSTRAINT_SCANS
+            || state_bytes > MAX_TRANSACTION_STATE_BYTES
+        {
+            return Err(transaction_overload("state bytes"));
+        }
         let id = TXN_ID.fetch_add(1, Ordering::Relaxed);
         self.inner.active.insert(id, state.read_ts);
-        Transaction {
+        Ok(Transaction {
             id,
             read_ts: state.read_ts,
-            writes: state.writes.into_iter().collect(),
-            read_set: state.read_set.into_iter().collect(),
-            observed: state.observed.into_iter().collect(),
-            scanned: state.scanned.into_iter().collect(),
-            constraint_scanned: state.constraint_scanned.into_iter().collect(),
+            writes,
+            read_set,
+            observed,
+            scanned,
+            constraint_scanned,
             isolation: state.isolation,
             route_generation: state.route_generation,
+            state_bytes,
+            resource_error: None,
             pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
-        }
+        })
     }
 
     pub fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
+        txn.ensure_healthy()?;
         if let Some(staged) = txn.writes.get(key) {
             if staged.expires_at != 0 && staged.expires_at <= now_unix() {
                 return Ok(None);
             }
             return Ok(staged.value.clone());
         }
-        txn.read_set.insert(key.clone());
         let engine = self
             .inner
             .engine
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
         let value = engine.read(key, txn.read_ts, now_unix())?;
-        txn.observed.entry(key.clone()).or_insert(value.is_some());
+        txn.record_read(key.clone(), value.is_some())?;
         Ok(value)
     }
 
@@ -742,13 +967,13 @@ impl TxnManager {
         key: &RecordKey,
         fallback: impl FnOnce() -> Result<Option<Vec<u8>>>,
     ) -> Result<Option<Vec<u8>>> {
+        txn.ensure_healthy()?;
         if let Some(staged) = txn.writes.get(key) {
             if staged.expires_at != 0 && staged.expires_at <= now_unix() {
                 return Ok(None);
             }
             return Ok(staged.value.clone());
         }
-        txn.read_set.insert(key.clone());
         let now = now_unix();
         let (has_version, value) = {
             let engine = self
@@ -761,12 +986,26 @@ impl TxnManager {
             (has_version, value.flatten())
         };
         let value = if has_version { value } else { fallback()? };
-        txn.observed.entry(key.clone()).or_insert(value.is_some());
+        txn.record_read(key.clone(), value.is_some())?;
         Ok(value)
     }
 
+    pub fn try_put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) -> Result<()> {
+        txn.stage_write(key, WriteOp::put(value))
+    }
+
     pub fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
-        txn.writes.insert(key, WriteOp::put(value));
+        let _ = self.try_put(txn, key, value);
+    }
+
+    pub fn try_put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) -> Result<()> {
+        txn.stage_write(key, WriteOp::put_ttl(value, expires_at))
     }
 
     pub fn put_with_ttl(
@@ -776,11 +1015,15 @@ impl TxnManager {
         value: Vec<u8>,
         expires_at: u64,
     ) {
-        txn.writes.insert(key, WriteOp::put_ttl(value, expires_at));
+        let _ = self.try_put_with_ttl(txn, key, value, expires_at);
+    }
+
+    pub fn try_delete(&self, txn: &mut Transaction, key: RecordKey) -> Result<()> {
+        txn.stage_write(key, WriteOp::delete())
     }
 
     pub fn delete(&self, txn: &mut Transaction, key: RecordKey) {
-        txn.writes.insert(key, WriteOp::delete());
+        let _ = self.try_delete(txn, key);
     }
 
     pub fn reserve(&self, txn: &Transaction) -> Result<u64> {
@@ -793,6 +1036,7 @@ impl TxnManager {
     }
 
     fn reserve_locked(&self, txn: &Transaction) -> Result<u64> {
+        txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
@@ -912,6 +1156,7 @@ impl TxnManager {
     }
 
     pub fn validate_at(&self, txn: &Transaction, commit_ts: u64) -> Result<()> {
+        txn.ensure_healthy()?;
         let _guard = self
             .inner
             .commit
@@ -926,6 +1171,7 @@ impl TxnManager {
         commit_ts: u64,
         keep: impl Fn(&RecordKey) -> bool,
     ) -> Result<()> {
+        txn.ensure_healthy()?;
         let _guard = self
             .inner
             .commit
@@ -1086,6 +1332,7 @@ impl TxnManager {
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<u64> {
+        txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
@@ -1107,6 +1354,7 @@ impl TxnManager {
     where
         Fut: std::future::Future<Output = Result<()>>,
     {
+        txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
@@ -1160,6 +1408,7 @@ impl TxnManager {
     where
         Fut: std::future::Future<Output = Result<()>>,
     {
+        txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
@@ -1206,6 +1455,7 @@ impl TxnManager {
         txn: Transaction,
         persist: impl FnOnce(u64, &[u8], &BTreeMap<RecordKey, WriteOp>) -> Result<()>,
     ) -> Result<u64> {
+        txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
@@ -1229,7 +1479,8 @@ impl TxnManager {
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        txn.ensure_healthy()?;
+        txn.record_scan(tenant, database, table)?;
         let overlay_count = txn.scan_overlay_count(tenant, database, table, None);
         let scan_limit = limit.saturating_add(overlay_count);
         let engine = self
@@ -1254,7 +1505,8 @@ impl TxnManager {
         limit: usize,
         fallback: impl FnOnce(usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        txn.ensure_healthy()?;
+        txn.record_scan(tenant, database, table)?;
         let overlay_count = txn.scan_overlay_count(tenant, database, table, None);
         let scan_limit = limit.saturating_add(overlay_count);
         let rows = fallback(scan_limit)?;
@@ -1274,7 +1526,8 @@ impl TxnManager {
         start_after: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        txn.ensure_healthy()?;
+        txn.record_scan(tenant, database, table)?;
         let overlay_count = txn.scan_overlay_count(tenant, database, table, Some(start_after));
         let scan_limit = limit.saturating_add(overlay_count);
         let engine = self
@@ -1309,7 +1562,8 @@ impl TxnManager {
         limit: usize,
         fallback: impl FnOnce(usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        txn.scanned.insert((tenant.to_string(), database.to_string(), table.to_string()));
+        txn.ensure_healthy()?;
+        txn.record_scan(tenant, database, table)?;
         let overlay_count = txn.scan_overlay_count(tenant, database, table, Some(start_after));
         let scan_limit = limit.saturating_add(overlay_count);
         let rows = fallback(scan_limit)?;
@@ -2336,8 +2590,22 @@ impl DurableManager {
         }
     }
 
+    pub fn try_put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) -> Result<()> {
+        self.inner.try_put(txn, key, value)
+    }
+
     pub fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
         self.inner.put(txn, key, value);
+    }
+
+    pub fn try_put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) -> Result<()> {
+        self.inner.try_put_with_ttl(txn, key, value, expires_at)
     }
 
     pub fn put_with_ttl(
@@ -2348,6 +2616,10 @@ impl DurableManager {
         expires_at: u64,
     ) {
         self.inner.put_with_ttl(txn, key, value, expires_at);
+    }
+
+    pub fn try_delete(&self, txn: &mut Transaction, key: RecordKey) -> Result<()> {
+        self.inner.try_delete(txn, key)
     }
 
     pub fn delete(&self, txn: &mut Transaction, key: RecordKey) {
@@ -2410,6 +2682,7 @@ impl DurableManager {
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<u64> {
+        txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
@@ -2690,7 +2963,7 @@ mod tests {
         manager.put(&mut txn, written, b"value".to_vec());
         txn.set_isolation(Isolation::Snapshot);
         let state = txn.state();
-        let restored = manager.from_state(state.clone());
+        let restored = manager.from_state(state.clone()).unwrap();
 
         assert_eq!(restored.state(), state);
     }
@@ -3531,5 +3804,84 @@ mod tests {
         let mut total = [0u8; 8];
         total.copy_from_slice(&raw);
         assert_eq!(u64::from_be_bytes(total), 200);
+    }
+
+    #[test]
+    fn transaction_write_budget_rejects_without_staging_or_commit() {
+        let manager = TxnManager::new();
+        let mut txn = manager.begin();
+        for index in 0..MAX_TRANSACTION_WRITE_ENTRIES {
+            manager
+                .try_put(
+                    &mut txn,
+                    RecordKey::new("tenant", "database", "table", index.to_be_bytes().as_slice()),
+                    vec![0],
+                )
+                .unwrap();
+        }
+        let rejected = manager.try_put(
+            &mut txn,
+            RecordKey::new("tenant", "database", "table", b"overflow"),
+            vec![0],
+        );
+        assert!(matches!(rejected, Err(RymeError::Overload(message)) if message == "transaction write set"));
+        assert_eq!(txn.writes().len(), MAX_TRANSACTION_WRITE_ENTRIES);
+        assert!(matches!(manager.commit(txn), Err(RymeError::Overload(message)) if message == "transaction write set"));
+    }
+
+    #[test]
+    fn transaction_state_budget_rejects_oversized_value_before_staging() {
+        let manager = TxnManager::new();
+        let mut txn = manager.begin();
+        let result = manager.try_put(
+            &mut txn,
+            RecordKey::new("tenant", "database", "table", b"oversized"),
+            vec![0; MAX_TRANSACTION_STATE_BYTES],
+        );
+        assert!(matches!(result, Err(RymeError::Overload(message)) if message == "transaction state bytes"));
+        assert!(txn.writes().is_empty());
+        assert!(matches!(manager.commit(txn), Err(RymeError::Overload(message)) if message == "transaction state bytes"));
+    }
+
+    #[test]
+    fn transaction_state_restore_preserves_budget_accounting() {
+        let manager = TxnManager::new();
+        let mut txn = manager.begin();
+        manager
+            .try_put(&mut txn, RecordKey::new("t", "d", "table", b"before"), b"value".to_vec())
+            .unwrap();
+        let checkpoint = txn.checkpoint();
+        manager
+            .try_put(&mut txn, RecordKey::new("t", "d", "table", b"after"), b"value".to_vec())
+            .unwrap();
+        txn.restore_checkpoint(&checkpoint);
+        manager
+            .try_put(&mut txn, RecordKey::new("t", "d", "table", b"replacement"), b"value".to_vec())
+            .unwrap();
+        assert_eq!(txn.writes().len(), 2);
+        manager.commit(txn).unwrap();
+    }
+
+    #[test]
+    fn transaction_state_reconstruction_rejects_oversized_input() {
+        let manager = TxnManager::new();
+        let state = TransactionState {
+            read_ts: 1,
+            writes: (0..=MAX_TRANSACTION_WRITE_ENTRIES)
+                .map(|index| {
+                    (
+                        RecordKey::new("t", "d", "table", index.to_be_bytes().as_slice()),
+                        WriteOp::put(vec![0]),
+                    )
+                })
+                .collect(),
+            read_set: Vec::new(),
+            observed: Vec::new(),
+            scanned: Vec::new(),
+            constraint_scanned: Vec::new(),
+            isolation: Isolation::Serializable,
+            route_generation: None,
+        };
+        assert!(matches!(manager.from_state(state), Err(RymeError::Overload(message)) if message == "transaction write set"));
     }
 }

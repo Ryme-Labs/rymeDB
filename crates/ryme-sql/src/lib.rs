@@ -10212,7 +10212,7 @@ where
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
         if table_indexes.iter().any(|state| state.definition.unique) {
-            txn.record_constraint_scan(&self.tenant, &self.database, table);
+            txn.record_constraint_scan(&self.tenant, &self.database, table)?;
         }
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
@@ -12266,12 +12266,14 @@ where
             statement if statement.is_write() => self.ensure_table(statement.table()),
             _ => {}
         }
-        match statement {
+        let result = match statement {
             Statement::Returning { statement, fields } => {
                 self.execute_returning_in_transaction(txn, *statement, fields).await
             }
             statement => self.execute_in_transaction_base(txn, statement).await,
-        }
+        }?;
+        txn.ensure_healthy()?;
+        Ok(result)
     }
 
     async fn execute_in_transaction_base(
@@ -13048,7 +13050,7 @@ where
                         &unique_index,
                         &incoming_index,
                     )? {
-                        txn.record_constraint_scan(&self.tenant, &self.database, table);
+                        txn.record_constraint_scan(&self.tenant, &self.database, table)?;
                         let mut candidate_pks = candidates;
                         candidate_pks.extend(
                             txn.writes()

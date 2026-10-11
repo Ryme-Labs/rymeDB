@@ -2473,7 +2473,7 @@ impl Node {
             Rpc::ProposeTransaction { payload } => {
                 let state: ryme_txn::TransactionState = serde_json::from_slice(&payload)
                     .map_err(|error| RymeError::Corrupt(format!("transaction: {error}")))?;
-                let txn = self.manager.from_state(state);
+                let txn = self.manager.from_state(state)?;
                 match self.forward_transaction_to_leader(txn).await {
                     Ok(commit_ts) => Ok(Rpc::ProposeTransactionResponse {
                         commit_ts: Some(commit_ts),
@@ -2489,7 +2489,7 @@ impl Node {
                 let _commit = self.txn_commit_lock.lock().await;
                 let state: ryme_txn::TransactionState = serde_json::from_slice(&payload)
                     .map_err(|error| RymeError::Corrupt(format!("transaction prepare: {error}")))?;
-                let txn = self.manager.from_state(state.clone());
+                let txn = self.manager.from_state(state.clone())?;
                 match self.prepare_intent(transaction_id, commit_ts, state, &txn) {
                     Ok(()) => Ok(Rpc::PrepareTransactionResponse { prepared: true, error: None }),
                     Err(error) => Ok(Rpc::PrepareTransactionResponse {
@@ -3310,7 +3310,7 @@ impl Node {
             return Err(RymeError::Conflict(String::from("transaction already prepared")));
         }
         for existing in prepared.values() {
-            let other = self.manager.from_state(existing.state.clone());
+            let other = self.manager.from_state(existing.state.clone())?;
             if transactions_conflict(txn, &other) {
                 return Err(RymeError::Conflict(String::from("prepared transaction conflict")));
             }
@@ -3331,7 +3331,7 @@ impl Node {
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("prepared transactions")))?;
             for existing in prepared.values() {
-                let other = self.manager.from_state(existing.state.clone());
+                let other = self.manager.from_state(existing.state.clone())?;
                 if transactions_conflict(txn, &other) {
                     return Err(RymeError::Conflict(String::from("prepared transaction conflict")));
                 }
@@ -3342,7 +3342,7 @@ impl Node {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("range prepared transactions")))?;
         for existing in range_prepared.values() {
-            let other = self.manager.from_state(existing.state.clone());
+            let other = self.manager.from_state(existing.state.clone())?;
             if transactions_conflict(txn, &other) {
                 return Err(RymeError::Conflict(String::from("prepared transaction conflict")));
             }
@@ -3372,7 +3372,7 @@ impl Node {
             if existing_group != group_id {
                 continue;
             }
-            let other = self.manager.from_state(existing.state.clone());
+            let other = self.manager.from_state(existing.state.clone())?;
             if transactions_conflict(txn, &other) {
                 return Err(RymeError::Conflict(String::from("prepared transaction conflict")));
             }
@@ -3396,7 +3396,7 @@ impl Node {
         if self.range_resolution(group_id, transaction_id, commit_ts) == Some(false) {
             return Err(RymeError::Conflict(String::from("transaction already aborted")));
         }
-        let txn = self.manager.from_state(state.clone());
+        let txn = self.manager.from_state(state.clone())?;
         if let Some(expected) = state.route_generation {
             if self.range_generation() != expected {
                 return Err(RymeError::Conflict(String::from("range topology changed")));
@@ -5912,7 +5912,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             if establish_snapshot && observed_read_ts != 0 {
                 txn.restamp(observed_read_ts);
             }
-            txn.record_read(key.clone(), value.is_some());
+            txn.record_read(key.clone(), value.is_some())?;
             Ok(value)
         })
     }
@@ -5933,7 +5933,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             let Some(page) = page else {
                 return node.manager().scan(txn, tenant, database, table, limit);
             };
-            txn.record_scan(tenant, database, table);
+            txn.record_scan(tenant, database, table)?;
             Ok(merge_scan_page(txn, tenant, database, table, None, limit, page))
         })
     }
@@ -5956,7 +5956,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             let Some(page) = page else {
                 return node.manager().scan_after(txn, tenant, database, table, start_after, limit);
             };
-            txn.record_scan(tenant, database, table);
+            txn.record_scan(tenant, database, table)?;
             Ok(merge_scan_page(txn, tenant, database, table, Some(start_after), limit, page))
         })
     }
@@ -6024,6 +6024,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             None
         };
         async move {
+            txn.ensure_healthy()?;
             let result = match routed {
                 Some((Some(owner), writes)) => {
                     node.propose_write_on(owner, writes, route_generation).await

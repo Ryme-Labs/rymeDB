@@ -98,7 +98,12 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
-    fn put(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey, value: Vec<u8>) {
+    fn put(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        key: ryme_storage::RecordKey,
+        value: Vec<u8>,
+    ) {
         match self {
             Self::Single(manager) => manager.put(txn, key, value),
             Self::Cluster(backend) => backend.put(txn, key, value),
@@ -122,7 +127,11 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
-    fn delete(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey) {
+    fn delete(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        key: ryme_storage::RecordKey,
+    ) {
         match self {
             Self::Single(manager) => manager.delete(txn, key),
             Self::Cluster(backend) => backend.delete(txn, key),

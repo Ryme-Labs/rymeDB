@@ -1004,7 +1004,13 @@ impl TxnBackend for ShardSet {
         }
     }
 
-    fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
+    fn put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
         let shard = self.touch(txn, &key);
         if let Some(manager) = self.manager_for(shard) {
             manager.put_with_ttl(txn, key, value, expires_at);
@@ -1039,6 +1045,7 @@ impl TxnBackend for ShardSet {
     fn commit(&self, txn: Transaction) -> impl std::future::Future<Output = Result<u64>> + Send {
         let backend = self.clone();
         async move {
+            txn.ensure_healthy()?;
             let ctx = backend
                 .inner
                 .lock()
@@ -1102,7 +1109,7 @@ impl TxnBackend for ShardSet {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         if let Some(managers) = self.range_scan_managers()? {
-            txn.record_scan(tenant, database, table);
+            txn.record_scan(tenant, database, table)?;
             let scan_limit =
                 limit.saturating_add(txn.scan_overlay_count(tenant, database, table, None));
             let mut rows = Vec::new();
@@ -1131,7 +1138,7 @@ impl TxnBackend for ShardSet {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         if let Some(managers) = self.range_scan_managers()? {
-            txn.record_scan(tenant, database, table);
+            txn.record_scan(tenant, database, table)?;
             let scan_limit = limit.saturating_add(txn.scan_overlay_count(
                 tenant,
                 database,
@@ -1318,7 +1325,13 @@ impl TxnBackend for HybridBackend {
         }
     }
 
-    fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
+    fn put_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: RecordKey,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
         let tier = self.touch(txn, TableRef::of(&key));
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match tier {
@@ -1357,6 +1370,7 @@ impl TxnBackend for HybridBackend {
     fn commit(&self, txn: Transaction) -> impl std::future::Future<Output = Result<u64>> + Send {
         let backend = self.clone();
         async move {
+            txn.ensure_healthy()?;
             let ctx = backend
                 .inner
                 .lock()

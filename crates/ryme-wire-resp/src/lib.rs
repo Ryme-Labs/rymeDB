@@ -1319,6 +1319,10 @@ where
                     bytes = bytes.saturating_add(Self::command_bytes(&queued));
                     replies.push(self.dispatch_in(&mut txn, queued));
                 }
+                if let Err(error) = txn.ensure_healthy() {
+                    self.record_timing("EXEC", start.elapsed().as_micros() as u64);
+                    return encode_error(error.to_string());
+                }
                 let write = !txn.writes().is_empty();
                 if let Some(denied) = self.readonly_deny(write) {
                     self.record_timing("EXEC", start.elapsed().as_micros() as u64);
@@ -1584,6 +1588,10 @@ where
         }
         let mut txn = self.manager.begin();
         let reply = self.dispatch_in(&mut txn, command);
+        if let Err(error) = txn.ensure_healthy() {
+            self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+            return encode_error(error.to_string());
+        }
         let write = !txn.writes().is_empty();
         if let Some(denied) = self.readonly_deny(write) {
             self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
