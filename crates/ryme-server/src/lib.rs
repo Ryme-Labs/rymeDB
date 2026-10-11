@@ -1742,7 +1742,7 @@ impl SharedState {
             )?;
             control.branches.persist(&branch_path)?;
         }
-        let keys = ApiKeyStore::from_snapshot(auth_snapshot.api_keys);
+        let keys = ApiKeyStore::from_snapshot(auth_snapshot.api_keys)?;
         if let Some(api_key) = configured_api_key {
             let mut roles = HashSet::new();
             roles.insert(Role::Superuser);
@@ -1750,7 +1750,7 @@ impl SharedState {
             keys.insert(
                 api_key,
                 Principal { id: String::from("dev"), tenant: tenant.clone(), roles },
-            );
+            )?;
         }
         let jwt = load_jwt_verifier()?;
         let archive = archive_target(&config.archive)?;
@@ -5183,10 +5183,10 @@ async fn auth_verify(State(state): State<SharedState>, body: axum::body::Bytes) 
 fn issue_api_key(
     keys: &ryme_auth::ApiKeyStore,
     principal: &ryme_auth::Principal,
-) -> (String, String) {
+) -> ryme_error::Result<(String, String)> {
     let key = format!("ryme_{}", ryme_auth::base64_url_encode(&ryme_auth::random_bytes(32)));
-    keys.insert(key.clone(), principal.clone());
-    (key, principal.tenant.clone())
+    keys.insert(key.clone(), principal.clone())?;
+    Ok((key, principal.tenant.clone()))
 }
 
 async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
@@ -5216,8 +5216,10 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
             }
             let presented =
                 request.refresh_token.as_deref().ok_or(ryme_error::RymeError::Unauthorized)?;
-            let (principal, refresh_token) = refresh_tokens.rotate(presented, now)?;
-            let (key, tenant) = issue_api_key(&keys, &principal);
+            let ((key, tenant), refresh_token) =
+                refresh_tokens.rotate_with(presented, now, |principal| {
+                    issue_api_key(&keys, principal)
+                })?;
             return Ok((key, tenant, refresh_token));
         }
         if request.grant_type.as_deref().is_some_and(|grant| grant != "password") {
@@ -5245,7 +5247,13 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
             }
         }
         let refresh_token = refresh_tokens.issue(principal.clone(), now)?;
-        let (key, tenant) = issue_api_key(&keys, &principal);
+        let (key, tenant) = match issue_api_key(&keys, &principal) {
+            Ok(issued) => issued,
+            Err(error) => {
+                let _ = refresh_tokens.revoke(&refresh_token);
+                return Err(error);
+            }
+        };
         Ok((key, tenant, refresh_token))
     })
     .await;
@@ -5513,7 +5521,10 @@ async fn passkey_verify(State(state): State<SharedState>, body: axum::body::Byte
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let (key, tenant) = issue_api_key(&keys, &principal);
+    let (key, tenant) = match issue_api_key(&keys, &principal) {
+        Ok(issued) => issued,
+        Err(error) => return error_response(error),
+    };
     complete_auth_attempt(&state, &attempt_key);
     match state.persist_auth() {
         Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
@@ -5607,7 +5618,10 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
             {
                 return error_response(error);
             }
-            let (key, tenant) = issue_api_key(&state.keys, &principal);
+            let (key, tenant) = match issue_api_key(&state.keys, &principal) {
+                Ok(issued) => issued,
+                Err(error) => return error_response(error),
+            };
             complete_auth_attempt(&state, &attempt_key);
             match state.persist_auth() {
                 Ok(()) => {

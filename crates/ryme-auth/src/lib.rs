@@ -168,15 +168,22 @@ pub struct ApiKeyStore {
     inner: Arc<RwLock<HashMap<String, Principal>>>,
 }
 
+const MAX_API_KEYS: usize = 100_000;
+
 impl ApiKeyStore {
     pub fn new() -> Self {
         Self { inner: Arc::new(RwLock::new(HashMap::new())) }
     }
 
-    pub fn insert(&self, api_key: String, principal: Principal) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.insert(Self::digest(&api_key), principal);
+    pub fn insert(&self, api_key: String, principal: Principal) -> Result<()> {
+        let digest = Self::digest(&api_key);
+        let mut guard =
+            self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
+        if guard.len() >= MAX_API_KEYS && !guard.contains_key(&digest) {
+            return Err(RymeError::Overload(String::from("api keys")));
         }
+        guard.insert(digest, principal);
+        Ok(())
     }
 
     pub fn remove(&self, api_key: &str) -> bool {
@@ -204,8 +211,11 @@ impl ApiKeyStore {
             .map_err(|_| RymeError::Internal(String::from("auth lock")))
     }
 
-    pub fn from_snapshot(snapshot: HashMap<String, Principal>) -> Self {
-        Self { inner: Arc::new(RwLock::new(snapshot)) }
+    pub fn from_snapshot(snapshot: HashMap<String, Principal>) -> Result<Self> {
+        if snapshot.len() > MAX_API_KEYS {
+            return Err(RymeError::Corrupt(String::from("api key snapshot")));
+        }
+        Ok(Self { inner: Arc::new(RwLock::new(snapshot)) })
     }
 
     fn digest(api_key: &str) -> String {
@@ -516,18 +526,27 @@ impl RefreshTokenStore {
     }
 
     pub fn rotate(&self, presented: &str, now_secs: u64) -> Result<(Principal, String)> {
+        self.rotate_with(presented, now_secs, |principal| Ok(principal.clone()))
+    }
+
+    pub fn rotate_with<T, F>(&self, presented: &str, now_secs: u64, issue: F) -> Result<(T, String)>
+    where
+        F: FnOnce(&Principal) -> Result<T>,
+    {
         if presented.is_empty() {
             return Err(RymeError::Unauthorized);
         }
         let digest = Self::digest(presented);
         let mut sessions =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        let session = sessions.remove(&digest).ok_or(RymeError::Unauthorized)?;
+        let session = sessions.get(&digest).cloned().ok_or(RymeError::Unauthorized)?;
         if session.expires_at <= now_secs {
             return Err(RymeError::Unauthorized);
         }
+        let issued = issue(&session.principal)?;
         let raw = base64_url_encode(&random_bytes(32));
         let next_digest = Self::digest(&raw);
+        sessions.remove(&digest);
         sessions.insert(
             next_digest,
             RefreshTokenRecord {
@@ -535,7 +554,7 @@ impl RefreshTokenStore {
                 expires_at: now_secs.saturating_add(REFRESH_TOKEN_TTL_SECS),
             },
         );
-        Ok((session.principal, raw))
+        Ok((issued, raw))
     }
 
     pub fn revoke(&self, presented: &str) -> bool {
@@ -1045,10 +1064,12 @@ mod tests {
         let store = ApiKeyStore::new();
         let mut roles = HashSet::new();
         roles.insert(Role::ReadWrite);
-        store.insert(
-            String::from("secret-key"),
-            Principal { id: String::from("u"), tenant: String::from("t"), roles },
-        );
+        store
+            .insert(
+                String::from("secret-key"),
+                Principal { id: String::from("u"), tenant: String::from("t"), roles },
+            )
+            .unwrap();
         assert!(store.authenticate("secret-key").is_ok());
         assert!(store.authenticate("wrong").is_err());
         assert_eq!(store.owner_of("secret-key").map(|p| p.id), Some(String::from("u")));
@@ -1070,7 +1091,13 @@ mod tests {
         assert_eq!(rotated_principal.id, principal.id);
         assert_ne!(first, second);
         assert!(store.rotate(&first, 101).is_err());
-        assert!(store.rotate(&second, 101 + REFRESH_TOKEN_TTL_SECS).is_err());
+        assert!(store
+            .rotate_with::<(), _>(&second, 101, |_| {
+                Err(RymeError::Overload(String::from("test")))
+            })
+            .is_err());
+        let (_, third) = store.rotate(&second, 101).unwrap();
+        assert!(store.rotate(&third, 101 + REFRESH_TOKEN_TTL_SECS).is_err());
         assert_eq!(store.len(), 0);
     }
 
