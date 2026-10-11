@@ -8046,8 +8046,10 @@ async fn text_search(
     }
     let space = index_space(&principal.tenant, &state.database, &request.table);
     let indexes = state.indexes.read().await;
-    let hits = indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10));
-    (StatusCode::OK, Json(hits)).into_response()
+    match indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10)) {
+        Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
+        Err(e) => error_response(e),
+    }
 }
 
 async fn text_delete(
