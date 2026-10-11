@@ -21,6 +21,7 @@ use tokio::sync::broadcast;
 
 const KV_TABLE: &str = "_kv";
 const RESP_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
 const RESP_SCRIPT_MAX_BYTES: usize = 1024 * 1024;
 const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
 const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -29,6 +30,14 @@ const RESP_MAX_PUBSUB_NAME_BYTES: usize = 4 * 1024;
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
 type PubSubCounts = Arc<Mutex<std::collections::HashMap<PubSubKey, usize>>>;
+
+fn check_collection_bytes(bytes: &[u8]) -> std::result::Result<(), String> {
+    if bytes.len() > RESP_MAX_COLLECTION_BYTES {
+        Err(String::from("collection exceeds the 16 MiB limit"))
+    } else {
+        Ok(())
+    }
+}
 
 pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
 
@@ -2599,6 +2608,7 @@ where
         match self.manager.get(txn, &record).unwrap_or(None) {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashMap::new())),
             Some(value) => {
+                check_collection_bytes(&value)?;
                 serde_json::from_slice(&value).map(Some).map_err(|_| String::from("wrong type"))
             }
             None => Ok(None),
@@ -2613,6 +2623,7 @@ where
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
         let raw = serde_json::to_vec(map).map_err(|_| String::from("wrong type"))?;
+        check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
     }
@@ -2626,6 +2637,7 @@ where
         match self.manager.get(txn, &record).unwrap_or(None) {
             Some(value) if value.is_empty() => Ok(Some(Vec::new())),
             Some(value) => {
+                check_collection_bytes(&value)?;
                 serde_json::from_slice(&value).map(Some).map_err(|_| String::from("wrong type"))
             }
             None => Ok(None),
@@ -2640,6 +2652,7 @@ where
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
         let raw = serde_json::to_vec(list).map_err(|_| String::from("wrong type"))?;
+        check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
     }
@@ -2697,6 +2710,7 @@ where
         match self.manager.get(txn, &record).unwrap_or(None) {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashSet::new())),
             Some(value) => {
+                check_collection_bytes(&value)?;
                 let list: Vec<String> =
                     serde_json::from_slice(&value).map_err(|_| String::from("wrong type"))?;
                 Ok(Some(list.into_iter().collect()))
@@ -2715,6 +2729,7 @@ where
         list.sort();
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
         let raw = serde_json::to_vec(&list).map_err(|_| String::from("wrong type"))?;
+        check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
     }
@@ -2728,6 +2743,7 @@ where
         match self.manager.get(txn, &record).unwrap_or(None) {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashMap::new())),
             Some(value) => {
+                check_collection_bytes(&value)?;
                 serde_json::from_slice(&value).map(Some).map_err(|_| String::from("wrong type"))
             }
             None => Ok(None),
@@ -2742,6 +2758,7 @@ where
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
         let raw = serde_json::to_vec(set).map_err(|_| String::from("wrong type"))?;
+        check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
     }
@@ -2943,6 +2960,7 @@ where
         match self.manager.get(txn, &record).unwrap_or(None) {
             Some(value) if value.is_empty() => Ok(Some(StreamData::default())),
             Some(value) => {
+                check_collection_bytes(&value)?;
                 let doc: serde_json::Value =
                     serde_json::from_slice(&value).map_err(|_| String::from("wrong type"))?;
                 if doc.is_array() {
@@ -3011,6 +3029,7 @@ where
             "max_deleted": data.max_deleted,
         }))
         .map_err(|_| String::from("wrong type"))?;
+        check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
     }
@@ -3603,6 +3622,7 @@ where
         match self.manager.get(txn, &record).unwrap_or(None) {
             Some(value) if value.is_empty() => Ok(Some(vec![0; HLL_REGISTERS])),
             Some(value) => {
+                check_collection_bytes(&value)?;
                 let registers: Vec<u8> =
                     serde_json::from_slice(&value).map_err(|_| String::from("wrong type"))?;
                 if registers.len() != HLL_REGISTERS {
@@ -3622,6 +3642,7 @@ where
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
         let raw = serde_json::to_vec(registers).map_err(|_| String::from("wrong type"))?;
+        check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
     }
@@ -3678,6 +3699,7 @@ where
         match self.manager.get(txn, &record).unwrap_or(None) {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashMap::new())),
             Some(value) => {
+                check_collection_bytes(&value)?;
                 let doc: serde_json::Value =
                     serde_json::from_slice(&value).map_err(|_| String::from("wrong type"))?;
                 if let Ok(points) = Self::parse_geo_points(&doc) {
@@ -3720,6 +3742,7 @@ where
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
         let raw = serde_json::to_vec(points).map_err(|_| String::from("wrong type"))?;
+        check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
     }
@@ -6019,6 +6042,12 @@ fn slice_list(list: &[String], start: i64, stop: i64) -> Vec<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_payloads_are_bounded() {
+        assert!(check_collection_bytes(&vec![0; RESP_MAX_COLLECTION_BYTES]).is_ok());
+        assert!(check_collection_bytes(&vec![0; RESP_MAX_COLLECTION_BYTES + 1]).is_err());
+    }
 
     #[test]
     fn resp_decoder_rejects_oversized_frames_before_copying_payload() {
