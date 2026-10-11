@@ -644,7 +644,7 @@ impl SegmentStore {
                     continue;
                 };
                 let value = if expires_at != 0 && expires_at <= now { None } else { value };
-                selected.insert(key.pk, value);
+                selected.insert(key.pk.clone(), value);
             }
             if segment.is_snapshot() {
                 break;
