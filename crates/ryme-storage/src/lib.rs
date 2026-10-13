@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
 
 mod segment;
@@ -130,8 +130,14 @@ struct Version {
 
 #[derive(Debug, Default, Clone)]
 pub struct Engine {
-    inner: BTreeMap<RecordKey, Vec<Version>>,
+    inner: BTreeMap<RecordKey, VecDeque<Version>>,
     bytes_held: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcCursor {
+    key: RecordKey,
+    inclusive: bool,
 }
 
 impl Engine {
@@ -201,7 +207,7 @@ impl Engine {
             return Err(RymeError::InvalidArgument(String::from("commit_ts")));
         }
         let versions = self.inner.entry(key).or_default();
-        if let Some(last) = versions.last() {
+        if let Some(last) = versions.back() {
             if commit_ts <= last.commit_ts {
                 return Err(RymeError::Conflict(String::from("stale commit_ts")));
             }
@@ -209,7 +215,7 @@ impl Engine {
         if let Some(v) = value.as_ref() {
             self.bytes_held += v.len() as u64;
         }
-        versions.push(Version { commit_ts, value, expires_at });
+        versions.push_back(Version { commit_ts, value, expires_at });
         Ok(())
     }
 
@@ -220,8 +226,18 @@ impl Engine {
         version.value.clone()
     }
 
-    fn version_index_at(versions: &[Version], read_ts: u64) -> Option<usize> {
-        versions.partition_point(|version| version.commit_ts <= read_ts).checked_sub(1)
+    fn version_index_at(versions: &VecDeque<Version>, read_ts: u64) -> Option<usize> {
+        let mut low = 0;
+        let mut high = versions.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if versions.get(middle)?.commit_ts <= read_ts {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low.checked_sub(1)
     }
 
     pub fn read(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
@@ -296,7 +312,7 @@ impl Engine {
         tenant: &'a str,
         database: &'a str,
         table: &'a str,
-    ) -> impl Iterator<Item = (&'a RecordKey, &'a Vec<Version>)> + 'a {
+    ) -> impl Iterator<Item = (&'a RecordKey, &'a VecDeque<Version>)> + 'a {
         let start = RecordKey::new(tenant, database, table, &[]);
         self.inner.range((Bound::Included(start), Bound::Unbounded)).take_while(move |(key, _)| {
             key.tenant == tenant && key.database == database && key.table == table
@@ -374,7 +390,7 @@ impl Engine {
             let (last, known) = histories.entry(key.clone()).or_insert_with(|| {
                 let existing = self.inner.get(&key);
                 (
-                    existing.and_then(|versions| versions.last().map(|version| version.commit_ts)),
+                    existing.and_then(|versions| versions.back().map(|version| version.commit_ts)),
                     BTreeMap::new(),
                 )
             });
@@ -419,7 +435,7 @@ impl Engine {
                 if entry.iter().any(|existing: &Version| existing.commit_ts == version.commit_ts) {
                     continue;
                 }
-                if let Some(last) = entry.last() {
+                if let Some(last) = entry.back() {
                     if version.commit_ts < last.commit_ts {
                         return Err(RymeError::Corrupt(String::from("version order")));
                     }
@@ -427,7 +443,7 @@ impl Engine {
                 if let Some(value) = version.value.as_ref() {
                     self.bytes_held += value.len() as u64;
                 }
-                entry.push(Version {
+                entry.push_back(Version {
                     commit_ts: version.commit_ts,
                     value: version.value,
                     expires_at: version.expires_at,
@@ -559,12 +575,12 @@ impl Engine {
     pub fn latest_version(&self, key: &RecordKey) -> Option<(u64, Option<Vec<u8>>, u64)> {
         self.inner
             .get(key)?
-            .last()
+            .back()
             .map(|version| (version.commit_ts, version.value.clone(), version.expires_at))
     }
 
     pub fn latest_commit_ts(&self, key: &RecordKey) -> Option<u64> {
-        self.inner.get(key)?.last().map(|version| version.commit_ts)
+        self.inner.get(key)?.back().map(|version| version.commit_ts)
     }
 
     pub fn expired(
@@ -627,63 +643,102 @@ impl Engine {
     }
 
     pub fn gc(&mut self, retain_ts: u64) {
-        self.gc_batch(retain_ts, None, usize::MAX);
+        let mut cursor = None;
+        loop {
+            let (next, complete) =
+                self.gc_batch(retain_ts, cursor.as_ref(), usize::MAX, usize::MAX);
+            if complete {
+                break;
+            }
+            cursor = next;
+        }
     }
 
-    /// Collects at most `max_keys` keys after `after`, returning a cursor and
-    /// whether the ordered keyspace is fully visited. Keeping the cursor
-    /// outside the engine lets callers release the engine lock between pages.
+    /// Collects bounded key/version work, returning a cursor and whether the
+    /// ordered keyspace is fully visited. Keeping the cursor outside the engine
+    /// lets callers release the engine lock between pages.
     pub fn gc_batch(
         &mut self,
         retain_ts: u64,
-        after: Option<&RecordKey>,
+        cursor: Option<&GcCursor>,
         max_keys: usize,
-    ) -> (Option<RecordKey>, bool) {
-        if max_keys == 0 {
-            return (after.cloned(), false);
+        max_versions: usize,
+    ) -> (Option<GcCursor>, bool) {
+        if max_keys == 0 || max_versions == 0 {
+            return (cursor.cloned(), false);
         }
         let mut reclaimed_bytes = 0u64;
-        let (cursor, complete) = {
-            let bounds: (Bound<&RecordKey>, Bound<&RecordKey>) = match after {
-                Some(key) => (Bound::Excluded(key), Bound::Unbounded),
+        let (next_cursor, complete) = {
+            let bounds: (Bound<&RecordKey>, Bound<&RecordKey>) = match cursor {
+                Some(cursor) if cursor.inclusive => {
+                    (Bound::Included(&cursor.key), Bound::Unbounded)
+                }
+                Some(cursor) => (Bound::Excluded(&cursor.key), Bound::Unbounded),
                 None => (Bound::Unbounded, Bound::Unbounded),
             };
             let mut entries = self.inner.range_mut(bounds);
-            let mut visited = 0usize;
+            let mut visited_keys = 0usize;
+            let mut removed_versions = 0usize;
             let mut last_key = None;
-            while visited < max_keys {
+            let mut resume_current = false;
+            while visited_keys < max_keys && removed_versions < max_versions {
                 let Some((key, versions)) = entries.next() else { break };
-                let mut keep_from = 0;
-                for (index, version) in versions.iter().enumerate() {
-                    if version.commit_ts <= retain_ts {
-                        keep_from = index;
-                    } else {
-                        break;
+                let eligible = Self::version_partition_at(versions, retain_ts);
+                let removable = eligible.saturating_sub(1);
+                let remove_count = removable.min(max_versions - removed_versions);
+                for _ in 0..remove_count {
+                    if let Some(version) = versions.pop_front() {
+                        if let Some(value) = version.value {
+                            reclaimed_bytes = reclaimed_bytes.saturating_add(value.len() as u64);
+                        }
                     }
                 }
-                if keep_from > 0 {
-                    reclaimed_bytes = reclaimed_bytes.saturating_add(
-                        versions
-                            .drain(0..keep_from)
-                            .filter_map(|version| version.value)
-                            .map(|value| value.len() as u64)
-                            .sum::<u64>(),
-                    );
+                if max_versions != usize::MAX
+                    && versions.len() <= max_versions
+                    && versions.capacity() > versions.len().saturating_mul(2)
+                {
+                    versions.shrink_to_fit();
                 }
-                visited += 1;
+                removed_versions += remove_count;
+                visited_keys += 1;
                 last_key = Some(key);
+                if remove_count < removable {
+                    resume_current = true;
+                    break;
+                }
             }
             let has_more = entries.next().is_some();
-            (has_more.then(|| last_key.cloned()).flatten(), !has_more)
+            let next_cursor = if resume_current {
+                last_key.cloned().map(|key| GcCursor { key, inclusive: true })
+            } else if has_more {
+                last_key.cloned().map(|key| GcCursor { key, inclusive: false })
+            } else {
+                None
+            };
+            (next_cursor, !resume_current && !has_more)
         };
         self.bytes_held = self.bytes_held.saturating_sub(reclaimed_bytes);
-        (cursor, complete)
+        (next_cursor, complete)
+    }
+
+    fn version_partition_at(versions: &VecDeque<Version>, read_ts: u64) -> usize {
+        let mut low = 0;
+        let mut high = versions.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if versions[middle].commit_ts <= read_ts {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
     }
 
     pub fn max_commit_ts(&self) -> u64 {
         self.inner
             .values()
-            .filter_map(|versions| versions.last().map(|v| v.commit_ts))
+            .filter_map(|versions| versions.back().map(|v| v.commit_ts))
             .max()
             .unwrap_or(0)
     }
@@ -770,7 +825,7 @@ impl Engine {
             if vcount > 1_000_000 {
                 return Err(RymeError::Corrupt(String::from("snapshot versions")));
             }
-            let mut versions = Vec::with_capacity(vcount.min(64));
+            let mut versions = VecDeque::with_capacity(vcount.min(64));
             let mut previous_commit_ts = None;
             for _ in 0..vcount {
                 let commit_ts = take_u64(&mut cursor)?;
@@ -790,7 +845,7 @@ impl Engine {
                     return Err(RymeError::Corrupt(String::from("snapshot tombstone")));
                 };
                 let expires_at = if version == 2 { take_u64(&mut cursor)? } else { 0 };
-                versions.push(Version { commit_ts, value, expires_at });
+                versions.push_back(Version { commit_ts, value, expires_at });
             }
             let key = RecordKey { tenant, database, table, pk };
             if engine.inner.contains_key(&key) {
@@ -823,7 +878,7 @@ impl Engine {
     }
 }
 
-fn version_payload_bytes(versions: &[Version]) -> u64 {
+fn version_payload_bytes(versions: &VecDeque<Version>) -> u64 {
     versions
         .iter()
         .filter_map(|version| version.value.as_ref())
@@ -1000,16 +1055,16 @@ mod tests {
             }
         }
 
-        let (cursor, complete) = engine.gc_batch(2, None, 2);
+        let (cursor, complete) = engine.gc_batch(2, None, 2, 100);
         assert!(!complete);
-        assert_eq!(cursor, Some(keys[1].clone()));
+        assert_eq!(cursor.as_ref().map(|cursor| cursor.key.clone()), Some(keys[1].clone()));
         assert_eq!(engine.version_at(&keys[0], 1), None);
         assert!(engine.version_at(&keys[2], 1).is_some());
 
-        let (cursor, complete) = engine.gc_batch(2, cursor.as_ref(), 2);
+        let (cursor, complete) = engine.gc_batch(2, cursor.as_ref(), 2, 100);
         assert!(!complete);
-        assert_eq!(cursor, Some(keys[3].clone()));
-        let (cursor, complete) = engine.gc_batch(2, cursor.as_ref(), 2);
+        assert_eq!(cursor.as_ref().map(|cursor| cursor.key.clone()), Some(keys[3].clone()));
+        let (cursor, complete) = engine.gc_batch(2, cursor.as_ref(), 2, 100);
         assert!(complete);
         assert_eq!(cursor, None);
 
@@ -1018,6 +1073,37 @@ mod tests {
             assert_eq!(engine.version_at(key, 2), Some((2, Some(vec![2]), 0)));
             assert_eq!(engine.version_at(key, 3), Some((3, Some(vec![3]), 0)));
         }
+    }
+
+    #[test]
+    fn gc_batches_bound_work_for_a_single_long_history() {
+        let mut engine = Engine::new();
+        let key = RecordKey::new("t", "d", "history", b"hot");
+        for commit_ts in 1..=10 {
+            engine.apply(key.clone(), commit_ts, Some(vec![commit_ts as u8])).unwrap();
+        }
+        let initial_capacity = engine.inner.get(&key).unwrap().capacity();
+
+        let (cursor, complete) = engine.gc_batch(9, None, 1, 3);
+        assert!(!complete);
+        let cursor = cursor.unwrap();
+        assert_eq!(cursor.key, key);
+        assert!(cursor.inclusive);
+        assert_eq!(engine.version_at(&key, 3), None);
+
+        let (cursor, complete) = engine.gc_batch(9, Some(&cursor), 1, 3);
+        assert!(!complete);
+        let cursor = cursor.unwrap();
+        assert_eq!(cursor.key, key);
+        assert!(cursor.inclusive);
+
+        let (cursor, complete) = engine.gc_batch(9, Some(&cursor), 1, 3);
+        assert!(complete);
+        assert_eq!(cursor, None);
+        assert_eq!(engine.bytes_held(), 2);
+        assert!(engine.inner.get(&key).unwrap().capacity() < initial_capacity);
+        assert_eq!(engine.read(&key, 9, 0).unwrap(), Some(vec![9]));
+        assert_eq!(engine.read(&key, 10, 0).unwrap(), Some(vec![10]));
     }
 
     #[test]

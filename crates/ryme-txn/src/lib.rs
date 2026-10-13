@@ -18,6 +18,7 @@ pub const MAX_TRANSACTION_STATE_BYTES: usize = 64 * 1024 * 1024;
 
 const TRANSACTION_ENTRY_OVERHEAD: usize = 64;
 const MVCC_GC_KEYS_PER_LOCK: usize = 1_024;
+const MVCC_GC_VERSIONS_PER_LOCK: usize = 4_096;
 
 fn transaction_key_bytes(key: &RecordKey) -> usize {
     TRANSACTION_ENTRY_OVERHEAD
@@ -1626,7 +1627,7 @@ impl TxnManager {
     }
 
     pub fn gc_oldest(&self) -> Result<u64> {
-        let mut cursor = None;
+        let mut cursor: Option<ryme_storage::GcCursor> = None;
         let horizon = loop {
             let (next, complete, batch_horizon) = {
                 let _commit = self
@@ -1650,8 +1651,12 @@ impl TxnManager {
                     .engine
                     .write()
                     .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-                let (next, complete) =
-                    engine.gc_batch(batch_horizon, cursor.as_ref(), MVCC_GC_KEYS_PER_LOCK);
+                let (next, complete) = engine.gc_batch(
+                    batch_horizon,
+                    cursor.as_ref(),
+                    MVCC_GC_KEYS_PER_LOCK,
+                    MVCC_GC_VERSIONS_PER_LOCK,
+                );
                 (next, complete, batch_horizon)
             };
             if complete {
@@ -3342,14 +3347,19 @@ mod tests {
             manager.put(&mut updates, key.clone(), vec![2]);
         }
         manager.commit(updates).unwrap();
+        let mut newest = manager.begin();
+        for key in &keys {
+            manager.put(&mut newest, key.clone(), vec![3]);
+        }
+        manager.commit(newest).unwrap();
 
-        assert_eq!(manager.memory_bytes().unwrap(), 4_100);
+        assert_eq!(manager.memory_bytes().unwrap(), 6_150);
         manager.gc_oldest().unwrap();
         assert_eq!(manager.memory_bytes().unwrap(), 2_050);
 
         let mut read = manager.begin();
         for key in &keys {
-            assert_eq!(manager.get(&mut read, key).unwrap(), Some(vec![2]));
+            assert_eq!(manager.get(&mut read, key).unwrap(), Some(vec![3]));
         }
     }
 
