@@ -485,8 +485,15 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Opt
     let value = vec![7u8; value_bytes];
     let workers = concurrency.max(1).min(ops.max(1));
     let keyspace = keyspace.unwrap_or(ops).max(1);
+    let warmup_ops = if keyspace < ops { keyspace } else { 0 };
+    for index in 0..warmup_ops {
+        let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
+        let mut txn = manager.begin();
+        manager.put(&mut txn, key, value.clone());
+        manager.commit(txn).expect("local benchmark warmup commit failed");
+    }
     println!(
-        "benchmark=txn-local value_bytes={value_bytes} keyspace={keyspace} metadata={}",
+        "benchmark=txn-local value_bytes={value_bytes} keyspace={keyspace} warmup_ops={warmup_ops} metadata={}",
         machine_metadata()
     );
     let start = Instant::now();
