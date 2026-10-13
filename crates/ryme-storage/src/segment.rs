@@ -436,7 +436,7 @@ impl SegmentStore {
 
     pub fn write(&self, id: u64, engine: &Engine) -> Result<(SegmentMeta, PathBuf)> {
         let segment = ImmutableSegment::from_engine(id, engine);
-        self.write_segment(segment, true)
+        self.write_segment(segment, true, true)
     }
 
     pub fn write_delta(&self, id: u64, entries: &[SegmentEntry]) -> Result<SegmentMeta> {
@@ -453,7 +453,7 @@ impl SegmentStore {
             return Ok(SegmentMeta { id, max_commit_ts: 0, entries: 0, bytes: 0 });
         }
         let segment = ImmutableSegment::from_entries(id, entries)?;
-        let (meta, _) = self.write_segment(segment, sync)?;
+        let (meta, _) = self.write_segment(segment, sync, false)?;
         Ok(meta)
     }
 
@@ -461,6 +461,7 @@ impl SegmentStore {
         &self,
         segment: ImmutableSegment,
         sync: bool,
+        update_latest_pointer: bool,
     ) -> Result<(SegmentMeta, PathBuf)> {
         let id = segment.meta.id;
         if let Ok(mut cache) = self.cache.lock() {
@@ -483,21 +484,23 @@ impl SegmentStore {
         }
         std::fs::rename(&temporary, &path)?;
         self.remember_segment(path.clone());
-        let latest = self.dir.join("latest");
-        let latest_tmp = self.dir.join("latest.tmp");
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| RymeError::Internal(String::from("segment name")))?;
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&latest_tmp)?;
-            file.write_all(name.as_bytes())?;
-            if sync {
-                file.sync_data()?;
+        if update_latest_pointer {
+            let latest = self.dir.join("latest");
+            let latest_tmp = self.dir.join("latest.tmp");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| RymeError::Internal(String::from("segment name")))?;
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&latest_tmp)?;
+                file.write_all(name.as_bytes())?;
+                if sync {
+                    file.sync_data()?;
+                }
             }
+            std::fs::rename(latest_tmp, latest)?;
         }
-        std::fs::rename(latest_tmp, latest)?;
         if sync {
             sync_directory(&self.dir)?;
         }
@@ -696,23 +699,41 @@ impl SegmentStore {
 
     pub fn latest_path(&self) -> Result<Option<PathBuf>> {
         let pointer = self.dir.join("latest");
-        if let Ok(raw) = std::fs::read(&pointer) {
+        let pointed = if let Ok(raw) = std::fs::read(&pointer) {
             let name = String::from_utf8(raw)
                 .map_err(|_| RymeError::Corrupt(String::from("segment pointer")))?;
             let name = name.trim();
             if !name.is_empty() && parse_segment_name(name).is_some() && !name.contains('/') {
                 let path = self.dir.join(name);
                 if path.is_file() {
-                    return Ok(Some(path));
+                    Some(path)
+                } else {
+                    return Err(RymeError::Corrupt(String::from("segment pointer")));
                 }
+            } else {
+                return Err(RymeError::Corrupt(String::from("segment pointer")));
             }
-            return Err(RymeError::Corrupt(String::from("segment pointer")));
-        }
+        } else {
+            None
+        };
         let mut paths = self.segment_paths()?;
         paths.sort_by_key(|path| {
             parse_segment_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
         });
-        Ok(paths.pop())
+        let newest = paths.pop();
+        Ok(match (pointed, newest) {
+            (Some(pointed), Some(newest)) => {
+                let pointed_id = parse_segment_name(
+                    pointed.file_name().and_then(|name| name.to_str()).unwrap_or(""),
+                );
+                let newest_id = parse_segment_name(
+                    newest.file_name().and_then(|name| name.to_str()).unwrap_or(""),
+                );
+                if newest_id > pointed_id { Some(newest) } else { Some(pointed) }
+            }
+            (Some(pointed), None) => Some(pointed),
+            (None, newest) => newest,
+        })
     }
 
     pub fn segment_paths(&self) -> Result<Vec<PathBuf>> {
@@ -1045,6 +1066,40 @@ mod tests {
         let segment = reopened.latest().unwrap().unwrap();
         assert_eq!(segment.meta().max_commit_ts, 42);
         assert_eq!(segment.get(&key, 42, 0).unwrap(), Some(b"value".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delta_write_keeps_snapshot_pointer_but_latest_tracks_new_delta() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-latest-delta-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let key = RecordKey::new("tenant", "db", "items", b"k");
+        let mut engine = Engine::new();
+        engine.apply(key.clone(), 1, Some(b"one".to_vec())).unwrap();
+        store.write(1, &engine).unwrap();
+        store
+            .write_delta(
+                2,
+                &[SegmentEntry {
+                    key,
+                    commit_ts: 2,
+                    value: Some(b"two".to_vec()),
+                    expires_at: 0,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(std::fs::read(dir.join("latest")).unwrap(), segment_name(1).as_bytes());
+        assert_eq!(
+            store.latest_path().unwrap().unwrap().file_name().unwrap().to_str().unwrap(),
+            segment_name(2)
+        );
+        assert_eq!(store.latest().unwrap().unwrap().meta().max_commit_ts, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
