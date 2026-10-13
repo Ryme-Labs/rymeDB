@@ -107,6 +107,22 @@ impl SegmentReadCache {
         segment
     }
 
+    fn get_all_cached(&mut self, ids: &[u64]) -> Option<Vec<Arc<ImmutableSegment>>> {
+        if ids.iter().any(|id| !self.entries.contains_key(id)) {
+            return None;
+        }
+
+        let segments = ids
+            .iter()
+            .map(|id| Arc::clone(&self.entries.get(id).expect("cached segment id").segment))
+            .collect();
+        self.hits = self.hits.saturating_add(ids.len() as u64);
+        for id in ids {
+            self.touch(*id);
+        }
+        Some(segments)
+    }
+
     fn insert(&mut self, id: u64, segment: Arc<ImmutableSegment>, bytes: u64) {
         if self.limit_bytes == 0 || bytes > self.limit_bytes {
             return;
@@ -568,6 +584,14 @@ impl SegmentStore {
         Ok(segment)
     }
 
+    fn read_cached_segments(&self, paths: &[PathBuf]) -> Option<Vec<Arc<ImmutableSegment>>> {
+        let ids = paths
+            .iter()
+            .map(|path| parse_segment_name(path.file_name()?.to_str()?))
+            .collect::<Option<Vec<_>>>()?;
+        self.cache.lock().ok()?.get_all_cached(&ids)
+    }
+
     fn newest_paths(&self) -> Result<Arc<Vec<PathBuf>>> {
         self.paths
             .read()
@@ -671,9 +695,16 @@ impl SegmentStore {
             return Ok(Vec::new());
         }
         let paths = self.newest_paths()?;
+        // `paths` are oldest-first; scans visit newest-first.
+        let mut cached_segments =
+            self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
         let mut segments = Vec::new();
         for path in paths.iter().rev() {
-            let segment = self.read_segment(path)?;
+            let segment = if let Some(cached_segments) = cached_segments.as_mut() {
+                cached_segments.next().expect("cached segment path")
+            } else {
+                self.read_segment(path)?
+            };
             let scope_start = segment
                 .keys
                 .partition_point(|key| scope_order(key, tenant, database, table) == Ordering::Less);
@@ -795,7 +826,11 @@ impl SegmentStore {
                 let newest_id = parse_segment_name(
                     newest.file_name().and_then(|name| name.to_str()).unwrap_or(""),
                 );
-                if newest_id > pointed_id { Some(newest) } else { Some(pointed) }
+                if newest_id > pointed_id {
+                    Some(newest)
+                } else {
+                    Some(pointed)
+                }
             }
             (Some(pointed), None) => Some(pointed),
             (None, newest) => newest,
@@ -1228,12 +1263,7 @@ mod tests {
         store
             .write_delta(
                 2,
-                &[SegmentEntry {
-                    key,
-                    commit_ts: 2,
-                    value: Some(b"two".to_vec()),
-                    expires_at: 0,
-                }],
+                &[SegmentEntry { key, commit_ts: 2, value: Some(b"two".to_vec()), expires_at: 0 }],
             )
             .unwrap();
 
@@ -1549,5 +1579,27 @@ mod tests {
         }
         let queue_limit = cache.entries.len().saturating_mul(2).saturating_add(32);
         assert!(cache.order.len() <= queue_limit);
+    }
+
+    #[test]
+    fn segment_cache_bulk_lookup_requires_all_entries_and_updates_lru() {
+        let segment = Arc::new(ImmutableSegment::from_engine(1, &Engine::new()));
+        let mut cache = SegmentReadCache::new(3);
+        cache.insert(1, Arc::clone(&segment), 1);
+        cache.insert(2, Arc::clone(&segment), 1);
+
+        assert!(cache.get_all_cached(&[1, 2, 3]).is_none());
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 0);
+
+        cache.insert(3, Arc::clone(&segment), 1);
+        assert_eq!(cache.get_all_cached(&[1, 2, 3]).unwrap().len(), 3);
+        assert_eq!(cache.hits, 3);
+
+        cache.insert(4, segment, 1);
+        assert!(!cache.entries.contains_key(&1));
+        assert!(cache.entries.contains_key(&2));
+        assert!(cache.entries.contains_key(&3));
+        assert!(cache.entries.contains_key(&4));
     }
 }
