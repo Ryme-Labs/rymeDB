@@ -1205,7 +1205,7 @@ impl TxnManager {
             .filter(|(key, _)| keep(key))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        self.apply_locked(commit_ts, &writes)?;
+        self.apply_owned_locked(commit_ts, writes)?;
         self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
         Ok(())
     }
@@ -2876,6 +2876,24 @@ fn segment_entries_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filtered_commit_applies_only_owned_writes() {
+        let manager = TxnManager::new();
+        let mut txn = manager.begin();
+        let local = RecordKey::new("t", "d", "local", b"1");
+        let remote = RecordKey::new("t", "d", "remote", b"2");
+        manager.put(&mut txn, local.clone(), b"local".to_vec());
+        manager.put(&mut txn, remote.clone(), b"remote".to_vec());
+
+        manager
+            .commit_filtered_at(&txn, txn.read_ts + 1, |key| key.table == "local")
+            .unwrap();
+
+        let mut read = manager.begin();
+        assert_eq!(manager.get(&mut read, &local).unwrap(), Some(b"local".to_vec()));
+        assert_eq!(manager.get(&mut read, &remote).unwrap(), None);
+    }
 
     #[test]
     fn active_registry_tracks_oldest_timestamp_across_insert_remove_and_restamp() {
