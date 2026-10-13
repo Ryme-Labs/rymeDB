@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+/*
+ * rymeDB Studio theme.
+ * Same token architecture as Supabase Studio (Tailwind v4 `@theme` +
+ * semantic surface tokens), but the brand scale is ryme red instead of
+ * Supabase green (#3ECF8E family). Dark-first like Studio.
+ */
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* ryme brand red scale (replaces Supabase green brand scale) */
+  --color-brand-100: hsl(0, 85%, 98%);
+  --color-brand-200: hsl(0, 80%, 94%);
+  --color-brand-300: hsl(0, 78%, 88%);
+  --color-brand-400: hsl(0, 76%, 76%);
+  --color-brand-500: hsl(0, 72%, 62%);
+  --color-brand-600: hsl(0, 68%, 52%);
+  --color-brand-700: hsl(0, 65%, 44%);
+  --color-brand-800: hsl(0, 62%, 36%);
+  --color-brand-900: hsl(0, 60%, 30%);
+  --color-brand-1000: hsl(0, 58%, 24%);
+
+  /* Studio-like dark surfaces */
+  --color-surface-100: #101014;
+  --color-surface-200: #16161c;
+  --color-surface-300: #1d1d25;
+  --color-surface-400: #26262f;
+
+  --color-border-default: #2a2a34;
+  --color-border-muted: #22222b;
+
+  --color-foreground-default: #ededf0;
+  --color-foreground-light: #c9c9d1;
+  --color-foreground-lighter: #a1a1ab;
+  --color-foreground-muted: #6e6e78;
+
+  --color-success: #3fb950;
+  --color-warning: #d29922;
+  --color-danger: #f85149;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-surface-100);
+  color: var(--color-foreground-default);
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Slim Studio-like scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3a3a45 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #3a3a45;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* Focus ring uses the red brand token, mirroring Studio's green ring */
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-brand-500);
+  outline-offset: 1px;
+}

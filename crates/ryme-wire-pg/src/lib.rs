@@ -182,19 +182,18 @@ impl SessionTransaction {
         Ok(())
     }
 
-    fn restore_metadata_lengths(&mut self, changes_len: usize, notifications_len: usize, listener_changes_len: usize) {
+    fn restore_metadata_lengths(
+        &mut self,
+        changes_len: usize,
+        notifications_len: usize,
+        listener_changes_len: usize,
+    ) {
         self.changes.truncate(changes_len);
-        self.changes_bytes = self
-            .changes
-            .iter()
-            .map(transaction_change_bytes)
-            .fold(0usize, usize::saturating_add);
+        self.changes_bytes =
+            self.changes.iter().map(transaction_change_bytes).fold(0usize, usize::saturating_add);
         self.notifications.truncate(notifications_len);
-        self.notification_bytes = self
-            .notifications
-            .iter()
-            .map(notification_bytes)
-            .fold(0usize, usize::saturating_add);
+        self.notification_bytes =
+            self.notifications.iter().map(notification_bytes).fold(0usize, usize::saturating_add);
         self.listener_changes.truncate(listener_changes_len);
         self.listener_changes_bytes = self
             .listener_changes
@@ -1017,11 +1016,12 @@ where
                                                         count.max(1) as u64,
                                                     );
                                                     observe_statement(&limits, true);
-                                                    let fingerprint = limits.slow_log.as_ref().map(|_| {
-                                                        query_fingerprint(&format!(
-                                                            "COPY {table} FROM STDIN"
-                                                        ))
-                                                    });
+                                                    let fingerprint =
+                                                        limits.slow_log.as_ref().map(|_| {
+                                                            query_fingerprint(&format!(
+                                                                "COPY {table} FROM STDIN"
+                                                            ))
+                                                        });
                                                     record_timing(
                                                         &limits,
                                                         fingerprint,
@@ -3424,25 +3424,30 @@ where
             Ok((result, changes)) => {
                 let change_start = transaction.changes.len();
                 match transaction.append_changes(changes) {
-                Ok(()) => {
-                    if write {
-                        note_range_changes(
-                            &limits.range_hook,
-                            &limits.tenant,
-                            &limits.database,
-                            &table,
-                            &transaction.changes[change_start..],
-                            transaction.changes[change_start..].len().max(1) as u64,
+                    Ok(()) => {
+                        if write {
+                            note_range_changes(
+                                &limits.range_hook,
+                                &limits.tenant,
+                                &limits.database,
+                                &table,
+                                &transaction.changes[change_start..],
+                                transaction.changes[change_start..].len().max(1) as u64,
+                            );
+                        }
+                        observe_statement(limits, write);
+                        record_timing(
+                            limits,
+                            fingerprint,
+                            table,
+                            start.elapsed().as_micros() as u64,
                         );
+                        encode_result(result)
                     }
-                    observe_statement(limits, write);
-                    record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
-                    encode_result(result)
-                }
-                Err(error) => {
-                    transaction.failed = true;
-                    encode_error_code(error_code(&error), error.to_string())
-                }
+                    Err(error) => {
+                        transaction.failed = true;
+                        encode_error_code(error_code(&error), error.to_string())
+                    }
                 }
             }
             Err(error) => {
@@ -3492,7 +3497,7 @@ where
                     transaction.failed = true;
                     Err(error)
                 }
-            }
+            },
             Err(error) => {
                 transaction.failed = true;
                 Err(error)
@@ -5065,9 +5070,7 @@ mod tests {
             failed: false,
             savepoints: Vec::new(),
         };
-        let changes = (0..=MAX_TRANSACTION_CHANGES)
-            .map(|_| template.clone())
-            .collect();
+        let changes = (0..=MAX_TRANSACTION_CHANGES).map(|_| template.clone()).collect();
         assert!(matches!(
             state.append_changes(changes),
             Err(RymeError::Overload(message)) if message == "transaction changes"

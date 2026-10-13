@@ -10297,10 +10297,9 @@ where
         self.ensure_index_entries_for_tenant(table)?;
         let indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
-        let Some(state) = indexes
-            .get(table)
-            .and_then(|states| states.iter().find(|state| state.definition.name == definition.name))
-        else {
+        let Some(state) = indexes.get(table).and_then(|states| {
+            states.iter().find(|state| state.definition.name == definition.name)
+        }) else {
             return Ok(None);
         };
         Ok(Some(
@@ -10355,13 +10354,7 @@ where
         }
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
-            if self.unique_index_conflicts_with_transaction(
-                txn,
-                state,
-                &indexed,
-                pk,
-                excluded_pk,
-            ) {
+            if self.unique_index_conflicts_with_transaction(txn, state, &indexed, pk, excluded_pk) {
                 return Err(RymeError::Conflict(format!("unique index {}", state.definition.name)));
             }
         }
@@ -10379,11 +10372,8 @@ where
         let is_other_pk = |candidate: &[u8]| {
             candidate != pk && excluded_pk.is_none_or(|excluded| candidate != excluded)
         };
-        if state
-            .entries
-            .get(&self.tenant)
-            .and_then(|entries| entries.get(indexed))
-            .is_some_and(|pks| {
+        if state.entries.get(&self.tenant).and_then(|entries| entries.get(indexed)).is_some_and(
+            |pks| {
                 pks.iter().any(|existing| {
                     if !is_other_pk(existing) {
                         return false;
@@ -10403,8 +10393,8 @@ where
                         None => true,
                     }
                 })
-            })
-        {
+            },
+        ) {
             return true;
         }
         txn.writes().iter().any(|(key, write)| {
@@ -13196,11 +13186,9 @@ where
             });
             if let Some(unique_index) = unique_index {
                 if let Some(incoming_index) = index_value(&unique_index, pk, value) {
-                    if let Some(candidates) = self.indexed_candidates_for_value(
-                        table,
-                        &unique_index,
-                        &incoming_index,
-                    )? {
+                    if let Some(candidates) =
+                        self.indexed_candidates_for_value(table, &unique_index, &incoming_index)?
+                    {
                         txn.record_constraint_scan(&self.tenant, &self.database, table)?;
                         let mut candidate_pks = candidates;
                         candidate_pks.extend(
@@ -15542,10 +15530,8 @@ mod tests {
         );
         assert_eq!(budget.rows, MAX_QUERY_MATERIALIZED_ROWS);
 
-        let mut byte_budget = MaterializationBudget {
-            rows: 0,
-            bytes: MAX_QUERY_MATERIALIZED_BYTES - 1,
-        };
+        let mut byte_budget =
+            MaterializationBudget { rows: 0, bytes: MAX_QUERY_MATERIALIZED_BYTES - 1 };
         assert!(byte_budget.add_row(&row).is_err());
         assert_eq!(byte_budget.bytes, MAX_QUERY_MATERIALIZED_BYTES - 1);
 
@@ -17673,10 +17659,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "ryme-schema-persist-failure-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -17698,10 +17681,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "ryme-schema-transaction-persist-failure-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -17718,10 +17698,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(executor
-            .commit_transaction_with_schema(txn, changes, before)
-            .await
-            .is_err());
+        assert!(executor.commit_transaction_with_schema(txn, changes, before).await.is_err());
         assert!(!executor.catalog_tables().contains(&String::from("should_rollback")));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -19106,7 +19083,9 @@ mod tests {
             .await
             .unwrap();
         executor
-            .execute(parse("CREATE UNIQUE INDEX profiles_email_unique ON profiles (email)").unwrap())
+            .execute(
+                parse("CREATE UNIQUE INDEX profiles_email_unique ON profiles (email)").unwrap(),
+            )
             .await
             .unwrap();
 
@@ -19131,7 +19110,9 @@ mod tests {
         executor.commit_transaction(txn, changes).await.unwrap();
 
         let result = executor.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
-        assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 1 && rows[0].0 == b"p1"));
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows.len() == 1 && rows[0].0 == b"p1")
+        );
     }
 
     #[tokio::test]
@@ -19766,10 +19747,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "ryme-bulk-schema-{}-{}.json",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_file(&path);
         let mut executor = Executor::new(String::from("t"), String::from("d"));
@@ -19908,14 +19886,14 @@ mod tests {
     #[tokio::test]
     async fn explain_requires_table_privileges() {
         let executor = Executor::new(String::from("t"), String::from("d"));
-        executor.execute(parse("CREATE TABLE private_rows (id TEXT PRIMARY KEY)").unwrap()).await.unwrap();
+        executor
+            .execute(parse("CREATE TABLE private_rows (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
         executor.execute(parse("CREATE ROLE app_reader LOGIN").unwrap()).await.unwrap();
 
         let reader = executor.clone().with_role(String::from("app_reader"));
-        assert!(matches!(
-            reader.explain("SELECT * FROM private_rows"),
-            Err(RymeError::Forbidden)
-        ));
+        assert!(matches!(reader.explain("SELECT * FROM private_rows"), Err(RymeError::Forbidden)));
 
         executor
             .execute(parse("GRANT SELECT ON TABLE private_rows TO app_reader").unwrap())

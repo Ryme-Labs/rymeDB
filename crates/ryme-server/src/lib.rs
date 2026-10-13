@@ -2533,6 +2533,10 @@ pub fn router(state: SharedState) -> axum::Router {
     axum::Router::new()
         .route("/health", get(health))
         .route("/dashboard", get(dashboard))
+        .route("/dashboard/", get(dashboard))
+        .route("/dashboard/*path", get(dashboard_asset))
+        .route("/v1/dashboard/setup", get(dashboard_setup))
+        .route("/v1/dashboard/bootstrap", post(dashboard_bootstrap))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .route("/metrics/prometheus", get(prometheus))
@@ -3509,13 +3513,99 @@ async fn health() -> &'static str {
     "ok"
 }
 
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../../apps/dashboard/out/"]
+struct DashboardAssets;
+
 async fn dashboard() -> Response {
+    dashboard_file("index.html")
+}
+
+async fn dashboard_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    dashboard_file(&path)
+}
+
+fn dashboard_file(path: &str) -> Response {
+    let candidates = [path.to_owned(), format!("{path}.html"), format!("{path}/index.html")];
+    let Some((asset_path, asset)) = candidates
+        .iter()
+        .find_map(|candidate| DashboardAssets::get(candidate).map(|asset| (candidate, asset)))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = match asset_path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "txt" => "text/plain; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    };
     (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../../../apps/dashboard/web/index.html"),
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        asset.data.into_owned(),
     )
         .into_response()
+}
+
+async fn dashboard_setup(State(state): State<SharedState>) -> Response {
+    match state.credentials.lock() {
+        Ok(credentials) => {
+            Json(serde_json::json!({ "needs_setup": credentials.is_empty() })).into_response()
+        }
+        Err(_) => error_response(ryme_error::RymeError::Internal(String::from("auth lock"))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DashboardBootstrapRequest {
+    id: String,
+    password: String,
+}
+
+fn register_dashboard_admin(
+    credentials: &mut ryme_auth::CredentialStore,
+    id: String,
+    password: &str,
+) -> ryme_error::Result<()> {
+    if !credentials.is_empty() {
+        return Err(ryme_error::RymeError::Conflict(String::from("dashboard already initialized")));
+    }
+    let mut roles = std::collections::HashSet::new();
+    roles.insert(Role::Superuser);
+    credentials.register_password(id, String::from("default"), password, roles)
+}
+
+async fn dashboard_bootstrap(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: DashboardBootstrapRequest = match json_body(&body) {
+        Ok(request) => request,
+        Err(error) => return error_response(error),
+    };
+    let registered = match state.credentials.lock() {
+        Ok(mut credentials) => {
+            register_dashboard_admin(&mut credentials, request.id, &request.password)
+        }
+        Err(_) => Err(ryme_error::RymeError::Internal(String::from("auth lock"))),
+    };
+    match registered {
+        Ok(()) => match state.persist_auth() {
+            Ok(()) => {
+                (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
+            }
+            Err(error) => error_response(error),
+        },
+        Err(error) => error_response(error),
+    }
 }
 
 async fn ready(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -13353,6 +13443,22 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn dashboard_bootstrap_creates_only_one_platform_admin() {
+        let mut credentials = ryme_auth::CredentialStore::new();
+        register_dashboard_admin(&mut credentials, String::from("first-admin"), "long-password")
+            .unwrap();
+        assert!(credentials.principal("first-admin").unwrap().can_platform_admin());
+        assert!(matches!(
+            register_dashboard_admin(
+                &mut credentials,
+                String::from("second-admin"),
+                "another-password"
+            ),
+            Err(ryme_error::RymeError::Conflict(_))
+        ));
+    }
 
     #[test]
     fn user_management_requires_a_matching_tenant_for_self_or_admin() {

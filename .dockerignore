@@ -1,4 +1,6 @@
 target
 node_modules
 dist
+**/.next
+apps/dashboard/out
 *.log

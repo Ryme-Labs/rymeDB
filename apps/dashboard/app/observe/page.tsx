@@ -1,0 +1,156 @@
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { DataTable, cell } from "@/components/studio/data";
+import {
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  Field,
+  Input,
+  QueryError,
+  Row,
+  SectionHeader,
+} from "@/components/studio/ui";
+import { autosplitRanges, fetchRangeLoads, fetchRanges, fetchSlow, fetchTraces } from "@/lib/api";
+import { useConnection } from "@/lib/connection";
+
+export default function ObservePage() {
+  const conn = useConnection();
+  const [slowTable, setSlowTable] = useState("");
+  const [traceTable, setTraceTable] = useState("");
+
+  const ranges = useQuery({
+    queryKey: ["ranges", conn.base, conn.key],
+    queryFn: () => fetchRanges(conn),
+  });
+  const loads = useQuery({
+    queryKey: ["loads", conn.base, conn.key],
+    queryFn: () => fetchRangeLoads(conn),
+  });
+  const slow = useQuery({
+    queryKey: ["slow", conn.base, conn.key, slowTable],
+    queryFn: () => fetchSlow(conn, slowTable || undefined),
+  });
+  const traces = useQuery({
+    queryKey: ["traces", conn.base, conn.key, traceTable],
+    queryFn: () => fetchTraces(conn, traceTable || undefined),
+  });
+
+  const slowRows = Array.isArray((slow.data as { entries?: unknown[] } | undefined)?.entries)
+    ? ((slow.data as { entries: Record<string, unknown>[] }).entries ?? [])
+    : [];
+  const traceRows = Array.isArray((traces.data as { spans?: unknown[] } | undefined)?.spans)
+    ? ((traces.data as { spans: Record<string, unknown>[] }).spans ?? [])
+    : [];
+
+  return (
+    <div>
+      <SectionHeader
+        title="Observe"
+        description="Placement ranges, slow-query log and distributed traces — Studio's Logs & Reports for rymeDB."
+      />
+      <div className="grid gap-3 lg:grid-cols-2">
+        <Card>
+          <CardHeader
+            title="Placement ranges"
+            description="GET /v1/ranges · /v1/ranges/loads"
+            actions={
+              <Button
+                onClick={() => void Promise.all([ranges.refetch(), loads.refetch()])}
+              >
+                Refresh
+              </Button>
+            }
+          />
+          <CardContent>
+            <QueryError error={ranges.error ?? loads.error} />
+            <DataTable
+              columns={[
+                { header: "Range", accessorKey: "id", cell: (c) => <span className="mono">{cell(c.getValue())}</span> },
+                { header: "Epoch", accessorKey: "epoch", cell: (c) => cell(c.getValue()) },
+                { header: "Leader", accessorKey: "leader", cell: (c) => cell(c.getValue()) },
+                { header: "Writes", accessorKey: "writes", cell: (c) => cell(c.getValue()) },
+              ]}
+              rows={(Array.isArray(ranges.data) ? ranges.data : []) as unknown as Record<string, unknown>[]}
+              empty="No ranges reported"
+              dense
+            />
+            <Row className="mt-2">
+              <Button
+                onClick={() =>
+                  void autosplitRanges(conn).then(
+                    () => void Promise.all([ranges.refetch(), loads.refetch()]),
+                  )
+                }
+              >
+                Split hot ranges
+              </Button>
+            </Row>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader title="Slow log" description="GET /v1/observe/slow" />
+          <CardContent>
+            <Row>
+              <Field label="Table filter" className="min-w-40 flex-1">
+                <Input
+                  value={slowTable}
+                  onChange={(e) => setSlowTable(e.target.value)}
+                  placeholder="table filter"
+                />
+              </Field>
+              <Button onClick={() => void slow.refetch()}>Refresh</Button>
+            </Row>
+            <div className="mt-3">
+              <QueryError error={slow.error} />
+              <DataTable
+                columns={[
+                  { header: "Kind", accessorKey: "kind", cell: (c) => cell(c.getValue()) },
+                  { header: "Fingerprint", accessorKey: "fingerprint", cell: (c) => <span className="mono">{cell(c.getValue())}</span> },
+                  { header: "Table", accessorKey: "table", cell: (c) => cell(c.getValue()) },
+                  { header: "µs", accessorKey: "micros", cell: (c) => cell(c.getValue()) },
+                ]}
+                rows={slowRows as Record<string, unknown>[]}
+                empty="No slow statements"
+                dense
+              />
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="mt-3">
+        <CardHeader title="Traces" description="GET /v1/traces" />
+        <CardContent>
+          <Row>
+            <Field label="Table filter" className="min-w-40 flex-1">
+              <Input
+                value={traceTable}
+                onChange={(e) => setTraceTable(e.target.value)}
+                placeholder="table filter"
+              />
+            </Field>
+            <Button onClick={() => void traces.refetch()}>Refresh</Button>
+          </Row>
+          <div className="mt-3">
+            <QueryError error={traces.error} />
+            <DataTable
+              columns={[
+                { header: "Span", accessorKey: "name", cell: (c) => <span className="mono">{cell(c.getValue())}</span> },
+                { header: "Trace", accessorKey: "trace_id", cell: (c) => <span className="mono">{cell(c.getValue())}</span> },
+                { header: "Duration µs", accessorKey: "duration_micros", cell: (c) => cell(c.getValue()) },
+              ]}
+              rows={traceRows as Record<string, unknown>[]}
+              empty="No spans recorded"
+              dense
+            />
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

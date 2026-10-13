@@ -2,6 +2,13 @@
 ARG VERSION=dev
 ARG GIT_SHA=unknown
 
+FROM node:22-bookworm-slim AS dashboard
+WORKDIR /src/apps/dashboard
+COPY apps/dashboard/package.json apps/dashboard/package-lock.json ./
+RUN npm ci
+COPY apps/dashboard/ ./
+RUN npm run build:studio
+
 FROM rust:1.89-bookworm AS build
 ARG VERSION
 ARG GIT_SHA
@@ -13,9 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
-# NOTE: `COPY . .` (not selective manifests) is intentional:
-# ryme-server embeds ../../../apps/dashboard/web/index.html via include_str!,
-# so apps/ must be present in the build context.
+COPY --from=dashboard /src/apps/dashboard/out /src/apps/dashboard/out
+# `ryme-server` embeds this generated static export; the runtime image only
+# needs the Rust binary and does not start a separate Node.js process.
 
 # BuildKit cache mounts keep rebuilds fast in CI and locally.
 # Only the server binary is shipped (bench is CI-only, not copied).
