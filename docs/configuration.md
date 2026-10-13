@@ -65,7 +65,8 @@ When HTTP/HTTPS is behind a reverse proxy,
 set `RYME_TRUSTED_PROXY_CIDRS` to the comma-separated CIDRs of proxies that
 connect directly to RymeDB (for example, `10.20.0.0/16,2001:db8:20::/48`).
 Only those peers may supply `X-Forwarded-For`; the server walks the forwarded
-chain from the trusted side and ignores untrusted header values. Configure the
+chain from the trusted side and ignores untrusted header values. Chains over
+32 hops fall back to the direct peer address for rate limiting. Configure the
 proxy to append the actual client address. Leave this variable unset when
 clients connect directly. Invalid CIDRs prevent startup.
 

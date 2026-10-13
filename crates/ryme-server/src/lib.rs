@@ -622,6 +622,7 @@ const AUTH_ATTEMPT_WINDOW_SECS: u64 = 60;
 const AUTH_ATTEMPTS_PER_IDENTITY: u32 = 5;
 const AUTH_ATTEMPTS_PER_CLIENT: u32 = 120;
 const AUTH_LIMITER_MAX_IDENTITIES: usize = 8192;
+const MAX_FORWARDED_FOR_HOPS: usize = 32;
 const OIDC_STATE_TTL_SECS: u64 = 600;
 const OIDC_STATE_MAX_PENDING: usize = 8192;
 
@@ -738,13 +739,15 @@ fn resolve_client_ip(
         return peer;
     }
     let Some(forwarded_for) = forwarded_for else { return peer };
-    let Some(chain) = forwarded_for
-        .split(',')
-        .map(|value| value.trim().parse::<std::net::IpAddr>().ok())
-        .collect::<Option<Vec<_>>>()
-    else {
+    let mut parts = forwarded_for.split(',');
+    let mut chain = Vec::with_capacity(MAX_FORWARDED_FOR_HOPS);
+    for value in parts.by_ref().take(MAX_FORWARDED_FOR_HOPS) {
+        let Ok(address) = value.trim().parse::<std::net::IpAddr>() else { return peer };
+        chain.push(address);
+    }
+    if parts.next().is_some() {
         return peer;
-    };
+    }
     let mut client = peer;
     for address in chain.iter().rev() {
         if !is_trusted_proxy(client, trusted) {
@@ -886,6 +889,10 @@ mod auth_attempt_limiter_tests {
             client
         );
         assert_eq!(resolve_client_ip(proxy_peer, Some("not-an-ip"), &trusted), proxy_peer);
+        let long_chain = std::iter::repeat_n("10.0.0.3", MAX_FORWARDED_FOR_HOPS + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(resolve_client_ip(proxy_peer, Some(&long_chain), &trusted), proxy_peer);
     }
 }
 
