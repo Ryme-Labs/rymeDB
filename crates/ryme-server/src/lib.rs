@@ -3609,11 +3609,18 @@ fn spawn_gateways(
                 Ok(Err(e)) => tracing::warn!(error = %e, "mvcc gc failed"),
                 Err(e) => tracing::warn!(error = %e, "mvcc gc task failed"),
             }
-            match sweep_state.backend.retention_sweep(sweep_state.snapshot_keep) {
-                Ok((snaps, segs)) if snaps + segs > 0 => {
+            let retention_backend = sweep_state.backend.clone();
+            let snapshot_keep = sweep_state.snapshot_keep;
+            match tokio::task::spawn_blocking(move || {
+                retention_backend.retention_sweep(snapshot_keep)
+            })
+            .await
+            {
+                Ok(Ok((snaps, segs))) if snaps + segs > 0 => {
                     tracing::info!(snapshots = snaps, wal_segments = segs, "pruned retention")
                 }
-                Err(e) => tracing::warn!(error = %e, "retention sweep failed"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "retention sweep failed"),
+                Err(e) => tracing::warn!(error = %e, "retention sweep task failed"),
                 _ => {}
             }
             sweep_state.backend.reconcile_qos(&sweep_state.qos);
