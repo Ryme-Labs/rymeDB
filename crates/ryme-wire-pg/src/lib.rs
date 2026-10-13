@@ -4875,12 +4875,19 @@ mod tests {
         };
         assert_eq!(read_only.sql_role(), "anon");
 
-        let admin = Principal {
+        let tenant_admin = Principal {
             id: String::from("untrusted-id"),
             tenant: String::from("tenant"),
             roles: [Role::Admin].into_iter().collect(),
         };
-        assert_eq!(admin.sql_role(), "postgres");
+        assert_eq!(tenant_admin.sql_role(), "authenticated");
+
+        let platform_admin = Principal {
+            id: String::from("operator"),
+            tenant: String::from("tenant"),
+            roles: [Role::Superuser].into_iter().collect(),
+        };
+        assert_eq!(platform_admin.sql_role(), "postgres");
     }
 
     #[test]
