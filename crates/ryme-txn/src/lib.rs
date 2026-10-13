@@ -2709,7 +2709,7 @@ impl DurableManager {
         let result = self.inner.commit_durable_with(txn, |commit_ts, payload, writes| {
             let mut wal =
                 self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-            wal.append(commit_ts, payload)?;
+            wal.append_lsn(commit_ts, payload)?;
             if policy == SyncPolicy::Always {
                 wal.sync()?;
             }
@@ -2747,7 +2747,7 @@ impl DurableManager {
         {
             let mut wal =
                 self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-            wal.append(commit_ts, &payload)?;
+            wal.append_lsn(commit_ts, &payload)?;
             if self.policy == SyncPolicy::Always {
                 wal.sync()?;
             }

@@ -61,6 +61,13 @@ impl Wal {
     }
 
     pub fn append(&mut self, commit_ts: u64, payload: &[u8]) -> Result<WalRecord> {
+        let lsn = self.append_lsn(commit_ts, payload)?;
+        Ok(WalRecord { lsn, commit_ts, payload: payload.to_vec() })
+    }
+
+    /// Append a record and return its log sequence number without copying the
+    /// payload into a `WalRecord` that the caller may not need.
+    pub fn append_lsn(&mut self, commit_ts: u64, payload: &[u8]) -> Result<u64> {
         if self.poisoned {
             return Err(RymeError::Unavailable(String::from(
                 "wal append failed; reopen the wal before writing again",
@@ -87,7 +94,7 @@ impl Wal {
         }
         self.active_len = self.active_len.saturating_add(frame.len() as u64);
         self.next_lsn = next_lsn;
-        Ok(WalRecord { lsn, commit_ts, payload: payload.to_vec() })
+        Ok(lsn)
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -501,6 +508,21 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].payload, b"hello");
         assert_eq!(records[1].commit_ts, 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_lsn_writes_payload_without_returning_a_copy() {
+        let dir = std::env::temp_dir().join(format!("ryme-wal-lsn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 1024 * 1024).unwrap();
+        assert_eq!(wal.append_lsn(7, b"first").unwrap(), 0);
+        let record = wal.append(8, b"second").unwrap();
+        assert_eq!(record.lsn, 1);
+        assert_eq!(record.payload, b"second");
+        let records = Wal::read_all(&dir).unwrap();
+        assert_eq!(records[0].payload, b"first");
+        assert_eq!(records[1].payload, b"second");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
