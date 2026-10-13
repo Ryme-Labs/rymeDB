@@ -970,12 +970,14 @@ impl TxnManager {
             }
             return Ok(staged.value.clone());
         }
-        let engine = self
-            .inner
-            .engine
-            .read()
-            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        let value = engine.read(key, txn.read_ts, now_unix())?;
+        let value = {
+            let engine = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+            engine.read(key, txn.read_ts, now_unix())?
+        };
         txn.record_read(key.clone(), value.is_some())?;
         Ok(value)
     }
