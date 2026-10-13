@@ -419,11 +419,7 @@ impl Backend {
                 Ok(count)
             }
             Self::Sharded(shards) => {
-                let shard = shards.route_table(tenant, database, table);
-                let manager = shards
-                    .shard_manager(shard)
-                    .ok_or_else(|| ryme_error::RymeError::Unavailable(String::from("shard")))?;
-                let expired = manager.expired_keys(tenant, database, table, limit)?;
+                let expired = shards.expired_keys(tenant, database, table, limit)?;
                 if expired.is_empty() {
                     return Ok(0);
                 }
@@ -465,11 +461,7 @@ impl Backend {
                     }
                     ryme_shard::Tier::Local => {
                         let local = hybrid.local();
-                        let shard = local.route_table(tenant, database, table);
-                        let manager = local.shard_manager(shard).ok_or_else(|| {
-                            ryme_error::RymeError::Unavailable(String::from("shard"))
-                        })?;
-                        let expired = manager.expired_keys(tenant, database, table, limit)?;
+                        let expired = local.expired_keys(tenant, database, table, limit)?;
                         if expired.is_empty() {
                             return Ok(0);
                         }
@@ -13679,13 +13671,7 @@ async fn snapshot_backend_files(
             }
         }
         Backend::Sharded(shards) => {
-            let mut out = Vec::new();
-            for index in 0..shards.shard_count() {
-                let Some(manager) = shards.shard_manager(index) else {
-                    continue;
-                };
-                out.push(manager.write_snapshot()?);
-            }
+            let out = shards.write_snapshots()?;
             if out.is_empty() {
                 return Err(ryme_error::RymeError::Internal(String::from("snapshot")));
             }
@@ -13697,12 +13683,7 @@ async fn snapshot_backend_files(
                 &state.data_dir.join("snapshots"),
             )?];
             let local = hybrid.local();
-            for index in 0..local.shard_count() {
-                let Some(manager) = local.shard_manager(index) else {
-                    continue;
-                };
-                out.push(manager.write_snapshot()?);
-            }
+            out.extend(local.write_snapshots()?);
             Ok(out)
         }
     }

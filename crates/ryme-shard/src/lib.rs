@@ -411,6 +411,31 @@ impl ShardSet {
             .unwrap_or(0)
     }
 
+    pub fn expired_keys(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let _read =
+            self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+        let shard = self.route_table(tenant, database, table);
+        let manager =
+            self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
+        manager.expired_keys(tenant, database, table, limit)
+    }
+
+    pub fn write_snapshots(&self) -> Result<Vec<(u64, std::path::PathBuf)>> {
+        let managers = self
+            .inner
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
+            .shards
+            .clone();
+        managers.iter().map(DurableManager::write_snapshot).collect()
+    }
+
     pub fn gc_oldest(&self) -> Result<u64> {
         let inner =
             self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
@@ -447,7 +472,8 @@ impl ShardSet {
         Ok((pruned, wal_removed))
     }
 
-    pub fn shard_manager(&self, shard: usize) -> Option<DurableManager> {
+    #[cfg(test)]
+    fn shard_manager(&self, shard: usize) -> Option<DurableManager> {
         self.inner.lock().ok()?.shards.get(shard).cloned()
     }
 
@@ -779,16 +805,7 @@ impl ShardSet {
             .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?
             .lock()
             .map_err(|_| RymeError::Internal(String::from("shard commit lock")))?;
-        let latest_commit = self
-            .inner
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
-            .shards
-            .iter()
-            .map(DurableManager::latest_commit)
-            .max()
-            .unwrap_or(0);
-        let commit_ts = self.reserve_commit_ts(latest_commit, txn.read_ts)?;
+        let commit_ts = self.reserve_commit_ts(0, txn.read_ts)?;
         manager.inner().validate_at(&txn, commit_ts)?;
         manager.commit_at(&txn, commit_ts, |_| true)?;
         Ok(commit_ts)
@@ -852,9 +869,7 @@ impl ShardSet {
                 })
             })
             .collect();
-        let latest_commit =
-            inner.shards.iter().map(DurableManager::latest_commit).max().unwrap_or(0);
-        let commit_ts = self.reserve_commit_ts(latest_commit, txn.read_ts)?;
+        let commit_ts = self.reserve_commit_ts(0, txn.read_ts)?;
         for (_, manager) in managers.iter() {
             manager.inner().validate_at(&txn, commit_ts)?;
         }
@@ -1029,12 +1044,8 @@ impl ShardSet {
 impl TxnBackend for ShardSet {
     fn begin(&self) -> Transaction {
         let _write = self.commit.write().unwrap_or_else(|error| error.into_inner());
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let read_ts =
-            inner.shards.iter().map(|shard| shard.inner().latest_commit()).max().unwrap_or(1);
-        drop(inner);
         let mut txn = TxnManager::new().begin();
-        txn.restamp(read_ts);
+        txn.restamp(self.commit_clock.load(Ordering::SeqCst).max(1));
         txn
     }
 
