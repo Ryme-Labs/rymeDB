@@ -32,8 +32,10 @@ repair, WAL/segment growth, archive age, failed drills, connection rejection,
 QoS throttling, p99/p99.9 latency, and repeated SQLSTATE `40001` conflicts.
 
 The JSON metrics endpoint and Prometheus output expose request histograms,
-operation counts, storage/cache state, QoS, ranges, and realtime counters.
-`/v1/observe/slow` and `/v1/traces` provide recent slow operations and spans.
+HTTP 4xx/5xx response totals, operation counts, storage/cache state, QoS,
+ranges, and realtime counters. `/v1/observe/slow` and `/v1/traces` provide
+recent slow operations and spans. The admin dashboard's Observe page also
+shows the persisted security audit trail from `/v1/audit`.
 
 ## QoS and noisy neighbors
 
@@ -64,9 +66,12 @@ an external backup until the rollback window closes.
 
 ## Security operations
 
-Use secret managers for API/JWT/KMS material, rotate keys, limit superuser
-credentials, and audit archive and membership routes. File permissions must
-protect `data_dir`; archive object policies should deny public access.
+Use secret managers for API/JWT/KMS material, rotate keys, and limit superuser
+credentials. The server persists the latest 512 authentication and
+administrative events in `data_dir/audit.json` with owner-only file permissions;
+protect `data_dir` and include it in secure backups. This local trail is not
+tamper-proof against an operator who can modify the data directory. Archive
+object policies should deny public access.
 
 ## Failure response
 

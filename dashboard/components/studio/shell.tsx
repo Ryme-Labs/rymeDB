@@ -40,15 +40,17 @@ const NAV = [
 
 function Logo() {
   return (
-    <div className="flex size-8 items-center justify-center rounded-md bg-brand-600 text-[15px] font-bold text-white shadow-sm">
-      R
-    </div>
+    <img
+      src="/dashboard/rymedb-logo.png"
+      alt="rymeDB"
+      className="size-8 rounded-md object-contain"
+    />
   );
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const { base, key, connected, latencyMs, initialized, needsSetup, login, bootstrap, logout } = useConnection();
+  const { key, connected, latencyMs, initialized, needsSetup, login, bootstrap, logout } = useConnection();
   const [userId, setUserId] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -135,7 +137,6 @@ export function AppShell({ children }: { children: ReactNode }) {
               </span>
             </div>
             <div className="ml-auto flex flex-wrap items-center gap-2">
-              <span className="text-xs text-foreground-muted">{base}</span>
               <Button onClick={logout}>Sign out</Button>
               {connected === null ? (
                 <Pill tone="muted">idle</Pill>

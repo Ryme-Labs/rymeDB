@@ -14,7 +14,15 @@ import {
   Row,
   SectionHeader,
 } from "@/components/studio/ui";
-import { autosplitRanges, fetchRangeLoads, fetchRanges, fetchSlow, fetchTraces } from "@/lib/api";
+import {
+  autosplitRanges,
+  fetchAudit,
+  fetchMetrics,
+  fetchRangeLoads,
+  fetchRanges,
+  fetchSlow,
+  fetchTraces,
+} from "@/lib/api";
 import { useConnection } from "@/lib/connection";
 
 export default function ObservePage() {
@@ -25,6 +33,16 @@ export default function ObservePage() {
   const ranges = useQuery({
     queryKey: ["ranges", conn.base, conn.key],
     queryFn: () => fetchRanges(conn),
+  });
+  const metrics = useQuery({
+    queryKey: ["metrics", conn.base, conn.key],
+    queryFn: () => fetchMetrics(conn),
+    refetchInterval: 5_000,
+  });
+  const audit = useQuery({
+    queryKey: ["audit", conn.base, conn.key],
+    queryFn: () => fetchAudit(conn, 100),
+    refetchInterval: 15_000,
   });
   const loads = useQuery({
     queryKey: ["loads", conn.base, conn.key],
@@ -50,8 +68,19 @@ export default function ObservePage() {
     <div>
       <SectionHeader
         title="Observe"
-        description="Placement ranges, slow-query log and distributed traces — Studio's Logs & Reports for rymeDB."
+        description="Live request health, placement ranges, slow-query log and distributed traces."
       />
+      <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <MetricCard label="HTTP 4xx responses" value={metrics.data?.http_4xx_count} detail="since server start" />
+        <MetricCard label="HTTP 5xx responses" value={metrics.data?.http_5xx_count} detail="since server start" />
+        <MetricCard label="HTTP requests" value={metrics.data?.http_request_count} detail="since server start" />
+        <MetricCard
+          label="p99 latency"
+          value={metrics.data ? `${metrics.data.p99_micros ?? 0}µs` : undefined}
+          detail="recent rolling sample"
+        />
+      </div>
+      <QueryError error={metrics.error} />
       <div className="grid gap-3 lg:grid-cols-2">
         <Card>
           <CardHeader
@@ -124,6 +153,36 @@ export default function ObservePage() {
       </div>
 
       <Card className="mt-3">
+        <CardHeader title="Security audit log" description="Recent authentication and administrative actions. The server retains the latest 512 events on disk." />
+        <CardContent>
+          <QueryError error={audit.error} />
+          <DataTable
+            columns={[
+              { header: "Time", accessorKey: "timestamp_secs", cell: (c) => new Date(Number(c.getValue()) * 1000).toLocaleString() },
+              { header: "Actor", accessorKey: "actor", cell: (c) => cell(c.getValue() ?? "unauthenticated") },
+              { header: "Action", accessorKey: "action", cell: (c) => <span className="mono">{cell(c.getValue())}</span> },
+              { header: "Method", accessorKey: "method", cell: (c) => cell(c.getValue()) },
+              {
+                header: "Result",
+                accessorKey: "status",
+                cell: (c) => {
+                  const status = Number(c.getValue());
+                  return (
+                    <span className={status >= 400 ? "text-danger" : "text-success"}>
+                      {status} {status >= 400 ? "failed" : "ok"}
+                    </span>
+                  );
+                },
+              },
+            ]}
+            rows={audit.data?.events ?? []}
+            empty="No tracked security actions yet"
+            dense
+          />
+        </CardContent>
+      </Card>
+
+      <Card className="mt-3">
         <CardHeader title="Traces" description="GET /v1/traces" />
         <CardContent>
           <Row>
@@ -152,5 +211,17 @@ export default function ObservePage() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+function MetricCard({ label, value, detail }: { label: string; value?: string | number; detail: string }) {
+  return (
+    <Card>
+      <CardContent>
+        <p className="text-xs text-foreground-muted">{label}</p>
+        <p className="mt-1 text-xl font-semibold">{value ?? "—"}</p>
+        <p className="text-xs text-foreground-muted">{detail}</p>
+      </CardContent>
+    </Card>
   );
 }

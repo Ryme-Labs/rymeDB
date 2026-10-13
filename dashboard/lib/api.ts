@@ -75,6 +75,9 @@ export interface MetricsInfo {
   rest_count?: number;
   rest_mean_micros?: number;
   rest_max_micros?: number;
+  http_request_count?: number;
+  http_4xx_count?: number;
+  http_5xx_count?: number;
   p50_micros?: number;
   p90_micros?: number;
   p95_micros?: number;
@@ -87,11 +90,20 @@ export interface ClusterMember {
   self?: boolean;
 }
 export interface ClusterInfo {
+  mode?: "standalone" | "raft";
   term: number;
   leader?: boolean;
   commit: number;
   members: ClusterMember[];
   joint?: number[];
+}
+export interface AuditEvent {
+  timestamp_secs: number;
+  actor?: string | null;
+  method: string;
+  action: string;
+  status: number;
+  outcome: "success" | "failure";
 }
 export interface ShardPlacement {
   table: string;
@@ -128,6 +140,8 @@ export const fetchHealth = (c: Connection) =>
   });
 export const fetchReady = (c: Connection) => get<ReadyInfo>(c, "/ready");
 export const fetchMetrics = (c: Connection) => get<MetricsInfo>(c, "/metrics");
+export const fetchAudit = (c: Connection, limit = 100) =>
+  get<{ events: AuditEvent[] }>(c, `/v1/audit?limit=${limit}`);
 export const fetchCluster = (c: Connection) => get<ClusterInfo>(c, "/v1/cluster/members");
 export const fetchShards = (c: Connection) => get<ShardsInfo>(c, "/v1/shards");
 export const fetchAutoscale = (c: Connection) => get(c, "/v1/autoscale");

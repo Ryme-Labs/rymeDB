@@ -31,7 +31,7 @@ ryme-server --config /etc/rymedb/node.json
 | `pg_listen` | `127.0.0.1:5433` | PostgreSQL wire listener. |
 | `resp_listen` | `127.0.0.1:6380` | RESP listener. |
 | `http_listen` | `127.0.0.1:8080` | REST, GraphQL, WebSocket, and dashboard listener. |
-| `data_dir` | `/var/lib/rymedb` | WAL, schema, auth, branch, topic, snapshot, and placement state. |
+| `data_dir` | `/var/lib/rymedb` | WAL, schema, auth, audit, branch, topic, snapshot, and placement state. |
 | `durability` | `local-durable` | `strict`, `regional-fast`, `local-durable`, or `memory`. Only `memory` skips fsync. |
 | `storage_mode` | `hot` | `hot` keeps the working set materialized; `standard` reads immutable segments through a bounded cache. |
 | `cache_bytes` | `67108864` | Segment cache size. Minimum 1 MiB. |

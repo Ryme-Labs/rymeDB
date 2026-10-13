@@ -39,10 +39,12 @@ export default function HomePage() {
   const metrics = useQuery({
     queryKey: ["metrics", conn.base, conn.key],
     queryFn: () => fetchMetrics(conn),
+    refetchInterval: 5_000,
   });
   const cluster = useQuery({
     queryKey: ["cluster", conn.base, conn.key],
     queryFn: () => fetchCluster(conn),
+    refetchInterval: 10_000,
   });
   const autoscale = useQuery({
     queryKey: ["autoscale", conn.base, conn.key],
@@ -50,6 +52,7 @@ export default function HomePage() {
   });
 
   const members = useMemo(() => cluster.data?.members ?? [], [cluster.data]);
+  const standalone = cluster.data?.mode === "standalone";
 
   return (
     <div>
@@ -94,8 +97,14 @@ export default function HomePage() {
         />
         <Stat
           label="Cluster term"
-          value={cluster.data ? String(cluster.data.term) : "—"}
-          sub={cluster.data ? `${members.length} member(s)` : "waiting for /v1/cluster/members"}
+          value={standalone ? "Standalone" : cluster.data ? String(cluster.data.term) : "—"}
+          sub={
+            standalone
+              ? "Raft clustering is not configured"
+              : cluster.data
+                ? `${members.length} member(s)`
+                : "waiting for /v1/cluster/members"
+          }
         />
       </div>
 
@@ -105,12 +114,32 @@ export default function HomePage() {
         <Stat label="Max latency" value={metrics.data ? `${metrics.data.rest_max_micros ?? 0}µs` : "—"} />
         <Stat label="p95 latency" value={metrics.data ? `${metrics.data.p95_micros ?? 0}µs` : "—"} />
         <Stat label="p999 latency" value={metrics.data ? `${metrics.data.p999_micros ?? 0}µs` : "—"} />
-        <Stat label="Process uptime" value={metrics.data ? `${Math.floor((metrics.data.uptime_secs ?? 0) / 3600)}h ${Math.floor(((metrics.data.uptime_secs ?? 0) % 3600) / 60)}m` : "—"} />
+        <Stat
+          label="Process uptime"
+          value={
+            metrics.data
+              ? `${Math.floor((metrics.data.uptime_secs ?? 0) / 3600)}h ${Math.floor(((metrics.data.uptime_secs ?? 0) % 3600) / 60)}m`
+              : "—"
+          }
+        />
+        <Stat
+          label="HTTP 4xx"
+          value={String(metrics.data?.http_4xx_count ?? "—")}
+          sub="client/auth errors since startup"
+        />
+        <Stat
+          label="HTTP 5xx"
+          value={String(metrics.data?.http_5xx_count ?? "—")}
+          sub="server errors since startup"
+        />
       </div>
 
       <div className="mt-3 grid gap-3 lg:grid-cols-2">
         <Card>
-          <CardHeader title="Cluster members" description="Raft membership via /v1/cluster/members" />
+          <CardHeader
+            title="Cluster members"
+            description={standalone ? "This server is running without Raft clustering" : "Raft membership via /v1/cluster/members"}
+          />
           <CardContent>
             <DataTable columns={memberColumns} rows={members} empty="No members reported" dense />
           </CardContent>

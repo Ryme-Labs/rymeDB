@@ -28,7 +28,7 @@ use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -531,6 +531,93 @@ impl Backend {
 
 type BranchStorage = ryme_branch::BranchBackend<Backend>;
 
+const MAX_AUDIT_EVENTS: usize = 512;
+const MAX_AUDIT_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct AuditEvent {
+    timestamp_secs: u64,
+    actor: Option<String>,
+    method: String,
+    action: String,
+    status: u16,
+    outcome: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuditLog {
+    path: std::path::PathBuf,
+    events: Arc<Mutex<VecDeque<AuditEvent>>>,
+}
+
+impl AuditLog {
+    fn load(path: std::path::PathBuf) -> ryme_error::Result<Self> {
+        let events = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > MAX_AUDIT_FILE_BYTES as u64 => {
+                return Err(ryme_error::RymeError::Overload(String::from("audit log")));
+            }
+            Ok(_) => {
+                let bytes = std::fs::read(&path)?;
+                serde_json::from_slice::<VecDeque<AuditEvent>>(&bytes).map_err(|error| {
+                    ryme_error::RymeError::Corrupt(format!("audit log: {error}"))
+                })?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => VecDeque::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut events = events;
+        while events.len() > MAX_AUDIT_EVENTS {
+            events.pop_front();
+        }
+        Ok(Self { path, events: Arc::new(Mutex::new(events)) })
+    }
+
+    fn record(&self, event: AuditEvent) -> ryme_error::Result<()> {
+        let mut current = self
+            .events
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("audit lock")))?;
+        let mut next = current.clone();
+        next.push_back(event);
+        while next.len() > MAX_AUDIT_EVENTS {
+            next.pop_front();
+        }
+        let bytes = serde_json::to_vec(&next)
+            .map_err(|error| ryme_error::RymeError::Internal(format!("audit log: {error}")))?;
+        if bytes.len() > MAX_AUDIT_FILE_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("audit log")));
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self.path.with_extension("json.tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(temporary, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            sync_metadata_directory(parent)?;
+        }
+        *current = next;
+        Ok(())
+    }
+
+    fn recent(&self, limit: usize) -> Vec<AuditEvent> {
+        self.events
+            .lock()
+            .map(|events| events.iter().rev().take(limit).cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 const AUTH_ATTEMPT_WINDOW_SECS: u64 = 60;
 const AUTH_ATTEMPTS_PER_IDENTITY: u32 = 5;
 const AUTH_ATTEMPTS_GLOBAL: u32 = 120;
@@ -706,6 +793,10 @@ pub struct SharedState {
     control: Arc<Mutex<ControlPlane>>,
     latency: LatencyWindow,
     histogram: Histogram,
+    http_request_count: Arc<AtomicU64>,
+    http_4xx_count: Arc<AtomicU64>,
+    http_5xx_count: Arc<AtomicU64>,
+    audit_log: AuditLog,
     slow_log: SlowLog,
     traces: Arc<Mutex<TraceCollector>>,
     metering: Arc<Mutex<MeterRegistry>>,
@@ -1996,6 +2087,7 @@ impl SharedState {
         let credentials = CredentialStore::from_snapshot(auth_snapshot.users)?;
         let refresh_tokens = RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens)?;
         let passkeys = PasskeyRegistry::from_snapshot(auth_snapshot.passkeys)?;
+        let audit_log = AuditLog::load(config.data_dir.join("audit.json"))?;
         let jwt = load_jwt_verifier()?;
         let archive = archive_target(&config.archive)?;
         let archive_replica = match config.archive_replica.clone() {
@@ -2098,6 +2190,10 @@ impl SharedState {
             control: Arc::new(Mutex::new(control)),
             latency: LatencyWindow::new(),
             histogram: Histogram::new(1024),
+            http_request_count: Arc::new(AtomicU64::new(0)),
+            http_4xx_count: Arc::new(AtomicU64::new(0)),
+            http_5xx_count: Arc::new(AtomicU64::new(0)),
+            audit_log,
             slow_log: SlowLog::new(256),
             traces: Arc::new(Mutex::new(TraceCollector::new(256))),
             metering: Arc::new(Mutex::new(MeterRegistry::new())),
@@ -2540,6 +2636,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .route("/metrics/prometheus", get(prometheus))
+        .route("/v1/audit", get(audit_events))
         .route("/v1/observe/slow", get(slow_log))
         .route("/v1/traces", get(traces))
         .route("/v1/kv/:table/:key", get(kv_get).put(kv_put).delete(kv_delete))
@@ -2631,7 +2728,95 @@ pub fn router(state: SharedState) -> axum::Router {
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_guard))
         .layer(axum::middleware::from_fn(cors_headers))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), record_http_status))
         .with_state(state)
+}
+
+async fn record_http_status(
+    State(state): State<SharedState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let audit_action = is_audited_action(&method, &path).then(|| {
+        request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|matched| matched.as_str().to_owned())
+            .unwrap_or_else(|| String::from("/v1/admin-action"))
+    });
+    let actor = audit_action
+        .as_ref()
+        .and_then(|_| state.principal(request.headers()).ok().map(|principal| principal.id));
+    let response = next.run(request).await;
+    let status = response.status().as_u16();
+    state.http_request_count.fetch_add(1, AtomicOrdering::Relaxed);
+    if (400..500).contains(&status) {
+        state.http_4xx_count.fetch_add(1, AtomicOrdering::Relaxed);
+    } else if status >= 500 {
+        state.http_5xx_count.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    if let Some(action) = audit_action {
+        let event = AuditEvent {
+            timestamp_secs: now_secs(),
+            actor,
+            method,
+            action,
+            status,
+            outcome: if status < 400 { String::from("success") } else { String::from("failure") },
+        };
+        let audit_log = state.audit_log.clone();
+        match tokio::task::spawn_blocking(move || audit_log.record(event)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "failed to persist security audit event");
+            }
+            Err(error) => {
+                tracing::error!(%error, "audit persistence task failed");
+            }
+        }
+    }
+    response
+}
+
+fn is_audited_action(method: &str, path: &str) -> bool {
+    if matches!(path, "/v1/auth/token" | "/v1/auth/verify") {
+        return method == "POST";
+    }
+    if matches!(path, "/v1/auth/keys" | "/v1/dashboard/bootstrap") {
+        return matches!(method, "POST" | "DELETE");
+    }
+    let admin_mutation = [
+        "/v1/branches",
+        "/v1/backups/",
+        "/v1/cluster/",
+        "/v1/migrate/",
+        "/v1/qos/",
+        "/v1/ranges/",
+        "/v1/shards/",
+        "/v1/snapshots",
+    ];
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+        && admin_mutation.iter().any(|prefix| path.starts_with(prefix))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+async fn audit_events(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Response {
+    if let Err(error) = require_platform_admin(&state, &headers) {
+        return error_response(error);
+    }
+    let limit = query.limit.unwrap_or(100).clamp(1, MAX_AUDIT_EVENTS);
+    (StatusCode::OK, Json(serde_json::json!({ "events": state.audit_log.recent(limit) })))
+        .into_response()
 }
 
 async fn cors_options(headers: HeaderMap) -> Response {
@@ -3631,6 +3816,9 @@ async fn metrics(State(state): State<SharedState>, headers: HeaderMap) -> Respon
         "rest_count": snapshot.count,
         "rest_mean_micros": snapshot.mean_micros,
         "rest_max_micros": snapshot.max_micros,
+        "http_request_count": state.http_request_count.load(AtomicOrdering::Relaxed),
+        "http_4xx_count": state.http_4xx_count.load(AtomicOrdering::Relaxed),
+        "http_5xx_count": state.http_5xx_count.load(AtomicOrdering::Relaxed),
         "p50_micros": histogram.p50_micros,
         "p90_micros": histogram.p90_micros,
         "p95_micros": histogram.p95_micros,
@@ -3646,9 +3834,12 @@ async fn prometheus(State(state): State<SharedState>, headers: HeaderMap) -> Res
     }
     let histogram = state.histogram.snapshot();
     let body = format!(
-        "# HELP rymedb_uptime_seconds node uptime\n# TYPE rymedb_uptime_seconds counter\nrymedb_uptime_seconds {} \n# HELP rymedb_commit_index latest commit\n# TYPE rymedb_commit_index gauge\nrymedb_commit_index {} \n# HELP rymedb_rest_microseconds rest latency\n# TYPE rymedb_rest_microseconds summary\nrymedb_rest_microseconds{{quantile=\"0.5\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.9\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.95\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.99\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.999\"}} {}\nrymedb_rest_microseconds_count {}\nrymedb_rest_microseconds_max {} \n",
+        "# HELP rymedb_uptime_seconds node uptime\n# TYPE rymedb_uptime_seconds counter\nrymedb_uptime_seconds {} \n# HELP rymedb_commit_index latest commit\n# TYPE rymedb_commit_index gauge\nrymedb_commit_index {} \n# HELP rymedb_http_requests_total HTTP requests since start\n# TYPE rymedb_http_requests_total counter\nrymedb_http_requests_total {}\n# HELP rymedb_http_responses_total HTTP responses by error class\n# TYPE rymedb_http_responses_total counter\nrymedb_http_responses_total{{class=\"4xx\"}} {}\nrymedb_http_responses_total{{class=\"5xx\"}} {}\n# HELP rymedb_rest_microseconds rest latency\n# TYPE rymedb_rest_microseconds summary\nrymedb_rest_microseconds{{quantile=\"0.5\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.9\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.95\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.99\"}} {}\nrymedb_rest_microseconds{{quantile=\"0.999\"}} {}\nrymedb_rest_microseconds_count {}\nrymedb_rest_microseconds_max {} \n",
         now_secs().saturating_sub(state.started_unix),
         state.backend.latest_commit(),
+        state.http_request_count.load(AtomicOrdering::Relaxed),
+        state.http_4xx_count.load(AtomicOrdering::Relaxed),
+        state.http_5xx_count.load(AtomicOrdering::Relaxed),
         histogram.p50_micros,
         histogram.p90_micros,
         histogram.p95_micros,
@@ -11394,7 +11585,18 @@ async fn cluster_members(State(state): State<SharedState>, headers: HeaderMap) -
         return error_response(error);
     }
     let Some(node) = require_raft(&state) else {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("cluster")));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "mode": "standalone",
+                "term": 0,
+                "leader": state.backend.is_leader().await,
+                "commit": state.backend.latest_commit(),
+                "members": [],
+                "joint": [],
+            })),
+        )
+            .into_response();
     };
     let current = node.current_config().await;
     let joint = node.joint_config().await.unwrap_or_default();
@@ -11416,6 +11618,7 @@ async fn cluster_members(State(state): State<SharedState>, headers: HeaderMap) -
             "commit": node.commit_index().await,
             "members": members,
             "joint": joint.iter().map(|member| member.id).collect::<Vec<_>>(),
+            "mode": "raft",
         })),
     )
         .into_response()
@@ -13445,6 +13648,147 @@ mod realtime_policy_tests {
     use super::*;
 
     #[test]
+    fn audit_log_is_persisted_and_returns_newest_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-audit-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.json");
+        let audit = AuditLog::load(path.clone()).unwrap();
+        for status in [200, 403] {
+            audit
+                .record(AuditEvent {
+                    timestamp_secs: status as u64,
+                    actor: Some(String::from("operator")),
+                    method: String::from("POST"),
+                    action: String::from("/v1/cluster/members"),
+                    status,
+                    outcome: if status < 400 {
+                        String::from("success")
+                    } else {
+                        String::from("failure")
+                    },
+                })
+                .unwrap();
+        }
+        assert_eq!(audit.recent(1)[0].status, 403);
+        let reopened = AuditLog::load(path.clone()).unwrap();
+        assert_eq!(reopened.recent(2).iter().map(|event| event.status).collect::<Vec<_>>(), [403, 200]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_filter_tracks_admin_mutations_and_auth_attempts() {
+        assert!(is_audited_action("POST", "/v1/cluster/members"));
+        assert!(is_audited_action("POST", "/v1/auth/token"));
+        assert!(!is_audited_action("GET", "/v1/cluster/members"));
+        assert!(!is_audited_action("POST", "/v1/sql"));
+    }
+
+    #[tokio::test]
+    async fn cluster_members_reports_standalone_mode_without_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standalone-cluster-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut config = Config::default();
+        config.node_id = String::from("single-node");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .keys
+            .insert(
+                String::from("admin-key"),
+                Principal {
+                    id: String::from("operator"),
+                    tenant: String::from("default"),
+                    roles: [Role::Superuser].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-key"),
+        );
+        let response = cluster_members(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["mode"], "standalone");
+        assert_eq!(value["members"], serde_json::json!([]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_endpoint_requires_platform_admin() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-audit-auth-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        for (key, id, role) in [
+            ("admin-key", "operator", Role::Superuser),
+            ("reader-key", "reader", Role::ReadOnly),
+        ] {
+            state
+                .keys
+                .insert(
+                    String::from(key),
+                    Principal {
+                        id: String::from(id),
+                        tenant: String::from("default"),
+                        roles: [role].into_iter().collect(),
+                    },
+                )
+                .unwrap();
+        }
+        let unauthorized = audit_events(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AuditQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let mut reader_headers = HeaderMap::new();
+        reader_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer reader-key"),
+        );
+        let forbidden = audit_events(
+            State(state.clone()),
+            reader_headers,
+            Query(AuditQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let mut admin_headers = HeaderMap::new();
+        admin_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-key"),
+        );
+        let allowed = audit_events(
+            State(state),
+            admin_headers,
+            Query(AuditQuery { limit: None }),
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn dashboard_bootstrap_creates_only_one_platform_admin() {
         let mut credentials = ryme_auth::CredentialStore::new();
         register_dashboard_admin(&mut credentials, String::from("first-admin"), "long-password")
@@ -13867,8 +14211,17 @@ mod realtime_policy_tests {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let body =
-            br#"{"keys":[{"kty":"RSA","kid":"url-key","alg":"RS256","n":"AQAB","e":"AQAB"}]}"#;
+        let modulus = ryme_auth::base64_url_encode(&vec![0xA5; MIN_RSA_MODULUS_BYTES]);
+        let body = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "url-key",
+                "alg": "RS256",
+                "n": modulus,
+                "e": "AQAB"
+            }]
+        })
+        .to_string();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut request = [0u8; 1024];
@@ -13877,7 +14230,7 @@ mod realtime_policy_tests {
                 socket,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
-                String::from_utf8_lossy(body)
+                body
             )
             .unwrap();
         });

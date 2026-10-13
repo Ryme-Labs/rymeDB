@@ -7,6 +7,7 @@ import { AppShell } from "@/components/studio/shell";
 export const metadata: Metadata = {
   title: "rymeDB Admin",
   description: "rymeDB Studio — operator console for the rymeDB database",
+  icons: { icon: "/dashboard/rymedb-logo.png", apple: "/dashboard/rymedb-logo.png" },
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

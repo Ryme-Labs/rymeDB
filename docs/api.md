@@ -28,7 +28,7 @@ require the appropriate principal. See [authentication](auth.md).
 
 | Group | Examples |
 | --- | --- |
-| Health | `/health`, `/ready`, `/metrics`, `/metrics/prometheus` (platform superuser) |
+| Health and monitoring | `/health`, `/ready`; `/metrics`, `/metrics/prometheus`, `/v1/audit` (platform superuser) |
 | Data | `/v1/kv`, `/v1/sql`, `/v1/sql/copy`, `/v1/scan` |
 | Supabase-style | `/rest/v1/{table}`, `/graphql` |
 | Realtime | `/v1/stream`, `/v1/query-stream`, `/v1/broadcast`, `/v1/presence`, `/realtime/v1/websocket` |
@@ -39,7 +39,10 @@ require the appropriate principal. See [authentication](auth.md).
 
 `/health` and `/ready` are suitable for liveness/readiness probes. Metrics,
 region status, autoscaling advice, traces, and other operational inspection
-routes require an authenticated platform superuser.
+routes require an authenticated platform superuser. `/v1/cluster/members` also
+works in standalone mode and reports `mode: "standalone"` with an empty member
+list. `/v1/audit` returns the newest persisted authentication and administrative
+events; request bodies and credentials are excluded.
 
 The operator CLI wraps these paths:
 

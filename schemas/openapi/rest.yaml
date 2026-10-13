@@ -111,10 +111,9 @@ paths:
   /metrics:
     get:
       tags: [node]
-      security: []
       responses:
         '200':
-          description: latency histogram snapshot plus node counters
+          description: latency histogram, HTTP error counters, and node counters; platform superuser required
           content:
             application/json:
               schema:
@@ -122,10 +121,32 @@ paths:
   /metrics/prometheus:
     get:
       tags: [node]
-      security: []
       responses:
         '200':
-          description: prometheus text exposition
+          description: prometheus text exposition; platform superuser required
+  /v1/audit:
+    get:
+      tags: [node]
+      description: Recent persisted authentication and administrative actions. Only a platform superuser may read the audit trail.
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 512
+          description: newest events to return, default 100
+      responses:
+        '200':
+          description: newest audit events first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditLog'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/observe/slow:
     get:
       tags: [node]
@@ -1789,7 +1810,7 @@ paths:
   /v1/cluster/members:
     get:
       tags: [cluster]
-      description: Raft term, local leadership, commit index, member list and any in-flight joint config.
+      description: Raft term, local leadership, commit index, membership and joint config; standalone nodes return mode=standalone, term 0 and an empty member list.
       responses:
         '200':
           description: cluster status
@@ -1797,12 +1818,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClusterStatus'
-        '400':
-          description: node is not running in cluster mode
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
     post:
@@ -2138,6 +2153,15 @@ components:
           type: number
         rest_max_micros:
           type: integer
+        http_request_count:
+          type: integer
+          description: HTTP requests since server start.
+        http_4xx_count:
+          type: integer
+          description: HTTP 4xx responses since server start.
+        http_5xx_count:
+          type: integer
+          description: HTTP 5xx responses since server start.
         p50_micros:
           type: integer
         p90_micros:
@@ -2146,6 +2170,36 @@ components:
           type: integer
         p99_micros:
           type: integer
+        p999_micros:
+          type: integer
+    AuditLog:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+    AuditEvent:
+      type: object
+      required: [timestamp_secs, method, action, status, outcome]
+      properties:
+        timestamp_secs:
+          type: integer
+        actor:
+          type: string
+          nullable: true
+          description: authenticated principal ID, or null for unauthenticated attempts
+        method:
+          type: string
+        action:
+          type: string
+          description: matched route template; request bodies and credentials are never recorded
+        status:
+          type: integer
+        outcome:
+          type: string
+          enum: [success, failure]
     CopyRequest:
       type: object
       required: [table, rows]
@@ -2679,6 +2733,9 @@ components:
     ClusterStatus:
       type: object
       properties:
+        mode:
+          type: string
+          enum: [standalone, raft]
         term:
           type: integer
         leader:
