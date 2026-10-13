@@ -1175,6 +1175,17 @@ fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, colum
     }
 }
 
+fn tenant_field_matches(
+    object: &serde_json::Map<String, serde_json::Value>,
+    column: &str,
+    tenant: &str,
+) -> bool {
+    let mut values =
+        object.iter().filter(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, value)| value);
+    let Some(value) = values.next() else { return false };
+    values.next().is_none() && value.as_str().is_some_and(|value| value == tenant)
+}
+
 pub type Row = (Vec<u8>, Vec<u8>);
 
 // Queries that need a complete row set (aggregates, joins, grouped queries and
@@ -8772,11 +8783,7 @@ where
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return false;
         };
-        object
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&column))
-            .and_then(|(_, value)| value.as_str())
-            .is_some_and(|tenant| tenant == self.tenant)
+        tenant_field_matches(&object, &column, &self.tenant)
     }
 
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
@@ -8818,12 +8825,7 @@ where
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return Err(RymeError::Forbidden);
         };
-        if object
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&column))
-            .and_then(|(_, value)| value.as_str())
-            .is_some_and(|tenant| tenant == self.tenant)
-        {
+        if tenant_field_matches(&object, &column, &self.tenant) {
             Ok(())
         } else {
             Err(RymeError::Forbidden)
@@ -16671,6 +16673,9 @@ mod tests {
         let executor = Executor::new(String::from("tenant-a"), String::from("d")).with_rls_tables(
             HashMap::from([(String::from("messages"), String::from("tenant_id"))]),
         );
+        let ambiguous_tenant = br#"{"tenant_id":"tenant-a","Tenant_id":"tenant-b"}"#;
+        assert!(!executor.row_allowed_by_rls("messages", ambiguous_tenant));
+        assert!(!executor.row_allowed_for_write("messages", ambiguous_tenant));
         executor
             .execute(
                 parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT, body TEXT)")

@@ -83,6 +83,17 @@ pub const MAX_MASKED_FIELDS: usize = 128;
 pub const MAX_MASKED_FIELD_BYTES: usize = 256;
 pub const MAX_POLICY_TABLE_BYTES: usize = 256;
 
+fn tenant_field_matches(
+    object: &serde_json::Map<String, serde_json::Value>,
+    column: &str,
+    tenant: &str,
+) -> bool {
+    let mut values =
+        object.iter().filter(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, value)| value);
+    let Some(value) = values.next() else { return false };
+    values.next().is_none() && value.as_str().is_some_and(|value| value == tenant)
+}
+
 impl PolicyEngine {
     pub fn new() -> Self {
         Self {
@@ -170,11 +181,7 @@ impl PolicyEngine {
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return Ok(false);
         };
-        Ok(object
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(column))
-            .and_then(|(_, value)| value.as_str())
-            .is_some_and(|tenant| tenant == principal.tenant))
+        Ok(tenant_field_matches(&object, column, &principal.tenant))
     }
 
     pub fn check_write_row(&self, principal: &Principal, table: &str, value: &[u8]) -> Result<()> {
@@ -1660,11 +1667,26 @@ mod tests {
             .row_allowed(&principal, "messages", br#"{"tenant_id":"tenant-b","body":"secret"}"#)
             .unwrap());
         assert!(!engine.row_allowed(&principal, "messages", br#"{"body":"missing"}"#).unwrap());
+        assert!(!engine
+            .row_allowed(
+                &principal,
+                "messages",
+                br#"{"tenant_id":"tenant-a","Tenant_id":"tenant-b"}"#,
+            )
+            .unwrap());
         assert!(engine
             .check_write_row(&principal, "messages", br#"{"tenant_id":"tenant-a"}"#)
             .is_ok());
         assert!(matches!(
             engine.check_write_row(&principal, "messages", br#"{"tenant_id":"tenant-b"}"#),
+            Err(RymeError::Forbidden)
+        ));
+        assert!(matches!(
+            engine.check_write_row(
+                &principal,
+                "messages",
+                br#"{"tenant_id":"tenant-a","Tenant_id":"tenant-b"}"#,
+            ),
             Err(RymeError::Forbidden)
         ));
         assert_eq!(

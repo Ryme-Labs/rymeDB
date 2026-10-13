@@ -105,7 +105,9 @@ For simple tenant tables, configure a tenant column:
 ```
 
 Rows are visible and writable only when that field matches the authenticated
-tenant. SQL migrations can also use PostgreSQL-shaped policy declarations:
+tenant. If multiple JSON fields match the configured field name without regard
+to case, RymeDB denies the row. SQL migrations can also use PostgreSQL-shaped
+policy declarations:
 
 ```sql
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
