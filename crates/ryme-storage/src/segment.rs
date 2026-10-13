@@ -225,11 +225,19 @@ impl ImmutableSegment {
     }
 
     pub fn from_entries(id: u64, entries: &[SegmentEntry]) -> Result<Self> {
+        Self::from_entries_owned(id, entries.to_vec())
+    }
+
+    pub fn from_entries_owned(id: u64, mut ordered: Vec<SegmentEntry>) -> Result<Self> {
+        if !ordered.windows(2).all(|pair| {
+            pair[0].key < pair[1].key
+                || (pair[0].key == pair[1].key && pair[0].commit_ts <= pair[1].commit_ts)
+        }) {
+            ordered.sort_by(|left, right| {
+                left.key.cmp(&right.key).then(left.commit_ts.cmp(&right.commit_ts))
+            });
+        }
         let mut engine = Engine::new();
-        let mut ordered = entries.to_vec();
-        ordered.sort_by(|left, right| {
-            left.key.cmp(&right.key).then(left.commit_ts.cmp(&right.commit_ts))
-        });
         for entry in ordered {
             engine.apply_with_expiry(entry.key, entry.commit_ts, entry.value, entry.expires_at)?;
         }
@@ -449,10 +457,19 @@ impl SegmentStore {
         entries: &[SegmentEntry],
         sync: bool,
     ) -> Result<SegmentMeta> {
+        self.write_delta_owned_with_sync(id, entries.to_vec(), sync)
+    }
+
+    pub fn write_delta_owned_with_sync(
+        &self,
+        id: u64,
+        entries: Vec<SegmentEntry>,
+        sync: bool,
+    ) -> Result<SegmentMeta> {
         if entries.is_empty() {
             return Ok(SegmentMeta { id, max_commit_ts: 0, entries: 0, bytes: 0 });
         }
-        let segment = ImmutableSegment::from_entries(id, entries)?;
+        let segment = ImmutableSegment::from_entries_owned(id, entries)?;
         let (meta, _) = self.write_segment(segment, sync, false)?;
         Ok(meta)
     }
@@ -1046,6 +1063,40 @@ mod tests {
         delta.merge_into(&mut restored).unwrap();
         assert_eq!(restored.read(&first, 11, 0).unwrap(), Some(b"one".to_vec()));
         assert_eq!(restored.read(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
+    }
+
+    #[test]
+    fn owned_delta_entries_preserve_sorted_and_unsorted_history() {
+        let first = RecordKey::new("tenant", "db", "items", b"a");
+        let second = RecordKey::new("tenant", "db", "items", b"b");
+        let entries = vec![
+            SegmentEntry {
+                key: first.clone(),
+                commit_ts: 1,
+                value: Some(b"a1".to_vec()),
+                expires_at: 0,
+            },
+            SegmentEntry {
+                key: first.clone(),
+                commit_ts: 2,
+                value: Some(b"a2".to_vec()),
+                expires_at: 0,
+            },
+            SegmentEntry {
+                key: second.clone(),
+                commit_ts: 2,
+                value: Some(b"b2".to_vec()),
+                expires_at: 0,
+            },
+        ];
+        let sorted = ImmutableSegment::from_entries_owned(7, entries.clone()).unwrap();
+        let unsorted =
+            ImmutableSegment::from_entries_owned(7, entries.into_iter().rev().collect()).unwrap();
+
+        assert_eq!(sorted.encode().unwrap(), unsorted.encode().unwrap());
+        assert_eq!(sorted.get(&first, 1, 0).unwrap(), Some(b"a1".to_vec()));
+        assert_eq!(sorted.get(&first, 2, 0).unwrap(), Some(b"a2".to_vec()));
+        assert_eq!(sorted.get(&second, 2, 0).unwrap(), Some(b"b2".to_vec()));
     }
 
     #[test]

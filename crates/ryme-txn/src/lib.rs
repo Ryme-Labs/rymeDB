@@ -2248,9 +2248,9 @@ impl DurableManager {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         for (commit_ts, entries) in deltas {
-            self.segments.write_delta_with_sync(
+            self.segments.write_delta_owned_with_sync(
                 commit_ts,
-                &entries,
+                entries,
                 self.policy == SyncPolicy::Always,
             )?;
         }
@@ -2595,9 +2595,9 @@ impl DurableManager {
             }
             let writes = decode_writes(&record.payload)?;
             if self.mode == StorageMode::Standard {
-                self.segments.write_delta_with_sync(
+                self.segments.write_delta_owned_with_sync(
                     record.commit_ts,
-                    &segment_entries(record.commit_ts, &writes),
+                    segment_entries(record.commit_ts, &writes),
                     self.policy == SyncPolicy::Always,
                 )?;
             }
@@ -2611,9 +2611,9 @@ impl DurableManager {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         if self.mode == StorageMode::Standard {
-            self.segments.write_delta_with_sync(
+            self.segments.write_delta_owned_with_sync(
                 commit_ts,
-                &segment_entries(commit_ts, writes),
+                segment_entries(commit_ts, writes),
                 self.policy == SyncPolicy::Always,
             )?;
         }
@@ -2744,9 +2744,9 @@ impl DurableManager {
             if policy == SyncPolicy::Always {
                 wal.sync()?;
             }
-            self.segments.write_delta_with_sync(
+            self.segments.write_delta_owned_with_sync(
                 commit_ts,
-                &segment_entries(commit_ts, writes),
+                segment_entries(commit_ts, writes),
                 policy == SyncPolicy::Always,
             )?;
             Ok(())
@@ -2783,9 +2783,9 @@ impl DurableManager {
                 wal.sync()?;
             }
         }
-        self.segments.write_delta_with_sync(
+        self.segments.write_delta_owned_with_sync(
             commit_ts,
-            &segment_entries(commit_ts, &writes),
+            segment_entries(commit_ts, &writes),
             self.policy == SyncPolicy::Always,
         )?;
         let result = self.inner.commit_filtered_at(txn, commit_ts, keep);
