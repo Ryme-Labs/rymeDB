@@ -760,6 +760,7 @@ impl ShardSet {
             .max(txn.read_ts)
             .checked_add(1)
             .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+        manager.inner().validate_at(&txn, commit_ts)?;
         manager.commit_at(&txn, commit_ts, |_| true)?;
         Ok(commit_ts)
     }
@@ -1941,6 +1942,11 @@ mod tests {
 
         let mut probe = backend.begin();
         assert_eq!(backend.get(&mut probe, &key).unwrap(), Some(b"v2".to_vec()));
+        drop(backend);
+
+        let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
+        let mut recovered = backend.begin();
+        assert_eq!(backend.get(&mut recovered, &key).unwrap(), Some(b"v2".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
