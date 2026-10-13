@@ -63,9 +63,6 @@ protocols, and build the documentation site.
 4. Update OpenAPI, SDK methods, CLI coverage, and docs together.
 5. Add a benchmark when the feature affects latency, throughput, memory, or
    connections.
-6. Run the complete verification suite and use a descriptive commit authored
-   as `deyoyk <karthikw7755@gmail.com>` for repository work.
-
 ## Benchmark development
 
 Use `ryme-bench` with JSON output and preserve raw results under `bench/results`.
