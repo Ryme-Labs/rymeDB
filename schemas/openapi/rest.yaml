@@ -485,6 +485,36 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+  /v1/auth/session:
+    delete:
+      tags: [auth]
+      security: []
+      description: Revoke the presented rotating refresh token. Possession of the token is sufficient; the token must be sent in the request body, never in a URL. Repeating a revocation is safe and returns revoked=false.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+      responses:
+        '200':
+          description: Session revocation result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
   /v1/auth/otp/setup:
     post:
       tags: [auth]

@@ -83,10 +83,11 @@ rymedb-cli auth token ada '$PASSWORD'
 ```
 
 The REST surface also exposes `/v1/auth/register`, `/verify`, `/token`, OTP
-setup/verify, passkey challenge/register/verify, OIDC login/token, and key
-revocation. Password, passkey, and OIDC login return an application access key
-that expires after 15 minutes, plus a refresh token where supported. Refresh
-tokens rotate on use and expire after 30 days. Operator-created API keys remain
+setup/verify, passkey challenge/register/verify, OIDC login/token, API-key
+revocation, and refresh-session revocation. Password, passkey, and OIDC login
+return an application access key that expires after 15 minutes, plus a refresh
+token where supported. Refresh tokens rotate on use and expire after 30 days.
+Operator-created API keys remain
 long-lived until revoked and must stay server-side. Browser access keys are
 visible to their user by design; limit their roles and enforce tenant access
 with RLS. Never ship `RYME_API_KEY` to a browser. OIDC login returns a
@@ -97,6 +98,19 @@ minutes and cannot be reused. A caller-supplied login `state` is returned as
 state. The server stores password hashes, API-key digests, refresh-token
 digests, and auth metadata under `data_dir/auth.json`; raw secrets and
 WebAuthn challenges are not written there.
+
+To log out and invalidate a rotating refresh token, send it in the body of
+`DELETE /v1/auth/session` over HTTPS:
+
+```bash
+curl -X DELETE https://db.example.com/v1/auth/session \
+  -H 'Content-Type: application/json' \
+  -d '{"refresh_token":"<refresh-token>"}'
+```
+
+The refresh token is a bearer credential, so possession authorizes revoking
+only that token. The operation does not require an unexpired 15-minute access
+key, is safe to repeat, and never accepts the token in a URL.
 
 When OIDC is enabled, `RYME_OIDC_REDIRECT_URIS` is required. It must contain
 the exact callback URLs accepted by `/v1/auth/oidc/login`; arbitrary callback

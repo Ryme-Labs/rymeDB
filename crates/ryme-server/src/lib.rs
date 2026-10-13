@@ -2820,6 +2820,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/auth/verify", post(auth_verify))
         .route("/v1/auth/token", post(auth_token))
         .route("/v1/auth/keys", delete(auth_revoke))
+        .route("/v1/auth/session", delete(auth_revoke_session))
         .route("/v1/auth/otp/setup", post(otp_setup))
         .route("/v1/auth/otp/verify", post(otp_verify))
         .route("/v1/auth/passkey/challenge", post(passkey_challenge))
@@ -2937,7 +2938,7 @@ fn is_audited_action(method: &str, path: &str) -> bool {
     if matches!(path, "/v1/auth/token" | "/v1/auth/verify") {
         return method == "POST";
     }
-    if matches!(path, "/v1/auth/keys" | "/v1/dashboard/bootstrap") {
+    if matches!(path, "/v1/auth/keys" | "/v1/auth/session" | "/v1/dashboard/bootstrap") {
         return matches!(method, "POST" | "DELETE");
     }
     let admin_mutation = [
@@ -5869,6 +5870,11 @@ pub struct AuthRevokeRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct AuthSessionRevokeRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct OtpSetupRequest {
     pub id: String,
 }
@@ -6180,6 +6186,31 @@ async fn auth_revoke(
         }
     } else {
         error_response(ryme_error::RymeError::NotFound(String::from("key")))
+    }
+}
+
+async fn auth_revoke_session(
+    State(state): State<SharedState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: AuthSessionRevokeRequest = match json_body(&body) {
+        Ok(request) => request,
+        Err(error) => return error_response(error),
+    };
+    if request.refresh_token.is_empty() || request.refresh_token.len() > 128 {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from(
+            "refresh_token",
+        )));
+    }
+    if state.refresh_tokens.revoke(&request.refresh_token) {
+        match state.persist_auth() {
+            Ok(()) => {
+                (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
+            }
+            Err(error) => error_response(error),
+        }
+    } else {
+        (StatusCode::OK, Json(serde_json::json!({ "revoked": false }))).into_response()
     }
 }
 
@@ -13956,6 +13987,7 @@ mod realtime_policy_tests {
     fn audit_filter_tracks_admin_mutations_and_auth_attempts() {
         assert!(is_audited_action("POST", "/v1/cluster/members"));
         assert!(is_audited_action("POST", "/v1/auth/token"));
+        assert!(is_audited_action("DELETE", "/v1/auth/session"));
         assert!(!is_audited_action("GET", "/v1/cluster/members"));
         assert!(!is_audited_action("POST", "/v1/sql"));
     }

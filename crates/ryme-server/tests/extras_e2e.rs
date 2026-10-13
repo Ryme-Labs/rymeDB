@@ -49,6 +49,49 @@ async fn http_request(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> (u
     (status, body)
 }
 
+async fn http_request_no_auth(
+    addr: std::net::SocketAddr,
+    head: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "{head} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(request.as_bytes()).await.unwrap();
+    socket.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse::<u16>()
+        .unwrap_or(0);
+    let body = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|index| raw[index + 4..].to_vec())
+        .unwrap_or_default();
+    (status, body)
+}
+
 async fn http_request_branch(
     addr: std::net::SocketAddr,
     branch: &str,
@@ -1828,7 +1871,11 @@ async fn extras_auth_token_issues_usable_keys() {
     let refreshed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let refreshed_key = refreshed.get("key").and_then(|v| v.as_str()).unwrap();
     assert_eq!(refreshed.get("expires_in").and_then(|v| v.as_u64()), Some(15 * 60));
-    let next_refresh = refreshed.get("refresh_token").and_then(|v| v.as_str()).unwrap();
+    let next_refresh = refreshed
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
     assert_ne!(next_refresh, refresh_token);
     let (status, _) = bearer_request(http, refreshed_key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
@@ -1840,6 +1887,31 @@ async fn extras_auth_token_issues_usable_keys() {
     )
     .await;
     assert_eq!(status, 401);
+    let revoke_session = format!("{{\"refresh_token\":\"{next_refresh}\"}}");
+    let (status, body) = http_request_no_auth(
+        http,
+        "DELETE /v1/auth/session",
+        revoke_session.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["revoked"], true);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/auth/token",
+        format!("{{\"grant_type\":\"refresh_token\",\"refresh_token\":\"{next_refresh}\"}}")
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 401);
+    let (status, body) = http_request_no_auth(
+        http,
+        "DELETE /v1/auth/session",
+        revoke_session.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["revoked"], false);
     let (status, body) = bearer_request(http, &key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
     assert!(body.is_object());
