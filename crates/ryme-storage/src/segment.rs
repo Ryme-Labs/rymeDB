@@ -559,18 +559,10 @@ impl SegmentStore {
         Ok(Some(ImmutableSegment::decode(&bytes)?))
     }
 
-    fn read_segment(&self, path: &Path) -> Result<Arc<ImmutableSegment>> {
+    fn read_segment_under_lock(&self, path: &Path) -> Result<Arc<ImmutableSegment>> {
         let id = parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
             .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
         if let Some(segment) = self.cache.lock().ok().and_then(|mut cache| cache.get(id)) {
-            return Ok(segment);
-        }
-
-        let _segment_io = self
-            .segment_io
-            .read()
-            .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
-        if let Some(segment) = self.cache.lock().ok().and_then(|mut cache| cache.get_cached(id)) {
             return Ok(segment);
         }
 
@@ -592,6 +584,52 @@ impl SegmentStore {
         self.cache.lock().ok()?.get_all_cached(&ids)
     }
 
+    fn read_scan_segments(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start_after: Option<&[u8]>,
+    ) -> Result<Vec<(Arc<ImmutableSegment>, usize, usize)>> {
+        // Hold the read lock only while resolving paths into owned segment
+        // handles. Compaction cannot remove a file between path capture and
+        // decode; the row merge itself runs after the lock is released.
+        let _segment_io = self
+            .segment_io
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
+        let paths = self.newest_paths()?;
+        let mut cached_segments =
+            self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
+        let mut segments = Vec::new();
+        for path in paths.iter().rev() {
+            let segment = if let Some(cached_segments) = cached_segments.as_mut() {
+                cached_segments.next().expect("cached segment path")
+            } else {
+                self.read_segment_under_lock(path)?
+            };
+            let scope_start = segment
+                .keys
+                .partition_point(|key| scope_order(key, tenant, database, table) == Ordering::Less);
+            let scope_end = segment.keys[scope_start..].partition_point(|key| {
+                scope_order(key, tenant, database, table) != Ordering::Greater
+            }) + scope_start;
+            let scan_start = start_after
+                .map(|after| {
+                    segment.keys[scope_start..scope_end]
+                        .partition_point(|key| key.pk.as_slice() <= after)
+                        + scope_start
+                })
+                .unwrap_or(scope_start);
+            let is_snapshot = segment.is_snapshot();
+            segments.push((segment, scan_start, scope_end));
+            if is_snapshot {
+                break;
+            }
+        }
+        Ok(segments)
+    }
+
     fn newest_paths(&self) -> Result<Arc<Vec<PathBuf>>> {
         self.paths
             .read()
@@ -610,9 +648,13 @@ impl SegmentStore {
     }
 
     pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<VersionLookup>> {
+        let _segment_io = self
+            .segment_io
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
         let paths = self.newest_paths()?;
         for path in paths.iter().rev() {
-            let segment = self.read_segment(path)?;
+            let segment = self.read_segment_under_lock(path)?;
             let Some(version) = segment.version_at(key, read_ts) else {
                 if segment.is_snapshot() {
                     return Ok(None);
@@ -694,36 +736,7 @@ impl SegmentStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let paths = self.newest_paths()?;
-        // `paths` are oldest-first; scans visit newest-first.
-        let mut cached_segments =
-            self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
-        let mut segments = Vec::new();
-        for path in paths.iter().rev() {
-            let segment = if let Some(cached_segments) = cached_segments.as_mut() {
-                cached_segments.next().expect("cached segment path")
-            } else {
-                self.read_segment(path)?
-            };
-            let scope_start = segment
-                .keys
-                .partition_point(|key| scope_order(key, tenant, database, table) == Ordering::Less);
-            let scope_end = segment.keys[scope_start..].partition_point(|key| {
-                scope_order(key, tenant, database, table) != Ordering::Greater
-            }) + scope_start;
-            let scan_start = start_after
-                .map(|after| {
-                    segment.keys[scope_start..scope_end]
-                        .partition_point(|key| key.pk.as_slice() <= after)
-                        + scope_start
-                })
-                .unwrap_or(scope_start);
-            let is_snapshot = segment.is_snapshot();
-            segments.push((segment, scan_start, scope_end));
-            if is_snapshot {
-                break;
-            }
-        }
+        let segments = self.read_scan_segments(tenant, database, table, start_after)?;
         if let Some((segment, start, end)) = segments.first() {
             if segment.is_snapshot() {
                 let mut out = Vec::with_capacity(limit.min(end - start));
@@ -1512,6 +1525,54 @@ mod tests {
                 (b"d".to_vec(), b"D".to_vec()),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scans_remain_valid_while_compaction_replaces_segment_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-scan-compaction-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let key = RecordKey::new("tenant", "db", "items", b"row");
+        let mut engine = Engine::new();
+        engine.apply(key.clone(), 1, Some(b"base".to_vec())).unwrap();
+        store.write(1, &engine).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let scan_store = store.clone();
+            let scan_barrier = Arc::clone(&barrier);
+            let scan_thread = scope.spawn(move || {
+                scan_barrier.wait();
+                for _ in 0..100 {
+                    let rows = scan_store.scan("tenant", "db", "items", 100, 0, 10).unwrap();
+                    assert_eq!(rows.len(), 1);
+                }
+            });
+
+            barrier.wait();
+            for commit_ts in 2..=32 {
+                store
+                    .write_delta_owned_with_sync(
+                        commit_ts,
+                        vec![SegmentEntry {
+                            key: key.clone(),
+                            commit_ts,
+                            value: Some(commit_ts.to_be_bytes().to_vec()),
+                            expires_at: 0,
+                        }],
+                        false,
+                    )
+                    .unwrap();
+                store.compact().unwrap();
+            }
+            scan_thread.join().unwrap();
+        });
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
