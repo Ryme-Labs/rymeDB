@@ -853,6 +853,7 @@ struct AuthSnapshot {
 }
 
 const AUTH_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const KEYRING_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot> {
     if let Ok(metadata) = std::fs::metadata(path) {
@@ -13223,34 +13224,66 @@ fn kms_from_env() -> Option<EnvKms> {
         .and_then(|key| EnvKms::from_key(String::from("env-1"), key.into_bytes()).ok())
 }
 
+fn read_keyring(path: &std::path::Path) -> ryme_error::Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let length = file.metadata()?.len();
+    if length > KEYRING_MAX_BYTES as u64 {
+        return Err(ryme_error::RymeError::Overload(String::from("keyring")));
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    use std::io::Read;
+    file.take(KEYRING_MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > KEYRING_MAX_BYTES {
+        return Err(ryme_error::RymeError::Overload(String::from("keyring")));
+    }
+    Ok(Some(bytes))
+}
+
+fn wrapped_ring_bytes<K: KmsProvider>(ring: &KeyRing, kms: &K) -> ryme_error::Result<Vec<u8>> {
+    let mut deks = Vec::new();
+    for tenant in ring.tenants() {
+        deks.extend(ring.export_wrapped(&tenant, kms)?);
+    }
+    serde_json::to_vec(&WrappedRing { kek_id: kms.kek_id(), deks })
+        .map_err(|error| ryme_error::RymeError::Internal(error.to_string()))
+}
+
 fn load_or_create_ring(
     data_dir: &std::path::Path,
     tenant: &str,
 ) -> ryme_error::Result<Arc<Mutex<KeyRing>>> {
     let path = data_dir.join("keyring.json");
-    match std::fs::read(&path) {
-        Ok(raw) => {
-            if let Ok(wrapped) = serde_json::from_slice::<WrappedRing>(&raw) {
-                if let Some(kms) = kms_from_env() {
-                    if kms.kek_id() == wrapped.kek_id {
-                        let mut ring = KeyRing::new();
-                        if ring.import_wrapped(wrapped.deks, &kms).is_ok()
-                            && ring.active(tenant).is_some()
-                        {
-                            return Ok(Arc::new(Mutex::new(ring)));
-                        }
+    if let Some(raw) = read_keyring(&path)? {
+        if let Ok(wrapped) = serde_json::from_slice::<WrappedRing>(&raw) {
+            if let Some(kms) = kms_from_env() {
+                if kms.kek_id() == wrapped.kek_id {
+                    let mut ring = KeyRing::new();
+                    if ring.import_wrapped(wrapped.deks, &kms).is_ok()
+                        && ring.active(tenant).is_some()
+                    {
+                        return Ok(Arc::new(Mutex::new(ring)));
                     }
                 }
             }
-            if let Ok(ring) = serde_json::from_slice::<KeyRing>(&raw) {
-                if ring.active(tenant).is_some() {
-                    return Ok(Arc::new(Mutex::new(ring)));
-                }
-            }
-            return Err(ryme_error::RymeError::Corrupt(String::from("keyring")));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        if let Ok(ring) = serde_json::from_slice::<KeyRing>(&raw) {
+            if ring.active(tenant).is_some() {
+                return Ok(Arc::new(Mutex::new(ring)));
+            }
+        }
+        return Err(ryme_error::RymeError::Corrupt(String::from("keyring")));
     }
     let mut ring = KeyRing::new();
     ring.rotate(tenant, now_secs());
@@ -13260,14 +13293,7 @@ fn load_or_create_ring(
 
 fn persist_ring(ring: &KeyRing, path: &std::path::Path) -> ryme_error::Result<()> {
     let raw = match kms_from_env() {
-        Some(kms) => {
-            let mut deks = Vec::new();
-            for tenant in ring.tenants() {
-                deks.extend(ring.export_wrapped(&tenant, &kms).unwrap_or_default());
-            }
-            serde_json::to_vec(&WrappedRing { kek_id: kms.kek_id(), deks })
-                .map_err(|e| ryme_error::RymeError::Internal(e.to_string()))?
-        }
+        Some(kms) => wrapped_ring_bytes(ring, &kms)?,
         None => {
             tracing::warn!(
                 "persisting DEK ring without KMS wrap; volume encryption is the outer layer"
@@ -13275,20 +13301,30 @@ fn persist_ring(ring: &KeyRing, path: &std::path::Path) -> ryme_error::Result<()
             serde_json::to_vec(ring).map_err(|e| ryme_error::RymeError::Internal(e.to_string()))?
         }
     };
+    if raw.len() > KEYRING_MAX_BYTES {
+        return Err(ryme_error::RymeError::Overload(String::from("keyring")));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let temporary = path.with_extension("tmp");
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(&raw)?;
         file.sync_data()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(temporary, path)?;
     if let Some(parent) = path.parent() {
@@ -14005,6 +14041,11 @@ mod realtime_policy_tests {
         ring.rotate("tenant-a", now_secs());
 
         persist_ring(&ring, &path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         let loaded = load_or_create_ring(&dir, "tenant-a").unwrap();
         assert!(loaded.lock().unwrap().active("tenant-a").is_some());
         assert!(!path.with_extension("tmp").exists());
@@ -14015,6 +14056,61 @@ mod realtime_policy_tests {
             Err(ryme_error::RymeError::Corrupt(_))
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyring_load_is_bounded_and_repairs_permissions() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-keyring-limits-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keyring.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((KEYRING_MAX_BYTES + 1) as u64).unwrap();
+        assert!(matches!(
+            read_keyring(&path),
+            Err(ryme_error::RymeError::Overload(message)) if message == "keyring"
+        ));
+
+        std::fs::write(&path, b"{}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(read_keyring(&path).unwrap(), Some(b"{}".to_vec()));
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keyring_wrap_errors_are_not_silently_dropped() {
+        struct FailingKms;
+        impl KmsProvider for FailingKms {
+            fn wrap(&self, _dek: &[u8]) -> ryme_error::Result<ryme_crypto::KmsEnvelope> {
+                Err(ryme_error::RymeError::Unavailable(String::from("KMS unavailable")))
+            }
+
+            fn unwrap(
+                &self,
+                _envelope: &ryme_crypto::WrappedDekRef,
+            ) -> ryme_error::Result<Vec<u8>> {
+                Err(ryme_error::RymeError::Unavailable(String::from("KMS unavailable")))
+            }
+
+            fn kek_id(&self) -> String {
+                String::from("failing-kms")
+            }
+        }
+
+        let mut ring = KeyRing::new();
+        ring.rotate("tenant-a", now_secs());
+        assert!(matches!(
+            wrapped_ring_bytes(&ring, &FailingKms),
+            Err(ryme_error::RymeError::Unavailable(message)) if message == "KMS unavailable"
+        ));
     }
 
     #[test]
