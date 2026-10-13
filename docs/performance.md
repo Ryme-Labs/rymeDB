@@ -14,6 +14,15 @@ rymedb-cli qos tier dedicated_cluster dedicated_cluster
 ryme-bench resp --addr 127.0.0.1:6380 --workload mixed --ops 40000 --concurrency 8 --pipeline 1 --json
 ```
 
+To isolate the in-memory transaction core from networking and WAL durability:
+
+```bash
+ryme-bench local --ops 200000 --concurrency 8 --value-bytes 128
+```
+
+This reports parallel commit throughput and a separate parallel point-read
+probe. It is a core microbenchmark, not an end-to-end database comparison.
+
 For PostgreSQL-wire workloads:
 
 ```bash

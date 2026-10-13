@@ -25,6 +25,8 @@ enum Command {
     Local {
         #[arg(long, default_value_t = 200000)]
         ops: usize,
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
         #[arg(long, default_value_t = 128)]
         value_bytes: usize,
     },
@@ -98,8 +100,8 @@ enum Command {
 async fn main() {
     let args = Args::parse();
     match args.command {
-        Some(Command::Local { ops, value_bytes }) => {
-            local_bench(ops, value_bytes);
+        Some(Command::Local { ops, concurrency, value_bytes }) => {
+            local_bench(ops, concurrency, value_bytes);
         }
         Some(Command::Resp {
             addr,
@@ -180,7 +182,7 @@ async fn main() {
             .await;
         }
         None => {
-            local_bench(args.ops, args.value_bytes);
+            local_bench(args.ops, args.concurrency, args.value_bytes);
         }
     }
 }
@@ -476,36 +478,78 @@ async fn realtime_bench(config: RealtimeBench) {
     }
 }
 
-fn local_bench(ops: usize, value_bytes: usize) {
-    let manager = TxnManager::new();
+fn local_bench(ops: usize, concurrency: usize, value_bytes: usize) {
+    let manager = Arc::new(TxnManager::new());
     let value = vec![7u8; value_bytes];
+    let workers = concurrency.max(1).min(ops.max(1));
+    println!(
+        "benchmark=txn-local value_bytes={value_bytes} metadata={}",
+        machine_metadata()
+    );
     let start = Instant::now();
-    let mut applied = 0usize;
-    for index in 0..ops {
-        let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
-        let mut txn = manager.begin();
-        manager.put(&mut txn, key, value.clone());
-        if manager.commit(txn).is_ok() {
-            applied += 1;
-        }
+    let mut handles = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let manager = Arc::clone(&manager);
+        let value = value.clone();
+        let base = ops / workers;
+        let extra = ops % workers;
+        let first = worker * base + worker.min(extra);
+        let end = first + base + usize::from(worker < extra);
+        handles.push(std::thread::spawn(move || {
+            let mut applied = 0usize;
+            for index in first..end {
+                let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
+                let mut txn = manager.begin();
+                manager.put(&mut txn, key, value.clone());
+                if manager.commit(txn).is_ok() {
+                    applied += 1;
+                }
+            }
+            applied
+        }));
     }
+    let applied = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("local benchmark worker panicked"))
+        .sum::<usize>();
     let elapsed = start.elapsed();
     let seconds = elapsed.as_secs_f64().max(0.000001);
     let throughput = applied as f64 / seconds;
-    println!("ops={applied} seconds={seconds:.3} qps={throughput:.0}");
+    println!("ops={applied} workers={workers} seconds={seconds:.3} qps={throughput:.0}");
     let probe_ops = 10000.min(ops);
     if probe_ops > 0 {
+        let probe_workers = concurrency.max(1).min(probe_ops);
         let probe_start = Instant::now();
-        let mut hits = 0usize;
-        for index in 0..probe_ops {
-            let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
-            let mut txn = manager.begin();
-            if manager.get(&mut txn, &key).unwrap_or(None).is_some() {
-                hits += 1;
-            }
+        let mut handles = Vec::with_capacity(probe_workers);
+        for worker in 0..probe_workers {
+            let manager = Arc::clone(&manager);
+            let base = probe_ops / probe_workers;
+            let extra = probe_ops % probe_workers;
+            let first = worker * base + worker.min(extra);
+            let end = first + base + usize::from(worker < extra);
+            handles.push(std::thread::spawn(move || {
+                let mut hits = 0usize;
+                for index in first..end {
+                    let key =
+                        RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
+                    let mut txn = manager.begin();
+                    if manager.get(&mut txn, &key).unwrap_or(None).is_some() {
+                        hits += 1;
+                    }
+                }
+                hits
+            }));
         }
-        let probe_micros = probe_start.elapsed().as_micros().max(1);
-        println!("probe_hits={hits} probe_mean_micros={}", probe_micros / probe_ops as u128);
+        let hits = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("local benchmark probe worker panicked"))
+            .sum::<usize>();
+        let probe_nanos = probe_start.elapsed().as_nanos().max(1);
+        let probe_mean_micros = probe_nanos as f64 / probe_ops as f64 / 1_000.0;
+        let probe_qps = probe_ops as f64 / (probe_nanos as f64 / 1_000_000_000.0);
+        println!(
+            "probe_hits={hits} probe_workers={probe_workers} probe_mean_micros={probe_mean_micros:.3} probe_qps={probe_qps:.0}"
+        );
     }
 }
 
