@@ -27,6 +27,15 @@
     "turbo": "2.11.3",
     "typescript": "7.0.2"
   },
+  "pnpm": {
+    "overrides": {
+      "katex": "0.18.2",
+      "postcss-selector-parser": "7.1.6",
+      "serialize-javascript": "7.1.2",
+      "tinypool": "2.2.0",
+      "uuid": "11.1.1"
+    }
+  },
   "description": "rymeDB is an open-source, ultra-low-latency distributed relational database and backend platform. One static `ryme-server` binary serves PostgreSQL wire protocol clients, RESP (Valkey-compatible) clients, and a REST operator API.",
   "main": "index.js",
   "directories": {
