@@ -10,6 +10,7 @@ security:
   - apiKeyHeader: []
 tags:
   - name: node
+  - name: dashboard
   - name: kv
   - name: sql
   - name: rest
@@ -37,6 +38,65 @@ paths:
       responses:
         '200':
           description: html admin console
+  /dashboard/:
+    get:
+      tags: [dashboard]
+      security: []
+      description: Static admin web UI at its slash-terminated URL.
+      responses:
+        '200':
+          description: html admin console
+  /dashboard/{path}:
+    get:
+      tags: [dashboard]
+      security: []
+      description: Static dashboard asset path; the server route accepts nested asset paths.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          description: Dashboard asset path, including nested path segments when needed.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dashboard asset bytes with a content type selected from its extension.
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/dashboard/setup:
+    get:
+      tags: [dashboard]
+      security: []
+      description: Reports whether the first dashboard administrator still needs to be created.
+      responses:
+        '200':
+          description: Dashboard bootstrap state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardSetup'
+  /v1/dashboard/bootstrap:
+    post:
+      tags: [dashboard]
+      security: []
+      description: Creates the first platform administrator only; subsequent attempts conflict. This endpoint is unauthenticated by design for initial setup.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DashboardBootstrapRequest'
+      responses:
+        '201':
+          description: First administrator created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardBootstrapResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
   /ready:
     get:
       tags: [node]
@@ -1958,6 +2018,32 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
   schemas:
+    DashboardSetup:
+      type: object
+      required: [needs_setup]
+      properties:
+        needs_setup:
+          type: boolean
+          description: True only while no dashboard administrator has been registered.
+    DashboardBootstrapRequest:
+      type: object
+      required: [id, password]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 256
+    DashboardBootstrapResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
     Error:
       type: object
       required: [error]
