@@ -12,7 +12,7 @@ impl LocalStore {
     }
 
     fn path(&self, key: &str) -> Result<PathBuf> {
-        if key.is_empty() || key.starts_with('/') || key.contains("..") {
+        if !super::safe_relative_name(key) {
             return Err(RymeError::InvalidArgument(String::from("key")));
         }
         Ok(self.root.join(key))
@@ -38,6 +38,30 @@ impl LocalStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_store_rejects_rooted_and_traversal_keys() {
+        let store = LocalStore::new(PathBuf::from("archive"));
+        for key in [
+            "../escape",
+            "nested/../../escape",
+            "/absolute",
+            "nested\\escape",
+            "C:\\outside",
+            "\\\\server\\share",
+        ] {
+            assert!(matches!(store.path(key), Err(RymeError::InvalidArgument(_))), "{key}");
+        }
+        assert_eq!(
+            store.path("backups/backup-1/file.wal").unwrap(),
+            PathBuf::from("archive/backups/backup-1/file.wal")
+        );
     }
 }
 
