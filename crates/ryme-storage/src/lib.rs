@@ -288,25 +288,44 @@ impl Engine {
         }
         out
     }
+
+    fn table_entries<'a>(
+        &'a self,
+        tenant: &'a str,
+        database: &'a str,
+        table: &'a str,
+    ) -> impl Iterator<Item = (&'a RecordKey, &'a Vec<Version>)> + 'a {
+        let start = RecordKey::new(tenant, database, table, &[]);
+        self.inner.range((Bound::Included(start), Bound::Unbounded)).take_while(move |(key, _)| {
+            key.tenant == tenant && key.database == database && key.table == table
+        })
+    }
+
     pub fn table_names(&self, tenant: &str, database: &str) -> Vec<String> {
-        let mut tables = std::collections::BTreeSet::new();
-        for key in self.inner.keys() {
-            if key.tenant == tenant && key.database == database {
-                tables.insert(key.table.clone());
+        let start = RecordKey::new(tenant, database, "", &[]);
+        let mut tables = Vec::new();
+        let mut previous: Option<&str> = None;
+        for key in self
+            .inner
+            .range((Bound::Included(start), Bound::Unbounded))
+            .map(|(key, _)| key)
+            .take_while(|key| key.tenant == tenant && key.database == database)
+        {
+            if previous != Some(key.table.as_str()) {
+                tables.push(key.table.clone());
+                previous = Some(&key.table);
             }
         }
-        tables.into_iter().collect()
+        tables
     }
 
     pub fn table_bytes(&self, tenant: &str, database: &str, table: &str) -> u64 {
         let mut bytes = 0u64;
-        for (key, versions) in &self.inner {
-            if key.tenant == tenant && key.database == database && key.table == table {
-                bytes += key.pk.len() as u64;
-                for version in versions {
-                    if let Some(value) = version.value.as_ref() {
-                        bytes += value.len() as u64;
-                    }
+        for (key, versions) in self.table_entries(tenant, database, table) {
+            bytes += key.pk.len() as u64;
+            for version in versions {
+                if let Some(value) = version.value.as_ref() {
+                    bytes += value.len() as u64;
                 }
             }
         }
@@ -315,20 +334,18 @@ impl Engine {
 
     pub fn export_table(&self, tenant: &str, database: &str, table: &str) -> TableRows {
         let mut out = Vec::new();
-        for (key, versions) in &self.inner {
-            if key.tenant == tenant && key.database == database && key.table == table {
-                out.push((
-                    key.pk.clone(),
-                    versions
-                        .iter()
-                        .map(|version| TableVersion {
-                            commit_ts: version.commit_ts,
-                            value: version.value.clone(),
-                            expires_at: version.expires_at,
-                        })
-                        .collect(),
-                ));
-            }
+        for (key, versions) in self.table_entries(tenant, database, table) {
+            out.push((
+                key.pk.clone(),
+                versions
+                    .iter()
+                    .map(|version| TableVersion {
+                        commit_ts: version.commit_ts,
+                        value: version.value.clone(),
+                        expires_at: version.expires_at,
+                    })
+                    .collect(),
+            ));
         }
         out
     }
@@ -930,6 +947,47 @@ mod tests {
         assert_eq!(engine.purge_keys(&[purged.clone(), purged]), 1);
         assert_eq!(engine.bytes_held(), b"retain".len() as u64);
         assert_eq!(engine.read(&retained, 4, 0).unwrap(), Some(b"retain".to_vec()));
+    }
+
+    #[test]
+    fn table_operations_are_scoped_to_the_requested_ordered_key_range() {
+        let mut engine = Engine::new();
+        for key in [
+            RecordKey::new("a", "db", "messages", b"row"),
+            RecordKey::new("tenant", "a", "messages", b"row"),
+            RecordKey::new("tenant", "db", "message-archive", b"row"),
+            RecordKey::new("tenant", "db", "messages", b""),
+            RecordKey::new("tenant", "db", "messages", b"row"),
+            RecordKey::new("tenant", "db", "profiles", b"row"),
+            RecordKey::new("tenant", "other", "messages", b"row"),
+            RecordKey::new("z", "db", "messages", b"row"),
+        ] {
+            engine.apply(key, 1, Some(b"value".to_vec())).unwrap();
+        }
+
+        assert_eq!(
+            engine.table_names("tenant", "db"),
+            vec![
+                String::from("message-archive"),
+                String::from("messages"),
+                String::from("profiles")
+            ]
+        );
+        assert_eq!(engine.table_bytes("tenant", "db", "messages"), 13);
+        assert_eq!(
+            engine
+                .export_table("tenant", "db", "messages")
+                .iter()
+                .map(|(pk, _)| pk.clone())
+                .collect::<Vec<_>>(),
+            vec![Vec::new(), b"row".to_vec()]
+        );
+        assert_eq!(engine.drop_table("tenant", "db", "messages"), 2);
+        assert_eq!(
+            engine.table_names("tenant", "db"),
+            vec![String::from("message-archive"), String::from("profiles")]
+        );
+        assert_eq!(engine.len(), 6);
     }
 
     #[test]
