@@ -801,7 +801,8 @@ mod tests {
         keys.insert(
             String::from("k"),
             Principal { id: String::from("u"), tenant: String::from("t"), roles },
-        );
+        )
+        .unwrap();
         let native = NativeGateway::with_gateway(gateway, keys);
         let put = serde_json::to_vec(&Request {
             key: String::from("k"),
@@ -855,6 +856,10 @@ mod tests {
             .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
             .await
             .unwrap();
+        executor
+            .execute(ryme_sql::parse("GRANT SELECT ON TABLE docs TO authenticated").unwrap())
+            .await
+            .unwrap();
         let mut txn = manager.begin();
         manager.put(
             &mut txn,
@@ -874,7 +879,8 @@ mod tests {
         keys.insert(
             String::from("k"),
             Principal { id: String::from("u"), tenant: String::from("t"), roles },
-        );
+        )
+        .unwrap();
         let native = NativeGateway::with_gateway(gateway, keys).with_sql_executor(executor);
         let request = serde_json::to_vec(&Request {
             key: String::from("k"),
@@ -961,7 +967,8 @@ mod tests {
         keys.insert(
             String::from("k"),
             Principal { id: String::from("u"), tenant: String::from("t"), roles },
-        );
+        )
+        .unwrap();
         let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
         {
             let mut registry = qos.lock().unwrap();

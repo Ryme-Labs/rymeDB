@@ -73,7 +73,8 @@ async fn tls_ping_roundtrip() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let native = NativeGateway::with_gateway(gateway, keys);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -163,7 +164,8 @@ fn test_service() -> NativeGateway {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     NativeGateway::with_gateway(gateway, keys)
 }
 

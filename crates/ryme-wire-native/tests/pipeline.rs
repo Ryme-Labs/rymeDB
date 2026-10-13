@@ -19,7 +19,8 @@ fn test_gateway() -> NativeGateway {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     NativeGateway::with_gateway(gateway, keys)
 }
 

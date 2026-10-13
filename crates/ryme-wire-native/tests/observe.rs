@@ -42,7 +42,8 @@ async fn native_observe_meter_and_classify_sql() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
     let metering = Arc::new(Mutex::new(ryme_metering::MeterRegistry::new()));
     {

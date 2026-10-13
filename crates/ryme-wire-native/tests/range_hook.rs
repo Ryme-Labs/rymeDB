@@ -36,7 +36,8 @@ async fn range_hook_records_native_put_and_delete() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let moved = seen.clone();
     let hook = RangeLoadHook::armed(Arc::new(
