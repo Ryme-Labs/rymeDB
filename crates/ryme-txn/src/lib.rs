@@ -4035,6 +4035,74 @@ mod tests {
     }
 
     #[test]
+    fn retention_sweep_compacts_standard_segments_at_threshold() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-segment-threshold-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Never,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+
+        for index in 0..(SEGMENT_COMPACTION_THRESHOLD - 1) {
+            let mut txn = manager.begin();
+            manager.put(
+                &mut txn,
+                RecordKey::new("tenant", "db", "items", &(index as u64).to_be_bytes()),
+                vec![index as u8],
+            );
+            manager.commit(txn).unwrap();
+        }
+        assert_eq!(
+            manager.segments.segment_paths().unwrap().len(),
+            SEGMENT_COMPACTION_THRESHOLD - 1
+        );
+        manager.retention_sweep(1).unwrap();
+        assert_eq!(
+            manager.segments.segment_paths().unwrap().len(),
+            SEGMENT_COMPACTION_THRESHOLD - 1
+        );
+
+        let mut txn = manager.begin();
+        manager.put(
+            &mut txn,
+            RecordKey::new(
+                "tenant",
+                "db",
+                "items",
+                &((SEGMENT_COMPACTION_THRESHOLD - 1) as u64).to_be_bytes(),
+            ),
+            vec![(SEGMENT_COMPACTION_THRESHOLD - 1) as u8],
+        );
+        manager.commit(txn).unwrap();
+        manager.retention_sweep(1).unwrap();
+        assert_eq!(manager.segments.segment_paths().unwrap().len(), 1);
+        drop(manager);
+
+        let reopened = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Never,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut probe = reopened.begin();
+        for index in 0..SEGMENT_COMPACTION_THRESHOLD {
+            let key = RecordKey::new("tenant", "db", "items", &(index as u64).to_be_bytes());
+            assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(vec![index as u8]));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn retention_sweep_prunes_and_truncates() {
         let dir =
             std::env::temp_dir().join(format!("ryme-retain-{}-{}", std::process::id(), now_ms()));
