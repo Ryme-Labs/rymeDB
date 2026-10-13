@@ -36,7 +36,7 @@ impl RealtimeSubscription {
     pub async fn recv(&mut self) -> Result<Option<String>, ClientError> {
         while let Some(message) = self.stream.next().await {
             match message.map_err(|error| ClientError::WebSocket(error.to_string()))? {
-                Message::Text(text) => return Ok(Some(text)),
+                Message::Text(text) => return Ok(Some(text.to_string())),
                 Message::Ping(payload) => self
                     .stream
                     .send(Message::Pong(payload))
@@ -58,7 +58,7 @@ impl RealtimeSubscription {
 
     async fn send_json(&mut self, value: serde_json::Value) -> Result<(), ClientError> {
         self.stream
-            .send(Message::Text(value.to_string()))
+            .send(Message::Text(value.to_string().into()))
             .await
             .map_err(|error| ClientError::WebSocket(error.to_string()))
     }
@@ -388,7 +388,7 @@ impl RymeClient {
         params: Vec<(String, String)>,
     ) -> Result<RealtimeSubscription, ClientError> {
         let url = self.websocket_url(path, &params)?;
-        let (stream, _) = connect_async(url)
+        let (stream, _) = connect_async(url.as_str())
             .await
             .map_err(|error| ClientError::WebSocket(error.to_string()))?;
         Ok(RealtimeSubscription { stream })
