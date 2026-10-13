@@ -687,6 +687,12 @@ impl AuthAttemptLimiter {
     }
 }
 
+fn auth_attempt_key(scope: &str, credential: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = ryme_auth::base64_url_encode(&Sha256::digest(credential.as_bytes()));
+    format!("{scope}:{digest}")
+}
+
 #[derive(Debug, Default)]
 struct OidcStateStore {
     pending: HashMap<String, u64>,
@@ -753,6 +759,25 @@ mod auth_attempt_limiter_tests {
         assert!(limiter.admit(&identity, 100).is_ok());
         assert_eq!(limiter.identities.len(), 1);
         assert_eq!(limiter.identities.keys().next().map(String::len), Some(43));
+    }
+
+    #[test]
+    fn refresh_tokens_and_oidc_states_have_independent_attempt_buckets() {
+        let mut limiter = AuthAttemptLimiter::default();
+        let refresh_a = auth_attempt_key("refresh", "refresh-token-a");
+        let refresh_b = auth_attempt_key("refresh", "refresh-token-b");
+        let oidc_a = auth_attempt_key("oidc", "state-a");
+        let oidc_b = auth_attempt_key("oidc", "state-b");
+
+        for _ in 0..AUTH_ATTEMPTS_PER_IDENTITY {
+            assert!(limiter.admit(&refresh_a, 100).is_ok());
+            assert!(limiter.admit(&oidc_a, 100).is_ok());
+        }
+        assert!(limiter.admit(&refresh_a, 100).is_err());
+        assert!(limiter.admit(&oidc_a, 100).is_err());
+
+        assert!(limiter.admit(&refresh_b, 100).is_ok());
+        assert!(limiter.admit(&oidc_b, 100).is_ok());
     }
 }
 
@@ -5865,7 +5890,7 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     let attempt_key = if request.refresh_token.is_some()
         || request.grant_type.as_deref() == Some("refresh_token")
     {
-        String::from("refresh")
+        auth_attempt_key("refresh", request.refresh_token.as_deref().unwrap_or(&request.id))
     } else {
         format!("password:{}", request.id)
     };
@@ -6261,7 +6286,7 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
-    let attempt_key = String::from("oidc");
+    let attempt_key = auth_attempt_key("oidc", &request.state);
     if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
         return error_response(error);
     }
