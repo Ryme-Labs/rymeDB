@@ -48,6 +48,8 @@ enum Command {
         sync_each_write: bool,
         #[arg(long, help = "Use segment-backed Standard mode instead of Hot mode")]
         standard_mode: bool,
+        #[arg(long, default_value_t = 1, help = "Writes per transaction")]
+        batch_size: usize,
     },
     SegmentBuild {
         #[arg(long, default_value_t = 1024)]
@@ -138,6 +140,7 @@ async fn main() {
             keyspace,
             sync_each_write,
             standard_mode,
+            batch_size,
         }) => {
             let mode = if standard_mode { StorageMode::Standard } else { StorageMode::Hot };
             sharded_local_bench(
@@ -148,6 +151,7 @@ async fn main() {
                 keyspace,
                 sync_each_write,
                 mode,
+                batch_size,
             );
         }
         Some(Command::SegmentBuild { entries, value_bytes, iterations }) => {
@@ -631,11 +635,26 @@ fn sharded_local_bench(
     keyspace: Option<usize>,
     sync_each_write: bool,
     mode: StorageMode,
+    batch_size: usize,
 ) {
-    if !(1..=256).contains(&shards) {
-        eprintln!("shards must be between 1 and 256");
+    const MAX_BATCH_SIZE: usize = 20_000;
+    const MAX_BATCH_VALUE_BYTES: usize = 8 * 1024 * 1024;
+    let batch_value_bytes = batch_size.checked_mul(value_bytes);
+    if !(1..=256).contains(&shards)
+        || batch_size == 0
+        || batch_size > MAX_BATCH_SIZE
+        || batch_value_bytes.is_none_or(|bytes| bytes > MAX_BATCH_VALUE_BYTES)
+    {
+        eprintln!("shards or batch size are outside benchmark bounds");
         std::process::exit(2);
     }
+    let requested_writes = match ops.checked_mul(batch_size) {
+        Some(writes) => writes,
+        None => {
+            eprintln!("requested write count overflows");
+            std::process::exit(2);
+        }
+    };
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -650,12 +669,21 @@ fn sharded_local_bench(
     let tables = benchmark_tables(&backend, shards);
     let value = vec![7u8; value_bytes];
     let workers = concurrency.max(1).min(ops.max(1));
-    let keyspace = keyspace.unwrap_or(ops).max(1);
-    let warmup_ops = if keyspace < ops { keyspace.saturating_mul(shards) } else { 0 };
+    let keyspace = keyspace.unwrap_or(requested_writes).max(1);
+    let total_keyspace = keyspace.saturating_mul(shards);
+    let warmup_ops =
+        if total_keyspace < requested_writes { total_keyspace.div_ceil(batch_size) } else { 0 };
     for index in 0..warmup_ops {
-        let key = benchmark_record_key(&tables, shards, index, keyspace);
         let mut txn = backend.begin();
-        backend.put(&mut txn, key, value.clone());
+        for offset in 0..batch_size {
+            let key = benchmark_record_key(
+                &tables,
+                shards,
+                index.saturating_mul(batch_size).saturating_add(offset),
+                keyspace,
+            );
+            backend.put(&mut txn, key, value.clone());
+        }
         block_on_ready(backend.commit(txn)).expect("sharded benchmark warmup commit failed");
     }
 
@@ -677,9 +705,16 @@ fn sharded_local_bench(
             for index in first..end {
                 let sample = index % SAMPLE_EVERY == 0;
                 let operation_start = sample.then(Instant::now);
-                let key = benchmark_record_key(&tables, shards, index, keyspace);
                 let mut txn = backend.begin();
-                backend.put(&mut txn, key, value.clone());
+                for offset in 0..batch_size {
+                    let key = benchmark_record_key(
+                        &tables,
+                        shards,
+                        index.saturating_mul(batch_size).saturating_add(offset),
+                        keyspace,
+                    );
+                    backend.put(&mut txn, key, value.clone());
+                }
                 if block_on_ready(backend.commit(txn)).is_ok() {
                     applied += 1;
                 } else {
@@ -719,17 +754,22 @@ fn sharded_local_bench(
             StorageMode::Hot => "hot",
             StorageMode::Standard => "standard",
         },
+        "writes_per_transaction": batch_size,
         "shards": shards,
         "workers": workers,
         "sync_each_write": sync_each_write,
         "value_bytes": value_bytes,
         "keyspace_per_shard": keyspace,
         "warmup_ops": warmup_ops,
-        "requested_ops": ops,
-        "successful_ops": applied,
-        "failed_ops": failed,
+        "requested_transactions": ops,
+        "successful_transactions": applied,
+        "failed_transactions": failed,
+        "requested_ops": requested_writes,
+        "successful_ops": applied.saturating_mul(batch_size),
+        "failed_ops": failed.saturating_mul(batch_size),
         "seconds": seconds,
-        "qps": applied as f64 / seconds,
+        "qps": applied.saturating_mul(batch_size) as f64 / seconds,
+        "transaction_qps": applied as f64 / seconds,
         "latency_sample_stride": 64,
         "latency_samples": samples.len(),
         "sampled_p50_us": percentile(50.0),

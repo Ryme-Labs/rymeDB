@@ -50,7 +50,19 @@ Pass `--standard-mode` to benchmark the segment-backed Standard path with the
 same workload and acknowledgement policy. Output identifies the selected
 storage mode. Compare Hot and Standard runs sequentially on the same idle
 machine; they have different memory-residency semantics, so the result is a
-mode comparison rather than a like-for-like database claim.
+mode comparison rather than a like-for-like database claim. By default, each
+transaction writes one key; set `--batch-size 64` to test larger commits. In
+that case `--ops` counts transactions, while `qps` counts individual writes
+and `transaction_qps` reports committed transactions per second.
+
+A local three-pair batch comparison on the AMD Ryzen 5 4500 used one shard,
+one worker, 500 transactions × 64 distinct 128-byte writes, and no per-write
+fsync. All runs completed with zero failures. Median throughput was 128.8k
+writes/s in Hot mode and 145.6k writes/s in Standard mode; sampled transaction
+p50 was 508 µs and 438 µs respectively. This is evidence for this specific
+mode/workload comparison, not a before/after measurement or an end-to-end
+database claim. The benchmark samples only eight transactions per run, so its
+tail percentiles are too sparse to interpret.
 
 To isolate the delta-segment builder's owned-entry path from the borrowed API:
 
