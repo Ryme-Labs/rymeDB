@@ -336,7 +336,8 @@ async fn e2e_resp_rest_and_recovery() {
     assert_eq!(status, 200);
     let text = String::from_utf8_lossy(&body).into_owned();
     assert!(text.contains("rymeDB Admin"), "{text}");
-    assert!(text.contains("/v1/sql"), "{text}");
+    assert!(text.contains("/dashboard/_next/static/"), "{text}");
+    assert!(text.contains("/dashboard/rymedb-logo.png"), "{text}");
     let (status, body) =
         http_request(http, "POST /v1/backups/archive", b"{\"backup_id\":\"e2e-1\"}").await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));

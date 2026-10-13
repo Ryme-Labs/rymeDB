@@ -29,6 +29,8 @@ enum Command {
         concurrency: usize,
         #[arg(long, default_value_t = 128)]
         value_bytes: usize,
+        #[arg(long, help = "Number of distinct keys (defaults to ops)")]
+        keyspace: Option<usize>,
     },
     Resp {
         #[arg(long, default_value = "127.0.0.1:6380")]
@@ -100,8 +102,8 @@ enum Command {
 async fn main() {
     let args = Args::parse();
     match args.command {
-        Some(Command::Local { ops, concurrency, value_bytes }) => {
-            local_bench(ops, concurrency, value_bytes);
+        Some(Command::Local { ops, concurrency, value_bytes, keyspace }) => {
+            local_bench(ops, concurrency, value_bytes, keyspace);
         }
         Some(Command::Resp {
             addr,
@@ -182,7 +184,7 @@ async fn main() {
             .await;
         }
         None => {
-            local_bench(args.ops, args.concurrency, args.value_bytes);
+            local_bench(args.ops, args.concurrency, args.value_bytes, None);
         }
     }
 }
@@ -478,12 +480,13 @@ async fn realtime_bench(config: RealtimeBench) {
     }
 }
 
-fn local_bench(ops: usize, concurrency: usize, value_bytes: usize) {
+fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Option<usize>) {
     let manager = Arc::new(TxnManager::new());
     let value = vec![7u8; value_bytes];
     let workers = concurrency.max(1).min(ops.max(1));
+    let keyspace = keyspace.unwrap_or(ops).max(1);
     println!(
-        "benchmark=txn-local value_bytes={value_bytes} metadata={}",
+        "benchmark=txn-local value_bytes={value_bytes} keyspace={keyspace} metadata={}",
         machine_metadata()
     );
     let start = Instant::now();
@@ -497,25 +500,35 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize) {
         let end = first + base + usize::from(worker < extra);
         handles.push(std::thread::spawn(move || {
             let mut applied = 0usize;
+            let mut failed = 0usize;
             for index in first..end {
-                let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
+                let key = RecordKey::new(
+                    "bench",
+                    "bench",
+                    "kv",
+                    format!("k-{}", index % keyspace).as_bytes(),
+                );
                 let mut txn = manager.begin();
                 manager.put(&mut txn, key, value.clone());
                 if manager.commit(txn).is_ok() {
                     applied += 1;
+                } else {
+                    failed += 1;
                 }
             }
-            applied
+            (applied, failed)
         }));
     }
-    let applied = handles
+    let (applied, failed) = handles
         .into_iter()
         .map(|handle| handle.join().expect("local benchmark worker panicked"))
-        .sum::<usize>();
+        .fold((0usize, 0usize), |(applied, failed), (worker_applied, worker_failed)| {
+            (applied + worker_applied, failed + worker_failed)
+        });
     let elapsed = start.elapsed();
     let seconds = elapsed.as_secs_f64().max(0.000001);
     let throughput = applied as f64 / seconds;
-    println!("ops={applied} workers={workers} seconds={seconds:.3} qps={throughput:.0}");
+    println!("successful_ops={applied} failed_ops={failed} requested_ops={ops} workers={workers} seconds={seconds:.3} qps={throughput:.0}");
     let probe_ops = 10000.min(ops);
     if probe_ops > 0 {
         let probe_workers = concurrency.max(1).min(probe_ops);
@@ -530,8 +543,12 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize) {
             handles.push(std::thread::spawn(move || {
                 let mut hits = 0usize;
                 for index in first..end {
-                    let key =
-                        RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
+                    let key = RecordKey::new(
+                        "bench",
+                        "bench",
+                        "kv",
+                        format!("k-{}", index % keyspace).as_bytes(),
+                    );
                     let mut txn = manager.begin();
                     if manager.get(&mut txn, &key).unwrap_or(None).is_some() {
                         hits += 1;

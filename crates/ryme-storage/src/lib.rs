@@ -538,11 +538,33 @@ impl Engine {
             .map(|version| (version.value.clone(), version.expires_at))
     }
 
+    pub fn matches_exact_version(
+        &self,
+        key: &RecordKey,
+        commit_ts: u64,
+        value: Option<&[u8]>,
+        expires_at: u64,
+    ) -> bool {
+        self.inner.get(key).is_some_and(|versions| {
+            versions
+                .binary_search_by_key(&commit_ts, |version| version.commit_ts)
+                .ok()
+                .and_then(|index| versions.get(index))
+                .is_some_and(|version| {
+                    version.value.as_deref() == value && version.expires_at == expires_at
+                })
+        })
+    }
+
     pub fn latest_version(&self, key: &RecordKey) -> Option<(u64, Option<Vec<u8>>, u64)> {
         self.inner
             .get(key)?
             .last()
             .map(|version| (version.commit_ts, version.value.clone(), version.expires_at))
+    }
+
+    pub fn latest_commit_ts(&self, key: &RecordKey) -> Option<u64> {
+        self.inner.get(key)?.last().map(|version| version.commit_ts)
     }
 
     pub fn expired(

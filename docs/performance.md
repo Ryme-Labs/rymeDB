@@ -20,8 +20,13 @@ To isolate the in-memory transaction core from networking and WAL durability:
 ryme-bench local --ops 200000 --concurrency 8 --value-bytes 128
 ```
 
-This reports parallel commit throughput and a separate parallel point-read
-probe. It is a core microbenchmark, not an end-to-end database comparison.
+This reports parallel commit throughput, failed commits, and a separate
+parallel point-read probe. By default it writes distinct keys. Set `--keyspace`
+below `--ops` to measure overwrites, for example `--keyspace 1000`; failed
+commits are included in the output because concurrent writes to a hot keyspace
+can conflict under optimistic concurrency control. Use a single worker when
+measuring overwrite cost without concurrent conflicts. This is a core
+microbenchmark, not an end-to-end database comparison.
 
 For PostgreSQL-wire workloads:
 

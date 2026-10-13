@@ -1317,8 +1317,25 @@ impl TxnManager {
         commit_ts: u64,
         writes: BTreeMap<RecordKey, WriteOp>,
     ) -> Result<()> {
+        self.apply_owned_inner(commit_ts, writes, false).map(|_| ())
+    }
+
+    fn apply_owned_or_confirm_locked(
+        &self,
+        commit_ts: u64,
+        writes: BTreeMap<RecordKey, WriteOp>,
+    ) -> Result<()> {
+        self.apply_owned_inner(commit_ts, writes, true).map(|_| ())
+    }
+
+    fn apply_owned_inner(
+        &self,
+        commit_ts: u64,
+        writes: BTreeMap<RecordKey, WriteOp>,
+        accept_identical: bool,
+    ) -> Result<bool> {
         if writes.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let committed_keys = writes.keys().cloned().collect();
         {
@@ -1327,11 +1344,20 @@ impl TxnManager {
                 .engine
                 .write()
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+            if accept_identical
+                && writes.iter().all(|(key, op)| {
+                    engine.matches_exact_version(
+                        key,
+                        commit_ts,
+                        op.value.as_deref(),
+                        op.expires_at,
+                    )
+                })
+            {
+                return Ok(false);
+            }
             for key in writes.keys() {
-                if engine
-                    .latest_version(key)
-                    .is_some_and(|(latest_ts, _, _)| latest_ts >= commit_ts)
-                {
+                if engine.latest_commit_ts(key).is_some_and(|latest_ts| latest_ts >= commit_ts) {
                     return Err(RymeError::Conflict(String::from("stale commit_ts")));
                 }
             }
@@ -1351,7 +1377,7 @@ impl TxnManager {
         self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
         self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
         publish_commit(commit_ts);
-        Ok(())
+        Ok(true)
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<u64> {
@@ -1400,26 +1426,8 @@ impl TxnManager {
             return Err(RymeError::Conflict(String::from("commit invalidated")));
         }
         self.check_locked(&txn, commit_ts)?;
-        match self.apply_locked(commit_ts, &txn.writes) {
-            Ok(()) => Ok(commit_ts),
-            Err(RymeError::Conflict(_)) => {
-                let engine = self
-                    .inner
-                    .engine
-                    .read()
-                    .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-                for (key, op) in txn.writes.iter() {
-                    match engine.exact(key, commit_ts) {
-                        Some((value, expiry)) if value == op.value && expiry == op.expires_at => {
-                            continue
-                        }
-                        _ => return Err(RymeError::Conflict(String::from("stale commit_ts"))),
-                    }
-                }
-                Ok(commit_ts)
-            }
-            Err(e) => Err(e),
-        }
+        self.apply_owned_or_confirm_locked(commit_ts, txn.writes)?;
+        Ok(commit_ts)
     }
 
     pub async fn commit_at_with<Fut>(
@@ -1443,26 +1451,8 @@ impl TxnManager {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         self.check_locked(&txn, commit_ts)?;
-        match self.apply_locked(commit_ts, &txn.writes) {
-            Ok(()) => Ok(commit_ts),
-            Err(RymeError::Conflict(_)) => {
-                let engine = self
-                    .inner
-                    .engine
-                    .read()
-                    .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-                for (key, op) in txn.writes.iter() {
-                    match engine.exact(key, commit_ts) {
-                        Some((value, expiry)) if value == op.value && expiry == op.expires_at => {
-                            continue
-                        }
-                        _ => return Err(RymeError::Conflict(String::from("stale commit_ts"))),
-                    }
-                }
-                Ok(commit_ts)
-            }
-            Err(error) => Err(error),
-        }
+        self.apply_owned_or_confirm_locked(commit_ts, txn.writes)?;
+        Ok(commit_ts)
     }
 
     pub fn commit_durable(
@@ -1490,7 +1480,7 @@ impl TxnManager {
         let commit_ts = self.reserve_locked(&txn)?;
         let payload = encode_writes(&txn.writes)?;
         persist(commit_ts, &payload, &txn.writes)?;
-        self.apply_locked(commit_ts, &txn.writes)?;
+        self.apply_owned_locked(commit_ts, txn.writes)?;
         Ok(commit_ts)
     }
 
@@ -3164,6 +3154,34 @@ mod tests {
         let mut retry = manager.begin();
         manager.put(&mut retry, key_b, b"retry".to_vec());
         assert!(manager.commit(retry).is_ok());
+    }
+
+    #[tokio::test]
+    async fn replicated_commit_at_is_idempotent_only_for_identical_writes() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "replicated", b"idempotent");
+        let mut initial = manager.begin();
+        let mut duplicate = manager.begin();
+        let mut different = manager.begin();
+        manager.put(&mut initial, key.clone(), b"same".to_vec());
+        manager.put(&mut duplicate, key.clone(), b"same".to_vec());
+        manager.put(&mut different, key.clone(), b"different".to_vec());
+
+        manager
+            .commit_at_with(initial, 100, |_, _| async { Ok(()) })
+            .await
+            .unwrap();
+        manager
+            .commit_at_with(duplicate, 100, |_, _| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.commit_at_with(different, 100, |_, _| async { Ok(()) }).await,
+            Err(RymeError::Conflict(_))
+        ));
+
+        let mut read = manager.begin();
+        assert_eq!(manager.get(&mut read, &key).unwrap(), Some(b"same".to_vec()));
     }
 
     #[tokio::test]
