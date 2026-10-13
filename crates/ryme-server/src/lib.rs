@@ -3514,7 +3514,7 @@ async fn health() -> &'static str {
 }
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "../../apps/dashboard/out/"]
+#[folder = "../../dashboard/out/"]
 struct DashboardAssets;
 
 async fn dashboard() -> Response {
