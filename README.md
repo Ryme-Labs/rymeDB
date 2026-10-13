@@ -1,71 +1,11 @@
 ![rymeDB banner](images/rymedb-banner.png)
 
-[Read the documentation](https://db.rymelabs.dev/) · [OpenAPI reference](https://db.rymelabs.dev/api/)
+# rymeDB
 
-rymeDB is an open-source, ultra-low-latency distributed relational database and
-backend platform. One static `ryme-server` binary serves PostgreSQL wire
-protocol clients, RESP (Valkey-compatible) clients, and a REST operator API.
+rymeDB is an open-source, Rust-first distributed relational database for transactional and realtime applications.
+One server exposes PostgreSQL-compatible wire, RESP, REST, GraphQL, and WebSocket interfaces.
+Its storage core combines MVCC transactions and WAL with hot-memory or immutable-segment persistence.
+Raft replication, tenant-aware authorization, branching, and backup features support reliable application data.
+Realtime change streams connect committed database updates to clients.
 
-## Quick start
-
-```bash
-export RYME_API_KEY=local-dev-key
-cargo run --locked -p ryme-server -- --http-listen 127.0.0.1:8080 --pg-listen 127.0.0.1:5433 --resp-listen 127.0.0.1:6380 --data-dir ./data
-```
-
-Default listeners:
-
-* Postgres wire: `127.0.0.1:5433`
-* RESP: `127.0.0.1:6380`
-* REST: `127.0.0.1:8080`
-
-Set `RYME_API_KEY` for auth. See `docs/configuration.md` for all options.
-
-```bash
-psql -h 127.0.0.1 -p 5433 -U postgres -c "SELECT 1"
-curl -H "Authorization: Bearer $RYME_API_KEY" http://127.0.0.1:8080/ready
-```
-
-SDKs live in `sdks/` (npm/TypeScript and Rust).
-Release artifacts are published from version tags; see `docs/sdk-release.md`.
-
-The operator CLI lives in `apps/cli` and is installed as `rymedb-cli`:
-
-```bash
-pnpm --dir apps/cli install
-pnpm --dir apps/cli build
-node apps/cli/dist/cli.js --help
-```
-
-Dashboard is served at `GET /dashboard`.
-
-## Docs
-
-* `docs/configuration.md`
-* `docs/cluster-operations.md`
-* `docs/backup-restore.md`
-* `docs/production.md`
-* `docs/performance.md`
-* `docs/isolation.md`
-* `docs/resp.md`
-* `docs/streaming.md`
-* `docs/migration.md`
-
-REST reference: `schemas/openapi/rest.yaml`
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md).
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).
-
-## Maintainers
-
-See [MAINTAINERS.md](MAINTAINERS.md). Security reports: see [SECURITY.md](SECURITY.md).
-
-## Report a bug or vulnerability
-
-* Bugs: open a GitHub Issue with steps to reproduce.
-* Vulnerabilities (private, staff-only): [Report a vulnerability privately](https://github.com/Ryme-Labs/rymeDB/security/advisories/new). Do not open a public Issue for unpatched vulnerabilities.
+[Documentation](https://db.rymelabs.dev/) · [Installation and setup](https://db.rymelabs.dev/setup/) · [REST API reference](https://db.rymelabs.dev/api/)

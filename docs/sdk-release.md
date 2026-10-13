@@ -1,44 +1,36 @@
-# SDK releases
+---
+title: SDKs and client libraries
+sidebar_label: SDKs
+---
 
-The supported SDK surface is intentionally limited to two packages:
+# SDKs and client libraries
 
-| Ecosystem | Directory | Package |
-| --- | --- | --- |
-| npm/TypeScript | `sdks/js` | `@rymelabs/rymedb` |
-| Rust | `sdks/rust` | `rymedb-client` |
+Use an SDK when you want typed helpers for HTTP, SQL requests, key/value
+operations, and realtime subscriptions. Use PostgreSQL or RESP clients when
+you want to keep an existing driver and protocol in your application.
 
-No Java, Python, Go, Swift, or extra SDK directory is published by the
-repository workflows. Those clients can use stable PostgreSQL, RESP, HTTP,
-and WebSocket protocols directly.
+## JavaScript and TypeScript
 
-## Release checks
+Install `@rymelabs/rymedb`:
 
-```bash
-pnpm --dir sdks/js build && pnpm --dir sdks/js test
-cargo test --manifest-path sdks/rust/Cargo.toml --locked
+```sh
+npm install @rymelabs/rymedb
 ```
 
-SDK releases are started from **Actions → sdk-release → Run workflow** on
-`main`. The workflow picks the next major automatically. The release baseline
-is currently `1.0.0` because that npm version is already occupied, so the next
-release is `2.0.0`; later releases continue with `3.0.0`, and so on. The
-workflow tests both SDKs at the selected version, publishes npm and Cargo packages,
-commits the synchronized version fields, creates the matching `v*` tag and
-GitHub release, and attaches package archives with checksums. Do not create
-release tags manually. The first release uses `sdks/RELEASE_BASE_VERSION`;
-later versions follow completed GitHub SDK releases.
+Create a `RymeHttpClient` with the server URL and API key, then use its
+`kvPut`, `kvGet`, `sql`, and `ready` methods. Realtime helpers include
+`subscribeTable`, `subscribeQuery`, `subscribeBroadcast`, and presence APIs.
+See the [JavaScript SDK guide](sdk-js.md) for examples and options.
 
-The workflow is idempotent if a registry already contains the exact artifact;
-it rejects a version whose published contents differ. npm uses Trusted
-Publishing through GitHub OIDC. Cargo publishing uses the repository Actions
-secret `CARGO_REGISTRY_TOKEN`.
+## Rust
 
-The npm trusted publisher must name the workflow file `sdk-release.yml` (not a
-tag-trigger workflow). If an older trusted-publisher entry names a removed
-workflow, delete that entry and create a new one for `sdk-release.yml`.
+Add `rymedb-client` and a Tokio runtime to your application. `RymeClient`
+provides async HTTP operations and WebSocket subscriptions. See the
+[Rust SDK guide](sdk-rust.md) for a complete quickstart.
 
-Pushes and pull requests run build/test/package checks only; they do not publish.
-The Pages build verifies that only `js` and `rust` exist under `sdks/`.
+## Direct protocol clients
 
-SDK methods should remain thin protocol clients. Add database semantics to the
-server/API contract first, then update both clients and their examples.
+Connect PostgreSQL drivers to port `5433` and RESP/Redis-compatible clients to
+port `6380` by default. HTTP and WebSocket clients use port `8080`. The
+[PostgreSQL](postgres.md), [RESP](resp.md), and [REST API](api.md) guides
+describe supported behavior and compatibility boundaries.

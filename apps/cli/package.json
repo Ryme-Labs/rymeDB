@@ -1,8 +1,23 @@
 {
   "name": "@rymelabs/rymedb-cli",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "description": "Command-line operator client for rymeDB",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ryme-Labs/rymeDB.git",
+    "directory": "apps/cli"
+  },
+  "homepage": "https://db.rymelabs.dev/cli/",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "files": [
+    "dist/cli.js",
+    "README.md"
+  ],
   "bin": {
     "rymedb-cli": "dist/cli.js"
   },

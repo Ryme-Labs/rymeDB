@@ -27,6 +27,8 @@ module.exports = {
         "postgres",
         "migration",
         "performance",
+        "scalability",
+        "comparison",
       ],
     },
     {
@@ -40,6 +42,7 @@ module.exports = {
           href: "https://db.rymelabs.dev/api/",
         },
         "api",
+        "cli",
         "sdk-js",
         "sdk-rust",
       ],

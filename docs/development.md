@@ -52,7 +52,7 @@ pnpm docs:build
 ```
 
 The CI workflows run on `ubuntu-24.04`, install `protoc` and `psql`, test the
-protocols, build Pages, and publish only the npm/JS and Rust SDKs.
+protocols, and build the documentation site.
 
 ## Adding a feature
 

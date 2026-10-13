@@ -1,0 +1,158 @@
+name: cli-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/cli/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "docs/cli.md"
+      - ".github/workflows/cli-release.yml"
+  pull_request:
+    paths:
+      - "apps/cli/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "docs/cli.md"
+      - ".github/workflows/cli-release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'cli-release-publish-main' || format('cli-release-check-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Test and pack npm CLI
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check, build, and test CLI
+        run: |
+          pnpm --filter @rymelabs/rymedb-cli check
+          pnpm --filter @rymelabs/rymedb-cli build
+          pnpm --filter @rymelabs/rymedb-cli test
+
+      - name: Pack npm artifact
+        run: mkdir -p "$RUNNER_TEMP/npm" && npm pack --pack-destination "$RUNNER_TEMP/npm"
+        working-directory: apps/cli
+
+      - name: Verify package contents
+        run: |
+          shopt -s nullglob
+          packages=("$RUNNER_TEMP/npm/"*.tgz)
+          test "${#packages[@]}" -eq 1
+          tar -tzf "${packages[0]}" | grep -qx 'package/dist/cli.js'
+          tar -tzf "${packages[0]}" | grep -qx 'package/README.md'
+          if tar -tzf "${packages[0]}" | grep -qE '(^|/)cli\.test\.'; then
+            echo "npm artifact unexpectedly contains test files"
+            exit 1
+          fi
+
+      - name: Upload npm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-npm
+          path: ${{ runner.temp }}/npm/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish CLI to npm
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set up Node with npm registry
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.14.0
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.5.1
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download npm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-npm
+          path: ${{ runner.temp }}/npm
+
+      - name: Publish if version is new or artifact matches
+        run: |
+          set -euo pipefail
+          release_version="$(node -p 'JSON.parse(require("fs").readFileSync("apps/cli/package.json", "utf8")).version')"
+          [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          shopt -s nullglob
+          packages=("$RUNNER_TEMP/npm/"*.tgz)
+          test "${#packages[@]}" -eq 1
+          metadata_file="$RUNNER_TEMP/npm-cli-$release_version.json"
+          for attempt in 1 2 3; do
+            if ! npm_status="$(curl --retry 3 --retry-all-errors -sS \
+              -H 'Cache-Control: no-cache' \
+              -H 'Accept: application/json' \
+              --output "$metadata_file" --write-out '%{http_code}' \
+              "https://registry.npmjs.org/@rymelabs%2frymedb-cli/$release_version?cacheBust=$GITHUB_RUN_ID-$attempt")"; then
+              echo "npm package lookup failed for @rymelabs/rymedb-cli@$release_version"
+              exit 1
+            fi
+            if [[ "$npm_status" != "404" || "$attempt" == 3 ]]; then
+              break
+            fi
+            sleep 2
+          done
+          case "$npm_status" in
+            200)
+              published="$(jq -er '.version // empty' "$metadata_file")"
+              [[ "$published" == "$release_version" ]]
+              published_tarball="$(jq -er '.dist.tarball // empty' "$metadata_file")"
+              existing_tgz="$RUNNER_TEMP/npm-existing-$release_version.tgz"
+              existing_dir="$RUNNER_TEMP/npm-existing-$release_version"
+              local_dir="$RUNNER_TEMP/npm-local-$release_version"
+              mkdir -p "$existing_dir" "$local_dir"
+              curl --retry 3 --retry-all-errors -sS \
+                -H 'Cache-Control: no-cache' \
+                --output "$existing_tgz" "$published_tarball"
+              tar -xzf "$existing_tgz" -C "$existing_dir"
+              tar -xzf "${packages[0]}" -C "$local_dir"
+              if ! diff -qr "$existing_dir/package" "$local_dir/package"; then
+                echo "@rymelabs/rymedb-cli@$release_version already exists with different contents"
+                exit 1
+              fi
+              echo "@rymelabs/rymedb-cli@$release_version already published with matching files; skipping"
+              ;;
+            404)
+              npm publish "${packages[0]}" --access public --provenance
+              ;;
+            *)
+              echo "npm registry returned HTTP $npm_status while checking @rymelabs/rymedb-cli@$release_version"
+              exit 1
+              ;;
+          esac
