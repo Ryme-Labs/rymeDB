@@ -855,8 +855,16 @@ where
     };
     let tenant = principal.tenant.clone();
     let role = principal.sql_role().to_string();
-    let executor =
-        Arc::new((*executor).clone().with_tenant(tenant.clone()).with_role(role.clone()));
+    let executor = (*executor)
+        .clone()
+        .with_tenant(tenant.clone())
+        .with_role(role.clone());
+    let executor = if principal.can_platform_admin() {
+        executor.without_auth_uid()
+    } else {
+        executor.with_auth_uid(principal.id.clone())
+    };
+    let executor = Arc::new(executor);
     let mut limits = limits.with_tenant(tenant);
     limits.read_allowed = principal.can_read();
     limits.write_allowed = principal.can_write();

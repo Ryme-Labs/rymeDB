@@ -64,8 +64,8 @@ application's generated SQL and realtime tests.
 ### Supabase-specific review
 
 - Map Supabase JWT issuer/audience and `tenant_id`/role claims.
-- Translate simple `auth.uid() = tenant_column` RLS policies and test default
-  deny behavior.
+- Translate simple `auth.uid() = user_id` RLS policies using JWT `sub` and
+  test default-deny behavior. Keep tenant isolation policies separate.
 - Review storage buckets, Edge Functions, scheduled jobs, and extensions;
   they are not automatically moved by a database dump.
 - Replace Supabase Realtime subscriptions with `/v1/stream`,

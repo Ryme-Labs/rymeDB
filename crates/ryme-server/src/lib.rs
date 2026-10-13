@@ -4320,7 +4320,19 @@ fn branch_executor_for_principal(
     principal: &Principal,
 ) -> ryme_error::Result<Executor<BranchStorage>> {
     branch_executor(state, headers, &principal.tenant)
-        .map(|executor| executor.with_role(principal.sql_role().to_string()))
+        .map(|executor| executor_for_principal(executor, principal))
+}
+
+fn executor_for_principal<B>(executor: Executor<B>, principal: &Principal) -> Executor<B>
+where
+    B: ryme_txn::TxnBackend,
+{
+    let executor = executor.with_role(principal.sql_role().to_string());
+    if principal.can_platform_admin() {
+        executor.without_auth_uid()
+    } else {
+        executor.with_auth_uid(principal.id.clone())
+    }
 }
 
 fn sql_range_keys(statement: &Statement) -> Option<Vec<Vec<u8>>> {
@@ -6882,7 +6894,7 @@ async fn supabase_realtime_stream(
         Err(error) => return error_response(error),
     };
     let rls_executor = match branch_executor(&state, &headers, &principal.tenant) {
-        Ok(executor) => executor.with_role(principal.sql_role().to_string()),
+        Ok(executor) => executor_for_principal(executor, &principal),
         Err(error) => return error_response(error),
     };
     let connection = match open_realtime_connection(&state, &principal.tenant) {
@@ -12020,7 +12032,7 @@ async fn stream(
         branch_commit,
         storage_epoch,
     ) {
-        Ok(executor) => executor.with_role(principal.sql_role().to_string()),
+        Ok(executor) => executor_for_principal(executor, &principal),
         Err(e) => return error_response(e),
     };
     if !rls_executor.can_select_table(&table) {
@@ -12371,7 +12383,7 @@ async fn query_stream(
         branch_commit,
         storage_epoch,
     ) {
-        Ok(executor) => executor.with_role(principal.sql_role().to_string()),
+        Ok(executor) => executor_for_principal(executor, &principal),
         Err(e) => return error_response(e),
     };
     if !rls_executor.can_select_table(&table) {

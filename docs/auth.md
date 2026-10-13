@@ -132,11 +132,16 @@ policy declarations:
 
 ```sql
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
-CREATE POLICY messages_tenant ON messages
+CREATE POLICY messages_owner ON messages
   FOR ALL
-  USING (auth.uid() = tenant_id)
-  WITH CHECK (auth.uid() = tenant_id);
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 ```
+
+For SQL policies, `auth.uid()` is the authenticated JWT `sub` identity. It is
+distinct from the tenant claim. Configure `rls_tables` when rows should be
+restricted by tenant instead. Requests authenticated only with an operator API
+key have no user identity; do not use them to test user-scoped policies.
 
 RLS affects SQL, REST, scans, and realtime snapshots/updates. An enabled table
 without a matching policy follows default-deny behavior. Inspect policy
@@ -144,7 +149,7 @@ metadata through `pg_catalog.pg_policies`. Complex policy expressions need a
 manual compatibility review.
 
 SQL schema, role, and privilege changes operate on the shared database
-catalog and require a platform `superuser`/`service_role` credential. Tenant
+catalog and require a platform `superuser` credential. Tenant
 `owner` and `admin` principals remain tenant-local: they can manage their
 tenant's data and users, but cannot change global DDL or SQL grants.
 

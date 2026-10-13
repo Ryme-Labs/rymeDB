@@ -567,7 +567,7 @@ where
             None
         };
         let fingerprint = self.slow_log.as_ref().map(|_| query_fingerprint(&inner.sql));
-        let mut executor = self
+        let executor = self
             .sql_executor
             .as_deref()
             .cloned()
@@ -581,6 +581,11 @@ where
             })
             .with_tenant(principal.tenant.clone())
             .with_role(principal.sql_role().to_string());
+        let mut executor = if principal.can_platform_admin() {
+            executor.without_auth_uid()
+        } else {
+            executor.with_auth_uid(principal.id.clone())
+        };
         if self.gateway.is_read_only() {
             executor.set_read_only(true);
         }

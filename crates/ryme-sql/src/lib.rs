@@ -920,6 +920,14 @@ pub struct RlsPolicy {
     pub write: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RlsPolicyMaps {
+    tenant_read: HashMap<String, String>,
+    tenant_write: HashMap<String, String>,
+    uid_read: HashMap<String, String>,
+    uid_write: HashMap<String, String>,
+}
+
 fn default_rls_policy_command() -> String {
     String::from("ALL")
 }
@@ -1173,6 +1181,14 @@ fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, colum
         Some(existing) if column.is_empty() => existing.clear(),
         Some(existing) => *existing = String::from(RLS_CONFLICT_COLUMN),
     }
+}
+
+fn policy_uses_auth_uid(policy: &RlsPolicy) -> bool {
+    policy
+        .using
+        .iter()
+        .chain(policy.check.iter())
+        .any(|expression| expression.to_ascii_lowercase().contains("auth.uid()"))
 }
 
 fn tenant_field_matches(
@@ -3308,8 +3324,10 @@ fn policy_tenant_column(expression: &str) -> Option<String> {
         let candidate = side.trim_matches(|character: char| {
             character.is_ascii_whitespace() || character == '"' || character == '\''
         });
-        if candidate.eq_ignore_ascii_case("auth.uid()")
-            || candidate.is_empty()
+        if policy_auth_uid_side(candidate) {
+            return None;
+        }
+        if candidate.is_empty()
             || candidate.contains('(')
             || candidate.contains(')')
             || !candidate.chars().all(|character| {
@@ -3320,6 +3338,20 @@ fn policy_tenant_column(expression: &str) -> Option<String> {
         }
         Some(candidate.rsplit('.').next().unwrap_or(candidate).to_string())
     })
+}
+
+fn policy_auth_uid_side(side: &str) -> bool {
+    let mut candidate = side.trim();
+    loop {
+        let Some(inner) = candidate.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+            break;
+        };
+        candidate = inner.trim();
+    }
+    if candidate.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("select ")) {
+        candidate = candidate[7..].trim();
+    }
+    candidate.eq_ignore_ascii_case("auth.uid()")
 }
 
 fn parse_named_table_constraints(raw: &str) -> Result<Vec<TableConstraint>> {
@@ -7059,6 +7091,7 @@ fn returning_field_value(field: &ReturningField, pk: &[u8], value: &[u8]) -> Vec
 #[derive(Clone)]
 pub struct Executor<B = TxnManager> {
     tenant: String,
+    auth_uid: Option<String>,
     database: String,
     branch: String,
     role: String,
@@ -7069,8 +7102,7 @@ pub struct Executor<B = TxnManager> {
     isolation: Isolation,
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
-    rls_tables: Arc<RwLock<HashMap<String, String>>>,
-    rls_write_tables: Arc<RwLock<HashMap<String, String>>>,
+    rls_maps: Arc<RwLock<RlsPolicyMaps>>,
     rls_enabled: Arc<RwLock<HashSet<String>>>,
     rls_forced: Arc<RwLock<HashSet<String>>>,
     platform_rls_tables: Arc<RwLock<HashSet<String>>>,
@@ -7117,6 +7149,7 @@ struct IndexState {
 impl Executor<TxnManager> {
     pub fn new(tenant: String, database: String) -> Self {
         Self {
+            auth_uid: Some(tenant.clone()),
             tenant,
             database,
             branch: String::from("main"),
@@ -7128,8 +7161,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
-            rls_tables: Arc::new(RwLock::new(HashMap::new())),
-            rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
             platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
@@ -7154,6 +7186,7 @@ impl Executor<TxnManager> {
 
     pub fn with_manager(tenant: String, database: String, manager: TxnManager) -> Self {
         Self {
+            auth_uid: Some(tenant.clone()),
             tenant,
             database,
             branch: String::from("main"),
@@ -7165,8 +7198,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
-            rls_tables: Arc::new(RwLock::new(HashMap::new())),
-            rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
             platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
@@ -7196,6 +7228,7 @@ where
 {
     pub fn with_backend(tenant: String, database: String, manager: B) -> Self {
         Self {
+            auth_uid: Some(tenant.clone()),
             tenant,
             database,
             branch: String::from("main"),
@@ -7207,8 +7240,7 @@ where
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
-            rls_tables: Arc::new(RwLock::new(HashMap::new())),
-            rls_write_tables: Arc::new(RwLock::new(HashMap::new())),
+            rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
             platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
@@ -7283,20 +7315,14 @@ where
                 (format!("{table}\0{}", policy.name), policy)
             })
             .collect();
-        self.rls_tables = Arc::new(RwLock::new(rls_tables.clone()));
-        self.rls_write_tables = Arc::new(RwLock::new(rls_tables));
-        self.rls_enabled = Arc::new(RwLock::new(
-            self.rls_tables
-                .read()
-                .map(|tables| tables.keys().cloned().collect())
-                .unwrap_or_default(),
-        ));
-        self.platform_rls_tables = Arc::new(RwLock::new(
-            self.rls_tables
-                .read()
-                .map(|tables| tables.keys().cloned().collect())
-                .unwrap_or_default(),
-        ));
+        let table_names: HashSet<String> = rls_tables.keys().cloned().collect();
+        self.rls_maps = Arc::new(RwLock::new(RlsPolicyMaps {
+            tenant_read: rls_tables.clone(),
+            tenant_write: rls_tables,
+            ..RlsPolicyMaps::default()
+        }));
+        self.rls_enabled = Arc::new(RwLock::new(table_names.clone()));
+        self.platform_rls_tables = Arc::new(RwLock::new(table_names));
         self.rls_policies = Arc::new(RwLock::new(policies));
         self
     }
@@ -7305,11 +7331,9 @@ where
         if let Ok(mut platform_tables) = self.platform_rls_tables.write() {
             platform_tables.extend(rls_tables.keys().cloned());
         }
-        if let Ok(mut configured) = self.rls_tables.write() {
-            configured.extend(rls_tables.clone());
-        }
-        if let Ok(mut configured) = self.rls_write_tables.write() {
-            configured.extend(rls_tables.clone());
+        if let Ok(mut maps) = self.rls_maps.write() {
+            maps.tenant_read.extend(rls_tables.clone());
+            maps.tenant_write.extend(rls_tables.clone());
         }
         if let Ok(mut enabled) = self.rls_enabled.write() {
             enabled.extend(rls_tables.keys().cloned());
@@ -7908,20 +7932,23 @@ where
             .clone();
         let mut reads = HashMap::new();
         let mut writes = HashMap::new();
+        let mut uid_reads = HashMap::new();
+        let mut uid_writes = HashMap::new();
         for policy in policies.values() {
+            let (read_map, write_map) = if policy_uses_auth_uid(policy) {
+                (&mut uid_reads, &mut uid_writes)
+            } else {
+                (&mut reads, &mut writes)
+            };
             if policy.read {
-                merge_rls_policy_column(&mut reads, &policy.table, &policy.column);
+                merge_rls_policy_column(read_map, &policy.table, &policy.column);
             }
             if policy.write {
-                merge_rls_policy_column(&mut writes, &policy.table, &policy.column);
+                merge_rls_policy_column(write_map, &policy.table, &policy.column);
             }
         }
-        *self.rls_tables.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? =
-            reads;
-        *self
-            .rls_write_tables
-            .write()
-            .map_err(|_| RymeError::Internal(String::from("RLS write lock")))? = writes;
+        *self.rls_maps.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? =
+            RlsPolicyMaps { tenant_read: reads, tenant_write: writes, uid_read: uid_reads, uid_write: uid_writes };
         Ok(())
     }
 
@@ -8018,6 +8045,7 @@ where
     pub fn with_backend_manager<C>(self, manager: C) -> Executor<C> {
         Executor {
             tenant: self.tenant,
+            auth_uid: self.auth_uid,
             database: self.database,
             branch: self.branch,
             role: self.role,
@@ -8028,8 +8056,7 @@ where
             isolation: self.isolation,
             catalog: self.catalog,
             indexes: self.indexes,
-            rls_tables: self.rls_tables,
-            rls_write_tables: self.rls_write_tables,
+            rls_maps: self.rls_maps,
             rls_enabled: self.rls_enabled,
             rls_forced: self.rls_forced,
             platform_rls_tables: self.platform_rls_tables,
@@ -8071,7 +8098,22 @@ where
     /// Returns an executor using a different tenant namespace while keeping
     /// the shared backend, catalog, indexes, and policy settings.
     pub fn with_tenant(mut self, tenant: String) -> Self {
+        if self.auth_uid.as_deref() == Some(self.tenant.as_str()) {
+            self.auth_uid = Some(tenant.clone());
+        }
         self.tenant = tenant;
+        self
+    }
+
+    /// Set the authenticated user identity used by PostgreSQL-compatible `auth.uid()` policies.
+    pub fn with_auth_uid(mut self, auth_uid: String) -> Self {
+        self.auth_uid = Some(auth_uid);
+        self
+    }
+
+    /// Clear authenticated-user identity for operator or anonymous contexts.
+    pub fn without_auth_uid(mut self) -> Self {
+        self.auth_uid = None;
         self
     }
 
@@ -8150,20 +8192,9 @@ where
                     .collect()
             })
             .unwrap_or_default();
-        let rls_tables = self
-            .rls_tables
-            .read()
-            .map(|rls_tables| {
-                rls_tables.iter().map(|(table, column)| (table.clone(), column.clone())).collect()
-            })
-            .unwrap_or_default();
-        let rls_write_tables = self
-            .rls_write_tables
-            .read()
-            .map(|rls_tables| {
-                rls_tables.iter().map(|(table, column)| (table.clone(), column.clone())).collect()
-            })
-            .unwrap_or_default();
+        let rls_maps = self.rls_maps.read().map(|maps| maps.clone()).unwrap_or_default();
+        let rls_tables: BTreeMap<_, _> = rls_maps.tenant_read.into_iter().collect();
+        let rls_write_tables: BTreeMap<_, _> = rls_maps.tenant_write.into_iter().collect();
         let rls_enabled = self
             .rls_enabled
             .read()
@@ -8363,15 +8394,13 @@ where
         }
         let rls_policies =
             if snapshot.rls_policies.is_empty() { legacy_policies } else { snapshot.rls_policies };
-        if let Ok(mut rls_tables) = self.rls_tables.write() {
-            *rls_tables = snapshot.rls_tables.into_iter().collect();
+        if let Ok(mut maps) = self.rls_maps.write() {
+            maps.tenant_read = snapshot.rls_tables.into_iter().collect();
+            maps.tenant_write = snapshot.rls_write_tables.into_iter().collect();
+            maps.uid_read.clear();
+            maps.uid_write.clear();
         } else {
             return Err(RymeError::Internal(String::from("RLS lock")));
-        }
-        if let Ok(mut rls_tables) = self.rls_write_tables.write() {
-            *rls_tables = snapshot.rls_write_tables.into_iter().collect();
-        } else {
-            return Err(RymeError::Internal(String::from("RLS write lock")));
         }
         if let Ok(mut tables) = self.rls_enabled.write() {
             *tables = rls_enabled;
@@ -8388,6 +8417,7 @@ where
         } else {
             return Err(RymeError::Internal(String::from("RLS policy lock")));
         }
+        self.rebuild_rls_policy_maps()?;
         if let Ok(mut indexes) = self.indexes.lock() {
             indexes.clear();
         } else {
@@ -8422,9 +8452,7 @@ where
             self.privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
         let default_privileges =
             self.default_privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
-        let rls_tables = self.rls_tables.read().map(|tables| tables.clone()).unwrap_or_default();
-        let rls_write_tables =
-            self.rls_write_tables.read().map(|tables| tables.clone()).unwrap_or_default();
+        let rls_maps = self.rls_maps.read().map(|maps| maps.clone()).unwrap_or_default();
         let rls_enabled = self.rls_enabled.read().map(|tables| tables.clone()).unwrap_or_default();
         let rls_forced = self.rls_forced.read().map(|tables| tables.clone()).unwrap_or_default();
         let platform_rls_tables = self
@@ -8436,6 +8464,7 @@ where
             self.rls_policies.read().map(|policies| policies.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
+            auth_uid: self.auth_uid,
             database: self.database,
             branch: self.branch,
             role: self.role,
@@ -8446,8 +8475,7 @@ where
             isolation: self.isolation,
             catalog: Arc::new(Mutex::new(catalog)),
             indexes: Arc::new(Mutex::new(indexes)),
-            rls_tables: Arc::new(RwLock::new(rls_tables)),
-            rls_write_tables: Arc::new(RwLock::new(rls_write_tables)),
+            rls_maps: Arc::new(RwLock::new(rls_maps)),
             rls_enabled: Arc::new(RwLock::new(rls_enabled)),
             rls_forced: Arc::new(RwLock::new(rls_forced)),
             platform_rls_tables: Arc::new(RwLock::new(platform_rls_tables)),
@@ -8773,17 +8801,23 @@ where
     }
 
     fn rls_policy_allows(&self, table: &str, value: &[u8]) -> bool {
-        let Some(column) = self.rls_tables.read().ok().and_then(|rls| rls.get(table).cloned())
-        else {
+        let Ok(maps) = self.rls_maps.read() else { return false };
+        let tenant_column = maps.tenant_read.get(table);
+        let uid_column = maps.uid_read.get(table);
+        if tenant_column.is_none() && uid_column.is_none() {
             return false;
-        };
-        if column.is_empty() {
-            return true;
         }
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return false;
         };
-        tenant_field_matches(&object, &column, &self.tenant)
+        let allows = |column: Option<&String>, identity: Option<&str>| match column {
+            None => true,
+            Some(column) if column.is_empty() => true,
+            Some(column) => identity
+                .is_some_and(|identity| tenant_field_matches(&object, column, identity)),
+        };
+        allows(tenant_column, Some(&self.tenant))
+            && allows(uid_column, self.auth_uid.as_deref())
     }
 
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
@@ -8814,18 +8848,26 @@ where
         if !self.rls_applies_to_role(table) {
             return Ok(());
         }
-        let Some(column) =
-            self.rls_write_tables.read().ok().and_then(|rls| rls.get(table).cloned())
-        else {
+        let maps = self
+            .rls_maps
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("RLS lock")))?;
+        let tenant_column = maps.tenant_write.get(table);
+        let uid_column = maps.uid_write.get(table);
+        if tenant_column.is_none() && uid_column.is_none() {
             return Err(RymeError::Forbidden);
-        };
-        if column.is_empty() {
-            return Ok(());
         }
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return Err(RymeError::Forbidden);
         };
-        if tenant_field_matches(&object, &column, &self.tenant) {
+        let allows = |column: Option<&String>, identity: Option<&str>| match column {
+            None => true,
+            Some(column) if column.is_empty() => true,
+            Some(column) => identity
+                .is_some_and(|identity| tenant_field_matches(&object, column, identity)),
+        };
+        if allows(tenant_column, Some(&self.tenant)) && allows(uid_column, self.auth_uid.as_deref())
+        {
             Ok(())
         } else {
             Err(RymeError::Forbidden)
@@ -16810,7 +16852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_create_policy_installs_persisted_tenant_rls() {
+    async fn sql_create_policy_installs_persisted_auth_uid_rls() {
         let executor = Executor::new(String::from("tenant-a"), String::from("d"));
         executor
             .execute(
@@ -16879,13 +16921,101 @@ mod tests {
         assert!(matches!(rejected, Err(RymeError::Forbidden)));
 
         let snapshot = executor.schema_snapshot();
-        assert_eq!(snapshot.rls_tables.get("messages"), Some(&String::from("tenant_id")));
-        assert_eq!(snapshot.rls_write_tables.get("messages"), Some(&String::from("tenant_id")));
+        assert!(!snapshot.rls_tables.contains_key("messages"));
+        assert!(!snapshot.rls_write_tables.contains_key("messages"));
+        assert!(snapshot.rls_policies.values().any(|policy| {
+            policy.table == "messages"
+                && policy.using.as_deref() == Some("auth.uid() = tenant_id")
+                && policy.check.as_deref() == Some("auth.uid() = tenant_id")
+        }));
         assert!(snapshot.rls_enabled.contains("messages"));
         executor.restore_schema_snapshot(snapshot).unwrap();
         let user = executor.with_role(String::from("authenticated"));
         let result = user.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn auth_uid_rls_uses_authenticated_user_not_tenant() {
+        let executor = Executor::new(String::from("project-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE profiles (id TEXT PRIMARY KEY, user_id TEXT, body TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO profiles (id, user_id, body) VALUES ('own', 'user-a', 'visible'), ('other', 'user-b', 'hidden')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE POLICY profile_owner ON profiles FOR ALL USING ((select auth.uid()) = user_id) WITH CHECK ((select auth.uid()) = user_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE profiles ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT SELECT, INSERT ON TABLE profiles TO authenticated").unwrap())
+            .await
+            .unwrap();
+
+        let user = executor
+            .clone()
+            .with_role(String::from("authenticated"))
+            .with_auth_uid(String::from("user-a"));
+        let rows = user.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
+        assert!(
+            matches!(rows, QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"own")
+        );
+        let write = user
+            .execute(
+                parse("INSERT INTO profiles (id, user_id, body) VALUES ('blocked', 'user-b', 'no')")
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(write, Err(RymeError::Forbidden)));
+
+        let other_user = executor
+            .clone()
+            .with_role(String::from("authenticated"))
+            .with_auth_uid(String::from("user-b"));
+        let other_rows =
+            other_user.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
+        assert!(matches!(
+            other_rows,
+            QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"other"
+        ));
+
+        let snapshot = executor.schema_snapshot();
+        executor.restore_schema_snapshot(snapshot).unwrap();
+        let restored_user = executor
+            .clone()
+            .with_role(String::from("authenticated"))
+            .with_auth_uid(String::from("user-a"));
+        let restored_rows =
+            restored_user.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
+        assert!(matches!(
+            restored_rows,
+            QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"own"
+        ));
+        let no_user = executor
+            .with_role(String::from("authenticated"))
+            .without_auth_uid();
+        let no_user_rows = no_user.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
+        assert!(matches!(no_user_rows, QueryResult::Rows { ref rows } if rows.is_empty()));
     }
 
     #[tokio::test]
