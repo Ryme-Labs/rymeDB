@@ -75,6 +75,7 @@ struct ShardInner {
 pub struct ShardSet {
     inner: Arc<Mutex<ShardInner>>,
     commit: Arc<RwLock<()>>,
+    commit_serial: Arc<Mutex<()>>,
 }
 
 fn hash_table(table: &TableRef, buckets: usize) -> usize {
@@ -317,6 +318,7 @@ impl ShardSet {
                 coordinator: Mutex::new(coordinator),
             })),
             commit: Arc::new(RwLock::new(())),
+            commit_serial: Arc::new(Mutex::new(())),
         };
         set.recover_coordinator()?;
         Ok(set)
@@ -720,10 +722,17 @@ impl ShardSet {
     }
 
     fn commit_single(&self, txn: Transaction, ctx: ShardCtx, shard: usize) -> Result<u64> {
+        if txn.writes().is_empty() {
+            return Ok(txn.read_ts);
+        }
+        let _serial = self
+            .commit_serial
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit serial lock")))?;
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         // Pin topology with the read guard; release metadata lock before WAL I/O.
-        let manager = {
+        let (manager, latest_commit) = {
             let inner =
                 self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
             if Some(shard) != ctx.shard {
@@ -734,13 +743,25 @@ impl ShardSet {
                     return Err(RymeError::Unavailable(String::from("rescheduling")));
                 }
             }
-            inner
+            let manager = inner
                 .shards
                 .get(shard)
                 .cloned()
-                .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?
+                .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
+            let latest_commit = inner
+                .shards
+                .iter()
+                .map(DurableManager::latest_commit)
+                .max()
+                .unwrap_or(0);
+            (manager, latest_commit)
         };
-        manager.commit(txn)
+        let commit_ts = latest_commit
+            .max(txn.read_ts)
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+        manager.commit_at(&txn, commit_ts, |_| true)?;
+        Ok(commit_ts)
     }
 
     fn commit_two_phase(&self, txn: Transaction) -> Result<u64> {
@@ -801,11 +822,13 @@ impl ShardSet {
                 })
             })
             .collect();
-        let commit_ts = managers
+        let latest_commit = inner
+            .shards
             .iter()
-            .map(|(_, manager)| manager.inner().latest_commit())
+            .map(DurableManager::latest_commit)
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let commit_ts = latest_commit
             .max(txn.read_ts)
             .checked_add(1)
             .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
@@ -1918,6 +1941,38 @@ mod tests {
 
         let mut probe = backend.begin();
         assert_eq!(backend.get(&mut probe, &key).unwrap(), Some(b"v2".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_shard_commits_use_a_global_snapshot_timestamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-single-shard-global-ts-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
+        let (first_table, second_table) = distinct_tables(&backend);
+        let second_key = RecordKey::new("t", "d", &second_table, b"k");
+
+        let mut first = backend.begin();
+        let mut second = backend.begin();
+        backend.put(
+            &mut first,
+            RecordKey::new("t", "d", &first_table, b"k"),
+            b"first".to_vec(),
+        );
+        backend.put(&mut second, second_key.clone(), b"second".to_vec());
+        let first_commit = futures_executor_block_on(backend.commit(first)).unwrap();
+
+        let mut snapshot = backend.begin();
+        let snapshot_ts = snapshot.read_ts;
+        let second_commit = futures_executor_block_on(backend.commit(second)).unwrap();
+        assert!(second_commit > first_commit);
+        assert!(second_commit > snapshot_ts);
+        assert_eq!(backend.get(&mut snapshot, &second_key).unwrap(), None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
