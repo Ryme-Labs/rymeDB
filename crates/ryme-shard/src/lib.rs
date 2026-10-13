@@ -6,6 +6,7 @@ use ryme_txn::{
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -75,7 +76,8 @@ struct ShardInner {
 pub struct ShardSet {
     inner: Arc<Mutex<ShardInner>>,
     commit: Arc<RwLock<()>>,
-    commit_serial: Arc<Mutex<()>>,
+    shard_commit_locks: Arc<Vec<Mutex<()>>>,
+    commit_clock: Arc<AtomicU64>,
 }
 
 fn hash_table(table: &TableRef, buckets: usize) -> usize {
@@ -304,6 +306,7 @@ impl ShardSet {
         let range_placement_path = data_dir.join("range-placements.json");
         let place = load_placements(&placement_path, shards)?;
         let range_assignments = load_range_assignments(&range_placement_path, shards)?;
+        let latest_commit = managers.iter().map(DurableManager::latest_commit).max().unwrap_or(0);
         let set = Self {
             inner: Arc::new(Mutex::new(ShardInner {
                 base_dir: data_dir.to_path_buf(),
@@ -318,9 +321,11 @@ impl ShardSet {
                 coordinator: Mutex::new(coordinator),
             })),
             commit: Arc::new(RwLock::new(())),
-            commit_serial: Arc::new(Mutex::new(())),
+            shard_commit_locks: Arc::new((0..shards).map(|_| Mutex::new(())).collect()),
+            commit_clock: Arc::new(AtomicU64::new(latest_commit)),
         };
         set.recover_coordinator()?;
+        set.commit_clock.fetch_max(set.latest_commit(), Ordering::SeqCst);
         Ok(set)
     }
 
@@ -723,18 +728,34 @@ impl ShardSet {
         self.inner.lock().ok()?.shards.get(shard).cloned()
     }
 
+    fn reserve_commit_ts(&self, latest_commit: u64, read_ts: u64) -> Result<u64> {
+        let mut observed = self.commit_clock.load(Ordering::SeqCst);
+        loop {
+            let next = observed
+                .max(latest_commit)
+                .max(read_ts)
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+            match self.commit_clock.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(current) => observed = current,
+            }
+        }
+    }
+
     fn commit_single(&self, txn: Transaction, ctx: ShardCtx, shard: usize) -> Result<u64> {
         if txn.writes().is_empty() {
             return Ok(txn.read_ts);
         }
-        let _serial = self
-            .commit_serial
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("commit serial lock")))?;
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         // Pin topology with the read guard; release metadata lock before WAL I/O.
-        let (manager, latest_commit) = {
+        let manager = {
             let inner =
                 self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
             if Some(shard) != ctx.shard {
@@ -750,18 +771,24 @@ impl ShardSet {
                 .get(shard)
                 .cloned()
                 .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
-            let latest_commit = inner
-                .shards
-                .iter()
-                .map(DurableManager::latest_commit)
-                .max()
-                .unwrap_or(0);
-            (manager, latest_commit)
+            manager
         };
-        let commit_ts = latest_commit
-            .max(txn.read_ts)
-            .checked_add(1)
-            .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+        let _shard_commit = self
+            .shard_commit_locks
+            .get(shard)
+            .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("shard commit lock")))?;
+        let latest_commit = self
+            .inner
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("shard lock")))?
+            .shards
+            .iter()
+            .map(DurableManager::latest_commit)
+            .max()
+            .unwrap_or(0);
+        let commit_ts = self.reserve_commit_ts(latest_commit, txn.read_ts)?;
         manager.inner().validate_at(&txn, commit_ts)?;
         manager.commit_at(&txn, commit_ts, |_| true)?;
         Ok(commit_ts)
@@ -825,16 +852,9 @@ impl ShardSet {
                 })
             })
             .collect();
-        let latest_commit = inner
-            .shards
-            .iter()
-            .map(DurableManager::latest_commit)
-            .max()
-            .unwrap_or(0);
-        let commit_ts = latest_commit
-            .max(txn.read_ts)
-            .checked_add(1)
-            .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+        let latest_commit =
+            inner.shards.iter().map(DurableManager::latest_commit).max().unwrap_or(0);
+        let commit_ts = self.reserve_commit_ts(latest_commit, txn.read_ts)?;
         for (_, manager) in managers.iter() {
             manager.inner().validate_at(&txn, commit_ts)?;
         }
@@ -1008,7 +1028,7 @@ impl ShardSet {
 
 impl TxnBackend for ShardSet {
     fn begin(&self) -> Transaction {
-        let _read = self.commit.read().unwrap_or_else(|error| error.into_inner());
+        let _write = self.commit.write().unwrap_or_else(|error| error.into_inner());
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let read_ts =
             inner.shards.iter().map(|shard| shard.inner().latest_commit()).max().unwrap_or(1);
@@ -1034,13 +1054,7 @@ impl TxnBackend for ShardSet {
         }
     }
 
-    fn put_with_ttl(
-        &self,
-        txn: &mut Transaction,
-        key: RecordKey,
-        value: Vec<u8>,
-        expires_at: u64,
-    ) {
+    fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
         let shard = self.touch(txn, &key);
         if let Some(manager) = self.manager_for(shard) {
             manager.put_with_ttl(txn, key, value, expires_at);
@@ -1355,13 +1369,7 @@ impl TxnBackend for HybridBackend {
         }
     }
 
-    fn put_with_ttl(
-        &self,
-        txn: &mut Transaction,
-        key: RecordKey,
-        value: Vec<u8>,
-        expires_at: u64,
-    ) {
+    fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
         let tier = self.touch(txn, TableRef::of(&key));
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match tier {
@@ -1967,11 +1975,7 @@ mod tests {
 
         let mut first = backend.begin();
         let mut second = backend.begin();
-        backend.put(
-            &mut first,
-            RecordKey::new("t", "d", &first_table, b"k"),
-            b"first".to_vec(),
-        );
+        backend.put(&mut first, RecordKey::new("t", "d", &first_table, b"k"), b"first".to_vec());
         backend.put(&mut second, second_key.clone(), b"second".to_vec());
         let first_commit = futures_executor_block_on(backend.commit(first)).unwrap();
 
@@ -1982,6 +1986,73 @@ mod tests {
         assert!(second_commit > snapshot_ts);
         assert_eq!(backend.get(&mut snapshot, &second_key).unwrap(), None);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_single_shard_commit_stays_after_newer_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-queued-single-shard-ts-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
+        let mut first = backend.begin();
+        let mut queued = backend.begin();
+        let first_key = RecordKey::new("t", "d", "users", b"first");
+        let queued_key = RecordKey::new("t", "d", "users", b"queued");
+        backend.put(&mut first, first_key, b"first".to_vec());
+        backend.put(&mut queued, queued_key.clone(), b"queued".to_vec());
+        let first_ts = futures_executor_block_on(backend.commit(first)).unwrap();
+
+        let mut snapshot = backend.begin();
+        let snapshot_ts = snapshot.read_ts;
+        let queued_ts = futures_executor_block_on(backend.commit(queued)).unwrap();
+        assert!(queued_ts > first_ts);
+        assert!(queued_ts > snapshot_ts);
+        assert_eq!(backend.get(&mut snapshot, &queued_key).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn independent_shard_commits_get_distinct_global_timestamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-parallel-shard-commits-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
+        let (left_table, right_table) = distinct_tables(&backend);
+        let left_key = RecordKey::new("t", "d", &left_table, b"k");
+        let right_key = RecordKey::new("t", "d", &right_table, b"k");
+        let mut left = backend.begin();
+        let mut right = backend.begin();
+        backend.put(&mut left, left_key.clone(), b"left".to_vec());
+        backend.put(&mut right, right_key.clone(), b"right".to_vec());
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let left_backend = backend.clone();
+        let left_barrier = barrier.clone();
+        let left_commit = std::thread::spawn(move || {
+            left_barrier.wait();
+            futures_executor_block_on(left_backend.commit(left)).unwrap()
+        });
+        let right_backend = backend.clone();
+        let right_barrier = barrier.clone();
+        let right_commit = std::thread::spawn(move || {
+            right_barrier.wait();
+            futures_executor_block_on(right_backend.commit(right)).unwrap()
+        });
+        barrier.wait();
+        let left_ts = left_commit.join().unwrap();
+        let right_ts = right_commit.join().unwrap();
+        assert_ne!(left_ts, right_ts);
+
+        let mut probe = backend.begin();
+        assert_eq!(backend.get(&mut probe, &left_key).unwrap(), Some(b"left".to_vec()));
+        assert_eq!(backend.get(&mut probe, &right_key).unwrap(), Some(b"right".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
