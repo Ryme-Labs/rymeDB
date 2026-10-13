@@ -806,8 +806,7 @@ impl ShardSet {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("shard commit lock")))?;
         let commit_ts = self.reserve_commit_ts(0, txn.read_ts)?;
-        manager.inner().validate_at(&txn, commit_ts)?;
-        manager.commit_at(&txn, commit_ts, |_| true)?;
+        manager.commit_at_owned(txn, commit_ts)?;
         Ok(commit_ts)
     }
 

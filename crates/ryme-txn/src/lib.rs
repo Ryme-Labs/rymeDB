@@ -1210,6 +1210,39 @@ impl TxnManager {
         Ok(())
     }
 
+    /// Durably commits a filtered owned transaction without cloning its write
+    /// map. Validation runs before persistence so a rejected transaction never
+    /// leaves a WAL record that could be replayed after restart.
+    pub fn commit_filtered_durable_at(
+        &self,
+        txn: Transaction,
+        commit_ts: u64,
+        keep: impl Fn(&RecordKey) -> bool,
+        persist: impl FnOnce(
+            u64,
+            &[u8],
+            &BTreeMap<RecordKey, WriteOp>,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        txn.ensure_healthy()?;
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        self.check_locked(&txn, commit_ts)?;
+        let writes: BTreeMap<RecordKey, WriteOp> =
+            txn.writes.into_iter().filter(|(key, _)| keep(key)).collect();
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let payload = encode_writes(&writes)?;
+        persist(commit_ts, &payload, &writes)?;
+        self.apply_owned_locked(commit_ts, writes)?;
+        self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn replay_at(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
         let _guard = self
             .inner
@@ -2844,6 +2877,39 @@ impl DurableManager {
         }
         result
     }
+
+    /// Commits an owned single-shard transaction, avoiding filtered write-map
+    /// copies on the durable path.
+    pub fn commit_at_owned(&self, txn: Transaction, commit_ts: u64) -> Result<()> {
+        let _gate =
+            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
+        let policy = self.policy;
+        let result = self.inner.commit_filtered_durable_at(
+            txn,
+            commit_ts,
+            |_| true,
+            |commit_ts, payload, writes| {
+                let mut wal = self
+                    .wal
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                wal.append_lsn(commit_ts, payload)?;
+                if policy == SyncPolicy::Always {
+                    wal.sync()?;
+                }
+                self.segments.write_delta_owned_with_sync(
+                    commit_ts,
+                    segment_entries(commit_ts, writes),
+                    policy == SyncPolicy::Always,
+                )?;
+                Ok(())
+            },
+        );
+        if result.is_ok() && self.mode == StorageMode::Standard {
+            self.inner.clear_engine()?;
+        }
+        result
+    }
 }
 
 fn segment_entries(commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Vec<SegmentEntry> {
@@ -3603,6 +3669,47 @@ mod tests {
         let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"v".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejected_owned_durable_commit_does_not_persist_wal_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-durable-owned-conflict-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let key = RecordKey::new("t", "d", "items", b"1");
+        let mut stale = manager.begin();
+        manager.put(&mut stale, key.clone(), b"stale".to_vec());
+        let mut winner = manager.begin();
+        manager.put(&mut winner, key.clone(), b"winner".to_vec());
+        manager.commit(winner).unwrap();
+
+        let wal_records_before = Wal::read_all(&dir).unwrap().len();
+        let mut persist_called = false;
+        let commit_ts = manager.latest_commit() + 1;
+        assert!(matches!(
+            manager.inner.commit_filtered_durable_at(
+                stale,
+                commit_ts,
+                |_| true,
+                |_, _, _| {
+                    persist_called = true;
+                    Ok(())
+                },
+            ),
+            Err(RymeError::Conflict(_))
+        ));
+        assert!(!persist_called);
+        assert_eq!(Wal::read_all(&dir).unwrap().len(), wal_records_before);
+
+        drop(manager);
+        let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"winner".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
