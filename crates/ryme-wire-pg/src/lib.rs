@@ -855,10 +855,7 @@ where
     };
     let tenant = principal.tenant.clone();
     let role = principal.sql_role().to_string();
-    let executor = (*executor)
-        .clone()
-        .with_tenant(tenant.clone())
-        .with_role(role.clone());
+    let executor = (*executor).clone().with_tenant(tenant.clone()).with_role(role.clone());
     let executor = if principal.can_platform_admin() {
         executor.without_auth_uid()
     } else {

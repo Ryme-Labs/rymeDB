@@ -7948,7 +7948,12 @@ where
             }
         }
         *self.rls_maps.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? =
-            RlsPolicyMaps { tenant_read: reads, tenant_write: writes, uid_read: uid_reads, uid_write: uid_writes };
+            RlsPolicyMaps {
+                tenant_read: reads,
+                tenant_write: writes,
+                uid_read: uid_reads,
+                uid_write: uid_writes,
+            };
         Ok(())
     }
 
@@ -8455,11 +8460,8 @@ where
         let rls_maps = self.rls_maps.read().map(|maps| maps.clone()).unwrap_or_default();
         let rls_enabled = self.rls_enabled.read().map(|tables| tables.clone()).unwrap_or_default();
         let rls_forced = self.rls_forced.read().map(|tables| tables.clone()).unwrap_or_default();
-        let platform_rls_tables = self
-            .platform_rls_tables
-            .read()
-            .map(|tables| tables.clone())
-            .unwrap_or_default();
+        let platform_rls_tables =
+            self.platform_rls_tables.read().map(|tables| tables.clone()).unwrap_or_default();
         let rls_policies =
             self.rls_policies.read().map(|policies| policies.clone()).unwrap_or_default();
         Executor {
@@ -8813,11 +8815,11 @@ where
         let allows = |column: Option<&String>, identity: Option<&str>| match column {
             None => true,
             Some(column) if column.is_empty() => true,
-            Some(column) => identity
-                .is_some_and(|identity| tenant_field_matches(&object, column, identity)),
+            Some(column) => {
+                identity.is_some_and(|identity| tenant_field_matches(&object, column, identity))
+            }
         };
-        allows(tenant_column, Some(&self.tenant))
-            && allows(uid_column, self.auth_uid.as_deref())
+        allows(tenant_column, Some(&self.tenant)) && allows(uid_column, self.auth_uid.as_deref())
     }
 
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
@@ -8848,10 +8850,8 @@ where
         if !self.rls_applies_to_role(table) {
             return Ok(());
         }
-        let maps = self
-            .rls_maps
-            .read()
-            .map_err(|_| RymeError::Internal(String::from("RLS lock")))?;
+        let maps =
+            self.rls_maps.read().map_err(|_| RymeError::Internal(String::from("RLS lock")))?;
         let tenant_column = maps.tenant_write.get(table);
         let uid_column = maps.uid_write.get(table);
         if tenant_column.is_none() && uid_column.is_none() {
@@ -8863,8 +8863,9 @@ where
         let allows = |column: Option<&String>, identity: Option<&str>| match column {
             None => true,
             Some(column) if column.is_empty() => true,
-            Some(column) => identity
-                .is_some_and(|identity| tenant_field_matches(&object, column, identity)),
+            Some(column) => {
+                identity.is_some_and(|identity| tenant_field_matches(&object, column, identity))
+            }
         };
         if allows(tenant_column, Some(&self.tenant)) && allows(uid_column, self.auth_uid.as_deref())
         {
@@ -16982,8 +16983,10 @@ mod tests {
         );
         let write = user
             .execute(
-                parse("INSERT INTO profiles (id, user_id, body) VALUES ('blocked', 'user-b', 'no')")
-                    .unwrap(),
+                parse(
+                    "INSERT INTO profiles (id, user_id, body) VALUES ('blocked', 'user-b', 'no')",
+                )
+                .unwrap(),
             )
             .await;
         assert!(matches!(write, Err(RymeError::Forbidden)));
@@ -17011,9 +17014,7 @@ mod tests {
             restored_rows,
             QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"own"
         ));
-        let no_user = executor
-            .with_role(String::from("authenticated"))
-            .without_auth_uid();
+        let no_user = executor.with_role(String::from("authenticated")).without_auth_uid();
         let no_user_rows = no_user.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
         assert!(matches!(no_user_rows, QueryResult::Rows { ref rows } if rows.is_empty()));
     }
