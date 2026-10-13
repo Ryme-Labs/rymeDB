@@ -101,7 +101,7 @@ fn write_snapshot_file(dir: &Path, commit_ts: u64, raw: &[u8]) -> Result<std::pa
 fn read_snapshot_file(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
     if length > ryme_storage::MAX_SNAPSHOT_BYTES as u64 {
         return Err(RymeError::Overload(String::from("snapshot")));

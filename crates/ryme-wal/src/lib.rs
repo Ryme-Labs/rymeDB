@@ -373,7 +373,7 @@ fn parse_segment_name(name: &str) -> Option<u64> {
 }
 
 fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
+    let file = File::open(path)?;
     let length = file.metadata()?.len();
     if length > MAX_WAL_SEGMENT_BYTES {
         return Err(RymeError::Overload(String::from("wal segment")));
