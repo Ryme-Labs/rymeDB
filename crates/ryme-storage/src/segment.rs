@@ -200,6 +200,10 @@ pub struct ImmutableSegment {
 
 impl ImmutableSegment {
     pub fn from_engine(id: u64, engine: &Engine) -> Self {
+        Self::from_engine_owned(id, engine.clone(), SegmentKind::Snapshot)
+    }
+
+    fn from_engine_owned(id: u64, engine: Engine, kind: SegmentKind) -> Self {
         let keys = engine.record_keys();
         let sparse_index = keys
             .iter()
@@ -214,14 +218,7 @@ impl ImmutableSegment {
             entries: keys.len() as u64,
             bytes: engine.bytes_held(),
         };
-        Self {
-            meta,
-            kind: SegmentKind::Snapshot,
-            engine: engine.clone(),
-            keys,
-            sparse_index,
-            bloom,
-        }
+        Self { meta, kind, engine, keys, sparse_index, bloom }
     }
 
     pub fn from_entries(id: u64, entries: &[SegmentEntry]) -> Result<Self> {
@@ -241,9 +238,7 @@ impl ImmutableSegment {
         for entry in ordered {
             engine.apply_with_expiry(entry.key, entry.commit_ts, entry.value, entry.expires_at)?;
         }
-        let mut segment = Self::from_engine(id, &engine);
-        segment.kind = SegmentKind::Delta;
-        Ok(segment)
+        Ok(Self::from_engine_owned(id, engine, SegmentKind::Delta))
     }
 
     pub fn meta(&self) -> &SegmentMeta {
@@ -1037,6 +1032,8 @@ mod tests {
         assert_eq!(segment.sparse_index_len(), 1);
         assert!(segment.bloom_might_contain(&first));
         assert!(!segment.bloom_might_contain(&RecordKey::new("tenant", "db", "items", b"missing")));
+        engine.apply(first.clone(), 12, Some(b"changed".to_vec())).unwrap();
+        assert_eq!(segment.get(&first, 12, 0).unwrap(), Some(b"one".to_vec()));
         let restored = ImmutableSegment::decode(&segment.encode().unwrap()).unwrap();
         assert_eq!(restored.get(&first, 10, 0).unwrap(), Some(b"one".to_vec()));
         assert_eq!(restored.get(&second, 11, 0).unwrap(), Some(b"two".to_vec()));

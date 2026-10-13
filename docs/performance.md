@@ -57,12 +57,12 @@ and `transaction_qps` reports committed transactions per second.
 
 A local three-pair batch comparison on the AMD Ryzen 5 4500 used one shard,
 one worker, 500 transactions × 64 distinct 128-byte writes, and no per-write
-fsync. All runs completed with zero failures. Median throughput was 128.8k
-writes/s in Hot mode and 145.6k writes/s in Standard mode; sampled transaction
-p50 was 508 µs and 438 µs respectively. This is evidence for this specific
-mode/workload comparison, not a before/after measurement or an end-to-end
-database claim. The benchmark samples only eight transactions per run, so its
-tail percentiles are too sparse to interpret.
+fsync. All runs completed with zero failures. After removing the redundant
+segment-engine clone, median throughput was 129.8k writes/s in Hot mode and
+151.0k writes/s in Standard mode; sampled transaction p50 was 482 µs and
+435 µs respectively. This is evidence for this specific mode/workload
+comparison, not an end-to-end database claim. The benchmark samples only eight
+transactions per run, so its tail percentiles are too sparse to interpret.
 
 To isolate the delta-segment builder's owned-entry path from the borrowed API:
 
@@ -81,11 +81,13 @@ interpreting small differences.
 
 On the 12-logical-CPU AMD Ryzen 5 4500 listed by the command, three release
 runs at 1,024 entries × 128 value bytes × 40 iterations measured borrowed-path
-median build times of 1.310–1.329 ms and owned-path medians of 1.213–1.230 ms.
-The median of the three per-run ratios was about 1.08×. This supports a modest
-segment-construction improvement for this input size; it does not establish a
-transaction-throughput or end-to-end latency gain. The p95 varied between runs,
-so treat this as local directional evidence and rerun on the target workload.
+median build times of 0.870–0.872 ms and owned-path medians of 0.762–0.766 ms.
+The median of the three per-run ratios was about 1.14×. Compared with the prior
+recorded run of this same microbenchmark, before moving the locally built
+engine into the segment, borrowed-path median time fell from 1.314 ms to
+0.872 ms and owned-path time from 1.215 ms to 0.765 ms. This is narrowly scoped
+segment-construction evidence; it does not establish a transaction-throughput
+or end-to-end latency gain. Rerun on the target workload.
 
 ## Delta-segment pointer experiment
 
