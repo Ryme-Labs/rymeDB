@@ -598,6 +598,11 @@ where
             })
             .with_tenant(principal.tenant.clone())
             .with_role(principal.sql_role().to_string());
+        executor = if principal.can_platform_admin() {
+            executor.without_auth_uid()
+        } else {
+            executor.with_auth_uid(principal.id.clone())
+        };
         if self.gateway.is_read_only() {
             executor.set_read_only(true);
         }
@@ -885,6 +890,59 @@ mod tests {
         let response = native.dispatch(&request).await;
         assert!(response.ok, "{:?}", response.error);
         assert_eq!(response.rows.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn native_sql_sets_authenticated_uid_for_row_policies() {
+        use std::collections::HashSet;
+
+        let gateway = Gateway::new(
+            String::from("tenant-a"),
+            String::from("d"),
+            String::from("main"),
+            ryme_auth::PolicyEngine::new(),
+            ryme_realtime::Realtime::new(16),
+        );
+        let executor = ryme_sql::Executor::with_backend(
+            String::from("tenant-a"),
+            String::from("d"),
+            gateway.manager_clone(),
+        );
+        for sql in [
+            "CREATE TABLE profiles (id TEXT PRIMARY KEY, user_id TEXT)",
+            "INSERT INTO profiles (id, user_id) VALUES ('own', 'user-a'), ('other', 'user-b')",
+            "CREATE POLICY profile_owner ON profiles FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id)",
+            "ALTER TABLE profiles ENABLE ROW LEVEL SECURITY",
+            "GRANT SELECT ON TABLE profiles TO authenticated",
+        ] {
+            executor.execute(ryme_sql::parse(sql).unwrap()).await.unwrap();
+        }
+
+        let keys = ApiKeyStore::new();
+        let mut roles = HashSet::new();
+        roles.insert(ryme_auth::Role::ReadWrite);
+        keys.insert(
+            String::from("user-a-key"),
+            Principal { id: String::from("user-a"), tenant: String::from("tenant-a"), roles },
+        )
+        .unwrap();
+        let native = NativeGateway::with_gateway(gateway, keys).with_sql_executor(executor);
+        let request = serde_json::to_vec(&Request {
+            key: String::from("user-a-key"),
+            op: String::from("sql"),
+            table: String::new(),
+            pk: String::new(),
+            value: String::new(),
+            sql: String::from("SELECT * FROM profiles"),
+            limit: 0,
+            ttl_secs: 0,
+        })
+        .unwrap();
+
+        let response = native.dispatch(&request).await;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.rows.as_ref().map(Vec::len), Some(1));
+        assert_eq!(response.rows.as_ref().unwrap()[0].pk, "own");
     }
 
     #[tokio::test]
