@@ -447,7 +447,7 @@ where
                 after: Some(after),
                 commit_ts,
                 tx_id: commit_ts,
-            })?;
+            });
         }
         self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
@@ -489,7 +489,7 @@ where
             after: Some(value),
             commit_ts,
             tx_id: commit_ts,
-        })?;
+        });
         self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
     }
@@ -529,7 +529,7 @@ where
             after: Some(current),
             commit_ts,
             tx_id: commit_ts,
-        })?;
+        });
         self.refresh_table(principal, table, commit_ts);
         Ok(true)
     }
@@ -640,7 +640,7 @@ where
                 after: None,
                 commit_ts,
                 tx_id: commit_ts,
-            })?;
+            });
         }
         self.refresh_table(principal, table, commit_ts);
         Ok(commit_ts)
@@ -1052,7 +1052,7 @@ mod tests {
             Some(b"branch-value".to_vec())
         );
         assert_eq!(branch.ttl_of_async(&principal, "docs", b"k").await.unwrap(), Ttl::Persistent);
-        let mut changes = branch.realtime().subscribe("t", "d", "feature");
+        let mut changes = branch.realtime().subscribe_branch("t", "d", "feature", "docs");
         branch.put(&principal, "docs", b"k".to_vec(), b"updated".to_vec()).await.unwrap();
         let change = changes.recv().await.unwrap();
         assert_eq!(change.before, Some(b"branch-value".to_vec()));
