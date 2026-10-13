@@ -4,7 +4,7 @@ use ryme_shard::{ShardSet, TableRef};
 use ryme_storage::{Engine, ImmutableSegment, RecordKey, SegmentEntry, SegmentStore, StorageMode};
 use ryme_txn::{SyncPolicy, TxnBackend, TxnManager};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -68,6 +68,10 @@ enum Command {
         limit: usize,
         #[arg(long, default_value_t = 30)]
         iterations: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 67_108_864)]
+        cache_bytes: u64,
     },
     Resp {
         #[arg(long, default_value = "127.0.0.1:6380")]
@@ -167,8 +171,15 @@ async fn main() {
         Some(Command::SegmentBuild { entries, value_bytes, iterations }) => {
             segment_build_bench(entries, value_bytes, iterations);
         }
-        Some(Command::SegmentScan { rows, deltas, limit, iterations }) => {
-            segment_scan_bench(rows, deltas, limit, iterations);
+        Some(Command::SegmentScan {
+            rows,
+            deltas,
+            limit,
+            iterations,
+            concurrency,
+            cache_bytes,
+        }) => {
+            segment_scan_bench(rows, deltas, limit, iterations, concurrency, cache_bytes);
         }
         Some(Command::Resp {
             addr,
@@ -893,7 +904,14 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
     );
 }
 
-fn segment_scan_bench(rows: usize, deltas: usize, limit: usize, iterations: usize) {
+fn segment_scan_bench(
+    rows: usize,
+    deltas: usize,
+    limit: usize,
+    iterations: usize,
+    concurrency: usize,
+    cache_bytes: u64,
+) {
     const MAX_ROWS: usize = 100_000;
     const MAX_DELTAS: usize = 1_024;
     const MAX_ITERATIONS: usize = 100_000;
@@ -905,8 +923,10 @@ fn segment_scan_bench(rows: usize, deltas: usize, limit: usize, iterations: usiz
         || total_keys.is_none_or(|keys| keys > MAX_ROWS + MAX_DELTAS)
         || iterations == 0
         || iterations > MAX_ITERATIONS
+        || concurrency == 0
+        || concurrency > 64
     {
-        eprintln!("rows, deltas, limit, or iterations exceed benchmark bounds");
+        eprintln!("rows, deltas, limit, iterations, or concurrency exceed benchmark bounds");
         std::process::exit(2);
     }
     let total_keys = total_keys.expect("validated scan key count");
@@ -918,7 +938,7 @@ fn segment_scan_bench(rows: usize, deltas: usize, limit: usize, iterations: usiz
             .map(|duration| duration.as_nanos())
             .unwrap_or(0)
     ));
-    let store = SegmentStore::open_with_cache(&data_dir, 64 * 1024 * 1024)
+    let store = SegmentStore::open_with_cache(&data_dir, cache_bytes)
         .expect("could not open temporary segment scan benchmark store");
     let mut engine = Engine::new();
     for index in 0..rows {
@@ -952,17 +972,35 @@ fn segment_scan_bench(rows: usize, deltas: usize, limit: usize, iterations: usiz
     assert_eq!(warmup.len(), expected_rows, "scan warmup returned wrong row count");
     drop(warmup);
 
-    let mut samples_ns = Vec::with_capacity(iterations);
+    let mut samples_ns = Vec::with_capacity(iterations.saturating_mul(concurrency));
     let benchmark_start = Instant::now();
-    for _ in 0..iterations {
-        let start = Instant::now();
-        let result = store
-            .scan("bench", "bench", "scan", read_ts, 0, limit)
-            .expect("segment scan benchmark failed");
-        samples_ns.push(start.elapsed().as_nanos());
-        assert_eq!(result.len(), expected_rows, "scan returned wrong row count");
-        std::hint::black_box(&result);
-    }
+    let barrier = Barrier::new(concurrency);
+    let worker_samples: Vec<Vec<u128>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..concurrency)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let mut samples = Vec::with_capacity(iterations);
+                    for _ in 0..iterations {
+                        let start = Instant::now();
+                        let result = store
+                            .scan("bench", "bench", "scan", read_ts, 0, limit)
+                            .expect("segment scan benchmark failed");
+                        samples.push(start.elapsed().as_nanos());
+                        assert_eq!(result.len(), expected_rows, "scan returned wrong row count");
+                        std::hint::black_box(&result);
+                    }
+                    samples
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("scan benchmark worker failed"))
+            .collect()
+    });
+    samples_ns.extend(worker_samples.into_iter().flatten());
+    let scan_count = iterations.saturating_mul(concurrency);
     let elapsed = benchmark_start.elapsed().as_secs_f64().max(0.000001);
     samples_ns.sort_unstable();
     let percentile = |percentile: usize| -> u128 {
@@ -979,11 +1017,13 @@ fn segment_scan_bench(rows: usize, deltas: usize, limit: usize, iterations: usiz
             "total_keys": total_keys,
             "limit": limit,
             "iterations": iterations,
+            "concurrency": concurrency,
+            "cache_bytes": cache_bytes,
             "returned_rows_per_scan": expected_rows,
             "scan_p50_ns": percentile(50),
             "scan_p95_ns": percentile(95),
-            "scans_per_second": iterations as f64 / elapsed,
-            "rows_per_second": iterations as f64 * expected_rows as f64 / elapsed,
+            "scans_per_second": scan_count as f64 / elapsed,
+            "rows_per_second": scan_count as f64 * expected_rows as f64 / elapsed,
             "segment_cache_hits": cache.hits,
             "segment_cache_misses": cache.misses,
         })

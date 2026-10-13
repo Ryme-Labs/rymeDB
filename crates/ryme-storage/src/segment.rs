@@ -528,17 +528,18 @@ impl SegmentStore {
     fn read_segment(&self, path: &Path) -> Result<Arc<ImmutableSegment>> {
         let id = parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
             .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
-        if let Ok(mut cache) = self.cache.lock() {
-            if let Some(segment) = cache.get(id) {
-                return Ok(segment);
-            }
-            let bytes = read_segment_file(path)?;
-            let segment = Arc::new(ImmutableSegment::decode(&bytes)?);
-            cache.insert(id, Arc::clone(&segment), bytes.len() as u64);
-            Ok(segment)
-        } else {
-            Ok(Arc::new(ImmutableSegment::decode(&read_segment_file(path)?)?))
+        if let Some(segment) = self.cache.lock().ok().and_then(|mut cache| cache.get(id)) {
+            return Ok(segment);
         }
+
+        // Do disk I/O and segment decoding without the global cache lock so
+        // misses for different segments do not serialize concurrent readers.
+        let bytes = read_segment_file(path)?;
+        let segment = Arc::new(ImmutableSegment::decode(&bytes)?);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(id, Arc::clone(&segment), bytes.len() as u64);
+        }
+        Ok(segment)
     }
 
     fn newest_paths(&self) -> Result<Arc<Vec<PathBuf>>> {
