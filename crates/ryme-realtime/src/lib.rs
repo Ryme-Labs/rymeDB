@@ -1032,7 +1032,7 @@ impl Realtime {
         let is_new_member = existing_state_bytes.is_none();
         if is_new_member && members.len() >= PRESENCE_MAX_MEMBERS {
             if new_room {
-                presence.remove(&key);
+                presence.remove(&scope_key(tenant, channel));
             }
             drop(presence);
             if new_room {
@@ -1052,7 +1052,7 @@ impl Realtime {
         };
         if !capacity_reserved {
             if new_room {
-                presence.remove(&key);
+                presence.remove(&scope_key(tenant, channel));
             }
             drop(presence);
             if new_room {
@@ -1916,11 +1916,11 @@ impl Realtime {
             ));
         }
         for (key, topic) in pending {
-            let Some((tenant, _)) = split_scope_key(&key) else {
-                return Err(RymeError::Corrupt(String::from("durable topic scope")));
-            };
+            let tenant = split_scope_key(&key)
+                .map(|(tenant, _)| tenant.to_string())
+                .ok_or_else(|| RymeError::Corrupt(String::from("durable topic scope")))?;
             inner.durable.insert(key, topic);
-            *inner.durable_topics_by_tenant.entry(tenant.to_string()).or_default() += 1;
+            *inner.durable_topics_by_tenant.entry(tenant).or_default() += 1;
         }
         Ok(())
     }
@@ -1934,7 +1934,7 @@ impl Default for Realtime {
 
 fn branch_topic_key(tenant: &str, database: &str, branch: &str, table: &str) -> String {
     format!(
-        "{}:{}{}:{}{}:{}{}:{}{}",
+        "{}:{}{}:{}{}:{}{}:{}",
         tenant.len(),
         tenant,
         database.len(),
