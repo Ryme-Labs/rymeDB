@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use ryme_shard::{ShardSet, TableRef};
-use ryme_storage::{ImmutableSegment, RecordKey, SegmentEntry};
+use ryme_storage::{ImmutableSegment, RecordKey, SegmentEntry, StorageMode};
 use ryme_txn::{SyncPolicy, TxnBackend, TxnManager};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -46,6 +46,8 @@ enum Command {
         keyspace: Option<usize>,
         #[arg(long, help = "Sync each write before acknowledging it")]
         sync_each_write: bool,
+        #[arg(long, help = "Use segment-backed Standard mode instead of Hot mode")]
+        standard_mode: bool,
     },
     SegmentBuild {
         #[arg(long, default_value_t = 1024)]
@@ -135,8 +137,18 @@ async fn main() {
             shards,
             keyspace,
             sync_each_write,
+            standard_mode,
         }) => {
-            sharded_local_bench(ops, concurrency, value_bytes, shards, keyspace, sync_each_write);
+            let mode = if standard_mode { StorageMode::Standard } else { StorageMode::Hot };
+            sharded_local_bench(
+                ops,
+                concurrency,
+                value_bytes,
+                shards,
+                keyspace,
+                sync_each_write,
+                mode,
+            );
         }
         Some(Command::SegmentBuild { entries, value_bytes, iterations }) => {
             segment_build_bench(entries, value_bytes, iterations);
@@ -618,6 +630,7 @@ fn sharded_local_bench(
     shards: usize,
     keyspace: Option<usize>,
     sync_each_write: bool,
+    mode: StorageMode,
 ) {
     if !(1..=256).contains(&shards) {
         eprintln!("shards must be between 1 and 256");
@@ -631,7 +644,7 @@ fn sharded_local_bench(
         std::env::temp_dir().join(format!("ryme-bench-sharded-{}-{nanos}", std::process::id()));
     let policy = if sync_each_write { SyncPolicy::Always } else { SyncPolicy::Never };
     let backend = Arc::new(
-        ShardSet::open_with_cache(&data_dir, shards, policy, 0)
+        ShardSet::open_with_mode(&data_dir, shards, policy, 0, mode)
             .expect("could not open temporary sharded benchmark database"),
     );
     let tables = benchmark_tables(&backend, shards);
@@ -702,6 +715,10 @@ fn sharded_local_bench(
     let output = serde_json::json!({
         "benchmark": "sharded-local",
         "machine": machine_metadata(),
+        "storage_mode": match mode {
+            StorageMode::Hot => "hot",
+            StorageMode::Standard => "standard",
+        },
         "shards": shards,
         "workers": workers,
         "sync_each_write": sync_each_write,

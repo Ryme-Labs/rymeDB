@@ -46,6 +46,12 @@ the same machine, and retain JSON output with hardware and durability details.
 This benchmark is in-process and must not be compared directly with networked
 database results.
 
+Pass `--standard-mode` to benchmark the segment-backed Standard path with the
+same workload and acknowledgement policy. Output identifies the selected
+storage mode. Compare Hot and Standard runs sequentially on the same idle
+machine; they have different memory-residency semantics, so the result is a
+mode comparison rather than a like-for-like database claim.
+
 To isolate the delta-segment builder's owned-entry path from the borrowed API:
 
 ```bash

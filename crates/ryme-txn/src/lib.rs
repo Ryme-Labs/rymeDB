@@ -1367,19 +1367,25 @@ impl TxnManager {
                 engine.apply_with_expiry(key, commit_ts, op.value, op.expires_at)?;
             }
         }
-        {
-            let mut committed = self
-                .inner
-                .committed
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-            committed.record(commit_ts, committed_keys);
-        }
+        self.record_committed_locked(commit_ts, committed_keys)?;
+        Ok(true)
+    }
+
+    fn record_committed_locked(
+        &self,
+        commit_ts: u64,
+        committed_keys: Vec<RecordKey>,
+    ) -> Result<()> {
+        self.inner
+            .committed
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?
+            .record(commit_ts, committed_keys);
         let visible_ts = commit_ts.saturating_add(1);
         self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
         self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
         publish_commit(commit_ts);
-        Ok(true)
+        Ok(())
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<u64> {
@@ -1483,6 +1489,30 @@ impl TxnManager {
         let payload = encode_writes(&txn.writes)?;
         persist(commit_ts, &payload, &txn.writes)?;
         self.apply_owned_locked(commit_ts, txn.writes)?;
+        Ok(commit_ts)
+    }
+
+    /// Persists an owned write set without applying it to the in-memory engine.
+    /// Segment-backed callers use this while retaining conflict-index updates.
+    fn commit_durable_consuming_with(
+        &self,
+        txn: Transaction,
+        persist: impl FnOnce(u64, &[u8], BTreeMap<RecordKey, WriteOp>) -> Result<()>,
+    ) -> Result<u64> {
+        txn.ensure_healthy()?;
+        if txn.writes.is_empty() {
+            return Ok(txn.read_ts);
+        }
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let commit_ts = self.reserve_locked(&txn)?;
+        let payload = encode_writes(&txn.writes)?;
+        let committed_keys = txn.writes.keys().cloned().collect();
+        persist(commit_ts, &payload, txn.writes)?;
+        self.record_committed_locked(commit_ts, committed_keys)?;
         Ok(commit_ts)
     }
 
@@ -2737,24 +2767,44 @@ impl DurableManager {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let policy = self.policy;
-        let result = self.inner.commit_durable_with(txn, |commit_ts, payload, writes| {
-            let mut wal =
-                self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-            wal.append_lsn(commit_ts, payload)?;
-            if policy == SyncPolicy::Always {
-                wal.sync()?;
+        match self.mode {
+            StorageMode::Hot => {
+                self.inner.commit_durable_with(txn, |commit_ts, payload, writes| {
+                    let mut wal = self
+                        .wal
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                    wal.append_lsn(commit_ts, payload)?;
+                    if policy == SyncPolicy::Always {
+                        wal.sync()?;
+                    }
+                    self.segments.write_delta_owned_with_sync(
+                        commit_ts,
+                        segment_entries(commit_ts, writes),
+                        policy == SyncPolicy::Always,
+                    )?;
+                    Ok(())
+                })
             }
-            self.segments.write_delta_owned_with_sync(
-                commit_ts,
-                segment_entries(commit_ts, writes),
-                policy == SyncPolicy::Always,
-            )?;
-            Ok(())
-        });
-        if result.is_ok() && self.mode == StorageMode::Standard {
-            self.inner.clear_engine()?;
+            StorageMode::Standard => {
+                self.inner.commit_durable_consuming_with(txn, |commit_ts, payload, writes| {
+                    let mut wal = self
+                        .wal
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                    wal.append_lsn(commit_ts, payload)?;
+                    if policy == SyncPolicy::Always {
+                        wal.sync()?;
+                    }
+                    self.segments.write_delta_owned_with_sync(
+                        commit_ts,
+                        segment_entries_owned(commit_ts, writes),
+                        policy == SyncPolicy::Always,
+                    )?;
+                    Ok(())
+                })
+            }
         }
-        result
     }
 
     pub fn commit_at(
@@ -2803,6 +2853,21 @@ fn segment_entries(commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Vec
             key: key.clone(),
             commit_ts,
             value: op.value.clone(),
+            expires_at: op.expires_at,
+        })
+        .collect()
+}
+
+fn segment_entries_owned(
+    commit_ts: u64,
+    writes: BTreeMap<RecordKey, WriteOp>,
+) -> Vec<SegmentEntry> {
+    writes
+        .into_iter()
+        .map(|(key, op)| SegmentEntry {
+            key,
+            commit_ts,
+            value: op.value,
             expires_at: op.expires_at,
         })
         .collect()
@@ -3543,9 +3608,12 @@ mod tests {
         assert_eq!(manager.resident_bytes().unwrap(), 0);
 
         let mut reader = manager.begin();
+        let mut stale_writer = manager.begin();
         let mut second = manager.begin();
         manager.put(&mut second, key.clone(), b"two".to_vec());
         manager.commit(second).unwrap();
+        manager.put(&mut stale_writer, key.clone(), b"stale".to_vec());
+        assert!(matches!(manager.commit(stale_writer), Err(RymeError::Conflict(_))));
         assert_eq!(manager.get(&mut reader, &key).unwrap(), Some(b"one".to_vec()));
         assert_eq!(manager.resident_bytes().unwrap(), 0);
 
