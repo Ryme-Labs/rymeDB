@@ -8411,6 +8411,18 @@ where
             self.privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
         let default_privileges =
             self.default_privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
+        let rls_tables = self.rls_tables.read().map(|tables| tables.clone()).unwrap_or_default();
+        let rls_write_tables =
+            self.rls_write_tables.read().map(|tables| tables.clone()).unwrap_or_default();
+        let rls_enabled = self.rls_enabled.read().map(|tables| tables.clone()).unwrap_or_default();
+        let rls_forced = self.rls_forced.read().map(|tables| tables.clone()).unwrap_or_default();
+        let platform_rls_tables = self
+            .platform_rls_tables
+            .read()
+            .map(|tables| tables.clone())
+            .unwrap_or_default();
+        let rls_policies =
+            self.rls_policies.read().map(|policies| policies.clone()).unwrap_or_default();
         Executor {
             tenant: self.tenant,
             database: self.database,
@@ -8423,12 +8435,12 @@ where
             isolation: self.isolation,
             catalog: Arc::new(Mutex::new(catalog)),
             indexes: Arc::new(Mutex::new(indexes)),
-            rls_tables: self.rls_tables,
-            rls_write_tables: self.rls_write_tables,
-            rls_enabled: self.rls_enabled,
-            rls_forced: self.rls_forced,
-            platform_rls_tables: self.platform_rls_tables,
-            rls_policies: self.rls_policies,
+            rls_tables: Arc::new(RwLock::new(rls_tables)),
+            rls_write_tables: Arc::new(RwLock::new(rls_write_tables)),
+            rls_enabled: Arc::new(RwLock::new(rls_enabled)),
+            rls_forced: Arc::new(RwLock::new(rls_forced)),
+            platform_rls_tables: Arc::new(RwLock::new(platform_rls_tables)),
+            rls_policies: Arc::new(RwLock::new(rls_policies)),
             checks: Arc::new(Mutex::new(checks)),
             foreign_keys: Arc::new(Mutex::new(foreign_keys)),
             constraints: Arc::new(Mutex::new(constraints)),
@@ -17616,6 +17628,12 @@ mod tests {
         ));
 
         let isolated = restored.clone().with_isolated_schema(TxnManager::new());
+        isolated
+            .execute(parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        assert!(isolated.row_security_enabled("messages"));
+        assert!(!restored.row_security_enabled("messages"));
         isolated.execute(parse("CREATE TABLE branch_only").unwrap()).await.unwrap();
         assert!(!restored.catalog_tables().contains(&String::from("branch_only")));
         let _ = std::fs::remove_dir_all(&dir);
