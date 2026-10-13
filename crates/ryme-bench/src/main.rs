@@ -778,15 +778,31 @@ fn machine_metadata() -> serde_json::Value {
         metadata["host"] = serde_json::Value::String(host);
     }
     if let Ok(model) = std::fs::read_to_string("/proc/cpuinfo") {
-        if let Some(model) = model.lines().find_map(|line| {
-            line.strip_prefix("model name")
-                .and_then(|value| value.strip_prefix(':'))
-                .map(|value| value.trim().to_string())
-        }) {
+        if let Some(model) = cpu_model_from_proc(&model) {
             metadata["cpu_model"] = serde_json::Value::String(model);
         }
     }
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(bytes) = host_memory_bytes_from_proc(&meminfo) {
+            metadata["host_memory_bytes"] = serde_json::Value::from(bytes);
+        }
+    }
     metadata
+}
+
+fn cpu_model_from_proc(cpuinfo: &str) -> Option<String> {
+    cpuinfo.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once(':')?;
+        (name.trim() == "model name").then(|| value.trim().to_string())
+    })
+}
+
+fn host_memory_bytes_from_proc(meminfo: &str) -> Option<u64> {
+    let value = meminfo.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once(':')?;
+        (name.trim() == "MemTotal").then_some(value)
+    })?;
+    value.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
 }
 
 fn latency_histogram(samples: &[u64]) -> Vec<serde_json::Value> {
@@ -1464,7 +1480,10 @@ async fn resp_bench(config: RespBench) {
 
 #[cfg(test)]
 mod tests {
-    use super::{expected_fanout, latency_histogram, realtime_channel, worker_ops};
+    use super::{
+        cpu_model_from_proc, expected_fanout, host_memory_bytes_from_proc, latency_histogram,
+        realtime_channel, worker_ops,
+    };
 
     #[test]
     fn realtime_channel_names_preserve_single_channel_compatibility() {
@@ -1499,5 +1518,13 @@ mod tests {
         let total: u64 = histogram.iter().map(|bucket| bucket["count"].as_u64().unwrap()).sum();
         assert_eq!(total, 5);
         assert_eq!(histogram.last().unwrap()["count"], 1);
+    }
+
+    #[test]
+    fn machine_metadata_parses_linux_cpu_and_memory_fields() {
+        let cpuinfo = "processor : 0\nmodel name\t: Test CPU 3.2GHz\n";
+        assert_eq!(cpu_model_from_proc(cpuinfo).as_deref(), Some("Test CPU 3.2GHz"));
+        assert_eq!(host_memory_bytes_from_proc("MemTotal: 16384 kB\n"), Some(16_777_216));
+        assert_eq!(host_memory_bytes_from_proc("MemFree: 1024 kB\n"), None);
     }
 }
