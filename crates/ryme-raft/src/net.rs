@@ -5512,6 +5512,8 @@ impl Node {
         database: String,
     ) -> Result<RangeSnapshot> {
         let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
+        let max_rows = u32::try_from(max_rows.min(100_000))
+            .map_err(|_| RymeError::InvalidArgument(String::from("max_rows")))?;
         match pool
             .roundtrip(&Rpc::RangeSnapshotRequest {
                 start,
