@@ -599,7 +599,10 @@ fn claim_roles(claims: &serde_json::Value) -> HashSet<Role> {
 
 fn parse_role(name: &str) -> Option<Role> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "service_role" | "superuser" => Some(Role::Superuser),
+        // Supabase's service_role bypasses application RLS; it is not a
+        // database-cluster superuser. Keep its mapped database access tenant-scoped.
+        "service_role" => Some(Role::ReadWrite),
+        "superuser" => Some(Role::Superuser),
         "owner" => Some(Role::Owner),
         "admin" => Some(Role::Admin),
         "developer" => Some(Role::Developer),
@@ -1521,6 +1524,21 @@ mod tests {
             .unwrap();
         assert!(!principal.can_read());
         assert!(!principal.can_write());
+    }
+
+    #[test]
+    fn supabase_service_role_cannot_administer_the_database_cluster() {
+        let principal = Principal {
+            id: String::from("service"),
+            tenant: String::from("tenant-a"),
+            roles: HashSet::from([parse_role("service_role").unwrap()]),
+        };
+
+        assert!(principal.can_read());
+        assert!(principal.can_write());
+        assert!(!principal.can_admin());
+        assert!(!principal.can_platform_admin());
+        assert_eq!(principal.sql_role(), "authenticated");
     }
 
     #[test]

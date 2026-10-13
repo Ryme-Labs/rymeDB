@@ -46,7 +46,8 @@ JWTs accept rymeDB claims (`tenant`, `roles`) and common Supabase claims
 | --- | --- |
 | `anon` | Read-only public access |
 | `authenticated` | Authenticated application reads and writes |
-| `service_role` / `superuser` | Platform and tenant administration; keep server-side |
+| `service_role` | Tenant-scoped application read/write; RLS still applies; keep server-side |
+| `superuser` | Platform administration; accept only from a trusted operator issuer |
 | `owner` / `admin` | Tenant-local administration; no cluster, archive, or platform access |
 
 The exact policy is still enforced by the server's configured principal and
