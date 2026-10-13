@@ -13260,6 +13260,21 @@ fn wrapped_ring_bytes<K: KmsProvider>(ring: &KeyRing, kms: &K) -> ryme_error::Re
         .map_err(|error| ryme_error::RymeError::Internal(error.to_string()))
 }
 
+fn create_keyring_temp(
+    path: &std::path::Path,
+) -> ryme_error::Result<(std::path::PathBuf, std::fs::File)> {
+    let suffix = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(16));
+    let temporary = path.with_extension(format!("tmp-{suffix}"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok((temporary.clone(), options.open(temporary)?))
+}
+
 fn load_or_create_ring(
     data_dir: &std::path::Path,
     tenant: &str,
@@ -13307,25 +13322,13 @@ fn persist_ring(ring: &KeyRing, path: &std::path::Path) -> ryme_error::Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("tmp");
-    {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(&raw)?;
-        file.sync_data()?;
+    let (temporary, mut file) = create_keyring_temp(path)?;
+    use std::io::Write;
+    if let Err(error) = file.write_all(&raw).and_then(|()| file.sync_data()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
+    drop(file);
     std::fs::rename(temporary, path)?;
     if let Some(parent) = path.parent() {
         sync_metadata_directory(parent)?;
@@ -14040,7 +14043,17 @@ mod realtime_policy_tests {
         let mut ring = KeyRing::new();
         ring.rotate("tenant-a", now_secs());
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let marker = dir.join("marker");
+            std::fs::write(&marker, b"preserve").unwrap();
+            symlink(&marker, path.with_extension("tmp")).unwrap();
+        }
+
         persist_ring(&ring, &path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(std::fs::read(dir.join("marker")).unwrap(), b"preserve");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -14048,7 +14061,6 @@ mod realtime_policy_tests {
         }
         let loaded = load_or_create_ring(&dir, "tenant-a").unwrap();
         assert!(loaded.lock().unwrap().active("tenant-a").is_some());
-        assert!(!path.with_extension("tmp").exists());
 
         std::fs::write(&path, b"truncated-keyring").unwrap();
         assert!(matches!(
