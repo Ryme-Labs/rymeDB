@@ -206,7 +206,13 @@ impl PolicyEngine {
 
 #[derive(Debug, Clone)]
 pub struct ApiKeyStore {
-    inner: Arc<RwLock<HashMap<String, Principal>>>,
+    inner: Arc<RwLock<HashMap<String, ApiKeyRecord>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ApiKeyRecord {
+    principal: Principal,
+    expires_at: Option<u64>,
 }
 
 const MAX_API_KEYS: usize = 100_000;
@@ -217,14 +223,38 @@ impl ApiKeyStore {
     }
 
     pub fn insert(&self, api_key: String, principal: Principal) -> Result<()> {
+        self.insert_record(api_key, principal, None, current_unix_secs())
+    }
+
+    pub fn insert_with_expiry(
+        &self,
+        api_key: String,
+        principal: Principal,
+        expires_at: u64,
+        now_secs: u64,
+    ) -> Result<()> {
+        self.insert_record(api_key, principal, Some(expires_at), now_secs)
+    }
+
+    fn insert_record(
+        &self,
+        api_key: String,
+        principal: Principal,
+        expires_at: Option<u64>,
+        now_secs: u64,
+    ) -> Result<()> {
         principal.validate()?;
+        if expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
+            return Err(RymeError::InvalidArgument(String::from("api key expiration")));
+        }
         let digest = Self::digest(&api_key);
         let mut guard =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
+        guard.retain(|_, record| record.expires_at.is_none_or(|expiry| expiry > now_secs));
         if guard.len() >= MAX_API_KEYS && !guard.contains_key(&digest) {
             return Err(RymeError::Overload(String::from("api keys")));
         }
-        guard.insert(digest, principal);
+        guard.insert(digest, ApiKeyRecord { principal, expires_at });
         Ok(())
     }
 
@@ -236,37 +266,98 @@ impl ApiKeyStore {
     }
 
     pub fn owner_of(&self, presented: &str) -> Option<Principal> {
+        self.owner_of_at(presented, current_unix_secs())
+    }
+
+    pub fn owner_of_at(&self, presented: &str, now_secs: u64) -> Option<Principal> {
         let guard = self.inner.read().ok()?;
-        guard.get(&Self::digest(presented)).cloned()
+        let record = guard.get(&Self::digest(presented))?;
+        if record.expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
+            return None;
+        }
+        Some(record.principal.clone())
     }
 
     pub fn authenticate(&self, presented: &str) -> Result<Principal> {
+        self.authenticate_at(presented, current_unix_secs())
+    }
+
+    pub fn authenticate_at(&self, presented: &str, now_secs: u64) -> Result<Principal> {
         let guard =
             self.inner.read().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        guard.get(&Self::digest(presented)).cloned().ok_or(RymeError::Unauthorized)
+        let record = guard.get(&Self::digest(presented)).ok_or(RymeError::Unauthorized)?;
+        if record.expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
+            return Err(RymeError::Unauthorized);
+        }
+        Ok(record.principal.clone())
     }
 
     pub fn snapshot(&self) -> Result<HashMap<String, Principal>> {
         self.inner
             .read()
-            .map(|guard| guard.clone())
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(digest, record)| (digest.clone(), record.principal.clone()))
+                    .collect()
+            })
             .map_err(|_| RymeError::Internal(String::from("auth lock")))
     }
 
     pub fn from_snapshot(snapshot: HashMap<String, Principal>) -> Result<Self> {
+        Self::from_snapshot_with_expirations(snapshot, HashMap::new())
+    }
+
+    pub fn expiration_snapshot(&self) -> Result<HashMap<String, u64>> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter_map(|(digest, record)| {
+                        record.expires_at.map(|expires_at| (digest.clone(), expires_at))
+                    })
+                    .collect()
+            })
+            .map_err(|_| RymeError::Internal(String::from("auth lock")))
+    }
+
+    pub fn from_snapshot_with_expirations(
+        snapshot: HashMap<String, Principal>,
+        expirations: HashMap<String, u64>,
+    ) -> Result<Self> {
         if snapshot.len() > MAX_API_KEYS {
             return Err(RymeError::Corrupt(String::from("api key snapshot")));
         }
         if snapshot.values().any(|principal| principal.validate().is_err()) {
             return Err(RymeError::Corrupt(String::from("api key principal")));
         }
-        Ok(Self { inner: Arc::new(RwLock::new(snapshot)) })
+        if expirations.len() > snapshot.len()
+            || expirations.keys().any(|key| !snapshot.contains_key(key))
+        {
+            return Err(RymeError::Corrupt(String::from("api key expiration snapshot")));
+        }
+        let records = snapshot
+            .into_iter()
+            .map(|(digest, principal)| {
+                let expires_at = expirations.get(&digest).copied();
+                (digest, ApiKeyRecord { principal, expires_at })
+            })
+            .collect();
+        Ok(Self { inner: Arc::new(RwLock::new(records)) })
     }
 
     fn digest(api_key: &str) -> String {
         use sha2::{Digest, Sha256};
         base64_url_encode(&Sha256::digest(api_key.as_bytes()))
     }
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 impl Default for ApiKeyStore {
@@ -594,6 +685,7 @@ impl RefreshTokenStore {
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
         let session = sessions.get(&digest).cloned().ok_or(RymeError::Unauthorized)?;
         if session.expires_at <= now_secs {
+            sessions.remove(&digest);
             return Err(RymeError::Unauthorized);
         }
         let issued = issue(&session.principal)?;
@@ -1171,6 +1263,27 @@ mod tests {
         assert!(store.remove("secret-key"));
         assert!(store.authenticate("secret-key").is_err());
         assert!(store.owner_of("secret-key").is_none());
+    }
+
+    #[test]
+    fn expiring_api_keys_reject_expired_tokens_and_survive_snapshots() {
+        let store = ApiKeyStore::new();
+        let mut roles = HashSet::new();
+        roles.insert(Role::ReadWrite);
+        let principal = Principal { id: String::from("u"), tenant: String::from("t"), roles };
+        store.insert_with_expiry(String::from("short-key"), principal, 200, 100).unwrap();
+
+        assert!(store.authenticate_at("short-key", 199).is_ok());
+        assert!(store.authenticate_at("short-key", 200).is_err());
+        assert!(store.owner_of_at("short-key", 200).is_none());
+
+        let restored = ApiKeyStore::from_snapshot_with_expirations(
+            store.snapshot().unwrap(),
+            store.expiration_snapshot().unwrap(),
+        )
+        .unwrap();
+        assert!(restored.authenticate_at("short-key", 199).is_ok());
+        assert!(restored.authenticate_at("short-key", 200).is_err());
     }
 
     #[test]

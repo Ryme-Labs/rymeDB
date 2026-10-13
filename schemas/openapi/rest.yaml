@@ -417,7 +417,7 @@ paths:
     post:
       tags: [auth]
       security: []
-      description: "Verify id/password (plus TOTP code when the account enrolled one) and issue a usable API key. The key carries the account tenant and roles."
+      description: "Verify id/password (plus TOTP code when the account enrolled one) and issue a short-lived access key. The key carries the account tenant and roles and expires after 15 minutes; refresh tokens can obtain a replacement."
       requestBody:
         required: true
         content:
@@ -431,12 +431,23 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [key, tenant]
+                required: [key, tenant, expires_in]
                 properties:
                   key:
                     type: string
                   tenant:
                     type: string
+                  expires_in:
+                    type: integer
+                    format: int64
+                    description: Access-key lifetime in seconds.
+                  refresh_token:
+                    type: string
+                    description: Rotating refresh token, returned by password-grant login.
+                  refresh_token_expires_in:
+                    type: integer
+                    format: int64
+                    description: Refresh-token lifetime in seconds.
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -542,7 +553,7 @@ paths:
     post:
       tags: [auth]
       security: []
-      description: "Verify a WebAuthn assertion (rpId hash, user-presence flag, origin allow-list, challenge freshness with one-shot consumption, sign-count monotonicity, ECDSA over authenticatorData and clientData hash) and issue a usable API key."
+      description: "Verify a WebAuthn assertion (rpId hash, user-presence flag, origin allow-list, challenge freshness with one-shot consumption, sign-count monotonicity, ECDSA over authenticatorData and clientData hash) and issue a 15-minute access key."
       requestBody:
         required: true
         content:
@@ -556,12 +567,16 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [key, tenant]
+                required: [key, tenant, expires_in]
                 properties:
                   key:
                     type: string
                   tenant:
                     type: string
+                  expires_in:
+                    type: integer
+                    format: int64
+                    description: Access-key lifetime in seconds.
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -592,7 +607,7 @@ paths:
     post:
       tags: [auth]
       security: []
-      description: Verify a provider ID token and issue a usable API key carrying the identity tenant and roles.
+      description: Verify a provider ID token and issue a 15-minute access key carrying the identity tenant and roles.
       requestBody:
         required: true
         content:
@@ -606,12 +621,16 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [key, tenant]
+                required: [key, tenant, expires_in]
                 properties:
                   key:
                     type: string
                   tenant:
                     type: string
+                  expires_in:
+                    type: integer
+                    format: int64
+                    description: Access-key lifetime in seconds.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '503':
@@ -2259,7 +2278,6 @@ components:
           type: string
     AuthTokenRequest:
       type: object
-      required: [id, password]
       properties:
         id:
           type: string
@@ -2268,6 +2286,13 @@ components:
         code:
           type: string
           description: TOTP code, required when the account enrolled one
+        grant_type:
+          type: string
+          enum: [password, refresh_token]
+          default: password
+        refresh_token:
+          type: string
+          description: Required when grant_type is refresh_token.
     OtpSetupRequest:
       type: object
       required: [id]

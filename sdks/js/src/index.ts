@@ -80,6 +80,14 @@ export interface RymeHttpOptions {
   apiKey?: string;
 }
 
+export interface AuthTokenResponse {
+  key: string;
+  tenant: string;
+  expires_in: number;
+  refresh_token: string;
+  refresh_token_expires_in: number;
+}
+
 export interface ClusterMember {
   id: number;
   addr: string;
@@ -547,11 +555,22 @@ export class RymeHttpClient {
     return this.request<unknown>("POST", "/v1/auth/verify", { id, password });
   }
 
-  authToken(id: string, password: string, code?: string): Promise<{ key: string; tenant: string }> {
-    return this.request<{ key: string; tenant: string }>("POST", "/v1/auth/token", {
+  authToken(
+    id: string,
+    password: string,
+    code?: string,
+  ): Promise<AuthTokenResponse> {
+    return this.request<AuthTokenResponse>("POST", "/v1/auth/token", {
       id,
       password,
       code: code ?? null,
+    });
+  }
+
+  authRefresh(refresh_token: string): Promise<AuthTokenResponse> {
+    return this.request<AuthTokenResponse>("POST", "/v1/auth/token", {
+      grant_type: "refresh_token",
+      refresh_token,
     });
   }
 

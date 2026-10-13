@@ -84,7 +84,13 @@ rymedb-cli auth token ada '$PASSWORD'
 
 The REST surface also exposes `/v1/auth/register`, `/verify`, `/token`, OTP
 setup/verify, passkey challenge/register/verify, OIDC login/token, and key
-revocation. OIDC login returns a server-generated one-time `state`; send that
+revocation. Password, passkey, and OIDC login return an application access key
+that expires after 15 minutes, plus a refresh token where supported. Refresh
+tokens rotate on use and expire after 30 days. Operator-created API keys remain
+long-lived until revoked and must stay server-side. Browser access keys are
+visible to their user by design; limit their roles and enforce tenant access
+with RLS. Never ship `RYME_API_KEY` to a browser. OIDC login returns a
+server-generated one-time `state`; send that
 value with `id_token` to `/v1/auth/oidc/token`. The state expires after ten
 minutes and cannot be reused. A caller-supplied login `state` is returned as
 `client_state` for application correlation, but is not used as the security

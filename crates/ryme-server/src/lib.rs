@@ -986,6 +986,8 @@ struct AuthSnapshot {
     #[serde(default)]
     api_keys: HashMap<String, Principal>,
     #[serde(default)]
+    api_key_expirations: HashMap<String, u64>,
+    #[serde(default)]
     users: HashMap<String, ryme_auth::StoredUser>,
     #[serde(default)]
     refresh_tokens: HashMap<String, RefreshTokenRecord>,
@@ -1623,6 +1625,7 @@ impl SharedState {
             .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
         let snapshot = AuthSnapshot {
             api_keys: self.keys.snapshot()?,
+            api_key_expirations: self.keys.expiration_snapshot()?,
             users: self
                 .credentials
                 .lock()
@@ -2217,7 +2220,20 @@ impl SharedState {
             )?;
             control.branches.persist(&branch_path)?;
         }
-        let keys = ApiKeyStore::from_snapshot(auth_snapshot.api_keys)?;
+        let mut api_key_expirations = auth_snapshot.api_key_expirations;
+        let migration_time = ryme_txn::now_unix();
+        // Legacy application keys had no expiry. Require users to sign in
+        // again after upgrade; the configured operator key is reinserted
+        // below with its intended non-expiring lifetime.
+        expire_legacy_api_keys(
+            &auth_snapshot.api_keys,
+            &mut api_key_expirations,
+            migration_time,
+        );
+        let keys = ApiKeyStore::from_snapshot_with_expirations(
+            auth_snapshot.api_keys,
+            api_key_expirations,
+        )?;
         if let Some(api_key) = configured_api_key {
             let mut roles = HashSet::new();
             roles.insert(Role::Superuser);
@@ -6015,12 +6031,30 @@ async fn auth_verify(
     }
 }
 
+const ACCESS_TOKEN_TTL_SECS: u64 = 15 * 60;
+
+fn expire_legacy_api_keys(
+    api_keys: &HashMap<String, Principal>,
+    expirations: &mut HashMap<String, u64>,
+    now_secs: u64,
+) {
+    for digest in api_keys.keys() {
+        expirations.entry(digest.clone()).or_insert(now_secs);
+    }
+}
+
 fn issue_api_key(
     keys: &ryme_auth::ApiKeyStore,
     principal: &ryme_auth::Principal,
+    now_secs: u64,
 ) -> ryme_error::Result<(String, String)> {
     let key = format!("ryme_{}", ryme_auth::base64_url_encode(&ryme_auth::random_bytes(32)));
-    keys.insert(key.clone(), principal.clone())?;
+    keys.insert_with_expiry(
+        key.clone(),
+        principal.clone(),
+        now_secs.saturating_add(ACCESS_TOKEN_TTL_SECS),
+        now_secs,
+    )?;
     Ok((key, principal.tenant.clone()))
 }
 
@@ -6057,7 +6091,7 @@ async fn auth_token(
                 request.refresh_token.as_deref().ok_or(ryme_error::RymeError::Unauthorized)?;
             let ((key, tenant), refresh_token) =
                 refresh_tokens.rotate_with(presented, now, |principal| {
-                    issue_api_key(&keys, principal)
+                    issue_api_key(&keys, principal, now)
                 })?;
             return Ok((key, tenant, refresh_token));
         }
@@ -6086,7 +6120,7 @@ async fn auth_token(
             }
         }
         let refresh_token = refresh_tokens.issue(principal.clone(), now)?;
-        let (key, tenant) = match issue_api_key(&keys, &principal) {
+        let (key, tenant) = match issue_api_key(&keys, &principal, now) {
             Ok(issued) => issued,
             Err(error) => {
                 let _ = refresh_tokens.revoke(&refresh_token);
@@ -6105,6 +6139,7 @@ async fn auth_token(
                     Json(serde_json::json!({
                         "key": key,
                         "tenant": tenant,
+                        "expires_in": ACCESS_TOKEN_TTL_SECS,
                         "refresh_token": refresh_token,
                         "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
                     })),
@@ -6374,13 +6409,21 @@ async fn passkey_verify(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let (key, tenant) = match issue_api_key(&keys, &principal) {
+    let now = ryme_txn::now_unix();
+    let (key, tenant) = match issue_api_key(&keys, &principal, now) {
         Ok(issued) => issued,
         Err(error) => return error_response(error),
     };
     complete_auth_attempt(&state, &attempt_key, client_ip.0);
     match state.persist_auth() {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "key": key,
+                "tenant": tenant,
+                "expires_in": ACCESS_TOKEN_TTL_SECS,
+            })),
+        )
             .into_response(),
         Err(e) => error_response(e),
     }
@@ -6475,14 +6518,21 @@ async fn oidc_token(
             {
                 return error_response(error);
             }
-            let (key, tenant) = match issue_api_key(&state.keys, &principal) {
+            let (key, tenant) = match issue_api_key(&state.keys, &principal, now) {
                 Ok(issued) => issued,
                 Err(error) => return error_response(error),
             };
             complete_auth_attempt(&state, &attempt_key, client_ip.0);
             match state.persist_auth() {
                 Ok(()) => {
-                    (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
+                    (
+                        StatusCode::CREATED,
+                        Json(serde_json::json!({
+                            "key": key,
+                            "tenant": tenant,
+                            "expires_in": ACCESS_TOKEN_TTL_SECS,
+                        })),
+                    )
                         .into_response()
                 }
                 Err(e) => error_response(e),
@@ -13872,6 +13922,30 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod realtime_policy_tests {
     use super::*;
+
+    #[test]
+    fn legacy_user_keys_expire_on_upgrade_but_configured_key_stays_active() {
+        let legacy_store = ApiKeyStore::new();
+        let mut roles = HashSet::new();
+        roles.insert(Role::ReadWrite);
+        let user = Principal { id: String::from("user"), tenant: String::from("t"), roles };
+        legacy_store.insert(String::from("old-user-key"), user).unwrap();
+        let api_keys = legacy_store.snapshot().unwrap();
+        let mut expirations = legacy_store.expiration_snapshot().unwrap();
+        expire_legacy_api_keys(&api_keys, &mut expirations, 100);
+        let migrated = ApiKeyStore::from_snapshot_with_expirations(api_keys, expirations).unwrap();
+        assert!(migrated.authenticate_at("old-user-key", 100).is_err());
+
+        let mut roles = HashSet::new();
+        roles.insert(Role::Superuser);
+        migrated
+            .insert(
+                String::from("configured-operator-key"),
+                Principal { id: String::from("operator"), tenant: String::from("t"), roles },
+            )
+            .unwrap();
+        assert!(migrated.authenticate_at("configured-operator-key", u64::MAX).is_ok());
+    }
 
     #[test]
     fn audit_log_is_persisted_and_returns_newest_first() {

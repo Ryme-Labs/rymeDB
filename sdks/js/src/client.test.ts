@@ -232,6 +232,13 @@ describe("RymeHttpClient", () => {
     assert.equal(seen().method, "POST");
     assert.equal(seen().url, "/v1/auth/token");
     assert.deepEqual(JSON.parse(seen().body), { id: "ada", password: "correct-horse", code: null });
+    await client.authRefresh("refresh-secret");
+    assert.equal(seen().method, "POST");
+    assert.equal(seen().url, "/v1/auth/token");
+    assert.deepEqual(JSON.parse(seen().body), {
+      grant_type: "refresh_token",
+      refresh_token: "refresh-secret",
+    });
     await client.authToken("ada", "correct-horse", "123456");
     assert.deepEqual(JSON.parse(seen().body).code, "123456");
     await client.authRevoke("ryme_deadbeef");

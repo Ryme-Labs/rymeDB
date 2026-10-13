@@ -913,6 +913,14 @@ impl RymeClient {
             .await
     }
 
+    pub async fn auth_refresh(&self, refresh_token: &str) -> Result<serde_json::Value, ClientError> {
+        self.post_json(
+            "/v1/auth/token",
+            serde_json::json!({ "grant_type": "refresh_token", "refresh_token": refresh_token }),
+        )
+        .await
+    }
+
     pub async fn auth_revoke(&self, key: &str) -> Result<serde_json::Value, ClientError> {
         self.delete_json("/v1/auth/keys", serde_json::json!({ "key": key })).await
     }
@@ -1603,6 +1611,10 @@ mod tests {
         client.auth_token("ada", "correct-horse", Some("123456")).await.unwrap();
         let got = seen(&state);
         assert_eq!(got.body, "{\"code\":\"123456\",\"id\":\"ada\",\"password\":\"correct-horse\"}");
+        client.auth_refresh("refresh-secret").await.unwrap();
+        let got = seen(&state);
+        assert_eq!((got.method.as_str(), got.path.as_str()), ("POST", "/v1/auth/token"));
+        assert_eq!(got.body, "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"refresh-secret\"}");
         client.auth_revoke("ryme_deadbeef").await.unwrap();
         let got = seen(&state);
         assert_eq!((got.method.as_str(), got.path.as_str()), ("DELETE", "/v1/auth/keys"));

@@ -1814,6 +1814,7 @@ async fn extras_auth_token_issues_usable_keys() {
     assert_eq!(status, 201);
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let key = parsed.get("key").and_then(|v| v.as_str()).unwrap().to_string();
+    assert_eq!(parsed.get("expires_in").and_then(|v| v.as_u64()), Some(15 * 60));
     let refresh_token = parsed.get("refresh_token").and_then(|v| v.as_str()).unwrap().to_string();
     assert!(key.starts_with("ryme_"));
     let (status, body) = http_request(
@@ -1826,6 +1827,7 @@ async fn extras_auth_token_issues_usable_keys() {
     assert_eq!(status, 201);
     let refreshed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let refreshed_key = refreshed.get("key").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(refreshed.get("expires_in").and_then(|v| v.as_u64()), Some(15 * 60));
     let next_refresh = refreshed.get("refresh_token").and_then(|v| v.as_str()).unwrap();
     assert_ne!(next_refresh, refresh_token);
     let (status, _) = bearer_request(http, refreshed_key, "GET /v1/billing/invoice", b"").await;
