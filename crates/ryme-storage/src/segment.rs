@@ -377,23 +377,22 @@ impl ImmutableSegment {
         if bloom_len > cursor.len().saturating_sub(4) {
             return Err(RymeError::Corrupt(String::from("segment bloom")));
         }
-        let bloom = cursor[..bloom_len].to_vec();
+        let bloom = &cursor[..bloom_len];
         cursor = &cursor[bloom_len..];
         let index_count = take_u32(&mut cursor)? as usize;
-        if index_count > segment.engine.len() {
+        if index_count != segment.sparse_index.len() {
             return Err(RymeError::Corrupt(String::from("segment index")));
         }
-        let mut sparse_index = Vec::with_capacity(index_count);
-        for _ in 0..index_count {
-            let key = take_key(&mut cursor)?;
+        for (key, expected_ordinal) in &segment.sparse_index {
+            if !take_key_matches(&mut cursor, key)? {
+                return Err(RymeError::Corrupt(String::from("segment metadata")));
+            }
             let ordinal = take_u32(&mut cursor)? as usize;
-            sparse_index.push((key, ordinal));
+            if ordinal != *expected_ordinal {
+                return Err(RymeError::Corrupt(String::from("segment metadata")));
+            }
         }
-        if cursor.len() != 4
-            || bloom != segment.bloom
-            || sparse_index != segment.sparse_index
-            || kind != segment.kind
-        {
+        if cursor.len() != 4 || bloom != segment.bloom || kind != segment.kind {
             return Err(RymeError::Corrupt(String::from("segment metadata")));
         }
         Ok(segment)
@@ -984,20 +983,21 @@ fn push_key(out: &mut Vec<u8>, key: &RecordKey) -> Result<()> {
     Ok(())
 }
 
-fn take_key(cursor: &mut &[u8]) -> Result<RecordKey> {
-    let tenant = String::from_utf8(take_field(cursor)?.to_vec())
-        .map_err(|_| RymeError::Corrupt(String::from("segment key")))?;
-    let database = String::from_utf8(take_field(cursor)?.to_vec())
-        .map_err(|_| RymeError::Corrupt(String::from("segment key")))?;
-    let table = String::from_utf8(take_field(cursor)?.to_vec())
-        .map_err(|_| RymeError::Corrupt(String::from("segment key")))?;
+fn take_key_matches(cursor: &mut &[u8], expected: &RecordKey) -> Result<bool> {
+    for field in
+        [expected.tenant.as_bytes(), expected.database.as_bytes(), expected.table.as_bytes()]
+    {
+        if take_field(cursor)? != field {
+            return Ok(false);
+        }
+    }
     let pk_len = take_u32(cursor)? as usize;
     if pk_len > cursor.len() {
         return Err(RymeError::Corrupt(String::from("segment key")));
     }
-    let pk = cursor[..pk_len].to_vec();
+    let pk = &cursor[..pk_len];
     *cursor = &cursor[pk_len..];
-    Ok(RecordKey::new(&tenant, &database, &table, &pk))
+    Ok(pk == expected.pk.as_slice())
 }
 
 fn take_field<'a>(cursor: &mut &'a [u8]) -> Result<&'a [u8]> {
@@ -1036,6 +1036,34 @@ mod tests {
         let restored = ImmutableSegment::decode(&segment.encode().unwrap()).unwrap();
         assert_eq!(restored.get(&first, 10, 0).unwrap(), Some(b"one".to_vec()));
         assert_eq!(restored.get(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
+    }
+
+    #[test]
+    fn decode_rejects_sparse_index_mismatch_without_accepting_bad_metadata() {
+        let key = RecordKey::new("tenant", "db", "items", b"a");
+        let mut engine = Engine::new();
+        engine.apply(key.clone(), 10, Some(b"value".to_vec())).unwrap();
+        let segment = ImmutableSegment::from_engine(7, &engine);
+        let mut encoded = segment.encode().unwrap();
+
+        let payload_len = u32::from_be_bytes(encoded[16..20].try_into().unwrap()) as usize;
+        let metadata_offset = 20 + payload_len;
+        let bloom_len =
+            u32::from_be_bytes(encoded[metadata_offset..metadata_offset + 4].try_into().unwrap())
+                as usize;
+        let mut index_cursor = &encoded[metadata_offset + 4 + bloom_len..];
+        assert_eq!(take_u32(&mut index_cursor).unwrap(), 1);
+        assert!(take_key_matches(&mut index_cursor, &key).unwrap());
+        let ordinal_offset = encoded.len() - 4 - index_cursor.len();
+        encoded[ordinal_offset..ordinal_offset + 4].copy_from_slice(&1u32.to_be_bytes());
+        let checksum_offset = encoded.len() - 4;
+        let checksum = crc32fast::hash(&encoded[..checksum_offset]);
+        encoded[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(matches!(
+            ImmutableSegment::decode(&encoded),
+            Err(RymeError::Corrupt(message)) if message == "segment metadata"
+        ));
     }
 
     #[test]
