@@ -55,6 +55,12 @@ transaction writes one key; set `--batch-size 64` to test larger commits. In
 that case `--ops` counts transactions, while `qps` counts individual writes
 and `transaction_qps` reports committed transactions per second.
 
+Standard-mode scans merge the sorted key ranges of their delta segments and
+resolve each key from newest to oldest at the requested snapshot. They stop
+after collecting the requested number of visible rows instead of materializing
+the whole table first; scan work still depends on how many segment files must
+be consulted and how many tombstones or expired rows are encountered.
+
 A local three-pair batch comparison on the AMD Ryzen 5 4500 used one shard,
 one worker, 500 transactions × 64 distinct 128-byte writes, and no per-write
 fsync. All runs completed with zero failures. After removing the redundant

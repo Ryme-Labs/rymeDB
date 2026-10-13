@@ -1,7 +1,7 @@
 use super::{Engine, RecordKey};
 use ryme_error::{Result, RymeError};
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -643,8 +643,8 @@ impl SegmentStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut selected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         let paths = self.newest_paths()?;
+        let mut segments = Vec::new();
         for path in paths.iter().rev() {
             let segment = self.read_segment(path)?;
             let scope_start = segment
@@ -660,9 +660,16 @@ impl SegmentStore {
                         + scope_start
                 })
                 .unwrap_or(scope_start);
-            if segment.is_snapshot() && selected.is_empty() {
-                let mut out = Vec::with_capacity(limit.min(scope_end - scan_start));
-                for key in &segment.keys[scan_start..scope_end] {
+            let is_snapshot = segment.is_snapshot();
+            segments.push((segment, scan_start, scope_end));
+            if is_snapshot {
+                break;
+            }
+        }
+        if let Some((segment, start, end)) = segments.first() {
+            if segment.is_snapshot() {
+                let mut out = Vec::with_capacity(limit.min(end - start));
+                for key in &segment.keys[*start..*end] {
                     let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts)
                     else {
                         continue;
@@ -678,33 +685,55 @@ impl SegmentStore {
                 }
                 return Ok(out);
             }
-            // `keys` is the segment's already-sorted key directory. Reusing
-            // it avoids cloning every key into a temporary Vec on every scan.
-            // The key is known to be present in this segment, so going
-            // directly to the engine also avoids repeating the bloom filter
-            // and binary-search checks performed by the public lookup path.
-            for key in &segment.keys[scan_start..scope_end] {
-                if selected.contains_key(&key.pk) {
-                    continue;
-                }
-                let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts) else {
-                    continue;
-                };
-                let value = if expires_at != 0 && expires_at <= now { None } else { value };
-                selected.insert(key.pk.clone(), value);
-            }
-            if segment.is_snapshot() {
-                break;
+        }
+
+        // Every segment is ordered by RecordKey. Merge the scoped key ranges
+        // instead of materializing all visible rows before applying `limit`.
+        // Segment order is newest-first, so the first version at read_ts wins.
+        let mut cursors = BinaryHeap::with_capacity(segments.len());
+        for (segment_index, (segment, start, end)) in segments.iter().enumerate() {
+            if start < end {
+                cursors.push(Reverse((segment.keys[*start].pk.clone(), segment_index, *start)));
             }
         }
-        Ok(selected
-            .into_iter()
-            .filter(|(pk, value)| {
-                start_after.map(|after| pk.as_slice() > after).unwrap_or(true) && value.is_some()
-            })
-            .take(limit)
-            .filter_map(|(pk, value)| value.map(|value| (pk, value)))
-            .collect())
+
+        let mut out = Vec::with_capacity(limit.min(1024));
+        while let Some(Reverse((pk, segment_index, key_index))) = cursors.pop() {
+            let mut chosen: Option<Option<Vec<u8>>> = None;
+            let mut current = Some((segment_index, key_index));
+            while let Some((segment_index, key_index)) = current.take() {
+                let (segment, _, end) = &segments[segment_index];
+                let key = &segment.keys[key_index];
+                if chosen.is_none() {
+                    if let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts) {
+                        chosen =
+                            Some(if expires_at != 0 && expires_at <= now { None } else { value });
+                    }
+                }
+                let next_index = key_index + 1;
+                if next_index < *end {
+                    cursors.push(Reverse((
+                        segment.keys[next_index].pk.clone(),
+                        segment_index,
+                        next_index,
+                    )));
+                }
+                current = if cursors.peek().is_some_and(|Reverse((next_pk, _, _))| next_pk == &pk) {
+                    cursors
+                        .pop()
+                        .map(|Reverse((_, segment_index, key_index))| (segment_index, key_index))
+                } else {
+                    None
+                };
+            }
+            if let Some(Some(value)) = chosen {
+                out.push((pk, value));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn latest_path(&self) -> Result<Option<PathBuf>> {
@@ -1324,6 +1353,97 @@ mod tests {
         assert_eq!(
             store.scan_after("tenant", "db", "items", 10, 0, b"a", 10).unwrap(),
             vec![(b"b".to_vec(), b"two".to_vec())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_store_scan_merges_deltas_in_key_order_and_stops_at_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-scan-merge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let mut engine = Engine::new();
+        for (pk, value) in
+            [(b"a".as_slice(), b"A".as_slice()), (b"b", b"B"), (b"c", b"C"), (b"d", b"D")]
+        {
+            engine
+                .apply(RecordKey::new("tenant", "db", "items", pk), 1, Some(value.to_vec()))
+                .unwrap();
+        }
+        store.write(1, &engine).unwrap();
+        store
+            .write_delta_owned_with_sync(
+                2,
+                vec![
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "items", b"a"),
+                        commit_ts: 2,
+                        value: None,
+                        expires_at: 0,
+                    },
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "items", b"b"),
+                        commit_ts: 2,
+                        value: Some(b"B2".to_vec()),
+                        expires_at: 0,
+                    },
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "items", b"c"),
+                        commit_ts: 2,
+                        value: Some(b"C2".to_vec()),
+                        expires_at: 5,
+                    },
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "items", b"e"),
+                        commit_ts: 2,
+                        value: Some(b"E".to_vec()),
+                        expires_at: 0,
+                    },
+                ],
+                false,
+            )
+            .unwrap();
+        store
+            .write_delta_owned_with_sync(
+                3,
+                vec![SegmentEntry {
+                    key: RecordKey::new("tenant", "db", "items", b"b"),
+                    commit_ts: 3,
+                    value: Some(b"B3".to_vec()),
+                    expires_at: 0,
+                }],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.scan("tenant", "db", "items", 3, 10, 2).unwrap(),
+            vec![(b"b".to_vec(), b"B3".to_vec()), (b"d".to_vec(), b"D".to_vec())]
+        );
+        assert_eq!(
+            store.scan_after("tenant", "db", "items", 3, 10, b"b", 2).unwrap(),
+            vec![(b"d".to_vec(), b"D".to_vec()), (b"e".to_vec(), b"E".to_vec())]
+        );
+        assert_eq!(
+            store.scan("tenant", "db", "items", 2, 10, 10).unwrap(),
+            vec![
+                (b"b".to_vec(), b"B2".to_vec()),
+                (b"d".to_vec(), b"D".to_vec()),
+                (b"e".to_vec(), b"E".to_vec()),
+            ]
+        );
+        assert_eq!(
+            store.scan("tenant", "db", "items", 1, 10, 10).unwrap(),
+            vec![
+                (b"a".to_vec(), b"A".to_vec()),
+                (b"b".to_vec(), b"B".to_vec()),
+                (b"c".to_vec(), b"C".to_vec()),
+                (b"d".to_vec(), b"D".to_vec()),
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
