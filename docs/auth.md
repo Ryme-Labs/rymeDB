@@ -37,6 +37,34 @@ When a listener is bound beyond loopback, its API key or protocol password must
 contain at least 16 bytes. Use a randomly generated value rather than a sample
 or human-memorable password.
 
+## Browser applications
+
+A credential embedded in JavaScript is public: users can read it in DevTools
+or extract it from the shipped files. Supabase's public `anon` key works on
+this same principle; the key is not what protects rows. Do not expose
+`RYME_API_KEY`, a platform `superuser` key, or any other broad operator
+credential in a browser.
+
+For a browser-to-database app, use a short-lived user credential and enforce
+access in RymeDB with tenant restrictions or row-level security (RLS). One
+option is to issue user JWTs from your identity provider and configure RymeDB
+to verify its JWKS, issuer, and audience. Give each token only the user's
+identity (`sub`), tenant, and required data-access role; add policies that
+default-deny rows the user should not see or change. The JWT remains visible
+to that user, so keep its lifetime short and its permissions narrow. A
+publicly visible credential is safe only when it grants no access beyond the
+policies you intend.
+
+Alternatively, put a backend-for-frontend (BFF) between the browser and
+RymeDB. Keep the operator key in the server environment, authenticate the
+user with a `Secure`, `HttpOnly`, `SameSite` session cookie, and have the BFF
+authorize each operation before calling the database. Do not forward a broad
+operator credential to the browser. RymeDB's built-in password sign-in
+returns a 15-minute access key and rotating refresh token; other sign-in
+methods may not provide refresh tokens. The access key is still inspectable
+by the browser, and a refresh token is a bearer secret. Prefer keeping
+refresh tokens server-side rather than persisting them in browser storage.
+
 ## Roles and tenants
 
 JWTs accept rymeDB claims (`tenant`, `roles`) and common Supabase claims
