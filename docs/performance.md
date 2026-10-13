@@ -73,6 +73,10 @@ cargo run --locked --release -p ryme-bench -- segment-scan \
   --rows 10000 --deltas 100 --limit 100 --iterations 30
 ```
 
+Add `--compact` to compact the generated segment chain before warming the cache
+and timing scans. Compare paired runs with and without this flag to isolate the
+effect of compaction; compaction setup is outside the measured interval.
+
 Setup and one cache-warming scan are outside the timed samples. The output
 includes p50/p95 scan latency and throughput; vary one parameter at a time and
 compare sequential runs on the same otherwise-idle machine.
