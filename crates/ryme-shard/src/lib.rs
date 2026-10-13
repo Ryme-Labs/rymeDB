@@ -447,6 +447,8 @@ impl ShardSet {
     }
 
     pub fn restore_to(&self, target: u64) -> Result<Vec<u64>> {
+        let _write =
+            self.commit.write().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
         let shards = self
             .inner
             .lock()
@@ -1006,6 +1008,7 @@ impl ShardSet {
 
 impl TxnBackend for ShardSet {
     fn begin(&self) -> Transaction {
+        let _read = self.commit.read().unwrap_or_else(|error| error.into_inner());
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let read_ts =
             inner.shards.iter().map(|shard| shard.inner().latest_commit()).max().unwrap_or(1);
