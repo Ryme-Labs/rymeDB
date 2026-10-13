@@ -46,6 +46,29 @@ the same machine, and retain JSON output with hardware and durability details.
 This benchmark is in-process and must not be compared directly with networked
 database results.
 
+To isolate the delta-segment builder's owned-entry path from the borrowed API:
+
+```bash
+cargo run --locked --release -p ryme-bench -- segment-build \
+  --entries 1024 --value-bytes 128 --iterations 30
+```
+
+This compares building from a borrowed slice (which clones its entries) with
+building from an already-owned vector. Vector creation for the owned case is
+outside the timed interval because transaction code already owns that vector.
+The benchmark reports p50/p95 build time and a median ratio. It measures only
+segment construction—not durable writes, transaction throughput, or end-to-end
+latency—and should be repeated on the same otherwise-idle machine before
+interpreting small differences.
+
+On the 12-logical-CPU AMD Ryzen 5 4500 listed by the command, three release
+runs at 1,024 entries × 128 value bytes × 40 iterations measured borrowed-path
+median build times of 1.310–1.329 ms and owned-path medians of 1.213–1.230 ms.
+The median of the three per-run ratios was about 1.08×. This supports a modest
+segment-construction improvement for this input size; it does not establish a
+transaction-throughput or end-to-end latency gain. The p95 varied between runs,
+so treat this as local directional evidence and rerun on the target workload.
+
 ## Delta-segment pointer experiment
 
 A paired release microbenchmark used the same 12-logical-CPU AMD Ryzen 5 4500,

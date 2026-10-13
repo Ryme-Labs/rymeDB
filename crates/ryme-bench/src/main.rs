@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use ryme_shard::{ShardSet, TableRef};
-use ryme_storage::RecordKey;
+use ryme_storage::{ImmutableSegment, RecordKey, SegmentEntry};
 use ryme_txn::{SyncPolicy, TxnBackend, TxnManager};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -46,6 +46,14 @@ enum Command {
         keyspace: Option<usize>,
         #[arg(long, help = "Sync each write before acknowledging it")]
         sync_each_write: bool,
+    },
+    SegmentBuild {
+        #[arg(long, default_value_t = 1024)]
+        entries: usize,
+        #[arg(long, default_value_t = 128)]
+        value_bytes: usize,
+        #[arg(long, default_value_t = 30)]
+        iterations: usize,
     },
     Resp {
         #[arg(long, default_value = "127.0.0.1:6380")]
@@ -129,6 +137,9 @@ async fn main() {
             sync_each_write,
         }) => {
             sharded_local_bench(ops, concurrency, value_bytes, shards, keyspace, sync_each_write);
+        }
+        Some(Command::SegmentBuild { entries, value_bytes, iterations }) => {
+            segment_build_bench(entries, value_bytes, iterations);
         }
         Some(Command::Resp {
             addr,
@@ -713,6 +724,85 @@ fn sharded_local_bench(
     if let Err(error) = std::fs::remove_dir_all(&data_dir) {
         eprintln!("could not remove temporary benchmark data {}: {error}", data_dir.display());
     }
+}
+
+fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+    let input_bytes = entries.checked_mul(value_bytes);
+    if entries == 0
+        || entries > MAX_ENTRIES
+        || iterations == 0
+        || input_bytes.is_none_or(|bytes| bytes > MAX_INPUT_BYTES)
+    {
+        eprintln!("entries, value bytes, or iterations exceed benchmark bounds");
+        std::process::exit(2);
+    }
+
+    let template = (0..entries)
+        .map(|index| SegmentEntry {
+            key: RecordKey::new(
+                "bench",
+                "bench",
+                "segment-build",
+                format!("k-{index:08}").as_bytes(),
+            ),
+            commit_ts: 1,
+            value: Some(vec![7; value_bytes]),
+            expires_at: 0,
+        })
+        .collect::<Vec<_>>();
+
+    // Warm both paths before collecting samples.
+    drop(ImmutableSegment::from_entries(0, &template).expect("borrowed segment warmup failed"));
+    drop(
+        ImmutableSegment::from_entries_owned(0, template.clone())
+            .expect("owned segment warmup failed"),
+    );
+
+    let mut borrowed_ns = Vec::with_capacity(iterations);
+    let mut owned_ns = Vec::with_capacity(iterations);
+    for sample in 0..iterations {
+        let start = Instant::now();
+        let segment = ImmutableSegment::from_entries(sample as u64, &template)
+            .expect("borrowed segment build failed");
+        borrowed_ns.push(start.elapsed().as_nanos());
+        std::hint::black_box(&segment);
+        drop(segment);
+
+        // In production the caller already owns this vector; keep its setup
+        // outside the timed interval to isolate the builder's extra clone.
+        let input = template.clone();
+        let start = Instant::now();
+        let segment = ImmutableSegment::from_entries_owned(sample as u64, input)
+            .expect("owned segment build failed");
+        owned_ns.push(start.elapsed().as_nanos());
+        std::hint::black_box(&segment);
+        drop(segment);
+    }
+
+    borrowed_ns.sort_unstable();
+    owned_ns.sort_unstable();
+    let percentile = |samples: &[u128], percentile: usize| -> u128 {
+        samples[((samples.len() - 1) * percentile / 100).min(samples.len() - 1)]
+    };
+    let borrowed_median = percentile(&borrowed_ns, 50).max(1);
+    let owned_median = percentile(&owned_ns, 50).max(1);
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "segment-build-ownership",
+            "machine": machine_metadata(),
+            "entries": entries,
+            "value_bytes": value_bytes,
+            "iterations": iterations,
+            "borrowed_clone_p50_ns": borrowed_median,
+            "borrowed_clone_p95_ns": percentile(&borrowed_ns, 95),
+            "owned_p50_ns": owned_median,
+            "owned_p95_ns": percentile(&owned_ns, 95),
+            "owned_p50_speedup": borrowed_median as f64 / owned_median as f64,
+        })
+    );
 }
 
 fn benchmark_tables(backend: &ShardSet, shards: usize) -> Vec<String> {
