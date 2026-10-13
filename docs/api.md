@@ -44,6 +44,29 @@ works in standalone mode and reports `mode: "standalone"` with an empty member
 list. `/v1/audit` returns the newest persisted authentication and administrative
 events; request bodies and credentials are excluded.
 
+## Embedded admin dashboard
+
+Open `http://127.0.0.1:8080/dashboard` (or the configured HTTP address) to use
+the dashboard served by the database process. The static page itself is public;
+dashboard API calls require an authenticated session. On a fresh data directory,
+create the one-time platform administrator in the dashboard, or bootstrap it
+through the API:
+
+```bash
+curl -fsS http://127.0.0.1:8080/v1/dashboard/setup
+curl -fsS -X POST http://127.0.0.1:8080/v1/dashboard/bootstrap \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"admin","password":"replace-with-a-long-password"}'
+```
+
+Bootstrap is unauthenticated by design and succeeds only before the first
+password-based user account is registered. The administrator can then sign in
+at `/dashboard`; keep initial setup on a private or TLS-protected network. The
+dashboard's Observe page combines
+`/metrics`, `/v1/ranges`, `/v1/ranges/loads`, `/v1/observe/slow`, `/v1/traces`,
+and `/v1/audit`. Metrics, operational inspection, and audit data are restricted
+to a platform superuser.
+
 The operator CLI wraps these paths:
 
 ```bash
