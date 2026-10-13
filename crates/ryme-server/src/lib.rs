@@ -3903,6 +3903,17 @@ struct DashboardBootstrapRequest {
     password: String,
 }
 
+fn authorize_dashboard_bootstrap(
+    state: &SharedState,
+    headers: &HeaderMap,
+    client_ip: std::net::IpAddr,
+) -> ryme_error::Result<()> {
+    if client_ip.is_loopback() {
+        return Ok(());
+    }
+    require_platform_admin(state, headers).map(|_| ())
+}
+
 fn register_dashboard_admin(
     credentials: &mut ryme_auth::CredentialStore,
     id: String,
@@ -3918,8 +3929,13 @@ fn register_dashboard_admin(
 
 async fn dashboard_bootstrap(
     State(state): State<SharedState>,
+    headers: HeaderMap,
+    Extension(client_ip): Extension<AuthClientIp>,
     body: axum::body::Bytes,
 ) -> Response {
+    if let Err(error) = authorize_dashboard_bootstrap(&state, &headers, client_ip.0) {
+        return error_response(error);
+    }
     let request: DashboardBootstrapRequest = match json_body(&body) {
         Ok(request) => request,
         Err(error) => return error_response(error),
@@ -14012,6 +14028,61 @@ mod realtime_policy_tests {
             ),
             Err(ryme_error::RymeError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dashboard_bootstrap_requires_admin_off_loopback() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-dashboard-bootstrap-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let remote = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10));
+
+        assert!(authorize_dashboard_bootstrap(&state, &HeaderMap::new(), loopback).is_ok());
+        let denied = dashboard_bootstrap(
+            State(state.clone()),
+            HeaderMap::new(),
+            Extension(AuthClientIp(remote)),
+            axum::body::Bytes::from_static(
+                br#"{"id":"first-admin","password":"long-password"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(state.credentials.lock().unwrap().is_empty());
+
+        state
+            .keys
+            .insert(
+                String::from("bootstrap-admin-key"),
+                Principal {
+                    id: String::from("operator"),
+                    tenant: String::from("default"),
+                    roles: [Role::Superuser].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer bootstrap-admin-key"),
+        );
+        let allowed = dashboard_bootstrap(
+            State(state),
+            headers,
+            Extension(AuthClientIp(remote)),
+            axum::body::Bytes::from_static(
+                br#"{"id":"first-admin","password":"long-password"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::CREATED);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

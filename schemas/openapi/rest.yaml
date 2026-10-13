@@ -79,7 +79,7 @@ paths:
     post:
       tags: [dashboard]
       security: []
-      description: Creates the first platform administrator only; subsequent attempts conflict. This endpoint is unauthenticated by design for initial setup.
+      description: Creates the first platform administrator only; subsequent attempts conflict. Unauthenticated requests are permitted only from loopback client addresses. Other clients must authenticate as a platform superuser using bearer or x-api-key credentials.
       requestBody:
         required: true
         content:
@@ -95,6 +95,10 @@ paths:
                 $ref: '#/components/schemas/DashboardBootstrapResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
   /ready:

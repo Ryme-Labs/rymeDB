@@ -59,10 +59,11 @@ curl -fsS -X POST http://127.0.0.1:8080/v1/dashboard/bootstrap \
   -d '{"id":"admin","password":"replace-with-a-long-password"}'
 ```
 
-Bootstrap is unauthenticated by design and succeeds only before the first
-password-based user account is registered. The administrator can then sign in
-at `/dashboard`; keep initial setup on a private or TLS-protected network. The
-dashboard's Observe page combines
+Unauthenticated bootstrap is allowed only from a loopback client address. Remote
+bootstrap requests must authenticate as a platform superuser (for example,
+with `Authorization: Bearer "$RYME_API_KEY"`). A TLS-protected public network
+alone is not sufficient. The administrator can then sign in at `/dashboard`.
+The dashboard's Observe page combines
 `/metrics`, `/v1/ranges`, `/v1/ranges/loads`, `/v1/observe/slow`, `/v1/traces`,
 and `/v1/audit`. Metrics, operational inspection, and audit data are restricted
 to a platform superuser.
