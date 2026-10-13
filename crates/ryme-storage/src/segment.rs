@@ -369,9 +369,8 @@ impl ImmutableSegment {
         let payload = &cursor[..payload_len];
         cursor = &cursor[payload_len..];
         let engine = Engine::decode_snapshot(payload)?;
-        let mut segment = Self::from_engine(id, &engine);
-        segment.kind = kind;
-        if segment.meta.max_commit_ts != engine.max_commit_ts() {
+        let segment = Self::from_engine_owned(id, engine, kind);
+        if segment.meta.max_commit_ts != segment.engine.max_commit_ts() {
             return Err(RymeError::Corrupt(String::from("segment commit")));
         }
         let bloom_len = take_u32(&mut cursor)? as usize;
@@ -381,7 +380,7 @@ impl ImmutableSegment {
         let bloom = cursor[..bloom_len].to_vec();
         cursor = &cursor[bloom_len..];
         let index_count = take_u32(&mut cursor)? as usize;
-        if index_count > engine.len() {
+        if index_count > segment.engine.len() {
             return Err(RymeError::Corrupt(String::from("segment index")));
         }
         let mut sparse_index = Vec::with_capacity(index_count);
@@ -1091,9 +1090,11 @@ mod tests {
             ImmutableSegment::from_entries_owned(7, entries.into_iter().rev().collect()).unwrap();
 
         assert_eq!(sorted.encode().unwrap(), unsorted.encode().unwrap());
-        assert_eq!(sorted.get(&first, 1, 0).unwrap(), Some(b"a1".to_vec()));
-        assert_eq!(sorted.get(&first, 2, 0).unwrap(), Some(b"a2".to_vec()));
-        assert_eq!(sorted.get(&second, 2, 0).unwrap(), Some(b"b2".to_vec()));
+        let restored = ImmutableSegment::decode(&sorted.encode().unwrap()).unwrap();
+        assert!(!restored.is_snapshot());
+        assert_eq!(restored.get(&first, 1, 0).unwrap(), Some(b"a1".to_vec()));
+        assert_eq!(restored.get(&first, 2, 0).unwrap(), Some(b"a2".to_vec()));
+        assert_eq!(restored.get(&second, 2, 0).unwrap(), Some(b"b2".to_vec()));
     }
 
     #[test]
