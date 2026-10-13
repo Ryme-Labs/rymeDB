@@ -860,7 +860,9 @@ impl SegmentStore {
         let Some((engine, max_commit_ts)) = self.load_all()? else {
             return Ok(None);
         };
-        let (meta, newest) = self.write(max_commit_ts, &engine)?;
+        let segment =
+            ImmutableSegment::from_engine_owned(max_commit_ts, engine, SegmentKind::Snapshot);
+        let (meta, newest) = self.write_segment(segment, true, true)?;
         self.remove_except(&newest)?;
         Ok(Some(meta))
     }
