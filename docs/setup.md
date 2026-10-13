@@ -106,9 +106,10 @@ traffic. A single-node StatefulSet manifest is also available at
 
 ## Run from source
 
-Install Rust using the repository's pinned toolchain. For PostgreSQL and RESP
-smoke tests, also install `psql` and `redis-cli` (or `valkey-cli`). Clone the
-repository and verify the Rust toolchain:
+Install Rust using the repository's pinned toolchain and a system C compiler
+and linker (`cc`; on Debian/Ubuntu, install `build-essential`). For PostgreSQL
+and RESP smoke tests, also install `psql` and `redis-cli` (or `valkey-cli`).
+Clone the repository and verify the Rust toolchain:
 
 ```bash
 git clone https://github.com/Ryme-Labs/rymeDB.git
