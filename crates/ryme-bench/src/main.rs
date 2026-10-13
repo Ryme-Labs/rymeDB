@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use ryme_shard::{ShardSet, TableRef};
-use ryme_storage::{ImmutableSegment, RecordKey, SegmentEntry, StorageMode};
+use ryme_storage::{Engine, ImmutableSegment, RecordKey, SegmentEntry, SegmentStore, StorageMode};
 use ryme_txn::{SyncPolicy, TxnBackend, TxnManager};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -56,6 +56,16 @@ enum Command {
         entries: usize,
         #[arg(long, default_value_t = 128)]
         value_bytes: usize,
+        #[arg(long, default_value_t = 30)]
+        iterations: usize,
+    },
+    SegmentScan {
+        #[arg(long, default_value_t = 10_000)]
+        rows: usize,
+        #[arg(long, default_value_t = 100)]
+        deltas: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
         #[arg(long, default_value_t = 30)]
         iterations: usize,
     },
@@ -156,6 +166,9 @@ async fn main() {
         }
         Some(Command::SegmentBuild { entries, value_bytes, iterations }) => {
             segment_build_bench(entries, value_bytes, iterations);
+        }
+        Some(Command::SegmentScan { rows, deltas, limit, iterations }) => {
+            segment_scan_bench(rows, deltas, limit, iterations);
         }
         Some(Command::Resp {
             addr,
@@ -878,6 +891,107 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
             "decode_p95_ns": percentile(&decoded_ns, 95),
         })
     );
+}
+
+fn segment_scan_bench(rows: usize, deltas: usize, limit: usize, iterations: usize) {
+    const MAX_ROWS: usize = 100_000;
+    const MAX_DELTAS: usize = 1_024;
+    const MAX_ITERATIONS: usize = 100_000;
+    let total_keys = rows.checked_add(deltas);
+    if rows == 0
+        || rows > MAX_ROWS
+        || deltas > MAX_DELTAS
+        || limit == 0
+        || total_keys.is_none_or(|keys| keys > MAX_ROWS + MAX_DELTAS)
+        || iterations == 0
+        || iterations > MAX_ITERATIONS
+    {
+        eprintln!("rows, deltas, limit, or iterations exceed benchmark bounds");
+        std::process::exit(2);
+    }
+    let total_keys = total_keys.expect("validated scan key count");
+    let data_dir = std::env::temp_dir().join(format!(
+        "ryme-bench-segment-scan-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let store = SegmentStore::open_with_cache(&data_dir, 64 * 1024 * 1024)
+        .expect("could not open temporary segment scan benchmark store");
+    let mut engine = Engine::new();
+    for index in 0..rows {
+        let key = RecordKey::new("bench", "bench", "scan", format!("k-{index:08}").as_bytes());
+        engine.apply(key, 1, Some(vec![7; 64])).expect("could not build scan snapshot");
+    }
+    store.write(1, &engine).expect("could not write scan snapshot");
+    drop(engine);
+    for index in 0..deltas {
+        let entry = SegmentEntry {
+            key: RecordKey::new(
+                "bench",
+                "bench",
+                "scan",
+                format!("k-{:08}", rows + index).as_bytes(),
+            ),
+            commit_ts: index as u64 + 2,
+            value: Some(vec![7; 64]),
+            expires_at: 0,
+        };
+        store
+            .write_delta_owned_with_sync(index as u64 + 2, vec![entry], false)
+            .expect("could not write scan delta");
+    }
+
+    let read_ts = deltas as u64 + 1;
+    let expected_rows = limit.min(total_keys);
+    let warmup = store
+        .scan("bench", "bench", "scan", read_ts, 0, limit)
+        .expect("scan benchmark warmup failed");
+    assert_eq!(warmup.len(), expected_rows, "scan warmup returned wrong row count");
+    drop(warmup);
+
+    let mut samples_ns = Vec::with_capacity(iterations);
+    let benchmark_start = Instant::now();
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let result = store
+            .scan("bench", "bench", "scan", read_ts, 0, limit)
+            .expect("segment scan benchmark failed");
+        samples_ns.push(start.elapsed().as_nanos());
+        assert_eq!(result.len(), expected_rows, "scan returned wrong row count");
+        std::hint::black_box(&result);
+    }
+    let elapsed = benchmark_start.elapsed().as_secs_f64().max(0.000001);
+    samples_ns.sort_unstable();
+    let percentile = |percentile: usize| -> u128 {
+        samples_ns[((samples_ns.len() - 1) * percentile / 100).min(samples_ns.len() - 1)]
+    };
+    let cache = store.cache_stats();
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "segment-scan-page",
+            "machine": machine_metadata(),
+            "snapshot_rows": rows,
+            "delta_segments": deltas,
+            "total_keys": total_keys,
+            "limit": limit,
+            "iterations": iterations,
+            "returned_rows_per_scan": expected_rows,
+            "scan_p50_ns": percentile(50),
+            "scan_p95_ns": percentile(95),
+            "scans_per_second": iterations as f64 / elapsed,
+            "rows_per_second": iterations as f64 * expected_rows as f64 / elapsed,
+            "segment_cache_hits": cache.hits,
+            "segment_cache_misses": cache.misses,
+        })
+    );
+    drop(store);
+    if let Err(error) = std::fs::remove_dir_all(&data_dir) {
+        eprintln!("could not remove temporary benchmark data {}: {error}", data_dir.display());
+    }
 }
 
 fn benchmark_tables(backend: &ShardSet, shards: usize) -> Vec<String> {

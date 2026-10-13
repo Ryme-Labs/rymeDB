@@ -61,6 +61,25 @@ after collecting the requested number of visible rows instead of materializing
 the whole table first; scan work still depends on how many segment files must
 be consulted and how many tombstones or expired rows are encountered.
 
+To measure cached Standard-mode scan pages over a snapshot plus one-row delta
+segments:
+
+```bash
+cargo run --locked --release -p ryme-bench -- segment-scan \
+  --rows 10000 --deltas 100 --limit 100 --iterations 30
+```
+
+Setup and one cache-warming scan are outside the timed samples. The output
+includes p50/p95 scan latency and throughput; vary one parameter at a time and
+compare sequential runs on the same otherwise-idle machine.
+
+Two sequential A/B pairs on an AMD Ryzen 5 4500 (12 logical CPUs), comparing
+the pre-merge implementation at `0202d42` with the k-way merge, measured p50
+latency of 7.49–7.57 ms versus 51.6–51.9 µs. The median p50 was about 145×
+lower; p95 was 7.59–7.81 ms versus 61.7–63.6 µs. This is a warm-cache,
+synthetic page workload (10,000 snapshot rows, 100 one-row deltas, limit 100),
+not a general database or end-to-end performance claim.
+
 A local three-pair batch comparison on the AMD Ryzen 5 4500 used one shard,
 one worker, 500 transactions × 64 distinct 128-byte writes, and no per-write
 fsync. All runs completed with zero failures. After removing the redundant
