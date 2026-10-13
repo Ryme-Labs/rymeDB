@@ -27,6 +27,15 @@ async fn command(addr: std::net::SocketAddr, parts: &[&str]) -> String {
     String::from_utf8(raw).unwrap().trim().to_string()
 }
 
+async fn command_on(socket: &mut tokio::net::TcpStream, parts: &[&str]) -> String {
+    let mut frame = format!("*{}\r\n", parts.len());
+    for part in parts {
+        frame.push_str(&format!("${}\r\n{part}\r\n", part.len()));
+    }
+    socket.write_all(frame.as_bytes()).await.unwrap();
+    read_reply(socket).await.trim().to_string()
+}
+
 async fn read_reply(socket: &mut tokio::net::TcpStream) -> String {
     let mut raw = Vec::new();
     let mut chunk = vec![0u8; 4096];
@@ -104,6 +113,40 @@ async fn counters_roundtrip() {
     assert_eq!(command(addr, &["SET", "s", "abc"]).await, "+OK");
     assert!(command(addr, &["INCR", "s"]).await.starts_with("-ERR"));
     assert_eq!(command(addr, &["INCRBY", "n"]).await.split_whitespace().next().unwrap(), "-ERR");
+}
+
+#[tokio::test]
+async fn concurrent_set_overwrites_do_not_expose_serialization_conflicts() {
+    const CLIENTS: usize = 12;
+    const WRITES_PER_CLIENT: usize = 40;
+
+    let addr = serve().await;
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(CLIENTS));
+    let mut clients = Vec::with_capacity(CLIENTS);
+    for client in 0..CLIENTS {
+        let start = start.clone();
+        clients.push(tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            start.wait().await;
+            let mut failures = Vec::new();
+            for write in 0..WRITES_PER_CLIENT {
+                let value = format!("{client}-{write}");
+                let reply = command_on(&mut socket, &["SET", "hot-key", &value]).await;
+                if reply != "+OK" {
+                    failures.push(reply);
+                }
+            }
+            failures
+        }));
+    }
+
+    let mut failures = Vec::new();
+    for client in clients {
+        failures.extend(client.await.unwrap());
+    }
+    assert!(failures.is_empty(), "SET exposed internal transaction conflicts: {failures:?}");
+    let value = command(addr, &["GET", "hot-key"]).await;
+    assert!(value.starts_with('$'), "hot key missing after successful SETs: {value}");
 }
 
 #[tokio::test]

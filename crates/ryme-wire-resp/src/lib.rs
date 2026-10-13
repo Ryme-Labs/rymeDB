@@ -28,6 +28,7 @@ const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const RESP_MAX_PUBSUB_SUBSCRIPTIONS: usize = 1024;
 const RESP_MAX_PUBSUB_NAME_BYTES: usize = 4 * 1024;
 const RESP_MAX_CLUSTER_BRIDGES: usize = 10_000;
+const MAX_COMMAND_CONFLICT_RETRIES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
@@ -1586,41 +1587,55 @@ where
             self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
             return reply;
         }
-        let mut txn = self.manager.begin();
-        let reply = self.dispatch_in(&mut txn, command);
-        if let Err(error) = txn.ensure_healthy() {
-            self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
-            return encode_error(error.to_string());
-        }
-        let write = !txn.writes().is_empty();
-        if let Some(denied) = self.readonly_deny(write) {
-            self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
-            return denied;
-        }
-        if let Some(denied) = self.admit(write, bytes) {
-            self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
-            return denied;
-        }
-        let pending = self.cdc_pending(&txn);
-        let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
-            txn.writes().keys().cloned().collect()
-        } else {
-            Vec::new()
-        };
-        match self.manager.commit(txn).await {
-            Ok(commit_ts) => {
-                for key in &range_keys {
-                    self.note_range_write(key);
-                }
-                self.cdc_emit(pending, commit_ts);
-                self.observe(write);
+        let retry_conflicts = !matches!(command.name.as_str(), "EVAL" | "EVALSHA");
+        let mut retries = 0;
+        let mut admitted = false;
+        loop {
+            let mut txn = self.manager.begin();
+            let reply = self.dispatch_in(&mut txn, command.clone());
+            if let Err(error) = txn.ensure_healthy() {
                 self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
-                reply
+                return encode_error(error.to_string());
             }
-            Err(e) => {
-                let reply = encode_error(e.to_string());
-                self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
-                reply
+            let write = !txn.writes().is_empty();
+            if !admitted {
+                if let Some(denied) = self.readonly_deny(write) {
+                    self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+                    return denied;
+                }
+                if let Some(denied) = self.admit(write, bytes) {
+                    self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+                    return denied;
+                }
+                admitted = true;
+            }
+            let pending = self.cdc_pending(&txn);
+            let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
+                txn.writes().keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            match self.manager.commit(txn).await {
+                Ok(commit_ts) => {
+                    for key in &range_keys {
+                        self.note_range_write(key);
+                    }
+                    self.cdc_emit(pending, commit_ts);
+                    self.observe(write);
+                    self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+                    return reply;
+                }
+                Err(RymeError::Conflict(_))
+                    if retry_conflicts && retries < MAX_COMMAND_CONFLICT_RETRIES =>
+                {
+                    retries += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    let reply = encode_error(error.to_string());
+                    self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+                    return reply;
+                }
             }
         }
     }
@@ -1817,6 +1832,15 @@ where
                 };
                 let record =
                     RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+                if !options.only_missing && !options.only_present && !options.return_previous {
+                    match options.expires_at {
+                        Some(ts) => {
+                            self.manager.put_with_ttl(txn, record, command.args[1].clone(), ts)
+                        }
+                        None => self.manager.put(txn, record, command.args[1].clone()),
+                    }
+                    return encode_simple("OK");
+                }
                 let previous = match self.manager.get(txn, &record) {
                     Ok(value) => value,
                     Err(e) => return encode_error(e.to_string()),
