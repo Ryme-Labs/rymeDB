@@ -851,15 +851,19 @@ pub fn verify_totp(secret: &[u8], code: &str, unix_secs: u64) -> bool {
 
 fn matching_totp_step(secret: &[u8], code: &str, unix_secs: u64) -> Option<u64> {
     let current_step = unix_secs / 30;
-    [current_step, current_step.saturating_sub(1), current_step.saturating_sub(2)]
-        .into_iter()
-        .find(|step| {
-            let step = *step;
-            constant_time_equal(
-                totp_code(secret, step * 30).as_bytes(),
-                code.as_bytes(),
-            )
-        })
+    let mut matched_step = 0u64;
+    let mut found = 0u64;
+    for step in [current_step, current_step.saturating_sub(1), current_step.saturating_sub(2)] {
+        let matches = u64::from(constant_time_equal(
+            totp_code(secret, step * 30).as_bytes(),
+            code.as_bytes(),
+        ));
+        let take = matches & (found ^ 1);
+        let mask = 0u64.wrapping_sub(take);
+        matched_step = (matched_step & !mask) | (step & mask);
+        found |= matches;
+    }
+    (found == 1).then_some(matched_step)
 }
 
 #[derive(Debug, Default)]
@@ -1729,9 +1733,12 @@ mod tests {
     #[test]
     fn totp_window() {
         let secret = b"totp-secret";
-        let code = totp_code(secret, 1_700_000_000);
-        assert!(verify_totp(secret, &code, 1_700_000_000));
-        assert!(!verify_totp(secret, "000000", 1_700_000_000));
+        let now = 1_700_000_000;
+        assert!(verify_totp(secret, &totp_code(secret, now), now));
+        assert!(verify_totp(secret, &totp_code(secret, now - 30), now));
+        assert!(verify_totp(secret, &totp_code(secret, now - 60), now));
+        assert!(!verify_totp(secret, &totp_code(secret, now - 90), now));
+        assert!(!verify_totp(secret, "000000", now));
     }
 
     #[test]
