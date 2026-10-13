@@ -627,24 +627,57 @@ impl Engine {
     }
 
     pub fn gc(&mut self, retain_ts: u64) {
-        for versions in self.inner.values_mut() {
-            let mut keep_from = 0;
-            for (index, version) in versions.iter().enumerate() {
-                if version.commit_ts <= retain_ts {
-                    keep_from = index;
-                } else {
-                    break;
-                }
-            }
-            if keep_from > 0 {
-                let reclaimed = versions
-                    .drain(0..keep_from)
-                    .filter_map(|version| version.value)
-                    .map(|value| value.len() as u64)
-                    .sum::<u64>();
-                self.bytes_held = self.bytes_held.saturating_sub(reclaimed);
-            }
+        self.gc_batch(retain_ts, None, usize::MAX);
+    }
+
+    /// Collects at most `max_keys` keys after `after`, returning a cursor and
+    /// whether the ordered keyspace is fully visited. Keeping the cursor
+    /// outside the engine lets callers release the engine lock between pages.
+    pub fn gc_batch(
+        &mut self,
+        retain_ts: u64,
+        after: Option<&RecordKey>,
+        max_keys: usize,
+    ) -> (Option<RecordKey>, bool) {
+        if max_keys == 0 {
+            return (after.cloned(), false);
         }
+        let mut reclaimed_bytes = 0u64;
+        let (cursor, complete) = {
+            let bounds: (Bound<&RecordKey>, Bound<&RecordKey>) = match after {
+                Some(key) => (Bound::Excluded(key), Bound::Unbounded),
+                None => (Bound::Unbounded, Bound::Unbounded),
+            };
+            let mut entries = self.inner.range_mut(bounds);
+            let mut visited = 0usize;
+            let mut last_key = None;
+            while visited < max_keys {
+                let Some((key, versions)) = entries.next() else { break };
+                let mut keep_from = 0;
+                for (index, version) in versions.iter().enumerate() {
+                    if version.commit_ts <= retain_ts {
+                        keep_from = index;
+                    } else {
+                        break;
+                    }
+                }
+                if keep_from > 0 {
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(
+                        versions
+                            .drain(0..keep_from)
+                            .filter_map(|version| version.value)
+                            .map(|value| value.len() as u64)
+                            .sum::<u64>(),
+                    );
+                }
+                visited += 1;
+                last_key = Some(key);
+            }
+            let has_more = entries.next().is_some();
+            (has_more.then(|| last_key.cloned()).flatten(), !has_more)
+        };
+        self.bytes_held = self.bytes_held.saturating_sub(reclaimed_bytes);
+        (cursor, complete)
     }
 
     pub fn max_commit_ts(&self) -> u64 {
@@ -953,6 +986,38 @@ mod tests {
         assert_eq!(engine.bytes_held(), 6 + 3);
         assert_eq!(engine.read(&key, 3, 0).unwrap(), Some(b"anchor".to_vec()));
         assert_eq!(engine.read(&key, 4, 0).unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn gc_batches_resume_in_key_order_without_skipping_rows() {
+        let mut engine = Engine::new();
+        let keys: Vec<_> = (0..5)
+            .map(|index| RecordKey::new("t", "d", "history", format!("k-{index}").as_bytes()))
+            .collect();
+        for key in &keys {
+            for commit_ts in 1..=3 {
+                engine.apply(key.clone(), commit_ts, Some(vec![commit_ts as u8])).unwrap();
+            }
+        }
+
+        let (cursor, complete) = engine.gc_batch(2, None, 2);
+        assert!(!complete);
+        assert_eq!(cursor, Some(keys[1].clone()));
+        assert_eq!(engine.version_at(&keys[0], 1), None);
+        assert!(engine.version_at(&keys[2], 1).is_some());
+
+        let (cursor, complete) = engine.gc_batch(2, cursor.as_ref(), 2);
+        assert!(!complete);
+        assert_eq!(cursor, Some(keys[3].clone()));
+        let (cursor, complete) = engine.gc_batch(2, cursor.as_ref(), 2);
+        assert!(complete);
+        assert_eq!(cursor, None);
+
+        for key in &keys {
+            assert_eq!(engine.version_at(key, 1), None);
+            assert_eq!(engine.version_at(key, 2), Some((2, Some(vec![2]), 0)));
+            assert_eq!(engine.version_at(key, 3), Some((3, Some(vec![3]), 0)));
+        }
     }
 
     #[test]

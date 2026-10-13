@@ -3553,9 +3553,11 @@ fn spawn_gateways(
             if idle > 0 {
                 tracing::info!(removed = idle, "pruned idle realtime scopes");
             }
-            match sweep_state.backend.gc_oldest() {
-                Ok(horizon) => tracing::debug!(horizon = horizon, "collected mvcc versions"),
-                Err(e) => tracing::warn!(error = %e, "mvcc gc failed"),
+            let gc_backend = sweep_state.backend.clone();
+            match tokio::task::spawn_blocking(move || gc_backend.gc_oldest()).await {
+                Ok(Ok(horizon)) => tracing::debug!(horizon = horizon, "collected mvcc versions"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "mvcc gc failed"),
+                Err(e) => tracing::warn!(error = %e, "mvcc gc task failed"),
             }
             match sweep_state.backend.retention_sweep(sweep_state.snapshot_keep) {
                 Ok((snaps, segs)) if snaps + segs > 0 => {

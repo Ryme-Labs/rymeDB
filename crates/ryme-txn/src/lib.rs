@@ -17,6 +17,7 @@ pub const MAX_TRANSACTION_CONSTRAINT_SCANS: usize = 10_000;
 pub const MAX_TRANSACTION_STATE_BYTES: usize = 64 * 1024 * 1024;
 
 const TRANSACTION_ENTRY_OVERHEAD: usize = 64;
+const MVCC_GC_KEYS_PER_LOCK: usize = 1_024;
 
 fn transaction_key_bytes(key: &RecordKey) -> usize {
     TRANSACTION_ENTRY_OVERHEAD
@@ -1625,13 +1626,42 @@ impl TxnManager {
     }
 
     pub fn gc_oldest(&self) -> Result<u64> {
-        let horizon = self.gc_horizon();
-        let mut engine = self
-            .inner
-            .engine
-            .write()
-            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        engine.gc(horizon);
+        let mut cursor = None;
+        let horizon = loop {
+            let (next, complete, batch_horizon) = {
+                let _commit = self
+                    .inner
+                    .commit
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+                let active = self
+                    .inner
+                    .active
+                    .transactions
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("active transaction lock")))?;
+                let batch_horizon = active
+                    .by_read_ts
+                    .first_key_value()
+                    .map(|(read_ts, _)| *read_ts)
+                    .unwrap_or_else(|| self.latest_commit());
+                let mut engine = self
+                    .inner
+                    .engine
+                    .write()
+                    .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+                let (next, complete) =
+                    engine.gc_batch(batch_horizon, cursor.as_ref(), MVCC_GC_KEYS_PER_LOCK);
+                (next, complete, batch_horizon)
+            };
+            if complete {
+                break batch_horizon;
+            }
+            cursor = next;
+            if cursor.is_none() {
+                return Err(RymeError::Internal(String::from("mvcc gc cursor")));
+            }
+        };
         Ok(horizon)
     }
     pub fn table_bytes(&self, tenant: &str, database: &str, table: &str) -> Result<u64> {
@@ -3294,6 +3324,33 @@ mod tests {
         let mut fresh = manager.begin();
         let current = manager.get(&mut fresh, &key).unwrap();
         assert_eq!(current, Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn gc_oldest_collects_all_key_batches() {
+        let manager = TxnManager::new();
+        let keys: Vec<_> = (0usize..2_050)
+            .map(|index| RecordKey::new("t", "d", "gc-batch", &index.to_be_bytes()))
+            .collect();
+        let mut initial = manager.begin();
+        for key in &keys {
+            manager.put(&mut initial, key.clone(), vec![1]);
+        }
+        manager.commit(initial).unwrap();
+        let mut updates = manager.begin();
+        for key in &keys {
+            manager.put(&mut updates, key.clone(), vec![2]);
+        }
+        manager.commit(updates).unwrap();
+
+        assert_eq!(manager.memory_bytes().unwrap(), 4_100);
+        manager.gc_oldest().unwrap();
+        assert_eq!(manager.memory_bytes().unwrap(), 2_050);
+
+        let mut read = manager.begin();
+        for key in &keys {
+            assert_eq!(manager.get(&mut read, key).unwrap(), Some(vec![2]));
+        }
     }
 
     #[test]
