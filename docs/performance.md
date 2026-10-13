@@ -54,6 +54,10 @@ mode comparison rather than a like-for-like database claim. By default, each
 transaction writes one key; set `--batch-size 64` to test larger commits. In
 that case `--ops` counts transactions, while `qps` counts individual writes
 and `transaction_qps` reports committed transactions per second.
+With multiple shards, rows within a batch are assigned round-robin across
+shard-placed tables, so larger batches exercise cross-shard coordination. Use
+`--shards 1` to isolate the single-shard batch path; benchmark table-local
+batches separately when that matches the application workload.
 
 Standard-mode scans merge the sorted key ranges of their delta segments and
 resolve each key from newest to oldest at the requested snapshot. They stop
