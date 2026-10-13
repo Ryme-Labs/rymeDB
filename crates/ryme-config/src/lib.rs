@@ -92,6 +92,8 @@ const fn max_http_body_bytes() -> u64 {
     64 * 1024 * 1024
 }
 
+const MAX_RLS_NAME_BYTES: usize = 256;
+
 fn default_otel_service() -> String {
     String::from("rymedb")
 }
@@ -290,6 +292,16 @@ impl Config {
         if self.index_partitions == 0 || self.index_partitions > 64 {
             return Err(RymeError::InvalidArgument(String::from("index_partitions")));
         }
+        if self.rls_tables.iter().any(|(table, column)| {
+            table.is_empty()
+                || table.len() > MAX_RLS_NAME_BYTES
+                || table.contains('\0')
+                || column.is_empty()
+                || column.len() > MAX_RLS_NAME_BYTES
+                || column.contains('\0')
+        }) {
+            return Err(RymeError::InvalidArgument(String::from("rls_tables")));
+        }
         if self.cluster.raft_listen.is_some() && self.shards > 1 {
             return Err(RymeError::InvalidArgument(String::from("cluster sharding")));
         }
@@ -408,6 +420,28 @@ mod tests {
             let config = Config { http_max_body_bytes: limit, ..Config::default() };
             assert_eq!(config.validate().is_ok(), valid, "{limit}");
         }
+    }
+
+    #[test]
+    fn rls_table_and_tenant_field_names_must_be_valid() {
+        for rls_tables in [
+            HashMap::from([(String::from("messages"), String::new())]),
+            HashMap::from([(String::new(), String::from("tenant_id"))]),
+            HashMap::from([(String::from("messages"), String::from("tenant\0id"))]),
+            HashMap::from([("t".repeat(MAX_RLS_NAME_BYTES + 1), String::from("tenant_id"))]),
+            HashMap::from([(String::from("messages"), "c".repeat(MAX_RLS_NAME_BYTES + 1))]),
+        ] {
+            let config = Config { rls_tables, ..Config::default() };
+            assert!(
+                matches!(config.validate(), Err(RymeError::InvalidArgument(name)) if name == "rls_tables")
+            );
+        }
+
+        let config = Config {
+            rls_tables: HashMap::from([(String::from("messages"), String::from("tenant_id"))]),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

@@ -144,6 +144,9 @@ superuser credential.
 { "rls_tables": { "messages": "tenant_id", "jobs": "account_id" } }
 ```
 
+Table and field names must be nonempty, NUL-free, and at most 256 bytes.
+Invalid mappings prevent the server from starting.
+
 Requests authenticated as a tenant can only read or mutate matching rows.
 For SQL-native policy metadata and migration behavior, read [auth and tenants](auth.md).
 

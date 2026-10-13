@@ -1944,6 +1944,7 @@ impl SharedState {
     }
 
     pub fn build(config: &Config) -> ryme_error::Result<Self> {
+        config.validate()?;
         let configured_api_key = std::env::var("RYME_API_KEY").ok();
         let configured_pg_password = std::env::var("RYME_PG_PASSWORD").ok();
         let configured_resp_password = std::env::var("RYME_RESP_PASSWORD").ok();
@@ -14197,6 +14198,18 @@ mod realtime_policy_tests {
             validate_listener_auth(&config, Some(API_KEY), Some(PG_PASSWORD), None),
             Err(ryme_error::RymeError::InvalidArgument(message))
                 if message.contains("RYME_RESP_PASSWORD")
+        ));
+    }
+
+    #[test]
+    fn server_build_rejects_empty_rls_tenant_field() {
+        let config = Config {
+            rls_tables: HashMap::from([(String::from("messages"), String::new())]),
+            ..Config::default()
+        };
+        assert!(matches!(
+            SharedState::build(&config),
+            Err(ryme_error::RymeError::InvalidArgument(name)) if name == "rls_tables"
         ));
     }
 
