@@ -120,6 +120,18 @@ async fn range_hook_records_exec_batch_once() {
     }
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
-    assert!(seen.contains(&(routing("_kv", "a"), 1)));
-    assert!(seen.contains(&(routing("_kv", "b"), 1)));
+    assert!(seen.contains(&(
+        String::from("t"),
+        String::from("d"),
+        String::from("_kv"),
+        b"a".to_vec(),
+        1,
+    )));
+    assert!(seen.contains(&(
+        String::from("t"),
+        String::from("d"),
+        String::from("_kv"),
+        b"b".to_vec(),
+        1,
+    )));
 }
