@@ -1823,6 +1823,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "ryme-error",
+ "ryme-shard",
  "ryme-storage",
  "ryme-txn",
  "serde",

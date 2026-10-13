@@ -29,6 +29,20 @@ under optimistic concurrency control. Use a single worker when measuring
 overwrite cost without concurrent conflicts. This is a core microbenchmark, not
 an end-to-end database comparison.
 
+To measure the sharded durable write path independently of network protocols:
+
+```bash
+ryme-bench sharded-local --ops 20000 --concurrency 4 --shards 4 --value-bytes 128
+```
+
+This distributes writes across tables placed on each shard, reports throughput
+and sampled p50/p95/p99 operation latency, and removes its temporary data
+directory after the run. It appends WAL/segment data but does not fsync each
+write by default; add `--sync-each-write` to include per-write fsync cost.
+Compare shard counts and worker counts on the same machine, and retain the JSON
+output with hardware and durability details. This benchmark is in-process and
+must not be compared directly with networked database results.
+
 For PostgreSQL-wire workloads:
 
 ```bash

@@ -12,6 +12,7 @@ path = "src/main.rs"
 ryme-error = { workspace = true }
 ryme-txn = { workspace = true }
 ryme-storage = { workspace = true }
+ryme-shard = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

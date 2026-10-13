@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
+use ryme_shard::{ShardSet, TableRef};
 use ryme_storage::RecordKey;
-use ryme_txn::TxnManager;
+use ryme_txn::{SyncPolicy, TxnBackend, TxnManager};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +32,20 @@ enum Command {
         value_bytes: usize,
         #[arg(long, help = "Number of distinct keys (defaults to ops)")]
         keyspace: Option<usize>,
+    },
+    ShardedLocal {
+        #[arg(long, default_value_t = 20000)]
+        ops: usize,
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 128)]
+        value_bytes: usize,
+        #[arg(long, default_value_t = 4)]
+        shards: usize,
+        #[arg(long, help = "Distinct keys per shard; defaults to ops")]
+        keyspace: Option<usize>,
+        #[arg(long, help = "Sync each write before acknowledging it")]
+        sync_each_write: bool,
     },
     Resp {
         #[arg(long, default_value = "127.0.0.1:6380")]
@@ -105,6 +120,16 @@ async fn main() {
         Some(Command::Local { ops, concurrency, value_bytes, keyspace }) => {
             local_bench(ops, concurrency, value_bytes, keyspace);
         }
+        Some(Command::ShardedLocal {
+            ops,
+            concurrency,
+            value_bytes,
+            shards,
+            keyspace,
+            sync_each_write,
+        }) => {
+            sharded_local_bench(ops, concurrency, value_bytes, shards, keyspace, sync_each_write);
+        }
         Some(Command::Resp {
             addr,
             ops,
@@ -168,9 +193,7 @@ async fn main() {
         }) => {
             realtime_bench(RealtimeBench {
                 addr,
-                api_key: api_key
-                    .or_else(|| std::env::var("RYME_API_KEY").ok())
-                    .unwrap_or_default(),
+                api_key: api_key.or_else(|| std::env::var("RYME_API_KEY").ok()).unwrap_or_default(),
                 channel,
                 channel_count,
                 connections,
@@ -577,8 +600,163 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Opt
     }
 }
 
+fn sharded_local_bench(
+    ops: usize,
+    concurrency: usize,
+    value_bytes: usize,
+    shards: usize,
+    keyspace: Option<usize>,
+    sync_each_write: bool,
+) {
+    if !(1..=256).contains(&shards) {
+        eprintln!("shards must be between 1 and 256");
+        std::process::exit(2);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let data_dir =
+        std::env::temp_dir().join(format!("ryme-bench-sharded-{}-{nanos}", std::process::id()));
+    let policy = if sync_each_write { SyncPolicy::Always } else { SyncPolicy::Never };
+    let backend = Arc::new(
+        ShardSet::open_with_cache(&data_dir, shards, policy, 0)
+            .expect("could not open temporary sharded benchmark database"),
+    );
+    let tables = benchmark_tables(&backend, shards);
+    let value = vec![7u8; value_bytes];
+    let workers = concurrency.max(1).min(ops.max(1));
+    let keyspace = keyspace.unwrap_or(ops).max(1);
+    let warmup_ops = if keyspace < ops { keyspace.saturating_mul(shards) } else { 0 };
+    for index in 0..warmup_ops {
+        let key = benchmark_record_key(&tables, shards, index, keyspace);
+        let mut txn = backend.begin();
+        backend.put(&mut txn, key, value.clone());
+        block_on_ready(backend.commit(txn)).expect("sharded benchmark warmup commit failed");
+    }
+
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let backend = Arc::clone(&backend);
+        let tables = tables.clone();
+        let value = value.clone();
+        let base = ops / workers;
+        let extra = ops % workers;
+        let first = worker * base + worker.min(extra);
+        let end = first + base + usize::from(worker < extra);
+        handles.push(std::thread::spawn(move || {
+            const SAMPLE_EVERY: usize = 64;
+            let mut applied = 0usize;
+            let mut failed = 0usize;
+            let mut samples = Vec::new();
+            for index in first..end {
+                let sample = index % SAMPLE_EVERY == 0;
+                let operation_start = sample.then(Instant::now);
+                let key = benchmark_record_key(&tables, shards, index, keyspace);
+                let mut txn = backend.begin();
+                backend.put(&mut txn, key, value.clone());
+                if block_on_ready(backend.commit(txn)).is_ok() {
+                    applied += 1;
+                } else {
+                    failed += 1;
+                }
+                if let Some(operation_start) = operation_start {
+                    samples.push(operation_start.elapsed().as_micros() as u64);
+                }
+            }
+            (applied, failed, samples)
+        }));
+    }
+    let mut samples = Vec::new();
+    let (applied, failed) = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("sharded benchmark worker panicked"))
+        .fold(
+            (0usize, 0usize),
+            |(applied, failed), (worker_applied, worker_failed, worker_samples)| {
+                samples.extend(worker_samples);
+                (applied + worker_applied, failed + worker_failed)
+            },
+        );
+    let seconds = start.elapsed().as_secs_f64().max(0.000001);
+    samples.sort_unstable();
+    let percentile = |value: f64| -> u64 {
+        if samples.is_empty() {
+            return 0;
+        }
+        let index = ((value / 100.0) * samples.len() as f64).floor() as usize;
+        samples[index.min(samples.len() - 1)]
+    };
+    let output = serde_json::json!({
+        "benchmark": "sharded-local",
+        "machine": machine_metadata(),
+        "shards": shards,
+        "workers": workers,
+        "sync_each_write": sync_each_write,
+        "value_bytes": value_bytes,
+        "keyspace_per_shard": keyspace,
+        "warmup_ops": warmup_ops,
+        "requested_ops": ops,
+        "successful_ops": applied,
+        "failed_ops": failed,
+        "seconds": seconds,
+        "qps": applied as f64 / seconds,
+        "latency_sample_stride": 64,
+        "latency_samples": samples.len(),
+        "sampled_p50_us": percentile(50.0),
+        "sampled_p95_us": percentile(95.0),
+        "sampled_p99_us": percentile(99.0),
+    });
+    println!("{output}");
+    drop(backend);
+    if let Err(error) = std::fs::remove_dir_all(&data_dir) {
+        eprintln!("could not remove temporary benchmark data {}: {error}", data_dir.display());
+    }
+}
+
+fn benchmark_tables(backend: &ShardSet, shards: usize) -> Vec<String> {
+    let mut tables = vec![None; shards];
+    for index in 0..shards.saturating_mul(256) {
+        let table = format!("kv-{index}");
+        let shard = backend.route(&TableRef::new("bench", "bench", &table));
+        tables[shard].get_or_insert(table);
+        if tables.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    tables.into_iter().map(|table| table.expect("could not find a table for every shard")).collect()
+}
+
+fn benchmark_record_key(
+    tables: &[String],
+    shards: usize,
+    index: usize,
+    keyspace: usize,
+) -> RecordKey {
+    let table_index = index % shards;
+    let key_index = index / shards % keyspace;
+    RecordKey::new("bench", "bench", &tables[table_index], format!("k-{key_index}").as_bytes())
+}
+
+fn block_on_ready<F: std::future::Future>(future: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+    let mut future = std::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
 fn realtime_channel(base: &str, channel_count: usize, topic: usize) -> String {
-    if channel_count == 1 { base.to_owned() } else { format!("{base}-{topic}") }
+    if channel_count == 1 {
+        base.to_owned()
+    } else {
+        format!("{base}-{topic}")
+    }
 }
 
 fn expected_fanout(subscribers: &[usize], published: &[usize]) -> usize {
@@ -697,7 +875,11 @@ fn frame_len(buffer: &[u8]) -> Option<usize> {
                 return Some(end + 2);
             }
             let total = end + 2 + length as usize + 2;
-            if buffer.len() >= total { Some(total) } else { None }
+            if buffer.len() >= total {
+                Some(total)
+            } else {
+                None
+            }
         }
         b'*' => {
             let end = buffer.windows(2).position(|w| w == b"\r\n")?;
