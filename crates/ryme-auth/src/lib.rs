@@ -747,16 +747,20 @@ pub fn totp_code(secret: &[u8], unix_secs: u64) -> String {
 }
 
 pub fn verify_totp(secret: &[u8], code: &str, unix_secs: u64) -> bool {
-    for delta in [0u64, 30, 60] {
-        let base = unix_secs.saturating_sub(delta);
-        if constant_time_equal(totp_code(secret, base).as_bytes(), code.as_bytes()) {
-            return true;
-        }
-        if constant_time_equal(totp_code(secret, base + delta).as_bytes(), code.as_bytes()) {
-            return true;
-        }
-    }
-    false
+    matching_totp_step(secret, code, unix_secs).is_some()
+}
+
+fn matching_totp_step(secret: &[u8], code: &str, unix_secs: u64) -> Option<u64> {
+    let current_step = unix_secs / 30;
+    [current_step, current_step.saturating_sub(1), current_step.saturating_sub(2)]
+        .into_iter()
+        .find(|step| {
+            let step = *step;
+            constant_time_equal(
+                totp_code(secret, step * 30).as_bytes(),
+                code.as_bytes(),
+            )
+        })
 }
 
 #[derive(Debug, Default)]
@@ -1002,6 +1006,8 @@ pub struct StoredUser {
     pub roles: HashSet<Role>,
     pub password: Option<PasswordHash>,
     pub otp_secret: Option<Vec<u8>>,
+    #[serde(default)]
+    pub otp_last_used_step: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -1037,7 +1043,13 @@ impl CredentialStore {
         }
         self.users.insert(
             id,
-            StoredUser { tenant, roles, password: Some(hash_password(password)), otp_secret: None },
+            StoredUser {
+                tenant,
+                roles,
+                password: Some(hash_password(password)),
+                otp_secret: None,
+                otp_last_used_step: None,
+            },
         );
         Ok(())
     }
@@ -1072,6 +1084,7 @@ impl CredentialStore {
         }
         let user = self.users.get_mut(id).ok_or(RymeError::NotFound(String::from("user")))?;
         user.otp_secret = Some(secret);
+        user.otp_last_used_step = None;
         Ok(())
     }
 
@@ -1088,18 +1101,19 @@ impl CredentialStore {
         self.users.get(id).map(|user| user.tenant.as_str())
     }
 
-    pub fn verify_otp(&self, id: &str, code: &str, now_secs: u64) -> Result<Principal> {
-        let user = self.users.get(id).ok_or(RymeError::Unauthorized)?;
+    pub fn verify_otp(&mut self, id: &str, code: &str, now_secs: u64) -> Result<Principal> {
+        let user = self.users.get_mut(id).ok_or(RymeError::Unauthorized)?;
         let secret = user.otp_secret.as_ref().ok_or(RymeError::Unauthorized)?;
-        if verify_totp(secret, code, now_secs) {
-            Ok(Principal {
-                id: id.to_string(),
-                tenant: user.tenant.clone(),
-                roles: user.roles.clone(),
-            })
-        } else {
-            Err(RymeError::Unauthorized)
+        let step = matching_totp_step(secret, code, now_secs).ok_or(RymeError::Unauthorized)?;
+        if user.otp_last_used_step.is_some_and(|last_used| step <= last_used) {
+            return Err(RymeError::Unauthorized);
         }
+        user.otp_last_used_step = Some(step);
+        Ok(Principal {
+            id: id.to_string(),
+            tenant: user.tenant.clone(),
+            roles: user.roles.clone(),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -1168,6 +1182,7 @@ mod tests {
                 roles: HashSet::new(),
                 password: None,
                 otp_secret: None,
+                otp_last_used_step: None,
             },
         );
         assert!(matches!(

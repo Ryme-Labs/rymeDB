@@ -697,6 +697,7 @@ pub struct SharedState {
     rls_tables: HashMap<String, String>,
     realtime: Realtime,
     durable_persist_lock: Arc<tokio::sync::Mutex<()>>,
+    auth_persist_lock: Arc<Mutex<()>>,
     migration_lock: Arc<tokio::sync::Mutex<()>>,
     keys: ApiKeyStore,
     jwt: Option<JwtVerifier>,
@@ -1383,6 +1384,10 @@ impl SharedState {
     }
 
     fn persist_auth(&self) -> ryme_error::Result<()> {
+        let _persist_guard = self
+            .auth_persist_lock
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
         let snapshot = AuthSnapshot {
             api_keys: self.keys.snapshot()?,
             users: self
@@ -2084,6 +2089,7 @@ impl SharedState {
             rls_tables: config.rls_tables.clone(),
             realtime,
             durable_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            auth_persist_lock: Arc::new(Mutex::new(())),
             migration_lock: Arc::new(tokio::sync::Mutex::new(())),
             keys,
             jwt,
@@ -5618,7 +5624,7 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
         };
         if otp_enrolled {
             let code = request.code.as_deref().unwrap_or("");
-            let store = match credentials.lock() {
+            let mut store = match credentials.lock() {
                 Ok(store) => store,
                 Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
             };
@@ -5745,15 +5751,21 @@ async fn otp_verify(State(state): State<SharedState>, body: axum::body::Bytes) -
     }
     let now = ryme_txn::now_unix();
     let verified = match state.credentials.lock() {
-        Ok(store) => store.verify_otp(&request.id, &request.code, now),
+        Ok(mut store) => store.verify_otp(&request.id, &request.code, now),
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
     match verified {
-        Ok(principal) => {
-            complete_auth_attempt(&state, &attempt_key);
-            (StatusCode::OK, Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })))
-                .into_response()
-        }
+        Ok(principal) => match state.persist_auth() {
+            Ok(()) => {
+                complete_auth_attempt(&state, &attempt_key);
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })),
+                )
+                    .into_response()
+            }
+            Err(error) => error_response(error),
+        },
         Err(e) => error_response(e),
     }
 }
