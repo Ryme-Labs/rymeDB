@@ -31,6 +31,19 @@ const config = {
       },
     ],
   ],
+  plugins: [
+    [
+      "@scalar/docusaurus",
+      {
+        label: "REST API",
+        route: "/api",
+        showNavLink: false,
+        configuration: {
+          url: "/openapi/rest.yaml",
+        },
+      },
+    ],
+  ],
   themes: ["@docusaurus/theme-mermaid"],
   themeConfig: {
     image: "/images/rymedb-banner.png",
