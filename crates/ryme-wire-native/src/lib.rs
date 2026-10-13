@@ -920,7 +920,7 @@ mod tests {
 
         let keys = ApiKeyStore::new();
         let mut roles = HashSet::new();
-        roles.insert(ryme_auth::Role::ReadWrite);
+        roles.insert(ryme_auth::Role::Admin);
         keys.insert(
             String::from("user-a-key"),
             Principal { id: String::from("user-a"), tenant: String::from("tenant-a"), roles },

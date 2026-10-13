@@ -55,6 +55,10 @@ table rules. A valid token is not automatically permission to administer the
 cluster. Tokens without a recognized data-access role authenticate without
 read or write capability.
 
+Tenant `owner` and `admin` principals use the SQL `authenticated` role; only a
+platform `superuser` uses SQL `postgres`. Tenant administration does not bypass
+SQL grants or row-level security.
+
 ## JWT settings
 
 ```bash

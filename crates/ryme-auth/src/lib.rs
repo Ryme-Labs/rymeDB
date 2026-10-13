@@ -50,7 +50,7 @@ impl Principal {
     }
 
     pub fn sql_role(&self) -> &'static str {
-        if self.can_admin() {
+        if self.can_platform_admin() {
             "postgres"
         } else if self.can_write() {
             "authenticated"
@@ -1539,6 +1539,28 @@ mod tests {
         assert!(!principal.can_admin());
         assert!(!principal.can_platform_admin());
         assert_eq!(principal.sql_role(), "authenticated");
+    }
+
+    #[test]
+    fn tenant_admin_roles_do_not_map_to_sql_superuser() {
+        for role in [Role::Owner, Role::Admin] {
+            let principal = Principal {
+                id: String::from("tenant-admin"),
+                tenant: String::from("tenant-a"),
+                roles: HashSet::from([role]),
+            };
+
+            assert!(principal.can_admin());
+            assert!(!principal.can_platform_admin());
+            assert_eq!(principal.sql_role(), "authenticated");
+        }
+
+        let platform_admin = Principal {
+            id: String::from("platform-admin"),
+            tenant: String::from("tenant-a"),
+            roles: HashSet::from([Role::Superuser]),
+        };
+        assert_eq!(platform_admin.sql_role(), "postgres");
     }
 
     #[test]
