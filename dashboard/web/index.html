@@ -88,7 +88,7 @@ async function refresh() {
     $("latency").textContent = "p50 " + m.p50_micros + "us p90 " + m.p90_micros + "us p95 " + m.p95_micros + "us p99 " + m.p99_micros + "us count " + m.rest_count;
     try {
       const c = JSON.parse(await call("GET", "/v1/cluster/members"));
-      $("cluster").innerHTML = "<table><tr><th>id</th><th>addr</th><th>self</th></tr>" + c.members.map((x) => "<tr><td>" + x.id + "</td><td>" + esc(x.addr) + "</td><td>" + (x.self ? "yes" : "") + "</td></tr>").join("") + "</table><span class='dim'>term " + c.term + " commit " + c.commit + "</span>";
+      $("cluster").innerHTML = "<table><tr><th>id</th><th>addr</th><th>self</th></tr>" + c.members.map((x) => "<tr><td>" + esc(x.id) + "</td><td>" + esc(x.addr) + "</td><td>" + (x.self ? "yes" : "") + "</td></tr>").join("") + "</table><span class='dim'>term " + c.term + " commit " + c.commit + "</span>";
     } catch (e) { $("cluster").innerHTML = "<span class='dim'>" + esc(e.message) + "</span>"; }
     const shards = JSON.parse(await call("GET", "/v1/shards"));
     $("shards").textContent = shards.mode + " " + JSON.stringify(shards.placement || shards.shards || "");
