@@ -1,3 +1,5 @@
+use ryme_txn::TxnBackend;
+
 #[tokio::test]
 async fn sweep_removes_expired() {
     let dir = std::env::temp_dir().join(format!("ryme-sweep-{}-{}", std::process::id(), now_ms()));
@@ -65,6 +67,63 @@ async fn sweep_emits_cdc_delete() {
     assert_eq!(record.pk, b"gone".to_vec());
     assert_eq!(record.before, None);
     assert_eq!(record.after, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sharded_expiry_sweep_uses_global_commit_timestamp() {
+    let dir = std::env::temp_dir().join(format!(
+        "ryme-sweep-sharded-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let shards = ryme_shard::ShardSet::open(&dir, 4, ryme_txn::SyncPolicy::Never).unwrap();
+    let mut tables_by_shard: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let (expired_table, busy_table) = (0..64)
+        .map(|index| {
+            let table = format!("table-{index}");
+            (table.clone(), shards.route_table("t", "d", &table))
+        })
+        .find_map(|(table, shard)| {
+            let previous =
+                tables_by_shard.iter().find(|(_, previous_shard)| **previous_shard != shard);
+            match previous {
+                Some((previous_table, _)) => Some((previous_table.clone(), table)),
+                None => {
+                    tables_by_shard.insert(table, shard);
+                    None
+                }
+            }
+        })
+        .expect("tables should route to distinct shards");
+    let backend = ryme_server::Backend::Sharded(shards);
+    let expired_key = ryme_storage::RecordKey::new("t", "d", &expired_table, b"expired");
+    let mut seed = backend.begin();
+    backend.put_with_ttl(&mut seed, expired_key, b"value".to_vec(), 1);
+    backend.commit(seed).await.unwrap();
+
+    let mut latest_before_sweep = 0;
+    for index in 0..5 {
+        let mut txn = backend.begin();
+        backend.put(
+            &mut txn,
+            ryme_storage::RecordKey::new("t", "d", &busy_table, format!("key-{index}").as_bytes()),
+            b"value".to_vec(),
+        );
+        latest_before_sweep = backend.commit(txn).await.unwrap();
+    }
+
+    let realtime = ryme_realtime::Realtime::new(16);
+    let mut receiver = realtime.subscribe("t", "d", &expired_table);
+    assert_eq!(
+        backend.sweep_table("t", "d", &expired_table, 10, Some(&realtime)).await.unwrap(),
+        1
+    );
+    let deletion = receiver.try_recv().unwrap();
+    assert!(deletion.commit_ts > latest_before_sweep);
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

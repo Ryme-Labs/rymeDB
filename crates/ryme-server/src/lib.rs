@@ -428,14 +428,14 @@ impl Backend {
                     return Ok(0);
                 }
                 let count = expired.len();
-                let mut txn = manager.begin();
+                let mut txn = shards.begin();
                 for pk in &expired {
-                    manager.delete(
+                    shards.delete(
                         &mut txn,
                         ryme_storage::RecordKey::new(tenant, database, table, pk),
                     );
                 }
-                let commit_ts = <DurableManager as TxnBackend>::commit(&manager, txn).await?;
+                let commit_ts = shards.commit(txn).await?;
                 Self::emit_swept(cdc, tenant, database, table, &expired, commit_ts);
                 Ok(count)
             }
@@ -474,15 +474,14 @@ impl Backend {
                             return Ok(0);
                         }
                         let count = expired.len();
-                        let mut txn = manager.begin();
+                        let mut txn = local.begin();
                         for pk in &expired {
-                            manager.delete(
+                            local.delete(
                                 &mut txn,
                                 ryme_storage::RecordKey::new(tenant, database, table, pk),
                             );
                         }
-                        let commit_ts =
-                            <DurableManager as TxnBackend>::commit(&manager, txn).await?;
+                        let commit_ts = local.commit(txn).await?;
                         Self::emit_swept(cdc, tenant, database, table, &expired, commit_ts);
                         Ok(count)
                     }
@@ -10373,19 +10372,7 @@ async fn backup_restore(
         Backend::Cluster(_) | Backend::Hybrid(_) => Err(ryme_error::RymeError::Unavailable(
             String::from("restore unavailable in cluster mode"),
         )),
-        Backend::Sharded(shards) => {
-            let mut replayed = Vec::new();
-            for index in 0..shards.shard_count() {
-                let Some(manager) = shards.shard_manager(index) else {
-                    return error_response(ryme_error::RymeError::Internal(String::from("shard")));
-                };
-                match manager.restore_to(query.target) {
-                    Ok(count) => replayed.push(count),
-                    Err(e) => return error_response(e),
-                }
-            }
-            Ok(replayed)
-        }
+        Backend::Sharded(shards) => shards.restore_to(query.target),
     };
     match restored {
         Ok(replayed) => (
