@@ -693,7 +693,11 @@ impl SegmentStore {
         let mut cursors = BinaryHeap::with_capacity(segments.len());
         for (segment_index, (segment, start, end)) in segments.iter().enumerate() {
             if start < end {
-                cursors.push(Reverse((segment.keys[*start].pk.clone(), segment_index, *start)));
+                cursors.push(Reverse((
+                    segment.keys[*start].pk.as_slice(),
+                    segment_index,
+                    *start,
+                )));
             }
         }
 
@@ -713,7 +717,7 @@ impl SegmentStore {
                 let next_index = key_index + 1;
                 if next_index < *end {
                     cursors.push(Reverse((
-                        segment.keys[next_index].pk.clone(),
+                        segment.keys[next_index].pk.as_slice(),
                         segment_index,
                         next_index,
                     )));
@@ -727,7 +731,7 @@ impl SegmentStore {
                 };
             }
             if let Some(Some(value)) = chosen {
-                out.push((pk, value));
+                out.push((pk.to_vec(), value));
                 if out.len() == limit {
                     break;
                 }
