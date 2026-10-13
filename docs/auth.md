@@ -200,4 +200,11 @@ tenant's data and users, but cannot change global DDL or SQL grants.
 - Keep `data_dir`, `auth.json`, `keyring.json`, and archive credentials private.
 - Test authorization failures as well as successful requests.
 
+When deploying behind a reverse proxy, set `RYME_TRUSTED_PROXY_CIDRS` to the
+proxy's exact source ranges and configure it to send a valid
+`X-Forwarded-For` chain. RymeDB ignores forwarded addresses from untrusted
+peers. The loopback-only first-admin bootstrap also requires a valid trusted
+proxy chain for proxied loopback clients; do not expose the bootstrap route
+through an unconfigured proxy.
+
 See [security and vulnerability reports](security.md) for disclosure rules.

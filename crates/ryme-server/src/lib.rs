@@ -695,7 +695,10 @@ impl AuthAttemptLimiter {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AuthClientIp(std::net::IpAddr);
+struct AuthClientIp {
+    address: std::net::IpAddr,
+    allow_loopback_bootstrap: bool,
+}
 
 fn load_trusted_proxy_cidrs() -> ryme_error::Result<Vec<ipnet::IpNet>> {
     let configured = match std::env::var("RYME_TRUSTED_PROXY_CIDRS") {
@@ -721,6 +724,18 @@ fn is_trusted_proxy(address: std::net::IpAddr, trusted: &[ipnet::IpNet]) -> bool
     trusted.iter().any(|network| network.contains(&address))
 }
 
+fn parse_forwarded_for(forwarded_for: &str) -> Option<Vec<std::net::IpAddr>> {
+    let mut parts = forwarded_for.split(',');
+    let mut chain = Vec::with_capacity(MAX_FORWARDED_FOR_HOPS);
+    for value in parts.by_ref().take(MAX_FORWARDED_FOR_HOPS) {
+        chain.push(value.trim().parse::<std::net::IpAddr>().ok()?);
+    }
+    if parts.next().is_some() || chain.is_empty() {
+        return None;
+    }
+    Some(chain)
+}
+
 fn resolve_client_ip(
     peer: std::net::IpAddr,
     forwarded_for: Option<&str>,
@@ -730,15 +745,7 @@ fn resolve_client_ip(
         return peer;
     }
     let Some(forwarded_for) = forwarded_for else { return peer };
-    let mut parts = forwarded_for.split(',');
-    let mut chain = Vec::with_capacity(MAX_FORWARDED_FOR_HOPS);
-    for value in parts.by_ref().take(MAX_FORWARDED_FOR_HOPS) {
-        let Ok(address) = value.trim().parse::<std::net::IpAddr>() else { return peer };
-        chain.push(address);
-    }
-    if parts.next().is_some() {
-        return peer;
-    }
+    let Some(chain) = parse_forwarded_for(forwarded_for) else { return peer };
     let mut client = peer;
     for address in chain.iter().rev() {
         if !is_trusted_proxy(client, trusted) {
@@ -747,6 +754,21 @@ fn resolve_client_ip(
         client = *address;
     }
     client
+}
+
+fn auth_client_ip(
+    peer: std::net::IpAddr,
+    forwarded_for: Option<&str>,
+    trusted: &[ipnet::IpNet],
+) -> AuthClientIp {
+    let trusted_peer = is_trusted_proxy(peer, trusted);
+    let address = resolve_client_ip(peer, forwarded_for, trusted);
+    let allow_loopback_bootstrap = if trusted_peer {
+        forwarded_for.and_then(parse_forwarded_for).is_some_and(|_| address.is_loopback())
+    } else {
+        peer.is_loopback() && forwarded_for.is_none()
+    };
+    AuthClientIp { address, allow_loopback_bootstrap }
 }
 
 async fn attach_auth_client_ip(
@@ -761,8 +783,8 @@ async fn attach_auth_client_ip(
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let forwarded_for =
         request.headers().get("x-forwarded-for").and_then(|value| value.to_str().ok());
-    let client_ip = resolve_client_ip(peer, forwarded_for, &state.trusted_proxy_cidrs);
-    request.extensions_mut().insert(AuthClientIp(client_ip));
+    let client_ip = auth_client_ip(peer, forwarded_for, &state.trusted_proxy_cidrs);
+    request.extensions_mut().insert(client_ip);
     next.run(request).await
 }
 
@@ -884,6 +906,18 @@ mod auth_attempt_limiter_tests {
             .collect::<Vec<_>>()
             .join(", ");
         assert_eq!(resolve_client_ip(proxy_peer, Some(&long_chain), &trusted), proxy_peer);
+
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let trusted_loopback = ["127.0.0.1/32".parse().unwrap()];
+        assert!(auth_client_ip(loopback, None, &[]).allow_loopback_bootstrap);
+        assert!(!auth_client_ip(loopback, Some("198.51.100.10"), &[]).allow_loopback_bootstrap);
+        assert!(!auth_client_ip(loopback, None, &trusted_loopback).allow_loopback_bootstrap);
+        assert!(
+            auth_client_ip(loopback, Some("127.0.0.1"), &trusted_loopback).allow_loopback_bootstrap
+        );
+        assert!(
+            !auth_client_ip(loopback, Some("not-an-ip"), &trusted_loopback).allow_loopback_bootstrap
+        );
     }
 }
 
@@ -3914,9 +3948,9 @@ struct DashboardBootstrapRequest {
 fn authorize_dashboard_bootstrap(
     state: &SharedState,
     headers: &HeaderMap,
-    client_ip: std::net::IpAddr,
+    client_ip: AuthClientIp,
 ) -> ryme_error::Result<()> {
-    if client_ip.is_loopback() {
+    if client_ip.allow_loopback_bootstrap {
         return Ok(());
     }
     require_platform_admin(state, headers).map(|_| ())
@@ -3941,7 +3975,7 @@ async fn dashboard_bootstrap(
     Extension(client_ip): Extension<AuthClientIp>,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Err(error) = authorize_dashboard_bootstrap(&state, &headers, client_ip.0) {
+    if let Err(error) = authorize_dashboard_bootstrap(&state, &headers, client_ip) {
         return error_response(error);
     }
     let request: DashboardBootstrapRequest = match json_body(&body) {
@@ -6020,7 +6054,7 @@ async fn auth_verify(
         Err(e) => return error_response(e),
     };
     let attempt_key = format!("password:{}", request.id);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
     }
     let credentials = state.credentials.clone();
@@ -6031,7 +6065,7 @@ async fn auth_verify(
     .await;
     match verified {
         Ok(Ok(principal)) => {
-            complete_auth_attempt(&state, &attempt_key, client_ip.0);
+            complete_auth_attempt(&state, &attempt_key, client_ip.address);
             (StatusCode::OK, Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })))
                 .into_response()
         }
@@ -6083,7 +6117,7 @@ async fn auth_token(
     } else {
         format!("password:{}", request.id)
     };
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
     }
     let credentials = state.credentials.clone();
@@ -6142,7 +6176,7 @@ async fn auth_token(
     match issued {
         Ok(Ok((key, tenant, refresh_token))) => match state.persist_auth() {
             Ok(()) => {
-                complete_auth_attempt(&state, &attempt_key, client_ip.0);
+                complete_auth_attempt(&state, &attempt_key, client_ip.address);
                 (
                     StatusCode::CREATED,
                     Json(serde_json::json!({
@@ -6272,7 +6306,7 @@ async fn otp_verify(
         Err(e) => return error_response(e),
     };
     let attempt_key = format!("otp:{}", request.id);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
     }
     let now = ryme_txn::now_unix();
@@ -6283,7 +6317,7 @@ async fn otp_verify(
     match verified {
         Ok(principal) => match state.persist_auth() {
             Ok(()) => {
-                complete_auth_attempt(&state, &attempt_key, client_ip.0);
+                complete_auth_attempt(&state, &attempt_key, client_ip.address);
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })),
@@ -6380,7 +6414,7 @@ async fn passkey_verify(
         Err(e) => return error_response(e),
     };
     let attempt_key = format!("passkey:{}", request.user);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
     }
     if state.passkey_rp_id.is_empty() {
@@ -6448,7 +6482,7 @@ async fn passkey_verify(
         Ok(issued) => issued,
         Err(error) => return error_response(error),
     };
-    complete_auth_attempt(&state, &attempt_key, client_ip.0);
+    complete_auth_attempt(&state, &attempt_key, client_ip.address);
     match state.persist_auth() {
         Ok(()) => (
             StatusCode::CREATED,
@@ -6522,7 +6556,7 @@ async fn oidc_token(
         Err(e) => return error_response(e),
     };
     let attempt_key = auth_attempt_key("oidc", &request.state);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
     }
     let Some(config) = state.oidc.clone() else {
@@ -6556,7 +6590,7 @@ async fn oidc_token(
                 Ok(issued) => issued,
                 Err(error) => return error_response(error),
             };
-            complete_auth_attempt(&state, &attempt_key, client_ip.0);
+            complete_auth_attempt(&state, &attempt_key, client_ip.address);
             match state.persist_auth() {
                 Ok(()) => {
                     (
@@ -14129,11 +14163,22 @@ mod realtime_policy_tests {
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let remote = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10));
 
-        assert!(authorize_dashboard_bootstrap(&state, &HeaderMap::new(), loopback).is_ok());
+        assert!(authorize_dashboard_bootstrap(
+            &state,
+            &HeaderMap::new(),
+            AuthClientIp { address: loopback, allow_loopback_bootstrap: true },
+        )
+        .is_ok());
+        assert!(authorize_dashboard_bootstrap(
+            &state,
+            &HeaderMap::new(),
+            auth_client_ip(loopback, Some("203.0.113.10"), &[]),
+        )
+        .is_err());
         let denied = dashboard_bootstrap(
             State(state.clone()),
             HeaderMap::new(),
-            Extension(AuthClientIp(remote)),
+            Extension(AuthClientIp { address: remote, allow_loopback_bootstrap: false }),
             axum::body::Bytes::from_static(
                 br#"{"id":"first-admin","password":"long-password"}"#,
             ),
@@ -14161,7 +14206,7 @@ mod realtime_policy_tests {
         let allowed = dashboard_bootstrap(
             State(state),
             headers,
-            Extension(AuthClientIp(remote)),
+            Extension(AuthClientIp { address: remote, allow_loopback_bootstrap: false }),
             axum::body::Bytes::from_static(
                 br#"{"id":"first-admin","password":"long-password"}"#,
             ),
