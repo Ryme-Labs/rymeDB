@@ -817,13 +817,27 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
             .expect("owned segment warmup failed"),
     );
 
+    let encoded_segment = ImmutableSegment::from_entries(0, &template)
+        .expect("decode benchmark segment build failed")
+        .encode()
+        .expect("decode benchmark segment encode failed");
+    drop(ImmutableSegment::decode(&encoded_segment).expect("segment decode warmup failed"));
+
     let mut borrowed_ns = Vec::with_capacity(iterations);
     let mut owned_ns = Vec::with_capacity(iterations);
+    let mut decoded_ns = Vec::with_capacity(iterations);
     for sample in 0..iterations {
         let start = Instant::now();
         let segment = ImmutableSegment::from_entries(sample as u64, &template)
             .expect("borrowed segment build failed");
         borrowed_ns.push(start.elapsed().as_nanos());
+        std::hint::black_box(&segment);
+        drop(segment);
+
+        let start = Instant::now();
+        let segment =
+            ImmutableSegment::decode(&encoded_segment).expect("segment decode benchmark failed");
+        decoded_ns.push(start.elapsed().as_nanos());
         std::hint::black_box(&segment);
         drop(segment);
 
@@ -840,6 +854,7 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
 
     borrowed_ns.sort_unstable();
     owned_ns.sort_unstable();
+    decoded_ns.sort_unstable();
     let percentile = |samples: &[u128], percentile: usize| -> u128 {
         samples[((samples.len() - 1) * percentile / 100).min(samples.len() - 1)]
     };
@@ -853,11 +868,14 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
             "entries": entries,
             "value_bytes": value_bytes,
             "iterations": iterations,
+            "encoded_bytes": encoded_segment.len(),
             "borrowed_clone_p50_ns": borrowed_median,
             "borrowed_clone_p95_ns": percentile(&borrowed_ns, 95),
             "owned_p50_ns": owned_median,
             "owned_p95_ns": percentile(&owned_ns, 95),
             "owned_p50_speedup": borrowed_median as f64 / owned_median as f64,
+            "decode_p50_ns": percentile(&decoded_ns, 50),
+            "decode_p95_ns": percentile(&decoded_ns, 95),
         })
     );
 }

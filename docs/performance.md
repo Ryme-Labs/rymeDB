@@ -74,8 +74,9 @@ cargo run --locked --release -p ryme-bench -- segment-build \
 This compares building from a borrowed slice (which clones its entries) with
 building from an already-owned vector. Vector creation for the owned case is
 outside the timed interval because transaction code already owns that vector.
-The benchmark reports p50/p95 build time and a median ratio. It measures only
-segment construction—not durable writes, transaction throughput, or end-to-end
+It also reports p50/p95 decode time for a pre-encoded segment; encoding is not
+included in the decode timing. The benchmark measures construction and decode
+in isolation—not durable writes, transaction throughput, or end-to-end
 latency—and should be repeated on the same otherwise-idle machine before
 interpreting small differences.
 
