@@ -722,21 +722,24 @@ impl ShardSet {
     fn commit_single(&self, txn: Transaction, ctx: ShardCtx, shard: usize) -> Result<u64> {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
-        let inner =
-            self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
-        if Some(shard) != ctx.shard {
-            return Err(RymeError::Unavailable(String::from("rescheduling")));
-        }
-        for table in ctx.tables.iter() {
-            if inner.paused.contains(table) {
+        // Pin topology with the read guard; release metadata lock before WAL I/O.
+        let manager = {
+            let inner =
+                self.inner.lock().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+            if Some(shard) != ctx.shard {
                 return Err(RymeError::Unavailable(String::from("rescheduling")));
             }
-        }
-        let manager = inner
-            .shards
-            .get(shard)
-            .cloned()
-            .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
+            for table in ctx.tables.iter() {
+                if inner.paused.contains(table) {
+                    return Err(RymeError::Unavailable(String::from("rescheduling")));
+                }
+            }
+            inner
+                .shards
+                .get(shard)
+                .cloned()
+                .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?
+        };
         manager.commit(txn)
     }
 
