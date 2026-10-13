@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
+use axum::extract::{Extension, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -620,7 +620,7 @@ impl AuditLog {
 
 const AUTH_ATTEMPT_WINDOW_SECS: u64 = 60;
 const AUTH_ATTEMPTS_PER_IDENTITY: u32 = 5;
-const AUTH_ATTEMPTS_GLOBAL: u32 = 120;
+const AUTH_ATTEMPTS_PER_CLIENT: u32 = 120;
 const AUTH_LIMITER_MAX_IDENTITIES: usize = 8192;
 const OIDC_STATE_TTL_SECS: u64 = 600;
 const OIDC_STATE_MAX_PENDING: usize = 8192;
@@ -633,47 +633,62 @@ struct AuthAttemptWindow {
 
 #[derive(Debug, Default)]
 struct AuthAttemptLimiter {
-    global: AuthAttemptWindow,
+    clients: HashMap<std::net::IpAddr, AuthAttemptWindow>,
     identities: HashMap<String, AuthAttemptWindow>,
 }
 
 impl AuthAttemptLimiter {
-    fn admit(&mut self, identity: &str, now: u64) -> ryme_error::Result<()> {
-        let identity = Self::identity_key(identity);
-        Self::reset_if_expired(&mut self.global, now);
-        if self.global.attempts >= AUTH_ATTEMPTS_GLOBAL {
+    fn admit(
+        &mut self,
+        client_ip: std::net::IpAddr,
+        identity: &str,
+        now: u64,
+    ) -> ryme_error::Result<()> {
+        Self::evict_oldest_if_full(&mut self.clients, AUTH_LIMITER_MAX_IDENTITIES, &client_ip);
+        let client = self.clients.entry(client_ip).or_default();
+        Self::reset_if_expired(client, now);
+        if client.attempts >= AUTH_ATTEMPTS_PER_CLIENT {
             return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
         }
 
-        if !self.identities.contains_key(&identity)
-            && self.identities.len() >= AUTH_LIMITER_MAX_IDENTITIES
-        {
-            let oldest = self
-                .identities
-                .iter()
-                .min_by_key(|(_, window)| window.started_at)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                self.identities.remove(&oldest);
-            }
-        }
+        let identity = Self::identity_key(client_ip, identity);
+        Self::evict_oldest_if_full(&mut self.identities, AUTH_LIMITER_MAX_IDENTITIES, &identity);
         let window = self.identities.entry(identity).or_default();
         Self::reset_if_expired(window, now);
         if window.attempts >= AUTH_ATTEMPTS_PER_IDENTITY {
             return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
         }
         window.attempts += 1;
-        self.global.attempts += 1;
+        client.attempts += 1;
         Ok(())
     }
 
-    fn success(&mut self, identity: &str) {
-        self.identities.remove(&Self::identity_key(identity));
+    fn success(&mut self, client_ip: std::net::IpAddr, identity: &str) {
+        self.identities.remove(&Self::identity_key(client_ip, identity));
     }
 
-    fn identity_key(identity: &str) -> String {
+    fn identity_key(client_ip: std::net::IpAddr, identity: &str) -> String {
         use sha2::{Digest, Sha256};
-        ryme_auth::base64_url_encode(&Sha256::digest(identity.as_bytes()))
+        let mut digest = Sha256::new();
+        digest.update(client_ip.to_string().as_bytes());
+        digest.update([0]);
+        digest.update(identity.as_bytes());
+        ryme_auth::base64_url_encode(&digest.finalize())
+    }
+
+    fn evict_oldest_if_full<K: std::hash::Hash + Eq + Clone>(
+        map: &mut HashMap<K, AuthAttemptWindow>,
+        limit: usize,
+        key: &K,
+    ) {
+        if map.contains_key(key) || map.len() < limit {
+            return;
+        }
+        if let Some(oldest) =
+            map.iter().min_by_key(|(_, window)| window.started_at).map(|(key, _)| key.clone())
+        {
+            map.remove(&oldest);
+        }
     }
 
     fn reset_if_expired(window: &mut AuthAttemptWindow, now: u64) {
@@ -685,6 +700,76 @@ impl AuthAttemptLimiter {
             window.attempts = 0;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthClientIp(std::net::IpAddr);
+
+fn load_trusted_proxy_cidrs() -> ryme_error::Result<Vec<ipnet::IpNet>> {
+    let configured = match std::env::var("RYME_TRUSTED_PROXY_CIDRS") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(_) => {
+            return Err(ryme_error::RymeError::InvalidArgument(String::from("trusted proxy cidrs")))
+        }
+    };
+    configured
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<ipnet::IpNet>().map_err(|_| {
+                ryme_error::RymeError::InvalidArgument(String::from("trusted proxy cidrs"))
+            })
+        })
+        .collect()
+}
+
+fn is_trusted_proxy(address: std::net::IpAddr, trusted: &[ipnet::IpNet]) -> bool {
+    trusted.iter().any(|network| network.contains(&address))
+}
+
+fn resolve_client_ip(
+    peer: std::net::IpAddr,
+    forwarded_for: Option<&str>,
+    trusted: &[ipnet::IpNet],
+) -> std::net::IpAddr {
+    if !is_trusted_proxy(peer, trusted) {
+        return peer;
+    }
+    let Some(forwarded_for) = forwarded_for else { return peer };
+    let Some(chain) = forwarded_for
+        .split(',')
+        .map(|value| value.trim().parse::<std::net::IpAddr>().ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return peer;
+    };
+    let mut client = peer;
+    for address in chain.iter().rev() {
+        if !is_trusted_proxy(client, trusted) {
+            break;
+        }
+        client = *address;
+    }
+    client
+}
+
+async fn attach_auth_client_ip(
+    State(state): State<SharedState>,
+    mut request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let forwarded_for =
+        request.headers().get("x-forwarded-for").and_then(|value| value.to_str().ok());
+    let client_ip = resolve_client_ip(peer, forwarded_for, &state.trusted_proxy_cidrs);
+    request.extensions_mut().insert(AuthClientIp(client_ip));
+    next.run(request).await
 }
 
 fn auth_attempt_key(scope: &str, credential: &str) -> String {
@@ -730,33 +815,38 @@ mod auth_attempt_limiter_tests {
     #[test]
     fn limits_identity_and_resets_after_success_or_window() {
         let mut limiter = AuthAttemptLimiter::default();
+        let client = "192.0.2.1".parse().unwrap();
         for _ in 0..AUTH_ATTEMPTS_PER_IDENTITY {
-            assert!(limiter.admit("password:ada", 100).is_ok());
+            assert!(limiter.admit(client, "password:ada", 100).is_ok());
         }
-        assert!(limiter.admit("password:ada", 100).is_err());
-        limiter.success("password:ada");
-        assert!(limiter.admit("password:ada", 100).is_ok());
+        assert!(limiter.admit(client, "password:ada", 100).is_err());
+        limiter.success(client, "password:ada");
+        assert!(limiter.admit(client, "password:ada", 100).is_ok());
 
         for _ in 0..AUTH_ATTEMPTS_PER_IDENTITY - 1 {
-            assert!(limiter.admit("password:ada", 100).is_ok());
+            assert!(limiter.admit(client, "password:ada", 100).is_ok());
         }
-        assert!(limiter.admit("password:ada", 160).is_ok());
+        assert!(limiter.admit(client, "password:ada", 160).is_ok());
     }
 
     #[test]
-    fn global_limit_caps_rotating_identities() {
+    fn client_limit_caps_rotating_identities_without_cross_client_lockout() {
         let mut limiter = AuthAttemptLimiter::default();
-        for index in 0..AUTH_ATTEMPTS_GLOBAL {
-            assert!(limiter.admit(&format!("password:user-{index}"), 100).is_ok());
+        let client_a = "192.0.2.1".parse().unwrap();
+        let client_b = "192.0.2.2".parse().unwrap();
+        for index in 0..AUTH_ATTEMPTS_PER_CLIENT {
+            assert!(limiter.admit(client_a, &format!("password:user-{index}"), 100).is_ok());
         }
-        assert!(limiter.admit("password:last", 100).is_err());
+        assert!(limiter.admit(client_a, "password:last", 100).is_err());
+        assert!(limiter.admit(client_b, "password:ada", 100).is_ok());
     }
 
     #[test]
     fn identity_keys_have_fixed_size() {
         let mut limiter = AuthAttemptLimiter::default();
         let identity = format!("password:{}", "x".repeat(1_000_000));
-        assert!(limiter.admit(&identity, 100).is_ok());
+        let client = "192.0.2.1".parse().unwrap();
+        assert!(limiter.admit(client, &identity, 100).is_ok());
         assert_eq!(limiter.identities.len(), 1);
         assert_eq!(limiter.identities.keys().next().map(String::len), Some(43));
     }
@@ -768,16 +858,34 @@ mod auth_attempt_limiter_tests {
         let refresh_b = auth_attempt_key("refresh", "refresh-token-b");
         let oidc_a = auth_attempt_key("oidc", "state-a");
         let oidc_b = auth_attempt_key("oidc", "state-b");
+        let client = "192.0.2.1".parse().unwrap();
 
         for _ in 0..AUTH_ATTEMPTS_PER_IDENTITY {
-            assert!(limiter.admit(&refresh_a, 100).is_ok());
-            assert!(limiter.admit(&oidc_a, 100).is_ok());
+            assert!(limiter.admit(client, &refresh_a, 100).is_ok());
+            assert!(limiter.admit(client, &oidc_a, 100).is_ok());
         }
-        assert!(limiter.admit(&refresh_a, 100).is_err());
-        assert!(limiter.admit(&oidc_a, 100).is_err());
+        assert!(limiter.admit(client, &refresh_a, 100).is_err());
+        assert!(limiter.admit(client, &oidc_a, 100).is_err());
 
-        assert!(limiter.admit(&refresh_b, 100).is_ok());
-        assert!(limiter.admit(&oidc_b, 100).is_ok());
+        assert!(limiter.admit(client, &refresh_b, 100).is_ok());
+        assert!(limiter.admit(client, &oidc_b, 100).is_ok());
+    }
+
+    #[test]
+    fn forwarded_client_ip_is_trusted_only_through_configured_proxy_chain() {
+        let proxy: ipnet::IpNet = "10.0.0.0/8".parse().unwrap();
+        let trusted = [proxy];
+        let client: std::net::IpAddr = "198.51.100.10".parse().unwrap();
+        let direct: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+        let proxy_peer: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert_eq!(resolve_client_ip(direct, Some("203.0.113.1"), &trusted), direct);
+        assert_eq!(resolve_client_ip(proxy_peer, Some("198.51.100.10"), &trusted), client);
+        assert_eq!(
+            resolve_client_ip(proxy_peer, Some("198.51.100.10, 10.0.0.3"), &trusted),
+            client
+        );
+        assert_eq!(resolve_client_ip(proxy_peer, Some("not-an-ip"), &trusted), proxy_peer);
     }
 }
 
@@ -831,6 +939,7 @@ pub struct SharedState {
     http_max_body_bytes: u64,
     credentials: Arc<Mutex<CredentialStore>>,
     auth_attempts: Arc<Mutex<AuthAttemptLimiter>>,
+    trusted_proxy_cidrs: Vec<ipnet::IpNet>,
     oidc_states: Arc<Mutex<OidcStateStore>>,
     refresh_tokens: RefreshTokenStore,
     passkeys: Arc<Mutex<PasskeyRegistry>>,
@@ -2115,6 +2224,7 @@ impl SharedState {
         let passkeys = PasskeyRegistry::from_snapshot(auth_snapshot.passkeys)?;
         let audit_log = AuditLog::load(config.data_dir.join("audit.json"))?;
         let jwt = load_jwt_verifier()?;
+        let trusted_proxy_cidrs = load_trusted_proxy_cidrs()?;
         let archive = archive_target(&config.archive)?;
         let archive_replica = match config.archive_replica.clone() {
             Some(replica) => archive_target(&replica)?,
@@ -2229,6 +2339,7 @@ impl SharedState {
             http_max_body_bytes: config.http_max_body_bytes,
             credentials: Arc::new(Mutex::new(credentials)),
             auth_attempts: Arc::new(Mutex::new(AuthAttemptLimiter::default())),
+            trusted_proxy_cidrs,
             oidc_states: Arc::new(Mutex::new(OidcStateStore::default())),
             refresh_tokens,
             passkeys: Arc::new(Mutex::new(passkeys)),
@@ -2755,6 +2866,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_guard))
         .layer(axum::middleware::from_fn(cors_headers))
         .layer(axum::middleware::from_fn_with_state(state.clone(), record_http_status))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), attach_auth_client_ip))
         .with_state(state)
 }
 
@@ -3605,13 +3717,13 @@ pub async fn serve_http_with_listener(
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
     let limit = Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
     loop {
-        let (socket, _) =
+        let (socket, peer_addr) =
             listener.accept().await.map_err(|e| ryme_error::RymeError::Io(e.to_string()))?;
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
         let _ = socket.set_nodelay(true).map_err(|e| ryme_error::RymeError::Io(e.to_string()));
-        let app = app.clone();
+        let app = app.clone().layer(Extension(axum::extract::ConnectInfo(peer_addr)));
         tokio::spawn(async move {
             let _permit = permit;
             let io = TokioIo::new(socket);
@@ -3644,7 +3756,7 @@ pub async fn serve_https_with_listener(
     let limit = Arc::new(tokio::sync::Semaphore::new(max_connections.max(1)));
     let acceptor = acceptor.acceptor();
     loop {
-        let (socket, _) =
+        let (socket, peer_addr) =
             listener.accept().await.map_err(|e| ryme_error::RymeError::Io(e.to_string()))?;
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
@@ -3657,7 +3769,7 @@ pub async fn serve_https_with_listener(
             let Ok(tls) = acceptor.accept(socket).await else {
                 return;
             };
-            let app = router(service);
+            let app = router(service).layer(Extension(axum::extract::ConnectInfo(peer_addr)));
             let io = TokioIo::new(tls);
             let service = hyper_util::service::TowerToHyperService::new(app);
             let _ = ConnBuilder::new(TokioExecutor::new())
@@ -5847,13 +5959,17 @@ async fn auth_register(
     }
 }
 
-async fn auth_verify(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
+async fn auth_verify(
+    State(state): State<SharedState>,
+    Extension(client_ip): Extension<AuthClientIp>,
+    body: axum::body::Bytes,
+) -> Response {
     let request: AuthVerifyRequest = match json_body(&body) {
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
     let attempt_key = format!("password:{}", request.id);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
         return error_response(error);
     }
     let credentials = state.credentials.clone();
@@ -5864,7 +5980,7 @@ async fn auth_verify(State(state): State<SharedState>, body: axum::body::Bytes) 
     .await;
     match verified {
         Ok(Ok(principal)) => {
-            complete_auth_attempt(&state, &attempt_key);
+            complete_auth_attempt(&state, &attempt_key, client_ip.0);
             (StatusCode::OK, Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })))
                 .into_response()
         }
@@ -5882,7 +5998,11 @@ fn issue_api_key(
     Ok((key, principal.tenant.clone()))
 }
 
-async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
+async fn auth_token(
+    State(state): State<SharedState>,
+    Extension(client_ip): Extension<AuthClientIp>,
+    body: axum::body::Bytes,
+) -> Response {
     let request: AuthTokenRequest = match json_body(&body) {
         Ok(request) => request,
         Err(e) => return error_response(e),
@@ -5894,7 +6014,7 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     } else {
         format!("password:{}", request.id)
     };
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
         return error_response(error);
     }
     let credentials = state.credentials.clone();
@@ -5953,7 +6073,7 @@ async fn auth_token(State(state): State<SharedState>, body: axum::body::Bytes) -
     match issued {
         Ok(Ok((key, tenant, refresh_token))) => match state.persist_auth() {
             Ok(()) => {
-                complete_auth_attempt(&state, &attempt_key);
+                complete_auth_attempt(&state, &attempt_key, client_ip.0);
                 (
                     StatusCode::CREATED,
                     Json(serde_json::json!({
@@ -6047,13 +6167,17 @@ async fn otp_setup(
     }
 }
 
-async fn otp_verify(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
+async fn otp_verify(
+    State(state): State<SharedState>,
+    Extension(client_ip): Extension<AuthClientIp>,
+    body: axum::body::Bytes,
+) -> Response {
     let request: OtpVerifyRequest = match json_body(&body) {
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
     let attempt_key = format!("otp:{}", request.id);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
         return error_response(error);
     }
     let now = ryme_txn::now_unix();
@@ -6064,7 +6188,7 @@ async fn otp_verify(State(state): State<SharedState>, body: axum::body::Bytes) -
     match verified {
         Ok(principal) => match state.persist_auth() {
             Ok(()) => {
-                complete_auth_attempt(&state, &attempt_key);
+                complete_auth_attempt(&state, &attempt_key, client_ip.0);
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })),
@@ -6151,13 +6275,17 @@ async fn passkey_register(
     }
 }
 
-async fn passkey_verify(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
+async fn passkey_verify(
+    State(state): State<SharedState>,
+    Extension(client_ip): Extension<AuthClientIp>,
+    body: axum::body::Bytes,
+) -> Response {
     let request: PasskeyVerifyRequest = match json_body(&body) {
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
     let attempt_key = format!("passkey:{}", request.user);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
         return error_response(error);
     }
     if state.passkey_rp_id.is_empty() {
@@ -6224,7 +6352,7 @@ async fn passkey_verify(State(state): State<SharedState>, body: axum::body::Byte
         Ok(issued) => issued,
         Err(error) => return error_response(error),
     };
-    complete_auth_attempt(&state, &attempt_key);
+    complete_auth_attempt(&state, &attempt_key, client_ip.0);
     match state.persist_auth() {
         Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
             .into_response(),
@@ -6281,13 +6409,17 @@ async fn oidc_login(State(state): State<SharedState>, body: axum::body::Bytes) -
     }
 }
 
-async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
+async fn oidc_token(
+    State(state): State<SharedState>,
+    Extension(client_ip): Extension<AuthClientIp>,
+    body: axum::body::Bytes,
+) -> Response {
     let request: OidcTokenRequest = match json_body(&body) {
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
     let attempt_key = auth_attempt_key("oidc", &request.state);
-    if let Err(error) = admit_auth_attempt(&state, &attempt_key) {
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.0) {
         return error_response(error);
     }
     let Some(config) = state.oidc.clone() else {
@@ -6321,7 +6453,7 @@ async fn oidc_token(State(state): State<SharedState>, body: axum::body::Bytes) -
                 Ok(issued) => issued,
                 Err(error) => return error_response(error),
             };
-            complete_auth_attempt(&state, &attempt_key);
+            complete_auth_attempt(&state, &attempt_key, client_ip.0);
             match state.persist_auth() {
                 Ok(()) => {
                     (StatusCode::CREATED, Json(serde_json::json!({ "key": key, "tenant": tenant })))
@@ -12917,17 +13049,21 @@ fn validate_jwt_claim_configuration(
     Ok(())
 }
 
-fn admit_auth_attempt(state: &SharedState, identity: &str) -> ryme_error::Result<()> {
+fn admit_auth_attempt(
+    state: &SharedState,
+    identity: &str,
+    client_ip: std::net::IpAddr,
+) -> ryme_error::Result<()> {
     state
         .auth_attempts
         .lock()
         .map_err(|_| ryme_error::RymeError::Internal(String::from("auth rate limit lock")))?
-        .admit(identity, now_secs())
+        .admit(client_ip, identity, now_secs())
 }
 
-fn complete_auth_attempt(state: &SharedState, identity: &str) {
+fn complete_auth_attempt(state: &SharedState, identity: &str, client_ip: std::net::IpAddr) {
     if let Ok(mut limiter) = state.auth_attempts.lock() {
-        limiter.success(identity);
+        limiter.success(client_ip, identity);
     }
 }
 
