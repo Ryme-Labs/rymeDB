@@ -241,7 +241,7 @@ fn decode_decision(raw: &[u8]) -> Result<(u64, DecisionParts)> {
         return Err(corrupt());
     }
     let mut parts = Vec::with_capacity(count);
-    let mut offset = 13;
+    let mut offset: usize = 13;
     for _ in 0..count {
         let header_end = offset.checked_add(8).ok_or_else(corrupt)?;
         if header_end > raw.len() {
