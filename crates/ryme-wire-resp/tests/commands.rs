@@ -8,23 +8,7 @@ async fn command(addr: std::net::SocketAddr, parts: &[&str]) -> String {
         frame.push_str(&format!("${}\r\n{part}\r\n", part.len()));
     }
     socket.write_all(frame.as_bytes()).await.unwrap();
-    let mut raw = Vec::new();
-    let mut chunk = vec![0u8; 4096];
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let read = socket.read(&mut chunk).await.unwrap();
-            if read == 0 {
-                break;
-            }
-            raw.extend_from_slice(&chunk[..read]);
-            if raw.ends_with(b"\r\n") {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    String::from_utf8(raw).unwrap().trim().to_string()
+    read_reply(&mut socket).await.trim().to_string()
 }
 
 async fn command_on(socket: &mut tokio::net::TcpStream, parts: &[&str]) -> String {
@@ -38,20 +22,65 @@ async fn command_on(socket: &mut tokio::net::TcpStream, parts: &[&str]) -> Strin
 
 async fn read_reply(socket: &mut tokio::net::TcpStream) -> String {
     let mut raw = Vec::new();
-    let mut chunk = vec![0u8; 4096];
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let read = socket.read(&mut chunk).await.unwrap();
-            assert!(read > 0, "connection closed before reply");
-            raw.extend_from_slice(&chunk[..read]);
-            if raw.ends_with(b"\r\n") {
-                break;
-            }
-        }
+        read_resp_frame(socket, &mut raw).await;
     })
     .await
     .unwrap();
     String::from_utf8(raw).unwrap()
+}
+
+async fn read_resp_line(socket: &mut tokio::net::TcpStream, raw: &mut Vec<u8>) -> Vec<u8> {
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        socket.read_exact(&mut byte).await.unwrap();
+        raw.push(byte[0]);
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return line;
+        }
+    }
+}
+
+async fn read_resp_frame(socket: &mut tokio::net::TcpStream, raw: &mut Vec<u8>) {
+    let mut pending = vec![1usize];
+    while let Some(remaining) = pending.last_mut() {
+        if *remaining == 0 {
+            pending.pop();
+            continue;
+        }
+        *remaining -= 1;
+        let mut prefix = [0u8; 1];
+        socket.read_exact(&mut prefix).await.unwrap();
+        raw.push(prefix[0]);
+        let line = read_resp_line(socket, raw).await;
+        let children = match prefix[0] {
+            b'$' | b'!' | b'=' => {
+                let len = std::str::from_utf8(&line).unwrap().parse::<isize>().unwrap();
+                if len >= 0 {
+                    let mut body = vec![0; len as usize + 2];
+                    socket.read_exact(&mut body).await.unwrap();
+                    raw.extend_from_slice(&body);
+                }
+                0
+            }
+            b'*' | b'~' | b'>' | b'%' | b'|' => {
+                let count = std::str::from_utf8(&line).unwrap().parse::<isize>().unwrap().max(0);
+                let count = usize::try_from(count).unwrap_or(0);
+                if matches!(prefix[0], b'%' | b'|') {
+                    count.saturating_mul(2)
+                } else {
+                    count
+                }
+            }
+            _ => 0,
+        };
+        if children > 0 {
+            pending.push(children);
+        }
+    }
 }
 
 async fn serve() -> std::net::SocketAddr {
@@ -115,7 +144,7 @@ async fn counters_roundtrip() {
     assert_eq!(command(addr, &["INCRBY", "n"]).await.split_whitespace().next().unwrap(), "-ERR");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 12)]
 async fn concurrent_set_overwrites_do_not_expose_serialization_conflicts() {
     const CLIENTS: usize = 12;
     const WRITES_PER_CLIENT: usize = 40;
@@ -147,6 +176,54 @@ async fn concurrent_set_overwrites_do_not_expose_serialization_conflicts() {
     assert!(failures.is_empty(), "SET exposed internal transaction conflicts: {failures:?}");
     let value = command(addr, &["GET", "hot-key"]).await;
     assert!(value.starts_with('$'), "hot key missing after successful SETs: {value}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 12)]
+async fn concurrent_multi_increments_retry_conflicts_without_losing_updates() {
+    const CLIENTS: usize = 12;
+    const TRANSACTIONS_PER_CLIENT: usize = 20;
+
+    let addr = serve().await;
+    assert_eq!(command(addr, &["SET", "multi-count", "0"]).await, "+OK");
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(CLIENTS));
+    let mut clients = Vec::with_capacity(CLIENTS);
+    for _ in 0..CLIENTS {
+        let start = start.clone();
+        clients.push(tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            start.wait().await;
+            let mut failures = Vec::new();
+            for _ in 0..TRANSACTIONS_PER_CLIENT {
+                if command_on(&mut socket, &["MULTI"]).await != "+OK" {
+                    failures.push(String::from("MULTI failed"));
+                    continue;
+                }
+                if command_on(&mut socket, &["INCR", "multi-count"]).await != "+QUEUED" {
+                    failures.push(String::from("INCR was not queued"));
+                    continue;
+                }
+                let reply = command_on(&mut socket, &["EXEC"]).await;
+                if !reply.starts_with("*1\r\n:") {
+                    failures.push(reply);
+                }
+            }
+            failures
+        }));
+    }
+
+    let mut failures = Vec::new();
+    for client in clients {
+        failures.extend(client.await.unwrap());
+    }
+    assert!(failures.is_empty(), "EXEC exposed transaction conflicts: {failures:?}");
+    assert_eq!(
+        command(addr, &["GET", "multi-count"]).await,
+        format!(
+            "${}\r\n{}",
+            (CLIENTS * TRANSACTIONS_PER_CLIENT).to_string().len(),
+            CLIENTS * TRANSACTIONS_PER_CLIENT
+        )
+    );
 }
 
 #[tokio::test]

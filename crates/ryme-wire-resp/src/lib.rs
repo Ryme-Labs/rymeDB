@@ -1313,46 +1313,62 @@ where
                 if state.dirty {
                     return encode_exec_abort();
                 }
-                let mut txn = self.manager.begin();
-                let mut replies = Vec::with_capacity(state.queue.len());
                 let mut bytes = 0u64;
-                for queued in state.queue {
-                    bytes = bytes.saturating_add(Self::command_bytes(&queued));
-                    replies.push(self.dispatch_in(&mut txn, queued));
+                for queued in &state.queue {
+                    bytes = bytes.saturating_add(Self::command_bytes(queued));
                 }
-                if let Err(error) = txn.ensure_healthy() {
-                    self.record_timing("EXEC", start.elapsed().as_micros() as u64);
-                    return encode_error(error.to_string());
-                }
-                let write = !txn.writes().is_empty();
-                if let Some(denied) = self.readonly_deny(write) {
-                    self.record_timing("EXEC", start.elapsed().as_micros() as u64);
-                    return denied;
-                }
-                if let Some(denied) = self.admit(write, bytes) {
-                    self.record_timing("EXEC", start.elapsed().as_micros() as u64);
-                    return denied;
-                }
-                let pending = self.cdc_pending(&txn);
-                let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
-                    txn.writes().keys().cloned().collect()
-                } else {
-                    Vec::new()
-                };
-                match self.manager.commit(txn).await {
-                    Ok(commit_ts) => {
-                        for key in &range_keys {
-                            self.note_range_write(key);
-                        }
-                        self.cdc_emit(pending, commit_ts);
-                        self.observe(write);
-                        self.record_timing("EXEC", start.elapsed().as_micros() as u64);
-                        encode_raw_array(replies)
+                let retry_conflicts = state.queue.iter().all(retries_conflict_safely);
+                let mut retries = 0;
+                let mut admitted = false;
+                loop {
+                    let mut txn = self.manager.begin();
+                    let mut replies = Vec::with_capacity(state.queue.len());
+                    for queued in &state.queue {
+                        replies.push(self.dispatch_in(&mut txn, queued.clone()));
                     }
-                    Err(e) => {
-                        let reply = encode_error(e.to_string());
+                    if let Err(error) = txn.ensure_healthy() {
                         self.record_timing("EXEC", start.elapsed().as_micros() as u64);
-                        reply
+                        return encode_error(error.to_string());
+                    }
+                    let write = !txn.writes().is_empty();
+                    if !admitted {
+                        if let Some(denied) = self.readonly_deny(write) {
+                            self.record_timing("EXEC", start.elapsed().as_micros() as u64);
+                            return denied;
+                        }
+                        if let Some(denied) = self.admit(write, bytes) {
+                            self.record_timing("EXEC", start.elapsed().as_micros() as u64);
+                            return denied;
+                        }
+                        admitted = true;
+                    }
+                    let pending = self.cdc_pending(&txn);
+                    let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
+                        txn.writes().keys().cloned().collect()
+                    } else {
+                        Vec::new()
+                    };
+                    match self.manager.commit(txn).await {
+                        Ok(commit_ts) => {
+                            for key in &range_keys {
+                                self.note_range_write(key);
+                            }
+                            self.cdc_emit(pending, commit_ts);
+                            self.observe(write);
+                            self.record_timing("EXEC", start.elapsed().as_micros() as u64);
+                            return encode_raw_array(replies);
+                        }
+                        Err(RymeError::Conflict(_))
+                            if retry_conflicts && retries < MAX_COMMAND_CONFLICT_RETRIES =>
+                        {
+                            retries += 1;
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => {
+                            let reply = encode_error(error.to_string());
+                            self.record_timing("EXEC", start.elapsed().as_micros() as u64);
+                            return reply;
+                        }
                     }
                 }
             }
@@ -1587,7 +1603,7 @@ where
             self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
             return reply;
         }
-        let retry_conflicts = !matches!(command.name.as_str(), "EVAL" | "EVALSHA");
+        let retry_conflicts = retries_conflict_safely(&command);
         let mut retries = 0;
         let mut admitted = false;
         loop {
@@ -5109,6 +5125,10 @@ fn parse_set_options(args: &[Vec<u8>]) -> std::result::Result<SetOptions, String
 struct RespCommand {
     name: String,
     args: Vec<Vec<u8>>,
+}
+
+fn retries_conflict_safely(command: &RespCommand) -> bool {
+    !matches!(command.name.as_str(), "EVAL" | "EVALSHA" | "PUBLISH")
 }
 
 #[derive(Debug)]
