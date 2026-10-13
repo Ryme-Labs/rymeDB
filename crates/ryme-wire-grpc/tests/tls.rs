@@ -47,7 +47,8 @@ async fn grpc_tls_handshake_and_roundtrip() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let acceptor = ryme_tls::TlsAcceptor::from_pem_files(
         &fixture("grpc-localhost-cert.pem"),
         &fixture("grpc-localhost-key.pem"),

@@ -1818,7 +1818,7 @@ impl SharedState {
             let reader = RemoteReader::new(move |key| {
                 let node = single_node.clone();
                 async move {
-                    let Some(owner) = node.range_owner_key(key) else {
+                    let Some(owner) = node.range_owner_key(&key) else {
                         return Ok(RemoteRead::Local);
                     };
                     if owner == node.node_id() {
@@ -8380,10 +8380,10 @@ async fn filter_vector_hits(
     let gateway = branch_gateway(state, headers, &principal.tenant)?;
     let mut visible = Vec::with_capacity(hits.len());
     for hit in hits {
-        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await?
-            && executor.row_allowed_by_rls(table, &value)
-        {
-            visible.push(hit);
+        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await? {
+            if executor.row_allowed_by_rls(table, &value) {
+                visible.push(hit);
+            }
         }
     }
     Ok(visible)
@@ -8403,10 +8403,10 @@ async fn filter_text_hits(
     let gateway = branch_gateway(state, headers, &principal.tenant)?;
     let mut visible = Vec::with_capacity(hits.len());
     for hit in hits {
-        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await?
-            && executor.row_allowed_by_rls(table, &value)
-        {
-            visible.push(hit);
+        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await? {
+            if executor.row_allowed_by_rls(table, &value) {
+                visible.push(hit);
+            }
         }
     }
     Ok(visible)
@@ -9261,7 +9261,7 @@ async fn branch_create(
         Ok(commit) => commit,
         Err(error) => return error_response(error),
     };
-    let mut control = match state.control.lock() {
+    let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
@@ -9355,7 +9355,7 @@ async fn branch_delete(
         return error_response(ryme_error::RymeError::Forbidden);
     }
     let _migration_guard = state.migration_lock.lock().await;
-    let mut control = match state.control.lock() {
+    let control = match state.control.lock() {
         Ok(guard) => guard,
         Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
     };
@@ -9553,7 +9553,7 @@ async fn branch_promote(
         Err(e) => return error_response(e),
     };
     let (old_branches, new_branches, old_main_ledger, new_main_ledger) = {
-        let mut control = match state.control.lock() {
+        let control = match state.control.lock() {
             Ok(guard) => guard,
             Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
         };

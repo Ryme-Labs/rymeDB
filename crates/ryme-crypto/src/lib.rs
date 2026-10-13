@@ -18,7 +18,7 @@ pub struct Envelope {
     pub tag_b64: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KeyRing {
     keys: HashMap<String, Vec<Dek>>,
     counter: u64,

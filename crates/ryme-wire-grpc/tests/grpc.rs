@@ -25,7 +25,8 @@ async fn serve() -> (std::net::SocketAddr, GrpcGateway) {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let grpc = GrpcGateway::with_gateway(gateway, keys);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -172,7 +173,8 @@ async fn grpc_sql_uses_configured_rls_executor() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let grpc = GrpcGateway::with_gateway(gateway, keys).with_sql_executor(executor);
     let response = grpc
         .sql(authed(proto::SqlRequest { sql: String::from("SELECT * FROM docs") }, "k"))
@@ -198,7 +200,8 @@ async fn grpc_limited_roundtrip() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let grpc = GrpcGateway::with_gateway(gateway, keys);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -276,7 +279,8 @@ async fn grpc_read_only_rejects_sql_writes() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let grpc = GrpcGateway::with_gateway(inner, keys);
     let reply = grpc
         .sql(authed(
@@ -313,7 +317,8 @@ async fn grpc_egress_throttles_responses() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let qos = Arc::new(Mutex::new(ryme_qos::QosRegistry::new()));
     {
         let mut registry = qos.lock().unwrap();
@@ -376,7 +381,8 @@ async fn grpc_traceparent_links_spans() {
     keys.insert(
         String::from("k"),
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
-    );
+    )
+    .unwrap();
     let traces = std::sync::Arc::new(std::sync::Mutex::new(ryme_observe::TraceCollector::new(16)));
     let grpc = GrpcGateway::with_gateway(gateway, keys).with_traces(traces.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

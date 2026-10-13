@@ -79,16 +79,14 @@ fn limited_incoming(
     let permits = Arc::new(Semaphore::new(max_connections.max(1)));
     tokio_stream::wrappers::TcpListenerStream::new(listener).filter_map(move |result| {
         let permits = permits.clone();
-        async move {
-            let stream = match result {
-                Ok(stream) => stream,
-                Err(error) => return Some(Err(error)),
-            };
-            let Ok(permit) = permits.try_acquire_owned() else {
-                return None;
-            };
-            Some(Ok(LimitedTcpStream { stream, _permit: permit }))
-        }
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(error) => return Some(Err(error)),
+        };
+        let Ok(permit) = permits.try_acquire_owned() else {
+            return None;
+        };
+        Some(Ok(LimitedTcpStream { stream, _permit: permit }))
     })
 }
 
@@ -467,7 +465,7 @@ where
                 &principal.tenant,
                 self.gateway.database_name(),
                 &inner.table,
-                inner.pk.as_bytes(),
+                inner.pk.as_slice(),
                 1,
             );
         }
@@ -497,7 +495,7 @@ where
                 &principal.tenant,
                 self.gateway.database_name(),
                 &inner.table,
-                inner.pk.as_bytes(),
+                inner.pk.as_slice(),
                 1,
             );
         }
