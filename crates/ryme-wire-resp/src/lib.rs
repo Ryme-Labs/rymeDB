@@ -1045,7 +1045,8 @@ where
                 Some(_) => match txn.observed_existed(key) {
                     Some(true) => Operation::Update,
                     Some(false) => Operation::Insert,
-                    None => Operation::Update,
+                    None if before.is_some() => Operation::Update,
+                    None => Operation::Insert,
                 },
             };
             out.push((key.clone(), op, before, staged.value.clone()));
@@ -4830,7 +4831,7 @@ where
         let mut names: Vec<&String> = data.groups.keys().collect();
         names.sort();
         let mut out = format!(
-            "*{}\r\n$6\r\nlength\r\n:{}\r\n$15\r\nradix-tree-keys\r\n:{}\r\n$16\r\nradix-tree-nodes\r\n:0\r\n$17\r\nlast-generated-id\r\n${}\r\n{last_id}\r\n$20\r\nmax-deleted-entry-id\r\n${}\r\n{}\r\n$13\r\nentries-added\r\n:{}\r\n$23\r\nrecorded-first-entry-id\r\n${}\r\n{first_id}\r\n$6\r\ngroups\r\n",
+            "*{}\r\n$6\r\nlength\r\n:{}\r\n$15\r\nradix-tree-keys\r\n:{}\r\n$16\r\nradix-tree-nodes\r\n:0\r\n$17\r\nlast-generated-id\r\n${}\r\n{last_id}\r\n$20\r\nmax-deleted-entry-id\r\n${}\r\n{}\r\n$13\r\nentries-added\r\n:{}\r\n$23\r\nrecorded-first-entry-id\r\n${}\r\n{first_id}\r\n",
             if full { 18 } else { 20 },
             data.entries.len(),
             data.entries.len(),
@@ -4858,6 +4859,7 @@ where
                 ));
             }
         } else {
+            out.extend_from_slice(b"$6\r\ngroups\r\n");
             out.extend_from_slice(format!(":{}\r\n", names.len()).as_bytes());
             out.extend_from_slice(b"$11\r\nfirst-entry\r\n");
             match data.entries.first() {
