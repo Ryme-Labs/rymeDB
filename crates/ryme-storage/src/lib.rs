@@ -46,12 +46,14 @@ pub fn routing_key(
     pk: &[u8],
 ) -> Result<Vec<u8>> {
     validate_routing_version(version)?;
-    let scoped_components = if version == SCOPED_ROUTING_VERSION {
-        [tenant, database, table].as_slice()
+    let has_invalid_component = if version == SCOPED_ROUTING_VERSION {
+        tenant.as_bytes().contains(&0)
+            || database.as_bytes().contains(&0)
+            || table.as_bytes().contains(&0)
     } else {
-        [table].as_slice()
+        table.as_bytes().contains(&0)
     };
-    if scoped_components.iter().any(|component| component.as_bytes().contains(&0)) {
+    if has_invalid_component {
         return Err(RymeError::InvalidArgument(String::from("routing component")));
     }
     let mut out = Vec::with_capacity(
