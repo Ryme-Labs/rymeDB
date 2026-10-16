@@ -799,6 +799,20 @@ fn auth_client_ip(
     AuthClientIp { address, allow_loopback_bootstrap }
 }
 
+fn auth_client_ip_from_peer(
+    peer: Option<std::net::IpAddr>,
+    forwarded_for: Option<&str>,
+    trusted: &[ipnet::IpNet],
+) -> AuthClientIp {
+    match peer {
+        Some(peer) => auth_client_ip(peer, forwarded_for, trusted),
+        None => AuthClientIp {
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            allow_loopback_bootstrap: false,
+        },
+    }
+}
+
 async fn attach_auth_client_ip(
     State(state): State<SharedState>,
     mut request: axum::http::Request<axum::body::Body>,
@@ -807,11 +821,10 @@ async fn attach_auth_client_ip(
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|info| info.0.ip())
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .map(|info| info.0.ip());
     let forwarded_for =
         request.headers().get("x-forwarded-for").and_then(|value| value.to_str().ok());
-    let client_ip = auth_client_ip(peer, forwarded_for, &state.trusted_proxy_cidrs);
+    let client_ip = auth_client_ip_from_peer(peer, forwarded_for, &state.trusted_proxy_cidrs);
     request.extensions_mut().insert(client_ip);
     next.run(request).await
 }
@@ -968,6 +981,10 @@ mod auth_attempt_limiter_tests {
         );
         assert!(
             !auth_client_ip(loopback, Some("not-an-ip"), &trusted_loopback).allow_loopback_bootstrap
+        );
+        assert!(
+            !auth_client_ip_from_peer(None, Some("127.0.0.1"), &trusted_loopback)
+                .allow_loopback_bootstrap
         );
     }
 }
@@ -2964,6 +2981,10 @@ fn can_manage_user_for_tenant(
     principal.can_admin() && user_tenant == Some(principal.tenant.as_str())
 }
 
+/// Creates the HTTP API router.
+///
+/// Servers embedding this router should provide `ConnectInfo<SocketAddr>` on
+/// each request. Without peer metadata, loopback-only bootstrap is disabled.
 pub fn router(state: SharedState) -> axum::Router {
     let body_limit = usize::try_from(state.http_max_body_bytes).unwrap_or(usize::MAX);
     axum::Router::new()
