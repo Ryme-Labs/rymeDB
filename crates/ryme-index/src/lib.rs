@@ -150,14 +150,12 @@ impl HnswIndex {
         if self.id_to_pos.contains_key(&id) {
             self.remove(&id);
         }
-        self.insert_new(id, vector)?;
-        if self.tombstones >= 64 && self.tombstones >= self.id_to_pos.len() {
-            self.rebuild()?;
-        }
+        self.insert_new(id, vector);
+        self.compact_if_needed();
         Ok(())
     }
 
-    fn insert_new(&mut self, id: String, vector: Vec<f32>) -> Result<()> {
+    fn insert_new(&mut self, id: String, vector: Vec<f32>) {
         let level = self.sample_level();
         let pos = self.nodes.len();
         self.nodes.push(HnswNode {
@@ -169,7 +167,7 @@ impl HnswIndex {
         self.id_to_pos.insert(id, pos);
         let Some(entry) = self.entry else {
             self.entry = Some(pos);
-            return Ok(());
+            return;
         };
         let query = self.nodes[pos].vector.clone();
         let mut current = entry;
@@ -193,10 +191,16 @@ impl HnswIndex {
         if level > entry_level {
             self.entry = Some(pos);
         }
-        Ok(())
     }
 
-    fn rebuild(&mut self) -> Result<()> {
+    fn compact_if_needed(&mut self) {
+        if self.tombstones < 64 || self.tombstones < self.id_to_pos.len() {
+            return;
+        }
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
         let active: Vec<(String, Vec<f32>)> = self
             .nodes
             .iter()
@@ -208,9 +212,8 @@ impl HnswIndex {
         *self = Self::default();
         self.dim = dim;
         for (id, vector) in active {
-            self.insert_new(id, vector)?;
+            self.insert_new(id, vector);
         }
-        Ok(())
     }
 
     fn greedy(&self, query: &[f32], start: usize, layer: usize) -> usize {
@@ -332,6 +335,7 @@ impl HnswIndex {
                 node.tombstoned = true;
                 self.tombstones += 1;
             }
+            self.compact_if_needed();
             true
         } else {
             false
@@ -1025,6 +1029,26 @@ mod tests {
         let ann = &registry.vectors["s"].ann;
         assert!(ann.nodes.len() <= ann.id_to_pos.len() + 63);
         assert!(ann.nodes.iter().filter(|node| node.tombstoned).count() < 64);
+
+        let mut delete_heavy = IndexRegistry::new();
+        for index in 0..200 {
+            let angle = index as f32 * std::f32::consts::TAU / 200.0;
+            delete_heavy
+                .vector_upsert("s", format!("v{index}"), vec![angle.cos(), angle.sin()])
+                .unwrap();
+        }
+        for index in 0..180 {
+            assert!(delete_heavy.vector_remove("s", &format!("v{index}")));
+        }
+        let query = [
+            (199.0f32 * std::f32::consts::TAU / 200.0).cos(),
+            (199.0f32 * std::f32::consts::TAU / 200.0).sin(),
+        ];
+        let exact = delete_heavy.vector_search("s", &query, 1).unwrap();
+        let approximate = delete_heavy.ann_search("s", &query, 1, 256).unwrap();
+        assert_eq!(approximate[0].id, exact[0].id);
+        let ann = &delete_heavy.vectors["s"].ann;
+        assert!(ann.nodes.len() <= ann.id_to_pos.len() + 63);
     }
 
     #[test]
