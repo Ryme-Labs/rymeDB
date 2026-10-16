@@ -11018,9 +11018,11 @@ where
 
     fn apply_index_changes(&self, changes: &[TransactionChange], commit_ts: u64) {
         let Ok(mut indexes) = self.indexes.lock() else { return };
-        let changed_tables =
-            changes.iter().map(|change| change.table.as_str()).collect::<HashSet<_>>();
-        for table in changed_tables {
+        let mut changes_by_table: HashMap<&str, Vec<&TransactionChange>> = HashMap::new();
+        for change in changes {
+            changes_by_table.entry(change.table.as_str()).or_default().push(change);
+        }
+        for (table, table_changes) in changes_by_table {
             let Some(table_indexes) = indexes.get_mut(table) else { continue };
             for state in table_indexes {
                 if !state.valid {
@@ -11031,7 +11033,7 @@ where
                     continue;
                 }
                 if let Some(tenant_entries) = state.entries.get_mut(&self.tenant) {
-                    for change in changes.iter().filter(|change| change.table == table) {
+                    for change in &table_changes {
                         let previous_pk = change.previous_pk.as_deref().unwrap_or(&change.pk);
                         if let Some(before) = change.before.as_ref() {
                             if let Some(indexed) =
