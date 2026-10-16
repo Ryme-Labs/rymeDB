@@ -1111,10 +1111,7 @@ impl PasskeyRegistry {
             authenticator_data[35],
             authenticator_data[36],
         ]);
-        if presented_count != 0
-            && credential.sign_count != 0
-            && presented_count <= credential.sign_count
-        {
+        if credential.sign_count != 0 && presented_count <= credential.sign_count {
             return Err(RymeError::Unauthorized);
         }
         let client_data: serde_json::Value =
@@ -2212,6 +2209,67 @@ mod tests {
         let replay_sig: p256::ecdsa::Signature = secret.sign(&replay_signed);
         let replay_sig = replay_sig.to_der().as_bytes().to_vec();
         assert!(attempt(&mut registry, &auth_data, replay_client.as_bytes(), &replay_sig).is_err());
+    }
+
+    #[test]
+    fn passkey_counter_rejects_zero_after_nonzero() {
+        use p256::ecdsa::signature::Signer;
+        use sha2::{Digest, Sha256};
+
+        let secret = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let public = secret.verifying_key().to_sec1_point(false).as_bytes().to_vec();
+        let rp = "auth.test";
+        let origins = vec![String::from("https://auth.test")];
+        let mut registry = PasskeyRegistry::new();
+        registry.register("ada", String::from("cred-counter"), &public).unwrap();
+
+        let signed_assertion = |challenge: &str, count: u32| {
+            let client_data = format!(
+                "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"https://auth.test\"}}"
+            );
+            let mut rp_hasher = Sha256::new();
+            rp_hasher.update(rp.as_bytes());
+            let mut authenticator_data = rp_hasher.finalize().to_vec();
+            authenticator_data.push(0x01);
+            authenticator_data.extend_from_slice(&count.to_be_bytes());
+            let mut client_hasher = Sha256::new();
+            client_hasher.update(client_data.as_bytes());
+            let mut signed = authenticator_data.clone();
+            signed.extend_from_slice(&client_hasher.finalize());
+            let signature: p256::ecdsa::Signature = secret.sign(&signed);
+            (authenticator_data, client_data, signature.to_der().as_bytes().to_vec())
+        };
+
+        let first_challenge = registry.challenge_at("ada", 1000).unwrap();
+        let (auth_data, client_data, signature) = signed_assertion(&first_challenge, 1);
+        registry
+            .verify_assertion(&PasskeyAssertion {
+                user: "ada",
+                credential_id: "cred-counter",
+                authenticator_data: &auth_data,
+                client_data_json: client_data.as_bytes(),
+                signature_der: &signature,
+                rp_id: rp,
+                origins: &origins,
+                now_secs: 1000,
+            })
+            .unwrap();
+
+        let second_challenge = registry.challenge_at("ada", 1001).unwrap();
+        let (auth_data, client_data, signature) = signed_assertion(&second_challenge, 0);
+        assert!(matches!(
+            registry.verify_assertion(&PasskeyAssertion {
+                user: "ada",
+                credential_id: "cred-counter",
+                authenticator_data: &auth_data,
+                client_data_json: client_data.as_bytes(),
+                signature_der: &signature,
+                rp_id: rp,
+                origins: &origins,
+                now_secs: 1001,
+            }),
+            Err(RymeError::Unauthorized)
+        ));
     }
 
     #[test]
