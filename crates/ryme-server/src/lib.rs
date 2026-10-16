@@ -4,7 +4,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Json;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use ryme_archive::{Archiver, BackupManifest};
 use ryme_auth::{
     ApiKeyStore, CredentialStore, JwtVerifier, OidcConfig, PasskeyRegistry, PolicyEngine,
@@ -12117,6 +12117,7 @@ fn stream_realtime_egress(qos: &Arc<Mutex<QosRegistry>>, tenant: &str, bytes: u6
 
 const REALTIME_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REALTIME_OUTGOING_QUEUE_CAPACITY: usize = 256;
+const REALTIME_WRITE_BATCH_MAX: usize = 64;
 
 type RealtimeSink =
     futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
@@ -12128,7 +12129,7 @@ fn start_realtime_writer(sender: RealtimeSink) -> RealtimeOutgoing {
     tokio::spawn(async move {
         let mut sender = sender;
         while let Some(message) = queue.recv().await {
-            if !send_realtime_message_with_sink(&mut sender, message).await {
+            if !send_realtime_batch_with_sink(&mut sender, &mut queue, message).await {
                 break;
             }
         }
@@ -12184,14 +12185,27 @@ fn queue_cursor_ahead(
     queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
 }
 
-async fn send_realtime_message_with_sink(
-    sender: &mut RealtimeSink,
-    message: axum::extract::ws::Message,
-) -> bool {
-    tokio::time::timeout(REALTIME_SEND_TIMEOUT, sender.send(message))
-        .await
-        .map(|result| result.is_ok())
-        .unwrap_or(false)
+async fn send_realtime_batch_with_sink<S>(
+    sender: &mut S,
+    queue: &mut tokio::sync::mpsc::Receiver<axum::extract::ws::Message>,
+    first: axum::extract::ws::Message,
+) -> bool
+where
+    S: Sink<axum::extract::ws::Message> + Unpin,
+{
+    tokio::time::timeout(REALTIME_SEND_TIMEOUT, async {
+        sender.feed(first).await?;
+        let mut sent = 1;
+        while sent < REALTIME_WRITE_BATCH_MAX {
+            let Ok(message) = queue.try_recv() else { break };
+            sender.feed(message).await?;
+            sent += 1;
+        }
+        sender.flush().await
+    })
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13975,6 +13989,46 @@ fn archive_target(
 mod realtime_policy_tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct RecordingRealtimeSink {
+        messages: Arc<Mutex<Vec<axum::extract::ws::Message>>>,
+        flushes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Sink<axum::extract::ws::Message> for RecordingRealtimeSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            message: axum::extract::ws::Message,
+        ) -> Result<(), Self::Error> {
+            self.get_mut().messages.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.flushes.fetch_add(1, AtomicOrdering::Relaxed);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn legacy_user_keys_expire_on_upgrade_but_configured_key_stays_active() {
         let legacy_store = ApiKeyStore::new();
@@ -14674,6 +14728,47 @@ mod realtime_policy_tests {
         tokio::task::yield_now().await;
         assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));
         assert!(pending.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn realtime_writer_batches_flushes_without_reordering_or_dropping() {
+        let (outgoing, mut queue) = tokio::sync::mpsc::channel(100);
+        for index in 0..70 {
+            outgoing
+                .send(axum::extract::ws::Message::Text(index.to_string()))
+                .await
+                .unwrap();
+        }
+        drop(outgoing);
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink = RecordingRealtimeSink {
+            messages: Arc::clone(&messages),
+            flushes: Arc::clone(&flushes),
+        };
+
+        let first = queue.recv().await.unwrap();
+        assert!(send_realtime_batch_with_sink(&mut sink, &mut queue, first).await);
+        assert_eq!(messages.lock().unwrap().len(), REALTIME_WRITE_BATCH_MAX);
+        assert_eq!(flushes.load(AtomicOrdering::Relaxed), 1);
+
+        let first = queue.recv().await.unwrap();
+        assert!(send_realtime_batch_with_sink(&mut sink, &mut queue, first).await);
+        assert_eq!(messages.lock().unwrap().len(), 70);
+        assert_eq!(flushes.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|message| match message {
+                    axum::extract::ws::Message::Text(text) => text.parse::<usize>().unwrap(),
+                    _ => panic!("expected text message"),
+                })
+                .collect::<Vec<_>>(),
+            (0..70).collect::<Vec<_>>()
+        );
     }
 
     #[test]
