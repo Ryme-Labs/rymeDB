@@ -1,0 +1,54 @@
+{
+  "benchmark": "resp-mget-local-standard-8clients",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "server": {
+    "storage_mode": "standard",
+    "durability": "memory",
+    "segment_cache_bytes": 67108864,
+    "listener": "loopback",
+    "qos_tier": "dedicated_cluster",
+    "dataset_keys": 16,
+    "value_bytes": 16
+  },
+  "workload": {
+    "command": "MGET",
+    "keys_per_command": 16,
+    "keyspace": 16,
+    "commands_per_capture": 16000,
+    "concurrency": 8,
+    "pipeline": 1
+  },
+  "notes": "Two sequential local captures against an isolated temporary server. Each MGET reads the 16 seeded keys; the segment cache is warm. Client command encoding and full RESP reply parsing are included. Memory durability and localhost only; not cold disk, production deployment, or cross-database comparison.",
+  "captures": [
+    {
+      "qps": 63633,
+      "p50_us": 112,
+      "p90_us": 196,
+      "p95_us": 230,
+      "p99_us": 308,
+      "p999_us": 551,
+      "max_us": 1045,
+      "mean_us": 123,
+      "successful_ops": 16000,
+      "errors": 0
+    },
+    {
+      "qps": 64018,
+      "p50_us": 111,
+      "p90_us": 196,
+      "p95_us": 234,
+      "p99_us": 328,
+      "p999_us": 617,
+      "max_us": 802,
+      "mean_us": 123,
+      "successful_ops": 16000,
+      "errors": 0
+    }
+  ]
+}

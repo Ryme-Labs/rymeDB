@@ -34,6 +34,13 @@ segment cache warmed during the run. This includes client encoding and reply
 parsing, but is not a cold-disk or production deployment result; see the
 [raw captures](../bench/results/resp-mget-standard-local.json).
 
+An eight-client Standard-mode capture on the same host used a dedicated-cluster
+QoS tier, 16 seeded 16-byte values, and 16,000 16-key MGET commands per capture.
+Two sequential runs measured 63.6k–64.0k commands/s, p50 at 111–112 µs, and
+p99 at 308–328 µs, with zero errors. This remains a localhost, memory-durability
+smoke benchmark, not a production or cross-database comparison; see the
+[raw captures](../bench/results/resp-mget-standard-8clients.json).
+
 To isolate the in-memory transaction core from networking and WAL durability:
 
 ```bash
