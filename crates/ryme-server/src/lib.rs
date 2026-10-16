@@ -3059,14 +3059,52 @@ async fn cors_options(headers: HeaderMap) -> Response {
 
 async fn cors_headers(request: axum::http::Request<axum::body::Body>, next: Next) -> Response {
     let origin = request.headers().get("origin").cloned();
+    let path = request.uri().path().to_owned();
     if request.method() == axum::http::Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
         apply_cors_headers(&mut response, origin.as_ref());
+        apply_api_cache_headers(&mut response, &path);
         return response;
     }
     let mut response = next.run(request).await;
     apply_cors_headers(&mut response, origin.as_ref());
+    apply_api_cache_headers(&mut response, &path);
     response
+}
+
+fn apply_api_cache_headers(response: &mut Response, path: &str) {
+    let is_api = path == "/v1"
+        || path.starts_with("/v1/")
+        || path == "/rest/v1"
+        || path.starts_with("/rest/v1/")
+        || path == "/graphql";
+    if is_api {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+}
+
+#[cfg(test)]
+mod api_cache_header_tests {
+    use super::*;
+
+    #[test]
+    fn api_responses_are_not_cacheable_but_dashboard_assets_are() {
+        for path in ["/v1/auth/token", "/v1/kv/messages/a", "/rest/v1/messages", "/graphql"] {
+            let mut response = StatusCode::OK.into_response();
+            apply_api_cache_headers(&mut response, path);
+            assert_eq!(
+                response.headers().get(axum::http::header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store")),
+                "{path}"
+            );
+        }
+
+        let mut dashboard = StatusCode::OK.into_response();
+        apply_api_cache_headers(&mut dashboard, "/dashboard/");
+        assert!(!dashboard.headers().contains_key(axum::http::header::CACHE_CONTROL));
+    }
 }
 
 fn apply_cors_headers(response: &mut Response, origin: Option<&HeaderValue>) {

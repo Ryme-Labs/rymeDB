@@ -23,6 +23,10 @@ curl -H "Authorization: Bearer $RYME_API_KEY" https://db.example.com/ready
 curl -H "x-api-key: $RYME_API_KEY" https://db.example.com/v1/scan/messages
 ```
 
+HTTP database API responses use `Cache-Control: no-store`, including login
+responses and returned application data. This limits accidental cache
+retention; it does not hide browser credentials from DevTools.
+
 Browser WebSocket clients can use `?api_key=` because the browser WebSocket
 constructor cannot attach arbitrary headers:
 
