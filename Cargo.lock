@@ -1820,6 +1820,7 @@ dependencies = [
  "ryme-error",
  "ryme-index",
  "ryme-shard",
+ "ryme-sql",
  "ryme-storage",
  "ryme-txn",
  "serde",

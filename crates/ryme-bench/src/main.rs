@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use ryme_index::PartitionedIndex;
 use ryme_shard::{ShardSet, TableRef};
+use ryme_sql::{parse, Executor, QueryResult};
 use ryme_storage::{Engine, ImmutableSegment, RecordKey, SegmentEntry, SegmentStore, StorageMode};
 use ryme_txn::{DurableManager, SyncPolicy, Transaction, TxnBackend, TxnManager};
 use serde::Deserialize;
@@ -166,6 +167,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    SqlLocal {
+        #[arg(long, default_value_t = 1000)]
+        rows: usize,
+        #[arg(long, default_value_t = 1000)]
+        ops: usize,
+        #[arg(long)]
+        json: bool,
+    },
     TxnReadBatch {
         #[arg(long, default_value_t = 10000)]
         records: usize,
@@ -321,6 +330,7 @@ async fn main() {
             })
             .await;
         }
+        Some(Command::SqlLocal { rows, ops, json }) => sql_local_bench(rows, ops, json).await,
         Some(Command::TxnReadBatch {
             records,
             candidates,
@@ -2452,6 +2462,112 @@ async fn sql_bench(config: SqlBench) {
             percentile(50.0),
             percentile(99.0),
             samples.last().copied().unwrap_or(0),
+        );
+    }
+}
+
+async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
+    if rows == 0 || rows > 50_000 || ops == 0 || ops > 1_000_000 {
+        eprintln!("rows must be 1..=50000 and ops must be 1..=1000000");
+        return;
+    }
+
+    let executor = Executor::new(String::from("bench"), String::from("bench"));
+    let setup = async {
+        executor
+            .execute(parse(
+                "CREATE TABLE bench_rows (id TEXT PRIMARY KEY, tenant TEXT, state TEXT, seq INTEGER)",
+            )?)
+            .await?;
+        for start in (0..rows).step_by(64) {
+            let values = (start..rows.min(start + 64))
+                .map(|row| {
+                    let tenant = if row % 8 == 0 { "tenant-0001" } else { "tenant-other" };
+                    let state = if row % 2 == 0 { "active" } else { "idle" };
+                    format!("('row-{row}', '{tenant}', '{state}', {row})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement = format!(
+                "INSERT INTO bench_rows (id, tenant, state, seq) VALUES {values}"
+            );
+            executor.execute(parse(&statement)?).await?;
+        }
+        Ok::<(), ryme_error::RymeError>(())
+    }
+    .await;
+    if let Err(error) = setup {
+        eprintln!("could not prepare in-process SQL benchmark: {error}");
+        return;
+    }
+
+    let statement = match parse(
+        "SELECT id, state FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT 100",
+    ) {
+        Ok(statement) => statement,
+        Err(error) => {
+            eprintln!("could not parse in-process SQL benchmark query: {error}");
+            return;
+        }
+    };
+    let expected_rows = rows.div_ceil(8).min(100);
+    let warmup_ops = ops.min(100);
+    for _ in 0..warmup_ops {
+        if !matches!(executor.execute(statement.clone()).await, Ok(QueryResult::Table { ref rows, .. }) if rows.len() == expected_rows)
+        {
+            eprintln!("in-process SQL benchmark returned an unexpected result");
+            return;
+        }
+    }
+
+    let mut samples_ns = Vec::with_capacity(ops);
+    let started = Instant::now();
+    for _ in 0..ops {
+        let operation_started = Instant::now();
+        match executor.execute(statement.clone()).await {
+            Ok(QueryResult::Table { rows, .. }) if rows.len() == expected_rows => {}
+            Ok(_) => {
+                eprintln!("in-process SQL benchmark returned an unexpected result");
+                return;
+            }
+            Err(error) => {
+                eprintln!("in-process SQL benchmark query failed: {error}");
+                return;
+            }
+        }
+        samples_ns.push(operation_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+    }
+    let seconds = started.elapsed().as_secs_f64().max(0.000001);
+    samples_ns.sort_unstable();
+    let percentile = |p: usize| -> u64 {
+        samples_ns[((samples_ns.len() - 1) * p / 100).min(samples_ns.len() - 1)]
+    };
+    let output = serde_json::json!({
+        "execution": "in-process",
+        "protocol": "ryme-sql-executor",
+        "workload": "filtered-projection-three-predicates",
+        "rows": rows,
+        "result_rows": expected_rows,
+        "warmup_ops": warmup_ops,
+        "ops": ops,
+        "seconds": (seconds * 1000.0).round() / 1000.0,
+        "qps": (ops as f64 / seconds).round() as u64,
+        "p50_ns": percentile(50),
+        "p95_ns": percentile(95),
+        "p99_ns": percentile(99),
+        "max_ns": samples_ns.last().copied().unwrap_or(0),
+        "machine": machine_metadata(),
+    });
+    if json {
+        println!("{output}");
+    } else {
+        println!(
+            "execution=in-process workload=filtered-projection-three-predicates rows={rows} result_rows={expected_rows} ops={ops} qps={:.0} p50={}ns p95={}ns p99={}ns max={}ns",
+            ops as f64 / seconds,
+            percentile(50),
+            percentile(95),
+            percentile(99),
+            samples_ns.last().copied().unwrap_or(0),
         );
     }
 }

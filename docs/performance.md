@@ -63,6 +63,21 @@ under optimistic concurrency control. Use a single worker when measuring
 overwrite cost without concurrent conflicts. This is a core microbenchmark, not
 an end-to-end database comparison.
 
+To benchmark the SQL executor in-process without PostgreSQL-wire or network
+overhead:
+
+```bash
+cargo run --locked --release -j 1 -p ryme-bench -- sql-local \
+  --rows 1000 --ops 1000 --json
+```
+
+The command seeds a bounded in-memory table outside the timed interval, warms
+the query, then measures a filtered projection with three predicates. It checks
+the result row count on every operation and reports p50/p95/p99 latency and
+throughput. This isolates executor/storage work for one fixed query shape; it
+does not measure SQL parsing, concurrent clients, WAL durability, network
+overhead, or establish a cross-database performance claim.
+
 To compare tracked single-key reads with read-only and batched reads in both
 storage modes:
 
