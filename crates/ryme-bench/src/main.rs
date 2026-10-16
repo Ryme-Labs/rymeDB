@@ -989,9 +989,13 @@ fn segment_scan_bench(
             .write_delta_owned_with_sync(index as u64 + 2, vec![entry], false)
             .expect("could not write scan delta");
     }
-    if compact {
+    let compaction_ns = if compact {
+        let start = Instant::now();
         store.compact().expect("could not compact benchmark segments");
-    }
+        Some(start.elapsed().as_nanos())
+    } else {
+        None
+    };
 
     let read_ts = deltas as u64 + 1;
     let expected_rows = limit.min(total_keys);
@@ -1049,6 +1053,7 @@ fn segment_scan_bench(
             "concurrency": concurrency,
             "cache_bytes": cache_bytes,
             "compacted": compact,
+            "compaction_ns": compaction_ns,
             "returned_rows_per_scan": expected_rows,
             "scan_p50_ns": percentile(50),
             "scan_p95_ns": percentile(95),
