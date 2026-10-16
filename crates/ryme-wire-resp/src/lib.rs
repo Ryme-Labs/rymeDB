@@ -2005,14 +2005,18 @@ where
                 if command.args.is_empty() {
                     return encode_error(String::from("wrong args"));
                 }
-                let mut found = 0;
-                for key in &command.args {
-                    let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-                    if self.manager.get(txn, &record).unwrap_or(None).is_some() {
-                        found += 1;
+                let records = command
+                    .args
+                    .iter()
+                    .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
+                    .collect::<Vec<_>>();
+                match self.manager.get_many(txn, &records) {
+                    Ok(values) => {
+                        let found = values.iter().filter(|value| value.is_some()).count();
+                        encode_integer(found as i64)
                     }
+                    Err(error) => encode_error(error.to_string()),
                 }
-                encode_integer(found)
             }
             "TYPE" => match command.args.first() {
                 Some(key) => {
@@ -2083,12 +2087,15 @@ where
                 if command.args.is_empty() {
                     return encode_error(String::from("wrong args"));
                 }
-                let mut items = Vec::new();
-                for key in &command.args {
-                    let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-                    items.push(self.manager.get(txn, &record).unwrap_or(None));
+                let records = command
+                    .args
+                    .iter()
+                    .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
+                    .collect::<Vec<_>>();
+                match self.manager.get_many(txn, &records) {
+                    Ok(items) => encode_array(items),
+                    Err(error) => encode_error(error.to_string()),
                 }
-                encode_array(items)
             }
             "MSET" => {
                 if command.args.is_empty() || !command.args.len().is_multiple_of(2) {

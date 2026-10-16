@@ -71,6 +71,20 @@ async fn multi_exec_reads_own_writes() {
 }
 
 #[tokio::test]
+async fn multi_get_many_reads_include_staged_values_and_preserve_duplicate_keys() {
+    let addr = serve().await;
+    let mut session = Session::connect(addr).await;
+    assert_eq!(session.command(&["MULTI"]).await, "+OK");
+    assert_eq!(session.command(&["SET", "tx:batch", "value"]).await, "+QUEUED");
+    assert_eq!(session.command(&["MGET", "tx:batch", "tx:missing", "tx:batch"]).await, "+QUEUED");
+    assert_eq!(session.command(&["EXISTS", "tx:batch", "tx:batch"]).await, "+QUEUED");
+    assert_eq!(
+        session.command(&["EXEC"]).await,
+        "*3\r\n+OK\r\n*3\r\n$5\r\nvalue\r\n$-1\r\n$5\r\nvalue\r\n:2"
+    );
+}
+
+#[tokio::test]
 async fn discard_drops_queue() {
     let addr = serve().await;
     let mut session = Session::connect(addr).await;

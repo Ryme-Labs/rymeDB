@@ -286,8 +286,13 @@ async fn multi_key_ops() {
         command(addr, &["MGET", "a", "b", "ghost"]).await,
         "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$-1"
     );
+    assert_eq!(
+        command(addr, &["MGET", "a", "a", "ghost"]).await,
+        "*3\r\n$1\r\n1\r\n$1\r\n1\r\n$-1"
+    );
     assert_eq!(command(addr, &["MSET", "odd"]).await.split_whitespace().next().unwrap(), "-ERR");
     assert_eq!(command(addr, &["EXISTS", "a", "b", "ghost"]).await, ":2");
+    assert_eq!(command(addr, &["EXISTS", "a", "a", "ghost"]).await, ":2");
     assert_eq!(command(addr, &["TYPE", "a"]).await, "+string");
     assert_eq!(command(addr, &["TYPE", "ghost"]).await, "+none");
     assert_eq!(command(addr, &["STRLEN", "a"]).await, ":1");
