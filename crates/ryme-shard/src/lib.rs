@@ -2,6 +2,7 @@ use ryme_error::{Result, RymeError};
 use ryme_storage::{RecordKey, SegmentCacheStats, StorageMode};
 use ryme_txn::{
     decode_writes, encode_writes, DurableManager, SyncPolicy, Transaction, TxnBackend, TxnManager,
+    TxnTracker,
 };
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
@@ -290,15 +291,17 @@ impl ShardSet {
         if shards == 0 || shards > 256 {
             return Err(RymeError::InvalidArgument(String::from("shards")));
         }
+        let tracker = TxnTracker::new();
         let mut managers = Vec::new();
         for index in 0..shards {
             let dir = data_dir.join("shards").join(index.to_string()).join("wal");
-            managers.push(DurableManager::open_with_mode(
+            managers.push(DurableManager::open_with_mode_and_tracker(
                 &dir,
                 64 * 1024 * 1024,
                 policy,
                 cache_bytes,
                 mode,
+                &tracker,
             )?);
         }
         let coordinator = Wal::open(&data_dir.join("coordinator"), 1024 * 1024)?;
@@ -1044,12 +1047,8 @@ impl TxnBackend for ShardSet {
     fn begin(&self) -> Transaction {
         let _write = self.commit.write().unwrap_or_else(|error| error.into_inner());
         let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let mut shards = inner.shards.iter();
-        let mut txn = shards.next().expect("ShardSet must have a shard").begin();
+        let mut txn = inner.shards.first().expect("ShardSet must have a shard").begin();
         txn.restamp(self.commit_clock.load(Ordering::SeqCst).max(1));
-        for shard in shards {
-            shard.inner().track_transaction(&mut txn);
-        }
         txn
     }
 

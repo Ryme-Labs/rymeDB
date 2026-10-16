@@ -173,13 +173,27 @@ impl ActiveRegistry {
     }
 }
 
+/// Shared active-transaction tracking for managers that participate in one snapshot domain.
+#[derive(Debug, Clone, Default)]
+pub struct TxnTracker {
+    active: Arc<ActiveRegistry>,
+}
+
+impl TxnTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 static ACTIVE_REGISTRIES: LazyLock<Mutex<Vec<Weak<ActiveRegistry>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn register_active_registry(registry: &Arc<ActiveRegistry>) {
     if let Ok(mut registries) = ACTIVE_REGISTRIES.lock() {
         registries.retain(|registry| registry.strong_count() > 0);
-        registries.push(Arc::downgrade(registry));
+        if !registries.iter().any(|existing| existing.as_ptr() == Arc::as_ptr(registry)) {
+            registries.push(Arc::downgrade(registry));
+        }
     }
 }
 
@@ -348,33 +362,12 @@ static TXN_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 struct TxnPin {
     id: u64,
-    registries: Mutex<Vec<Arc<ActiveRegistry>>>,
-}
-
-impl TxnPin {
-    fn track(&self, active: &Arc<ActiveRegistry>, read_ts: u64) {
-        let mut registries = self.registries.lock().unwrap_or_else(|error| error.into_inner());
-        if registries.iter().any(|registry| Arc::ptr_eq(registry, active)) {
-            return;
-        }
-        active.insert(self.id, read_ts);
-        registries.push(Arc::clone(active));
-    }
-
-    fn restamp(&self, read_ts: u64) {
-        let registries = self.registries.lock().unwrap_or_else(|error| error.into_inner());
-        for registry in registries.iter() {
-            registry.insert(self.id, read_ts);
-        }
-    }
+    active: Arc<ActiveRegistry>,
 }
 
 impl Drop for TxnPin {
     fn drop(&mut self) {
-        let registries = self.registries.get_mut().unwrap_or_else(|error| error.into_inner());
-        for registry in registries.iter() {
-            registry.remove(self.id);
-        }
+        self.active.remove(self.id);
     }
 }
 
@@ -479,16 +472,12 @@ impl Transaction {
         self.route_generation = checkpoint.route_generation;
         self.state_bytes = checkpoint.state_bytes;
         self.resource_error.clone_from(&checkpoint.resource_error);
-        self.pin.restamp(self.read_ts);
+        self.pin.active.insert(self.id, self.read_ts);
     }
 
     pub fn restamp(&mut self, read_ts: u64) {
         self.read_ts = read_ts;
-        self.pin.restamp(read_ts);
-    }
-
-    fn pin_to(&mut self, active: &Arc<ActiveRegistry>) {
-        self.pin.track(active, self.read_ts);
+        self.pin.active.insert(self.id, read_ts);
     }
 
     pub fn set_isolation(&mut self, isolation: Isolation) {
@@ -903,7 +892,11 @@ pub enum SyncPolicy {
 
 impl TxnManager {
     pub fn new() -> Self {
-        let active = Arc::new(ActiveRegistry::default());
+        Self::new_with_tracker(&TxnTracker::new())
+    }
+
+    pub fn new_with_tracker(tracker: &TxnTracker) -> Self {
+        let active = Arc::clone(&tracker.active);
         register_active_registry(&active);
         Self {
             inner: Arc::new(TxnInner {
@@ -933,17 +926,8 @@ impl TxnManager {
             route_generation: None,
             state_bytes: 0,
             resource_error: None,
-            pin: Arc::new(TxnPin {
-                id,
-                registries: Mutex::new(vec![Arc::clone(&self.inner.active)]),
-            }),
+            pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
         }
-    }
-
-    /// Keeps this transaction's snapshot visible to this manager's MVCC garbage collector.
-    /// Call before using a transaction with a manager other than its creator.
-    pub fn track_transaction(&self, txn: &mut Transaction) {
-        txn.pin_to(&self.inner.active);
     }
 
     #[allow(clippy::wrong_self_convention)]
@@ -1004,10 +988,7 @@ impl TxnManager {
             route_generation: state.route_generation,
             state_bytes,
             resource_error: None,
-            pin: Arc::new(TxnPin {
-                id,
-                registries: Mutex::new(vec![Arc::clone(&self.inner.active)]),
-            }),
+            pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
         })
     }
 
@@ -2219,10 +2200,28 @@ impl DurableManager {
         cache_bytes: u64,
         mode: StorageMode,
     ) -> Result<Self> {
+        Self::open_with_mode_and_tracker(
+            dir,
+            segment_bytes,
+            policy,
+            cache_bytes,
+            mode,
+            &TxnTracker::new(),
+        )
+    }
+
+    pub fn open_with_mode_and_tracker(
+        dir: &Path,
+        segment_bytes: u64,
+        policy: SyncPolicy,
+        cache_bytes: u64,
+        mode: StorageMode,
+        tracker: &TxnTracker,
+    ) -> Result<Self> {
         let wal = Wal::open(dir, segment_bytes)?;
         let segments = Arc::new(SegmentStore::open_with_cache(&dir.join("segments"), cache_bytes)?);
         let manager = Self {
-            inner: TxnManager::new(),
+            inner: TxnManager::new_with_tracker(tracker),
             wal: Arc::new(Mutex::new(wal)),
             segments,
             gate: Arc::new(Mutex::new(())),
@@ -3010,12 +3009,13 @@ mod tests {
     }
 
     #[test]
-    fn tracked_transaction_restamps_and_releases_each_manager_pin() {
-        let creator = TxnManager::new();
-        let other = TxnManager::new();
+    fn shared_tracker_restamps_and_releases_manager_pins() {
+        let tracker = TxnTracker::new();
+        let creator = TxnManager::new_with_tracker(&tracker);
+        let other = TxnManager::new_with_tracker(&tracker);
         let mut txn = creator.begin();
 
-        other.track_transaction(&mut txn);
+        assert!(Arc::ptr_eq(&creator.inner.active, &other.inner.active));
         assert_eq!(creator.inner.active.oldest(), Some(txn.read_ts));
         assert_eq!(other.inner.active.oldest(), Some(txn.read_ts));
 
