@@ -168,14 +168,14 @@ impl HnswIndex {
             self.entry = Some(pos);
             return;
         };
-        let query = self.nodes[pos].vector.clone();
         let mut current = entry;
         let entry_level = self.nodes[entry].neighbors.len() - 1;
         for layer in ((level + 1)..=entry_level).rev() {
-            current = self.greedy(&query, current, layer);
+            current = self.greedy(&self.nodes[pos].vector, current, layer);
         }
         for layer in (0..=level.min(entry_level)).rev() {
-            let candidates = self.beam(&query, vec![current], HNSW_EF_BUILD, layer);
+            let candidates =
+                self.beam(&self.nodes[pos].vector, vec![current], HNSW_EF_BUILD, layer);
             current = candidates.first().map(|(_, p)| *p).unwrap_or(current);
             let selected = select_neighbors(&candidates, HNSW_M, &self.nodes);
             self.nodes[pos].neighbors[layer] = selected.clone();
