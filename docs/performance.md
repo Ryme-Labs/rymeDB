@@ -66,6 +66,15 @@ read-only p50 regressed from 490 µs to 588 µs with hashing and 529 µs with
 sorting. Repeated-key batches benefited, but the general path must not penalize
 the unique-key workload without a cheaper exact duplicate check.
 
+Standard segment point reads previously Bloom-checked, binary-searched the
+segment key vector, then searched the same key in the segment engine. Removing
+the redundant vector search reduced read-only batched p50 from 490 µs to
+296–298 µs for 1,024 unique reads, and from 323–326 µs to 221–222 µs for 64
+keys repeated 16 times. Single-read p50 also fell from 705 µs to 494–497 µs
+for the unique workload. The unique baseline is one capture; after values are
+two captures. False-positive Bloom results still go through the authoritative
+engine lookup. See [raw before/after captures](../bench/results/segment-bloom-lookup.json).
+
 On an AMD Ryzen 5 4500, two sequential release captures with 10,000 records,
 1,024 reads/iteration, 100 iterations, and batches of 256 showed read-only
 batch p50 of 588–592 µs versus 812–817 µs for individual read-only gets in

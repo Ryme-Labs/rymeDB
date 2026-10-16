@@ -1,0 +1,91 @@
+{
+  "benchmark": "standard-segment-bloom-lookup",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "config": {
+    "storage_mode": "standard",
+    "iterations": 100,
+    "batch_size": 256,
+    "value_bytes": 128,
+    "sync_policy": "Never",
+    "segment_cache": "warmed"
+  },
+  "notes": "Before captures use the previous implementation, which checked the Bloom filter, binary-searched ImmutableSegment.keys, then looked up the same key in Engine. After captures remove the redundant keys binary search; Engine remains authoritative on Bloom positives. In-process core results only, not cold disk or end-to-end RESP latency. Unique-key baseline has one capture; repeated-key baseline has two.",
+  "captures": [
+    {
+      "phase": "before",
+      "records": 1024,
+      "candidates_per_iteration": 1024,
+      "distinct_keys_per_iteration": 1024,
+      "single_read": { "p50_ns": 1502244, "p95_ns": 1534986, "p99_ns": 1621169, "rows_per_second": 678944 },
+      "read_only_single_read": { "p50_ns": 705435, "p95_ns": 744961, "p99_ns": 764067, "rows_per_second": 1440995 },
+      "batched_read": { "p50_ns": 1275905, "p95_ns": 1301925, "p99_ns": 1373680, "rows_per_second": 800205 },
+      "read_only_batched_read": { "p50_ns": 490469, "p95_ns": 514064, "p99_ns": 536315, "rows_per_second": 2078593 }
+    },
+    {
+      "phase": "after",
+      "records": 1024,
+      "candidates_per_iteration": 1024,
+      "distinct_keys_per_iteration": 1024,
+      "single_read": { "p50_ns": 1280754, "p95_ns": 1295212, "p99_ns": 2037307, "rows_per_second": 789151 },
+      "read_only_single_read": { "p50_ns": 496750, "p95_ns": 513803, "p99_ns": 741294, "rows_per_second": 2033256 },
+      "batched_read": { "p50_ns": 1080185, "p95_ns": 1095143, "p99_ns": 1180675, "rows_per_second": 940489 },
+      "read_only_batched_read": { "p50_ns": 296281, "p95_ns": 304276, "p99_ns": 451154, "rows_per_second": 3400154 }
+    },
+    {
+      "phase": "after",
+      "records": 1024,
+      "candidates_per_iteration": 1024,
+      "distinct_keys_per_iteration": 1024,
+      "single_read": { "p50_ns": 1290554, "p95_ns": 1574822, "p99_ns": 1983756, "rows_per_second": 767619 },
+      "read_only_single_read": { "p50_ns": 494245, "p95_ns": 660180, "p99_ns": 738438, "rows_per_second": 2013865 },
+      "batched_read": { "p50_ns": 1083111, "p95_ns": 1180254, "p99_ns": 1589239, "rows_per_second": 924950 },
+      "read_only_batched_read": { "p50_ns": 297583, "p95_ns": 411138, "p99_ns": 481150, "rows_per_second": 3295981 }
+    },
+    {
+      "phase": "before",
+      "records": 64,
+      "candidates_per_iteration": 1024,
+      "distinct_keys_per_iteration": 64,
+      "single_read": { "p50_ns": 685258, "p95_ns": 741885, "p99_ns": 754208, "rows_per_second": 1474832 },
+      "read_only_single_read": { "p50_ns": 535865, "p95_ns": 594275, "p99_ns": 603623, "rows_per_second": 1889322 },
+      "batched_read": { "p50_ns": 466203, "p95_ns": 526176, "p99_ns": 545804, "rows_per_second": 2156449 },
+      "read_only_batched_read": { "p50_ns": 322711, "p95_ns": 374839, "p99_ns": 377815, "rows_per_second": 3124008 }
+    },
+    {
+      "phase": "before",
+      "records": 64,
+      "candidates_per_iteration": 1024,
+      "distinct_keys_per_iteration": 64,
+      "single_read": { "p50_ns": 684936, "p95_ns": 905674, "p99_ns": 1045209, "rows_per_second": 1443813 },
+      "read_only_single_read": { "p50_ns": 536365, "p95_ns": 586370, "p99_ns": 649360, "rows_per_second": 1881773 },
+      "batched_read": { "p50_ns": 465762, "p95_ns": 653588, "p99_ns": 745030, "rows_per_second": 2113999 },
+      "read_only_batched_read": { "p50_ns": 325547, "p95_ns": 406880, "p99_ns": 527979, "rows_per_second": 3035008 }
+    },
+    {
+      "phase": "after",
+      "records": 64,
+      "candidates_per_iteration": 1024,
+      "distinct_keys_per_iteration": 64,
+      "single_read": { "p50_ns": 565681, "p95_ns": 666672, "p99_ns": 837285, "rows_per_second": 1757953 },
+      "read_only_single_read": { "p50_ns": 419033, "p95_ns": 444782, "p99_ns": 588544, "rows_per_second": 2393994 },
+      "batched_read": { "p50_ns": 366193, "p95_ns": 477393, "p99_ns": 567804, "rows_per_second": 2710793 },
+      "read_only_batched_read": { "p50_ns": 222412, "p95_ns": 259392, "p99_ns": 352597, "rows_per_second": 4460314 }
+    },
+    {
+      "phase": "after",
+      "records": 64,
+      "candidates_per_iteration": 1024,
+      "distinct_keys_per_iteration": 64,
+      "single_read": { "p50_ns": 561854, "p95_ns": 819371, "p99_ns": 860549, "rows_per_second": 1757617 },
+      "read_only_single_read": { "p50_ns": 418072, "p95_ns": 570901, "p99_ns": 619152, "rows_per_second": 2372723 },
+      "batched_read": { "p50_ns": 359020, "p95_ns": 509103, "p99_ns": 571372, "rows_per_second": 2752311 },
+      "read_only_batched_read": { "p50_ns": 221429, "p95_ns": 334212, "p99_ns": 357116, "rows_per_second": 4419464 }
+    }
+  ]
+}

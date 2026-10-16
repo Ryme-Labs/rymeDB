@@ -298,14 +298,14 @@ impl ImmutableSegment {
     }
 
     pub fn get(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
-        if !self.bloom_might_contain(key) || self.keys.binary_search(key).is_err() {
+        if !self.bloom_might_contain(key) {
             return Ok(None);
         }
         self.engine.read(key, read_ts, now)
     }
 
     pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Option<(u64, Option<Vec<u8>>, u64)> {
-        if !self.bloom_might_contain(key) || self.keys.binary_search(key).is_err() {
+        if !self.bloom_might_contain(key) {
             return None;
         }
         self.engine.version_at(key, read_ts)
@@ -1550,6 +1550,22 @@ mod tests {
         let restored = ImmutableSegment::decode(&segment.encode().unwrap()).unwrap();
         assert_eq!(restored.get(&first, 10, 0).unwrap(), Some(b"one".to_vec()));
         assert_eq!(restored.get(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
+    }
+
+    #[test]
+    fn segment_reads_confirm_bloom_false_positives_in_engine() {
+        let key = RecordKey::new("tenant", "db", "items", b"present");
+        let missing = RecordKey::new("tenant", "db", "items", b"missing");
+        let mut engine = Engine::new();
+        engine.apply(key.clone(), 1, Some(b"value".to_vec())).unwrap();
+        let mut segment = ImmutableSegment::from_engine(1, &engine);
+        segment.bloom.fill(u8::MAX);
+
+        assert!(segment.bloom_might_contain(&missing));
+        assert_eq!(segment.get(&key, 1, 0).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(segment.version_at(&key, 1), Some((1, Some(b"value".to_vec()), 0)));
+        assert_eq!(segment.get(&missing, 1, 0).unwrap(), None);
+        assert_eq!(segment.version_at(&missing, 1), None);
     }
 
     #[test]
