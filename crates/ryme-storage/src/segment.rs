@@ -675,6 +675,46 @@ impl SegmentStore {
         Ok(value)
     }
 
+    /// Read several keys while resolving segment paths and loading each
+    /// segment only once for the batch.
+    pub fn get_many(
+        &self,
+        keys: &[RecordKey],
+        read_ts: u64,
+        now: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _segment_io = self
+            .segment_io
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
+        let paths = self.newest_paths()?;
+        let mut values = vec![None; keys.len()];
+        let mut unresolved = (0..keys.len()).collect::<Vec<_>>();
+
+        for path in paths.iter().rev() {
+            let segment = self.read_segment_under_lock(path)?;
+            let is_snapshot = segment.is_snapshot();
+            let mut next_unresolved = Vec::with_capacity(unresolved.len());
+            for index in unresolved {
+                if let Some((_, value, expires_at)) = segment.version_at(&keys[index], read_ts) {
+                    values[index] = if expires_at != 0 && expires_at <= now { None } else { value };
+                } else if !is_snapshot {
+                    next_unresolved.push(index);
+                }
+            }
+            unresolved = next_unresolved;
+            if unresolved.is_empty() || is_snapshot {
+                break;
+            }
+        }
+
+        Ok(values)
+    }
+
     pub fn version_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<VersionLookup>> {
         let _segment_io = self
             .segment_io

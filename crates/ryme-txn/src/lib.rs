@@ -2926,7 +2926,26 @@ impl DurableManager {
     ) -> Result<Vec<Option<Vec<u8>>>> {
         match self.mode {
             StorageMode::Hot => self.inner.get_many(txn, keys),
-            StorageMode::Standard => keys.iter().map(|key| self.get(txn, key)).collect(),
+            StorageMode::Standard => {
+                txn.ensure_healthy()?;
+                if keys.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let now = now_unix();
+                let mut values = self.segments.get_many(keys, txn.read_ts, now)?;
+                for (index, key) in keys.iter().enumerate() {
+                    if let Some(staged) = txn.writes.get(key) {
+                        values[index] = if staged.expires_at != 0 && staged.expires_at <= now {
+                            None
+                        } else {
+                            staged.value.clone()
+                        };
+                    } else {
+                        txn.record_read(key.clone(), values[index].is_some())?;
+                    }
+                }
+                Ok(values)
+            }
         }
     }
 
@@ -4175,6 +4194,94 @@ mod tests {
         assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"two".to_vec()));
         assert_eq!(reopened.resident_bytes().unwrap(), 0);
         assert!(reopened.segment_cache_stats().misses > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_mode_batch_reads_preserve_mvcc_staging_and_conflicts() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-batch-read-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let first = RecordKey::new("t", "d", "items", b"first");
+        let second = RecordKey::new("t", "d", "items", b"second");
+        let missing = RecordKey::new("t", "d", "items", b"missing");
+
+        let mut seed = manager.begin();
+        manager.put(&mut seed, first.clone(), b"old".to_vec());
+        manager.put(&mut seed, second.clone(), b"before-delete".to_vec());
+        manager.commit(seed).unwrap();
+
+        let mut stale = manager.begin();
+        assert_eq!(
+            manager.get_many(&mut stale, &[first.clone(), missing.clone()]).unwrap(),
+            vec![Some(b"old".to_vec()), None]
+        );
+        let mut update = manager.begin();
+        manager.put(&mut update, first.clone(), b"new".to_vec());
+        manager.commit(update).unwrap();
+        manager.put(&mut stale, second.clone(), b"must-not-commit".to_vec());
+        assert!(matches!(manager.commit(stale), Err(RymeError::Conflict(_))));
+
+        let mut delete = manager.begin();
+        manager.delete(&mut delete, second.clone());
+        manager.commit(delete).unwrap();
+        let mut current = manager.begin();
+        manager.put(&mut current, missing.clone(), b"staged".to_vec());
+        assert_eq!(
+            manager.get_many(&mut current, &[first, second, missing]).unwrap(),
+            vec![Some(b"new".to_vec()), None, Some(b"staged".to_vec())]
+        );
+
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_mode_batch_read_touches_each_cached_segment_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-batch-cache-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut seed = manager.begin();
+        let keys = (0..64)
+            .map(|id| {
+                let key = RecordKey::new("t", "d", "items", &(id as u64).to_be_bytes());
+                manager.put(&mut seed, key.clone(), b"value".to_vec());
+                key
+            })
+            .collect::<Vec<_>>();
+        manager.commit(seed).unwrap();
+
+        let mut first_read = manager.begin();
+        assert!(manager.get_many(&mut first_read, &keys).unwrap().iter().all(Option::is_some));
+        let before_cached_batch = manager.segment_cache_stats();
+        let mut second_read = manager.begin();
+        assert!(manager.get_many(&mut second_read, &keys).unwrap().iter().all(Option::is_some));
+        let after_cached_batch = manager.segment_cache_stats();
+        assert_eq!(after_cached_batch.hits - before_cached_batch.hits, 1);
+
+        drop(manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
