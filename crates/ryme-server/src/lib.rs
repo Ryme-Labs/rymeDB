@@ -3163,11 +3163,13 @@ async fn cors_headers(request: axum::http::Request<axum::body::Body>, next: Next
         let mut response = StatusCode::NO_CONTENT.into_response();
         apply_cors_headers(&mut response, origin.as_ref());
         apply_api_cache_headers(&mut response, &path);
+        apply_security_headers(&mut response, &path);
         return response;
     }
     let mut response = next.run(request).await;
     apply_cors_headers(&mut response, origin.as_ref());
     apply_api_cache_headers(&mut response, &path);
+    apply_security_headers(&mut response, &path);
     response
 }
 
@@ -3181,6 +3183,44 @@ fn apply_api_cache_headers(response: &mut Response, path: &str) {
         response
             .headers_mut()
             .insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+}
+
+fn apply_security_headers(response: &mut Response, path: &str) {
+    let headers = response.headers_mut();
+    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    if path == "/dashboard" || path.starts_with("/dashboard/") {
+        headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+        headers
+            .insert("content-security-policy", HeaderValue::from_static("frame-ancestors 'none'"));
+    }
+}
+
+#[cfg(test)]
+mod http_security_header_tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_cannot_be_framed_and_responses_disable_mime_sniffing() {
+        for path in ["/dashboard", "/dashboard/", "/dashboard/_next/static/app.js"] {
+            let mut response = StatusCode::OK.into_response();
+            apply_security_headers(&mut response, path);
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+            assert_eq!(response.headers()["x-frame-options"], "DENY");
+            assert_eq!(response.headers()["content-security-policy"], "frame-ancestors 'none'");
+        }
+    }
+
+    #[test]
+    fn non_dashboard_responses_get_safe_defaults_without_dashboard_csp() {
+        let mut response = StatusCode::OK.into_response();
+        apply_security_headers(&mut response, "/v1/ready");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert!(!response.headers().contains_key("content-security-policy"));
+        assert!(!response.headers().contains_key("x-frame-options"));
     }
 }
 
