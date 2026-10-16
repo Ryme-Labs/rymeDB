@@ -1235,18 +1235,10 @@ pub enum Tier {
 }
 
 #[derive(Debug)]
-struct HybridCtx {
-    tables: Vec<(TableRef, Tier)>,
-    poisoned: bool,
-    touched: Instant,
-}
-
-#[derive(Debug)]
 struct HybridInner {
     raft: ryme_raft::net::ClusterBackend,
     local: ShardSet,
     replicated: HashSet<TableRef>,
-    side: HashMap<u64, HybridCtx>,
 }
 
 #[derive(Debug, Clone)]
@@ -1260,14 +1252,7 @@ impl HybridBackend {
         local: ShardSet,
         replicated: HashSet<TableRef>,
     ) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(HybridInner {
-                raft,
-                local,
-                replicated,
-                side: HashMap::new(),
-            })),
-        }
+        Self { inner: Arc::new(Mutex::new(HybridInner { raft, local, replicated })) }
     }
 
     pub fn tier(&self, table: &TableRef) -> Tier {
@@ -1314,27 +1299,6 @@ impl HybridBackend {
             })
             .collect()
     }
-
-    fn touch(&self, txn: &Transaction, table: TableRef) -> Tier {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.side.len() > 4096 {
-            inner.side.retain(|_, ctx| ctx.touched.elapsed().as_secs() < 120);
-        }
-        let tier = if inner.replicated.contains(&table) { Tier::Replicated } else { Tier::Local };
-        let entry = inner.side.entry(txn.id).or_insert_with(|| HybridCtx {
-            tables: Vec::new(),
-            poisoned: false,
-            touched: Instant::now(),
-        });
-        entry.touched = Instant::now();
-        if !entry.tables.iter().any(|(existing, _)| existing == &table) {
-            entry.tables.push((table, tier));
-        }
-        if entry.tables.iter().any(|(_, other)| *other != tier) {
-            entry.poisoned = true;
-        }
-        tier
-    }
 }
 
 impl TxnBackend for HybridBackend {
@@ -1360,29 +1324,29 @@ impl TxnBackend for HybridBackend {
     }
 
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
-        let tier = self.touch(txn, TableRef::of(&key));
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match tier {
-            Tier::Replicated => inner.raft.put(txn, key, value),
-            Tier::Local => inner.local.put(txn, key, value),
+        if inner.replicated.contains(&TableRef::of(&key)) {
+            inner.raft.put(txn, key, value);
+        } else {
+            inner.local.put(txn, key, value);
         }
     }
 
     fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
-        let tier = self.touch(txn, TableRef::of(&key));
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match tier {
-            Tier::Replicated => inner.raft.put_with_ttl(txn, key, value, expires_at),
-            Tier::Local => inner.local.put_with_ttl(txn, key, value, expires_at),
+        if inner.replicated.contains(&TableRef::of(&key)) {
+            inner.raft.put_with_ttl(txn, key, value, expires_at);
+        } else {
+            inner.local.put_with_ttl(txn, key, value, expires_at);
         }
     }
 
     fn delete(&self, txn: &mut Transaction, key: RecordKey) {
-        let tier = self.touch(txn, TableRef::of(&key));
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match tier {
-            Tier::Replicated => inner.raft.delete(txn, key),
-            Tier::Local => inner.local.delete(txn, key),
+        if inner.replicated.contains(&TableRef::of(&key)) {
+            inner.raft.delete(txn, key);
+        } else {
+            inner.local.delete(txn, key);
         }
     }
 
@@ -1408,28 +1372,41 @@ impl TxnBackend for HybridBackend {
         let backend = self.clone();
         async move {
             txn.ensure_healthy()?;
-            let ctx = backend
-                .inner
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("shard lock")))?
-                .side
-                .remove(&txn.id);
-            let Some(ctx) = ctx else {
+            if txn.writes().is_empty() {
                 return Ok(txn.read_ts);
+            }
+            let (tier, raft, local) = {
+                let inner = backend
+                    .inner
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("shard lock")))?;
+                let tables =
+                    txn.writes().keys().chain(txn.read_keys().iter()).map(TableRef::of).chain(
+                        txn.scanned_tables().iter().map(|(tenant, database, table)| {
+                            TableRef::new(tenant, database, table)
+                        }),
+                    );
+                let mut tier = None;
+                for table in tables {
+                    let current = if inner.replicated.contains(&table) {
+                        Tier::Replicated
+                    } else {
+                        Tier::Local
+                    };
+                    if tier.is_some_and(|seen| seen != current) {
+                        return Err(RymeError::InvalidArgument(String::from("cross-tier")));
+                    }
+                    tier = Some(current);
+                }
+                (
+                    tier.ok_or_else(|| RymeError::Internal(String::from("hybrid write tier")))?,
+                    inner.raft.clone(),
+                    inner.local.clone(),
+                )
             };
-            if ctx.poisoned {
-                return Err(RymeError::InvalidArgument(String::from("cross-tier")));
-            }
-            let replicated = ctx.tables.iter().any(|(_, tier)| *tier == Tier::Replicated);
-            let local = ctx.tables.iter().any(|(_, tier)| *tier == Tier::Local);
-            if replicated && local {
-                return Err(RymeError::InvalidArgument(String::from("cross-tier")));
-            }
-            if replicated {
-                let raft = backend.inner.lock().unwrap_or_else(|e| e.into_inner()).raft.clone();
+            if tier == Tier::Replicated {
                 <ryme_raft::net::ClusterBackend as TxnBackend>::commit(&raft, txn).await
             } else {
-                let local = backend.inner.lock().unwrap_or_else(|e| e.into_inner()).local.clone();
                 <ShardSet as TxnBackend>::commit(&local, txn).await
             }
         }
@@ -2222,6 +2199,20 @@ mod tests {
             backend.get(&mut txn, &RecordKey::new("t", "d", "cache", b"k")).unwrap(),
             Some(b"c".to_vec())
         );
+        let mut cross_tier = backend.begin();
+        assert_eq!(
+            backend.get(&mut cross_tier, &RecordKey::new("t", "d", "sys", b"k")).unwrap(),
+            Some(b"v".to_vec())
+        );
+        backend.put(
+            &mut cross_tier,
+            RecordKey::new("t", "d", "cache", b"dependent"),
+            b"value".to_vec(),
+        );
+        assert!(matches!(
+            block_on(backend.commit(cross_tier)),
+            Err(RymeError::InvalidArgument(message)) if message == "cross-tier"
+        ));
         for task in tasks {
             task.abort();
         }
