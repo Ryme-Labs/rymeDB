@@ -8913,8 +8913,27 @@ async fn durable_read(
     (StatusCode::OK, Json(items)).into_response()
 }
 
-fn index_space(tenant: &str, database: &str, table: &str) -> String {
-    format!("{tenant}/{database}/{table}")
+fn index_space(tenant: &str, database: &str, branch: &str, table: &str) -> String {
+    format!(
+        "{}:{tenant}{}:{database}{}:{branch}{}:{table}",
+        tenant.len(),
+        database.len(),
+        branch.len(),
+        table.len(),
+    )
+}
+
+fn request_index_space(
+    state: &SharedState,
+    headers: &HeaderMap,
+    tenant: &str,
+    database: &str,
+    table: &str,
+) -> ryme_error::Result<String> {
+    let branch = branch_snapshot(state, headers, tenant)?
+        .map(|(id, _, _)| id)
+        .unwrap_or_else(|| String::from("main"));
+    Ok(index_space(tenant, database, &branch, table))
 }
 
 fn table_executor_for_principal(
@@ -9075,7 +9094,16 @@ async fn vector_upsert(
     if let Err(e) = admit_write(&state, &principal.tenant, (request.vector.len() * 4) as u64) {
         return error_response(e);
     }
-    let space = index_space(&principal.tenant, &state.database, &request.table);
+    let space = match request_index_space(
+        &state,
+        &headers,
+        &principal.tenant,
+        &state.database,
+        &request.table,
+    ) {
+        Ok(space) => space,
+        Err(e) => return error_response(e),
+    };
     {
         let mut indexes = state.indexes.write().await;
         match indexes.vector_upsert(&space, request.id, request.vector) {
@@ -9114,7 +9142,16 @@ async fn vector_search(
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
-    let space = index_space(&principal.tenant, &state.database, &request.table);
+    let space = match request_index_space(
+        &state,
+        &headers,
+        &principal.tenant,
+        &state.database,
+        &request.table,
+    ) {
+        Ok(space) => space,
+        Err(e) => return error_response(e),
+    };
     let result = {
         let indexes = state.indexes.read().await;
         indexes.vector_search(&space, &request.vector, request.top_k.unwrap_or(10))
@@ -9170,7 +9207,16 @@ async fn vector_ann_search(
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
-    let space = index_space(&principal.tenant, &state.database, &request.table);
+    let space = match request_index_space(
+        &state,
+        &headers,
+        &principal.tenant,
+        &state.database,
+        &request.table,
+    ) {
+        Ok(space) => space,
+        Err(e) => return error_response(e),
+    };
     let result = {
         let indexes = state.indexes.read().await;
         indexes.ann_search(
@@ -9230,7 +9276,16 @@ async fn vector_delete(
     }) {
         return error_response(e);
     }
-    let space = index_space(&principal.tenant, &state.database, &table);
+    let space = match request_index_space(
+        &state,
+        &headers,
+        &principal.tenant,
+        &state.database,
+        &table,
+    ) {
+        Ok(space) => space,
+        Err(e) => return error_response(e),
+    };
     let mut indexes = state.indexes.write().await;
     let removed = indexes.vector_remove(&space, &id);
     (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
@@ -9279,7 +9334,16 @@ async fn text_index(
     if let Err(e) = admit_write(&state, &principal.tenant, request.text.len() as u64) {
         return error_response(e);
     }
-    let space = index_space(&principal.tenant, &state.database, &request.table);
+    let space = match request_index_space(
+        &state,
+        &headers,
+        &principal.tenant,
+        &state.database,
+        &request.table,
+    ) {
+        Ok(space) => space,
+        Err(e) => return error_response(e),
+    };
     {
         let mut indexes = state.indexes.write().await;
         match indexes.text_index(&space, request.id, &request.text) {
@@ -9318,7 +9382,16 @@ async fn text_search(
     if let Err(e) = admit_read(&state, &principal.tenant) {
         return error_response(e);
     }
-    let space = index_space(&principal.tenant, &state.database, &request.table);
+    let space = match request_index_space(
+        &state,
+        &headers,
+        &principal.tenant,
+        &state.database,
+        &request.table,
+    ) {
+        Ok(space) => space,
+        Err(e) => return error_response(e),
+    };
     let result = {
         let indexes = state.indexes.read().await;
         indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10))
@@ -9373,7 +9446,16 @@ async fn text_delete(
     }) {
         return error_response(e);
     }
-    let space = index_space(&principal.tenant, &state.database, &table);
+    let space = match request_index_space(
+        &state,
+        &headers,
+        &principal.tenant,
+        &state.database,
+        &table,
+    ) {
+        Ok(space) => space,
+        Err(e) => return error_response(e),
+    };
     let mut indexes = state.indexes.write().await;
     let removed = indexes.text_remove(&space, &id);
     (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
@@ -14572,11 +14654,15 @@ mod realtime_policy_tests {
     }
 
     #[test]
-    fn search_index_spaces_are_tenant_scoped() {
-        let tenant_a = index_space("tenant-a", "default", "embeddings");
-        let tenant_b = index_space("tenant-b", "default", "embeddings");
+    fn search_index_spaces_encode_scope_without_collisions() {
+        let tenant_a = index_space("tenant-a", "default", "main", "embeddings");
+        let tenant_b = index_space("tenant-b", "default", "main", "embeddings");
         assert_ne!(tenant_a, tenant_b);
-        assert_eq!(tenant_a, "tenant-a/default/embeddings");
+        assert_ne!(tenant_a, index_space("tenant-a", "default", "preview", "embeddings"));
+        assert_ne!(
+            index_space("tenant/a", "db", "main", "table"),
+            index_space("tenant", "a/db", "main", "table"),
+        );
     }
 
     #[test]

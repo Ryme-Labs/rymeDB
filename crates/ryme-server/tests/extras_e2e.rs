@@ -728,6 +728,38 @@ async fn extras_vector_text_search() {
     )
     .await;
     assert_eq!(status, 200);
+    let (status, _) = http_request(
+        http,
+        "POST /v1/branches",
+        b"{\"id\":\"preview-index\",\"parent\":\"main\",\"base_commit_ts\":1}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = http_request_branch(
+        http,
+        "preview-index",
+        "POST /v1/vector/upsert",
+        b"{\"table\":\"emb\",\"id\":\"branch-only\",\"vector\":[0.8,0.2]}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, main_hits) = http_request(
+        http,
+        "POST /v1/vector/search",
+        b"{\"table\":\"emb\",\"vector\":[0.8,0.2],\"top_k\":3}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(!String::from_utf8_lossy(&main_hits).contains("branch-only"));
+    let (status, branch_hits) = http_request_branch(
+        http,
+        "preview-index",
+        "POST /v1/vector/search",
+        b"{\"table\":\"emb\",\"vector\":[0.8,0.2],\"top_k\":3}",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&branch_hits).contains("branch-only"));
     let (status, body) = http_request(
         http,
         "POST /v1/vector/search",
