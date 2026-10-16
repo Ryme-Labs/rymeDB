@@ -258,6 +258,16 @@ ryme-bench realtime --addr 127.0.0.1:8080 --api-key local-dev-key \
   --payload-bytes 128 --publish-concurrency 32 --json
 ```
 
+After batching WebSocket writes (commit `efb5101`), two sequential runs with
+that same workload on the AMD Ryzen 5 4500 loopback setup delivered all 20,000
+expected messages. Publish-to-client p50 was 0.572–0.669 ms and p95 was
+1.408–1.792 ms, while p99 remained 109.7–111.5 ms (maximum 137–139 ms).
+Completed fanout throughput was 136.7k–140.1k deliveries/s. The p99 tail is
+still poor. These runs are a validation capture, not a controlled before/after
+comparison; the 100-connection/10,000-publish workload above remains the target
+that needs a repeat run. Raw outputs and exact invocation are in
+[`bench/results/realtime-writer-batch-20x1000.json`](../bench/results/realtime-writer-batch-20x1000.json).
+
 ## How to read the numbers
 
 - Compare the same protocol and acknowledgement semantics.

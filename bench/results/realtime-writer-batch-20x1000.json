@@ -1,0 +1,41 @@
+{
+  "commit": "efb5101",
+  "command": "ryme-bench realtime --addr 127.0.0.1:18080 --api-key local-dev-key --connections 20 --connection-concurrency 64 --messages 1000 --payload-bytes 128 --publish-concurrency 32 --json",
+  "notes": "Two sequential loopback validation runs against an isolated release server, dedicated_cluster QoS tier, one hot channel. Not a paired before/after comparison.",
+  "runs": [
+    {
+      "machine": "AMD Ryzen 5 4500, 12 logical CPUs, Linux x86_64, 16 GB RAM",
+      "connections": 20,
+      "messages": 1000,
+      "payload_bytes": 128,
+      "publish_concurrency": 32,
+      "published": 1000,
+      "received": 20000,
+      "delivery_percent": 100.0,
+      "publish_qps": 7036,
+      "fanout_deliveries_per_second": 140139,
+      "publish_to_client_p50_us": 669,
+      "publish_to_client_p95_us": 1792,
+      "publish_to_client_p99_us": 111524,
+      "publish_to_client_max_us": 139336,
+      "total_seconds": 0.143
+    },
+    {
+      "machine": "AMD Ryzen 5 4500, 12 logical CPUs, Linux x86_64, 16 GB RAM",
+      "connections": 20,
+      "messages": 1000,
+      "payload_bytes": 128,
+      "publish_concurrency": 32,
+      "published": 1000,
+      "received": 20000,
+      "delivery_percent": 100.0,
+      "publish_qps": 6856,
+      "fanout_deliveries_per_second": 136719,
+      "publish_to_client_p50_us": 572,
+      "publish_to_client_p95_us": 1408,
+      "publish_to_client_p99_us": 109736,
+      "publish_to_client_max_us": 137478,
+      "total_seconds": 0.146
+    }
+  ]
+}
