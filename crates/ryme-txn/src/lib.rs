@@ -537,8 +537,10 @@ impl Transaction {
     }
 
     pub fn record_read(&mut self, key: RecordKey, existed: bool) -> Result<()> {
-        let add_read = !self.read_set.contains(&key);
-        let add_observed = !self.observed.contains_key(&key);
+        // from_state validates that both structures have identical keys, so
+        // the observed map can answer whether this key is already tracked.
+        let add_read = !self.observed.contains_key(&key);
+        let add_observed = add_read;
         let added_bytes = (if add_read { transaction_key_bytes(&key) } else { 0 }).saturating_add(
             if add_observed { transaction_key_bytes(&key).saturating_add(1) } else { 0 },
         );
@@ -1027,9 +1029,17 @@ impl TxnManager {
         if state.constraint_scanned.len() > MAX_TRANSACTION_CONSTRAINT_SCANS {
             return Err(transaction_overload("constraint scan set"));
         }
+        let read_set_entries = state.read_set.len();
+        let observed_entries = state.observed.len();
         let writes: BTreeMap<_, _> = state.writes.into_iter().collect();
         let read_set: BTreeSet<_> = state.read_set.into_iter().collect();
         let observed: BTreeMap<_, _> = state.observed.into_iter().collect();
+        if read_set.len() != read_set_entries
+            || observed.len() != observed_entries
+            || !read_set.iter().eq(observed.keys())
+        {
+            return Err(RymeError::Corrupt(String::from("transaction read state")));
+        }
         let scanned: BTreeSet<_> = state.scanned.into_iter().collect();
         let constraint_scanned: BTreeSet<_> = state.constraint_scanned.into_iter().collect();
         let state_bytes =
@@ -4702,5 +4712,35 @@ mod tests {
         assert!(
             matches!(manager.from_state(state), Err(RymeError::Overload(message)) if message == "transaction write set")
         );
+    }
+
+    #[test]
+    fn transaction_state_reconstruction_rejects_inconsistent_read_tracking() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "table", b"read");
+        let mut txn = manager.begin();
+        assert_eq!(manager.get(&mut txn, &key).unwrap(), None);
+        let valid_state = txn.state();
+
+        let mut missing_observation = valid_state.clone();
+        missing_observation.observed.clear();
+        assert!(matches!(
+            manager.from_state(missing_observation),
+            Err(RymeError::Corrupt(message)) if message == "transaction read state"
+        ));
+
+        let mut missing_read = valid_state.clone();
+        missing_read.read_set.clear();
+        assert!(matches!(
+            manager.from_state(missing_read),
+            Err(RymeError::Corrupt(message)) if message == "transaction read state"
+        ));
+
+        let mut duplicate_read = valid_state;
+        duplicate_read.read_set.push(key);
+        assert!(matches!(
+            manager.from_state(duplicate_read),
+            Err(RymeError::Corrupt(message)) if message == "transaction read state"
+        ));
     }
 }
