@@ -2144,17 +2144,21 @@ fn txn_read_batch_bench(
     let keys = &keys[..candidates];
 
     for _ in 0..5 {
-        std::hint::black_box(measure_single_reads(&manager, keys));
+        std::hint::black_box(measure_single_reads(&manager, keys, false));
+        std::hint::black_box(measure_single_reads(&manager, keys, true));
         std::hint::black_box(measure_batched_reads(&manager, keys, batch_size));
     }
 
     let mut single_samples = Vec::with_capacity(iterations);
+    let mut read_only_samples = Vec::with_capacity(iterations);
     let mut batch_samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        single_samples.push(measure_single_reads(&manager, keys));
+        single_samples.push(measure_single_reads(&manager, keys, false));
+        read_only_samples.push(measure_single_reads(&manager, keys, true));
         batch_samples.push(measure_batched_reads(&manager, keys, batch_size));
     }
     single_samples.sort_unstable();
+    read_only_samples.sort_unstable();
     batch_samples.sort_unstable();
     let percentile =
         |samples: &[u64], percent: usize| samples[((samples.len() - 1) * percent) / 100];
@@ -2169,8 +2173,10 @@ fn txn_read_batch_bench(
         })
     };
     let single = summarize(&single_samples);
+    let read_only = summarize(&read_only_samples);
     let batched = summarize(&batch_samples);
     let single_p50 = single["p50_ns"].as_u64().unwrap_or(0);
+    let read_only_p50 = read_only["p50_ns"].as_u64().unwrap_or(0).max(1);
     let batch_p50 = batched["p50_ns"].as_u64().unwrap_or(0).max(1);
     let output = serde_json::json!({
         "benchmark": "transaction-batch-read",
@@ -2181,26 +2187,31 @@ fn txn_read_batch_bench(
         "batch_size": batch_size,
         "value_bytes": value_bytes,
         "single_read": single,
+        "read_only_single_read": read_only,
         "batched_read": batched,
         "p50_speedup": (single_p50 as f64 / batch_p50 as f64 * 100.0).round() / 100.0,
+        "read_only_p50_speedup": (single_p50 as f64 / read_only_p50 as f64 * 100.0).round() / 100.0,
     });
     if json {
         println!("{output}");
     } else {
         println!(
-            "records={records} candidates={} iterations={iterations} batch_size={batch_size} single_p50={}ns batched_p50={}ns p50_speedup={}x single_rows_per_second={} batched_rows_per_second={}",
+            "records={records} candidates={} iterations={iterations} batch_size={batch_size} tracked_p50={}ns read_only_p50={}ns read_only_speedup={}x batched_p50={}ns batch_speedup={}x",
             candidates,
             output["single_read"]["p50_ns"].as_u64().unwrap_or(0),
+            output["read_only_single_read"]["p50_ns"].as_u64().unwrap_or(0),
+            output["read_only_p50_speedup"].as_f64().unwrap_or(0.0),
             output["batched_read"]["p50_ns"].as_u64().unwrap_or(0),
             output["p50_speedup"].as_f64().unwrap_or(0.0),
-            output["single_read"]["rows_per_second"].as_u64().unwrap_or(0),
-            output["batched_read"]["rows_per_second"].as_u64().unwrap_or(0),
         );
     }
 }
 
-fn measure_single_reads(manager: &TxnManager, keys: &[RecordKey]) -> u64 {
+fn measure_single_reads(manager: &TxnManager, keys: &[RecordKey], read_only: bool) -> u64 {
     let mut txn = manager.begin();
+    if read_only {
+        txn.set_read_only().expect("benchmark read-only mode");
+    }
     let started = Instant::now();
     let mut found = 0usize;
     for key in keys {
