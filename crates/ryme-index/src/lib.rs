@@ -527,6 +527,24 @@ impl TextSpace {
         doc_count: f64,
         document_frequencies: &HashMap<String, usize>,
     ) -> Vec<TextHit> {
+        if let [term] = terms {
+            let Some(posting) = self.postings.get(term) else {
+                return Vec::new();
+            };
+            let document_frequency = document_frequencies.get(term).copied().unwrap_or(0);
+            let idf = (1.0 + doc_count / (document_frequency as f64 + 0.5)).ln();
+            return top_k_scored_ids(
+                posting.iter().map(|(doc, freq)| {
+                    let freq = *freq as f64;
+                    (doc.as_str(), idf * (freq / (freq + 1.2)))
+                }),
+                top_k,
+            )
+            .into_iter()
+            .map(|hit| TextHit { id: hit.id.into_owned(), score: hit.score })
+            .collect();
+        }
+
         let mut scores: HashMap<&str, f64> = HashMap::new();
         for term in terms {
             let Some(posting) = self.postings.get(term) else {
@@ -1192,6 +1210,20 @@ mod tests {
         }
         let hits = registry.text_search("docs", "same", 2).unwrap();
         assert_eq!(hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn single_term_fast_path_preserves_frequency_scores() {
+        let mut registry = IndexRegistry::new();
+        registry.text_index("docs", String::from("repeated"), "needle needle").unwrap();
+        registry.text_index("docs", String::from("once"), "needle").unwrap();
+        let hits = registry.text_search("docs", "needle", 2).unwrap();
+        let idf = (1.0f64 + 2.0 / 2.5).ln();
+        assert_eq!(hits[0].id, "repeated");
+        assert!((hits[0].score - idf * (2.0 / 3.2)).abs() < 1e-12);
+        assert!((hits[1].score - idf * (1.0 / 2.2)).abs() < 1e-12);
+        let repeated_query = registry.text_search("docs", "needle needle", 2).unwrap();
+        assert!((repeated_query[0].score - 2.0 * hits[0].score).abs() < 1e-12);
     }
 
     #[test]

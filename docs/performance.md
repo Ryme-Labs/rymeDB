@@ -91,12 +91,14 @@ cargo run --locked --release -j 1 -p ryme-bench -- text-index \
 ```
 
 The benchmark returns p50/p95/p99 and QPS for a warmed, in-process index. On
-the same host and corpus, bounded top-k selection reduced median query p50 from
-1.716 ms to 0.837 ms and raised median QPS from 566 to 1,129 across three runs.
-Scoring still visits every matching posting; the optimization avoids allocating
-an owned ID and sorting every match when only a small top-k is requested. See
-the [raw runs](../bench/results/text-search-bounded-topk.json). This does not
-measure network, persistence, or replicated database latency.
+the same host and corpus, bounded top-k selection followed by direct single-term
+posting traversal reduced median query p50 from 1.716 ms to 98.8 µs and raised
+median QPS from 566 to 9,944 across three runs. The first step avoids sorting
+and copying every match; the single-term path also avoids building a score map.
+Multi-term queries retain the accumulator needed to combine term scores. See
+the [bounded top-k runs](../bench/results/text-search-bounded-topk.json) and
+[single-term fast-path runs](../bench/results/text-search-single-term-fast-path.json).
+These measurements exclude network, persistence, and replication.
 
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
