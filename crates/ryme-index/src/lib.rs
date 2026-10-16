@@ -533,7 +533,11 @@ pub fn tokenize(text: &str) -> Vec<String> {
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_alphanumeric() {
-            current.push(ch.to_ascii_lowercase());
+            if ch.is_ascii() {
+                current.push(ch.to_ascii_lowercase());
+            } else {
+                current.extend(ch.to_lowercase());
+            }
         } else if !current.is_empty() {
             out.push(std::mem::take(&mut current));
         }
@@ -1147,6 +1151,11 @@ mod tests {
         let hits = registry.text_search("docs", "quick fox", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "d1");
+    }
+
+    #[test]
+    fn tokenizer_lowercases_unicode_letters() {
+        assert_eq!(tokenize("RÉSUMÉ"), tokenize("résumé"));
     }
 
     #[test]
