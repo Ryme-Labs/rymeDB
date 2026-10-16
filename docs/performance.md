@@ -26,6 +26,14 @@ and reported latency covers writing the request and reading its full reply.
 Prepopulate those keys on the target server to measure hits. In cluster mode,
 this includes owner routing and local/remote value handling.
 
+A localhost smoke benchmark on an AMD Ryzen 5 4500 used Standard storage,
+memory durability, 16 seeded 16-byte values, and one client issuing 2,000
+16-key MGET commands per capture. Three captures measured p50 at 37–49 µs,
+p99 at 62–72 µs, and 20.3k–25.9k commands/s, with zero protocol errors. The
+segment cache warmed during the run. This includes client encoding and reply
+parsing, but is not a cold-disk or production deployment result; see the
+[raw captures](../bench/results/resp-mget-standard-local.json).
+
 To isolate the in-memory transaction core from networking and WAL durability:
 
 ```bash
