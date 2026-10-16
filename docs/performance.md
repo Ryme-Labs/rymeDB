@@ -220,11 +220,12 @@ The three-node loopback Raft test measured roughly 2.3 ms median leader
 quorum acknowledgement and 3.5 ms median follower visibility, with a maximum
 around 4.3 ms over 20 writes.
 
-The 100-connection, 10,000-publish realtime stress run delivered 1,000,000 of
-1,000,000 expected messages with zero receive errors. It measured approximately
-266k fanout deliveries/s and 1.29k publish requests/s, but publish-to-client
-latency was about 5.3 s p50 and 8.6 s p99 under that burst. Reliability was
-fixed; the low-latency/10k-publish target is not yet met for that workload.
+An earlier 100-connection, 10,000-publish realtime stress capture delivered
+1,000,000 of 1,000,000 expected messages with zero receive errors. It measured
+approximately 266k fanout deliveries/s and 1.29k publish requests/s, but
+publish-to-client latency was about 5.3 s p50 and 8.6 s p99 under that burst.
+That historical result predates the current cached-envelope and batched-writer
+path; it is not directly comparable to the newer captures below.
 
 The current release build also includes a cached broadcast envelope so one
 JSON payload is encoded once and reused across subscribers. A smaller
@@ -267,6 +268,16 @@ still poor. These runs are a validation capture, not a controlled before/after
 comparison; the 100-connection/10,000-publish workload above remains the target
 that needs a repeat run. Raw outputs and exact invocation are in
 [`bench/results/realtime-writer-batch-20x1000.json`](../bench/results/realtime-writer-batch-20x1000.json).
+
+The exact 100-connection/10,000-publish workload above was then run twice on
+the same machine against an isolated release server. Both runs delivered all
+1,000,000 expected messages with no publish or receive errors. Publish-to-client
+p50 was 2.310–2.365 ms, p95 was 4.207–4.285 ms, and p99 was 5.418–5.572 ms;
+completed fanout throughput was 1.098–1.112 million deliveries/s. However,
+about 0.14% of samples exceeded 100 ms (maximum 157–162 ms), so the extreme tail
+still needs work. This is a repeated current-build validation, not a controlled
+before/after experiment. Raw captures are in
+[`bench/results/realtime-writer-batch-100x10000.json`](../bench/results/realtime-writer-batch-100x10000.json).
 
 ## How to read the numbers
 
