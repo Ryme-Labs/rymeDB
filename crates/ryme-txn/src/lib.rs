@@ -232,10 +232,10 @@ impl Drop for PendingCommitGuard {
 struct TxnInner {
     clock: AtomicU64,
     applied: AtomicU64,
-    committed: Mutex<CommitIndex>,
     pending: Mutex<BTreeMap<u64, BTreeSet<RecordKey>>>,
     engine: RwLock<Engine>,
-    commit: Mutex<()>,
+    // This gate owns commit ordering and its conflict-history index.
+    commit: Mutex<CommitIndex>,
     active: Arc<ActiveRegistry>,
 }
 
@@ -884,10 +884,9 @@ impl TxnManager {
             inner: Arc::new(TxnInner {
                 clock: AtomicU64::new(1),
                 applied: AtomicU64::new(1),
-                committed: Mutex::new(CommitIndex::default()),
                 pending: Mutex::new(BTreeMap::new()),
                 engine: RwLock::new(Engine::new()),
-                commit: Mutex::new(()),
+                commit: Mutex::new(CommitIndex::default()),
                 active,
             }),
         }
@@ -1059,15 +1058,15 @@ impl TxnManager {
     }
 
     pub fn reserve(&self, txn: &Transaction) -> Result<u64> {
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        self.reserve_locked(txn)
+        self.reserve_locked(txn, &mut guard)
     }
 
-    fn reserve_locked(&self, txn: &Transaction) -> Result<u64> {
+    fn reserve_locked(&self, txn: &Transaction, committed: &mut CommitIndex) -> Result<u64> {
         txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
@@ -1088,21 +1087,21 @@ impl TxnManager {
                 Err(current) => observed = current,
             }
         };
-        self.check_locked(txn, commit_ts)?;
+        self.check_locked(txn, commit_ts, committed)?;
         Ok(commit_ts)
     }
 
-    fn check_locked(&self, txn: &Transaction, commit_ts: u64) -> Result<()> {
+    fn check_locked(
+        &self,
+        txn: &Transaction,
+        commit_ts: u64,
+        committed: &mut CommitIndex,
+    ) -> Result<()> {
         if commit_ts <= txn.read_ts {
             return Err(RymeError::Conflict(String::from(
                 "commit timestamp must be newer than transaction snapshot",
             )));
         }
-        let mut committed = self
-            .inner
-            .committed
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         if let Some(floor) = self.inner.active.oldest() {
             committed.prune_through(floor);
         }
@@ -1169,12 +1168,12 @@ impl TxnManager {
     }
 
     fn reserve_replicated(&self, txn: &Transaction) -> Result<u64> {
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        let commit_ts = self.reserve_locked(txn)?;
+        let commit_ts = self.reserve_locked(txn, &mut guard)?;
         self.inner
             .pending
             .lock()
@@ -1191,12 +1190,12 @@ impl TxnManager {
 
     pub fn validate_at(&self, txn: &Transaction, commit_ts: u64) -> Result<()> {
         txn.ensure_healthy()?;
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        self.check_locked(txn, commit_ts)
+        self.check_locked(txn, commit_ts, &mut guard)
     }
 
     pub fn commit_filtered_at(
@@ -1206,19 +1205,19 @@ impl TxnManager {
         keep: impl Fn(&RecordKey) -> bool,
     ) -> Result<()> {
         txn.ensure_healthy()?;
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        self.check_locked(txn, commit_ts)?;
+        self.check_locked(txn, commit_ts, &mut guard)?;
         let writes: BTreeMap<RecordKey, WriteOp> = txn
             .writes
             .iter()
             .filter(|(key, _)| keep(key))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        self.apply_owned_locked(commit_ts, writes)?;
+        self.apply_owned_locked(commit_ts, writes, &mut guard)?;
         self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
         Ok(())
     }
@@ -1234,12 +1233,12 @@ impl TxnManager {
         persist: impl FnOnce(u64, &[u8], &BTreeMap<RecordKey, WriteOp>) -> Result<()>,
     ) -> Result<()> {
         txn.ensure_healthy()?;
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        self.check_locked(&txn, commit_ts)?;
+        self.check_locked(&txn, commit_ts, &mut guard)?;
         let writes: BTreeMap<RecordKey, WriteOp> =
             txn.writes.into_iter().filter(|(key, _)| keep(key)).collect();
         if writes.is_empty() {
@@ -1247,18 +1246,18 @@ impl TxnManager {
         }
         let payload = encode_writes(&writes)?;
         persist(commit_ts, &payload, &writes)?;
-        self.apply_owned_locked(commit_ts, writes)?;
+        self.apply_owned_locked(commit_ts, writes, &mut guard)?;
         self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
         Ok(())
     }
 
     pub fn replay_at(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        self.replay_locked(commit_ts, writes, None)
+        self.replay_locked(commit_ts, writes, None, &mut guard)
     }
 
     /// Replays a committed transaction while materializing only the keys owned
@@ -1274,7 +1273,7 @@ impl TxnManager {
         writes: &BTreeMap<RecordKey, WriteOp>,
         keep: impl Fn(&RecordKey) -> bool,
     ) -> Result<()> {
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
@@ -1285,7 +1284,7 @@ impl TxnManager {
             .map(|(key, op)| (key.clone(), op.clone()))
             .collect();
         let committed_keys: Vec<RecordKey> = writes.keys().cloned().collect();
-        self.replay_locked(commit_ts, &local_writes, Some(&committed_keys))
+        self.replay_locked(commit_ts, &local_writes, Some(&committed_keys), &mut guard)
     }
 
     fn replay_locked(
@@ -1293,6 +1292,7 @@ impl TxnManager {
         commit_ts: u64,
         writes: &BTreeMap<RecordKey, WriteOp>,
         committed_keys: Option<&[RecordKey]>,
+        committed: &mut CommitIndex,
     ) -> Result<()> {
         let mut engine = self
             .inner
@@ -1318,22 +1318,12 @@ impl TxnManager {
         }
         drop(engine);
         if !fresh.is_empty() {
-            let mut committed = self
-                .inner
-                .committed
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
             let keys = committed_keys
                 .map(|keys| keys.to_vec())
                 .unwrap_or_else(|| fresh.keys().cloned().collect());
             committed.record(commit_ts, keys);
         } else if let Some(keys) = committed_keys {
             if !keys.is_empty() {
-                let mut committed = self
-                    .inner
-                    .committed
-                    .lock()
-                    .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
                 committed.record(commit_ts, keys.to_vec());
             }
         }
@@ -1344,32 +1334,39 @@ impl TxnManager {
     }
 
     pub fn apply_at(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        self.apply_locked(commit_ts, writes)
+        self.apply_locked(commit_ts, writes, &mut guard)
     }
 
-    fn apply_locked(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
-        self.apply_owned_locked(commit_ts, writes.clone())
+    fn apply_locked(
+        &self,
+        commit_ts: u64,
+        writes: &BTreeMap<RecordKey, WriteOp>,
+        committed: &mut CommitIndex,
+    ) -> Result<()> {
+        self.apply_owned_locked(commit_ts, writes.clone(), committed)
     }
 
     fn apply_owned_locked(
         &self,
         commit_ts: u64,
         writes: BTreeMap<RecordKey, WriteOp>,
+        committed: &mut CommitIndex,
     ) -> Result<()> {
-        self.apply_owned_inner(commit_ts, writes, false).map(|_| ())
+        self.apply_owned_inner(commit_ts, writes, false, committed).map(|_| ())
     }
 
     fn apply_owned_or_confirm_locked(
         &self,
         commit_ts: u64,
         writes: BTreeMap<RecordKey, WriteOp>,
+        committed: &mut CommitIndex,
     ) -> Result<()> {
-        self.apply_owned_inner(commit_ts, writes, true).map(|_| ())
+        self.apply_owned_inner(commit_ts, writes, true, committed).map(|_| ())
     }
 
     fn apply_owned_inner(
@@ -1377,6 +1374,7 @@ impl TxnManager {
         commit_ts: u64,
         writes: BTreeMap<RecordKey, WriteOp>,
         accept_identical: bool,
+        committed: &mut CommitIndex,
     ) -> Result<bool> {
         if writes.is_empty() {
             return Ok(false);
@@ -1404,7 +1402,7 @@ impl TxnManager {
                 engine.apply_with_expiry(key, commit_ts, op.value, op.expires_at)?;
             }
         }
-        self.record_committed_locked(commit_ts, committed_keys)?;
+        self.record_committed_locked(commit_ts, committed_keys, committed)?;
         Ok(true)
     }
 
@@ -1412,12 +1410,9 @@ impl TxnManager {
         &self,
         commit_ts: u64,
         committed_keys: Vec<RecordKey>,
+        committed: &mut CommitIndex,
     ) -> Result<()> {
-        self.inner
-            .committed
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("commit lock")))?
-            .record(commit_ts, committed_keys);
+        committed.record(commit_ts, committed_keys);
         let visible_ts = commit_ts.saturating_add(1);
         self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
         self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
@@ -1430,13 +1425,13 @@ impl TxnManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        let commit_ts = self.reserve_locked(&txn)?;
-        self.apply_owned_locked(commit_ts, txn.writes)?;
+        let commit_ts = self.reserve_locked(&txn, &mut guard)?;
+        self.apply_owned_locked(commit_ts, txn.writes, &mut guard)?;
         Ok(commit_ts)
     }
 
@@ -1456,7 +1451,7 @@ impl TxnManager {
         let commit_ts = self.reserve_replicated(&txn)?;
         let _pending = PendingCommitGuard { manager: self.clone(), commit_ts };
         replicate(commit_ts, payload).await?;
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
@@ -1470,8 +1465,8 @@ impl TxnManager {
         {
             return Err(RymeError::Conflict(String::from("commit invalidated")));
         }
-        self.check_locked(&txn, commit_ts)?;
-        self.apply_owned_or_confirm_locked(commit_ts, txn.writes)?;
+        self.check_locked(&txn, commit_ts, &mut guard)?;
+        self.apply_owned_or_confirm_locked(commit_ts, txn.writes, &mut guard)?;
         Ok(commit_ts)
     }
 
@@ -1490,13 +1485,13 @@ impl TxnManager {
         }
         let payload = encode_writes(&txn.writes)?;
         replicate(commit_ts, payload).await?;
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        self.check_locked(&txn, commit_ts)?;
-        self.apply_owned_or_confirm_locked(commit_ts, txn.writes)?;
+        self.check_locked(&txn, commit_ts, &mut guard)?;
+        self.apply_owned_or_confirm_locked(commit_ts, txn.writes, &mut guard)?;
         Ok(commit_ts)
     }
 
@@ -1517,15 +1512,15 @@ impl TxnManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        let commit_ts = self.reserve_locked(&txn)?;
+        let commit_ts = self.reserve_locked(&txn, &mut guard)?;
         let payload = encode_writes(&txn.writes)?;
         persist(commit_ts, &payload, &txn.writes)?;
-        self.apply_owned_locked(commit_ts, txn.writes)?;
+        self.apply_owned_locked(commit_ts, txn.writes, &mut guard)?;
         Ok(commit_ts)
     }
 
@@ -1540,16 +1535,16 @@ impl TxnManager {
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
         }
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        let commit_ts = self.reserve_locked(&txn)?;
+        let commit_ts = self.reserve_locked(&txn, &mut guard)?;
         let payload = encode_writes(&txn.writes)?;
         let committed_keys = txn.writes.keys().cloned().collect();
         persist(commit_ts, &payload, txn.writes)?;
-        self.record_committed_locked(commit_ts, committed_keys)?;
+        self.record_committed_locked(commit_ts, committed_keys, &mut guard)?;
         Ok(commit_ts)
     }
 
@@ -1912,7 +1907,7 @@ impl TxnManager {
     pub fn restore_snapshot(&self, raw: &[u8]) -> Result<u64> {
         let snapshot = Engine::decode_snapshot(raw)?;
         let max = snapshot.max_commit_ts();
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
@@ -1925,14 +1920,7 @@ impl TxnManager {
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
             engine.replace_from(snapshot);
         }
-        {
-            let mut committed = self
-                .inner
-                .committed
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-            committed.clear();
-        }
+        guard.clear();
         self.inner
             .pending
             .lock()
@@ -1960,7 +1948,7 @@ impl TxnManager {
             }
         }
         let max = snapshot.max_commit_ts();
-        let _guard = self
+        let mut guard = self
             .inner
             .commit
             .lock()
@@ -1970,11 +1958,7 @@ impl TxnManager {
             .write()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?
             .replace_from(snapshot);
-        self.inner
-            .committed
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("commit lock")))?
-            .clear();
+        guard.clear();
         self.inner
             .pending
             .lock()
