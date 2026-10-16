@@ -10596,8 +10596,7 @@ where
             };
             self.scan_rows(txn, &table, &filter, cap)?
         };
-        let mut rows: Vec<Row> =
-            rows.into_iter().filter(|(pk, value)| predicates_match(&filter, pk, value)).collect();
+        let mut rows = rows;
         rows.sort_by(|left, right| compare_order(&order, left, right));
         let rows = self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
         let output_columns = columns
@@ -14701,19 +14700,12 @@ where
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
                 let rows = self.scan_rows(txn, &table, &filter, cap)?;
-                let mut rows: Vec<(Vec<u8>, Vec<u8>)> = rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
-                    .collect();
+                let mut rows = rows;
                 rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
                 let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
-                let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
-                    .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
                     value: aggregate_target_rows(&rows, func, field, column.as_deref()),
@@ -14733,9 +14725,6 @@ where
                 let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
-                    if !predicates_match(&filter, &pk, &value) {
-                        continue;
-                    }
                     let key = group_value(&pk, &value, group, group_column.as_deref());
                     groups.entry(key).or_default().push((pk, value));
                 }
@@ -15720,20 +15709,13 @@ where
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
                 let rows = self.scan_rows(&mut txn, &table, &filter, cap)?;
-                let mut rows: Vec<(Vec<u8>, Vec<u8>)> = rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
-                    .collect();
+                let mut rows = rows;
                 rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
                 let mut txn = self.begin_read_only(isolation)?;
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
-                let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
-                    .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
                     value: aggregate_target_rows(&rows, func, field, column.as_deref()),
@@ -15754,9 +15736,6 @@ where
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
-                    if !predicates_match(&filter, &pk, &value) {
-                        continue;
-                    }
                     let key = group_value(&pk, &value, group, group_column.as_deref());
                     groups.entry(key).or_default().push((pk, value));
                 }
