@@ -17326,6 +17326,16 @@ mod tests {
             "docs",
             br#"{"tenant_id":"tenant-b","body":"must stay hidden"}"#,
         ));
+
+        let restored = Executor::new(String::from("tenant-a"), String::from("d"))
+            .with_role(String::from("authenticated"));
+        restored.restore_schema_snapshot(executor.schema_snapshot()).unwrap();
+        assert!(!restored
+            .row_allowed_by_rls("docs", br#"{"tenant_id":"tenant-b","body":"must stay hidden"}"#,));
+        assert!(!restored.row_allowed_for_write(
+            "docs",
+            br#"{"tenant_id":"tenant-b","body":"must stay hidden"}"#,
+        ));
     }
 
     #[tokio::test]
