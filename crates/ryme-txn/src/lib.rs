@@ -568,13 +568,17 @@ impl Transaction {
     }
 
     pub fn record_read(&mut self, key: RecordKey, existed: bool) -> Result<()> {
+        self.record_read_ref(&key, existed)
+    }
+
+    fn record_read_ref(&mut self, key: &RecordKey, existed: bool) -> Result<()> {
         if self.read_only {
             return Ok(());
         }
-        if self.read_set.contains(&key) {
+        if self.read_set.contains(key) {
             return Ok(());
         }
-        let key_bytes = transaction_key_bytes(&key);
+        let key_bytes = transaction_key_bytes(key);
         let added_bytes = key_bytes.saturating_add(key_bytes.saturating_add(1));
         self.ensure_growth(
             self.read_set.len() < MAX_TRANSACTION_READ_KEYS,
@@ -583,7 +587,7 @@ impl Transaction {
         )?;
         self.read_set.insert(key.clone());
         if !existed {
-            self.observed_missing.insert(key);
+            self.observed_missing.insert(key.clone());
         }
         self.state_bytes = self.state_bytes.saturating_add(added_bytes);
         Ok(())
@@ -1152,7 +1156,7 @@ impl TxnManager {
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
             engine.read(key, txn.read_ts, now_unix())?
         };
-        txn.record_read(key.clone(), value.is_some())?;
+        txn.record_read_ref(key, value.is_some())?;
         Ok(value)
     }
 
@@ -1188,7 +1192,7 @@ impl TxnManager {
         }
         for (key, value) in keys.iter().zip(&values) {
             if !txn.writes.contains_key(key) {
-                txn.record_read(key.clone(), value.is_some())?;
+                txn.record_read_ref(key, value.is_some())?;
             }
         }
         Ok(values)
@@ -1217,7 +1221,7 @@ impl TxnManager {
             engine.read_with_presence(key, txn.read_ts, now)?
         };
         let value = if has_version { value } else { fallback()? };
-        txn.record_read(key.clone(), value.is_some())?;
+        txn.record_read_ref(key, value.is_some())?;
         Ok(value)
     }
 
@@ -2941,7 +2945,7 @@ impl DurableManager {
                             staged.value.clone()
                         };
                     } else {
-                        txn.record_read(key.clone(), values[index].is_some())?;
+                        txn.record_read_ref(key, values[index].is_some())?;
                     }
                 }
                 Ok(values)
