@@ -132,6 +132,86 @@ fn validate_role_catalog(roles: &BTreeMap<String, RoleDefinition>) -> Result<()>
     Ok(())
 }
 
+fn validate_rls_policy_catalog(snapshot: &SchemaSnapshot) -> Result<()> {
+    for (key, policy) in &snapshot.rls_policies {
+        if policy.name.is_empty()
+            || policy.table.is_empty()
+            || key != &format!("{}\0{}", policy.table, policy.name)
+        {
+            return Err(RymeError::Corrupt(String::from("invalid RLS policy identity")));
+        }
+
+        let command = policy.command.to_ascii_uppercase();
+        let read = matches!(command.as_str(), "ALL" | "SELECT" | "UPDATE" | "DELETE");
+        let write = matches!(command.as_str(), "ALL" | "INSERT" | "UPDATE" | "DELETE");
+        if !matches!(command.as_str(), "ALL" | "SELECT" | "INSERT" | "UPDATE" | "DELETE")
+            || policy.read != read
+            || policy.write != write
+        {
+            return Err(RymeError::Corrupt(format!("invalid RLS policy command {}", policy.name)));
+        }
+
+        let mut targets = HashSet::new();
+        for target in &policy.roles {
+            let normalized = target.to_ascii_lowercase();
+            if target.is_empty()
+                || target.eq_ignore_ascii_case("PUBLIC")
+                || !targets.insert(normalized)
+                || (!is_builtin_sql_role(target)
+                    && !snapshot.roles.values().any(|role| role.name.eq_ignore_ascii_case(target)))
+            {
+                return Err(RymeError::Corrupt(format!(
+                    "invalid RLS policy role in {}",
+                    policy.name
+                )));
+            }
+        }
+
+        let expressions = policy.using.iter().chain(policy.check.iter());
+        let mut column: Option<String> = None;
+        let mut allow_all = false;
+        let mut has_expression = false;
+        for expression in expressions {
+            has_expression = true;
+            if expression.trim().eq_ignore_ascii_case("true") {
+                allow_all = true;
+                continue;
+            }
+            let Some(expression_column) = policy_tenant_column(expression) else {
+                return Err(RymeError::Corrupt(format!(
+                    "unsupported RLS policy expression in {}",
+                    policy.name
+                )));
+            };
+            if column.as_deref().is_some_and(|current| current != expression_column) {
+                return Err(RymeError::Corrupt(format!(
+                    "inconsistent RLS policy columns in {}",
+                    policy.name
+                )));
+            }
+            column = Some(expression_column);
+        }
+
+        if !has_expression {
+            if policy.name != format!("__config__{}", policy.table) || !policy.roles.is_empty() {
+                return Err(RymeError::Corrupt(format!(
+                    "missing RLS policy expression in {}",
+                    policy.name
+                )));
+            }
+        } else {
+            let expected_column = column.or_else(|| allow_all.then(String::new));
+            if expected_column.as_deref() != Some(policy.column.as_str()) {
+                return Err(RymeError::Corrupt(format!(
+                    "RLS policy column mismatch in {}",
+                    policy.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 const fn default_role_login() -> bool {
     false
 }
@@ -975,12 +1055,16 @@ fn schema_snapshot_object_count(snapshot: &SchemaSnapshot) -> Result<usize> {
     add(snapshot.rls_enabled.len())?;
     add(snapshot.rls_forced.len())?;
     add(snapshot.rls_policies.len())?;
+    for policy in snapshot.rls_policies.values() {
+        add(policy.roles.len())?;
+    }
     Ok(count)
 }
 
 fn schema_snapshot_bytes(snapshot: &SchemaSnapshot) -> Result<Vec<u8>> {
-    validate_role_catalog(&snapshot.roles)?;
     schema_snapshot_object_count(snapshot)?;
+    validate_role_catalog(&snapshot.roles)?;
+    validate_rls_policy_catalog(snapshot)?;
     let bytes = serde_json::to_vec(snapshot)
         .map_err(|error| RymeError::Internal(format!("schema snapshot: {error}")))?;
     if bytes.len() > MAX_SCHEMA_SNAPSHOT_BYTES {
@@ -7999,6 +8083,15 @@ where
         }
         let mut roles =
             self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        if self
+            .rls_policies
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("RLS policy lock")))?
+            .values()
+            .any(|policy| policy.roles.iter().any(|target| target.eq_ignore_ascii_case(name)))
+        {
+            return Err(RymeError::Conflict(format!("role {name} is used by an RLS policy")));
+        }
         let key = roles.keys().find(|key| key.eq_ignore_ascii_case(name)).cloned();
         let removed = key.and_then(|key| roles.remove(&key)).is_some();
         drop(roles);
@@ -8234,17 +8327,15 @@ where
         using: Option<&str>,
         check: Option<&str>,
     ) -> Result<()> {
-        if !roles.is_empty() {
-            let defined_roles =
-                self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
-            for target in roles {
-                let builtin =
-                    BUILTIN_SQL_ROLES.iter().any(|builtin| builtin.eq_ignore_ascii_case(target));
-                if !builtin
-                    && !defined_roles.values().any(|role| role.name.eq_ignore_ascii_case(target))
-                {
-                    return Err(RymeError::InvalidArgument(format!("policy role {target}")));
-                }
+        let defined_roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        for target in roles {
+            let builtin =
+                BUILTIN_SQL_ROLES.iter().any(|builtin| builtin.eq_ignore_ascii_case(target));
+            if !builtin
+                && !defined_roles.values().any(|role| role.name.eq_ignore_ascii_case(target))
+            {
+                return Err(RymeError::InvalidArgument(format!("policy role {target}")));
             }
         }
         let expressions = using.into_iter().chain(check);
@@ -8297,6 +8388,7 @@ where
         }
         policies.insert(key, policy);
         drop(policies);
+        drop(defined_roles);
         self.rebuild_rls_policy_maps()?;
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
@@ -17627,6 +17719,51 @@ mod tests {
         .is_ok());
     }
 
+    #[test]
+    fn schema_snapshot_rejects_invalid_rls_policy_scopes() {
+        let mut snapshot = SchemaSnapshot::default();
+        snapshot.roles.insert(
+            String::from("app_reader"),
+            RoleDefinition {
+                name: String::from("app_reader"),
+                login: false,
+                superuser: false,
+                createdb: false,
+                createrole: false,
+                inherit: true,
+            },
+        );
+        snapshot.rls_policies.insert(
+            String::from("docs\0owner"),
+            RlsPolicy {
+                name: String::from("owner"),
+                table: String::from("docs"),
+                column: String::from("owner_id"),
+                command: String::from("SELECT"),
+                using: Some(String::from("auth.uid() = owner_id")),
+                check: None,
+                roles: vec![String::from("app_reader")],
+                read: true,
+                write: false,
+            },
+        );
+        assert!(validate_schema_snapshot(&snapshot).is_ok());
+
+        let mut malformed = snapshot.clone();
+        malformed.rls_policies.get_mut("docs\0owner").unwrap().roles =
+            vec![String::from("PUBLIC"), String::from("app_reader")];
+        assert!(matches!(validate_schema_snapshot(&malformed), Err(RymeError::Corrupt(_))));
+
+        let mut malformed = snapshot.clone();
+        malformed.rls_policies.get_mut("docs\0owner").unwrap().write = true;
+        assert!(matches!(validate_schema_snapshot(&malformed), Err(RymeError::Corrupt(_))));
+
+        let mut malformed = snapshot;
+        malformed.rls_policies.get_mut("docs\0owner").unwrap().roles =
+            vec![String::from("missing_role")];
+        assert!(matches!(validate_schema_snapshot(&malformed), Err(RymeError::Corrupt(_))));
+    }
+
     #[tokio::test]
     async fn rls_policy_role_scope_does_not_leak_to_other_roles() {
         let executor = Executor::new(String::from("tenant-a"), String::from("d"));
@@ -17702,6 +17839,38 @@ mod tests {
         let unrelated = executor.with_role(String::from("authenticated"));
         let rows = unrelated.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
         assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn role_cannot_be_dropped_while_targeted_by_rls_policy() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor.execute(parse("CREATE ROLE app_reader").unwrap()).await.unwrap();
+        executor
+            .execute(
+                parse("CREATE TABLE scoped_docs (id TEXT PRIMARY KEY, owner_id TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE POLICY app_reader_docs ON scoped_docs FOR SELECT TO app_reader USING (auth.uid() = owner_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let result = executor.execute(parse("DROP ROLE app_reader").unwrap()).await;
+        assert!(
+            matches!(result, Err(RymeError::Conflict(message)) if message.contains("RLS policy"))
+        );
+
+        executor
+            .execute(parse("DROP POLICY app_reader_docs ON scoped_docs").unwrap())
+            .await
+            .unwrap();
+        executor.execute(parse("DROP ROLE app_reader").unwrap()).await.unwrap();
     }
 
     #[tokio::test]
