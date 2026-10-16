@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 ryme-error = { workspace = true }
+rustc-hash = "2.1.3"
 serde = { workspace = true }

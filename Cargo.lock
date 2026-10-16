@@ -1900,6 +1900,7 @@ dependencies = [
 name = "ryme-index"
 version = "0.1.0"
 dependencies = [
+ "rustc-hash",
  "ryme-error",
  "serde",
 ]

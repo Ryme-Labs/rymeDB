@@ -1,0 +1,37 @@
+{
+  "experiment": "hnsw-visited-set-fxhash",
+  "captured_date": "2026-10-17",
+  "description": "Three sequential release-mode runs comparing the existing reserved std HashSet against FxHashSet for internal HNSW node positions.",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "parameters": {
+    "vectors": 10240,
+    "dimensions": 64,
+    "partitions": 4,
+    "queries": 300,
+    "top_k": 10,
+    "ann_ef": 64,
+    "build_profile": "release",
+    "command": "ryme-bench vector-index --vectors 10240 --dimensions 64 --queries 300 --partitions 4 --top-k 10 --ann-ef 64 --json"
+  },
+  "baseline_revision": "0f4248b",
+  "baseline_experiment": "vector-hnsw-visited-capacity.json:visited_capacity_ef_times_m_capped_by_node_count",
+  "results": {
+    "reserved_std_hashset": [
+      { "adaptive_ann_p50_ns": 600176, "adaptive_ann_p95_ns": 684616, "adaptive_ann_p99_ns": 975617, "adaptive_ann_qps": 1624.464, "exact_p50_ns": 954767, "index_build_ns": 1082143548, "mean_recall_at_k": 0.9730005 },
+      { "adaptive_ann_p50_ns": 593814, "adaptive_ann_p95_ns": 674898, "adaptive_ann_p99_ns": 864627, "adaptive_ann_qps": 1654.120, "exact_p50_ns": 937064, "index_build_ns": 1070043058, "mean_recall_at_k": 0.9730005 },
+      { "adaptive_ann_p50_ns": 597982, "adaptive_ann_p95_ns": 633369, "adaptive_ann_p99_ns": 654379, "adaptive_ann_qps": 1666.692, "exact_p50_ns": 966460, "index_build_ns": 1038607350, "mean_recall_at_k": 0.9730005 }
+    ],
+    "fxhashset": [
+      { "adaptive_ann_p50_ns": 510187, "adaptive_ann_p95_ns": 737988, "adaptive_ann_p99_ns": 783854, "adaptive_ann_qps": 1833.595, "exact_p50_ns": 1001998, "index_build_ns": 851190639, "mean_recall_at_k": 0.9730000000000005 },
+      { "adaptive_ann_p50_ns": 506550, "adaptive_ann_p95_ns": 590539, "adaptive_ann_p99_ns": 675990, "adaptive_ann_qps": 1928.702, "exact_p50_ns": 998481, "index_build_ns": 829227809, "mean_recall_at_k": 0.9730000000000005 },
+      { "adaptive_ann_p50_ns": 500918, "adaptive_ann_p95_ns": 734701, "adaptive_ann_p99_ns": 893792, "adaptive_ann_qps": 1899.738, "exact_p50_ns": 982801, "index_build_ns": 837121096, "mean_recall_at_k": 0.9730000000000005 }
+    ]
+  },
+  "caveat": "Median ANN p50 improved about 15.3%, median QPS about 14.9%, and median index-build time about 21.8%. Recall stayed unchanged. Runs used one host and p95/p99 varied; validate on larger graphs, varied dimensions, and concurrent mixed database workloads before making broad performance claims."
+}

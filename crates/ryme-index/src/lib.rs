@@ -242,7 +242,7 @@ impl HnswIndex {
 
     fn beam(&self, query: &[f32], starts: &[usize], ef: usize, layer: usize) -> Vec<(f64, usize)> {
         use std::cmp::Ordering;
-        use std::collections::{BinaryHeap, HashSet};
+        use std::collections::BinaryHeap;
         #[derive(Clone, Copy)]
         struct Scored(f64, usize);
         impl PartialEq for Scored {
@@ -261,7 +261,11 @@ impl HnswIndex {
                 self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal).then(self.1.cmp(&other.1))
             }
         }
-        let mut visited = HashSet::with_capacity(ef.saturating_mul(HNSW_M).min(self.nodes.len()));
+        // Positions are internal dense integers, so keyed collision resistance is unnecessary.
+        let mut visited = rustc_hash::FxHashSet::with_capacity_and_hasher(
+            ef.saturating_mul(HNSW_M).min(self.nodes.len()),
+            Default::default(),
+        );
         visited.extend(starts.iter().copied());
         let mut candidates: BinaryHeap<Scored> = BinaryHeap::with_capacity(ef);
         let mut results: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(ef);
