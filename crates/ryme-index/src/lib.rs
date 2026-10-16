@@ -82,7 +82,6 @@ where
 #[derive(Debug, Default)]
 struct VectorSpace {
     dim: usize,
-    vectors: HashMap<String, Vec<f32>>,
     ann: HnswIndex,
 }
 
@@ -378,21 +377,21 @@ impl VectorSpace {
         if self.dim != 0 && vector.len() != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
-        if !self.vectors.contains_key(&id) && self.vectors.len() >= MAX_VECTORS_PER_SPACE {
+        if !self.ann.id_to_pos.contains_key(&id)
+            && self.ann.id_to_pos.len() >= MAX_VECTORS_PER_SPACE
+        {
             return Err(RymeError::Overload(String::from("vector space")));
         }
         let normalized = normalize(&vector)?;
         let dim = if self.dim == 0 { vector.len() } else { self.dim };
-        self.ann.upsert(dim, id.clone(), normalized.clone())?;
+        self.ann.upsert(dim, id, normalized)?;
         self.dim = dim;
-        self.vectors.insert(id, normalized);
         Ok(())
     }
 
     fn remove(&mut self, id: &str) -> bool {
-        self.ann.remove(id);
-        let removed = self.vectors.remove(id).is_some();
-        if removed && self.vectors.is_empty() {
+        let removed = self.ann.remove(id);
+        if removed && self.ann.id_to_pos.is_empty() {
             self.ann = HnswIndex::default();
         }
         removed
@@ -411,7 +410,8 @@ impl VectorSpace {
         }
         let normalized: Vec<f64> = query.iter().map(|v| (*v as f64) / norm).collect();
         Ok(top_k_vector_hits(
-            self.vectors.iter().map(|(id, stored)| {
+            self.ann.id_to_pos.iter().map(|(id, pos)| {
+                let stored = &self.ann.nodes[*pos].vector;
                 let score =
                     stored.iter().zip(normalized.iter()).map(|(a, b)| (*a as f64) * b).sum();
                 VectorHit { id: id.clone(), score }
@@ -656,7 +656,7 @@ impl IndexRegistry {
 
     fn remove_empty_space(&mut self, space: &str) {
         let vectors_empty =
-            self.vectors.get(space).is_none_or(|vectors| vectors.vectors.is_empty());
+            self.vectors.get(space).is_none_or(|vectors| vectors.ann.id_to_pos.is_empty());
         let texts_empty = self.texts.get(space).is_none_or(|texts| texts.docs.is_empty());
         if vectors_empty && texts_empty {
             self.vectors.remove(space);
@@ -744,7 +744,7 @@ impl PartitionedIndex {
         let is_new = !self.partitions[partition]
             .vectors
             .get(space)
-            .is_some_and(|vectors| vectors.vectors.contains_key(&id));
+            .is_some_and(|vectors| vectors.ann.id_to_pos.contains_key(&id));
         if is_new && self.vector_counts.get(space).copied().unwrap_or(0) >= MAX_VECTORS_PER_SPACE {
             return Err(RymeError::Overload(String::from("vector space")));
         }
