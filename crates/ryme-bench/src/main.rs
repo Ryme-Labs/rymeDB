@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use ryme_index::PartitionedIndex;
 use ryme_shard::{ShardSet, TableRef};
 use ryme_storage::{Engine, ImmutableSegment, RecordKey, SegmentEntry, SegmentStore, StorageMode};
-use ryme_txn::{SyncPolicy, TxnBackend, TxnManager};
+use ryme_txn::{DurableManager, SyncPolicy, Transaction, TxnBackend, TxnManager};
 use serde::Deserialize;
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
@@ -175,6 +175,8 @@ enum Command {
         batch_size: usize,
         #[arg(long, default_value_t = 128)]
         value_bytes: usize,
+        #[arg(long, help = "Benchmark disk-backed Standard storage mode")]
+        standard_mode: bool,
         #[arg(long)]
         json: bool,
     },
@@ -321,8 +323,17 @@ async fn main() {
             iterations,
             batch_size,
             value_bytes,
+            standard_mode,
             json,
-        }) => txn_read_batch_bench(records, candidates, iterations, batch_size, value_bytes, json),
+        }) => txn_read_batch_bench(
+            records,
+            candidates,
+            iterations,
+            batch_size,
+            value_bytes,
+            standard_mode,
+            json,
+        ),
         Some(Command::Realtime {
             addr,
             api_key,
@@ -2113,12 +2124,80 @@ async fn run_sql_worker(task: SqlTask) -> (Vec<u64>, u64) {
     (latencies, errors)
 }
 
+enum BatchReadStore {
+    Hot(TxnManager),
+    Standard(DurableManager),
+}
+
+impl BatchReadStore {
+    fn begin(&self) -> ryme_txn::Transaction {
+        match self {
+            Self::Hot(manager) => manager.begin(),
+            Self::Standard(manager) => manager.begin(),
+        }
+    }
+
+    fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
+        match self {
+            Self::Hot(manager) => manager.put(txn, key, value),
+            Self::Standard(manager) => manager.put(txn, key, value),
+        }
+    }
+
+    fn commit(&self, txn: Transaction) -> ryme_error::Result<u64> {
+        match self {
+            Self::Hot(manager) => manager.commit(txn),
+            Self::Standard(manager) => manager.commit(txn),
+        }
+    }
+
+    fn get(&self, txn: &mut Transaction, key: &RecordKey) -> ryme_error::Result<Option<Vec<u8>>> {
+        match self {
+            Self::Hot(manager) => manager.get(txn, key),
+            Self::Standard(manager) => manager.get(txn, key),
+        }
+    }
+
+    fn get_many(
+        &self,
+        txn: &mut Transaction,
+        keys: &[RecordKey],
+    ) -> ryme_error::Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Hot(manager) => manager.get_many(txn, keys),
+            Self::Standard(manager) => manager.get_many(txn, keys),
+        }
+    }
+}
+
+struct BenchTempDir(std::path::PathBuf);
+
+impl BenchTempDir {
+    fn create() -> std::io::Result<Self> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("ryme-bench-txn-batch-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for BenchTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn txn_read_batch_bench(
     records: usize,
     candidates: usize,
     iterations: usize,
     batch_size: usize,
     value_bytes: usize,
+    standard_mode: bool,
     json: bool,
 ) {
     if records == 0 || candidates == 0 || candidates > records || iterations == 0 || batch_size == 0
@@ -2127,7 +2206,34 @@ fn txn_read_batch_bench(
         return;
     }
 
-    let manager = TxnManager::new();
+    let temp_dir = if standard_mode {
+        match BenchTempDir::create() {
+            Ok(temp_dir) => Some(temp_dir),
+            Err(error) => {
+                eprintln!("failed to create temporary benchmark directory: {error}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let manager = if let Some(temp_dir) = temp_dir.as_ref() {
+        match DurableManager::open_with_mode(
+            &temp_dir.0,
+            64 * 1024 * 1024,
+            SyncPolicy::Never,
+            64 * 1024 * 1024,
+            StorageMode::Standard,
+        ) {
+            Ok(manager) => BatchReadStore::Standard(manager),
+            Err(error) => {
+                eprintln!("failed to initialize Standard-mode benchmark: {error}");
+                return;
+            }
+        }
+    } else {
+        BatchReadStore::Hot(TxnManager::new())
+    };
     let value = vec![b'x'; value_bytes];
     let mut keys = Vec::with_capacity(records);
     let mut seed = manager.begin();
@@ -2186,6 +2292,7 @@ fn txn_read_batch_bench(
         "iterations": iterations,
         "batch_size": batch_size,
         "value_bytes": value_bytes,
+        "storage_mode": if standard_mode { "standard" } else { "hot" },
         "single_read": single,
         "read_only_single_read": read_only,
         "batched_read": batched,
@@ -2207,7 +2314,7 @@ fn txn_read_batch_bench(
     }
 }
 
-fn measure_single_reads(manager: &TxnManager, keys: &[RecordKey], read_only: bool) -> u64 {
+fn measure_single_reads(manager: &BatchReadStore, keys: &[RecordKey], read_only: bool) -> u64 {
     let mut txn = manager.begin();
     if read_only {
         txn.set_read_only().expect("benchmark read-only mode");
@@ -2221,7 +2328,7 @@ fn measure_single_reads(manager: &TxnManager, keys: &[RecordKey], read_only: boo
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn measure_batched_reads(manager: &TxnManager, keys: &[RecordKey], batch_size: usize) -> u64 {
+fn measure_batched_reads(manager: &BatchReadStore, keys: &[RecordKey], batch_size: usize) -> u64 {
     let mut txn = manager.begin();
     let started = Instant::now();
     let mut found = 0usize;

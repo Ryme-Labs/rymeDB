@@ -29,6 +29,31 @@ under optimistic concurrency control. Use a single worker when measuring
 overwrite cost without concurrent conflicts. This is a core microbenchmark, not
 an end-to-end database comparison.
 
+To compare tracked single-key reads with read-only and batched reads in both
+storage modes:
+
+```bash
+cargo run --locked -j 1 -p ryme-bench -- txn-read-batch \
+  --records 10000 --candidates 1024 --iterations 100 --batch-size 256 --json
+cargo run --locked -j 1 -p ryme-bench -- txn-read-batch \
+  --records 10000 --candidates 1024 --iterations 100 --batch-size 256 \
+  --standard-mode --json
+```
+
+Standard mode seeds a temporary segment-backed database, warms its cache, and
+removes the temporary directory after the run. This measures cached point-read
+overhead, not cold disk latency or a full networked deployment. Compare modes
+on the same idle machine; the output includes the storage mode and read
+percentiles.
+
+Two sequential release captures on an AMD Ryzen 5 4500 (10,000 records,
+1,024 reads/iteration, 100 iterations, 256-key batches) measured Standard-mode
+batch p50 at 1.403–1.410 ms versus 1.645–1.646 ms for individual reads (1.17×
+in both captures). Hot-mode results varied between a small batch win and a
+small loss, so this change does not establish a reliable Hot-mode speedup.
+These are single-host microbenchmarks, not cross-database claims; see the
+[raw captures](../bench/results/txn-read-batch-standard.json).
+
 To measure the in-memory vector index's build, exact-search, and HNSW-search
 paths with the same generated corpus:
 

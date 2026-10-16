@@ -1,0 +1,111 @@
+{
+  "benchmark": "transaction-batch-read",
+  "profile": "release",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "records": 10000,
+  "candidates_per_iteration": 1024,
+  "iterations": 100,
+  "batch_size": 256,
+  "value_bytes": 128,
+  "notes": "Two sequential release captures per mode on the same idle host. Standard mode uses a warmed 64 MiB segment cache and SyncPolicy::Never; timings cover cached in-process transaction reads, not cold disk or network latency.",
+  "runs": [
+    {
+      "storage_mode": "standard",
+      "single_read": {
+        "p50_ns": 1645725,
+        "p95_ns": 1710046,
+        "p99_ns": 1775360,
+        "rows_per_second": 615477
+      },
+      "read_only_single_read": {
+        "p50_ns": 865218,
+        "p95_ns": 928397,
+        "p99_ns": 955860,
+        "rows_per_second": 1166550
+      },
+      "batched_read": {
+        "p50_ns": 1409908,
+        "p95_ns": 1472056,
+        "p99_ns": 1482366,
+        "rows_per_second": 718033
+      },
+      "p50_speedup": 1.17,
+      "read_only_p50_speedup": 1.9
+    },
+    {
+      "storage_mode": "standard",
+      "single_read": {
+        "p50_ns": 1645213,
+        "p95_ns": 1751024,
+        "p99_ns": 1783997,
+        "rows_per_second": 617221
+      },
+      "read_only_single_read": {
+        "p50_ns": 861431,
+        "p95_ns": 922856,
+        "p99_ns": 973282,
+        "rows_per_second": 1176840
+      },
+      "batched_read": {
+        "p50_ns": 1402775,
+        "p95_ns": 1458020,
+        "p99_ns": 1480913,
+        "rows_per_second": 726057
+      },
+      "p50_speedup": 1.17,
+      "read_only_p50_speedup": 1.91
+    },
+    {
+      "storage_mode": "hot",
+      "single_read": {
+        "p50_ns": 1115581,
+        "p95_ns": 1176005,
+        "p99_ns": 1374732,
+        "rows_per_second": 909153
+      },
+      "read_only_single_read": {
+        "p50_ns": 339703,
+        "p95_ns": 350353,
+        "p99_ns": 356825,
+        "rows_per_second": 2981349
+      },
+      "batched_read": {
+        "p50_ns": 998761,
+        "p95_ns": 1059395,
+        "p99_ns": 1340297,
+        "rows_per_second": 1013263
+      },
+      "p50_speedup": 1.12,
+      "read_only_p50_speedup": 3.28
+    },
+    {
+      "storage_mode": "hot",
+      "single_read": {
+        "p50_ns": 1039577,
+        "p95_ns": 1110903,
+        "p99_ns": 1187839,
+        "rows_per_second": 969701
+      },
+      "read_only_single_read": {
+        "p50_ns": 338060,
+        "p95_ns": 403955,
+        "p99_ns": 426236,
+        "rows_per_second": 2975766
+      },
+      "batched_read": {
+        "p50_ns": 1066919,
+        "p95_ns": 1129007,
+        "p99_ns": 1148594,
+        "rows_per_second": 946830
+      },
+      "p50_speedup": 0.97,
+      "read_only_p50_speedup": 3.08
+    }
+  ]
+}
