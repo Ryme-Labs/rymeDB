@@ -1980,6 +1980,8 @@ impl TxnManager {
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let recovery_floor =
+            max.saturating_add(1).max(self.inner.applied.load(Ordering::SeqCst).saturating_add(1));
         {
             let mut engine = self
                 .inner
@@ -1988,15 +1990,14 @@ impl TxnManager {
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
             engine.replace_from(snapshot);
         }
-        guard.clear_through(max);
+        guard.clear_through(recovery_floor);
         self.inner
             .pending
             .lock()
             .map_err(|_| RymeError::Internal(String::from("pending commits")))?
             .clear();
-        let visible_ts = max.saturating_add(1);
-        self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
-        self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
+        self.inner.clock.store(recovery_floor, Ordering::SeqCst);
+        self.inner.applied.store(recovery_floor, Ordering::SeqCst);
         Ok(max)
     }
 
@@ -2021,20 +2022,21 @@ impl TxnManager {
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let recovery_floor =
+            max.saturating_add(1).max(self.inner.applied.load(Ordering::SeqCst).saturating_add(1));
         self.inner
             .engine
             .write()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?
             .replace_from(snapshot);
-        guard.clear_through(max);
+        guard.clear_through(recovery_floor);
         self.inner
             .pending
             .lock()
             .map_err(|_| RymeError::Internal(String::from("pending commits")))?
             .clear();
-        let visible_ts = max.saturating_add(1);
-        self.inner.clock.store(visible_ts, Ordering::SeqCst);
-        self.inner.applied.store(visible_ts, Ordering::SeqCst);
+        self.inner.clock.store(recovery_floor, Ordering::SeqCst);
+        self.inner.applied.store(recovery_floor, Ordering::SeqCst);
         Ok(max)
     }
 }
@@ -3644,6 +3646,39 @@ mod tests {
             manager.commit(restored),
             Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
         ));
+    }
+
+    #[test]
+    fn point_in_time_restore_fences_transactions_from_discarded_future() {
+        let manager = TxnManager::new();
+        let retained_key = RecordKey::new("t", "d", "restore-fence", b"retained");
+        let discarded_key = RecordKey::new("t", "d", "restore-fence", b"discarded");
+        let output_key = RecordKey::new("t", "d", "restore-fence", b"output");
+
+        let mut first = manager.begin();
+        manager.put(&mut first, retained_key, b"at restore point".to_vec());
+        manager.commit(first).unwrap();
+        let restore_point = manager.encode_snapshot().unwrap();
+
+        let mut later = manager.begin();
+        manager.put(&mut later, discarded_key, b"discarded by restore".to_vec());
+        manager.commit(later).unwrap();
+
+        let mut stale = manager.begin();
+        manager.put(&mut stale, output_key, b"based on discarded future".to_vec());
+        let stale_state = stale.state();
+        drop(stale);
+
+        manager.restore_snapshot(&restore_point).unwrap();
+
+        let restored = manager.from_state(stale_state).unwrap();
+        assert!(matches!(
+            manager.commit(restored),
+            Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
+        ));
+
+        let fresh = manager.begin();
+        assert_eq!(fresh.read_ts, manager.latest_commit());
     }
 
     #[test]
