@@ -203,10 +203,15 @@ policy declarations:
 ```sql
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 CREATE POLICY messages_owner ON messages
-  FOR ALL
+  FOR ALL TO authenticated
   USING (auth.uid() = user_id)
   WITH CHECK (auth.uid() = user_id);
 ```
+
+Omitting `TO` or using `TO PUBLIC` applies the policy to every role. A policy
+targeted with `TO role[, role...]` applies only when the request uses one of
+those roles; the role names must already exist. Role membership inheritance is
+not implemented, so target the effective request role directly.
 
 For SQL policies, `auth.uid()` is the authenticated JWT `sub` identity. It is
 distinct from the tenant claim. Configure `rls_tables` when rows should be

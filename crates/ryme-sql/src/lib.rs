@@ -206,6 +206,8 @@ pub enum Statement {
         table: String,
         command: String,
         #[serde(default)]
+        roles: Vec<String>,
+        #[serde(default)]
         using: Option<String>,
         #[serde(default)]
         check: Option<String>,
@@ -916,6 +918,9 @@ pub struct RlsPolicy {
     pub using: Option<String>,
     #[serde(default)]
     pub check: Option<String>,
+    /// Empty means PUBLIC, preserving the scope of older snapshots.
+    #[serde(default)]
+    pub roles: Vec<String>,
     pub read: bool,
     pub write: bool,
 }
@@ -1194,6 +1199,37 @@ fn merge_uid_rls_policy_column(map: &mut HashMap<String, Vec<String>>, table: &s
     } else if !columns.iter().any(|existing| existing == column) {
         columns.push(column.to_string());
     }
+}
+
+fn rls_policy_maps_for_role<'a>(
+    policies: impl Iterator<Item = &'a RlsPolicy>,
+    role: Option<&str>,
+) -> RlsPolicyMaps {
+    let mut maps = RlsPolicyMaps::default();
+    for policy in policies {
+        if role.is_some_and(|role| {
+            !policy.roles.is_empty()
+                && !policy.roles.iter().any(|target| target.eq_ignore_ascii_case(role))
+        }) {
+            continue;
+        }
+        let is_uid_policy = policy_uses_auth_uid(policy) || policy.column.is_empty();
+        if policy.read {
+            if is_uid_policy {
+                merge_uid_rls_policy_column(&mut maps.uid_read, &policy.table, &policy.column);
+            } else {
+                merge_rls_policy_column(&mut maps.tenant_read, &policy.table, &policy.column);
+            }
+        }
+        if policy.write {
+            if is_uid_policy {
+                merge_uid_rls_policy_column(&mut maps.uid_write, &policy.table, &policy.column);
+            } else {
+                merge_rls_policy_column(&mut maps.tenant_write, &policy.table, &policy.column);
+            }
+        }
+    }
+    maps
 }
 
 fn policy_uses_auth_uid(policy: &RlsPolicy) -> bool {
@@ -3400,13 +3436,29 @@ fn parse_create_policy(tokens: &[String], raw: &str) -> Result<Statement> {
             return Err(RymeError::InvalidArgument(String::from("unsupported RLS policy mode")));
         }
     }
-    if let Some(to_index) = (3..options_end).find(|index| tokens[*index].eq_ignore_ascii_case("TO"))
+    let roles = if let Some(to_index) =
+        (3..options_end).find(|index| tokens[*index].eq_ignore_ascii_case("TO"))
     {
-        let roles = &tokens[to_index + 1..options_end];
-        if roles.len() != 1 || !roles[0].eq_ignore_ascii_case("PUBLIC") {
-            return Err(RymeError::InvalidArgument(String::from("unsupported RLS policy roles")));
+        let role_tokens = &tokens[to_index + 1..options_end];
+        let roles: Vec<String> = role_tokens
+            .iter()
+            .filter(|token| token.as_str() != ",")
+            .map(|token| unquote(token))
+            .collect();
+        if roles.is_empty()
+            || roles.iter().any(|role| role.is_empty())
+            || (roles.iter().any(|role| role.eq_ignore_ascii_case("PUBLIC")) && roles.len() != 1)
+        {
+            return Err(RymeError::InvalidArgument(String::from("RLS policy roles")));
         }
-    }
+        if roles[0].eq_ignore_ascii_case("PUBLIC") {
+            Vec::new()
+        } else {
+            roles
+        }
+    } else {
+        Vec::new()
+    };
     let command = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("FOR"))
@@ -3418,7 +3470,7 @@ fn parse_create_policy(tokens: &[String], raw: &str) -> Result<Statement> {
     if using.is_none() && check.is_none() {
         return Err(RymeError::InvalidArgument(String::from("create policy expression")));
     }
-    Ok(Statement::CreatePolicy { name, table, command, using, check })
+    Ok(Statement::CreatePolicy { name, table, command, roles, using, check })
 }
 
 fn parse_policy_expression(raw: &str, keyword: &str) -> Option<String> {
@@ -7497,6 +7549,7 @@ where
                     command: String::from("ALL"),
                     using: None,
                     check: None,
+                    roles: Vec::new(),
                     read: true,
                     write: true,
                 };
@@ -7535,6 +7588,7 @@ where
                     command: String::from("ALL"),
                     using: None,
                     check: None,
+                    roles: Vec::new(),
                     read: true,
                     write: true,
                 };
@@ -8118,35 +8172,14 @@ where
             .read()
             .map_err(|_| RymeError::Internal(String::from("RLS policy lock")))?
             .clone();
-        let mut reads = HashMap::new();
-        let mut writes = HashMap::new();
-        let mut uid_reads = HashMap::new();
-        let mut uid_writes = HashMap::new();
-        for policy in policies.values() {
-            let is_uid_policy = policy_uses_auth_uid(policy) || policy.column.is_empty();
-            if policy.read {
-                if is_uid_policy {
-                    merge_uid_rls_policy_column(&mut uid_reads, &policy.table, &policy.column);
-                } else {
-                    merge_rls_policy_column(&mut reads, &policy.table, &policy.column);
-                }
-            }
-            if policy.write {
-                if is_uid_policy {
-                    merge_uid_rls_policy_column(&mut uid_writes, &policy.table, &policy.column);
-                } else {
-                    merge_rls_policy_column(&mut writes, &policy.table, &policy.column);
-                }
-            }
-        }
-        *self.rls_maps.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? =
-            RlsPolicyMaps {
-                tenant_read: reads,
-                tenant_write: writes,
-                uid_read: uid_reads,
-                uid_write: uid_writes,
-            };
+        let maps = rls_policy_maps_for_role(policies.values(), None);
+        *self.rls_maps.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? = maps;
         Ok(())
+    }
+
+    fn rls_maps_for_current_role(&self) -> Option<RlsPolicyMaps> {
+        let policies = self.rls_policies.read().ok()?;
+        Some(rls_policy_maps_for_role(policies.values(), Some(&self.role)))
     }
 
     fn install_policy(
@@ -8154,9 +8187,23 @@ where
         name: &str,
         table: &str,
         command: &str,
+        roles: &[String],
         using: Option<&str>,
         check: Option<&str>,
     ) -> Result<()> {
+        if !roles.is_empty() {
+            let defined_roles =
+                self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+            for target in roles {
+                let builtin =
+                    BUILTIN_SQL_ROLES.iter().any(|builtin| builtin.eq_ignore_ascii_case(target));
+                if !builtin
+                    && !defined_roles.values().any(|role| role.name.eq_ignore_ascii_case(target))
+                {
+                    return Err(RymeError::InvalidArgument(format!("policy role {target}")));
+                }
+            }
+        }
         let expressions = using.into_iter().chain(check);
         let mut tenant_column = None;
         let mut allow_all = false;
@@ -8193,6 +8240,7 @@ where
             command,
             using: using.map(str::to_string),
             check: check.map(str::to_string),
+            roles: roles.to_vec(),
             read,
             write,
         };
@@ -8576,6 +8624,7 @@ where
                 command: String::from("ALL"),
                 using: None,
                 check: None,
+                roles: Vec::new(),
                 read: true,
                 write: snapshot.rls_write_tables.contains_key(table),
             };
@@ -8590,6 +8639,7 @@ where
                     command: String::from("ALL"),
                     using: None,
                     check: None,
+                    roles: Vec::new(),
                     read: false,
                     write: true,
                 }
@@ -9001,7 +9051,7 @@ where
     }
 
     fn rls_policy_allows(&self, table: &str, value: &[u8]) -> bool {
-        let Ok(maps) = self.rls_maps.read() else { return false };
+        let Some(maps) = self.rls_maps_for_current_role() else { return false };
         let tenant_column = maps.tenant_read.get(table);
         let uid_column = maps.uid_read.get(table);
         if tenant_column.is_none() && uid_column.is_none() {
@@ -9046,8 +9096,9 @@ where
         if !self.rls_applies_to_role(table) {
             return Ok(());
         }
-        let maps =
-            self.rls_maps.read().map_err(|_| RymeError::Internal(String::from("RLS lock")))?;
+        let maps = self
+            .rls_maps_for_current_role()
+            .ok_or_else(|| RymeError::Internal(String::from("RLS policy lock")))?;
         let tenant_column = maps.tenant_write.get(table);
         let uid_column = maps.uid_write.get(table);
         if tenant_column.is_none() && uid_column.is_none() {
@@ -12855,8 +12906,15 @@ where
             Statement::SequenceValue { operation, name, value, is_called } => {
                 Ok((self.execute_sequence_value(operation, name, value, is_called)?, Vec::new()))
             }
-            Statement::CreatePolicy { name, table, command, using, check } => {
-                self.install_policy(&name, &table, &command, using.as_deref(), check.as_deref())?;
+            Statement::CreatePolicy { name, table, command, roles, using, check } => {
+                self.install_policy(
+                    &name,
+                    &table,
+                    &command,
+                    &roles,
+                    using.as_deref(),
+                    check.as_deref(),
+                )?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::DropPolicy { name, table, if_exists } => {
@@ -15206,8 +15264,15 @@ where
             Statement::SequenceValue { operation, name, value, is_called } => {
                 self.execute_sequence_value(operation, name, value, is_called)
             }
-            Statement::CreatePolicy { name, table, command, using, check } => {
-                self.install_policy(&name, &table, &command, using.as_deref(), check.as_deref())?;
+            Statement::CreatePolicy { name, table, command, roles, using, check } => {
+                self.install_policy(
+                    &name,
+                    &table,
+                    &command,
+                    &roles,
+                    using.as_deref(),
+                    check.as_deref(),
+                )?;
                 Ok(QueryResult::Ok)
             }
             Statement::DropPolicy { name, table, if_exists } => {
@@ -17490,7 +17555,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_parser_rejects_unimplemented_role_and_restrictive_scopes() {
+    fn policy_parser_rejects_only_unimplemented_restrictive_scopes() {
         assert!(parse("CREATE POLICY ON docs USING (true)").is_err());
         assert!(parse(
             "CREATE POLICY admin_rows ON docs AS RESTRICTIVE FOR SELECT TO admin USING (true)"
@@ -17500,11 +17565,75 @@ mod tests {
         assert!(parse(
             "CREATE POLICY app_rows ON docs FOR SELECT TO authenticated USING (auth.uid() = user_id)"
         )
+        .is_ok());
+        assert!(parse(
+            "CREATE POLICY app_rows ON docs FOR SELECT TO authenticated, anon USING (auth.uid() = user_id)"
+        )
+        .is_ok());
+        assert!(parse(
+            "CREATE POLICY bad_scope ON docs FOR SELECT TO PUBLIC, authenticated USING (true)"
+        )
         .is_err());
         assert!(parse(
             "CREATE POLICY public_rows ON docs AS PERMISSIVE FOR SELECT TO PUBLIC USING (true)"
         )
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn rls_policy_role_scope_does_not_leak_to_other_roles() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE scoped_docs (id TEXT PRIMARY KEY, owner_id TEXT, body TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO scoped_docs (id, owner_id, body) VALUES ('owned', 'user-a', 'visible'), ('other', 'user-b', 'hidden')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE POLICY authenticated_docs ON scoped_docs FOR SELECT TO authenticated USING (auth.uid() = owner_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE scoped_docs ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT SELECT ON TABLE scoped_docs TO authenticated, anon").unwrap())
+            .await
+            .unwrap();
+
+        let authenticated = executor
+            .clone()
+            .with_role(String::from("authenticated"))
+            .with_auth_uid(String::from("user-a"));
+        let rows =
+            authenticated.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
+        assert!(
+            matches!(rows, QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"owned")
+        );
+
+        let anonymous = executor.clone().with_role(String::from("anon"));
+        let rows = anonymous.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
+        assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.is_empty()));
+
+        let unrelated = executor.with_role(String::from("authenticated"));
+        let rows = unrelated.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
+        assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.is_empty()));
     }
 
     #[tokio::test]
@@ -18275,7 +18404,7 @@ mod tests {
         executor
             .execute(
                 parse(
-                    "CREATE POLICY own_messages ON messages FOR ALL USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
+                    "CREATE POLICY own_messages ON messages FOR ALL TO authenticated USING (auth.uid() = tenant_id) WITH CHECK (auth.uid() = tenant_id)",
                 )
                 .unwrap(),
             )
@@ -18299,6 +18428,10 @@ mod tests {
         assert!(snapshot.rls_enabled.contains("messages"));
         assert!(snapshot.rls_forced.contains("messages"));
         assert!(snapshot.rls_policies.keys().any(|key| key.ends_with("\0own_messages")));
+        assert!(snapshot
+            .rls_policies
+            .values()
+            .any(|policy| policy.name == "own_messages" && policy.roles == ["authenticated"]));
 
         let mut restarted =
             Executor::with_manager(String::from("tenant-a"), String::from("d"), manager);
