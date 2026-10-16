@@ -1667,24 +1667,39 @@ impl Default for Order {
 
 impl Predicate {
     pub fn matches(&self, pk: &[u8], value: &[u8]) -> bool {
+        let parsed = self
+            .requires_row_object()
+            .then(|| serde_json::from_slice::<serde_json::Value>(value).ok())
+            .flatten();
+        self.matches_with_object(pk, value, parsed.as_ref().and_then(serde_json::Value::as_object))
+    }
+
+    fn requires_row_object(&self) -> bool {
+        self.column.is_some() || self.alternatives.iter().flatten().any(Self::requires_row_object)
+    }
+
+    fn matches_with_object(
+        &self,
+        pk: &[u8],
+        value: &[u8],
+        object: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> bool {
         if !self.alternatives.is_empty() {
-            return self
-                .alternatives
-                .iter()
-                .any(|branch| branch.iter().all(|predicate| predicate.matches(pk, value)));
+            return self.alternatives.iter().any(|branch| {
+                branch.iter().all(|predicate| predicate.matches_with_object(pk, value, object))
+            });
         }
         if matches!(self.op, Cmp::IsDistinct | Cmp::IsNotDistinct) {
-            let Some(target_is_null) = self.target_is_null(pk, value) else { return false };
+            let Some(target_is_null) = self.target_is_null(pk, value, object) else {
+                return false;
+            };
             let operand_is_null = is_null_bytes(&self.operand);
             let equal = if target_is_null || operand_is_null {
                 target_is_null && operand_is_null
             } else {
                 let target = if let Some(column) = self.column.as_deref() {
-                    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value)
-                    else {
-                        return false;
-                    };
-                    let Some(selected) = json_column_value(column, &object) else { return false };
+                    let Some(object) = object else { return false };
+                    let Some(selected) = json_column_value(column, object) else { return false };
                     json_result_bytes(selected)
                 } else {
                     match self.field {
@@ -1698,10 +1713,8 @@ impl Predicate {
         }
         if matches!(self.op, Cmp::IsNull | Cmp::IsNotNull) {
             let is_null = if let Some(column) = self.column.as_deref() {
-                let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
-                    return false;
-                };
-                json_column_value(column, &object).is_some_and(serde_json::Value::is_null)
+                let Some(object) = object else { return false };
+                json_column_value(column, object).is_some_and(serde_json::Value::is_null)
             } else {
                 match self.field {
                     Field::Key => pk.is_empty() || pk.eq_ignore_ascii_case(b"null"),
@@ -1712,10 +1725,8 @@ impl Predicate {
         }
         let column_value;
         let target = if let Some(column) = self.column.as_deref() {
-            let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
-                return false;
-            };
-            let selected = json_column_value(column, &object).map(json_result_bytes);
+            let Some(object) = object else { return false };
+            let selected = json_column_value(column, object).map(json_result_bytes);
             let Some(selected) = selected else { return false };
             column_value = selected;
             column_value.as_slice()
@@ -1776,12 +1787,14 @@ impl Predicate {
         }
     }
 
-    fn target_is_null(&self, pk: &[u8], value: &[u8]) -> Option<bool> {
+    fn target_is_null(
+        &self,
+        pk: &[u8],
+        value: &[u8],
+        object: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<bool> {
         if let Some(column) = self.column.as_deref() {
-            let serde_json::Value::Object(object) = serde_json::from_slice(value).ok()? else {
-                return None;
-            };
-            return Some(json_column_value(column, &object).is_none_or(serde_json::Value::is_null));
+            return Some(json_column_value(column, object?).is_none_or(serde_json::Value::is_null));
         }
         Some(match self.field {
             Field::Key => is_null_bytes(pk),
@@ -1790,18 +1803,42 @@ impl Predicate {
     }
 }
 
+fn predicates_match(predicates: &[Predicate], pk: &[u8], value: &[u8]) -> bool {
+    let parsed = predicates
+        .iter()
+        .any(Predicate::requires_row_object)
+        .then(|| serde_json::from_slice::<serde_json::Value>(value).ok())
+        .flatten();
+    let object = parsed.as_ref().and_then(serde_json::Value::as_object);
+    predicates.iter().all(|predicate| predicate.matches_with_object(pk, value, object))
+}
+
 fn is_null_bytes(value: &[u8]) -> bool {
     value.is_empty() || value.eq_ignore_ascii_case(b"null")
 }
 
 fn check_predicate_result(predicate: &Predicate, pk: &[u8], value: &[u8]) -> Option<bool> {
+    let parsed = predicate
+        .requires_row_object()
+        .then(|| serde_json::from_slice::<serde_json::Value>(value).ok())
+        .flatten();
+    let object = parsed.as_ref().and_then(serde_json::Value::as_object);
+    check_predicate_result_with_object(predicate, pk, value, object)
+}
+
+fn check_predicate_result_with_object(
+    predicate: &Predicate,
+    pk: &[u8],
+    value: &[u8],
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<bool> {
     if predicate.op == Cmp::AnyOf {
         let mut unknown = false;
         for branch in &predicate.alternatives {
             let mut branch_unknown = false;
             let mut branch_valid = true;
             for predicate in branch {
-                match check_predicate_result(predicate, pk, value) {
+                match check_predicate_result_with_object(predicate, pk, value, object) {
                     Some(true) => {}
                     Some(false) => {
                         branch_valid = false;
@@ -1819,11 +1856,11 @@ fn check_predicate_result(predicate: &Predicate, pk: &[u8], value: &[u8]) -> Opt
         }
         return if unknown { None } else { Some(false) };
     }
-    if predicate.matches(pk, value) {
+    if predicate.matches_with_object(pk, value, object) {
         return Some(true);
     }
     if !matches!(predicate.op, Cmp::IsNull | Cmp::IsNotNull | Cmp::IsDistinct | Cmp::IsNotDistinct)
-        && predicate.target_is_null(pk, value) == Some(true)
+        && predicate.target_is_null(pk, value, object) == Some(true)
     {
         return None;
     }
@@ -7195,7 +7232,7 @@ fn join_rows(
         }
     }
     ensure_materialized_rows(&rows)?;
-    rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
+    rows.retain(|(pk, value)| predicates_match(filter, pk, value));
     rows.sort_by(|left, right| compare_order(order, left, right));
     Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
 }
@@ -10559,10 +10596,8 @@ where
             };
             self.scan_rows(txn, &table, &filter, cap)?
         };
-        let mut rows: Vec<Row> = rows
-            .into_iter()
-            .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
-            .collect();
+        let mut rows: Vec<Row> =
+            rows.into_iter().filter(|(pk, value)| predicates_match(&filter, pk, value)).collect();
         rows.sort_by(|left, right| compare_order(&order, left, right));
         let rows = self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
         let output_columns = columns
@@ -10921,7 +10956,7 @@ where
             };
             ensure_materialized_rows(&rows)?;
             rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
-            rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
+            rows.retain(|(pk, value)| predicates_match(filter, pk, value));
             rows.truncate(limit);
             return Ok(rows);
         }
@@ -10955,9 +10990,7 @@ where
                 let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
                 return Ok(rows
                     .into_iter()
-                    .filter(|(pk, value)| {
-                        filter.iter().all(|predicate| predicate.matches(pk, value))
-                    })
+                    .filter(|(pk, value)| predicates_match(filter, pk, value))
                     .take(limit)
                     .collect());
             }
@@ -10998,7 +11031,7 @@ where
                     .into_iter()
                     .filter(|(pk, value)| {
                         self.rls_allows_with_context(table, value, rls_applies)
-                            && filter.iter().all(|predicate| predicate.matches(pk, value))
+                            && predicates_match(filter, pk, value)
                     })
                     .collect();
                 budget.add_rows(&matching)?;
@@ -11058,7 +11091,7 @@ where
             .into_iter()
             .filter(|(pk, value)| {
                 self.rls_allows_with_context(table, value, rls_applies)
-                    && filter.iter().all(|predicate| predicate.matches(pk, value))
+                    && predicates_match(filter, pk, value)
             })
             .take(limit)
             .collect())
@@ -11083,7 +11116,7 @@ where
             };
             ensure_materialized_rows(&rows)?;
             rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
-            rows.retain(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)));
+            rows.retain(|(pk, value)| predicates_match(filter, pk, value));
             rows.truncate(limit);
             return Ok(rows);
         }
@@ -11120,7 +11153,7 @@ where
                         .into_iter()
                         .filter(|(pk, value)| {
                             self.rls_allows_with_context(table, value, rls_applies)
-                                && filter.iter().all(|predicate| predicate.matches(pk, value))
+                                && predicates_match(filter, pk, value)
                         })
                         .collect();
                     budget.add_rows(&matching)?;
@@ -11182,7 +11215,7 @@ where
                 .into_iter()
                 .filter(|(pk, value)| {
                     self.rls_allows_with_context(table, value, rls_applies)
-                        && filter.iter().all(|predicate| predicate.matches(pk, value))
+                        && predicates_match(filter, pk, value)
                 })
                 .take(limit)
                 .collect());
@@ -11213,9 +11246,7 @@ where
                 let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
                 return Ok(rows
                     .into_iter()
-                    .filter(|(pk, value)| {
-                        filter.iter().all(|predicate| predicate.matches(pk, value))
-                    })
+                    .filter(|(pk, value)| predicates_match(filter, pk, value))
                     .take(limit)
                     .collect());
             }
@@ -11247,9 +11278,7 @@ where
                     let last = page.last().map(|(pk, _)| pk.clone());
                     let matching: Vec<Row> = page
                         .into_iter()
-                        .filter(|(pk, value)| {
-                            filter.iter().all(|predicate| predicate.matches(pk, value))
-                        })
+                        .filter(|(pk, value)| predicates_match(filter, pk, value))
                         .collect();
                     budget.add_rows(&matching)?;
                     matched.extend(matching);
@@ -11310,7 +11339,7 @@ where
             ensure_materialized_rows(&rows)?;
             return Ok(rows
                 .into_iter()
-                .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
+                .filter(|(pk, value)| predicates_match(filter, pk, value))
                 .take(limit)
                 .collect());
         }
@@ -14005,7 +14034,7 @@ where
         let rows = self.scan_rows_async(txn, &source_table, &filter, usize::MAX).await?;
         let values = rows
             .into_iter()
-            .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
+            .filter(|(pk, value)| predicates_match(&filter, pk, value))
             .map(|(pk, value)| {
                 source_columns
                     .iter()
@@ -14574,9 +14603,7 @@ where
                     .unwrap_or_default();
                 let mut rows: Vec<Row> = rows
                     .into_iter()
-                    .filter(|(pk, value)| {
-                        filter.iter().all(|predicate| predicate.matches(pk, value))
-                    })
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 rows.sort_by(|left, right| compare_order(&order, left, right));
                 let rows =
@@ -14602,9 +14629,7 @@ where
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
                 let mut rows: Vec<Row> = rows
                     .into_iter()
-                    .filter(|(pk, value)| {
-                        filter.iter().all(|predicate| predicate.matches(pk, value))
-                    })
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 rows.sort_by(|left, right| compare_order(&order, left, right));
                 let rows =
@@ -14627,9 +14652,7 @@ where
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
                 let mut rows: Vec<Row> = rows
                     .into_iter()
-                    .filter(|(pk, value)| {
-                        filter.iter().all(|predicate| predicate.matches(pk, value))
-                    })
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 rows.sort_by(|left, right| compare_order(&order, left, right));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
@@ -14638,9 +14661,7 @@ where
                 let rows = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
                 let rows: Vec<Row> = rows
                     .into_iter()
-                    .filter(|(pk, value)| {
-                        filter.iter().all(|predicate| predicate.matches(pk, value))
-                    })
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
@@ -14692,7 +14713,7 @@ where
                 let rows = self.scan_rows(txn, &table, &filter, cap)?;
                 let mut rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
-                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
@@ -14701,7 +14722,7 @@ where
                 let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
-                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
@@ -14722,7 +14743,7 @@ where
                 let rows = self.scan_rows(txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
-                    if !filter.iter().all(|p| p.matches(&pk, &value)) {
+                    if !predicates_match(&filter, &pk, &value) {
                         continue;
                     }
                     let key = group_value(&pk, &value, group, group_column.as_deref());
@@ -14786,7 +14807,7 @@ where
                     }
                     let record = serde_json::Value::Object(record);
                     let encoded = record.to_string().into_bytes();
-                    if having.iter().all(|predicate| predicate.matches(group_key, &encoded)) {
+                    if predicates_match(&having, group_key, &encoded) {
                         let row = (group_key.clone(), encoded);
                         output_budget.add_row(&row)?;
                         out.push(row);
@@ -15711,7 +15732,7 @@ where
                 let rows = self.scan_rows(&mut txn, &table, &filter, cap)?;
                 let mut rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
-                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 rows.sort_by(|a, b| compare_order(&order, a, b));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
@@ -15721,7 +15742,7 @@ where
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
-                    .filter(|(pk, value)| filter.iter().all(|p| p.matches(pk, value)))
+                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
                     .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
@@ -15743,7 +15764,7 @@ where
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
-                    if !filter.iter().all(|p| p.matches(&pk, &value)) {
+                    if !predicates_match(&filter, &pk, &value) {
                         continue;
                     }
                     let key = group_value(&pk, &value, group, group_column.as_deref());
@@ -15807,7 +15828,7 @@ where
                     }
                     let record = serde_json::Value::Object(record);
                     let encoded = record.to_string().into_bytes();
-                    if having.iter().all(|predicate| predicate.matches(group_key, &encoded)) {
+                    if predicates_match(&having, group_key, &encoded) {
                         let row = (group_key.clone(), encoded);
                         output_budget.add_row(&row)?;
                         out.push(row);
