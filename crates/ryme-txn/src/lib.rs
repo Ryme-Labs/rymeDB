@@ -363,11 +363,39 @@ static TXN_ID: AtomicU64 = AtomicU64::new(1);
 struct TxnPin {
     id: u64,
     active: Arc<ActiveRegistry>,
+    additional: Mutex<Vec<Arc<ActiveRegistry>>>,
+}
+
+impl TxnPin {
+    fn track(&self, active: &Arc<ActiveRegistry>, read_ts: u64) {
+        if Arc::ptr_eq(&self.active, active) {
+            return;
+        }
+        let mut additional = self.additional.lock().unwrap_or_else(|error| error.into_inner());
+        if additional.iter().any(|registry| Arc::ptr_eq(registry, active)) {
+            return;
+        }
+        active.insert(self.id, 0);
+        additional.push(Arc::clone(active));
+        active.insert(self.id, read_ts);
+    }
+
+    fn restamp(&self, read_ts: u64) {
+        self.active.insert(self.id, read_ts);
+        let additional = self.additional.lock().unwrap_or_else(|error| error.into_inner());
+        for registry in additional.iter() {
+            registry.insert(self.id, read_ts);
+        }
+    }
 }
 
 impl Drop for TxnPin {
     fn drop(&mut self) {
         self.active.remove(self.id);
+        let additional = self.additional.get_mut().unwrap_or_else(|error| error.into_inner());
+        for registry in additional.iter() {
+            registry.remove(self.id);
+        }
     }
 }
 
@@ -472,12 +500,12 @@ impl Transaction {
         self.route_generation = checkpoint.route_generation;
         self.state_bytes = checkpoint.state_bytes;
         self.resource_error.clone_from(&checkpoint.resource_error);
-        self.pin.active.insert(self.id, self.read_ts);
+        self.pin.restamp(self.read_ts);
     }
 
     pub fn restamp(&mut self, read_ts: u64) {
         self.read_ts = read_ts;
-        self.pin.active.insert(self.id, read_ts);
+        self.pin.restamp(read_ts);
     }
 
     pub fn set_isolation(&mut self, isolation: Isolation) {
@@ -912,8 +940,14 @@ impl TxnManager {
 
     pub fn begin(&self) -> Transaction {
         let id = TXN_ID.fetch_add(1, Ordering::Relaxed);
+        let pin = Arc::new(TxnPin {
+            id,
+            active: Arc::clone(&self.inner.active),
+            additional: Mutex::new(Vec::new()),
+        });
+        pin.active.insert(id, 0);
         let read_ts = self.inner.applied.load(Ordering::SeqCst);
-        self.inner.active.insert(id, read_ts);
+        pin.active.insert(id, read_ts);
         Transaction {
             id,
             read_ts,
@@ -926,8 +960,14 @@ impl TxnManager {
             route_generation: None,
             state_bytes: 0,
             resource_error: None,
-            pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
+            pin,
         }
+    }
+
+    /// Keeps a transaction snapshot visible to this manager's garbage collector.
+    /// Use when one transaction reads or writes across managers in the same timestamp domain.
+    pub fn track_transaction(&self, txn: &mut Transaction) {
+        txn.pin.track(&self.inner.active, txn.read_ts);
     }
 
     #[allow(clippy::wrong_self_convention)]
@@ -975,7 +1015,13 @@ impl TxnManager {
             return Err(transaction_overload("state bytes"));
         }
         let id = TXN_ID.fetch_add(1, Ordering::Relaxed);
-        self.inner.active.insert(id, state.read_ts);
+        let pin = Arc::new(TxnPin {
+            id,
+            active: Arc::clone(&self.inner.active),
+            additional: Mutex::new(Vec::new()),
+        });
+        pin.active.insert(id, 0);
+        pin.active.insert(id, state.read_ts);
         Ok(Transaction {
             id,
             read_ts: state.read_ts,
@@ -988,7 +1034,7 @@ impl TxnManager {
             route_generation: state.route_generation,
             state_bytes,
             resource_error: None,
-            pin: Arc::new(TxnPin { id, active: Arc::clone(&self.inner.active) }),
+            pin,
         })
     }
 
@@ -3013,19 +3059,25 @@ mod tests {
         let tracker = TxnTracker::new();
         let creator = TxnManager::new_with_tracker(&tracker);
         let other = TxnManager::new_with_tracker(&tracker);
+        let separate = TxnManager::new();
         let mut txn = creator.begin();
 
         assert!(Arc::ptr_eq(&creator.inner.active, &other.inner.active));
+        assert!(!Arc::ptr_eq(&creator.inner.active, &separate.inner.active));
+        separate.track_transaction(&mut txn);
         assert_eq!(creator.inner.active.oldest(), Some(txn.read_ts));
         assert_eq!(other.inner.active.oldest(), Some(txn.read_ts));
+        assert_eq!(separate.inner.active.oldest(), Some(txn.read_ts));
 
         txn.restamp(txn.read_ts + 10);
         assert_eq!(creator.inner.active.oldest(), Some(txn.read_ts));
         assert_eq!(other.inner.active.oldest(), Some(txn.read_ts));
+        assert_eq!(separate.inner.active.oldest(), Some(txn.read_ts));
 
         drop(txn);
         assert_eq!(creator.inner.active.len(), 0);
         assert_eq!(other.inner.active.len(), 0);
+        assert_eq!(separate.inner.active.len(), 0);
     }
 
     #[test]

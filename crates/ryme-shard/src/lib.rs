@@ -1,8 +1,7 @@
 use ryme_error::{Result, RymeError};
 use ryme_storage::{RecordKey, SegmentCacheStats, StorageMode};
 use ryme_txn::{
-    decode_writes, encode_writes, DurableManager, SyncPolicy, Transaction, TxnBackend, TxnManager,
-    TxnTracker,
+    decode_writes, encode_writes, DurableManager, SyncPolicy, Transaction, TxnBackend, TxnTracker,
 };
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
@@ -1238,8 +1237,6 @@ pub enum Tier {
 #[derive(Debug)]
 struct HybridCtx {
     tables: Vec<(TableRef, Tier)>,
-    stamp_raft: Option<u64>,
-    stamp_local: Option<u64>,
     poisoned: bool,
     touched: Instant,
 }
@@ -1324,28 +1321,14 @@ impl HybridBackend {
             inner.side.retain(|_, ctx| ctx.touched.elapsed().as_secs() < 120);
         }
         let tier = if inner.replicated.contains(&table) { Tier::Replicated } else { Tier::Local };
-        let stamp = match tier {
-            Tier::Replicated => inner.raft.node().manager().latest_commit(),
-            Tier::Local => inner.local.latest_commit(),
-        };
         let entry = inner.side.entry(txn.id).or_insert_with(|| HybridCtx {
             tables: Vec::new(),
-            stamp_raft: None,
-            stamp_local: None,
             poisoned: false,
             touched: Instant::now(),
         });
         entry.touched = Instant::now();
         if !entry.tables.iter().any(|(existing, _)| existing == &table) {
             entry.tables.push((table, tier));
-        }
-        match tier {
-            Tier::Replicated => {
-                entry.stamp_raft.get_or_insert(stamp);
-            }
-            Tier::Local => {
-                entry.stamp_local.get_or_insert(stamp);
-            }
         }
         if entry.tables.iter().any(|(_, other)| *other != tier) {
             entry.poisoned = true;
@@ -1357,10 +1340,12 @@ impl HybridBackend {
 impl TxnBackend for HybridBackend {
     fn begin(&self) -> Transaction {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let read_ts =
-            inner.raft.node().manager().latest_commit().max(inner.local.latest_commit()).max(1);
+        let raft = inner.raft.clone();
+        let local = inner.local.clone();
         drop(inner);
-        let mut txn = TxnManager::new().begin();
+        let mut txn = local.begin();
+        raft.node().manager().track_transaction(&mut txn);
+        let read_ts = raft.node().manager().latest_commit().max(local.latest_commit()).max(1);
         txn.restamp(read_ts);
         txn
     }
@@ -1440,17 +1425,10 @@ impl TxnBackend for HybridBackend {
             if replicated && local {
                 return Err(RymeError::InvalidArgument(String::from("cross-tier")));
             }
-            let mut txn = txn;
             if replicated {
-                if let Some(stamp) = ctx.stamp_raft {
-                    txn.restamp(stamp.min(txn.read_ts));
-                }
                 let raft = backend.inner.lock().unwrap_or_else(|e| e.into_inner()).raft.clone();
                 <ryme_raft::net::ClusterBackend as TxnBackend>::commit(&raft, txn).await
             } else {
-                if let Some(stamp) = ctx.stamp_local {
-                    txn.restamp(stamp.min(txn.read_ts));
-                }
                 let local = backend.inner.lock().unwrap_or_else(|e| e.into_inner()).local.clone();
                 <ShardSet as TxnBackend>::commit(&local, txn).await
             }
@@ -2244,6 +2222,92 @@ mod tests {
             backend.get(&mut txn, &RecordKey::new("t", "d", "cache", b"k")).unwrap(),
             Some(b"c".to_vec())
         );
+        for task in tasks {
+            task.abort();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hybrid_gc_preserves_live_replicated_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-hybrid-gc-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let raft_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node =
+            ryme_raft::net::Node::open(0, Vec::new(), Vec::new(), &dir.join("raft")).unwrap();
+        let tasks = node.spawn(raft_listener);
+        wait_raft_leader(&node).await;
+        let local = ShardSet::open(&dir.join("local"), 2, SyncPolicy::Never).unwrap();
+        let table = TableRef::new("t", "d", "replicated");
+        let backend = HybridBackend::new(
+            ryme_raft::net::ClusterBackend::new(node.clone()),
+            local,
+            HashSet::from([table]),
+        );
+        let key = RecordKey::new("t", "d", "replicated", b"k");
+
+        let mut first = backend.begin();
+        backend.put(&mut first, key.clone(), b"v1".to_vec());
+        block_on(backend.commit(first)).unwrap();
+
+        let mut reader = backend.begin();
+        assert_eq!(backend.get(&mut reader, &key).unwrap(), Some(b"v1".to_vec()));
+        let mut update = backend.begin();
+        backend.put(&mut update, key.clone(), b"v2".to_vec());
+        block_on(backend.commit(update)).unwrap();
+
+        backend.gc_oldest().unwrap();
+        assert_eq!(backend.get(&mut reader, &key).unwrap(), Some(b"v1".to_vec()));
+
+        drop(reader);
+        for task in tasks {
+            task.abort();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hybrid_snapshot_survives_independent_tier_clock_skew() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-hybrid-clock-skew-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let raft_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node =
+            ryme_raft::net::Node::open(0, Vec::new(), Vec::new(), &dir.join("raft")).unwrap();
+        let tasks = node.spawn(raft_listener);
+        wait_raft_leader(&node).await;
+        let local = ShardSet::open(&dir.join("local"), 2, SyncPolicy::Never).unwrap();
+        let backend = HybridBackend::new(
+            ryme_raft::net::ClusterBackend::new(node),
+            local,
+            HashSet::from([TableRef::new("t", "d", "replicated")]),
+        );
+
+        for index in 0..8 {
+            let key = RecordKey::new("t", "d", "replicated", index.to_string().as_bytes());
+            let mut txn = backend.begin();
+            backend.put(&mut txn, key, b"replicated".to_vec());
+            block_on(backend.commit(txn)).unwrap();
+        }
+
+        let local_key = RecordKey::new("t", "d", "cache", b"k");
+        let mut reader = backend.begin();
+        let snapshot_ts = reader.read_ts;
+        assert_eq!(backend.get(&mut reader, &local_key).unwrap(), None);
+        let mut writer = backend.begin();
+        backend.put(&mut writer, local_key.clone(), b"after-snapshot".to_vec());
+        let commit_ts = block_on(backend.commit(writer)).unwrap();
+        assert!(commit_ts > snapshot_ts);
+        assert_eq!(backend.get(&mut reader, &local_key).unwrap(), None);
+
+        drop(reader);
         for task in tasks {
             task.abort();
         }
