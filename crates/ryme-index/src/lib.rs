@@ -16,6 +16,7 @@ pub const MAX_TEXT_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMS_PER_DOCUMENT: usize = 65_536;
 pub const HNSW_M: usize = 16;
 pub const HNSW_EF_BUILD: usize = 64;
+const HNSW_EXACT_FALLBACK_MAX: usize = HNSW_M * HNSW_EF_BUILD * 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorHit {
@@ -423,10 +424,11 @@ impl VectorSpace {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
         let effective_ef = ef.clamp(top_k.clamp(1, MAX_TOP_K), 256);
-        // A full scan is cheaper than graph traversal while the local vector
-        // count is no larger than the approximate search's candidate-work
-        // estimate. This also avoids ANN recall loss on small partitions.
-        if self.ann.id_to_pos.len() <= effective_ef.saturating_mul(HNSW_M) {
+        // Keep small partitions exact near the measured crossover. Cap this
+        // threshold so larger search widths do not force scans of large spaces.
+        let exact_fallback_limit =
+            effective_ef.saturating_mul(HNSW_M).saturating_mul(2).min(HNSW_EXACT_FALLBACK_MAX);
+        if self.ann.id_to_pos.len() <= exact_fallback_limit {
             return self.search(query, top_k);
         }
         let normalized = normalize(query)?;
