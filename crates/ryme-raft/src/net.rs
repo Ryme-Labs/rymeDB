@@ -5754,7 +5754,15 @@ impl Node {
             txn.restamp(read_ts);
         }
         let value = self.manager.get(&mut txn, key)?;
-        let expires_at = value.as_ref().and_then(|_| self.manager.expires_at(key).ok().flatten());
+        let expires_at = if value.is_some() {
+            if read_ts == 0 {
+                self.manager.expires_at(key)?
+            } else {
+                self.manager.expires_at_at(key, read_ts)?
+            }
+        } else {
+            None
+        };
         Ok((value, expires_at))
     }
 
@@ -6760,6 +6768,31 @@ mod tests {
         assert_eq!(snapshot.snapshot_ts, 10);
         assert_eq!(snapshot.rows.len(), 1);
         assert_eq!(snapshot.rows[0].versions[0].value, Some(b"old".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn range_point_read_uses_historical_version_ttl() {
+        let dir = temp_dir("range-read-ttl-ts");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let key = RecordKey::new("t", "d", "docs", b"row");
+        let old_expires_at = ryme_txn::now_unix() + 60;
+        let new_expires_at = old_expires_at + 60;
+        let mut old = BTreeMap::new();
+        old.insert(key.clone(), ryme_txn::WriteOp::put_ttl(b"old".to_vec(), old_expires_at));
+        node.manager.replay_at(10, &old).unwrap();
+        let mut new = BTreeMap::new();
+        new.insert(key.clone(), ryme_txn::WriteOp::put_ttl(b"new".to_vec(), new_expires_at));
+        node.manager.replay_at(20, &new).unwrap();
+
+        assert_eq!(
+            node.read_range_value(&key, 10).unwrap(),
+            (Some(b"old".to_vec()), Some(old_expires_at))
+        );
+        assert_eq!(
+            node.read_range_value(&key, 0).unwrap(),
+            (Some(b"new".to_vec()), Some(new_expires_at))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

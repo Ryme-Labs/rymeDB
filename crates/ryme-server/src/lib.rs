@@ -2120,7 +2120,7 @@ impl SharedState {
         if let Some(range_reader_node) = range_reader_node {
             let single_node = range_reader_node.clone();
             let batch_node = range_reader_node.clone();
-            let reader = RemoteReader::new(move |key| {
+            let reader = RemoteReader::new_with_read_ts(move |key, read_ts| {
                 let node = single_node.clone();
                 async move {
                     let Some(owner) = node.range_owner_key(&key) else {
@@ -2129,11 +2129,11 @@ impl SharedState {
                     if owner == node.node_id() {
                         return Ok(RemoteRead::Local);
                     }
-                    let (value, expires_at) = node.fetch_range_value(owner, key, 0).await?;
+                    let (value, expires_at) = node.fetch_range_value(owner, key, read_ts).await?;
                     Ok(RemoteRead::Value { value, expires_at })
                 }
             })
-            .with_batch_reader(move |keys| {
+            .with_batch_reader_at(move |keys, read_ts| {
                 let node = batch_node.clone();
                 async move {
                     let mut values = vec![RemoteRead::Local; keys.len()];
@@ -2152,7 +2152,8 @@ impl SharedState {
                         async move {
                             let request_keys =
                                 entries.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-                            let values = node.fetch_range_values(owner, request_keys, 0).await?;
+                            let values =
+                                node.fetch_range_values(owner, request_keys, read_ts).await?;
                             if values.len() != entries.len() {
                                 return Err(ryme_error::RymeError::Corrupt(String::from(
                                     "range read batch count",

@@ -62,10 +62,12 @@ pub enum RemoteScan {
 }
 
 type RemoteReadFn = Arc<
-    dyn Fn(RecordKey) -> Pin<Box<dyn Future<Output = Result<RemoteRead>> + Send>> + Send + Sync,
+    dyn Fn(RecordKey, u64) -> Pin<Box<dyn Future<Output = Result<RemoteRead>> + Send>>
+        + Send
+        + Sync,
 >;
 type RemoteReadManyFn = Arc<
-    dyn Fn(Vec<RecordKey>) -> Pin<Box<dyn Future<Output = Result<Vec<RemoteRead>>> + Send>>
+    dyn Fn(Vec<RecordKey>, u64) -> Pin<Box<dyn Future<Output = Result<Vec<RemoteRead>>> + Send>>
         + Send
         + Sync,
 >;
@@ -94,6 +96,8 @@ fn remote_value_if_live(value: Option<Vec<u8>>, expires_at: Option<u64>) -> Opti
 pub struct RemoteReader {
     single: RemoteReadFn,
     batch: Option<RemoteReadManyFn>,
+    single_supports_read_ts: bool,
+    batch_supports_read_ts: bool,
 }
 
 impl std::fmt::Debug for RemoteReader {
@@ -108,7 +112,25 @@ impl RemoteReader {
         F: Fn(RecordKey) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<RemoteRead>> + Send + 'static,
     {
-        Self { single: Arc::new(move |key| Box::pin(reader(key))), batch: None }
+        Self {
+            single: Arc::new(move |key, _| Box::pin(reader(key))),
+            batch: None,
+            single_supports_read_ts: false,
+            batch_supports_read_ts: false,
+        }
+    }
+
+    pub fn new_with_read_ts<F, Fut>(reader: F) -> Self
+    where
+        F: Fn(RecordKey, u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<RemoteRead>> + Send + 'static,
+    {
+        Self {
+            single: Arc::new(move |key, read_ts| Box::pin(reader(key, read_ts))),
+            batch: None,
+            single_supports_read_ts: true,
+            batch_supports_read_ts: false,
+        }
     }
 
     pub fn with_batch_reader<F, Fut>(mut self, reader: F) -> Self
@@ -116,19 +138,49 @@ impl RemoteReader {
         F: Fn(Vec<RecordKey>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<RemoteRead>>> + Send + 'static,
     {
-        self.batch = Some(Arc::new(move |keys| Box::pin(reader(keys))));
+        self.batch = Some(Arc::new(move |keys, _| Box::pin(reader(keys))));
+        self.batch_supports_read_ts = false;
+        self
+    }
+
+    pub fn with_batch_reader_at<F, Fut>(mut self, reader: F) -> Self
+    where
+        F: Fn(Vec<RecordKey>, u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<RemoteRead>>> + Send + 'static,
+    {
+        self.batch = Some(Arc::new(move |keys, read_ts| Box::pin(reader(keys, read_ts))));
+        self.batch_supports_read_ts = true;
         self
     }
 
     pub async fn read(&self, key: RecordKey) -> Result<RemoteRead> {
-        (self.single)(key).await
+        self.read_at(key, 0).await
+    }
+
+    pub async fn read_at(&self, key: RecordKey, read_ts: u64) -> Result<RemoteRead> {
+        if read_ts != 0 && !self.single_supports_read_ts {
+            return Err(RymeError::Unavailable(String::from(
+                "remote reader does not support historical reads",
+            )));
+        }
+        (self.single)(key, read_ts).await
     }
 
     pub async fn read_many(&self, keys: Vec<RecordKey>) -> Result<Vec<RemoteRead>> {
-        if let Some(batch) = self.batch.as_ref() {
-            return batch(keys).await;
+        self.read_many_at(keys, 0).await
+    }
+
+    pub async fn read_many_at(
+        &self,
+        keys: Vec<RecordKey>,
+        read_ts: u64,
+    ) -> Result<Vec<RemoteRead>> {
+        if read_ts == 0 || self.batch_supports_read_ts {
+            if let Some(batch) = self.batch.as_ref() {
+                return batch(keys, read_ts).await;
+            }
         }
-        join_all(keys.into_iter().map(|key| self.read(key))).await.into_iter().collect()
+        join_all(keys.into_iter().map(|key| self.read_at(key, read_ts))).await.into_iter().collect()
     }
 }
 
@@ -372,7 +424,7 @@ where
         };
         self.policies.predicate(principal, table)?;
         let key = RecordKey::new(&principal.tenant, &self.database, table, pk);
-        match reader.read(key).await? {
+        match reader.read_at(key, self.read_ts.unwrap_or(0)).await? {
             RemoteRead::Local => self.get(principal, table, pk),
             RemoteRead::Value { value, expires_at } => {
                 match remote_value_if_live(value, expires_at) {
@@ -413,7 +465,7 @@ where
             .iter()
             .map(|pk| RecordKey::new(&principal.tenant, &self.database, table, pk))
             .collect();
-        let remote_reads = reader.read_many(keys).await?;
+        let remote_reads = reader.read_many_at(keys, self.read_ts.unwrap_or(0)).await?;
         if remote_reads.len() != pks.len() {
             return Err(RymeError::Corrupt(String::from("range read batch count")));
         }
@@ -1067,14 +1119,16 @@ mod tests {
 
     #[tokio::test]
     async fn async_reads_use_remote_owner_and_keep_ttl_semantics() {
-        let gateway = gateway().with_remote_reader(RemoteReader::new(|key| async move {
-            assert_eq!(key.table, "docs");
-            assert_eq!(key.pk, b"k".to_vec());
-            Ok(RemoteRead::Value {
-                value: Some(b"v".to_vec()),
-                expires_at: Some(ryme_txn::now_unix() + 60),
-            })
-        }));
+        let gateway = gateway().with_remote_reader(RemoteReader::new_with_read_ts(
+            |key, _read_ts| async move {
+                assert_eq!(key.table, "docs");
+                assert_eq!(key.pk, b"k".to_vec());
+                Ok(RemoteRead::Value {
+                    value: Some(b"v".to_vec()),
+                    expires_at: Some(ryme_txn::now_unix() + 60),
+                })
+            },
+        ));
         let principal = owner();
         assert_eq!(gateway.get_async(&principal, "docs", b"k").await.unwrap(), Some(b"v".to_vec()));
         assert!(matches!(
@@ -1084,15 +1138,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_read_timestamp_reaches_single_and_batch_remote_reads() {
+        let reader = RemoteReader::new_with_read_ts(|_, read_ts| async move {
+            assert_eq!(read_ts, 42);
+            Ok(RemoteRead::Value { value: Some(b"snapshot".to_vec()), expires_at: Some(0) })
+        })
+        .with_batch_reader_at(|keys, read_ts| async move {
+            assert_eq!(read_ts, 42);
+            Ok(keys
+                .into_iter()
+                .map(|_| RemoteRead::Value {
+                    value: Some(b"snapshot".to_vec()),
+                    expires_at: Some(0),
+                })
+                .collect())
+        });
+        let gateway = gateway().with_read_ts(42).with_remote_reader(reader);
+        let principal = owner();
+
+        assert_eq!(
+            gateway.get_async(&principal, "docs", b"single").await.unwrap(),
+            Some(b"snapshot".to_vec())
+        );
+        assert_eq!(
+            gateway.get_many_async(&principal, "docs", &[b"batch".to_vec()]).await.unwrap(),
+            vec![Some(b"snapshot".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_remote_reader_fails_closed_for_historical_reads() {
+        let reader = RemoteReader::new(|_| async {
+            Ok(RemoteRead::Value { value: Some(b"latest".to_vec()), expires_at: None })
+        });
+
+        assert!(matches!(
+            reader.read_at(RecordKey::new("t", "d", "docs", b"row"), 42).await,
+            Err(RymeError::Unavailable(message)) if message == "remote reader does not support historical reads"
+        ));
+    }
+
+    #[tokio::test]
     async fn async_batch_reads_use_one_remote_batch_and_apply_row_policies() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let batch_calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = batch_calls.clone();
-        let reader = RemoteReader::new(|_| async {
+        let reader = RemoteReader::new_with_read_ts(|_, _read_ts| async {
             Err(RymeError::Internal(String::from("single read path used")))
         })
-        .with_batch_reader(move |keys| {
+        .with_batch_reader_at(move |keys, _read_ts| {
             observed_calls.fetch_add(1, Ordering::Relaxed);
             async move {
                 Ok(keys
@@ -1139,7 +1234,7 @@ mod tests {
         let principal = owner();
         gateway.put(&principal, "docs", b"k".to_vec(), b"branch-value".to_vec()).await.unwrap();
         let branch = gateway.clone().with_branch(String::from("feature")).with_remote_reader(
-            RemoteReader::new(|_| async {
+            RemoteReader::new_with_read_ts(|_, _read_ts| async {
                 Ok(RemoteRead::Value {
                     value: Some(b"main-value".to_vec()),
                     expires_at: Some(ryme_txn::now_unix() + 600),
@@ -1164,9 +1259,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_write_reads_participate_in_occ() {
-        let gateway = gateway().with_remote_reader(RemoteReader::new(|_| async {
-            Ok(RemoteRead::Value { value: Some(b"remote".to_vec()), expires_at: Some(0) })
-        }));
+        let gateway =
+            gateway().with_remote_reader(RemoteReader::new_with_read_ts(|_, _read_ts| async {
+                Ok(RemoteRead::Value { value: Some(b"remote".to_vec()), expires_at: Some(0) })
+            }));
         let key = RecordKey::new("t", "d", "docs", b"k");
         let mut txn = gateway.begin();
         assert_eq!(gateway.read_for_write(&mut txn, &key).await.unwrap(), Some(b"remote".to_vec()));
@@ -1190,10 +1286,10 @@ mod tests {
 
     #[tokio::test]
     async fn remote_reader_uses_batch_transport_when_available() {
-        let reader = RemoteReader::new(|_| async {
+        let reader = RemoteReader::new_with_read_ts(|_, _read_ts| async {
             Err::<RemoteRead, _>(RymeError::Internal(String::from("single path")))
         })
-        .with_batch_reader(|keys| async move {
+        .with_batch_reader_at(|keys, _read_ts| async move {
             Ok(keys
                 .into_iter()
                 .map(|key| RemoteRead::Value { value: Some(key.pk), expires_at: Some(0) })
@@ -1340,7 +1436,7 @@ mod tests {
             policies,
             Realtime::new(16),
         )
-        .with_remote_reader(RemoteReader::new(|_| async {
+        .with_remote_reader(RemoteReader::new_with_read_ts(|_, _read_ts| async {
             Ok(RemoteRead::Value {
                 value: Some(br#"{"tenant_id":"tenant-b"}"#.to_vec()),
                 expires_at: Some(ryme_txn::now_unix() + 60),
@@ -1359,12 +1455,13 @@ mod tests {
 
     #[tokio::test]
     async fn async_remote_reads_hide_expired_values_before_reads_and_writes() {
-        let gateway = gateway().with_remote_reader(RemoteReader::new(|_| async {
-            Ok(RemoteRead::Value {
-                value: Some(b"expired".to_vec()),
-                expires_at: Some(ryme_txn::now_unix().saturating_sub(1)),
-            })
-        }));
+        let gateway =
+            gateway().with_remote_reader(RemoteReader::new_with_read_ts(|_, _read_ts| async {
+                Ok(RemoteRead::Value {
+                    value: Some(b"expired".to_vec()),
+                    expires_at: Some(ryme_txn::now_unix().saturating_sub(1)),
+                })
+            }));
         let principal = owner();
 
         assert_eq!(gateway.get_async(&principal, "docs", b"k").await.unwrap(), None);
