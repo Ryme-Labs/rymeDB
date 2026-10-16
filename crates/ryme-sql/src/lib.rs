@@ -7992,7 +7992,8 @@ where
         let mut uid_reads = HashMap::new();
         let mut uid_writes = HashMap::new();
         for policy in policies.values() {
-            let (read_map, write_map) = if policy_uses_auth_uid(policy) {
+            let (read_map, write_map) = if policy_uses_auth_uid(policy) || policy.column.is_empty()
+            {
                 (&mut uid_reads, &mut uid_writes)
             } else {
                 (&mut reads, &mut writes)
@@ -17302,6 +17303,29 @@ mod tests {
             )
             .await;
         assert!(matches!(rejected, Err(RymeError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn permissive_sql_policy_cannot_disable_configured_tenant_isolation() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"))
+            .with_rls_tables(HashMap::from([(String::from("docs"), String::from("tenant_id"))]));
+        executor
+            .execute(
+                parse("CREATE POLICY public_docs ON docs FOR ALL USING (true) WITH CHECK (true)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            executor.row_allowed_by_rls("docs", br#"{"tenant_id":"tenant-a","body":"visible"}"#,)
+        );
+        assert!(!executor
+            .row_allowed_by_rls("docs", br#"{"tenant_id":"tenant-b","body":"must stay hidden"}"#,));
+        assert!(!executor.row_allowed_for_write(
+            "docs",
+            br#"{"tenant_id":"tenant-b","body":"must stay hidden"}"#,
+        ));
     }
 
     #[tokio::test]
