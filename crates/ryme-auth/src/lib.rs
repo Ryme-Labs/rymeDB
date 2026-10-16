@@ -968,7 +968,7 @@ fn matching_totp_step(secret: &[u8], code: &str, unix_secs: u64) -> Option<u64> 
 
 #[derive(Debug, Default)]
 pub struct PasskeyRegistry {
-    challenges: HashMap<String, (Vec<u8>, u64)>,
+    challenges: HashMap<String, (String, u64)>,
     credentials: HashMap<String, PasskeyCredential>,
 }
 
@@ -1013,12 +1013,12 @@ impl PasskeyRegistry {
         self.challenges.retain(|_, (_, issued_at)| {
             issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) > now_secs
         });
-        if self.challenges.len() >= MAX_CHALLENGES && !self.challenges.contains_key(user) {
+        if self.challenges.len() >= MAX_CHALLENGES {
             return Err(RymeError::Overload(String::from("challenges")));
         }
         let raw = random_bytes(32);
         let encoded = base64_url_encode(&raw);
-        self.challenges.insert(user.to_string(), (raw, now_secs));
+        self.challenges.insert(encoded.clone(), (user.to_string(), now_secs));
         Ok(encoded)
     }
 
@@ -1084,10 +1084,19 @@ impl PasskeyRegistry {
         let credential_id: &str = credential_id;
         let rp_id: &str = rp_id;
         let now_secs: u64 = *now_secs;
-        let (expected_challenge, issued_at) =
-            self.challenges.get(user).ok_or(RymeError::Unauthorized)?;
+        let client_data: serde_json::Value =
+            serde_json::from_slice(client_data_json).map_err(|_| RymeError::Unauthorized)?;
+        if client_data.get("type").and_then(|v| v.as_str()) != Some("webauthn.get") {
+            return Err(RymeError::Unauthorized);
+        }
+        let presented = client_data.get("challenge").and_then(|v| v.as_str()).unwrap_or("");
+        let (challenge_user, issued_at) =
+            self.challenges.get(presented).ok_or(RymeError::Unauthorized)?;
+        if challenge_user != user {
+            return Err(RymeError::Unauthorized);
+        }
         if issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) <= now_secs {
-            self.challenges.remove(user);
+            self.challenges.remove(presented);
             return Err(RymeError::Unauthorized);
         }
         let credential = self.credentials.get(credential_id).ok_or(RymeError::Unauthorized)?;
@@ -1114,18 +1123,8 @@ impl PasskeyRegistry {
         if credential.sign_count != 0 && presented_count <= credential.sign_count {
             return Err(RymeError::Unauthorized);
         }
-        let client_data: serde_json::Value =
-            serde_json::from_slice(client_data_json).map_err(|_| RymeError::Unauthorized)?;
-        if client_data.get("type").and_then(|v| v.as_str()) != Some("webauthn.get") {
-            return Err(RymeError::Unauthorized);
-        }
         let origin = client_data.get("origin").and_then(|v| v.as_str()).unwrap_or("");
         if !origins.iter().any(|allowed| allowed == origin) {
-            return Err(RymeError::Unauthorized);
-        }
-        let presented = client_data.get("challenge").and_then(|v| v.as_str()).unwrap_or("");
-        let want = base64_url_encode(expected_challenge.as_slice());
-        if !constant_time_equal(presented.as_bytes(), want.as_bytes()) {
             return Err(RymeError::Unauthorized);
         }
         let verifying = VerifyingKey::from_sec1_bytes(&credential.public_key)
@@ -1136,7 +1135,7 @@ impl PasskeyRegistry {
         signed.extend_from_slice(&hasher.finalize());
         let signature = Signature::from_der(signature_der).map_err(|_| RymeError::Unauthorized)?;
         verifying.verify(&signed, &signature).map_err(|_| RymeError::Unauthorized)?;
-        self.challenges.remove(user);
+        self.challenges.remove(presented);
         if let Some(credential) = self.credentials.get_mut(credential_id) {
             credential.sign_count = credential.sign_count.max(presented_count);
         }
@@ -2107,7 +2106,7 @@ mod tests {
             registry.challenge_at(&format!("user-{index}"), 1000).unwrap();
         }
         assert!(registry.challenge_at("one-more", 1000).is_err());
-        assert!(registry.challenge_at("user-0", 1000).is_ok());
+        assert!(registry.challenge_at("user-0", 1000).is_err());
         assert!(registry.challenge_at("fresh", 1000 + PASSKEY_CHALLENGE_TTL_SECS).is_ok());
     }
 
@@ -2209,6 +2208,48 @@ mod tests {
         let replay_sig: p256::ecdsa::Signature = secret.sign(&replay_signed);
         let replay_sig = replay_sig.to_der().as_bytes().to_vec();
         assert!(attempt(&mut registry, &auth_data, replay_client.as_bytes(), &replay_sig).is_err());
+    }
+
+    #[test]
+    fn passkey_challenges_for_same_user_are_independent() {
+        use p256::ecdsa::signature::Signer;
+        use sha2::{Digest, Sha256};
+
+        let secret = p256::ecdsa::SigningKey::from_slice(&[11u8; 32]).unwrap();
+        let public = secret.verifying_key().to_sec1_point(false).as_bytes().to_vec();
+        let origins = vec![String::from("https://auth.test")];
+        let mut registry = PasskeyRegistry::new();
+        registry.register("ada", String::from("cred-independent"), &public).unwrap();
+        let first = registry.challenge_at("ada", 1000).unwrap();
+        let second = registry.challenge_at("ada", 1001).unwrap();
+
+        for (challenge, sign_count, now_secs) in [(first, 1u32, 1000u64), (second, 2, 1001)] {
+            let client_data = format!(
+                "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"https://auth.test\"}}"
+            );
+            let mut rp_hash = Sha256::new();
+            rp_hash.update(b"auth.test");
+            let mut authenticator_data = rp_hash.finalize().to_vec();
+            authenticator_data.push(0x01);
+            authenticator_data.extend_from_slice(&sign_count.to_be_bytes());
+            let mut client_hash = Sha256::new();
+            client_hash.update(client_data.as_bytes());
+            let mut signed = authenticator_data.clone();
+            signed.extend_from_slice(&client_hash.finalize());
+            let signature: p256::ecdsa::Signature = secret.sign(&signed);
+            registry
+                .verify_assertion(&PasskeyAssertion {
+                    user: "ada",
+                    credential_id: "cred-independent",
+                    authenticator_data: &authenticator_data,
+                    client_data_json: client_data.as_bytes(),
+                    signature_der: signature.to_der().as_bytes(),
+                    rp_id: "auth.test",
+                    origins: &origins,
+                    now_secs,
+                })
+                .unwrap();
+        }
     }
 
     #[test]
