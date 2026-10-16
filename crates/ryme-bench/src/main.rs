@@ -139,6 +139,8 @@ enum Command {
         hotspot_percent: u64,
         #[arg(long, default_value = "mixed")]
         workload: String,
+        #[arg(long, default_value_t = 16)]
+        mget_keys: usize,
         #[arg(long, default_value_t = 1)]
         pipeline: usize,
         #[arg(long)]
@@ -277,6 +279,7 @@ async fn main() {
             keyspace,
             hotspot_percent,
             workload,
+            mget_keys,
             pipeline,
             json,
         }) => {
@@ -288,6 +291,7 @@ async fn main() {
                 keyspace,
                 hotspot_percent,
                 workload,
+                mget_keys,
                 pipeline,
                 json,
             })
@@ -1805,6 +1809,13 @@ fn encode(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+fn encode_mget(keys: &[String]) -> Vec<u8> {
+    let mut parts = Vec::with_capacity(keys.len() + 1);
+    parts.push(b"MGET".as_slice());
+    parts.extend(keys.iter().map(|key| key.as_bytes()));
+    encode(&parts)
+}
+
 async fn read_reply(socket: &mut tokio::net::TcpStream, scratch: &mut Vec<u8>) -> Option<bool> {
     let mut chunk = vec![0u8; 65536];
     loop {
@@ -1874,6 +1885,7 @@ struct RespBench {
     keyspace: usize,
     hotspot_percent: u64,
     workload: String,
+    mget_keys: usize,
     pipeline: usize,
     json: bool,
 }
@@ -2452,6 +2464,7 @@ struct TaskConfig {
     keyspace: usize,
     hotspot_percent: u64,
     workload: String,
+    mget_keys: usize,
     pipeline: usize,
     ready_gate: Arc<tokio::sync::Barrier>,
     start_gate: Arc<tokio::sync::Barrier>,
@@ -2528,25 +2541,43 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
         let mut write_failed = false;
         for offset in 0..batch {
             let counter = (index + offset) as u64;
-            let key = pick_key(counter, task.keyspace, task.hotspot_percent, task.worker);
-            let write = match task.workload.as_str() {
-                "get" => false,
-                "set" => true,
-                _ => counter.is_multiple_of(2),
-            };
-            if write {
-                let key_bytes = key.into_bytes();
-                let frame = encode(&[b"SET", &key_bytes, &task.value]);
+            if task.workload == "mget" {
+                let first_key = counter.saturating_mul(task.mget_keys as u64);
+                let keys = (0..task.mget_keys)
+                    .map(|offset| {
+                        pick_key(
+                            first_key.saturating_add(offset as u64),
+                            task.keyspace,
+                            task.hotspot_percent,
+                            task.worker,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let frame = encode_mget(&keys);
                 if socket.write_all(&frame).await.is_err() {
                     write_failed = true;
                     break;
                 }
             } else {
-                let key_bytes = key.into_bytes();
-                let frame = encode(&[b"GET", &key_bytes]);
-                if socket.write_all(&frame).await.is_err() {
-                    write_failed = true;
-                    break;
+                let key = pick_key(counter, task.keyspace, task.hotspot_percent, task.worker);
+                if match task.workload.as_str() {
+                    "get" => false,
+                    "set" => true,
+                    _ => counter.is_multiple_of(2),
+                } {
+                    let key_bytes = key.into_bytes();
+                    let frame = encode(&[b"SET", &key_bytes, &task.value]);
+                    if socket.write_all(&frame).await.is_err() {
+                        write_failed = true;
+                        break;
+                    }
+                } else {
+                    let key_bytes = key.into_bytes();
+                    let frame = encode(&[b"GET", &key_bytes]);
+                    if socket.write_all(&frame).await.is_err() {
+                        write_failed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -2586,6 +2617,10 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
 }
 
 async fn resp_bench(config: RespBench) {
+    if config.workload == "mget" && (config.mget_keys == 0 || config.mget_keys > 65_536) {
+        eprintln!("mget-keys must be between 1 and 65536");
+        return;
+    }
     let value = vec![7u8; config.value_bytes];
     let workers = config.concurrency.max(1);
     let ready_gate = Arc::new(tokio::sync::Barrier::new(workers + 1));
@@ -2600,6 +2635,7 @@ async fn resp_bench(config: RespBench) {
             keyspace: config.keyspace,
             hotspot_percent: config.hotspot_percent,
             workload: config.workload.clone(),
+            mget_keys: config.mget_keys,
             pipeline: config.pipeline,
             ready_gate: ready_gate.clone(),
             start_gate: start_gate.clone(),
@@ -2630,6 +2666,7 @@ async fn resp_bench(config: RespBench) {
         "target": config.addr,
         "machine": machine_metadata(),
         "workload": config.workload,
+        "mget_keys_per_command": if config.workload == "mget" { config.mget_keys } else { 1 },
         "pipeline": config.pipeline,
         "ops": count,
         "requested_ops": config.ops,
@@ -2652,9 +2689,10 @@ async fn resp_bench(config: RespBench) {
         println!("{result}");
     } else {
         println!(
-            "target={} workload={} pipeline={} requested_ops={} successful_ops={count} failed_ops={errors} qps={:.0} attempted_qps={:.0} p50={}us p90={}us p95={}us p99={}us p999={}us max={}us",
+            "target={} workload={} keys_per_command={} pipeline={} requested_ops={} successful_ops={count} failed_ops={errors} qps={:.0} attempted_qps={:.0} p50={}us p90={}us p95={}us p99={}us p999={}us max={}us",
             config.addr,
             config.workload,
+            if config.workload == "mget" { config.mget_keys } else { 1 },
             config.pipeline,
             config.ops,
             count as f64 / elapsed,
@@ -2672,9 +2710,18 @@ async fn resp_bench(config: RespBench) {
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_model_from_proc, expected_fanout, host_memory_bytes_from_proc, latency_histogram,
-        realtime_channel, worker_ops,
+        cpu_model_from_proc, encode_mget, expected_fanout, frame_len, host_memory_bytes_from_proc,
+        latency_histogram, realtime_channel, worker_ops,
     };
+
+    #[test]
+    fn mget_encoder_and_nested_reply_parser_handle_bulk_values() {
+        let frame = encode_mget(&[String::from("a"), String::from("bc")]);
+        assert_eq!(frame, b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$2\r\nbc\r\n");
+
+        let response = b"*3\r\n$1\r\na\r\n$-1\r\n$2\r\nbc\r\n";
+        assert_eq!(frame_len(response), Some(response.len()));
+    }
 
     #[test]
     fn realtime_channel_names_preserve_single_channel_compatibility() {

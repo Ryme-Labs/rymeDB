@@ -14,6 +14,18 @@ rymedb-cli qos tier dedicated_cluster dedicated_cluster
 ryme-bench resp --addr 127.0.0.1:6380 --workload mixed --ops 40000 --concurrency 8 --pipeline 1 --json
 ```
 
+Measure RESP `MGET` end to end with a local or clustered server:
+
+```bash
+ryme-bench resp --addr 127.0.0.1:6380 --workload mget --mget-keys 256 \
+  --ops 10000 --concurrency 8 --pipeline 1 --json
+```
+
+Here `ops` and `pipeline` count commands; each command reads `mget-keys` values,
+and reported latency covers writing the request and reading its full reply.
+Prepopulate those keys on the target server to measure hits. In cluster mode,
+this includes owner routing and local/remote value handling.
+
 To isolate the in-memory transaction core from networking and WAL durability:
 
 ```bash
