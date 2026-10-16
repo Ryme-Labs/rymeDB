@@ -926,7 +926,7 @@ paths:
   /v1/vector/ann-search:
     post:
       tags: [index]
-      description: Approximate HNSW search. Higher ef trades latency for recall; ef >= 64 recommended.
+      description: Approximate HNSW search. Higher ef trades latency for recall. Defaults to 64; the effective value is clamped to top_k..256. Use 128 for higher recall at increased latency.
       requestBody:
         required: true
         content:
@@ -2521,6 +2521,7 @@ components:
           type: integer
         ef:
           type: integer
+          default: 64
     TextIndexRequest:
       type: object
       required: [table, id, text]

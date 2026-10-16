@@ -72,6 +72,17 @@ captures are not a statistically controlled benchmark; see the
 [borrowed-ID comparison](../bench/results/vector-topk-borrowed-ids.json) and
 repeat paired runs on the target workload.
 
+Search width is an explicit latency/quality control. On the same machine, with
+20,480 vectors (64 dimensions, four partitions), top-k 10, and 300 deterministic
+queries per run, three release runs at `ef=64` measured median ANN p50 878 µs,
+1,135 QPS, and 0.910 recall@10. At `ef=128`, median p50 was 1.527 ms,
+648 QPS, and recall@10 was 0.981. Both settings built the index in about
+2.7 seconds; exact-search p50 was about 3.38 ms. The API, CLI, and JS SDK keep
+`ef=64` as their default to favor speed; set `ef=128` when this measured
+recall/latency tradeoff better fits the workload. These are local index-only
+measurements; see the [raw profile](../bench/results/vector-hnsw-ef-profile.json)
+and benchmark your own corpus before choosing a production value.
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash

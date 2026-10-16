@@ -1,0 +1,34 @@
+{
+  "experiment": "hnsw-search-width-recall-profile",
+  "captured_date": "2026-10-17",
+  "revision": "c2e2a9a",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "corpus": {
+    "vectors": 20480,
+    "dimensions": 64,
+    "partitions": 4,
+    "queries_per_run": 300,
+    "top_k": 10,
+    "build_profile": "release",
+    "command": "ryme-bench vector-index --vectors 20480 --dimensions 64 --queries 300 --partitions 4 --top-k 10 --ann-ef {64,128} --json"
+  },
+  "results": {
+    "ef_64": [
+      { "ann_p50_ns": 881840, "ann_p95_ns": 994664, "ann_p99_ns": 1035130, "ann_qps": 1126.911, "exact_p50_ns": 3404868, "index_build_ns": 2719255524, "recall_at_10": 0.9096666666666677 },
+      { "ann_p50_ns": 877962, "ann_p95_ns": 957312, "ann_p99_ns": 1064426, "ann_qps": 1134.571, "exact_p50_ns": 3392725, "index_build_ns": 2687547829, "recall_at_10": 0.9096666666666677 },
+      { "ann_p50_ns": 874867, "ann_p95_ns": 984254, "ann_p99_ns": 1040290, "ann_qps": 1139.230, "exact_p50_ns": 3379099, "index_build_ns": 2726471479, "recall_at_10": 0.9096666666666677 }
+    ],
+    "ef_128": [
+      { "ann_p50_ns": 1539235, "ann_p95_ns": 1633974, "ann_p99_ns": 1734835, "ann_qps": 647.911, "exact_p50_ns": 3388797, "index_build_ns": 2735664397, "recall_at_10": 0.9813333333333336 },
+      { "ann_p50_ns": 1526571, "ann_p95_ns": 1667418, "ann_p99_ns": 1767898, "ann_qps": 651.393, "exact_p50_ns": 3377316, "index_build_ns": 2702420303, "recall_at_10": 0.9813333333333336 },
+      { "ann_p50_ns": 1524347, "ann_p95_ns": 1709307, "ann_p99_ns": 1814146, "ann_qps": 647.374, "exact_p50_ns": 3371244, "index_build_ns": 2660782874, "recall_at_10": 0.9813333333333336 }
+    ]
+  },
+  "caveat": "Three sequential runs per ef on one host. Median p50 was 878 us at ef=64 and 1527 us at ef=128; recall@10 was 0.910 and 0.981 respectively. In-process index benchmark only; not end-to-end database latency or a cross-database comparison."
+}

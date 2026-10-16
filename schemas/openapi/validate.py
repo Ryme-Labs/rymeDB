@@ -10,6 +10,7 @@ ROUTER = ROOT / "crates" / "ryme-server" / "src" / "lib.rs"
 
 
 def normalize(route: str) -> str:
+    route = re.sub(r"\{\*([A-Za-z_]+)\}", r"{\1}", route)
     route = re.sub(r":([A-Za-z_]+)", r"{\1}", route)
     return re.sub(r"\*([A-Za-z_]+)", r"{\1}", route)
 
