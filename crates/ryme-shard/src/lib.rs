@@ -1043,8 +1043,13 @@ impl ShardSet {
 impl TxnBackend for ShardSet {
     fn begin(&self) -> Transaction {
         let _write = self.commit.write().unwrap_or_else(|error| error.into_inner());
-        let mut txn = TxnManager::new().begin();
+        let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut shards = inner.shards.iter();
+        let mut txn = shards.next().expect("ShardSet must have a shard").begin();
         txn.restamp(self.commit_clock.load(Ordering::SeqCst).max(1));
+        for shard in shards {
+            shard.inner().track_transaction(&mut txn);
+        }
         txn
     }
 
@@ -1968,6 +1973,32 @@ mod tests {
         let backend = ShardSet::open(&dir, 4, SyncPolicy::Never).unwrap();
         let mut recovered = backend.begin();
         assert_eq!(backend.get(&mut recovered, &key).unwrap(), Some(b"v2".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_preserves_versions_for_live_sharded_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-shard-gc-snapshot-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = ShardSet::open(&dir, 1, SyncPolicy::Never).unwrap();
+        let key = RecordKey::new("t", "d", "users", b"k");
+        commit_table(&backend, "t", "d", "users", writes(vec![("k", "v1")]));
+
+        let mut reader = backend.begin();
+        let snapshot_ts = reader.read_ts;
+        assert_eq!(backend.get(&mut reader, &key).unwrap(), Some(b"v1".to_vec()));
+
+        commit_table(&backend, "t", "d", "users", writes(vec![("k", "v2")]));
+        let gc_horizon = backend.gc_oldest().unwrap();
+        assert!(gc_horizon <= snapshot_ts);
+        assert_eq!(backend.get(&mut reader, &key).unwrap(), Some(b"v1".to_vec()));
+
+        drop(reader);
+        drop(backend);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
