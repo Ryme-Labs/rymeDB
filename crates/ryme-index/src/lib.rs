@@ -494,12 +494,27 @@ impl TextSpace {
             return Ok(Vec::new());
         }
         let doc_count = self.docs.len().max(1) as f64;
+        let document_frequencies: HashMap<String, usize> = terms
+            .iter()
+            .map(|term| (term.clone(), self.postings.get(term).map_or(0, HashMap::len)))
+            .collect();
+        Ok(self.search_terms(&terms, top_k, doc_count, &document_frequencies))
+    }
+
+    fn search_terms(
+        &self,
+        terms: &[String],
+        top_k: usize,
+        doc_count: f64,
+        document_frequencies: &HashMap<String, usize>,
+    ) -> Vec<TextHit> {
         let mut scores: HashMap<&str, f64> = HashMap::new();
-        for term in &terms {
+        for term in terms {
             let Some(posting) = self.postings.get(term) else {
                 continue;
             };
-            let idf = (1.0 + doc_count / (posting.len() as f64 + 0.5)).ln();
+            let document_frequency = document_frequencies.get(term).copied().unwrap_or(0);
+            let idf = (1.0 + doc_count / (document_frequency as f64 + 0.5)).ln();
             for (doc, freq) in posting {
                 let tf = (*freq as f64) / ((*freq as f64) + 1.2);
                 *scores.entry(doc.as_str()).or_insert(0.0) += idf * tf;
@@ -509,7 +524,7 @@ impl TextSpace {
             scores.into_iter().map(|(id, score)| TextHit { id: id.to_string(), score }).collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         hits.truncate(top_k.clamp(1, MAX_TOP_K));
-        Ok(hits)
+        hits
     }
 }
 
@@ -835,9 +850,34 @@ impl PartitionedIndex {
         if query.len() > MAX_TEXT_QUERY_BYTES {
             return Err(RymeError::Overload(String::from("text query")));
         }
+        let terms = tokenize(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let doc_count = self
+            .partitions
+            .iter()
+            .filter_map(|partition| partition.texts.get(space))
+            .map(|texts| texts.docs.len())
+            .sum::<usize>()
+            .max(1) as f64;
+        let document_frequencies: HashMap<String, usize> = terms
+            .iter()
+            .map(|term| {
+                let frequency = self
+                    .partitions
+                    .iter()
+                    .filter_map(|partition| partition.texts.get(space))
+                    .map(|texts| texts.postings.get(term).map_or(0, HashMap::len))
+                    .sum();
+                (term.clone(), frequency)
+            })
+            .collect();
         let mut merged: Vec<TextHit> = Vec::new();
         for partition in &self.partitions {
-            merged.extend(partition.text_search(space, query, top_k)?);
+            if let Some(texts) = partition.texts.get(space) {
+                merged.extend(texts.search_terms(&terms, top_k, doc_count, &document_frequencies));
+            }
         }
         merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         merged.truncate(top_k.clamp(1, MAX_TOP_K));
@@ -904,6 +944,36 @@ mod tests {
 
         let hits = index.text_search("s", "equal", 1).unwrap();
         assert_eq!(hits[0].id, low_id_later_partition);
+    }
+
+    #[test]
+    fn partitioned_text_search_uses_global_document_frequencies() {
+        let mut single = IndexRegistry::new();
+        let mut partitioned = PartitionedIndex::new(4);
+        let mut documents = Vec::new();
+        for (prefix, target_partition, text) in
+            [("needle", 0, "needle common"), ("background", 3, "common")]
+        {
+            let ids = (0..1_000)
+                .map(|index| format!("{prefix}-{index:04}"))
+                .filter(|id| partitioned.route("s", id) == target_partition)
+                .take(2)
+                .collect::<Vec<_>>();
+            assert_eq!(ids.len(), 2);
+            documents.extend(ids.into_iter().map(|id| (id, text)));
+        }
+        for (id, text) in documents {
+            single.text_index("s", id.clone(), text).unwrap();
+            partitioned.text_index("s", id, text).unwrap();
+        }
+
+        let expected = single.text_search("s", "needle common", 10).unwrap();
+        let actual = partitioned.text_search("s", "needle common", 10).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.id, expected.id);
+            assert!((actual.score - expected.score).abs() < 1e-12);
+        }
     }
 
     #[test]
