@@ -7470,7 +7470,7 @@ pub struct Executor<B = TxnManager> {
     read_only: bool,
     isolation: Isolation,
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
-    indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
+    indexes: Arc<RwLock<HashMap<String, Vec<IndexState>>>>,
     pending_index_commits: Arc<Mutex<HashMap<String, usize>>>,
     rls_maps: Arc<RwLock<RlsPolicyMaps>>,
     rls_policy_version: Arc<AtomicU64>,
@@ -7551,7 +7551,7 @@ impl Executor<TxnManager> {
             read_only: false,
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
-            indexes: Arc::new(Mutex::new(HashMap::new())),
+            indexes: Arc::new(RwLock::new(HashMap::new())),
             pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
@@ -7591,7 +7591,7 @@ impl Executor<TxnManager> {
             read_only: false,
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
-            indexes: Arc::new(Mutex::new(HashMap::new())),
+            indexes: Arc::new(RwLock::new(HashMap::new())),
             pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
@@ -7636,7 +7636,7 @@ where
             read_only: false,
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
-            indexes: Arc::new(Mutex::new(HashMap::new())),
+            indexes: Arc::new(RwLock::new(HashMap::new())),
             pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
@@ -8638,7 +8638,7 @@ where
             .unwrap_or_default();
         let mut indexes = self
             .indexes
-            .lock()
+            .read()
             .map(|catalog| {
                 catalog
                     .values()
@@ -8907,7 +8907,7 @@ where
             return Err(RymeError::Internal(String::from("RLS policy lock")));
         }
         self.rebuild_rls_policy_maps()?;
-        if let Ok(mut indexes) = self.indexes.lock() {
+        if let Ok(mut indexes) = self.indexes.write() {
             indexes.clear();
         } else {
             return Err(RymeError::Internal(String::from("index lock")));
@@ -8924,7 +8924,7 @@ where
         C: TxnBackend,
     {
         let catalog = self.catalog.lock().map(|catalog| catalog.clone()).unwrap_or_default();
-        let indexes = self.indexes.lock().map(|indexes| indexes.clone()).unwrap_or_default();
+        let indexes = self.indexes.read().map(|indexes| indexes.clone()).unwrap_or_default();
         let checks = self.checks.lock().map(|checks| checks.clone()).unwrap_or_default();
         let foreign_keys =
             self.foreign_keys.lock().map(|foreign_keys| foreign_keys.clone()).unwrap_or_default();
@@ -8960,7 +8960,7 @@ where
             read_only: self.read_only,
             isolation: self.isolation,
             catalog: Arc::new(Mutex::new(catalog)),
-            indexes: Arc::new(Mutex::new(indexes)),
+            indexes: Arc::new(RwLock::new(indexes)),
             pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(rls_maps)),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
@@ -9244,7 +9244,7 @@ where
 
     pub fn catalog_indexes(&self, table: &str) -> Vec<IndexDefinition> {
         self.indexes
-            .lock()
+            .read()
             .ok()
             .and_then(|indexes| {
                 indexes.get(table).cloned().or_else(|| {
@@ -10746,7 +10746,7 @@ where
         }
         {
             let indexes =
-                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+                self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
             if indexes.values().flatten().any(|state| state.definition.name == definition.name) {
                 if if_not_exists {
                     return Ok(());
@@ -10767,7 +10767,7 @@ where
         }
         let entries = [(self.tenant.clone(), tenant_entries)].into_iter().collect();
         let mut indexes =
-            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            self.indexes.write().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let table_indexes = indexes.entry(definition.table.clone()).or_default();
         let valid = !self.has_pending_index_commit(&definition.table)
             && self.manager.begin().read_ts == applied_ts;
@@ -10779,7 +10779,7 @@ where
     fn drop_index(&self, name: String, if_exists: bool) -> Result<()> {
         self.reject_if_read_only()?;
         let mut indexes =
-            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            self.indexes.write().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table) = indexes.iter().find_map(|(table, states)| {
             states.iter().any(|state| state.definition.name == name).then(|| table.clone())
         }) else {
@@ -10814,7 +10814,7 @@ where
     ) -> Result<Option<Vec<Vec<u8>>>> {
         self.ensure_index_entries_for_tenant(table)?;
         let indexes =
-            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let mut matching_indexes = Vec::new();
         for state in indexes.get(table).into_iter().flatten() {
             let key = if state.definition.columns.is_empty() {
@@ -10863,7 +10863,7 @@ where
     ) -> Result<Option<Vec<Vec<u8>>>> {
         self.ensure_index_entries_for_tenant(table)?;
         let indexes =
-            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(state) = indexes.get(table).and_then(|states| {
             states.iter().find(|state| state.definition.name == definition.name)
         }) else {
@@ -10886,7 +10886,7 @@ where
         let needs_rebuild = !self.has_pending_index_commit(table)
             && self
                 .indexes
-                .lock()
+                .read()
                 .map_err(|_| RymeError::Internal(String::from("index lock")))?
                 .get(table)
                 .is_some_and(|states| {
@@ -10920,7 +10920,7 @@ where
     ) -> Result<()> {
         self.ensure_index_entries_for_tenant(table)?;
         let indexes =
-            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
         if table_indexes.iter().any(|state| state.definition.unique) {
             txn.record_constraint_scan(&self.tenant, &self.database, table)?;
@@ -11017,7 +11017,7 @@ where
     }
 
     fn apply_index_changes(&self, changes: &[TransactionChange], commit_ts: u64) {
-        let Ok(mut indexes) = self.indexes.lock() else { return };
+        let Ok(mut indexes) = self.indexes.write() else { return };
         let mut changes_by_table: HashMap<&str, Vec<&TransactionChange>> = HashMap::new();
         for change in changes {
             changes_by_table.entry(change.table.as_str()).or_default().push(change);
@@ -11527,7 +11527,7 @@ where
                 let table_name = entry.key().clone();
                 entry.insert(columns);
                 if !unique_columns.is_empty() {
-                    if let Ok(mut indexes) = self.indexes.lock() {
+                    if let Ok(mut indexes) = self.indexes.write() {
                         let table_indexes = indexes.entry(table_name.clone()).or_default();
                         for column in unique_columns {
                             let name = format!("{table_name}_{column}_unique");
@@ -11666,7 +11666,7 @@ where
                     if let Ok(mut catalog) = self.catalog.lock() {
                         catalog.remove(&table);
                     }
-                    if let Ok(mut indexes) = self.indexes.lock() {
+                    if let Ok(mut indexes) = self.indexes.write() {
                         indexes.remove(&table);
                     }
                     if let Ok(mut checks) = self.checks.lock() {
@@ -11910,7 +11910,7 @@ where
         let (rows, applied_ts) = self.scan_all_rows_with_ts(table)?;
         let definitions = {
             let indexes =
-                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+                self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
             indexes
                 .get(table)
                 .map(|states| {
@@ -11934,7 +11934,7 @@ where
             }
         }
         let mut indexes =
-            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            self.indexes.write().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         if let Some(states) = indexes.get_mut(table) {
             for state in states {
                 state.entries.insert(
@@ -12277,8 +12277,10 @@ where
             catalog.remove(&table);
         }
         {
-            let mut indexes =
-                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            let mut indexes = self
+                .indexes
+                .write()
+                .map_err(|_| RymeError::Internal(String::from("index lock")))?;
             indexes.remove(&table);
         }
         if let Ok(mut checks) = self.checks.lock() {
@@ -12364,8 +12366,10 @@ where
             truncate_commit_ts = Some(self.manager.commit(txn).await?);
         }
         {
-            let mut indexes =
-                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            let mut indexes = self
+                .indexes
+                .write()
+                .map_err(|_| RymeError::Internal(String::from("index lock")))?;
             for table in &tables {
                 if let Some(table_indexes) = indexes.get_mut(table) {
                     for state in table_indexes {
@@ -12492,8 +12496,10 @@ where
             definitions.push(column.clone());
         }
         if column.unique {
-            let mut indexes =
-                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            let mut indexes = self
+                .indexes
+                .write()
+                .map_err(|_| RymeError::Internal(String::from("index lock")))?;
             let table_indexes = indexes.entry(table.clone()).or_default();
             if !table_indexes.iter().any(|state| state.definition.name == index_definition.name) {
                 table_indexes.push(IndexState {
@@ -12614,8 +12620,10 @@ where
             definitions.retain(|definition| !definition.name.eq_ignore_ascii_case(&column));
         }
         {
-            let mut indexes =
-                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            let mut indexes = self
+                .indexes
+                .write()
+                .map_err(|_| RymeError::Internal(String::from("index lock")))?;
             if let Some(table_indexes) = indexes.get_mut(&table) {
                 let column_prefix = format!("{}->", column.to_ascii_lowercase());
                 table_indexes.retain(|state| {
@@ -12708,8 +12716,10 @@ where
             }
         }
         {
-            let mut indexes =
-                self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            let mut indexes = self
+                .indexes
+                .write()
+                .map_err(|_| RymeError::Internal(String::from("index lock")))?;
             if let Some(table_indexes) = indexes.get_mut(&table) {
                 for state in table_indexes {
                     if !state.definition.columns.is_empty() {
@@ -14688,7 +14698,7 @@ where
             self.ensure_index_entries_for_tenant(table)?;
         }
         let indexes =
-            self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
+            self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         for (table, table_indexes) in indexes.iter() {
             let table_changes: Vec<&TransactionChange> =
                 changes.iter().filter(|change| &change.table == table).collect();
@@ -19932,7 +19942,7 @@ mod tests {
             .execute(parse("UPDATE docs SET body = 'new' WHERE id = 'a'").unwrap())
             .await
             .unwrap();
-        let applied_ts = executor.indexes.lock().unwrap()["docs"][0].applied_ts;
+        let applied_ts = executor.indexes.read().unwrap()["docs"][0].applied_ts;
         assert!(snapshot.read_ts < applied_ts, "{} !< {applied_ts}", snapshot.read_ts);
         assert_eq!(
             executor.manager.get(&mut snapshot, &RecordKey::new("t", "d", "docs", b"a"),).unwrap(),
@@ -19982,7 +19992,7 @@ mod tests {
         assert_eq!(executor.indexed_candidates("docs", &filter, read_ts).unwrap(), None);
         drop(pending);
 
-        let applied_ts = executor.indexes.lock().unwrap()["docs"][0].applied_ts;
+        let applied_ts = executor.indexes.read().unwrap()["docs"][0].applied_ts;
         executor.apply_index_changes(
             &[TransactionChange {
                 table: String::from("docs"),
@@ -19994,7 +20004,7 @@ mod tests {
             }],
             applied_ts.saturating_sub(1),
         );
-        assert!(!executor.indexes.lock().unwrap()["docs"][0].valid);
+        assert!(!executor.indexes.read().unwrap()["docs"][0].valid);
         assert_eq!(
             executor.indexed_candidates("docs", &filter, read_ts).unwrap(),
             Some(vec![b"a".to_vec()])
