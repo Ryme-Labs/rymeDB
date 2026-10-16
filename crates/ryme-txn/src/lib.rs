@@ -129,31 +129,33 @@ struct ActiveTransactions {
 
 impl ActiveRegistry {
     fn insert(&self, id: u64, read_ts: u64) {
-        if let Ok(mut transactions) = self.transactions.lock() {
-            if let Some(previous) = transactions.by_id.insert(id, read_ts) {
-                Self::remove_read_ts(&mut transactions.by_read_ts, previous);
-            }
-            *transactions.by_read_ts.entry(read_ts).or_default() += 1;
+        self.insert_with(id, || read_ts);
+    }
+
+    fn insert_with(&self, id: u64, current_read_ts: impl FnOnce() -> u64) -> u64 {
+        let mut transactions = self.transactions.lock().unwrap_or_else(|error| error.into_inner());
+        let read_ts = current_read_ts();
+        if let Some(previous) = transactions.by_id.insert(id, read_ts) {
+            Self::remove_read_ts(&mut transactions.by_read_ts, previous);
         }
+        *transactions.by_read_ts.entry(read_ts).or_default() += 1;
+        read_ts
     }
 
     fn remove(&self, id: u64) {
-        if let Ok(mut transactions) = self.transactions.lock() {
-            if let Some(read_ts) = transactions.by_id.remove(&id) {
-                Self::remove_read_ts(&mut transactions.by_read_ts, read_ts);
-            }
+        let mut transactions = self.transactions.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(read_ts) = transactions.by_id.remove(&id) {
+            Self::remove_read_ts(&mut transactions.by_read_ts, read_ts);
         }
     }
 
     fn len(&self) -> usize {
-        self.transactions.lock().map(|transactions| transactions.by_id.len()).unwrap_or(0)
+        self.transactions.lock().unwrap_or_else(|error| error.into_inner()).by_id.len()
     }
 
     fn oldest(&self) -> Option<u64> {
-        self.transactions
-            .lock()
-            .ok()
-            .and_then(|transactions| transactions.by_read_ts.first_key_value().map(|(ts, _)| *ts))
+        let transactions = self.transactions.lock().unwrap_or_else(|error| error.into_inner());
+        transactions.by_read_ts.first_key_value().map(|(ts, _)| *ts)
     }
 
     fn remove_read_ts(read_timestamps: &mut BTreeMap<u64, usize>, read_ts: u64) {
@@ -375,9 +377,8 @@ impl TxnPin {
         if additional.iter().any(|registry| Arc::ptr_eq(registry, active)) {
             return;
         }
-        active.insert(self.id, 0);
-        additional.push(Arc::clone(active));
         active.insert(self.id, read_ts);
+        additional.push(Arc::clone(active));
     }
 
     fn restamp(&self, read_ts: u64) {
@@ -945,9 +946,7 @@ impl TxnManager {
             active: Arc::clone(&self.inner.active),
             additional: Mutex::new(Vec::new()),
         });
-        pin.active.insert(id, 0);
-        let read_ts = self.inner.applied.load(Ordering::SeqCst);
-        pin.active.insert(id, read_ts);
+        let read_ts = pin.active.insert_with(id, || self.inner.applied.load(Ordering::SeqCst));
         Transaction {
             id,
             read_ts,
