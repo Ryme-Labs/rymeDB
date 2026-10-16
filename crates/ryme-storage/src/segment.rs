@@ -682,6 +682,12 @@ impl SegmentStore {
         paths.sort_by_key(|path| {
             parse_segment_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
         });
+        if let Some(snapshot_id) = self.latest_snapshot_id() {
+            paths.retain(|path| {
+                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+                    .is_some_and(|id| id >= snapshot_id)
+            });
+        }
         let mut engine = Engine::new();
         let mut found = false;
         let mut max_commit_ts = 0;
@@ -700,10 +706,26 @@ impl SegmentStore {
 
     pub fn max_commit_ts(&self) -> Result<u64> {
         let mut max_commit_ts = 0;
+        let snapshot_id = self.latest_snapshot_id();
         for path in self.segment_paths()? {
+            if snapshot_id.is_some_and(|snapshot_id| {
+                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+                    .is_some_and(|id| id < snapshot_id)
+            }) {
+                continue;
+            }
             max_commit_ts = max_commit_ts.max(read_segment_max_commit_ts(&path)?);
         }
         Ok(max_commit_ts)
+    }
+
+    fn latest_snapshot_id(&self) -> Option<u64> {
+        let raw = std::fs::read(self.dir.join("latest")).ok()?;
+        let name = std::str::from_utf8(&raw).ok()?.trim();
+        let id = parse_segment_name(name)?;
+        let path = self.dir.join(name);
+        let (stored_id, kind) = read_segment_identity(&path).ok()?;
+        (stored_id == id && kind == SegmentKind::Snapshot).then_some(id)
     }
 
     pub fn scan(
@@ -979,6 +1001,33 @@ fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
         return Err(RymeError::Overload(String::from("segment")));
     }
     Ok(bytes)
+}
+
+fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
+    const V1_HEADER: u64 = 4 + 2 + 2 + 8 + 4;
+    const V2_HEADER: u64 = V1_HEADER + 8;
+    let file_len = std::fs::metadata(path)?.len();
+    let mut file = std::fs::File::open(path)?;
+    let mut prefix = [0; 16];
+    file.read_exact(&mut prefix)?;
+    let mut cursor = &prefix[..];
+    let magic = take_u32(&mut cursor)?;
+    let version = take_u16(&mut cursor)?;
+    let kind = match take_u16(&mut cursor)? {
+        0 => SegmentKind::Snapshot,
+        1 => SegmentKind::Delta,
+        _ => return Err(RymeError::Corrupt(String::from("segment kind"))),
+    };
+    let id = take_u64(&mut cursor)?;
+    let header_len = match version {
+        1 => V1_HEADER,
+        SEGMENT_VERSION => V2_HEADER,
+        _ => return Err(RymeError::Corrupt(String::from("segment magic"))),
+    };
+    if magic != SEGMENT_MAGIC || file_len < header_len + 4 {
+        return Err(RymeError::Corrupt(String::from("segment header")));
+    }
+    Ok((id, kind))
 }
 
 fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
@@ -1492,6 +1541,61 @@ mod tests {
         assert_eq!(compacted.max_commit_ts, 11);
         assert_eq!(store.segment_paths().unwrap().len(), 1);
         assert_eq!(store.newest_paths().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_snapshot_skips_superseded_segments_for_load_and_commit_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-snapshot-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let key = RecordKey::new("tenant", "db", "items", b"row");
+        store
+            .write_delta(
+                1,
+                &[SegmentEntry {
+                    key: key.clone(),
+                    commit_ts: 1,
+                    value: Some(b"old".to_vec()),
+                    expires_at: 0,
+                }],
+            )
+            .unwrap();
+        let mut snapshot = Engine::new();
+        snapshot.apply(key.clone(), 1, Some(b"old".to_vec())).unwrap();
+        snapshot.apply(key.clone(), 10, Some(b"snapshot".to_vec())).unwrap();
+        store.write(10, &snapshot).unwrap();
+        store
+            .write_delta(
+                11,
+                &[SegmentEntry {
+                    key: key.clone(),
+                    commit_ts: 11,
+                    value: Some(b"new".to_vec()),
+                    expires_at: 0,
+                }],
+            )
+            .unwrap();
+
+        let obsolete = dir.join(segment_name(1));
+        let mut bytes = std::fs::read(&obsolete).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(obsolete, bytes).unwrap();
+
+        assert_eq!(store.max_commit_ts().unwrap(), 11);
+        let (recovered, max_commit_ts) = store.load_all().unwrap().unwrap();
+        assert_eq!(max_commit_ts, 11);
+        assert_eq!(recovered.read(&key, 10, 0).unwrap(), Some(b"snapshot".to_vec()));
+        assert_eq!(recovered.read(&key, 11, 0).unwrap(), Some(b"new".to_vec()));
+
+        std::fs::write(dir.join("latest"), b"../outside.sst").unwrap();
+        assert!(store.max_commit_ts().is_err());
+        assert!(store.load_all().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

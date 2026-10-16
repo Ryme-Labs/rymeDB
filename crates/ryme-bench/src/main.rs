@@ -79,6 +79,8 @@ enum Command {
         #[arg(long, default_value_t = 10_000)]
         rows: usize,
         #[arg(long, default_value_t = 500)]
+        superseded_deltas: usize,
+        #[arg(long, default_value_t = 500)]
         deltas: usize,
         #[arg(long, default_value_t = 10)]
         iterations: usize,
@@ -192,8 +194,8 @@ async fn main() {
         }) => {
             segment_scan_bench(rows, deltas, limit, iterations, concurrency, cache_bytes, compact);
         }
-        Some(Command::SegmentStartup { rows, deltas, iterations }) => {
-            segment_startup_bench(rows, deltas, iterations);
+        Some(Command::SegmentStartup { rows, superseded_deltas, deltas, iterations }) => {
+            segment_startup_bench(rows, superseded_deltas, deltas, iterations);
         }
         Some(Command::Resp {
             addr,
@@ -1080,8 +1082,15 @@ fn segment_scan_bench(
     }
 }
 
-fn segment_startup_bench(rows: usize, deltas: usize, iterations: usize) {
-    if rows == 0 || rows > 100_000 || deltas > 1_024 || iterations == 0 || iterations > 100 {
+fn segment_startup_bench(rows: usize, superseded_deltas: usize, deltas: usize, iterations: usize) {
+    if rows == 0
+        || rows > 100_000
+        || superseded_deltas > 1_024
+        || deltas > 1_024
+        || superseded_deltas.saturating_add(deltas) > 1_024
+        || iterations == 0
+        || iterations > 100
+    {
         eprintln!("rows, deltas, or iterations exceed segment startup benchmark bounds");
         std::process::exit(2);
     }
@@ -1102,8 +1111,30 @@ fn segment_startup_bench(rows: usize, deltas: usize, iterations: usize) {
         engine.apply(key, 1, Some(vec![7; 64])).expect("could not build startup snapshot");
     }
     store.write(1, &engine).expect("could not write startup snapshot");
-    drop(engine);
+    for index in 0..superseded_deltas {
+        let commit_ts = index as u64 + 2;
+        let key = RecordKey::new(
+            "bench",
+            "bench",
+            "startup",
+            format!("k-{:08}", index % rows).as_bytes(),
+        );
+        let value = vec![9; 64];
+        engine
+            .apply(key.clone(), commit_ts, Some(value.clone()))
+            .expect("could not extend superseded startup history");
+        store
+            .write_delta_owned_with_sync(
+                commit_ts,
+                vec![SegmentEntry { key, commit_ts, value: Some(value), expires_at: 0 }],
+                false,
+            )
+            .expect("could not write superseded startup delta");
+    }
+    let snapshot_commit = superseded_deltas as u64 + 1;
+    store.write(snapshot_commit, &engine).expect("could not write latest startup snapshot");
     for index in 0..deltas {
+        let commit_ts = snapshot_commit + index as u64 + 1;
         let key = RecordKey::new(
             "bench",
             "bench",
@@ -1112,19 +1143,14 @@ fn segment_startup_bench(rows: usize, deltas: usize, iterations: usize) {
         );
         store
             .write_delta_owned_with_sync(
-                index as u64 + 2,
-                vec![SegmentEntry {
-                    key,
-                    commit_ts: index as u64 + 2,
-                    value: Some(vec![9; 64]),
-                    expires_at: 0,
-                }],
+                commit_ts,
+                vec![SegmentEntry { key, commit_ts, value: Some(vec![9; 64]), expires_at: 0 }],
                 false,
             )
             .expect("could not write startup delta");
     }
 
-    let expected_max = deltas as u64 + 1;
+    let expected_max = snapshot_commit + deltas as u64;
     let mut full_decode_ns = Vec::with_capacity(iterations);
     let mut header_scan_ns = Vec::with_capacity(iterations);
     for iteration in 0..iterations {
@@ -1187,6 +1213,7 @@ fn segment_startup_bench(rows: usize, deltas: usize, iterations: usize) {
             "benchmark": "segment-startup-max-commit",
             "machine": machine_metadata(),
             "snapshot_rows": rows,
+            "superseded_delta_segments": superseded_deltas,
             "delta_segments": deltas,
             "iterations": iterations,
             "full_decode_p50_ns": full_decode_p50,

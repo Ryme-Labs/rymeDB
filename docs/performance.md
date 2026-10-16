@@ -86,20 +86,23 @@ full-segment decode path:
 
 ```bash
 cargo run --locked --release -j 1 -p ryme-bench -- segment-startup \
-  --rows 10000 --deltas 500 --iterations 10
+  --rows 10000 --superseded-deltas 500 --deltas 500 --iterations 10
 ```
 
-The command creates one snapshot and one-row delta segments, alternates the
-two measurements to reduce filesystem-cache ordering bias, and reports p50/p95
-plus their p50 ratio. The full-decode path rebuilds each segment's engine,
-bloom filter, and sparse index; the header path reads and checksum-verifies
-the files using a fixed-size buffer. This isolates commit-timestamp discovery,
-not total database startup or cold-storage latency.
+The command creates an initial snapshot, a superseded delta run, a newer
+snapshot, and a live delta tail. It alternates the two measurements to reduce
+filesystem-cache ordering bias, and reports p50/p95 plus their p50 ratio. The
+full-decode path rebuilds every segment's engine, bloom filter, and sparse
+index; the optimized path skips files superseded by the latest snapshot and
+reads metadata while checksum-verifying the remaining segments with a
+fixed-size buffer. This isolates commit-timestamp discovery, not total database
+startup or cold-storage latency.
 
 On an AMD Ryzen 5 4500 (12 logical CPUs), a release run with 10,000 snapshot
-rows, 500 deltas, and 10 iterations measured p50 at 19.1 ms for full decode
-versus 4.1 ms for header scanning (4.65×). Files were locally cached; this is a
-startup-work microbenchmark, not a full server restart measurement.
+rows, 500 superseded deltas, 500 live deltas, and 10 iterations measured p50
+at 35.1 ms for full decode versus 4.45 ms for the optimized path (7.88×).
+Files were locally cached; this is a startup-work microbenchmark, not a full
+server restart measurement.
 
 Two sequential A/B pairs on an AMD Ryzen 5 4500 (12 logical CPUs), comparing
 the pre-merge implementation at `0202d42` with the k-way merge, measured p50
