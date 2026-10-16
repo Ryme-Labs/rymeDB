@@ -261,7 +261,7 @@ impl HnswIndex {
                 self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal).then(self.1.cmp(&other.1))
             }
         }
-        let mut visited = HashSet::with_capacity(ef.saturating_mul(2));
+        let mut visited = HashSet::with_capacity(ef.saturating_mul(HNSW_M).min(self.nodes.len()));
         visited.extend(starts.iter().copied());
         let mut candidates: BinaryHeap<Scored> = BinaryHeap::with_capacity(ef);
         let mut results: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(ef);

@@ -1,0 +1,46 @@
+{
+  "experiment": "hnsw-visited-set-capacity",
+  "captured_date": "2026-10-17",
+  "description": "Sequential release-mode vector-index benchmark runs comparing visited-set initial capacity. Local in-memory index only; not end-to-end database latency.",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "parameters": {
+    "vectors": 10240,
+    "dimensions": 64,
+    "partitions": 4,
+    "queries": 300,
+    "top_k": 10,
+    "ann_ef": 64,
+    "build_profile": "release",
+    "command": "ryme-bench vector-index --vectors 10240 --dimensions 64 --queries 300 --partitions 4 --top-k 10 --ann-ef 64 --json"
+  },
+  "baseline_revision": "6008449",
+  "results": {
+    "visited_capacity_2ef": [
+      { "ann_p50_ns": 721916, "ann_p95_ns": 929871, "ann_p99_ns": 1085967, "ann_qps": 1330.501, "exact_p50_ns": 1040380, "index_build_ns": 1218342563, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 702610, "ann_p95_ns": 766772, "ann_p99_ns": 869706, "ann_qps": 1409.436, "exact_p50_ns": 978212, "index_build_ns": 1183732386, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 701007, "ann_p95_ns": 750241, "ann_p99_ns": 799664, "ann_qps": 1416.351, "exact_p50_ns": 974705, "index_build_ns": 1182969011, "mean_recall_at_k": 0.9730005 }
+    ],
+    "visited_capacity_ef_times_m": [
+      { "ann_p50_ns": 604865, "ann_p95_ns": 793512, "ann_p99_ns": 906326, "ann_qps": 1597.308, "exact_p50_ns": 977010, "index_build_ns": 1077269359, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 606488, "ann_p95_ns": 649209, "ann_p99_ns": 790707, "ann_qps": 1633.269, "exact_p50_ns": 994193, "index_build_ns": 1054334606, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 596229, "ann_p95_ns": 631897, "ann_p99_ns": 668406, "ann_qps": 1669.122, "exact_p50_ns": 958415, "index_build_ns": 1041844799, "mean_recall_at_k": 0.9730005 }
+    ],
+    "visited_capacity_half_ef_times_m": [
+      { "ann_p50_ns": 664218, "ann_p95_ns": 707049, "ann_p99_ns": 805004, "ann_qps": 1497.553, "exact_p50_ns": 991527, "index_build_ns": 1122232267, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 647836, "ann_p95_ns": 702550, "ann_p99_ns": 736425, "ann_qps": 1533.539, "exact_p50_ns": 945430, "index_build_ns": 1073885243, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 664508, "ann_p95_ns": 898361, "ann_p99_ns": 987971, "ann_qps": 1426.568, "exact_p50_ns": 1006305, "index_build_ns": 1114393977, "mean_recall_at_k": 0.9730005 }
+    ],
+    "visited_capacity_ef_times_m_capped_by_node_count": [
+      { "ann_p50_ns": 600176, "ann_p95_ns": 684616, "ann_p99_ns": 975617, "ann_qps": 1624.464, "exact_p50_ns": 954767, "index_build_ns": 1082143548, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 593814, "ann_p95_ns": 674898, "ann_p99_ns": 864627, "ann_qps": 1654.120, "exact_p50_ns": 937064, "index_build_ns": 1070043058, "mean_recall_at_k": 0.9730005 },
+      { "ann_p50_ns": 597982, "ann_p95_ns": 633369, "ann_p99_ns": 654379, "ann_qps": 1666.692, "exact_p50_ns": 966460, "index_build_ns": 1038607350, "mean_recall_at_k": 0.9730005 }
+    ]
+  },
+  "caveat": "Three runs per variant on one host; background noise is visible in tail latency. Median ANN p50 improved about 15% and median QPS about 17% for ef*M versus 2*ef. The node-count cap reduces over-reservation on small graphs. Revalidate on production hardware and concurrent mixed workloads."
+}
