@@ -8093,6 +8093,12 @@ where
         txn
     }
 
+    fn begin_read_only(&self, isolation: Isolation) -> Result<Transaction> {
+        let mut txn = self.begin_with(isolation);
+        txn.set_read_only()?;
+        Ok(txn)
+    }
+
     pub fn manager(&self) -> &B {
         &self.manager
     }
@@ -14856,7 +14862,7 @@ where
                 Ok(apply_distinct(result, offset, limit))
             }
             Statement::Union { left, right, all, operation } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 let left = self.execute_read_in_transaction(&mut txn, *left)?;
                 let right = self.execute_read_in_transaction(&mut txn, *right)?;
                 merge_set_results(left, right, operation, all)
@@ -14963,7 +14969,7 @@ where
             }
             Statement::CreateMaterializedView { name, query, replace, with_data } => {
                 let query = *query;
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 let rows = if with_data {
                     query_result_rows(self.execute_read_in_transaction(&mut txn, query.clone())?)
                 } else {
@@ -14998,7 +15004,7 @@ where
                 Ok(QueryResult::Ok)
             }
             Statement::RefreshMaterializedView { name, concurrently: _ } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 self.refresh_materialized_view(&mut txn, &name)?;
                 Ok(QueryResult::Ok)
             }
@@ -15268,7 +15274,7 @@ where
                 Ok(QueryResult::Ok)
             }
             Statement::SelectByKey { table, pk } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 match self.manager.get(&mut txn, &key)? {
                     Some(value) if self.rls_allows(&table, &value) => {
@@ -15280,17 +15286,17 @@ where
             }
             Statement::SelectValues { columns, values } => select_values_result(columns, values),
             Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 self.select_columns_in_transaction(
                     &mut txn, table, columns, aliases, limit, offset, order, filter,
                 )
             }
             Statement::CopyTo { table, columns } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 self.copy_to_in_transaction(&mut txn, table, columns)
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
                 let rows = self.scan_rows(&mut txn, &table, &filter, cap)?;
@@ -15302,7 +15308,7 @@ where
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let rows: Vec<(Vec<u8>, Vec<u8>)> = rows
                     .into_iter()
@@ -15324,7 +15330,7 @@ where
                 offset,
                 order,
             } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 let rows = self.scan_rows(&mut txn, &table, &filter, usize::MAX)?;
                 let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
                 for (pk, value) in rows {
@@ -15402,7 +15408,7 @@ where
                 Ok(QueryResult::Rows { rows: out.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Join { left, right, join_type, limit, offset, order, filter } => {
-                let mut txn = self.begin_with(isolation);
+                let mut txn = self.begin_read_only(isolation)?;
                 let left_rows = self.scan_rows(&mut txn, &left, &[], usize::MAX)?;
                 let right_rows = self.scan_rows(&mut txn, &right, &[], usize::MAX)?;
                 Ok(join_rows(left_rows, right_rows, join_type, &filter, &order, offset, limit)?)

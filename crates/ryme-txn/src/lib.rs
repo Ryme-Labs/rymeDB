@@ -419,6 +419,7 @@ pub struct Transaction {
     scanned: BTreeSet<(String, String, String)>,
     constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
+    read_only: bool,
     route_generation: Option<u64>,
     state_bytes: usize,
     resource_error: Option<RymeError>,
@@ -437,6 +438,8 @@ pub struct TransactionState {
     pub constraint_scanned: Vec<(String, String, String)>,
     pub isolation: Isolation,
     #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
     pub route_generation: Option<u64>,
 }
 
@@ -449,6 +452,7 @@ pub struct TransactionCheckpoint {
     scanned: BTreeSet<(String, String, String)>,
     constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
+    read_only: bool,
     route_generation: Option<u64>,
     state_bytes: usize,
     resource_error: Option<RymeError>,
@@ -470,6 +474,7 @@ impl Transaction {
             scanned: self.scanned.clone(),
             constraint_scanned: self.constraint_scanned.clone(),
             isolation: self.isolation,
+            read_only: self.read_only,
             route_generation: self.route_generation,
             state_bytes: self.state_bytes,
             resource_error: self.resource_error.clone(),
@@ -503,6 +508,7 @@ impl Transaction {
             scanned: self.scanned.iter().cloned().collect(),
             constraint_scanned: self.constraint_scanned.iter().cloned().collect(),
             isolation: self.isolation,
+            read_only: self.read_only,
             route_generation: self.route_generation,
         }
     }
@@ -515,6 +521,7 @@ impl Transaction {
         self.scanned.clone_from(&checkpoint.scanned);
         self.constraint_scanned.clone_from(&checkpoint.constraint_scanned);
         self.isolation = checkpoint.isolation;
+        self.read_only = checkpoint.read_only;
         self.route_generation = checkpoint.route_generation;
         self.state_bytes = checkpoint.state_bytes;
         self.resource_error.clone_from(&checkpoint.resource_error);
@@ -528,6 +535,16 @@ impl Transaction {
 
     pub fn set_isolation(&mut self, isolation: Isolation) {
         self.isolation = isolation;
+    }
+
+    /// Disables conflict-observation tracking for a transaction that cannot write.
+    pub fn set_read_only(&mut self) -> Result<()> {
+        self.ensure_healthy()?;
+        if !self.writes.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("read-only transaction")));
+        }
+        self.read_only = true;
+        Ok(())
     }
 
     pub fn set_route_generation(&mut self, generation: u64) {
@@ -551,6 +568,9 @@ impl Transaction {
     }
 
     pub fn record_read(&mut self, key: RecordKey, existed: bool) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         if self.read_set.contains(&key) {
             return Ok(());
         }
@@ -570,6 +590,9 @@ impl Transaction {
     }
 
     pub fn record_scan(&mut self, tenant: &str, database: &str, table: &str) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let scope = (tenant.to_string(), database.to_string(), table.to_string());
         if self.scanned.contains(&scope) {
             return Ok(());
@@ -591,6 +614,9 @@ impl Transaction {
         database: &str,
         table: &str,
     ) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let scope = (tenant.to_string(), database.to_string(), table.to_string());
         if self.constraint_scanned.contains(&scope) {
             return Ok(());
@@ -628,6 +654,11 @@ impl Transaction {
     }
 
     fn stage_write(&mut self, key: RecordKey, op: WriteOp) -> Result<()> {
+        if self.read_only {
+            let error = RymeError::InvalidArgument(String::from("read-only transaction"));
+            self.resource_error = Some(error.clone());
+            return Err(error);
+        }
         if let Some(error) = self.resource_error.clone() {
             return Err(error);
         }
@@ -1008,6 +1039,7 @@ impl TxnManager {
             scanned: BTreeSet::new(),
             constraint_scanned: BTreeSet::new(),
             isolation: Isolation::Serializable,
+            read_only: false,
             route_generation: None,
             state_bytes: 0,
             resource_error: None,
@@ -1036,6 +1068,9 @@ impl TxnManager {
         }
         if state.constraint_scanned.len() > MAX_TRANSACTION_CONSTRAINT_SCANS {
             return Err(transaction_overload("constraint scan set"));
+        }
+        if state.read_only && !state.writes.is_empty() {
+            return Err(RymeError::Corrupt(String::from("read-only transaction writes")));
         }
         let read_set_entries = state.read_set.len();
         let observed_entries = state.observed.len();
@@ -1093,6 +1128,7 @@ impl TxnManager {
             scanned,
             constraint_scanned,
             isolation: state.isolation,
+            read_only: state.read_only,
             route_generation: state.route_generation,
             state_bytes,
             resource_error: None,
@@ -3274,6 +3310,31 @@ mod tests {
     }
 
     #[test]
+    fn read_only_transactions_skip_observations_and_reject_writes() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "items", b"row");
+        let mut txn = manager.begin();
+        txn.set_read_only().unwrap();
+
+        assert_eq!(manager.get(&mut txn, &key).unwrap(), None);
+        assert!(manager.scan(&mut txn, "t", "d", "items", 10).unwrap().is_empty());
+        assert!(txn.read_keys().is_empty());
+        assert!(txn.scanned_tables().is_empty());
+        let restored = manager.from_state(txn.state()).unwrap();
+        assert!(restored.state().read_only);
+        assert!(manager.try_put(&mut txn, key, b"value".to_vec()).is_err());
+
+        let mut ignored_write = manager.begin();
+        ignored_write.set_read_only().unwrap();
+        manager.put(
+            &mut ignored_write,
+            RecordKey::new("t", "d", "items", b"ignored"),
+            b"value".to_vec(),
+        );
+        assert!(manager.commit(ignored_write).is_err());
+    }
+
+    #[test]
     fn commit_advances_clock_past_an_older_manager_snapshot() {
         let manager = TxnManager::new();
         let mut txn = manager.begin();
@@ -4731,6 +4792,7 @@ mod tests {
             scanned: Vec::new(),
             constraint_scanned: Vec::new(),
             isolation: Isolation::Serializable,
+            read_only: false,
             route_generation: None,
         };
         assert!(
