@@ -119,20 +119,20 @@ impl SegmentReadCache {
         segment
     }
 
-    fn get_all_cached(&mut self, ids: &[u64]) -> Option<Vec<Arc<ImmutableSegment>>> {
-        if ids.iter().any(|id| !self.entries.contains_key(id)) {
-            return None;
-        }
-
+    fn get_many_cached(&mut self, ids: &[u64]) -> Vec<Option<Arc<ImmutableSegment>>> {
         let segments = ids
             .iter()
-            .map(|id| Arc::clone(&self.entries.get(id).expect("cached segment id").segment))
-            .collect();
-        self.hits = self.hits.saturating_add(ids.len() as u64);
+            .map(|id| self.entries.get(id).map(|entry| Arc::clone(&entry.segment)))
+            .collect::<Vec<_>>();
+        self.hits = self
+            .hits
+            .saturating_add(segments.iter().filter(|segment| segment.is_some()).count() as u64);
         for id in ids {
-            self.touch(*id);
+            if self.entries.contains_key(id) {
+                self.touch(*id);
+            }
         }
-        Some(segments)
+        segments
     }
 
     fn insert(&mut self, id: u64, segment: Arc<ImmutableSegment>, bytes: u64) {
@@ -604,12 +604,15 @@ impl SegmentStore {
         Ok(segment)
     }
 
-    fn read_cached_segments(&self, paths: &[PathBuf]) -> Option<Vec<Arc<ImmutableSegment>>> {
+    fn read_cached_segments(
+        &self,
+        paths: &[PathBuf],
+    ) -> Option<Vec<Option<Arc<ImmutableSegment>>>> {
         let ids = paths
             .iter()
             .map(|path| parse_segment_name(path.file_name()?.to_str()?))
             .collect::<Option<Vec<_>>>()?;
-        self.cache.lock().ok()?.get_all_cached(&ids)
+        Some(self.cache.lock().ok()?.get_many_cached(&ids))
     }
 
     fn read_scan_segments(
@@ -631,10 +634,9 @@ impl SegmentStore {
             self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
         let mut segments = Vec::new();
         for path in paths.iter().rev() {
-            let segment = if let Some(cached_segments) = cached_segments.as_mut() {
-                cached_segments.next().expect("cached segment path")
-            } else {
-                self.read_segment_under_lock(path)?
+            let segment = match cached_segments.as_mut().and_then(Iterator::next).flatten() {
+                Some(segment) => segment,
+                None => self.read_segment_under_lock(path)?,
             };
             let scope_start = segment
                 .keys
@@ -698,10 +700,9 @@ impl SegmentStore {
             self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
 
         for path in paths.iter().rev() {
-            let segment = if let Some(cached_segments) = cached_segments.as_mut() {
-                cached_segments.next().expect("cached segment path")
-            } else {
-                self.read_segment_under_lock(path)?
+            let segment = match cached_segments.as_mut().and_then(Iterator::next).flatten() {
+                Some(segment) => segment,
+                None => self.read_segment_under_lock(path)?,
             };
             let is_snapshot = segment.is_snapshot();
             let mut next_unresolved = Vec::with_capacity(unresolved.len());
@@ -2002,6 +2003,15 @@ mod tests {
                 .unwrap(),
             vec![Some(b"two".to_vec()), None, None, Some(b"two".to_vec()), None,]
         );
+        store.cache.lock().unwrap().remove(11);
+        let before_partial_cache_read = store.cache_stats();
+        assert_eq!(
+            store.get_many(&[first.clone(), second.clone()], 12, 0).unwrap(),
+            vec![None, Some(b"two".to_vec())]
+        );
+        let after_partial_cache_read = store.cache_stats();
+        assert_eq!(after_partial_cache_read.hits - before_partial_cache_read.hits, 2);
+        assert_eq!(after_partial_cache_read.misses - before_partial_cache_read.misses, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2285,23 +2295,23 @@ mod tests {
     }
 
     #[test]
-    fn segment_cache_bulk_lookup_requires_all_entries_and_updates_lru() {
+    fn segment_cache_bulk_lookup_returns_partial_hits_and_updates_lru() {
         let segment = Arc::new(ImmutableSegment::from_engine(1, &Engine::new()));
         let mut cache = SegmentReadCache::new(3);
         cache.insert(1, Arc::clone(&segment), 1);
         cache.insert(2, Arc::clone(&segment), 1);
+        cache.insert(3, Arc::clone(&segment), 1);
 
-        assert!(cache.get_all_cached(&[1, 2, 3]).is_none());
-        assert_eq!(cache.hits, 0);
+        let partial = cache.get_many_cached(&[1, 4, 3]);
+        assert!(partial[0].is_some());
+        assert!(partial[1].is_none());
+        assert!(partial[2].is_some());
+        assert_eq!(cache.hits, 2);
         assert_eq!(cache.misses, 0);
 
-        cache.insert(3, Arc::clone(&segment), 1);
-        assert_eq!(cache.get_all_cached(&[1, 2, 3]).unwrap().len(), 3);
-        assert_eq!(cache.hits, 3);
-
         cache.insert(4, segment, 1);
-        assert!(!cache.entries.contains_key(&1));
-        assert!(cache.entries.contains_key(&2));
+        assert!(cache.entries.contains_key(&1));
+        assert!(!cache.entries.contains_key(&2));
         assert!(cache.entries.contains_key(&3));
         assert!(cache.entries.contains_key(&4));
     }
