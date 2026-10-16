@@ -696,6 +696,7 @@ impl SegmentStore {
         let paths = self.newest_paths()?;
         let mut values = vec![None; keys.len()];
         let mut unresolved = (0..keys.len()).collect::<Vec<_>>();
+        let mut next_unresolved = Vec::with_capacity(keys.len());
         let mut cached_segments =
             self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
 
@@ -705,15 +706,15 @@ impl SegmentStore {
                 None => self.read_segment_under_lock(path)?,
             };
             let is_snapshot = segment.is_snapshot();
-            let mut next_unresolved = Vec::with_capacity(unresolved.len());
-            for index in unresolved {
+            next_unresolved.clear();
+            for index in unresolved.drain(..) {
                 if let Some((_, value, expires_at)) = segment.version_at(&keys[index], read_ts) {
                     values[index] = if expires_at != 0 && expires_at <= now { None } else { value };
                 } else if !is_snapshot {
                     next_unresolved.push(index);
                 }
             }
-            unresolved = next_unresolved;
+            std::mem::swap(&mut unresolved, &mut next_unresolved);
             if unresolved.is_empty() || is_snapshot {
                 break;
             }
