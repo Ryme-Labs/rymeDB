@@ -418,6 +418,7 @@ pub struct JwtVerifier {
     leeway_secs: u64,
     issuer: Option<String>,
     audience: Option<String>,
+    allow_platform_admin_claims: bool,
 }
 
 const MAX_JWT_TOKEN_LEN: usize = 16 * 1024;
@@ -433,7 +434,13 @@ fn validate_tenant(tenant: &str) -> Result<()> {
 
 impl JwtVerifier {
     pub fn new(secret: Vec<u8>) -> Self {
-        Self { key: JwtKey::Hmac(secret), leeway_secs: 60, issuer: None, audience: None }
+        Self {
+            key: JwtKey::Hmac(secret),
+            leeway_secs: 60,
+            issuer: None,
+            audience: None,
+            allow_platform_admin_claims: false,
+        }
     }
 
     pub fn with_issuer(secret: Vec<u8>, issuer: String, audience: String) -> Self {
@@ -445,7 +452,13 @@ impl JwtVerifier {
     }
 
     pub fn with_rsa_jwks(keys: Vec<RsaJwk>) -> Self {
-        Self { key: JwtKey::RsaJwks(keys), leeway_secs: 60, issuer: None, audience: None }
+        Self {
+            key: JwtKey::RsaJwks(keys),
+            leeway_secs: 60,
+            issuer: None,
+            audience: None,
+            allow_platform_admin_claims: false,
+        }
     }
 
     pub fn with_rsa_jwk_issuer(
@@ -464,6 +477,15 @@ impl JwtVerifier {
     fn with_claims(mut self, issuer: Option<String>, audience: Option<String>) -> Self {
         self.issuer = issuer;
         self.audience = audience;
+        self
+    }
+
+    /// Allows verified JWTs to grant platform-admin privileges.
+    ///
+    /// Only enable this when the verifier accepts tokens from a trusted,
+    /// operator-only issuer. Application-user JWTs should use the default.
+    pub fn with_platform_admin_claims(mut self, enabled: bool) -> Self {
+        self.allow_platform_admin_claims = enabled;
         self
     }
 
@@ -612,7 +634,10 @@ impl JwtVerifier {
         if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN {
             return Err(RymeError::Unauthorized);
         }
-        let roles = claim_roles(&claims);
+        let mut roles = claim_roles(&claims);
+        if !self.allow_platform_admin_claims {
+            roles.remove(&Role::Superuser);
+        }
         Ok(Principal { id, tenant: tenant.to_string(), roles })
     }
 }
@@ -1447,6 +1472,39 @@ mod tests {
     fn jwt_reject_bad_signature() {
         let verifier = JwtVerifier::new(b"test-secret".to_vec());
         assert!(verifier.principal_from_token("a.b.c", 1000).is_err());
+    }
+
+    #[test]
+    fn jwt_platform_admin_claim_requires_explicit_opt_in() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = b"operator-only-test-secret";
+        let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+        let payload = base64_url_encode(
+            serde_json::to_string(&serde_json::json!({
+                "sub": "operator",
+                "role": "superuser",
+                "exp": 2000000000u64,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        let input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(input.as_bytes());
+        let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
+
+        let ordinary =
+            JwtVerifier::new(secret.to_vec()).principal_from_token(&token, 1000).unwrap();
+        assert!(!ordinary.can_platform_admin());
+        assert!(!ordinary.roles.contains(&Role::Superuser));
+
+        let operator = JwtVerifier::new(secret.to_vec())
+            .with_platform_admin_claims(true)
+            .principal_from_token(&token, 1000)
+            .unwrap();
+        assert!(operator.can_platform_admin());
     }
 
     #[test]

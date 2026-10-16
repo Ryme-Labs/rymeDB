@@ -87,7 +87,7 @@ JWTs accept rymeDB claims (`tenant`, `roles`) and common Supabase claims
 | `anon` | Read-only public access |
 | `authenticated` | Authenticated application reads and writes |
 | `service_role` | Tenant-scoped application read/write; RLS still applies; keep server-side |
-| `superuser` | Platform administration; accept only from a trusted operator issuer |
+| `superuser` | Platform administration; JWT claim is ignored unless explicitly enabled |
 | `owner` / `admin` | Tenant-local administration; no cluster, archive, or platform access |
 
 The exact policy is still enforced by the server's configured principal and
@@ -118,6 +118,13 @@ disabling claim validation.
 Expired, not-yet-valid, and future-issued tokens are rejected with clock-skew
 checks. Mount secrets read-only and rotate them through your deployment
 system.
+
+JWTs cannot grant platform-admin (`superuser`) privileges by default, even if
+the verified token contains that role. To enable it, set
+`RYME_JWT_ALLOW_PLATFORM_ADMIN=true` only when this verifier is dedicated to a
+trusted operator-only issuer; do not share that verifier or signing key with
+application-user tokens. Prefer the configured `RYME_API_KEY` for operator
+access when application and operator identities share an issuer.
 
 ## Password and application auth
 

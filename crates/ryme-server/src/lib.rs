@@ -13606,16 +13606,32 @@ fn complete_auth_attempt(state: &SharedState, identity: &str, client_ip: std::ne
 fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
     let issuer = std::env::var("RYME_JWT_ISSUER").ok();
     let audience = std::env::var("RYME_JWT_AUDIENCE").ok();
+    let verification_source_configured = std::env::var("RYME_JWT_SECRET").is_ok()
+        || std::env::var_os("RYME_JWT_JWKS_FILE").is_some()
+        || std::env::var("RYME_JWT_JWKS_URL").is_ok();
+    let allow_platform_admin = match std::env::var("RYME_JWT_ALLOW_PLATFORM_ADMIN") {
+        Ok(value) => parse_jwt_platform_admin_flag(Some(&value))?,
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                "RYME_JWT_ALLOW_PLATFORM_ADMIN",
+            )))
+        }
+    };
     validate_jwt_claim_configuration(
         issuer.as_deref(),
         audience.as_deref(),
-        std::env::var("RYME_JWT_SECRET").is_ok()
-            || std::env::var_os("RYME_JWT_JWKS_FILE").is_some()
-            || std::env::var("RYME_JWT_JWKS_URL").is_ok(),
+        verification_source_configured,
         "jwt",
     )?;
+    if allow_platform_admin && !verification_source_configured {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "RYME_JWT_ALLOW_PLATFORM_ADMIN requires a JWT verifier",
+        )));
+    }
     if let Ok(secret) = std::env::var("RYME_JWT_SECRET") {
-        return hmac_jwt_verifier(secret.into_bytes(), issuer, audience).map(Some);
+        return hmac_jwt_verifier(secret.into_bytes(), issuer, audience)
+            .map(|verifier| Some(verifier.with_platform_admin_claims(allow_platform_admin)));
     }
 
     let Some(path) = std::env::var_os("RYME_JWT_JWKS_FILE") else {
@@ -13626,7 +13642,7 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
                 issuer,
                 audience,
             )?;
-            return Ok(Some(verifier));
+            return Ok(Some(verifier.with_platform_admin_claims(allow_platform_admin)));
         }
         return Ok(None);
     };
@@ -13636,12 +13652,31 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
         issuer,
         audience,
     )?;
-    Ok(Some(verifier))
+    Ok(Some(verifier.with_platform_admin_claims(allow_platform_admin)))
+}
+
+fn parse_jwt_platform_admin_flag(value: Option<&str>) -> ryme_error::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(_) => Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "RYME_JWT_ALLOW_PLATFORM_ADMIN must be true or false",
+        ))),
+    }
 }
 
 #[cfg(test)]
 mod jwt_config_tests {
     use super::*;
+
+    #[test]
+    fn jwt_platform_admin_claims_are_disabled_unless_explicitly_enabled() {
+        assert!(!parse_jwt_platform_admin_flag(None).unwrap());
+        assert!(parse_jwt_platform_admin_flag(Some("true")).unwrap());
+        assert!(!parse_jwt_platform_admin_flag(Some("FALSE")).unwrap());
+        assert!(parse_jwt_platform_admin_flag(Some("yes")).is_err());
+    }
 
     #[test]
     fn hmac_jwt_rejects_weak_secrets() {
