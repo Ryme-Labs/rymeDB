@@ -7937,6 +7937,35 @@ where
         }))
     }
 
+    fn select_scan_limit(
+        &self,
+        table: &str,
+        order: &Order,
+        limit: usize,
+        offset: usize,
+        filter_is_empty: bool,
+    ) -> Result<usize> {
+        let primary_key_order = order == &Order::default();
+        if filter_is_empty && offset == 0 && primary_key_order {
+            return Ok(limit.clamp(1, 10_000));
+        }
+        if primary_key_order {
+            let views =
+                self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
+            let is_view = views.contains_key(table)
+                || views.keys().any(|view_name| {
+                    view_name
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|short| short.eq_ignore_ascii_case(table))
+                });
+            if !is_view {
+                return Ok(limit.saturating_add(offset).clamp(1, 10_000));
+            }
+        }
+        Ok(10_000)
+    }
+
     fn install_sequence(&self, definition: SequenceDefinition, if_not_exists: bool) -> Result<()> {
         let mut sequences = self
             .sequences
@@ -10589,11 +10618,7 @@ where
                 .map(|value| vec![(pk, value)])
                 .unwrap_or_default()
         } else {
-            let cap = if filter.is_empty() && offset == 0 && order == Order::default() {
-                limit.clamp(1, 10000)
-            } else {
-                10000
-            };
+            let cap = self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
             self.scan_rows(txn, &table, &filter, cap)?
         };
         let mut rows = rows;
@@ -14620,11 +14645,8 @@ where
                 Ok(QueryResult::Table { columns: output_columns, rows })
             }
             Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter } => {
-                let cap = if filter.is_empty() && offset == 0 && order == Order::default() {
-                    limit.clamp(1, 10000)
-                } else {
-                    10000
-                };
+                let cap =
+                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
                 let mut rows = rows;
                 rows.sort_by(|left, right| compare_order(&order, left, right));
@@ -14643,8 +14665,8 @@ where
                 Ok(QueryResult::Table { columns: output_columns, rows })
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
-                let plain = filter.is_empty() && offset == 0 && order == Order::default();
-                let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
+                let cap =
+                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
                 let mut rows = rows;
                 rows.sort_by(|left, right| compare_order(&order, left, right));
@@ -14697,8 +14719,8 @@ where
                 self.copy_to_in_transaction(txn, table, columns)
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
-                let plain = filter.is_empty() && offset == 0 && order == Order::default();
-                let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
+                let cap =
+                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows(txn, &table, &filter, cap)?;
                 let mut rows = rows;
                 rows.sort_by(|a, b| compare_order(&order, a, b));
@@ -15706,8 +15728,8 @@ where
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let mut txn = self.begin_read_only(isolation)?;
-                let plain = filter.is_empty() && offset == 0 && order == Order::default();
-                let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
+                let cap =
+                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows(&mut txn, &table, &filter, cap)?;
                 let mut rows = rows;
                 rows.sort_by(|a, b| compare_order(&order, a, b));
@@ -20915,6 +20937,12 @@ mod tests {
         assert!(
             matches!(rows, QueryResult::Rows { rows } if rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>() == vec![b"a".as_slice(), b"c".as_slice()])
         );
+        let rows = executor
+            .execute(parse("SELECT * FROM docs WHERE value LIKE 'ap%' LIMIT 1 OFFSET 1").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(rows, QueryResult::Rows { rows }
+            if rows.len() == 1 && rows[0].0 == b"c"));
         let rows = executor
             .execute(
                 parse("SELECT * FROM docs WHERE key != 'b' ORDER BY key DESC LIMIT 2").unwrap(),
