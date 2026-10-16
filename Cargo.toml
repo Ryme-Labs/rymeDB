@@ -77,7 +77,7 @@ mlua = { version = "0.10", features = ["lua54", "vendored"] }
 sha1 = "0.10"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }

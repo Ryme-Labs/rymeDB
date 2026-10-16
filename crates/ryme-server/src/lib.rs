@@ -1221,7 +1221,7 @@ fn validate_listener_auth(
 ) -> ryme_error::Result<()> {
     const MIN_EXTERNAL_CREDENTIAL_BYTES: usize = 16;
     let strong_enough = |value: Option<&str>| {
-        value.is_some_and(|value| value.as_bytes().len() >= MIN_EXTERNAL_CREDENTIAL_BYTES)
+        value.is_some_and(|value| value.len() >= MIN_EXTERNAL_CREDENTIAL_BYTES)
     };
     let requires_api_key = [
         Some(config.http_listen),
@@ -2859,7 +2859,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/health", get(health))
         .route("/dashboard", get(dashboard))
         .route("/dashboard/", get(dashboard))
-        .route("/dashboard/*path", get(dashboard_asset))
+        .route("/dashboard/{*path}", get(dashboard_asset))
         .route("/v1/dashboard/setup", get(dashboard_setup))
         .route("/v1/dashboard/bootstrap", post(dashboard_bootstrap))
         .route("/ready", get(ready))
@@ -2868,14 +2868,14 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/audit", get(audit_events))
         .route("/v1/observe/slow", get(slow_log))
         .route("/v1/traces", get(traces))
-        .route("/v1/kv/:table/:key", get(kv_get).put(kv_put).delete(kv_delete))
-        .route("/v1/kv/:table/:key/ttl", get(kv_ttl))
+        .route("/v1/kv/{table}/{key}", get(kv_get).put(kv_put).delete(kv_delete))
+        .route("/v1/kv/{table}/{key}/ttl", get(kv_ttl))
         .route("/v1/sql", post(sql_exec))
         .route("/v1/sql/copy", post(sql_copy))
         .route("/v1/sql/explain", post(sql_explain))
-        .route("/v1/scan/:table", get(scan))
+        .route("/v1/scan/{table}", get(scan))
         .route(
-            "/rest/v1/:table",
+            "/rest/v1/{table}",
             get(rest_list)
                 .post(rest_insert)
                 .patch(rest_upsert)
@@ -2908,27 +2908,27 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/auth/mask", post(mask_set))
         .route("/v1/presence/join", post(presence_join))
         .route("/v1/presence/leave", post(presence_leave))
-        .route("/v1/presence/:channel/stream", get(presence_stream))
-        .route("/v1/presence/:channel", get(presence_list))
+        .route("/v1/presence/{channel}/stream", get(presence_stream))
+        .route("/v1/presence/{channel}", get(presence_list))
         .route("/v1/broadcast", post(broadcast_post))
-        .route("/v1/broadcast/:channel", get(broadcast_stream))
+        .route("/v1/broadcast/{channel}", get(broadcast_stream))
         .route("/realtime/v1/websocket", get(supabase_realtime_stream))
         .route("/v1/topics/append", post(durable_append))
         .route("/v1/topics/read", get(durable_read))
-        .route("/v1/topics/:partition/stream", get(durable_stream))
+        .route("/v1/topics/{partition}/stream", get(durable_stream))
         .route("/v1/vector/upsert", post(vector_upsert))
         .route("/v1/vector/search", post(vector_search))
         .route("/v1/vector/ann-search", post(vector_ann_search))
-        .route("/v1/vector/:table/:id", delete(vector_delete))
+        .route("/v1/vector/{table}/{id}", delete(vector_delete))
         .route("/v1/text/index", post(text_index))
         .route("/v1/text/search", post(text_search))
-        .route("/v1/text/:table/:id", delete(text_delete))
+        .route("/v1/text/{table}/{id}", delete(text_delete))
         .route("/v1/index/stats", get(index_stats))
         .route("/v1/branches", post(branch_create).get(branch_list))
-        .route("/v1/branches/:id", get(branch_get).delete(branch_delete))
-        .route("/v1/branches/:id/reset", post(branch_reset))
-        .route("/v1/branches/:id/promote", post(branch_promote))
-        .route("/v1/branches/:id/diff", get(branch_diff))
+        .route("/v1/branches/{id}", get(branch_get).delete(branch_delete))
+        .route("/v1/branches/{id}/reset", post(branch_reset))
+        .route("/v1/branches/{id}/promote", post(branch_promote))
+        .route("/v1/branches/{id}/diff", get(branch_diff))
         .route("/v1/backups/checkpoint", post(checkpoint_create))
         .route("/v1/backups/latest", get(checkpoint_latest))
         .route("/v1/backups/pitr", get(checkpoint_pitr))
@@ -2949,7 +2949,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/ranges/verify", post(range_verify))
         .route("/v1/ranges/transfer", post(range_transfer))
         .route("/v1/cluster/members", get(cluster_members).post(cluster_add_member))
-        .route("/v1/cluster/members/:id", delete(cluster_remove_member))
+        .route("/v1/cluster/members/{id}", delete(cluster_remove_member))
         .route("/v1/cluster/transfer", post(cluster_transfer))
         .route("/v1/cluster/replace", post(cluster_replace))
         .route("/v1/regions", get(regions))
@@ -5438,10 +5438,10 @@ async fn execute_graphql(
     query: &str,
 ) -> ryme_error::Result<serde_json::Value> {
     if let Some(key) = parse_graphql_key(query) {
-        match gateway.get(principal, &table, key.as_bytes())? {
+        match gateway.get(principal, table, key.as_bytes())? {
             Some(value) if executor.row_allowed_by_rls(table, &value) => {
                 admit_egress(state, &principal.tenant, value.len() as u64)?;
-                let masked = gateway.masked(&table, value);
+                let masked = gateway.masked(table, value);
                 Ok(serde_json::json!({ table: rest_row_to_json(key.as_bytes(), &masked) }))
             }
             _ => Ok(serde_json::json!({ table: serde_json::Value::Null })),
@@ -5458,7 +5458,7 @@ async fn execute_graphql(
         admit_egress(state, &principal.tenant, egress)?;
         let items: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(pk, value)| rest_row_to_json(pk, &gateway.masked(&table, value.clone())))
+            .map(|(pk, value)| rest_row_to_json(pk, &gateway.masked(table, value.clone())))
             .collect();
         Ok(serde_json::json!({ table: items }))
     }
@@ -7943,7 +7943,7 @@ async fn forward_supabase_realtime(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(Vec::new())) {
+                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(Vec::new().into())) {
                     break;
                 }
             }
@@ -8015,7 +8015,7 @@ async fn forward_supabase_realtime(
                     stream_realtime_event(&qos, &tenant, text.len() as u64)
                 };
                 if !admitted
-                    || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
+                    || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text.into())) {
                     break;
                 }
             }
@@ -8037,14 +8037,14 @@ async fn forward_supabase_realtime(
                 match frame.event.as_str() {
                     "heartbeat" if frame.topic == "phoenix" => {
                         let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
-                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) {
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) {
                             break;
                         }
                     }
                     "phx_join" => {
                         if !frame.topic.starts_with("realtime:") || frame.topic.len() > 256 {
                             let reply = supabase_reply(&frame, "error", serde_json::json!({"reason":"invalid topic"}), array_protocol);
-                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                             continue;
                         }
                         if !channels.contains_key(&frame.topic)
@@ -8058,7 +8058,7 @@ async fn forward_supabase_realtime(
                             );
                             if !queue_realtime_message(
                                 &outgoing,
-                                axum::extract::ws::Message::Text(reply),
+                                axum::extract::ws::Message::Text(reply.into()),
                             ) {
                                 break;
                             }
@@ -8097,7 +8097,7 @@ async fn forward_supabase_realtime(
                                     serde_json::json!({ "reason": reason }),
                                     array_protocol,
                                 );
-                                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                                 continue;
                             }
                         };
@@ -8113,7 +8113,7 @@ async fn forward_supabase_realtime(
                             );
                             if !queue_realtime_message(
                                 &outgoing,
-                                axum::extract::ws::Message::Text(reply),
+                                axum::extract::ws::Message::Text(reply.into()),
                             ) {
                                 break;
                             }
@@ -8129,7 +8129,7 @@ async fn forward_supabase_realtime(
                                     serde_json::json!({ "reason": reason }),
                                     array_protocol,
                                 );
-                                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                                if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                                 continue;
                             }
                         };
@@ -8170,7 +8170,7 @@ async fn forward_supabase_realtime(
                             })).collect::<Vec<_>>()
                         });
                         let reply = supabase_reply(&frame, "ok", response, array_protocol);
-                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                         if presence_key.is_some() {
                             let channel_name = frame
                                 .topic
@@ -8193,7 +8193,7 @@ async fn forward_supabase_realtime(
                             );
                             if !queue_realtime_message(
                                 &outgoing,
-                                axum::extract::ws::Message::Text(presence_state),
+                                axum::extract::ws::Message::Text(presence_state.into()),
                             ) {
                                 break;
                             }
@@ -8214,7 +8214,7 @@ async fn forward_supabase_realtime(
                                 },
                                 array_protocol,
                             );
-                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(system)) { break; }
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(system.into())) { break; }
                         }
                     }
                     "phx_leave" => {
@@ -8237,12 +8237,12 @@ async fn forward_supabase_realtime(
                             }
                         }
                         let reply = supabase_reply(&frame, "ok", serde_json::json!({}), array_protocol);
-                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                     }
                     "broadcast" => {
                         if !can_publish || !channels.contains_key(&frame.topic) {
                             let reply = supabase_reply(&frame, "error", serde_json::json!({"reason":"not joined or not allowed"}), array_protocol);
-                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                             continue;
                         }
                         let channel = frame.topic.strip_prefix("realtime:").unwrap_or(&frame.topic);
@@ -8268,7 +8268,7 @@ async fn forward_supabase_realtime(
                             );
                             if !queue_realtime_message(
                                 &outgoing,
-                                axum::extract::ws::Message::Text(reply),
+                                axum::extract::ws::Message::Text(reply.into()),
                             ) {
                                 break;
                             }
@@ -8287,7 +8287,7 @@ async fn forward_supabase_realtime(
                                 Err(error) => ("error", serde_json::json!({ "reason": error.to_string() })),
                             };
                             let reply = supabase_reply(&frame, status, response, array_protocol);
-                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                            if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                         }
                     }
                     "presence" => {
@@ -8357,7 +8357,7 @@ async fn forward_supabase_realtime(
                             ),
                         };
                         let reply = supabase_reply(&frame, status, response, array_protocol);
-                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply)) { break; }
+                        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(reply.into())) { break; }
                     }
                     _ => {}
                 }
@@ -8429,7 +8429,7 @@ async fn forward_broadcast(
             _ = heartbeat.tick() => {
                 if !queue_realtime_message_wait(
                     &outgoing,
-                    axum::extract::ws::Message::Ping(Vec::new()),
+                    axum::extract::ws::Message::Ping(Vec::new().into()),
                 ).await {
                     break;
                 }
@@ -8445,7 +8445,7 @@ async fn forward_broadcast(
                         }
                         if !queue_realtime_message_wait(
                             &outgoing,
-                            axum::extract::ws::Message::Text(text),
+                            axum::extract::ws::Message::Text(text.into()),
                         ).await {
                             break;
                         }
@@ -8488,7 +8488,7 @@ fn queue_presence_snapshot(
     })
     .to_string();
     if stream_realtime_event(qos, tenant, text.len() as u64)
-        && queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+        && queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text.into()))
     {
         Some(sequence)
     } else {
@@ -8518,7 +8518,7 @@ async fn forward_presence(
             _ = heartbeat.tick() => {
                 if !queue_realtime_message(
                     &outgoing,
-                    axum::extract::ws::Message::Ping(Vec::new()),
+                    axum::extract::ws::Message::Ping(Vec::new().into()),
                 ) {
                     break;
                 }
@@ -8535,7 +8535,7 @@ async fn forward_presence(
                         if !stream_realtime_event(&qos, tenant, text.len() as u64)
                             || !queue_realtime_message(
                                 &outgoing,
-                                axum::extract::ws::Message::Text(text),
+                                axum::extract::ws::Message::Text(text.into()),
                             )
                         {
                             break;
@@ -8630,7 +8630,7 @@ fn queue_durable_message(
 ) -> bool {
     let text = durable_message_text(message);
     stream_realtime_event(qos, tenant, text.len() as u64)
-        && queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+        && queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text.into()))
 }
 
 async fn forward_durable_topic(
@@ -8699,7 +8699,7 @@ async fn forward_durable_topic(
             _ = heartbeat.tick() => {
                 if !queue_realtime_message(
                     &outgoing,
-                    axum::extract::ws::Message::Ping(Vec::new()),
+                    axum::extract::ws::Message::Ping(Vec::new().into()),
                 ) {
                     break;
                 }
@@ -12334,7 +12334,7 @@ fn queue_cursor_expired(
         "oldest": oldest,
     })
     .to_string();
-    queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+    queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text.into()))
 }
 
 fn queue_cursor_ahead(
@@ -12351,7 +12351,7 @@ fn queue_cursor_ahead(
         "current": current,
     })
     .to_string();
-    queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text))
+    queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text.into()))
 }
 
 async fn send_realtime_batch_with_sink<S>(
@@ -12443,7 +12443,7 @@ async fn forward_changes(
         if !stream_realtime_event(&qos, tenant, text.len() as u64) {
             return;
         }
-        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
+        if !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text.into())) {
             return;
         }
     }
@@ -12454,7 +12454,7 @@ async fn forward_changes(
             _ = heartbeat.tick() => {
                 if !queue_realtime_message(
                     &outgoing,
-                    axum::extract::ws::Message::Ping(Vec::new()),
+                    axum::extract::ws::Message::Ping(Vec::new().into()),
                 ) {
                     break;
                 }
@@ -12478,7 +12478,7 @@ async fn forward_changes(
                         }
                         if !queue_realtime_message(
                             &outgoing,
-                            axum::extract::ws::Message::Text(text),
+                            axum::extract::ws::Message::Text(text.into()),
                         ) {
                             break;
                         }
@@ -12524,7 +12524,7 @@ async fn forward_changes(
                             }
                             if !queue_realtime_message(
                                 &outgoing,
-                                axum::extract::ws::Message::Text(text),
+                                axum::extract::ws::Message::Text(text.into()),
                             ) {
                                 return;
                             }
@@ -12704,7 +12704,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
             _ = heartbeat.tick() => {
                 if !queue_realtime_message(
                     &outgoing,
-                    axum::extract::ws::Message::Ping(Vec::new()),
+                    axum::extract::ws::Message::Ping(Vec::new().into()),
                 ) {
                     break;
                 }
@@ -12737,7 +12737,7 @@ async fn forward_query<B: TxnBackend + Send + Sync + 'static>(
                         }
                         if !queue_realtime_message(
                             &outgoing,
-                            axum::extract::ws::Message::Text(text),
+                            axum::extract::ws::Message::Text(text.into()),
                         ) {
                             break;
                         }
@@ -12833,7 +12833,7 @@ async fn forward_reactive_query<B: TxnBackend + Send + Sync + 'static>(
             _ = heartbeat.tick() => {
                 if !queue_realtime_message(
                     &outgoing,
-                    axum::extract::ws::Message::Ping(Vec::new()),
+                    axum::extract::ws::Message::Ping(Vec::new().into()),
                 ) {
                     break;
                 }
@@ -13216,7 +13216,7 @@ async fn send_query_snapshot<B: TxnBackend>(
     if !stream_realtime_event(qos, tenant, text.len() as u64) {
         return (commit, false);
     }
-    (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text)))
+    (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text.into())))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13279,7 +13279,7 @@ async fn send_reactive_query_snapshot<B: TxnBackend>(
     if !stream_realtime_event(qos, tenant, text.len() as u64) {
         return (commit, false);
     }
-    (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text)))
+    (commit, queue_realtime_message(outgoing, axum::extract::ws::Message::Text(text.into())))
 }
 
 fn json_body<T>(body: &[u8]) -> Result<T, ryme_error::RymeError>
@@ -14973,9 +14973,9 @@ mod realtime_policy_tests {
     async fn realtime_outgoing_queue_rejects_slow_consumers() {
         let (outgoing, mut queued) = tokio::sync::mpsc::channel(2);
 
-        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
-        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
-        assert!(!queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
+        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![].into())));
+        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![].into())));
+        assert!(!queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![].into())));
 
         assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));
     }
@@ -14983,11 +14983,11 @@ mod realtime_policy_tests {
     #[tokio::test]
     async fn realtime_broadcast_waits_for_a_temporarily_full_queue() {
         let (outgoing, mut queued) = tokio::sync::mpsc::channel(1);
-        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![])));
+        assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![].into())));
 
         let sender = outgoing.clone();
         let pending = tokio::spawn(async move {
-            queue_realtime_message_wait(&sender, axum::extract::ws::Message::Ping(vec![])).await
+            queue_realtime_message_wait(&sender, axum::extract::ws::Message::Ping(vec![].into())).await
         });
         tokio::task::yield_now().await;
         assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));
@@ -14999,7 +14999,7 @@ mod realtime_policy_tests {
         let (outgoing, mut queue) = tokio::sync::mpsc::channel(100);
         for index in 0..70 {
             outgoing
-                .send(axum::extract::ws::Message::Text(index.to_string()))
+                .send(axum::extract::ws::Message::Text(index.to_string().into()))
                 .await
                 .unwrap();
         }
