@@ -13630,8 +13630,9 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
         )));
     }
     if let Ok(secret) = std::env::var("RYME_JWT_SECRET") {
-        return hmac_jwt_verifier(secret.into_bytes(), issuer, audience)
-            .map(|verifier| Some(verifier.with_platform_admin_claims(allow_platform_admin)));
+        return hmac_jwt_verifier(secret.into_bytes(), issuer, audience).and_then(|verifier| {
+            verifier.with_platform_admin_claims(allow_platform_admin).map(Some)
+        });
     }
 
     let Some(path) = std::env::var_os("RYME_JWT_JWKS_FILE") else {
@@ -13642,7 +13643,7 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
                 issuer,
                 audience,
             )?;
-            return Ok(Some(verifier.with_platform_admin_claims(allow_platform_admin)));
+            return Ok(Some(verifier.with_platform_admin_claims(allow_platform_admin)?));
         }
         return Ok(None);
     };
@@ -13652,7 +13653,7 @@ fn load_jwt_verifier() -> ryme_error::Result<Option<JwtVerifier>> {
         issuer,
         audience,
     )?;
-    Ok(Some(verifier.with_platform_admin_claims(allow_platform_admin)))
+    Ok(Some(verifier.with_platform_admin_claims(allow_platform_admin)?))
 }
 
 fn parse_jwt_platform_admin_flag(value: Option<&str>) -> ryme_error::Result<bool> {

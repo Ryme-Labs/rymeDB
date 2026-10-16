@@ -122,9 +122,11 @@ system.
 JWTs cannot grant platform-admin (`superuser`) privileges by default, even if
 the verified token contains that role. To enable it, set
 `RYME_JWT_ALLOW_PLATFORM_ADMIN=true` only when this verifier is dedicated to a
-trusted operator-only issuer; do not share that verifier or signing key with
-application-user tokens. Prefer the configured `RYME_API_KEY` for operator
-access when application and operator identities share an issuer.
+trusted operator-only issuer, with `RYME_JWT_ISSUER` and
+`RYME_JWT_AUDIENCE` explicitly configured; startup rejects the opt-in without
+both claims. Do not share that verifier or signing key with application-user
+tokens. Prefer the configured `RYME_API_KEY` for operator access when
+application and operator identities share an issuer.
 
 ## Password and application auth
 

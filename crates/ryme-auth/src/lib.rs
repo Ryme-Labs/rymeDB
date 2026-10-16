@@ -484,9 +484,17 @@ impl JwtVerifier {
     ///
     /// Only enable this when the verifier accepts tokens from a trusted,
     /// operator-only issuer. Application-user JWTs should use the default.
-    pub fn with_platform_admin_claims(mut self, enabled: bool) -> Self {
+    pub fn with_platform_admin_claims(mut self, enabled: bool) -> Result<Self> {
+        if enabled
+            && (!self.issuer.as_deref().is_some_and(|issuer| !issuer.is_empty())
+                || !self.audience.as_deref().is_some_and(|audience| !audience.is_empty()))
+        {
+            return Err(RymeError::InvalidArgument(String::from(
+                "platform-admin JWT claims require an issuer and audience",
+            )));
+        }
         self.allow_platform_admin_claims = enabled;
-        self
+        Ok(self)
     }
 
     pub fn principal_from_token(&self, token: &str, now_secs: u64) -> Result<Principal> {
@@ -1486,6 +1494,8 @@ mod tests {
                 "sub": "operator",
                 "role": "superuser",
                 "exp": 2000000000u64,
+                "iss": "https://operator.example",
+                "aud": "rymedb-admin",
             }))
             .unwrap()
             .as_bytes(),
@@ -1500,10 +1510,17 @@ mod tests {
         assert!(!ordinary.can_platform_admin());
         assert!(!ordinary.roles.contains(&Role::Superuser));
 
-        let operator = JwtVerifier::new(secret.to_vec())
-            .with_platform_admin_claims(true)
-            .principal_from_token(&token, 1000)
-            .unwrap();
+        assert!(JwtVerifier::new(secret.to_vec()).with_platform_admin_claims(true).is_err());
+
+        let operator = JwtVerifier::with_issuer(
+            secret.to_vec(),
+            String::from("https://operator.example"),
+            String::from("rymedb-admin"),
+        )
+        .with_platform_admin_claims(true)
+        .unwrap()
+        .principal_from_token(&token, 1000)
+        .unwrap();
         assert!(operator.can_platform_admin());
     }
 
