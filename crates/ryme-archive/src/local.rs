@@ -15,7 +15,27 @@ impl LocalStore {
         if !super::safe_relative_name(key) {
             return Err(RymeError::InvalidArgument(String::from("key")));
         }
+        if Self::has_symlink_component(&self.root, &self.root.join(key))? {
+            return Err(RymeError::InvalidArgument(String::from("symlink key")));
+        }
         Ok(self.root.join(key))
+    }
+
+    fn has_symlink_component(root: &std::path::Path, path: &std::path::Path) -> Result<bool> {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| RymeError::InvalidArgument(String::from("path")))?;
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(RymeError::from(error)),
+            }
+        }
+        Ok(false)
     }
 
     fn collect(
@@ -23,6 +43,9 @@ impl LocalStore {
         root: &std::path::Path,
         out: &mut Vec<String>,
     ) -> Result<()> {
+        if Self::has_symlink_component(root, prefix)? {
+            return Ok(());
+        }
         let entries = match std::fs::read_dir(prefix) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -31,10 +54,15 @@ impl LocalStore {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            } else if file_type.is_dir() {
                 Self::collect(&path, root, out)?;
-            } else if let Ok(relative) = path.strip_prefix(root) {
-                out.push(relative.to_string_lossy().replace('\\', "/"));
+            } else if file_type.is_file() {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    out.push(relative.to_string_lossy().replace('\\', "/"));
+                }
             }
         }
         Ok(())
@@ -62,6 +90,41 @@ mod tests {
             store.path("backups/backup-1/file.wal").unwrap(),
             PathBuf::from("archive/backups/backup-1/file.wal")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_store_rejects_and_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "ryme-local-store-symlink-{}-{}",
+            std::process::id(),
+            crate::now_unix()
+        ));
+        let outside = root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(root.join("backups")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"private").unwrap();
+        symlink(&outside, root.join("backups/link")).unwrap();
+
+        let store = LocalStore::new(root.clone());
+        assert!(matches!(store.path("backups/link/secret"), Err(RymeError::InvalidArgument(_))));
+        let mut listed = Vec::new();
+        LocalStore::collect(&root.join("backups"), &root, &mut listed).unwrap();
+        assert!(listed.is_empty());
+
+        std::fs::remove_file(root.join("backups/link")).unwrap();
+        std::fs::remove_dir(root.join("backups")).unwrap();
+        symlink(&outside, root.join("backups")).unwrap();
+        assert!(matches!(store.path("backups/secret"), Err(RymeError::InvalidArgument(_))));
+        LocalStore::collect(&root.join("backups"), &root, &mut listed).unwrap();
+        assert!(listed.is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 }
 
