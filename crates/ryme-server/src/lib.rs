@@ -3579,11 +3579,25 @@ fn spawn_gateways(
             wire_tenant(&expected_password, &keys, jwt.as_ref(), &default_tenant, password)
         });
     }
+    let pg_audit_state = state.clone();
     let pg = pg
         .with_qos(state.qos.clone())
         .with_metering(state.metering.clone())
         .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
-        .with_range_hook(range_hook.clone());
+        .with_range_hook(range_hook.clone())
+        .with_audit_hook(Arc::new(move |actor, status| {
+            let state = pg_audit_state.clone();
+            Box::pin(async move {
+                record_audit_event(
+                    &state,
+                    Some(actor),
+                    String::from("PG"),
+                    String::from("/pg/sql/admin-or-schema-change"),
+                    status,
+                )
+                .await;
+            })
+        }));
     let mut resp = ryme_wire_resp::RespGateway::with_backend(
         state.tenant.clone(),
         state.database.clone(),

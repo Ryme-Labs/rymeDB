@@ -18,6 +18,8 @@ use ryme_txn::{
     MAX_TRANSACTION_STATE_BYTES,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -25,6 +27,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
 pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
+pub type PgAuditHook =
+    Arc<dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Default admission limit for the convenience `serve` method.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
@@ -43,6 +47,7 @@ pub struct PgGateway<B = TxnManager> {
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
     remote_reader: Option<RemoteReader>,
+    audit_hook: Option<PgAuditHook>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,7 +357,7 @@ fn cancel_backend(pid: u32, secret: u32) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ConnLimits {
     tenant: String,
     database: String,
@@ -367,6 +372,8 @@ struct ConnLimits {
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
     remote_reader: Option<RemoteReader>,
+    audit_actor: String,
+    audit_hook: Option<PgAuditHook>,
 }
 
 impl ConnLimits {
@@ -482,6 +489,7 @@ impl PgGateway<TxnManager> {
             traces: None,
             range_hook: RangeLoadHook::default(),
             remote_reader: None,
+            audit_hook: None,
         }
     }
 
@@ -500,6 +508,7 @@ impl PgGateway<TxnManager> {
             traces: None,
             range_hook: RangeLoadHook::default(),
             remote_reader: None,
+            audit_hook: None,
         }
     }
 
@@ -528,6 +537,7 @@ where
             traces: None,
             range_hook: RangeLoadHook::default(),
             remote_reader: None,
+            audit_hook: None,
         }
     }
 
@@ -549,6 +559,7 @@ where
             traces: None,
             range_hook: RangeLoadHook::default(),
             remote_reader: None,
+            audit_hook: None,
         }
     }
 
@@ -559,6 +570,11 @@ where
 
     pub fn with_remote_reader(mut self, reader: RemoteReader) -> Self {
         self.remote_reader = Some(reader);
+        self
+    }
+
+    pub fn with_audit_hook(mut self, hook: PgAuditHook) -> Self {
+        self.audit_hook = Some(hook);
         self
     }
 
@@ -612,6 +628,8 @@ where
             traces: self.traces.clone(),
             range_hook: self.range_hook.clone(),
             remote_reader: self.remote_reader.clone(),
+            audit_actor: String::new(),
+            audit_hook: self.audit_hook.clone(),
         }
     }
 
@@ -815,6 +833,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let Some(authenticator) = authenticator else {
+        let mut limits = limits;
+        limits.audit_actor = startup.user.clone();
         return Ok((executor, limits, startup.user.clone()));
     };
     send_auth_cleartext_password(socket).await?;
@@ -866,6 +886,7 @@ where
     limits.read_allowed = principal.can_read();
     limits.write_allowed = principal.can_write();
     limits.admin_allowed = principal.can_platform_admin();
+    limits.audit_actor = principal.id.clone();
     Ok((executor, limits, role))
 }
 
@@ -3326,27 +3347,47 @@ async fn execute_statement_for_session<B>(
 where
     B: TxnBackend,
 {
+    let audited = statement.requires_admin();
     let timeout = session_timeout(session);
-    if statement.is_schema_change() || timeout.is_none() {
-        return execute_statement_for_session_inner(
-            executor, limits, statement, bytes, session, active,
+    let response = if let Some(timeout) = timeout.filter(|_| !statement.is_schema_change()) {
+        match tokio::time::timeout(
+            timeout,
+            execute_statement_for_session_inner(
+                executor, limits, statement, bytes, session, active,
+            ),
         )
-        .await;
-    }
-    match tokio::time::timeout(
-        timeout.expect("statement timeout is present"),
-        execute_statement_for_session_inner(executor, limits, statement, bytes, session, active),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            if let Some(transaction) = active.as_mut() {
-                transaction.failed = true;
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                if let Some(transaction) = active.as_mut() {
+                    transaction.failed = true;
+                }
+                encode_error_code(
+                    "57014",
+                    String::from("canceling statement due to statement timeout"),
+                )
             }
-            encode_error_code("57014", String::from("canceling statement due to statement timeout"))
+        }
+    } else {
+        execute_statement_for_session_inner(executor, limits, statement, bytes, session, active)
+            .await
+    };
+    if audited {
+        if let Some(hook) = limits.audit_hook.as_ref() {
+            let status = if response.first() == Some(&b'E') {
+                if limits.admin_allowed {
+                    500
+                } else {
+                    403
+                }
+            } else {
+                200
+            };
+            hook(limits.audit_actor.clone(), status).await;
         }
     }
+    response
 }
 
 async fn execute_statement_for_session_inner<B>(
@@ -4835,6 +4876,8 @@ mod tests {
             traces: None,
             range_hook: RangeLoadHook::default(),
             remote_reader: None,
+            audit_actor: String::new(),
+            audit_hook: None,
         };
         for sql in [
             "CREATE ROLE app_reader LOGIN",
@@ -4852,6 +4895,77 @@ mod tests {
             assert!(admit_statement(&limits, &statement, sql.len() as u64).is_none(), "{sql}");
             limits.admin_allowed = false;
         }
+    }
+
+    #[tokio::test]
+    async fn admin_and_schema_statements_invoke_audit_hook() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let audit_events = Arc::clone(&events);
+        let hook: PgAuditHook = Arc::new(move |actor, status| {
+            let events = Arc::clone(&audit_events);
+            Box::pin(async move { events.lock().unwrap().push((actor, status)) })
+        });
+        let mut limits = ConnLimits {
+            tenant: String::from("tenant"),
+            database: String::from("db"),
+            read_allowed: true,
+            write_allowed: true,
+            admin_allowed: false,
+            qos: None,
+            metering: None,
+            latency: None,
+            histogram: None,
+            slow_log: None,
+            traces: None,
+            range_hook: RangeLoadHook::default(),
+            remote_reader: None,
+            audit_actor: String::from("reader-id"),
+            audit_hook: Some(hook),
+        };
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let session = HashMap::new();
+        let mut active = None;
+        let response = execute_statement_for_session(
+            &executor,
+            &limits,
+            parse("GRANT SELECT ON TABLE messages TO app_reader").unwrap(),
+            48,
+            &session,
+            &mut active,
+        )
+        .await;
+        assert_eq!(response.first(), Some(&b'E'));
+        assert_eq!(events.lock().unwrap().as_slice(), [(String::from("reader-id"), 403)]);
+
+        limits.admin_allowed = true;
+        let mut active = None;
+        let response = execute_statement_for_session(
+            &executor,
+            &limits,
+            parse("CREATE ROLE pg_audit_reader").unwrap(),
+            28,
+            &session,
+            &mut active,
+        )
+        .await;
+        assert_eq!(response.first(), Some(&b'C'));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [(String::from("reader-id"), 403), (String::from("reader-id"), 200)]
+        );
+
+        let mut active = None;
+        let response = execute_statement_for_session(
+            &executor,
+            &limits,
+            parse("SELECT 1").unwrap(),
+            8,
+            &session,
+            &mut active,
+        )
+        .await;
+        assert_ne!(response.first(), Some(&b'E'));
+        assert_eq!(events.lock().unwrap().len(), 2);
     }
 
     #[test]
