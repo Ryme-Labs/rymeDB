@@ -81,6 +81,26 @@ Setup and one cache-warming scan are outside the timed samples. The output
 includes p50/p95 scan latency and throughput; vary one parameter at a time and
 compare sequential runs on the same otherwise-idle machine.
 
+To measure Standard-mode startup's maximum-commit discovery against the former
+full-segment decode path:
+
+```bash
+cargo run --locked --release -j 1 -p ryme-bench -- segment-startup \
+  --rows 10000 --deltas 500 --iterations 10
+```
+
+The command creates one snapshot and one-row delta segments, alternates the
+two measurements to reduce filesystem-cache ordering bias, and reports p50/p95
+plus their p50 ratio. The full-decode path rebuilds each segment's engine,
+bloom filter, and sparse index; the header path reads and checksum-verifies
+the files using a fixed-size buffer. This isolates commit-timestamp discovery,
+not total database startup or cold-storage latency.
+
+On an AMD Ryzen 5 4500 (12 logical CPUs), a release run with 10,000 snapshot
+rows, 500 deltas, and 10 iterations measured p50 at 19.1 ms for full decode
+versus 4.1 ms for header scanning (4.65×). Files were locally cached; this is a
+startup-work microbenchmark, not a full server restart measurement.
+
 Two sequential A/B pairs on an AMD Ryzen 5 4500 (12 logical CPUs), comparing
 the pre-merge implementation at `0202d42` with the k-way merge, measured p50
 latency of 7.49–7.57 ms versus 51.6–51.9 µs. The median p50 was about 145×
