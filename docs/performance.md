@@ -29,6 +29,39 @@ under optimistic concurrency control. Use a single worker when measuring
 overwrite cost without concurrent conflicts. This is a core microbenchmark, not
 an end-to-end database comparison.
 
+To measure the in-memory vector index's build, exact-search, and HNSW-search
+paths with the same generated corpus:
+
+```bash
+cargo run --locked --release -j 1 -p ryme-bench -- vector-index \
+  --vectors 2000 --dimensions 64 --queries 200 --partitions 4 --top-k 10 --ann-ef 64 --json
+```
+
+The command reports dataset generation separately from index-build time, then
+measures exact and adaptive ANN API search latency/QPS and recall@k. Exact and
+ANN call order alternates per query to reduce systematic cache-order bias. The
+ANN API uses exact search when a partition's vector count is no larger than
+`effective_ef × HNSW_M`; otherwise it searches the HNSW graph. The deterministic
+SplitMix-derived corpus avoids the duplicate vectors produced by simple
+periodic generators. The vector payload is capped at 16 MiB to avoid
+unexpectedly large allocations; index metadata and graph edges require
+additional memory. Use identical corpus size, dimensions, partitions, top-k,
+`ann-ef`, and build profile when comparing revisions. This isolates the Rust
+index implementation; it does not measure HTTP overhead, persistence,
+replication, or establish a cross-database performance claim. Query percentiles
+are descriptive only with the reported sample count (200 is too small for
+stable p99 conclusions).
+
+On an AMD Ryzen 5 4500, release build, 64 dimensions, four partitions, top-k 10,
+`ann-ef=64`, and 100 deterministic queries, the adaptive ANN API measured p50
+at 300.5 µs with exact recall at 4,096 vectors; partitions below the
+`effective_ef × HNSW_M` work threshold use exact search. At 8,192 vectors it
+used HNSW and measured 632.6 µs p50, 0.978 mean recall@10; exact search measured
+907.1 µs p50. The [raw captures](../bench/results/vector-index-crossover.json)
+record full results. These are local in-memory crossover observations, not
+stable tail-latency or end-to-end database claims. Repeat several times on the
+target machine before using them for capacity planning.
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash

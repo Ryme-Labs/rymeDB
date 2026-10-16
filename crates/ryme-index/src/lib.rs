@@ -424,6 +424,13 @@ impl VectorSpace {
         if query.is_empty() || query.len() > MAX_DIM || query.len() != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
+        let effective_ef = ef.clamp(top_k.clamp(1, MAX_TOP_K), 256);
+        // A full scan is cheaper than graph traversal while the local vector
+        // count is no larger than the approximate search's candidate-work
+        // estimate. This also avoids ANN recall loss on small partitions.
+        if self.ann.id_to_pos.len() <= effective_ef.saturating_mul(HNSW_M) {
+            return self.search(query, top_k);
+        }
         let normalized = normalize(query)?;
         if normalized.len() != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
@@ -1204,7 +1211,7 @@ mod tests {
             ((state >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
         };
         let mut registry = IndexRegistry::new();
-        for index in 0..300 {
+        for index in 0..2_048 {
             let vector: Vec<f32> = (0..16).map(|_| next() as f32).collect();
             registry.vector_upsert("s", format!("v{index}"), vector).unwrap();
         }
@@ -1216,6 +1223,24 @@ mod tests {
         let overlap = approx.iter().filter(|h| exact_ids.contains(h.id.as_str())).count();
         assert!(overlap >= 8, "overlap {overlap}");
         assert!(registry.ann_search("missing", &query, 10, 64).is_err());
+    }
+
+    #[test]
+    fn small_ann_search_matches_exact_results() {
+        let mut registry = IndexRegistry::new();
+        for index in 0..256 {
+            registry
+                .vector_upsert("s", format!("v{index}"), vec![index as f32 + 1.0, 3.0, 7.0])
+                .unwrap();
+        }
+        let query = [1.0, 2.0, 3.0];
+        let exact = registry.vector_search("s", &query, 10).unwrap();
+        let approximate = registry.ann_search("s", &query, 10, 64).unwrap();
+        assert_eq!(approximate.len(), exact.len());
+        for (actual, expected) in approximate.iter().zip(exact) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.score, expected.score);
+        }
     }
 
     #[test]
@@ -1277,7 +1302,7 @@ mod tests {
         let exact_ids: std::collections::HashSet<&str> =
             exact.iter().map(|h| h.id.as_str()).collect();
         let overlap = approx.iter().filter(|h| exact_ids.contains(h.id.as_str())).count();
-        assert!(overlap >= 7, "overlap {overlap}");
+        assert_eq!(overlap, 10, "small partitions should use exact search");
         assert!(sharded.vector_search("missing", &query, 10).is_err());
     }
 }

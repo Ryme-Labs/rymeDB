@@ -13,6 +13,7 @@ ryme-error = { workspace = true }
 ryme-txn = { workspace = true }
 ryme-storage = { workspace = true }
 ryme-shard = { workspace = true }
+ryme-index = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

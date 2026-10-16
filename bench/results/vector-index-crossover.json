@@ -1,0 +1,55 @@
+{
+  "captured_date": "2026-10-16",
+  "description": "Release-mode in-memory vector-index crossover on deterministic SplitMix-derived vectors. Single local run per corpus size; not an end-to-end database comparison.",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "common_parameters": {
+    "dimensions": 64,
+    "partitions": 4,
+    "queries": 100,
+    "top_k": 10,
+    "ann_ef": 64,
+    "build_profile": "release"
+  },
+  "results": [
+    {
+      "vectors": 4096,
+      "vector_payload_bytes": 1048576,
+      "dataset_generation_ns": 1469784,
+      "index_build_ns": 327946426,
+      "index_build_vectors_per_second": 12489.844911436845,
+      "exact_qps": 3179.849825868244,
+      "exact_p50_ns": 302162,
+      "exact_p95_ns": 367626,
+      "exact_p99_ns": 523983,
+      "adaptive_ann_qps": 3202.531588410512,
+      "adaptive_ann_p50_ns": 300469,
+      "adaptive_ann_p95_ns": 355894,
+      "adaptive_ann_p99_ns": 607561,
+      "mean_recall_at_k": 1.0,
+      "selected_path": "exact fallback for partitions at or below the ef-times-M threshold; HNSW for larger partitions"
+    },
+    {
+      "vectors": 8192,
+      "vector_payload_bytes": 2097152,
+      "dataset_generation_ns": 2994091,
+      "index_build_ns": 873747636,
+      "index_build_vectors_per_second": 9375.704908917201,
+      "exact_qps": 1092.3969792907642,
+      "exact_p50_ns": 907068,
+      "exact_p95_ns": 993021,
+      "exact_p99_ns": 1054146,
+      "adaptive_ann_qps": 1573.8377798185209,
+      "adaptive_ann_p50_ns": 632648,
+      "adaptive_ann_p95_ns": 678876,
+      "adaptive_ann_p99_ns": 688925,
+      "mean_recall_at_k": 0.9780000000000002,
+      "selected_path": "HNSW"
+    }
+  ]
+}

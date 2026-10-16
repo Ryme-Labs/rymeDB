@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
+use ryme_index::PartitionedIndex;
 use ryme_shard::{ShardSet, TableRef};
 use ryme_storage::{Engine, ImmutableSegment, RecordKey, SegmentEntry, SegmentStore, StorageMode};
 use ryme_txn::{SyncPolicy, TxnBackend, TxnManager};
@@ -92,6 +93,22 @@ enum Command {
         deltas: usize,
         #[arg(long, default_value_t = 10)]
         iterations: usize,
+    },
+    VectorIndex {
+        #[arg(long, default_value_t = 2_000)]
+        vectors: usize,
+        #[arg(long, default_value_t = 64)]
+        dimensions: usize,
+        #[arg(long, default_value_t = 200)]
+        queries: usize,
+        #[arg(long, default_value_t = 4)]
+        partitions: usize,
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        #[arg(long, default_value_t = 64)]
+        ann_ef: usize,
+        #[arg(long)]
+        json: bool,
     },
     Resp {
         #[arg(long, default_value = "127.0.0.1:6380")]
@@ -207,6 +224,17 @@ async fn main() {
         }
         Some(Command::SegmentPrune { rows, deltas, iterations }) => {
             segment_prune_bench(rows, deltas, iterations);
+        }
+        Some(Command::VectorIndex {
+            vectors,
+            dimensions,
+            queries,
+            partitions,
+            top_k,
+            ann_ef,
+            json,
+        }) => {
+            vector_index_bench(vectors, dimensions, queries, partitions, top_k, ann_ef, json);
         }
         Some(Command::Resp {
             addr,
@@ -1352,6 +1380,163 @@ fn segment_prune_bench(rows: usize, deltas: usize, iterations: usize) {
     drop(store);
     if let Err(error) = std::fs::remove_dir_all(&data_dir) {
         eprintln!("could not remove temporary benchmark data {}: {error}", data_dir.display());
+    }
+}
+
+fn deterministic_bench_vector(index: usize, dimensions: usize) -> Vec<f32> {
+    (0..dimensions)
+        .map(|axis| {
+            let mut value = (index as u64)
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add((axis as u64).wrapping_mul(0xbf58476d1ce4e5b9));
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+            value ^= value >> 31;
+            let unit = (value >> 40) as f32 / ((1u32 << 24) - 1) as f32;
+            let component = unit * 2.0 - 1.0;
+            if component.abs() < f32::EPSILON {
+                if value & 1 == 0 {
+                    0.001
+                } else {
+                    -0.001
+                }
+            } else {
+                component
+            }
+        })
+        .collect()
+}
+
+fn vector_index_bench(
+    vectors: usize,
+    dimensions: usize,
+    queries: usize,
+    partitions: usize,
+    top_k: usize,
+    ann_ef: usize,
+    json: bool,
+) {
+    const MAX_VECTOR_BENCH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+    if vectors == 0
+        || vectors > ryme_index::MAX_VECTORS_PER_SPACE
+        || dimensions == 0
+        || dimensions > ryme_index::MAX_DIM
+        || queries == 0
+        || queries > 100_000
+        || !(1..=ryme_index::MAX_PARTITIONS).contains(&partitions)
+        || !(1..=ryme_index::MAX_TOP_K).contains(&top_k)
+        || !(1..=256).contains(&ann_ef)
+    {
+        eprintln!(
+            "vector-index benchmark arguments are outside supported limits (queries max: 100000, ann-ef max: 256)"
+        );
+        std::process::exit(2);
+    }
+    let vector_payload_bytes = match vectors.checked_mul(dimensions).and_then(|n| n.checked_mul(4))
+    {
+        Some(bytes) if bytes <= MAX_VECTOR_BENCH_PAYLOAD_BYTES => bytes,
+        _ => {
+            eprintln!("vector-index benchmark dataset exceeds the 16 MiB vector-payload limit");
+            std::process::exit(2);
+        }
+    };
+    let make_vector = |index: usize| deterministic_bench_vector(index, dimensions);
+
+    let generation_start = Instant::now();
+    let dataset = (0..vectors).map(make_vector).collect::<Vec<_>>();
+    let dataset_generation_ns = generation_start.elapsed().as_nanos();
+    let mut index = PartitionedIndex::new(partitions);
+    let build_start = Instant::now();
+    for (vector_id, vector) in dataset.into_iter().enumerate() {
+        index
+            .vector_upsert("vector-index-bench", format!("v{vector_id:08}"), vector)
+            .expect("vector-index benchmark insert failed");
+    }
+    let build_ns = build_start.elapsed().as_nanos();
+
+    let top_k = top_k.min(vectors);
+    let mut exact_ns = Vec::with_capacity(queries);
+    let mut ann_ns = Vec::with_capacity(queries);
+    let mut recall_sum = 0.0f64;
+    for query_number in 0..queries {
+        let query = make_vector(vectors.wrapping_add(query_number));
+        let (exact, approximate) = if query_number % 2 == 0 {
+            let start = Instant::now();
+            let exact = index
+                .vector_search("vector-index-bench", &query, top_k)
+                .expect("exact vector benchmark search failed");
+            exact_ns.push(start.elapsed().as_nanos());
+
+            let start = Instant::now();
+            let approximate = index
+                .ann_search("vector-index-bench", &query, top_k, ann_ef)
+                .expect("ANN vector benchmark search failed");
+            ann_ns.push(start.elapsed().as_nanos());
+            (exact, approximate)
+        } else {
+            let start = Instant::now();
+            let approximate = index
+                .ann_search("vector-index-bench", &query, top_k, ann_ef)
+                .expect("ANN vector benchmark search failed");
+            ann_ns.push(start.elapsed().as_nanos());
+
+            let start = Instant::now();
+            let exact = index
+                .vector_search("vector-index-bench", &query, top_k)
+                .expect("exact vector benchmark search failed");
+            exact_ns.push(start.elapsed().as_nanos());
+            (exact, approximate)
+        };
+
+        let exact_ids =
+            exact.into_iter().map(|hit| hit.id).collect::<std::collections::HashSet<_>>();
+        let matching = approximate.iter().filter(|hit| exact_ids.contains(&hit.id)).count();
+        recall_sum += matching as f64 / top_k.max(1) as f64;
+    }
+    exact_ns.sort_unstable();
+    ann_ns.sort_unstable();
+    let percentile = |samples: &[u128], percent: usize| {
+        samples[((samples.len() - 1) * percent / 100).min(samples.len() - 1)]
+    };
+    let exact_total_ns = exact_ns.iter().copied().sum::<u128>().max(1);
+    let ann_total_ns = ann_ns.iter().copied().sum::<u128>().max(1);
+    let output = serde_json::json!({
+        "benchmark": "vector-index-exact-vs-adaptive-ann",
+        "machine": machine_metadata(),
+        "vectors": vectors,
+        "dimensions": dimensions,
+        "partitions": partitions,
+        "queries": queries,
+        "top_k": top_k,
+        "ann_ef": ann_ef,
+        "vector_payload_bytes": vector_payload_bytes,
+        "dataset_generation_ns": dataset_generation_ns,
+        "index_build_ns": build_ns,
+        "index_build_vectors_per_second": vectors as f64 * 1_000_000_000.0 / build_ns.max(1) as f64,
+        "exact_qps": queries as f64 * 1_000_000_000.0 / exact_total_ns as f64,
+        "exact_p50_ns": percentile(&exact_ns, 50),
+        "exact_p95_ns": percentile(&exact_ns, 95),
+        "exact_p99_ns": percentile(&exact_ns, 99),
+        "adaptive_ann_qps": queries as f64 * 1_000_000_000.0 / ann_total_ns as f64,
+        "adaptive_ann_p50_ns": percentile(&ann_ns, 50),
+        "adaptive_ann_p95_ns": percentile(&ann_ns, 95),
+        "adaptive_ann_p99_ns": percentile(&ann_ns, 99),
+        "mean_recall_at_k": recall_sum / queries as f64,
+    });
+    if json {
+        println!("{output}");
+    } else {
+        println!(
+            "vectors={vectors} dimensions={dimensions} partitions={partitions} top_k={top_k} payload_bytes={vector_payload_bytes} build_vectors_per_second={:.0} exact_qps={:.0} exact_p50={}ns exact_p99={}ns adaptive_ann_qps={:.0} adaptive_ann_p50={}ns adaptive_ann_p99={}ns mean_recall_at_k={:.3}",
+            output["index_build_vectors_per_second"].as_f64().unwrap_or(0.0),
+            output["exact_qps"].as_f64().unwrap_or(0.0),
+            output["exact_p50_ns"].as_u64().unwrap_or(0),
+            output["exact_p99_ns"].as_u64().unwrap_or(0),
+            output["adaptive_ann_qps"].as_f64().unwrap_or(0.0),
+            output["adaptive_ann_p50_ns"].as_u64().unwrap_or(0),
+            output["adaptive_ann_p99_ns"].as_u64().unwrap_or(0),
+            output["mean_recall_at_k"].as_f64().unwrap_or(0.0),
+        );
     }
 }
 
