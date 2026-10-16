@@ -10523,17 +10523,24 @@ where
         if txn.writes().is_empty() {
             if let Some(candidates) = self.indexed_candidates(table, filter)? {
                 let mut rows = Vec::with_capacity(candidates.len());
-                for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
-                    let keys = candidate_batch
-                        .iter()
-                        .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
-                        .collect::<Vec<_>>();
-                    let values = self.manager.get_many_async(txn, &keys).await?;
-                    rows.extend(
-                        keys.into_iter()
-                            .zip(values)
-                            .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
-                    );
+                if let [pk] = candidates.as_slice() {
+                    let key = RecordKey::new(&self.tenant, &self.database, table, pk);
+                    if let Some(value) = self.manager.get_async(txn, &key).await? {
+                        rows.push((pk.clone(), value));
+                    }
+                } else {
+                    for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
+                        let keys = candidate_batch
+                            .iter()
+                            .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
+                            .collect::<Vec<_>>();
+                        let values = self.manager.get_many_async(txn, &keys).await?;
+                        rows.extend(
+                            keys.into_iter()
+                                .zip(values)
+                                .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
+                        );
+                    }
                 }
                 ensure_materialized_rows(&rows)?;
                 let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
@@ -10774,17 +10781,24 @@ where
         if txn.writes().is_empty() {
             if let Some(candidates) = self.indexed_candidates(table, filter)? {
                 let mut rows = Vec::with_capacity(candidates.len());
-                for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
-                    let keys = candidate_batch
-                        .iter()
-                        .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
-                        .collect::<Vec<_>>();
-                    let values = self.manager.get_many(txn, &keys)?;
-                    rows.extend(
-                        keys.into_iter()
-                            .zip(values)
-                            .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
-                    );
+                if let [pk] = candidates.as_slice() {
+                    let key = RecordKey::new(&self.tenant, &self.database, table, pk);
+                    if let Some(value) = self.manager.get(txn, &key)? {
+                        rows.push((pk.clone(), value));
+                    }
+                } else {
+                    for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
+                        let keys = candidate_batch
+                            .iter()
+                            .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
+                            .collect::<Vec<_>>();
+                        let values = self.manager.get_many(txn, &keys)?;
+                        rows.extend(
+                            keys.into_iter()
+                                .zip(values)
+                                .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
+                        );
+                    }
                 }
                 ensure_materialized_rows(&rows)?;
                 let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);

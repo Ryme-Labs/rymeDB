@@ -164,6 +164,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    TxnReadBatch {
+        #[arg(long, default_value_t = 10000)]
+        records: usize,
+        #[arg(long, default_value_t = 1024)]
+        candidates: usize,
+        #[arg(long, default_value_t = 100)]
+        iterations: usize,
+        #[arg(long, default_value_t = 256)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 128)]
+        value_bytes: usize,
+        #[arg(long)]
+        json: bool,
+    },
     Realtime {
         #[arg(long, default_value = "127.0.0.1:3000")]
         addr: String,
@@ -301,6 +315,14 @@ async fn main() {
             })
             .await;
         }
+        Some(Command::TxnReadBatch {
+            records,
+            candidates,
+            iterations,
+            batch_size,
+            value_bytes,
+            json,
+        }) => txn_read_batch_bench(records, candidates, iterations, batch_size, value_bytes, json),
         Some(Command::Realtime {
             addr,
             api_key,
@@ -2089,6 +2111,119 @@ async fn run_sql_worker(task: SqlTask) -> (Vec<u64>, u64) {
         }
     }
     (latencies, errors)
+}
+
+fn txn_read_batch_bench(
+    records: usize,
+    candidates: usize,
+    iterations: usize,
+    batch_size: usize,
+    value_bytes: usize,
+    json: bool,
+) {
+    if records == 0 || candidates == 0 || candidates > records || iterations == 0 || batch_size == 0
+    {
+        eprintln!("records, candidates, iterations, and batch-size must be positive; candidates must not exceed records");
+        return;
+    }
+
+    let manager = TxnManager::new();
+    let value = vec![b'x'; value_bytes];
+    let mut keys = Vec::with_capacity(records);
+    let mut seed = manager.begin();
+    for id in 0..records {
+        let pk = (id as u64).to_be_bytes();
+        let key = RecordKey::new("bench", "default", "batch-read", &pk);
+        manager.put(&mut seed, key.clone(), value.clone());
+        keys.push(key);
+    }
+    if let Err(error) = manager.commit(seed) {
+        eprintln!("failed to seed batch-read benchmark: {error}");
+        return;
+    }
+    let keys = &keys[..candidates];
+
+    for _ in 0..5 {
+        std::hint::black_box(measure_single_reads(&manager, keys));
+        std::hint::black_box(measure_batched_reads(&manager, keys, batch_size));
+    }
+
+    let mut single_samples = Vec::with_capacity(iterations);
+    let mut batch_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        single_samples.push(measure_single_reads(&manager, keys));
+        batch_samples.push(measure_batched_reads(&manager, keys, batch_size));
+    }
+    single_samples.sort_unstable();
+    batch_samples.sort_unstable();
+    let percentile =
+        |samples: &[u64], percent: usize| samples[((samples.len() - 1) * percent) / 100];
+    let summarize = |samples: &[u64]| {
+        let total_ns = samples.iter().map(|sample| u128::from(*sample)).sum::<u128>().max(1);
+        serde_json::json!({
+            "p50_ns": percentile(samples, 50),
+            "p95_ns": percentile(samples, 95),
+            "p99_ns": percentile(samples, 99),
+            "rows_per_second": (candidates as f64 * samples.len() as f64 * 1_000_000_000.0
+                / total_ns as f64).round() as u64,
+        })
+    };
+    let single = summarize(&single_samples);
+    let batched = summarize(&batch_samples);
+    let single_p50 = single["p50_ns"].as_u64().unwrap_or(0);
+    let batch_p50 = batched["p50_ns"].as_u64().unwrap_or(0).max(1);
+    let output = serde_json::json!({
+        "benchmark": "transaction-batch-read",
+        "machine": machine_metadata(),
+        "records": records,
+        "candidates_per_iteration": candidates,
+        "iterations": iterations,
+        "batch_size": batch_size,
+        "value_bytes": value_bytes,
+        "single_read": single,
+        "batched_read": batched,
+        "p50_speedup": (single_p50 as f64 / batch_p50 as f64 * 100.0).round() / 100.0,
+    });
+    if json {
+        println!("{output}");
+    } else {
+        println!(
+            "records={records} candidates={} iterations={iterations} batch_size={batch_size} single_p50={}ns batched_p50={}ns p50_speedup={}x single_rows_per_second={} batched_rows_per_second={}",
+            candidates,
+            output["single_read"]["p50_ns"].as_u64().unwrap_or(0),
+            output["batched_read"]["p50_ns"].as_u64().unwrap_or(0),
+            output["p50_speedup"].as_f64().unwrap_or(0.0),
+            output["single_read"]["rows_per_second"].as_u64().unwrap_or(0),
+            output["batched_read"]["rows_per_second"].as_u64().unwrap_or(0),
+        );
+    }
+}
+
+fn measure_single_reads(manager: &TxnManager, keys: &[RecordKey]) -> u64 {
+    let mut txn = manager.begin();
+    let started = Instant::now();
+    let mut found = 0usize;
+    for key in keys {
+        found += usize::from(manager.get(&mut txn, key).expect("benchmark read").is_some());
+    }
+    std::hint::black_box(found);
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn measure_batched_reads(manager: &TxnManager, keys: &[RecordKey], batch_size: usize) -> u64 {
+    let mut txn = manager.begin();
+    let started = Instant::now();
+    let mut found = 0usize;
+    for batch in keys.chunks(batch_size) {
+        found += manager
+            .get_many(&mut txn, batch)
+            .expect("benchmark batch read")
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+    }
+    std::hint::black_box(found);
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 async fn sql_bench(config: SqlBench) {
