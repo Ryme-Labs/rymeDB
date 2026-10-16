@@ -10782,43 +10782,40 @@ where
         self.ensure_index_entries_for_tenant(table)?;
         let indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
-        let Some(state) = indexes.get(table).and_then(|states| {
-            states.iter().find(|state| {
-                if !state.definition.columns.is_empty() {
-                    return index_filter_value(&state.definition, filter).is_some();
-                }
-                filter.iter().any(|predicate| {
-                    predicate.op == Cmp::Eq
-                        && state.definition.field == predicate.field
-                        && state.definition.column == predicate.column
-                })
-            })
-        }) else {
+        let mut matching_indexes = Vec::new();
+        for state in indexes.get(table).into_iter().flatten() {
+            let key = if state.definition.columns.is_empty() {
+                filter
+                    .iter()
+                    .find(|predicate| {
+                        predicate.op == Cmp::Eq
+                            && state.definition.field == predicate.field
+                            && state.definition.column == predicate.column
+                    })
+                    .map(|predicate| predicate.operand.clone())
+            } else {
+                index_filter_value(&state.definition, filter)
+            };
+            let Some(key) = key else { continue };
+            let Some(pks) = state.entries.get(&self.tenant).and_then(|entries| entries.get(&key))
+            else {
+                return Ok(Some(Vec::new()));
+            };
+            matching_indexes.push(pks);
+        }
+        let Some(smallest) = matching_indexes.iter().min_by_key(|pks| pks.len()) else {
             return Ok(None);
         };
-        let key = if state.definition.columns.is_empty() {
-            let Some(predicate) = filter.iter().find(|predicate| {
-                predicate.op == Cmp::Eq
-                    && state.definition.field == predicate.field
-                    && state.definition.column == predicate.column
-            }) else {
-                return Ok(None);
-            };
-            predicate.operand.clone()
-        } else {
-            let Some(key) = index_filter_value(&state.definition, filter) else {
-                return Ok(None);
-            };
-            key
-        };
-        let Some(pks) = state.entries.get(&self.tenant).and_then(|entries| entries.get(&key))
-        else {
-            return Ok(Some(Vec::new()));
-        };
-        if pks.len() > MAX_QUERY_MATERIALIZED_ROWS {
+        if smallest.len() > MAX_QUERY_MATERIALIZED_ROWS {
             return Err(materialization_overload());
         }
-        Ok(Some(pks.iter().cloned().collect()))
+        Ok(Some(
+            smallest
+                .iter()
+                .filter(|pk| matching_indexes.iter().all(|pks| pks.contains(*pk)))
+                .cloned()
+                .collect(),
+        ))
     }
 
     fn indexed_candidates_for_value(
@@ -10997,11 +10994,15 @@ where
         }
         if txn.writes().is_empty() {
             if let Some(candidates) = self.indexed_candidates(table, filter)? {
-                let mut rows = Vec::with_capacity(candidates.len());
+                let mut rows = Vec::with_capacity(candidates.len().min(limit));
                 if let [pk] = candidates.as_slice() {
                     let key = RecordKey::new(&self.tenant, &self.database, table, pk);
                     if let Some(value) = self.manager.get_async(txn, &key).await? {
-                        rows.push((pk.clone(), value));
+                        if self.rls_allows_with_context(table, &value, rls_applies)
+                            && predicates_match(filter, pk, &value)
+                        {
+                            rows.push((pk.clone(), value));
+                        }
                     }
                 } else {
                     for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
@@ -11010,20 +11011,24 @@ where
                             .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
                             .collect::<Vec<_>>();
                         let values = self.manager.get_many_async(txn, &keys).await?;
-                        rows.extend(
-                            keys.into_iter()
-                                .zip(values)
-                                .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
-                        );
+                        let batch_rows = keys
+                            .into_iter()
+                            .zip(values)
+                            .filter_map(|(key, value)| value.map(|value| (key.pk, value)))
+                            .collect::<Vec<_>>();
+                        ensure_materialized_rows(&batch_rows)?;
+                        rows.extend(batch_rows.into_iter().filter(|(pk, value)| {
+                            self.rls_allows_with_context(table, value, rls_applies)
+                                && predicates_match(filter, pk, value)
+                        }));
+                        if rows.len() >= limit {
+                            rows.truncate(limit);
+                            break;
+                        }
                     }
                 }
                 ensure_materialized_rows(&rows)?;
-                let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
-                return Ok(rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(filter, pk, value))
-                    .take(limit)
-                    .collect());
+                return Ok(rows);
             }
         }
         if txn.writes().is_empty() && filter.is_empty() && !rls_applies {
@@ -11253,11 +11258,15 @@ where
         }
         if txn.writes().is_empty() {
             if let Some(candidates) = self.indexed_candidates(table, filter)? {
-                let mut rows = Vec::with_capacity(candidates.len());
+                let mut rows = Vec::with_capacity(candidates.len().min(limit));
                 if let [pk] = candidates.as_slice() {
                     let key = RecordKey::new(&self.tenant, &self.database, table, pk);
                     if let Some(value) = self.manager.get(txn, &key)? {
-                        rows.push((pk.clone(), value));
+                        if self.rls_allows_with_context(table, &value, rls_applies)
+                            && predicates_match(filter, pk, &value)
+                        {
+                            rows.push((pk.clone(), value));
+                        }
                     }
                 } else {
                     for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
@@ -11266,20 +11275,24 @@ where
                             .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
                             .collect::<Vec<_>>();
                         let values = self.manager.get_many(txn, &keys)?;
-                        rows.extend(
-                            keys.into_iter()
-                                .zip(values)
-                                .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
-                        );
+                        let batch_rows = keys
+                            .into_iter()
+                            .zip(values)
+                            .filter_map(|(key, value)| value.map(|value| (key.pk, value)))
+                            .collect::<Vec<_>>();
+                        ensure_materialized_rows(&batch_rows)?;
+                        rows.extend(batch_rows.into_iter().filter(|(pk, value)| {
+                            self.rls_allows_with_context(table, value, rls_applies)
+                                && predicates_match(filter, pk, value)
+                        }));
+                        if rows.len() >= limit {
+                            rows.truncate(limit);
+                            break;
+                        }
                     }
                 }
                 ensure_materialized_rows(&rows)?;
-                let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
-                return Ok(rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(filter, pk, value))
-                    .take(limit)
-                    .collect());
+                return Ok(rows);
             }
 
             if !filter.is_empty() {
@@ -19768,6 +19781,67 @@ mod tests {
         assert!(invalid_check.is_err());
         assert_eq!(executor.schema_snapshot().foreign_keys.len(), 1);
         assert_eq!(executor.schema_snapshot().checks["messages"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn indexed_candidates_intersect_matching_indexes() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE docs (id TEXT PRIMARY KEY, tenant TEXT, state TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO docs (id, tenant, state) VALUES \
+                     ('a', 't1', 'active'), ('b', 't1', 'idle'), \
+                     ('c', 't2', 'active'), ('d', 't3', 'active')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX docs_tenant_idx ON docs (tenant)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX docs_state_idx ON docs (state)").unwrap())
+            .await
+            .unwrap();
+
+        let filter = [
+            Predicate {
+                field: Field::Value,
+                column: Some(String::from("tenant")),
+                op: Cmp::Eq,
+                operand: b"t1".to_vec(),
+                operands: Vec::new(),
+                alternatives: Vec::new(),
+            },
+            Predicate {
+                field: Field::Value,
+                column: Some(String::from("state")),
+                op: Cmp::Eq,
+                operand: b"active".to_vec(),
+                operands: Vec::new(),
+                alternatives: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            executor.indexed_candidates("docs", &filter).unwrap(),
+            Some(vec![b"a".to_vec()])
+        );
+
+        let result = executor
+            .execute(parse("SELECT * FROM docs WHERE tenant = 't1' AND state = 'active'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QueryResult::Rows { rows } if rows.len() == 1 && rows[0].0 == b"a")
+        );
     }
 
     #[tokio::test]

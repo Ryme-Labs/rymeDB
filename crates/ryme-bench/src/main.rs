@@ -2483,7 +2483,7 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
             let values = (start..rows.min(start + 64))
                 .map(|row| {
                     let tenant = if row % 8 == 0 { "tenant-0001" } else { "tenant-other" };
-                    let state = if row % 2 == 0 { "active" } else { "idle" };
+                    let state = if row % 3 == 0 { "active" } else { "idle" };
                     format!("('row-{row}', '{tenant}', '{state}', {row})")
                 })
                 .collect::<Vec<_>>()
@@ -2493,6 +2493,12 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
             );
             executor.execute(parse(&statement)?).await?;
         }
+        executor
+            .execute(parse("CREATE INDEX bench_rows_tenant_idx ON bench_rows (tenant)")?)
+            .await?;
+        executor
+            .execute(parse("CREATE INDEX bench_rows_state_idx ON bench_rows (state)")?)
+            .await?;
         Ok::<(), ryme_error::RymeError>(())
     }
     .await;
@@ -2502,7 +2508,7 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
     }
 
     let statement = match parse(
-        "SELECT id, state FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT 100",
+        "SELECT id, state FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT 4000",
     ) {
         Ok(statement) => statement,
         Err(error) => {
@@ -2510,7 +2516,7 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
             return;
         }
     };
-    let expected_rows = rows.div_ceil(8).min(100);
+    let expected_rows = rows.div_ceil(24).min(4_000);
     let warmup_ops = ops.min(100);
     for _ in 0..warmup_ops {
         if !matches!(executor.execute(statement.clone()).await, Ok(QueryResult::Table { ref rows, .. }) if rows.len() == expected_rows)
@@ -2545,7 +2551,7 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
     let output = serde_json::json!({
         "execution": "in-process",
         "protocol": "ryme-sql-executor",
-        "workload": "filtered-projection-three-predicates",
+        "workload": "indexed-filtered-projection-three-predicates",
         "rows": rows,
         "result_rows": expected_rows,
         "warmup_ops": warmup_ops,
