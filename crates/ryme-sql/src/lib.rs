@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 type TableDefinitionParts =
@@ -1176,6 +1176,7 @@ fn explain_analyze_result(
 /// Wire encoders translate it to their protocol-level null representation.
 pub const SQL_NULL_SENTINEL: &[u8] = b"\0";
 const RLS_CONFLICT_COLUMN: &str = "\0";
+const MAX_RLS_ROLE_MAP_CACHE_ENTRIES: usize = 128;
 
 fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, column: &str) {
     match map.get_mut(table) {
@@ -7343,6 +7344,8 @@ pub struct Executor<B = TxnManager> {
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
     rls_maps: Arc<RwLock<RlsPolicyMaps>>,
+    rls_policy_version: Arc<AtomicU64>,
+    rls_role_maps: Arc<RwLock<HashMap<String, (u64, Arc<RlsPolicyMaps>)>>>,
     rls_enabled: Arc<RwLock<HashSet<String>>>,
     rls_forced: Arc<RwLock<HashSet<String>>>,
     platform_rls_tables: Arc<RwLock<HashSet<String>>>,
@@ -7402,6 +7405,8 @@ impl Executor<TxnManager> {
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
+            rls_policy_version: Arc::new(AtomicU64::new(0)),
+            rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
             platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
@@ -7439,6 +7444,8 @@ impl Executor<TxnManager> {
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
+            rls_policy_version: Arc::new(AtomicU64::new(0)),
+            rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
             platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
@@ -7481,6 +7488,8 @@ where
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
+            rls_policy_version: Arc::new(AtomicU64::new(0)),
+            rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(HashSet::new())),
             rls_forced: Arc::new(RwLock::new(HashSet::new())),
             platform_rls_tables: Arc::new(RwLock::new(HashSet::new())),
@@ -7565,6 +7574,8 @@ where
         self.rls_enabled = Arc::new(RwLock::new(table_names.clone()));
         self.platform_rls_tables = Arc::new(RwLock::new(table_names));
         self.rls_policies = Arc::new(RwLock::new(policies));
+        self.rls_policy_version = Arc::new(AtomicU64::new(0));
+        self.rls_role_maps = Arc::new(RwLock::new(HashMap::new()));
         self
     }
 
@@ -7595,6 +7606,7 @@ where
                 policies.insert(format!("{table}\0{}", policy.name), policy);
             }
         }
+        self.invalidate_rls_role_maps();
     }
 
     fn set_rls_state(
@@ -8174,12 +8186,43 @@ where
             .clone();
         let maps = rls_policy_maps_for_role(policies.values(), None);
         *self.rls_maps.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? = maps;
+        self.invalidate_rls_role_maps();
         Ok(())
     }
 
-    fn rls_maps_for_current_role(&self) -> Option<RlsPolicyMaps> {
-        let policies = self.rls_policies.read().ok()?;
-        Some(rls_policy_maps_for_role(policies.values(), Some(&self.role)))
+    fn invalidate_rls_role_maps(&self) {
+        self.rls_policy_version.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut maps) = self.rls_role_maps.write() {
+            maps.clear();
+        }
+    }
+
+    fn rls_maps_for_current_role(&self) -> Option<Arc<RlsPolicyMaps>> {
+        loop {
+            let version = self.rls_policy_version.load(Ordering::SeqCst);
+            if let Some((cached_version, maps)) =
+                self.rls_role_maps.read().ok()?.get(&self.role).cloned()
+            {
+                if cached_version == version {
+                    return Some(maps);
+                }
+            }
+
+            let policies = self.rls_policies.read().ok()?;
+            let maps = Arc::new(rls_policy_maps_for_role(policies.values(), Some(&self.role)));
+            drop(policies);
+            if self.rls_policy_version.load(Ordering::SeqCst) != version {
+                continue;
+            }
+            let mut cache = self.rls_role_maps.write().ok()?;
+            if self.rls_policy_version.load(Ordering::SeqCst) != version {
+                continue;
+            }
+            if cache.len() < MAX_RLS_ROLE_MAP_CACHE_ENTRIES || cache.contains_key(&self.role) {
+                cache.insert(self.role.clone(), (version, Arc::clone(&maps)));
+            }
+            return Some(maps);
+        }
     }
 
     fn install_policy(
@@ -8302,6 +8345,8 @@ where
             catalog: self.catalog,
             indexes: self.indexes,
             rls_maps: self.rls_maps,
+            rls_policy_version: self.rls_policy_version,
+            rls_role_maps: self.rls_role_maps,
             rls_enabled: self.rls_enabled,
             rls_forced: self.rls_forced,
             platform_rls_tables: self.platform_rls_tables,
@@ -8726,6 +8771,8 @@ where
             catalog: Arc::new(Mutex::new(catalog)),
             indexes: Arc::new(Mutex::new(indexes)),
             rls_maps: Arc::new(RwLock::new(rls_maps)),
+            rls_policy_version: Arc::new(AtomicU64::new(0)),
+            rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
             rls_enabled: Arc::new(RwLock::new(rls_enabled)),
             rls_forced: Arc::new(RwLock::new(rls_forced)),
             platform_rls_tables: Arc::new(RwLock::new(platform_rls_tables)),
@@ -17629,6 +17676,27 @@ mod tests {
 
         let anonymous = executor.clone().with_role(String::from("anon"));
         let rows = anonymous.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
+        assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.is_empty()));
+
+        executor
+            .execute(
+                parse(
+                    "CREATE POLICY anonymous_docs ON scoped_docs FOR SELECT TO anon USING (auth.uid() = owner_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let anonymous_user = anonymous.clone().with_auth_uid(String::from("user-a"));
+        let rows =
+            anonymous_user.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
+        assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.len() == 1));
+        executor
+            .execute(parse("DROP POLICY anonymous_docs ON scoped_docs").unwrap())
+            .await
+            .unwrap();
+        let rows =
+            anonymous_user.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
         assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.is_empty()));
 
         let unrelated = executor.with_role(String::from("authenticated"));
