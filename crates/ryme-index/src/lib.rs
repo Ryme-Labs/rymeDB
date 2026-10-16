@@ -204,18 +204,14 @@ impl HnswIndex {
     }
 
     fn rebuild(&mut self) {
-        let active: Vec<(String, Vec<f32>)> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(pos, node)| !node.tombstoned && self.id_to_pos.get(&node.id) == Some(pos))
-            .map(|(_, node)| (node.id.clone(), node.vector.clone()))
-            .collect();
         let dim = self.dim;
-        *self = Self::default();
-        self.dim = dim;
-        for (id, vector) in active {
-            self.insert_new(id, vector);
+        let old_nodes = std::mem::take(&mut self.nodes);
+        let old_positions = std::mem::take(&mut self.id_to_pos);
+        *self = Self { dim, ..Self::default() };
+        for (pos, node) in old_nodes.into_iter().enumerate() {
+            if !node.tombstoned && old_positions.get(&node.id) == Some(&pos) {
+                self.insert_new(node.id, node.vector);
+            }
         }
     }
 
