@@ -924,8 +924,8 @@ pub struct RlsPolicy {
 struct RlsPolicyMaps {
     tenant_read: HashMap<String, String>,
     tenant_write: HashMap<String, String>,
-    uid_read: HashMap<String, String>,
-    uid_write: HashMap<String, String>,
+    uid_read: HashMap<String, Vec<String>>,
+    uid_write: HashMap<String, Vec<String>>,
 }
 
 fn default_rls_policy_command() -> String {
@@ -1183,6 +1183,19 @@ fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, colum
     }
 }
 
+fn merge_uid_rls_policy_column(map: &mut HashMap<String, Vec<String>>, table: &str, column: &str) {
+    let columns = map.entry(table.to_string()).or_default();
+    if columns.iter().any(String::is_empty) {
+        return;
+    }
+    if column.is_empty() {
+        columns.clear();
+        columns.push(String::new());
+    } else if !columns.iter().any(|existing| existing == column) {
+        columns.push(column.to_string());
+    }
+}
+
 fn policy_uses_auth_uid(policy: &RlsPolicy) -> bool {
     policy
         .using
@@ -1200,6 +1213,31 @@ fn tenant_field_matches(
         object.iter().filter(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, value)| value);
     let Some(value) = values.next() else { return false };
     values.next().is_none() && value.as_str().is_some_and(|value| value == tenant)
+}
+
+fn rls_tenant_column_allows(
+    object: &serde_json::Map<String, serde_json::Value>,
+    column: Option<&String>,
+    tenant: &str,
+) -> bool {
+    match column {
+        None => true,
+        Some(column) if column.is_empty() => true,
+        Some(column) => tenant_field_matches(object, column, tenant),
+    }
+}
+
+fn rls_uid_policies_allow(
+    object: &serde_json::Map<String, serde_json::Value>,
+    columns: Option<&[String]>,
+    auth_uid: Option<&str>,
+) -> bool {
+    columns.is_none_or(|columns| {
+        columns.iter().any(|column| {
+            column.is_empty()
+                || auth_uid.is_some_and(|auth_uid| tenant_field_matches(object, column, auth_uid))
+        })
+    })
 }
 
 pub type Row = (Vec<u8>, Vec<u8>);
@@ -8060,17 +8098,20 @@ where
         let mut uid_reads = HashMap::new();
         let mut uid_writes = HashMap::new();
         for policy in policies.values() {
-            let (read_map, write_map) = if policy_uses_auth_uid(policy) || policy.column.is_empty()
-            {
-                (&mut uid_reads, &mut uid_writes)
-            } else {
-                (&mut reads, &mut writes)
-            };
+            let is_uid_policy = policy_uses_auth_uid(policy) || policy.column.is_empty();
             if policy.read {
-                merge_rls_policy_column(read_map, &policy.table, &policy.column);
+                if is_uid_policy {
+                    merge_uid_rls_policy_column(&mut uid_reads, &policy.table, &policy.column);
+                } else {
+                    merge_rls_policy_column(&mut reads, &policy.table, &policy.column);
+                }
             }
             if policy.write {
-                merge_rls_policy_column(write_map, &policy.table, &policy.column);
+                if is_uid_policy {
+                    merge_uid_rls_policy_column(&mut uid_writes, &policy.table, &policy.column);
+                } else {
+                    merge_rls_policy_column(&mut writes, &policy.table, &policy.column);
+                }
             }
         }
         *self.rls_maps.write().map_err(|_| RymeError::Internal(String::from("RLS lock")))? =
@@ -8944,14 +8985,12 @@ where
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return false;
         };
-        let allows = |column: Option<&String>, identity: Option<&str>| match column {
-            None => true,
-            Some(column) if column.is_empty() => true,
-            Some(column) => {
-                identity.is_some_and(|identity| tenant_field_matches(&object, column, identity))
-            }
-        };
-        allows(tenant_column, Some(&self.tenant)) && allows(uid_column, self.auth_uid.as_deref())
+        rls_tenant_column_allows(&object, tenant_column, &self.tenant)
+            && rls_uid_policies_allow(
+                &object,
+                uid_column.map(Vec::as_slice),
+                self.auth_uid.as_deref(),
+            )
     }
 
     fn rls_allows(&self, table: &str, value: &[u8]) -> bool {
@@ -8992,14 +9031,12 @@ where
         let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
             return Err(RymeError::Forbidden);
         };
-        let allows = |column: Option<&String>, identity: Option<&str>| match column {
-            None => true,
-            Some(column) if column.is_empty() => true,
-            Some(column) => {
-                identity.is_some_and(|identity| tenant_field_matches(&object, column, identity))
-            }
-        };
-        if allows(tenant_column, Some(&self.tenant)) && allows(uid_column, self.auth_uid.as_deref())
+        if rls_tenant_column_allows(&object, tenant_column, &self.tenant)
+            && rls_uid_policies_allow(
+                &object,
+                uid_column.map(Vec::as_slice),
+                self.auth_uid.as_deref(),
+            )
         {
             Ok(())
         } else {
@@ -17425,6 +17462,62 @@ mod tests {
             )
             .await;
         assert!(matches!(policy, Err(RymeError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn permissive_auth_uid_policies_combine_with_or() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse(
+                    "CREATE TABLE profiles (id TEXT PRIMARY KEY, owner_id TEXT, reviewer_id TEXT)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO profiles (id, owner_id, reviewer_id) VALUES ('owned', 'user-a', 'user-b'), ('reviewed', 'user-b', 'user-a'), ('hidden', 'user-b', 'user-c')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("CREATE POLICY profile_owner ON profiles FOR SELECT USING (auth.uid() = owner_id)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("CREATE POLICY profile_reviewer ON profiles FOR SELECT USING (auth.uid() = reviewer_id)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE profiles ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT SELECT ON TABLE profiles TO authenticated").unwrap())
+            .await
+            .unwrap();
+
+        let user =
+            executor.with_role(String::from("authenticated")).with_auth_uid(String::from("user-a"));
+        let rows = user.execute(parse("SELECT * FROM profiles").unwrap()).await.unwrap();
+        assert!(matches!(
+            rows,
+            QueryResult::Rows { ref rows }
+                if rows.len() == 2
+                    && rows.iter().any(|row| row.0 == b"owned")
+                    && rows.iter().any(|row| row.0 == b"reviewed")
+        ));
     }
 
     #[tokio::test]

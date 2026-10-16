@@ -216,7 +216,10 @@ key have no user identity; do not use them to test user-scoped policies.
 RLS affects SQL, REST, scans, and realtime snapshots/updates. An enabled table
 without a matching policy follows default-deny behavior. Inspect policy
 metadata through `pg_catalog.pg_policies`. Complex policy expressions need a
-manual compatibility review.
+manual compatibility review. Supported permissive `auth.uid()` equality
+policies combine with PostgreSQL's OR semantics; configured `rls_tables`
+tenant restrictions remain an additional mandatory filter. Unsupported
+composite policy expressions are rejected instead of being approximated.
 
 SQL schema, role, and privilege changes operate on the shared database
 catalog and require a platform `superuser` credential. Tenant
