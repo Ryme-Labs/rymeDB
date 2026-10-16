@@ -507,7 +507,7 @@ impl TextSpace {
         }
         let mut hits: Vec<TextHit> =
             scores.into_iter().map(|(id, score)| TextHit { id: id.to_string(), score }).collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         hits.truncate(top_k.clamp(1, MAX_TOP_K));
         Ok(hits)
     }
@@ -793,7 +793,7 @@ impl PartitionedIndex {
                 Err(e) => return Err(e),
             }
         }
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         merged.truncate(top_k.clamp(1, MAX_TOP_K));
         Ok(merged)
     }
@@ -886,6 +886,17 @@ mod tests {
         let hits = registry.vector_search("s", &[0.9, 0.1], 2).unwrap();
         assert_eq!(hits[0].id, "a");
         assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn text_search_breaks_score_ties_by_id_before_truncating() {
+        let mut index = PartitionedIndex::new(4);
+        for id in ["z", "a", "m"] {
+            index.text_index("s", id.to_string(), "equal score").unwrap();
+        }
+
+        let hits = index.text_search("s", "equal", 2).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["a", "m"]);
     }
 
     #[test]
