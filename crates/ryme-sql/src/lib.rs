@@ -3374,6 +3374,9 @@ fn parse_create_policy(tokens: &[String], raw: &str) -> Result<Statement> {
         .iter()
         .position(|token| token.eq_ignore_ascii_case("ON"))
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create policy table")))?;
+    if on_index < 3 {
+        return Err(RymeError::InvalidArgument(String::from("create policy name")));
+    }
     let table = tokens
         .get(on_index + 1)
         .map(|value| {
@@ -3382,6 +3385,28 @@ fn parse_create_policy(tokens: &[String], raw: &str) -> Result<Statement> {
         })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create policy table")))?;
+    let options_end = tokens
+        .iter()
+        .enumerate()
+        .skip(on_index + 2)
+        .find(|(_, token)| {
+            token.eq_ignore_ascii_case("USING") || token.eq_ignore_ascii_case("WITH")
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(tokens.len());
+    if let Some(as_index) = (3..options_end).find(|index| tokens[*index].eq_ignore_ascii_case("AS"))
+    {
+        if !tokens.get(as_index + 1).is_some_and(|value| value.eq_ignore_ascii_case("PERMISSIVE")) {
+            return Err(RymeError::InvalidArgument(String::from("unsupported RLS policy mode")));
+        }
+    }
+    if let Some(to_index) = (3..options_end).find(|index| tokens[*index].eq_ignore_ascii_case("TO"))
+    {
+        let roles = &tokens[to_index + 1..options_end];
+        if roles.len() != 1 || !roles[0].eq_ignore_ascii_case("PUBLIC") {
+            return Err(RymeError::InvalidArgument(String::from("unsupported RLS policy roles")));
+        }
+    }
     let command = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("FOR"))
@@ -17462,6 +17487,24 @@ mod tests {
             )
             .await;
         assert!(matches!(policy, Err(RymeError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn policy_parser_rejects_unimplemented_role_and_restrictive_scopes() {
+        assert!(parse("CREATE POLICY ON docs USING (true)").is_err());
+        assert!(parse(
+            "CREATE POLICY admin_rows ON docs AS RESTRICTIVE FOR SELECT TO admin USING (true)"
+        )
+        .is_err());
+        assert!(parse("CREATE POLICY bad_mode ON docs AS RESTRICTIVE USING (true)").is_err());
+        assert!(parse(
+            "CREATE POLICY app_rows ON docs FOR SELECT TO authenticated USING (auth.uid() = user_id)"
+        )
+        .is_err());
+        assert!(parse(
+            "CREATE POLICY public_rows ON docs AS PERMISSIVE FOR SELECT TO PUBLIC USING (true)"
+        )
+        .is_ok());
     }
 
     #[tokio::test]

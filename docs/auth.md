@@ -220,6 +220,9 @@ manual compatibility review. Supported permissive `auth.uid()` equality
 policies combine with PostgreSQL's OR semantics; configured `rls_tables`
 tenant restrictions remain an additional mandatory filter. Unsupported
 composite policy expressions are rejected instead of being approximated.
+Policies scoped with `TO role` or declared `AS RESTRICTIVE` are also rejected
+until those semantics are supported; use the default permissive mode or
+`TO PUBLIC` for currently supported policies.
 
 SQL schema, role, and privilege changes operate on the shared database
 catalog and require a platform `superuser` credential. Tenant
