@@ -19816,8 +19816,10 @@ mod tests {
             executor.commit_transaction(first, first_changes),
             executor.commit_transaction(second, second_changes),
         );
-        assert_eq!(first_result.is_ok() as usize + second_result.is_ok() as usize, 1);
-        assert!(matches!(first_result.or(second_result), Err(RymeError::Conflict(_))));
+        assert!(matches!(
+            (first_result, second_result),
+            (Ok(_), Err(RymeError::Conflict(_))) | (Err(RymeError::Conflict(_)), Ok(_))
+        ));
     }
 
     #[tokio::test]
