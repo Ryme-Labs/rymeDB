@@ -260,9 +260,10 @@ impl HnswIndex {
                 self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal).then(self.1.cmp(&other.1))
             }
         }
-        let mut visited: HashSet<usize> = starts.iter().copied().collect();
-        let mut candidates: BinaryHeap<Scored> = BinaryHeap::new();
-        let mut results: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::new();
+        let mut visited = HashSet::with_capacity(ef.saturating_mul(2));
+        visited.extend(starts.iter().copied());
+        let mut candidates: BinaryHeap<Scored> = BinaryHeap::with_capacity(ef);
+        let mut results: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(ef);
         for &start in starts {
             let score = dot(query, &self.nodes[start].vector);
             candidates.push(Scored(score, start));
