@@ -486,8 +486,8 @@ impl JwtVerifier {
     /// operator-only issuer. Application-user JWTs should use the default.
     pub fn with_platform_admin_claims(mut self, enabled: bool) -> Result<Self> {
         if enabled
-            && (!self.issuer.as_deref().is_some_and(|issuer| !issuer.is_empty())
-                || !self.audience.as_deref().is_some_and(|audience| !audience.is_empty()))
+            && (self.issuer.as_deref().is_none_or(str::is_empty)
+                || self.audience.as_deref().is_none_or(str::is_empty))
         {
             return Err(RymeError::InvalidArgument(String::from(
                 "platform-admin JWT claims require an issuer and audience",
@@ -593,7 +593,7 @@ impl JwtVerifier {
         }
         let exp =
             claims.get("exp").and_then(|value| value.as_u64()).ok_or(RymeError::Unauthorized)?;
-        if exp.saturating_add(self.leeway_secs) < now_secs {
+        if exp.saturating_add(self.leeway_secs) <= now_secs {
             return Err(RymeError::Unauthorized);
         }
         for claim in ["nbf", "iat"] {
@@ -1565,6 +1565,28 @@ mod tests {
                 1000,
             )
             .is_err());
+    }
+
+    #[test]
+    fn jwt_rejects_at_expiration_plus_leeway_boundary() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+        let payload = base64_url_encode(
+            serde_json::to_string(&serde_json::json!({ "sub": "ada", "exp": 1000u64 }))
+                .unwrap()
+                .as_bytes(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"expiry-boundary-secret").unwrap();
+        mac.update(signing_input.as_bytes());
+        let token = format!("{signing_input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
+        let verifier = JwtVerifier::new(b"expiry-boundary-secret".to_vec());
+
+        assert!(verifier.principal_from_token(&token, 1059).is_ok());
+        assert!(verifier.principal_from_token(&token, 1060).is_err());
+        assert!(verifier.principal_from_token(&token, 1061).is_err());
     }
 
     #[test]
