@@ -1011,7 +1011,7 @@ impl PasskeyRegistry {
             return Err(RymeError::InvalidArgument(String::from("user")));
         }
         self.challenges.retain(|_, (_, issued_at)| {
-            issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) >= now_secs
+            issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) > now_secs
         });
         if self.challenges.len() >= MAX_CHALLENGES && !self.challenges.contains_key(user) {
             return Err(RymeError::Overload(String::from("challenges")));
@@ -1086,7 +1086,7 @@ impl PasskeyRegistry {
         let now_secs: u64 = *now_secs;
         let (expected_challenge, issued_at) =
             self.challenges.get(user).ok_or(RymeError::Unauthorized)?;
-        if issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) < now_secs {
+        if issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) <= now_secs {
             self.challenges.remove(user);
             return Err(RymeError::Unauthorized);
         }
@@ -2111,7 +2111,24 @@ mod tests {
         }
         assert!(registry.challenge_at("one-more", 1000).is_err());
         assert!(registry.challenge_at("user-0", 1000).is_ok());
-        assert!(registry.challenge_at("fresh", 1000 + PASSKEY_CHALLENGE_TTL_SECS + 1).is_ok());
+        assert!(registry.challenge_at("fresh", 1000 + PASSKEY_CHALLENGE_TTL_SECS).is_ok());
+    }
+
+    #[test]
+    fn passkey_challenge_expires_at_ttl_boundary() {
+        let mut registry = PasskeyRegistry::new();
+        registry.challenge_at("ada", 1000).unwrap();
+        let result = registry.verify_assertion(&PasskeyAssertion {
+            user: "ada",
+            credential_id: "cred-1",
+            authenticator_data: &[],
+            client_data_json: &[],
+            signature_der: &[],
+            rp_id: "auth.test",
+            origins: &[],
+            now_secs: 1000 + PASSKEY_CHALLENGE_TTL_SECS,
+        });
+        assert!(matches!(result, Err(RymeError::Unauthorized)));
     }
 
     #[test]
