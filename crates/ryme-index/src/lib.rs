@@ -839,7 +839,7 @@ impl PartitionedIndex {
         for partition in &self.partitions {
             merged.extend(partition.text_search(space, query, top_k)?);
         }
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         merged.truncate(top_k.clamp(1, MAX_TOP_K));
         Ok(merged)
     }
@@ -891,12 +891,19 @@ mod tests {
     #[test]
     fn text_search_breaks_score_ties_by_id_before_truncating() {
         let mut index = PartitionedIndex::new(4);
-        for id in ["z", "a", "m"] {
-            index.text_index("s", id.to_string(), "equal score").unwrap();
-        }
+        let low_id_later_partition = (0..1_000)
+            .map(|index| format!("a-{index:04}"))
+            .find(|id| index.route("s", id) == 3)
+            .unwrap();
+        let high_id_earlier_partition = (0..1_000)
+            .map(|index| format!("z-{index:04}"))
+            .find(|id| index.route("s", id) == 0)
+            .unwrap();
+        index.text_index("s", high_id_earlier_partition, "equal score").unwrap();
+        index.text_index("s", low_id_later_partition.clone(), "equal score").unwrap();
 
-        let hits = index.text_search("s", "equal", 2).unwrap();
-        assert_eq!(hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["a", "m"]);
+        let hits = index.text_search("s", "equal", 1).unwrap();
+        assert_eq!(hits[0].id, low_id_later_partition);
     }
 
     #[test]
