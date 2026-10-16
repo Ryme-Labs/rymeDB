@@ -2807,12 +2807,13 @@ impl SharedState {
         headers: &HeaderMap,
         api_key: Option<&str>,
     ) -> ryme_error::Result<Principal> {
-        if let Some(key) = api_key {
-            if let Ok(principal) = self.keys.authenticate(key) {
-                return Ok(principal);
-            }
+        match api_key {
+            Some(key) => match self.principal(headers) {
+                Ok(principal) => Ok(principal),
+                Err(_) => self.keys.authenticate(key),
+            },
+            None => self.principal(headers),
         }
-        self.principal(headers)
     }
 }
 
@@ -2825,6 +2826,60 @@ fn require_platform_admin(
         Ok(principal)
     } else {
         Err(ryme_error::RymeError::Forbidden)
+    }
+}
+
+#[cfg(test)]
+mod websocket_credential_precedence_tests {
+    use super::*;
+
+    #[test]
+    fn valid_header_identity_takes_precedence_over_query_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-ws-credential-precedence-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        let now = now_secs();
+        state
+            .keys
+            .insert_with_expiry(
+                String::from("user-key"),
+                Principal {
+                    id: String::from("app-user"),
+                    tenant: String::from("tenant-a"),
+                    roles: [Role::ReadWrite].into_iter().collect(),
+                },
+                now + 60,
+                now,
+            )
+            .unwrap();
+        state
+            .keys
+            .insert_with_expiry(
+                String::from("query-admin-key"),
+                Principal {
+                    id: String::from("operator"),
+                    tenant: String::from("default"),
+                    roles: [Role::Superuser].into_iter().collect(),
+                },
+                now + 60,
+                now,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers
+            .insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer user-key"));
+
+        let principal = state.principal_with_query(&headers, Some("query-admin-key")).unwrap();
+        assert_eq!(principal.id, "app-user");
+        assert_eq!(principal.tenant, "tenant-a");
+        assert!(!principal.can_platform_admin());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

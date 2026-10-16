@@ -37,7 +37,8 @@ wss://db.example.com/v1/stream?table=messages&api_key=...&branch=main
 URL credentials may be captured by reverse-proxy/access logs and monitoring.
 For browser WebSockets, use only a short-lived, least-privilege user
 credential, and configure every proxy in the path to redact `api_key` query
-parameters. Never put an operator or owner key in a WebSocket URL.
+parameters. A valid header credential takes precedence over a query key.
+Never put an operator or owner key in a WebSocket URL.
 
 Never put a long-lived owner key in browser code. Mint a narrowly scoped
 application credential or use a server-side proxy.
