@@ -1054,8 +1054,17 @@ impl SegmentStore {
     pub fn prune(&self, keep: usize) -> Result<usize> {
         let mut segments = Vec::new();
         for path in self.segment_paths()? {
-            let segment = ImmutableSegment::decode(&read_segment_file(&path)?)?;
-            segments.push((segment.meta.id, path, segment.is_snapshot()));
+            let (id, kind) = read_segment_identity(&path)?;
+            let path_id =
+                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+                    .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
+            if id != path_id {
+                return Err(RymeError::Corrupt(String::from("segment id")));
+            }
+            // Retention only needs each segment's identity and kind. Verify
+            // the complete file checksum without rebuilding its row index.
+            read_segment_max_commit_ts(&path)?;
+            segments.push((id, path, kind == SegmentKind::Snapshot));
         }
         segments.sort_by_key(|(id, _, _)| *id);
         let full_ids: Vec<u64> =
@@ -1558,6 +1567,9 @@ mod tests {
         std::fs::write(path, encoded).unwrap();
         assert!(
             matches!(store.max_commit_ts(), Err(RymeError::Corrupt(message)) if message == "segment checksum")
+        );
+        assert!(
+            matches!(store.prune(1), Err(RymeError::Corrupt(message)) if message == "segment checksum")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
