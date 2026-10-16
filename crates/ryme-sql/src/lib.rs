@@ -7937,18 +7937,15 @@ where
         }))
     }
 
-    fn select_scan_limit(
+    fn select_scan_options(
         &self,
         table: &str,
         order: &Order,
         limit: usize,
         offset: usize,
         filter_is_empty: bool,
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         let primary_key_order = order == &Order::default();
-        if filter_is_empty && offset == 0 && primary_key_order {
-            return Ok(limit.clamp(1, 10_000));
-        }
         if primary_key_order {
             let views =
                 self.views.lock().map_err(|_| RymeError::Internal(String::from("view lock")))?;
@@ -7959,11 +7956,16 @@ where
                         .next()
                         .is_some_and(|short| short.eq_ignore_ascii_case(table))
                 });
-            if !is_view {
-                return Ok(limit.saturating_add(offset).clamp(1, 10_000));
-            }
+            let cap = if filter_is_empty && offset == 0 {
+                limit.clamp(1, 10_000)
+            } else if !is_view {
+                limit.saturating_add(offset).clamp(1, 10_000)
+            } else {
+                10_000
+            };
+            return Ok((cap, is_view));
         }
-        Ok(10_000)
+        Ok((10_000, true))
     }
 
     fn install_sequence(&self, definition: SequenceDefinition, if_not_exists: bool) -> Result<()> {
@@ -10610,19 +10612,24 @@ where
             && filter[0].column.is_none()
             && filter[0].field == Field::Key
             && filter[0].op == Cmp::Eq;
-        let rows = if exact_key && self.view_definition(&table)?.is_none() {
+        let (rows, sort_rows) = if exact_key && self.view_definition(&table)?.is_none() {
             let pk = filter[0].operand.clone();
-            self.manager
+            let rows = self
+                .manager
                 .get(txn, &RecordKey::new(&self.tenant, &self.database, &table, &pk))?
                 .filter(|value| self.rls_allows(&table, value))
                 .map(|value| vec![(pk, value)])
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (rows, false)
         } else {
-            let cap = self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
-            self.scan_rows(txn, &table, &filter, cap)?
+            let (cap, sort_rows) =
+                self.select_scan_options(&table, &order, limit, offset, filter.is_empty())?;
+            (self.scan_rows(txn, &table, &filter, cap)?, sort_rows)
         };
         let mut rows = rows;
-        rows.sort_by(|left, right| compare_order(&order, left, right));
+        if sort_rows {
+            rows.sort_by(|left, right| compare_order(&order, left, right));
+        }
         let rows = self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
         let output_columns = columns
             .iter()
@@ -14645,11 +14652,13 @@ where
                 Ok(QueryResult::Table { columns: output_columns, rows })
             }
             Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter } => {
-                let cap =
-                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
+                let (cap, sort_rows) =
+                    self.select_scan_options(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
                 let mut rows = rows;
-                rows.sort_by(|left, right| compare_order(&order, left, right));
+                if sort_rows {
+                    rows.sort_by(|left, right| compare_order(&order, left, right));
+                }
                 let rows =
                     self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
                 let output_columns = columns
@@ -14665,11 +14674,13 @@ where
                 Ok(QueryResult::Table { columns: output_columns, rows })
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
-                let cap =
-                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
+                let (cap, sort_rows) =
+                    self.select_scan_options(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
                 let mut rows = rows;
-                rows.sort_by(|left, right| compare_order(&order, left, right));
+                if sort_rows {
+                    rows.sort_by(|left, right| compare_order(&order, left, right));
+                }
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
@@ -14719,11 +14730,13 @@ where
                 self.copy_to_in_transaction(txn, table, columns)
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
-                let cap =
-                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
+                let (cap, sort_rows) =
+                    self.select_scan_options(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows(txn, &table, &filter, cap)?;
                 let mut rows = rows;
-                rows.sort_by(|a, b| compare_order(&order, a, b));
+                if sort_rows {
+                    rows.sort_by(|a, b| compare_order(&order, a, b));
+                }
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
@@ -15728,11 +15741,13 @@ where
             }
             Statement::SelectScan { table, limit, offset, order, filter } => {
                 let mut txn = self.begin_read_only(isolation)?;
-                let cap =
-                    self.select_scan_limit(&table, &order, limit, offset, filter.is_empty())?;
+                let (cap, sort_rows) =
+                    self.select_scan_options(&table, &order, limit, offset, filter.is_empty())?;
                 let rows = self.scan_rows(&mut txn, &table, &filter, cap)?;
                 let mut rows = rows;
-                rows.sort_by(|a, b| compare_order(&order, a, b));
+                if sort_rows {
+                    rows.sort_by(|a, b| compare_order(&order, a, b));
+                }
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
