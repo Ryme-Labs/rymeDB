@@ -1648,6 +1648,10 @@ impl SharedState {
             .auth_persist_lock
             .lock()
             .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+        self.persist_auth_locked(|| {})
+    }
+
+    fn persist_auth_locked(&self, on_replace: impl FnOnce()) -> ryme_error::Result<()> {
         let snapshot = AuthSnapshot {
             api_keys: self.keys.snapshot()?,
             api_key_expirations: self.keys.expiration_snapshot()?,
@@ -1684,6 +1688,7 @@ impl SharedState {
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
         std::fs::rename(temporary, &self.auth_path)?;
+        on_replace();
         if let Some(parent) = self.auth_path.parent() {
             sync_metadata_directory(parent)?;
         }
@@ -6222,23 +6227,40 @@ async fn auth_revoke(
     if request.key.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("key")));
     }
-    let Some(owner) = state.keys.owner_of(&request.key) else {
+    let _persist_guard = match state.auth_persist_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "auth persist lock",
+            )));
+        }
+    };
+    let Some((owner, expires_at)) = state.keys.remove_with_expiry(&request.key) else {
         return error_response(ryme_error::RymeError::NotFound(String::from("key")));
     };
     if (owner.tenant != principal.tenant && !principal.can_platform_admin())
         || (!principal.can_admin() && owner.id != principal.id)
     {
+        if let Err(error) = state.keys.restore(&request.key, owner, expires_at) {
+            return error_response(ryme_error::RymeError::Internal(format!(
+                "auth key rollback failed: {error}"
+            )));
+        }
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    if state.keys.remove(&request.key) {
-        match state.persist_auth() {
-            Ok(()) => {
-                (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
+    let mut replaced = false;
+    match state.persist_auth_locked(|| replaced = true) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response(),
+        Err(error) => {
+            if !replaced {
+                if let Err(restore_error) = state.keys.restore(&request.key, owner, expires_at) {
+                    return error_response(ryme_error::RymeError::Internal(format!(
+                        "auth key rollback failed: {restore_error}"
+                    )));
+                }
             }
-            Err(e) => error_response(e),
+            error_response(error)
         }
-    } else {
-        error_response(ryme_error::RymeError::NotFound(String::from("key")))
     }
 }
 
@@ -6255,15 +6277,32 @@ async fn auth_revoke_session(
             "refresh_token",
         )));
     }
-    if state.refresh_tokens.revoke(&request.refresh_token) {
-        match state.persist_auth() {
-            Ok(()) => {
-                (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
-            }
-            Err(error) => error_response(error),
+    let _persist_guard = match state.auth_persist_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "auth persist lock",
+            )));
         }
-    } else {
-        (StatusCode::OK, Json(serde_json::json!({ "revoked": false }))).into_response()
+    };
+    let Some(record) = state.refresh_tokens.remove_record(&request.refresh_token) else {
+        return (StatusCode::OK, Json(serde_json::json!({ "revoked": false }))).into_response();
+    };
+    let mut replaced = false;
+    match state.persist_auth_locked(|| replaced = true) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response(),
+        Err(error) => {
+            if !replaced {
+                if let Err(restore_error) =
+                    state.refresh_tokens.restore_record(&request.refresh_token, record)
+                {
+                    return error_response(ryme_error::RymeError::Internal(format!(
+                        "refresh session rollback failed: {restore_error}"
+                    )));
+                }
+            }
+            error_response(error)
+        }
     }
 }
 
@@ -13981,6 +14020,78 @@ fn archive_target(
             )?)))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod auth_persistence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn revocations_restore_credentials_when_snapshot_replace_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-auth-revoke-rollback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        let admin = Principal {
+            id: String::from("admin"),
+            tenant: String::from("default"),
+            roles: [Role::Superuser].into_iter().collect(),
+        };
+        let user = Principal {
+            id: String::from("user"),
+            tenant: String::from("default"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        let now = now_secs();
+        let expires_at = now + 3600;
+        state.keys.insert_with_expiry(String::from("admin-key"), admin, expires_at, now).unwrap();
+        state
+            .keys
+            .insert_with_expiry(String::from("user-key"), user.clone(), expires_at, now)
+            .unwrap();
+        let refresh_token = state.refresh_tokens.issue(user, now).unwrap();
+        state.persist_auth().unwrap();
+
+        let blocked_temporary = state.auth_path.with_extension("tmp");
+        std::fs::create_dir(&blocked_temporary).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-key"),
+        );
+
+        let response = auth_revoke(
+            State(state.clone()),
+            headers,
+            axum::body::Bytes::from_static(br#"{"key":"user-key"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.keys.authenticate("user-key").is_ok());
+
+        let response = auth_revoke_session(
+            State(state.clone()),
+            axum::body::Bytes::from(
+                serde_json::json!({"refresh_token":refresh_token.clone()}).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(state.refresh_tokens.len(), 1);
+
+        std::fs::remove_dir(&blocked_temporary).unwrap();
+        drop(state);
+        let restarted = SharedState::build(&config).unwrap();
+        assert!(restarted.keys.authenticate("user-key").is_ok());
+        assert!(restarted.refresh_tokens.rotate(&refresh_token, now_secs()).is_ok());
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

@@ -259,10 +259,32 @@ impl ApiKeyStore {
     }
 
     pub fn remove(&self, api_key: &str) -> bool {
+        self.remove_with_expiry(api_key).is_some()
+    }
+
+    pub fn remove_with_expiry(&self, api_key: &str) -> Option<(Principal, Option<u64>)> {
         self.inner
             .write()
-            .map(|mut guard| guard.remove(&Self::digest(api_key)).is_some())
-            .unwrap_or(false)
+            .ok()?
+            .remove(&Self::digest(api_key))
+            .map(|record| (record.principal, record.expires_at))
+    }
+
+    pub fn restore(
+        &self,
+        api_key: &str,
+        principal: Principal,
+        expires_at: Option<u64>,
+    ) -> Result<()> {
+        principal.validate()?;
+        let digest = Self::digest(api_key);
+        let mut guard =
+            self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
+        if guard.len() >= MAX_API_KEYS && !guard.contains_key(&digest) {
+            return Err(RymeError::Overload(String::from("api keys")));
+        }
+        guard.insert(digest, ApiKeyRecord { principal, expires_at });
+        Ok(())
     }
 
     pub fn owner_of(&self, presented: &str) -> Option<Principal> {
@@ -706,10 +728,23 @@ impl RefreshTokenStore {
     }
 
     pub fn revoke(&self, presented: &str) -> bool {
-        self.inner
-            .write()
-            .map(|mut sessions| sessions.remove(&Self::digest(presented)).is_some())
-            .unwrap_or(false)
+        self.remove_record(presented).is_some()
+    }
+
+    pub fn remove_record(&self, presented: &str) -> Option<RefreshTokenRecord> {
+        self.inner.write().ok()?.remove(&Self::digest(presented))
+    }
+
+    pub fn restore_record(&self, presented: &str, record: RefreshTokenRecord) -> Result<()> {
+        record.principal.validate()?;
+        let digest = Self::digest(presented);
+        let mut sessions =
+            self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
+        if sessions.len() >= MAX_REFRESH_SESSIONS && !sessions.contains_key(&digest) {
+            return Err(RymeError::Overload(String::from("refresh sessions")));
+        }
+        sessions.insert(digest, record);
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
