@@ -14627,10 +14627,7 @@ where
                     10000
                 };
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
-                let mut rows: Vec<Row> = rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
-                    .collect();
+                let mut rows = rows;
                 rows.sort_by(|left, right| compare_order(&order, left, right));
                 let rows =
                     self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
@@ -14650,19 +14647,12 @@ where
                 let plain = filter.is_empty() && offset == 0 && order == Order::default();
                 let cap = if plain { limit.clamp(1, 10000) } else { 10000 };
                 let rows = self.scan_rows_async(txn, &table, &filter, cap).await?;
-                let mut rows: Vec<Row> = rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
-                    .collect();
+                let mut rows = rows;
                 rows.sort_by(|left, right| compare_order(&order, left, right));
                 Ok(QueryResult::Rows { rows: rows.into_iter().skip(offset).take(limit).collect() })
             }
             Statement::Aggregate { table, func, field, column, filter } => {
                 let rows = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
-                let rows: Vec<Row> = rows
-                    .into_iter()
-                    .filter(|(pk, value)| predicates_match(&filter, pk, value))
-                    .collect();
                 Ok(QueryResult::Scalar {
                     label: func.label().to_string(),
                     value: aggregate_target_rows(&rows, func, field, column.as_deref()),
@@ -17849,10 +17839,26 @@ mod tests {
         assert!(
             matches!(rows, QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"owned")
         );
+        let mut authenticated_txn = authenticated.begin_transaction(Isolation::Serializable);
+        let (transaction_rows, _) = authenticated
+            .execute_in_transaction(
+                &mut authenticated_txn,
+                parse("SELECT * FROM scoped_docs").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(transaction_rows, QueryResult::Rows { ref rows }
+            if rows.len() == 1 && rows[0].0 == b"owned"));
 
         let anonymous = executor.clone().with_role(String::from("anon"));
         let rows = anonymous.execute(parse("SELECT * FROM scoped_docs").unwrap()).await.unwrap();
         assert!(matches!(rows, QueryResult::Rows { ref rows } if rows.is_empty()));
+        let mut anonymous_txn = anonymous.begin_transaction(Isolation::Serializable);
+        let (transaction_rows, _) = anonymous
+            .execute_in_transaction(&mut anonymous_txn, parse("SELECT * FROM scoped_docs").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(transaction_rows, QueryResult::Rows { ref rows } if rows.is_empty()));
 
         executor
             .execute(
