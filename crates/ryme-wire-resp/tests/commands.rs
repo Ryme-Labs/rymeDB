@@ -228,20 +228,32 @@ async fn concurrent_multi_increments_retry_conflicts_without_losing_updates() {
 
 #[tokio::test]
 async fn owner_reader_serves_remote_gets() {
-    let gateway = ryme_wire_resp::RespGateway::new(String::from("t"), String::from("d"))
-        .with_remote_reader(ryme_wire_resp::RemoteReader::new(|key| async move {
-            assert_eq!(key.table, "_kv");
-            let value = match key.pk.as_slice() {
-                b"remote" => Some(b"owner-value".to_vec()),
-                b"other" => Some(b"other-value".to_vec()),
-                b"missing" => None,
-                _ => None,
-            };
-            Ok(ryme_wire_resp::RemoteRead::Value {
-                value,
-                expires_at: Some(ryme_txn::now_unix() + 60),
-            })
-        }));
+    let manager = ryme_txn::TxnManager::new();
+    let mut seed = manager.begin();
+    manager.put(
+        &mut seed,
+        ryme_storage::RecordKey::new("t", "d", "_kv", b"local"),
+        b"local-value".to_vec(),
+    );
+    manager.commit(seed).unwrap();
+    let gateway =
+        ryme_wire_resp::RespGateway::with_manager(String::from("t"), String::from("d"), manager)
+            .with_remote_reader(ryme_wire_resp::RemoteReader::new(|key| async move {
+                assert_eq!(key.table, "_kv");
+                if key.pk.as_slice() == b"local" {
+                    return Ok(ryme_wire_resp::RemoteRead::Local);
+                }
+                let value = match key.pk.as_slice() {
+                    b"remote" => Some(b"owner-value".to_vec()),
+                    b"other" => Some(b"other-value".to_vec()),
+                    b"missing" => None,
+                    _ => None,
+                };
+                Ok(ryme_wire_resp::RemoteRead::Value {
+                    value,
+                    expires_at: Some(ryme_txn::now_unix() + 60),
+                })
+            }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -252,7 +264,16 @@ async fn owner_reader_serves_remote_gets() {
         command(addr, &["MGET", "remote", "other", "missing"]).await,
         "*3\r\n$11\r\nowner-value\r\n$11\r\nother-value\r\n$-1"
     );
+    assert_eq!(
+        command(addr, &["MGET", "remote", "local", "missing"]).await,
+        "*3\r\n$11\r\nowner-value\r\n$11\r\nlocal-value\r\n$-1"
+    );
     assert_eq!(command(addr, &["EXISTS", "remote", "missing"]).await, ":1");
+    assert_eq!(command(addr, &["EXISTS", "remote", "local", "local"]).await, ":3");
+    assert_eq!(
+        command(addr, &["MGET", "local", "missing"]).await,
+        "*2\r\n$11\r\nlocal-value\r\n$-1"
+    );
     assert_eq!(command(addr, &["TYPE", "remote"]).await, "+string");
     let ttl: i64 = command(addr, &["TTL", "remote"]).await[1..].parse().unwrap();
     assert!((1..=60).contains(&ttl));

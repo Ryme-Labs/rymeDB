@@ -1696,34 +1696,43 @@ where
                     Ok(_) => return Some(encode_error(String::from("owner read count"))),
                     Err(error) => return Some(encode_error(error.to_string())),
                 };
-                let mut local = self.manager.begin();
-                if let Err(error) = local.set_read_only() {
-                    return Some(encode_error(error.to_string()));
+                if !results.iter().any(|result| matches!(result, RemoteRead::Value { .. })) {
+                    return None;
                 }
-                let mut saw_remote = false;
-                let mut values = Vec::with_capacity(results.len());
-                for (key, result) in command.args.iter().zip(results) {
+                let mut values = vec![None; results.len()];
+                let mut local_indexes = Vec::new();
+                let mut local_keys = Vec::new();
+                for (index, (key, result)) in command.args.iter().zip(results).enumerate() {
                     match result {
-                        RemoteRead::Local => values.push(
-                            match self.manager.get(
-                                &mut local,
-                                &RecordKey::new(&self.tenant, &self.database, KV_TABLE, key),
-                            ) {
-                                Ok(value) => value,
-                                Err(error) => return Some(encode_error(error.to_string())),
-                            },
-                        ),
+                        RemoteRead::Local => {
+                            local_indexes.push(index);
+                            local_keys.push(RecordKey::new(
+                                &self.tenant,
+                                &self.database,
+                                KV_TABLE,
+                                key,
+                            ));
+                        }
                         RemoteRead::Value { value, .. } => {
-                            saw_remote = true;
-                            values.push(value);
+                            values[index] = value;
                         }
                     }
                 }
-                if saw_remote {
-                    Some(encode_array(values))
-                } else {
-                    None
+                if !local_keys.is_empty() {
+                    let mut local = self.manager.begin();
+                    if let Err(error) = local.set_read_only() {
+                        return Some(encode_error(error.to_string()));
+                    }
+                    let local_values = match self.manager.get_many(&mut local, &local_keys) {
+                        Ok(values) if values.len() == local_indexes.len() => values,
+                        Ok(_) => return Some(encode_error(String::from("local read count"))),
+                        Err(error) => return Some(encode_error(error.to_string())),
+                    };
+                    for (index, value) in local_indexes.into_iter().zip(local_values) {
+                        values[index] = value;
+                    }
                 }
+                Some(encode_array(values))
             }
             "EXISTS" if !command.args.is_empty() => {
                 let results = match reader
@@ -1740,33 +1749,40 @@ where
                     Ok(_) => return Some(encode_error(String::from("owner read count"))),
                     Err(error) => return Some(encode_error(error.to_string())),
                 };
-                let mut local = self.manager.begin();
-                if let Err(error) = local.set_read_only() {
-                    return Some(encode_error(error.to_string()));
+                if !results.iter().any(|result| matches!(result, RemoteRead::Value { .. })) {
+                    return None;
                 }
-                let mut saw_remote = false;
                 let mut found = 0i64;
+                let mut local_keys = Vec::new();
                 for (key, result) in command.args.iter().zip(results) {
                     match result {
-                        RemoteRead::Local => {
-                            match self.manager.get(
-                                &mut local,
-                                &RecordKey::new(&self.tenant, &self.database, KV_TABLE, key),
-                            ) {
-                                Ok(Some(_)) => found += 1,
-                                Ok(None) => {}
-                                Err(error) => return Some(encode_error(error.to_string())),
-                            }
-                        }
+                        RemoteRead::Local => local_keys.push(RecordKey::new(
+                            &self.tenant,
+                            &self.database,
+                            KV_TABLE,
+                            key,
+                        )),
                         RemoteRead::Value { value, .. } => {
-                            saw_remote = true;
                             if value.is_some() {
                                 found += 1;
                             }
                         }
                     }
                 }
-                saw_remote.then(|| encode_integer(found))
+                if !local_keys.is_empty() {
+                    let mut local = self.manager.begin();
+                    if let Err(error) = local.set_read_only() {
+                        return Some(encode_error(error.to_string()));
+                    }
+                    match self.manager.get_many(&mut local, &local_keys) {
+                        Ok(values) if values.len() == local_keys.len() => {
+                            found += values.iter().filter(|value| value.is_some()).count() as i64;
+                        }
+                        Ok(_) => return Some(encode_error(String::from("local read count"))),
+                        Err(error) => return Some(encode_error(error.to_string())),
+                    }
+                }
+                Some(encode_integer(found))
             }
             "TYPE" if command.args.len() == 1 => {
                 let key = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
