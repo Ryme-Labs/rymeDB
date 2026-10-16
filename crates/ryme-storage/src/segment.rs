@@ -9,9 +9,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 const SEGMENT_MAGIC: u32 = 0x5259_5347;
 const SEGMENT_VERSION: u16 = 2;
+const DELTA_COMPACTION_MAGIC: u32 = 0x5259_4443;
+const DELTA_COMPACTION_VERSION: u16 = 1;
 const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
+const MAX_DELTA_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
 static NEXT_SEGMENT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +34,14 @@ fn sync_directory(_path: &Path) -> Result<()> {
 enum SegmentKind {
     Snapshot = 0,
     Delta = 1,
+    CompactedDelta = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeltaCompactionMarker {
+    snapshot_id: u64,
+    through_id: u64,
+    output_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +397,7 @@ impl ImmutableSegment {
         let kind = match take_u16(&mut cursor)? {
             0 => SegmentKind::Snapshot,
             1 => SegmentKind::Delta,
+            2 => SegmentKind::CompactedDelta,
             _ => return Err(RymeError::Corrupt(String::from("segment kind"))),
         };
         let id = take_u64(&mut cursor)?;
@@ -440,6 +452,7 @@ pub struct SegmentStore {
     cache: Arc<Mutex<SegmentReadCache>>,
     paths: Arc<RwLock<Arc<Vec<PathBuf>>>>,
     segment_io: Arc<RwLock<()>>,
+    compaction_gate: Arc<Mutex<()>>,
 }
 
 impl SegmentStore {
@@ -449,12 +462,13 @@ impl SegmentStore {
 
     pub fn open_with_cache(dir: &Path, cache_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let paths = discover_segment_paths(dir)?;
+        let paths = discover_active_segment_paths(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             cache: Arc::new(Mutex::new(SegmentReadCache::new(cache_bytes))),
             paths: Arc::new(RwLock::new(Arc::new(paths))),
             segment_io: Arc::new(RwLock::new(())),
+            compaction_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -511,7 +525,7 @@ impl SegmentStore {
         update_latest_pointer: bool,
     ) -> Result<(SegmentMeta, PathBuf)> {
         let id = segment.meta.id;
-        let path = self.dir.join(segment_name(id));
+        let path = self.dir.join(segment_file_name(id, segment.kind));
         let temporary = self.dir.join(format!(
             "{segment_name}.{}.{}.tmp",
             std::process::id(),
@@ -538,7 +552,9 @@ impl SegmentStore {
             cache.remove(id);
         }
         std::fs::rename(&temporary, &path)?;
-        self.remember_segment(path.clone());
+        if segment.kind != SegmentKind::CompactedDelta {
+            self.remember_segment(path.clone());
+        }
         if update_latest_pointer {
             let latest = self.dir.join("latest");
             let latest_tmp = self.dir.join("latest.tmp");
@@ -555,6 +571,7 @@ impl SegmentStore {
                 }
             }
             std::fs::rename(latest_tmp, latest)?;
+            self.refresh_paths()?;
         }
         if sync {
             sync_directory(&self.dir)?;
@@ -883,7 +900,17 @@ impl SegmentStore {
     }
 
     pub fn segment_paths(&self) -> Result<Vec<PathBuf>> {
-        discover_segment_paths(&self.dir)
+        discover_active_segment_paths(&self.dir)
+    }
+
+    fn refresh_paths(&self) -> Result<()> {
+        let paths = discover_active_segment_paths(&self.dir)?;
+        let mut cached = self
+            .paths
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("segment paths lock")))?;
+        *cached = Arc::new(paths);
+        Ok(())
     }
 
     fn remember_segment(&self, path: PathBuf) {
@@ -916,7 +943,7 @@ impl SegmentStore {
 
     pub fn remove_except(&self, keep: &Path) -> Result<usize> {
         let mut removed = 0;
-        for path in self.segment_paths()? {
+        for path in discover_segment_paths(&self.dir)? {
             if path == keep {
                 continue;
             }
@@ -936,7 +963,78 @@ impl SegmentStore {
         Ok(())
     }
 
+    pub fn compact_delta_run(&self) -> Result<Option<SegmentMeta>> {
+        let _maintenance = self
+            .compaction_gate
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("segment compaction lock")))?;
+        let paths = self.segment_paths()?;
+        let snapshot_id = self.latest_snapshot_id().unwrap_or(0);
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0u64;
+        for path in paths {
+            let id =
+                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+                    .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
+            if id <= snapshot_id {
+                continue;
+            }
+            let bytes = std::fs::metadata(&path)?.len();
+            let Some(total_bytes) = selected_bytes.checked_add(bytes) else {
+                break;
+            };
+            if total_bytes > MAX_DELTA_COMPACTION_INPUT_BYTES {
+                break;
+            }
+            selected_bytes = total_bytes;
+            selected.push(path);
+        }
+        if selected.len() < 2 {
+            return Ok(None);
+        }
+
+        let mut merged = Engine::new();
+        for path in &selected {
+            let segment = ImmutableSegment::decode(&read_segment_file(path)?)?;
+            if segment.is_snapshot() {
+                return Ok(None);
+            }
+            segment.merge_owned_into(&mut merged)?;
+        }
+        if merged.is_empty() {
+            return Ok(None);
+        }
+        let through_id = parse_segment_name(
+            selected
+                .last()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+        )
+        .ok_or_else(|| RymeError::Corrupt(String::from("segment name")))?;
+        if through_id <= snapshot_id {
+            return Ok(None);
+        }
+
+        let segment =
+            ImmutableSegment::from_engine_owned(through_id, merged, SegmentKind::CompactedDelta);
+        let (meta, _) = self.write_segment(segment, true, false)?;
+        publish_delta_compaction_marker(
+            &self.dir,
+            DeltaCompactionMarker { snapshot_id, through_id, output_id: through_id },
+        )?;
+        self.refresh_paths()?;
+        for path in selected {
+            self.remove_segment_file(&path)?;
+        }
+        Ok(Some(meta))
+    }
+
     pub fn compact(&self) -> Result<Option<SegmentMeta>> {
+        let _maintenance = self
+            .compaction_gate
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("segment compaction lock")))?;
         let Some((engine, max_commit_ts)) = self.load_all()? else {
             return Ok(None);
         };
@@ -944,6 +1042,12 @@ impl SegmentStore {
             ImmutableSegment::from_engine_owned(max_commit_ts, engine, SegmentKind::Snapshot);
         let (meta, newest) = self.write_segment(segment, true, true)?;
         self.remove_except(&newest)?;
+        let marker = self.dir.join("delta-compaction");
+        if marker.exists() {
+            std::fs::remove_file(marker)?;
+            sync_directory(&self.dir)?;
+        }
+        self.refresh_paths()?;
         Ok(Some(meta))
     }
 
@@ -1016,6 +1120,7 @@ fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
     let kind = match take_u16(&mut cursor)? {
         0 => SegmentKind::Snapshot,
         1 => SegmentKind::Delta,
+        2 => SegmentKind::CompactedDelta,
         _ => return Err(RymeError::Corrupt(String::from("segment kind"))),
     };
     let id = take_u64(&mut cursor)?;
@@ -1065,7 +1170,7 @@ fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
     let expected_id =
         parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
     if magic != SEGMENT_MAGIC
-        || !matches!(kind, 0 | 1)
+        || !matches!(kind, 0 | 1 | 2)
         || expected_id != Some(id)
         || payload_len > file_len.saturating_sub((V2_HEADER + 4) as u64)
     {
@@ -1092,6 +1197,75 @@ fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
     Ok(max_commit_ts)
 }
 
+fn read_delta_compaction_marker(dir: &Path) -> Result<Option<DeltaCompactionMarker>> {
+    let path = dir.join("delta-compaction");
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    const MARKER_LEN: usize = 4 + 2 + 8 + 8 + 8 + 4;
+    if bytes.len() != MARKER_LEN {
+        return Err(RymeError::Corrupt(String::from("delta compaction marker")));
+    }
+    let checksum_offset = bytes.len() - 4;
+    let stored_checksum = u32::from_be_bytes(
+        bytes[checksum_offset..]
+            .try_into()
+            .map_err(|_| RymeError::Corrupt(String::from("delta compaction marker")))?,
+    );
+    if crc32fast::hash(&bytes[..checksum_offset]) != stored_checksum {
+        return Err(RymeError::Corrupt(String::from("delta compaction marker")));
+    }
+    let mut cursor = &bytes[..checksum_offset];
+    let magic = take_u32(&mut cursor)?;
+    let version = take_u16(&mut cursor)?;
+    let marker = DeltaCompactionMarker {
+        snapshot_id: take_u64(&mut cursor)?,
+        through_id: take_u64(&mut cursor)?,
+        output_id: take_u64(&mut cursor)?,
+    };
+    if magic != DELTA_COMPACTION_MAGIC
+        || version != DELTA_COMPACTION_VERSION
+        || marker.through_id <= marker.snapshot_id
+        || marker.output_id != marker.through_id
+    {
+        return Err(RymeError::Corrupt(String::from("delta compaction marker")));
+    }
+    Ok(Some(marker))
+}
+
+fn publish_delta_compaction_marker(dir: &Path, marker: DeltaCompactionMarker) -> Result<()> {
+    let mut bytes = Vec::with_capacity(4 + 2 + 8 + 8 + 8 + 4);
+    bytes.extend_from_slice(&DELTA_COMPACTION_MAGIC.to_be_bytes());
+    bytes.extend_from_slice(&DELTA_COMPACTION_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&marker.snapshot_id.to_be_bytes());
+    bytes.extend_from_slice(&marker.through_id.to_be_bytes());
+    bytes.extend_from_slice(&marker.output_id.to_be_bytes());
+    let checksum = crc32fast::hash(&bytes);
+    bytes.extend_from_slice(&checksum.to_be_bytes());
+
+    let path = dir.join("delta-compaction");
+    let temporary = dir.join("delta-compaction.tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+    }
+    std::fs::rename(temporary, path)?;
+    sync_directory(dir)
+}
+
+fn latest_snapshot_id_in_dir(dir: &Path) -> Option<u64> {
+    let raw = std::fs::read(dir.join("latest")).ok()?;
+    let name = std::str::from_utf8(&raw).ok()?.trim();
+    let id = parse_segment_name(name)?;
+    let path = dir.join(name);
+    let (stored_id, kind) = read_segment_identity(&path).ok()?;
+    (stored_id == id && kind == SegmentKind::Snapshot).then_some(id)
+}
+
 fn discover_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let entries = match std::fs::read_dir(dir) {
@@ -1108,7 +1282,45 @@ fn discover_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     paths.sort_by_key(|path| {
-        parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+        (
+            parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or("")),
+            is_compacted_segment_path(path),
+        )
+    });
+    Ok(paths)
+}
+
+fn discover_active_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = discover_segment_paths(dir)?;
+    let Some(marker) = read_delta_compaction_marker(dir)? else {
+        paths.retain(|path| !is_compacted_segment_path(path));
+        return Ok(paths);
+    };
+    let latest_snapshot_id = latest_snapshot_id_in_dir(dir).unwrap_or(0);
+    if latest_snapshot_id < marker.snapshot_id {
+        return Err(RymeError::Corrupt(String::from("delta compaction snapshot")));
+    }
+    if latest_snapshot_id > marker.snapshot_id {
+        paths.retain(|path| !is_compacted_segment_path(path));
+        return Ok(paths);
+    }
+
+    let output = dir.join(compacted_segment_name(marker.output_id));
+    if !output.is_file() {
+        return Err(RymeError::Corrupt(String::from("delta compaction output")));
+    }
+    if read_segment_identity(&output)? != (marker.output_id, SegmentKind::CompactedDelta) {
+        return Err(RymeError::Corrupt(String::from("delta compaction output")));
+    }
+    paths.retain(|path| {
+        let id = parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
+        if is_compacted_segment_path(path) {
+            id == Some(marker.output_id)
+        } else if id.is_some_and(|id| id > marker.snapshot_id && id <= marker.through_id) {
+            false
+        } else {
+            true
+        }
     });
     Ok(paths)
 }
@@ -1125,8 +1337,26 @@ fn segment_name(id: u64) -> String {
     format!("segment-{id:020}.sst")
 }
 
+fn compacted_segment_name(id: u64) -> String {
+    format!("segment-{id:020}.cmp")
+}
+
+fn segment_file_name(id: u64, kind: SegmentKind) -> String {
+    if kind == SegmentKind::CompactedDelta {
+        compacted_segment_name(id)
+    } else {
+        segment_name(id)
+    }
+}
+
 fn parse_segment_name(name: &str) -> Option<u64> {
-    name.strip_prefix("segment-")?.strip_suffix(".sst")?.parse().ok()
+    let name = name.strip_prefix("segment-")?;
+    let name = name.strip_suffix(".sst").or_else(|| name.strip_suffix(".cmp"))?;
+    name.parse().ok()
+}
+
+fn is_compacted_segment_path(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("cmp")
 }
 
 fn build_bloom(keys: &[RecordKey]) -> Vec<u8> {
@@ -1541,6 +1771,72 @@ mod tests {
         assert_eq!(compacted.max_commit_ts, 11);
         assert_eq!(store.segment_paths().unwrap().len(), 1);
         assert_eq!(store.newest_paths().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compacted_delta_marker_makes_replacement_crash_safe() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-compact-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let first = RecordKey::new("tenant", "db", "items", b"a");
+        let second = RecordKey::new("tenant", "db", "items", b"b");
+        let mut snapshot = Engine::new();
+        snapshot.apply(first.clone(), 10, Some(b"old-a".to_vec())).unwrap();
+        snapshot.apply(second.clone(), 10, Some(b"old-b".to_vec())).unwrap();
+        store.write(10, &snapshot).unwrap();
+        store
+            .write_delta(
+                11,
+                &[SegmentEntry {
+                    key: first.clone(),
+                    commit_ts: 11,
+                    value: Some(b"new-a".to_vec()),
+                    expires_at: 0,
+                }],
+            )
+            .unwrap();
+        store
+            .write_delta(
+                12,
+                &[SegmentEntry { key: second.clone(), commit_ts: 12, value: None, expires_at: 0 }],
+            )
+            .unwrap();
+
+        let mut merged = Engine::new();
+        merged.apply(first.clone(), 11, Some(b"new-a".to_vec())).unwrap();
+        merged.apply(second.clone(), 12, None).unwrap();
+        let compacted =
+            ImmutableSegment::from_engine_owned(12, merged, SegmentKind::CompactedDelta);
+        store.write_segment(compacted, true, false).unwrap();
+
+        // Before marker publication, an orphan replacement must be ignored.
+        let before_marker = SegmentStore::open(&dir).unwrap();
+        assert_eq!(before_marker.segment_paths().unwrap().len(), 3);
+        let (before, _) = before_marker.load_all().unwrap().unwrap();
+        assert_eq!(before.read(&first, 11, 0).unwrap(), Some(b"new-a".to_vec()));
+        assert_eq!(before.read(&second, 12, 0).unwrap(), None);
+
+        publish_delta_compaction_marker(
+            &dir,
+            DeltaCompactionMarker { snapshot_id: 10, through_id: 12, output_id: 12 },
+        )
+        .unwrap();
+        // Simulate a crash after publishing the marker and deleting only part
+        // of the replaced inputs.
+        std::fs::remove_file(dir.join(segment_name(11))).unwrap();
+        let after_marker = SegmentStore::open(&dir).unwrap();
+        assert_eq!(after_marker.segment_paths().unwrap().len(), 2);
+        let (after, max_commit_ts) = after_marker.load_all().unwrap().unwrap();
+        assert_eq!(max_commit_ts, 12);
+        assert_eq!(after.read(&first, 10, 0).unwrap(), Some(b"old-a".to_vec()));
+        assert_eq!(after.read(&first, 11, 0).unwrap(), Some(b"new-a".to_vec()));
+        assert_eq!(after.read(&second, 11, 0).unwrap(), Some(b"old-b".to_vec()));
+        assert_eq!(after.read(&second, 12, 0).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
