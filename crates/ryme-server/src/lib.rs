@@ -796,22 +796,31 @@ fn auth_attempt_key(scope: &str, credential: &str) -> String {
 
 #[derive(Debug, Default)]
 struct OidcStateStore {
-    pending: HashMap<String, u64>,
+    pending: HashMap<String, OidcPendingState>,
+}
+
+#[derive(Debug)]
+struct OidcPendingState {
+    issued_at: u64,
+    nonce: String,
 }
 
 impl OidcStateStore {
-    fn issue(&mut self, state: String, now: u64) -> ryme_error::Result<()> {
+    fn issue(&mut self, state: String, nonce: String, now: u64) -> ryme_error::Result<()> {
+        if state.is_empty() || nonce.is_empty() {
+            return Err(ryme_error::RymeError::InvalidArgument(String::from("oidc state")));
+        }
         self.prune(now);
         if self.pending.len() >= OIDC_STATE_MAX_PENDING {
             return Err(ryme_error::RymeError::Overload(String::from("oidc state capacity")));
         }
-        self.pending.insert(state, now);
+        self.pending.insert(state, OidcPendingState { issued_at: now, nonce });
         Ok(())
     }
 
-    fn is_pending(&mut self, state: &str, now: u64) -> bool {
+    fn nonce_for(&mut self, state: &str, now: u64) -> Option<String> {
         self.prune(now);
-        self.pending.contains_key(state)
+        self.pending.get(state).map(|pending| pending.nonce.clone())
     }
 
     fn consume(&mut self, state: &str, now: u64) -> ryme_error::Result<()> {
@@ -820,7 +829,9 @@ impl OidcStateStore {
     }
 
     fn prune(&mut self, now: u64) {
-        self.pending.retain(|_, issued| now.saturating_sub(*issued) < OIDC_STATE_TTL_SECS);
+        self.pending.retain(|_, pending| {
+            now.saturating_sub(pending.issued_at) < OIDC_STATE_TTL_SECS
+        });
     }
 }
 
@@ -940,13 +951,13 @@ mod oidc_state_tests {
     #[test]
     fn oidc_state_is_single_use_and_expires() {
         let mut states = OidcStateStore::default();
-        states.issue(String::from("state"), 100).unwrap();
-        assert!(states.is_pending("state", 100));
+        states.issue(String::from("state"), String::from("nonce"), 100).unwrap();
+        assert_eq!(states.nonce_for("state", 100).as_deref(), Some("nonce"));
         states.consume("state", 100).unwrap();
-        assert!(!states.is_pending("state", 100));
+        assert!(states.nonce_for("state", 100).is_none());
 
-        states.issue(String::from("expired"), 100).unwrap();
-        assert!(!states.is_pending("expired", 100 + OIDC_STATE_TTL_SECS));
+        states.issue(String::from("expired"), String::from("nonce"), 100).unwrap();
+        assert!(states.nonce_for("expired", 100 + OIDC_STATE_TTL_SECS).is_none());
         assert!(states.consume("expired", 100 + OIDC_STATE_TTL_SECS).is_err());
     }
 }
@@ -6600,7 +6611,8 @@ async fn oidc_login(
     }
     let client_state = request.state;
     let state_value = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(32));
-    match config.auth_url(&request.redirect_uri, &state_value) {
+    let nonce = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(32));
+    match config.auth_url_with_nonce(&request.redirect_uri, &state_value, &nonce) {
         Ok(auth_url) => {
             let now = ryme_txn::now_unix();
             let issued = state
@@ -6608,7 +6620,7 @@ async fn oidc_login(
                 .lock()
                 .map_err(|_| ryme_error::RymeError::Internal(String::from("oidc state lock")));
             let issued = match issued {
-                Ok(mut states) => states.issue(state_value.clone(), now),
+                Ok(mut states) => states.issue(state_value.clone(), nonce, now),
                 Err(error) => Err(error),
             };
             if let Err(error) = issued {
@@ -6644,18 +6656,20 @@ async fn oidc_token(
         return error_response(ryme_error::RymeError::Unavailable(String::from("oidc")));
     };
     let now = ryme_txn::now_unix();
-    let pending = match state.oidc_states.lock() {
-        Ok(mut states) => states.is_pending(&request.state, now),
+    let expected_nonce = match state.oidc_states.lock() {
+        Ok(mut states) => states.nonce_for(&request.state, now),
         Err(_) => {
             return error_response(ryme_error::RymeError::Internal(String::from("oidc state lock")))
         }
     };
-    if !pending {
+    let Some(expected_nonce) = expected_nonce else {
         return error_response(ryme_error::RymeError::Unauthorized);
-    }
+    };
     let verified = match state.oidc_jwt.as_ref() {
-        Some(verifier) => verifier.principal_from_token(&request.id_token, now),
-        None => config.verify_id_token(&request.id_token, now),
+        Some(verifier) => {
+            verifier.principal_from_token_with_nonce(&request.id_token, now, &expected_nonce)
+        }
+        None => config.verify_id_token_with_nonce(&request.id_token, now, &expected_nonce),
     };
     match verified {
         Ok(principal) => {

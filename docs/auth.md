@@ -137,6 +137,11 @@ state. The server stores password hashes, API-key digests, refresh-token
 digests, and auth metadata under `data_dir/auth.json`; raw secrets and
 WebAuthn challenges are not written there.
 
+OIDC authorization URLs include a random per-login `nonce`; the signed ID token
+must return the same nonce. Bind the returned `state` to the initiating
+browser session in your application or BFF. The database validates that state
+is pending and single-use, but does not itself bind it to a browser session.
+
 To log out and invalidate a rotating refresh token, send it in the body of
 `DELETE /v1/auth/session` over HTTPS:
 

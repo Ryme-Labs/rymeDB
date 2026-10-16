@@ -1031,6 +1031,9 @@ async fn extras_oidc_flow() {
     assert_eq!(login["client_state"], "s1");
     let state = login["state"].as_str().unwrap();
     assert_ne!(state, "s1");
+    let auth_url = login["auth_url"].as_str().unwrap();
+    let nonce = auth_url.split("nonce=").nth(1).unwrap().split('&').next().unwrap();
+    assert!(!nonce.is_empty());
     let (status, _) =
         http_request(
             http,
@@ -1045,8 +1048,9 @@ async fn extras_oidc_flow() {
         .unwrap_or(0);
     let header = ryme_auth::base64_url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = format!(
-        "{{\"sub\":\"oidc-user\",\"tenant\":\"sso\",\"roles\":[\"readwrite\"],\"iss\":\"https://auth.rymedb.test\",\"aud\":\"rymedb-app\",\"exp\":{}}}",
-        now + 3600
+        "{{\"sub\":\"oidc-user\",\"tenant\":\"sso\",\"roles\":[\"readwrite\"],\"iss\":\"https://auth.rymedb.test\",\"aud\":\"rymedb-app\",\"exp\":{},\"nonce\":\"{}\"}}",
+        now + 3600,
+        nonce,
     );
     let payload_b64 = ryme_auth::base64_url_encode(payload.as_bytes());
     let input = format!("{header}.{payload_b64}");

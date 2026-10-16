@@ -468,6 +468,27 @@ impl JwtVerifier {
     }
 
     pub fn principal_from_token(&self, token: &str, now_secs: u64) -> Result<Principal> {
+        self.principal_from_token_with_expected_nonce(token, now_secs, None)
+    }
+
+    pub fn principal_from_token_with_nonce(
+        &self,
+        token: &str,
+        now_secs: u64,
+        expected_nonce: &str,
+    ) -> Result<Principal> {
+        if expected_nonce.is_empty() {
+            return Err(RymeError::Unauthorized);
+        }
+        self.principal_from_token_with_expected_nonce(token, now_secs, Some(expected_nonce))
+    }
+
+    fn principal_from_token_with_expected_nonce(
+        &self,
+        token: &str,
+        now_secs: u64,
+        expected_nonce: Option<&str>,
+    ) -> Result<Principal> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         if token.len() > MAX_JWT_TOKEN_LEN {
@@ -532,6 +553,14 @@ impl JwtVerifier {
         let payload_raw = base64_url_decode(payload_b64).map_err(|_| RymeError::Unauthorized)?;
         let claims: serde_json::Value =
             serde_json::from_slice(&payload_raw).map_err(|_| RymeError::Unauthorized)?;
+        if let Some(expected_nonce) = expected_nonce {
+            let token_nonce = claims.get("nonce").and_then(|value| value.as_str());
+            if !token_nonce.is_some_and(|nonce| {
+                constant_time_equal(nonce.as_bytes(), expected_nonce.as_bytes())
+            }) {
+                return Err(RymeError::Unauthorized);
+            }
+        }
         let exp =
             claims.get("exp").and_then(|value| value.as_u64()).ok_or(RymeError::Unauthorized)?;
         if exp.saturating_add(self.leeway_secs) < now_secs {
@@ -1097,6 +1126,27 @@ pub struct OidcConfig {
 
 impl OidcConfig {
     pub fn auth_url(&self, redirect_uri: &str, state: &str) -> Result<String> {
+        self.auth_url_inner(redirect_uri, state, None)
+    }
+
+    pub fn auth_url_with_nonce(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+        nonce: &str,
+    ) -> Result<String> {
+        if nonce.is_empty() {
+            return Err(RymeError::InvalidArgument(String::from("oidc nonce")));
+        }
+        self.auth_url_inner(redirect_uri, state, Some(nonce))
+    }
+
+    fn auth_url_inner(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+        nonce: Option<&str>,
+    ) -> Result<String> {
         if self.auth_endpoint.is_empty()
             || self.client_id.is_empty()
             || redirect_uri.is_empty()
@@ -1108,13 +1158,18 @@ impl OidcConfig {
             return Err(RymeError::InvalidArgument(String::from("oidc redirect_uri")));
         }
         let separator = if self.auth_endpoint.contains('?') { '&' } else { '?' };
-        Ok(format!(
+        let mut url = format!(
             "{}{separator}response_type=code&client_id={}&redirect_uri={}&scope=openid%20email%20profile&state={}",
             self.auth_endpoint,
             encode_query_component(&self.client_id),
             encode_query_component(redirect_uri),
             encode_query_component(state),
-        ))
+        );
+        if let Some(nonce) = nonce {
+            url.push_str("&nonce=");
+            url.push_str(&encode_query_component(nonce));
+        }
+        Ok(url)
     }
 
     pub fn verify_id_token(&self, id_token: &str, now_secs: u64) -> Result<Principal> {
@@ -1124,6 +1179,20 @@ impl OidcConfig {
             self.audience.clone(),
         );
         verifier.principal_from_token(id_token, now_secs)
+    }
+
+    pub fn verify_id_token_with_nonce(
+        &self,
+        id_token: &str,
+        now_secs: u64,
+        expected_nonce: &str,
+    ) -> Result<Principal> {
+        let verifier = JwtVerifier::with_issuer(
+            self.client_secret.clone(),
+            self.issuer.clone(),
+            self.audience.clone(),
+        );
+        verifier.principal_from_token_with_nonce(id_token, now_secs, expected_nonce)
     }
 }
 
@@ -1735,9 +1804,13 @@ mod tests {
     }
 
     fn oidc_test_token() -> String {
+        oidc_test_token_with_nonce(None)
+    }
+
+    fn oidc_test_token_with_nonce(nonce: Option<&str>) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "sub": "oidc-user",
             "tenant": "t",
             "roles": ["readonly"],
@@ -1745,6 +1818,9 @@ mod tests {
             "iss": "https://auth.rymedb.test",
             "aud": "rymedb-app",
         });
+        if let Some(nonce) = nonce {
+            payload["nonce"] = serde_json::Value::String(nonce.to_string());
+        }
         let payload_raw = serde_json::to_vec(&payload).unwrap();
         let header_b64 = base64_url_encode(br#"{"alg":"HS256"}"#);
         let payload_b64 = base64_url_encode(&payload_raw);
@@ -1765,11 +1841,25 @@ mod tests {
     }
 
     #[test]
+    fn oidc_id_token_must_match_the_login_nonce() {
+        let config = oidc_test_config();
+        let token = oidc_test_token_with_nonce(Some("login-nonce"));
+        assert!(config.verify_id_token_with_nonce(&token, 1000, "login-nonce").is_ok());
+        assert!(config.verify_id_token_with_nonce(&token, 1000, "another-nonce").is_err());
+        assert!(config
+            .verify_id_token_with_nonce(&oidc_test_token(), 1000, "login-nonce")
+            .is_err());
+    }
+
+    #[test]
     fn oidc_builds_login_url() {
         let config = oidc_test_config();
         let url = config.auth_url("https://app.test/callback", "xyz").unwrap();
         assert!(url.contains("response_type=code"));
         assert!(url.contains("state=xyz"));
+        let url =
+            config.auth_url_with_nonce("https://app.test/callback", "xyz", "nonce-value").unwrap();
+        assert!(url.ends_with("&nonce=nonce-value"));
         assert!(config.auth_url("", "xyz").is_err());
     }
 
