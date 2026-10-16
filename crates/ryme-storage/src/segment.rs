@@ -786,24 +786,14 @@ impl SegmentStore {
             return Ok(Vec::new());
         }
         let segments = self.read_scan_segments(tenant, database, table, start_after)?;
-        if let Some((segment, start, end)) = segments.first() {
+        if let Some((segment, _, _)) = segments.first() {
             if segment.is_snapshot() {
-                let mut out = Vec::with_capacity(limit.min(end - start));
-                for key in &segment.keys[*start..*end] {
-                    let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts)
-                    else {
-                        continue;
-                    };
-                    if expires_at != 0 && expires_at <= now {
-                        continue;
-                    }
-                    let Some(value) = value else { continue };
-                    out.push((key.pk.clone(), value));
-                    if out.len() == limit {
-                        break;
-                    }
-                }
-                return Ok(out);
+                return Ok(match start_after {
+                    Some(after) => segment
+                        .engine
+                        .scan_after(tenant, database, table, read_ts, now, after, limit),
+                    None => segment.engine.scan(tenant, database, table, read_ts, now, limit),
+                });
             }
         }
 
