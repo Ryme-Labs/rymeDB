@@ -10337,7 +10337,7 @@ where
         };
         let Some(pks) = state.entries.get(&self.tenant).and_then(|entries| entries.get(&key))
         else {
-            return Ok(None);
+            return Ok(Some(Vec::new()));
         };
         if pks.len() > MAX_QUERY_MATERIALIZED_ROWS {
             return Err(materialization_overload());
@@ -19002,6 +19002,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(executor.catalog_indexes("messages").len(), 1);
+        executor
+            .execute(parse("CREATE INDEX messages_key_idx ON messages (key)").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            executor
+                .indexed_candidates(
+                    "messages",
+                    &[Predicate {
+                        field: Field::Key,
+                        column: None,
+                        op: Cmp::Eq,
+                        operand: b"absent".to_vec(),
+                        operands: Vec::new(),
+                        alternatives: Vec::new(),
+                    }],
+                )
+                .unwrap(),
+            Some(Vec::new())
+        );
 
         let result = executor
             .execute(parse("SELECT * FROM messages WHERE value = 'two'").unwrap())
