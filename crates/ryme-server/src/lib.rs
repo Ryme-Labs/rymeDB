@@ -3121,26 +3121,36 @@ async fn record_http_status(
         state.http_5xx_count.fetch_add(1, AtomicOrdering::Relaxed);
     }
     if let Some(action) = audit_action {
-        let event = AuditEvent {
-            timestamp_secs: now_secs(),
-            actor,
-            method,
-            action,
-            status,
-            outcome: if status < 400 { String::from("success") } else { String::from("failure") },
-        };
-        let audit_log = state.audit_log.clone();
-        match tokio::task::spawn_blocking(move || audit_log.record(event)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::error!(%error, "failed to persist security audit event");
-            }
-            Err(error) => {
-                tracing::error!(%error, "audit persistence task failed");
-            }
-        }
+        record_audit_event(&state, actor, method, action, status).await;
     }
     response
+}
+
+async fn record_audit_event(
+    state: &SharedState,
+    actor: Option<String>,
+    method: String,
+    action: String,
+    status: u16,
+) {
+    let event = AuditEvent {
+        timestamp_secs: now_secs(),
+        actor,
+        method,
+        action,
+        status,
+        outcome: if status < 400 { String::from("success") } else { String::from("failure") },
+    };
+    let audit_log = state.audit_log.clone();
+    match tokio::task::spawn_blocking(move || audit_log.record(event)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(%error, "failed to persist security audit event"),
+        Err(error) => tracing::error!(%error, "audit persistence task failed"),
+    }
+}
+
+fn is_audited_sql(statement: &ryme_sql::Statement) -> bool {
+    statement.requires_admin()
 }
 
 fn is_audited_action(method: &str, path: &str) -> bool {
@@ -9927,7 +9937,16 @@ async fn sql_exec(
         Ok(statement) => statement,
         Err(e) => return error_response(e),
     };
-    if statement.requires_admin() && !principal.can_platform_admin() {
+    let audited_sql = is_audited_sql(&statement);
+    if audited_sql && !principal.can_platform_admin() {
+        record_audit_event(
+            &state,
+            Some(principal.id.clone()),
+            String::from("POST"),
+            String::from("/v1/sql/admin-or-schema-change"),
+            StatusCode::FORBIDDEN.as_u16(),
+        )
+        .await;
         return error_response(ryme_error::RymeError::Forbidden);
     }
     if statement.is_write() && !principal.can_write() {
@@ -10041,6 +10060,16 @@ async fn sql_exec(
         }
         Err(e) => error_response(e),
     };
+    if audited_sql {
+        record_audit_event(
+            &state,
+            Some(principal.id.clone()),
+            String::from("POST"),
+            String::from("/v1/sql/admin-or-schema-change"),
+            result.status().as_u16(),
+        )
+        .await;
+    }
     if write_statement && result.status() == StatusCode::OK {
         if let Some(keys) = range_keys.as_deref() {
             for key in keys {
@@ -14607,6 +14636,62 @@ mod realtime_policy_tests {
         assert!(is_audited_action("DELETE", "/v1/auth/session"));
         assert!(!is_audited_action("GET", "/v1/cluster/members"));
         assert!(!is_audited_action("POST", "/v1/sql"));
+
+        assert!(is_audited_sql(
+            &ryme_sql::parse("GRANT SELECT ON TABLE messages TO app_reader").unwrap()
+        ));
+        assert!(is_audited_sql(
+            &ryme_sql::parse("CREATE POLICY own_messages ON messages FOR SELECT USING (true)")
+                .unwrap()
+        ));
+        assert!(!is_audited_sql(&ryme_sql::parse("SELECT * FROM messages").unwrap()));
+        assert!(!is_audited_sql(
+            &ryme_sql::parse("INSERT INTO messages (id) VALUES ('one')").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn denied_sql_security_changes_are_audited() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-sql-audit-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .keys
+            .insert(
+                String::from("reader-key"),
+                Principal {
+                    id: String::from("reader"),
+                    tenant: String::from("default"),
+                    roles: [Role::ReadWrite].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer reader-key"),
+        );
+        let response = sql_exec(
+            State(state.clone()),
+            headers,
+            axum::body::Bytes::from_static(
+                br#"{"sql":"GRANT SELECT ON TABLE messages TO app_reader"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let event = state.audit_log.recent(1).pop().unwrap();
+        assert_eq!(event.actor.as_deref(), Some("reader"));
+        assert_eq!(event.action, "/v1/sql/admin-or-schema-change");
+        assert_eq!(event.status, StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(event.outcome, "failure");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
