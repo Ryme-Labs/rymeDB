@@ -282,6 +282,60 @@ async fn owner_reader_serves_remote_gets() {
 }
 
 #[tokio::test]
+async fn owner_reader_batches_local_reads_in_standard_storage_mode() {
+    let dir = std::env::temp_dir().join(format!(
+        "ryme-resp-owner-standard-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let manager = ryme_txn::DurableManager::open_with_mode(
+        &dir,
+        1024 * 1024,
+        ryme_txn::SyncPolicy::Never,
+        1024 * 1024,
+        ryme_storage::StorageMode::Standard,
+    )
+    .unwrap();
+    let mut seed = manager.begin();
+    manager.put(
+        &mut seed,
+        ryme_storage::RecordKey::new("t", "d", "_kv", b"local"),
+        b"local-value".to_vec(),
+    );
+    manager.commit(seed).unwrap();
+    let gateway =
+        ryme_wire_resp::RespGateway::with_backend(String::from("t"), String::from("d"), manager)
+            .with_remote_reader(ryme_wire_resp::RemoteReader::new(|key| async move {
+                if key.pk.as_slice() == b"local" {
+                    return Ok(ryme_wire_resp::RemoteRead::Local);
+                }
+                Ok(ryme_wire_resp::RemoteRead::Value {
+                    value: (key.pk.as_slice() == b"remote").then(|| b"owner-value".to_vec()),
+                    expires_at: None,
+                })
+            }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+
+    assert_eq!(
+        command(addr, &["MGET", "remote", "local", "missing"]).await,
+        "*3\r\n$11\r\nowner-value\r\n$11\r\nlocal-value\r\n$-1"
+    );
+    assert_eq!(command(addr, &["EXISTS", "remote", "local", "local"]).await, ":3");
+    assert_eq!(
+        command(addr, &["MGET", "local", "missing"]).await,
+        "*2\r\n$11\r\nlocal-value\r\n$-1"
+    );
+
+    server.abort();
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn set_get_returns_the_previous_value_atomically() {
     let addr = serve().await;
     assert_eq!(command(addr, &["SET", "cache:key", "v1", "GET"]).await, "$-1");
