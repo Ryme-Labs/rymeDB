@@ -1687,6 +1687,14 @@ fn sync_metadata_directory(_path: &std::path::Path) -> ryme_error::Result<()> {
     Ok(())
 }
 
+struct RemoveFileOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn create_auth_snapshot_temp(
     auth_path: &std::path::Path,
 ) -> ryme_error::Result<(std::path::PathBuf, std::fs::File)> {
@@ -1742,7 +1750,9 @@ impl SharedState {
         if let Some(parent) = self.auth_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let (temporary, mut file) = create_auth_snapshot_temp(&self.auth_path)?;
+        let (temporary, file) = create_auth_snapshot_temp(&self.auth_path)?;
+        let _temporary_cleanup = RemoveFileOnDrop(temporary.clone());
+        let mut file = file;
         {
             use std::io::Write;
             file.write_all(&bytes)?;
@@ -1753,6 +1763,7 @@ impl SharedState {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
+        drop(file);
         std::fs::rename(temporary, &self.auth_path)?;
         on_replace();
         if let Some(parent) = self.auth_path.parent() {
@@ -14754,6 +14765,30 @@ mod realtime_policy_tests {
             Err(ryme_error::RymeError::Overload(message)) if message == "auth snapshot"
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_auth_snapshot_persist_removes_temporary_credentials_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-auth-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+
+        assert!(state.persist_auth().is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().starts_with("auth.tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "auth temp files left behind: {leftovers:?}");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
