@@ -62,6 +62,16 @@ record full results. These are local in-memory crossover observations, not
 stable tail-latency or end-to-end database claims. Repeat several times on the
 target machine before using them for capacity planning.
 
+Exact vector search now borrows each indexed ID during scoring and copies only
+the selected top-k IDs. In a same-machine single-run comparison against
+`910d98d`, 4,096-vector exact-search p50 moved from 302.2 µs to 217.0–217.1 µs
+across two post-change runs; 8,192-vector exact-search p50 moved from 907.1 µs
+to 547.8 µs. The adaptive 8,192-vector HNSW p50 measured 625.8 µs after the
+change versus 632.6 µs before it, with recall@10 unchanged at 0.978. These
+captures are not a statistically controlled benchmark; see the
+[borrowed-ID comparison](../bench/results/vector-topk-borrowed-ids.json) and
+repeat paired runs on the target workload.
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash

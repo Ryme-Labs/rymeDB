@@ -1,5 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{hash_map::Entry, BinaryHeap, HashMap, HashSet};
 
@@ -29,26 +30,26 @@ pub struct TextHit {
 }
 
 #[derive(Debug)]
-struct ScoredId {
-    id: String,
+struct ScoredId<'a> {
+    id: Cow<'a, str>,
     score: f64,
 }
 
-impl PartialEq for ScoredId {
+impl PartialEq for ScoredId<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.score.total_cmp(&other.score) == Ordering::Equal && self.id == other.id
     }
 }
 
-impl Eq for ScoredId {}
+impl Eq for ScoredId<'_> {}
 
-impl PartialOrd for ScoredId {
+impl PartialOrd for ScoredId<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ScoredId {
+impl Ord for ScoredId<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap keeps the worst retained hit at the root: lower scores
         // are worse, and for equal scores lexicographically larger IDs lose.
@@ -56,14 +57,15 @@ impl Ord for ScoredId {
     }
 }
 
-fn top_k_vector_hits<I>(hits: I, top_k: usize) -> Vec<VectorHit>
+fn top_k_vector_hits<'a, I, S>(hits: I, top_k: usize) -> Vec<VectorHit>
 where
-    I: IntoIterator<Item = VectorHit>,
+    I: IntoIterator<Item = (S, f64)>,
+    S: Into<Cow<'a, str>>,
 {
     let limit = top_k.clamp(1, MAX_TOP_K);
     let mut best = BinaryHeap::with_capacity(limit);
-    for hit in hits {
-        let candidate = ScoredId { id: hit.id, score: hit.score };
+    for (id, score) in hits {
+        let candidate = ScoredId { id: id.into(), score };
         if best.len() < limit {
             best.push(candidate);
             continue;
@@ -73,8 +75,10 @@ where
             best.push(candidate);
         }
     }
-    let mut selected: Vec<VectorHit> =
-        best.into_iter().map(|hit| VectorHit { id: hit.id, score: hit.score }).collect();
+    let mut selected: Vec<VectorHit> = best
+        .into_iter()
+        .map(|hit| VectorHit { id: hit.id.into_owned(), score: hit.score })
+        .collect();
     selected.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     selected
 }
@@ -414,7 +418,7 @@ impl VectorSpace {
                 let stored = &self.ann.nodes[*pos].vector;
                 let score =
                     stored.iter().zip(normalized.iter()).map(|(a, b)| (*a as f64) * b).sum();
-                VectorHit { id: id.clone(), score }
+                (id.as_str(), score)
             }),
             top_k,
         ))
@@ -795,7 +799,7 @@ impl PartitionedIndex {
                 Err(e) => return Err(e),
             }
         }
-        Ok(top_k_vector_hits(merged, top_k))
+        Ok(top_k_vector_hits(merged.into_iter().map(|hit| (hit.id, hit.score)), top_k))
     }
 
     pub fn ann_search(

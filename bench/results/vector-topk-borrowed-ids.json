@@ -1,0 +1,59 @@
+{
+  "captured_date": "2026-10-16",
+  "description": "Single-run baseline and post-change release measurements for exact vector search after making top-k ID handling borrow IDs until selection. Post-change 4096-vector run repeated once; measurements are local and descriptive, not a controlled multi-run study.",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "parameters": {
+    "dimensions": 64,
+    "partitions": 4,
+    "queries": 100,
+    "top_k": 10,
+    "ann_ef": 64,
+    "build_profile": "release"
+  },
+  "baseline_revision": "910d98d",
+  "results": [
+    {
+      "vectors": 4096,
+      "revision": "910d98d",
+      "exact_p50_ns": 302162,
+      "adaptive_ann_p50_ns": 300469,
+      "mean_recall_at_k": 1.0
+    },
+    {
+      "vectors": 4096,
+      "revision": "working-tree-after-borrowed-id-top-k",
+      "run": 1,
+      "exact_p50_ns": 217001,
+      "adaptive_ann_p50_ns": 217371,
+      "mean_recall_at_k": 1.0
+    },
+    {
+      "vectors": 4096,
+      "revision": "working-tree-after-borrowed-id-top-k",
+      "run": 2,
+      "exact_p50_ns": 217131,
+      "adaptive_ann_p50_ns": 217282,
+      "mean_recall_at_k": 1.0
+    },
+    {
+      "vectors": 8192,
+      "revision": "910d98d",
+      "exact_p50_ns": 907068,
+      "adaptive_ann_p50_ns": 632648,
+      "mean_recall_at_k": 0.9780000000000002
+    },
+    {
+      "vectors": 8192,
+      "revision": "working-tree-after-borrowed-id-top-k",
+      "exact_p50_ns": 547828,
+      "adaptive_ann_p50_ns": 625775,
+      "mean_recall_at_k": 0.9780000000000002
+    }
+  ]
+}
