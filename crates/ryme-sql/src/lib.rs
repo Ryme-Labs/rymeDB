@@ -7471,7 +7471,7 @@ pub struct Executor<B = TxnManager> {
     isolation: Isolation,
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<RwLock<HashMap<String, Vec<IndexState>>>>,
-    pending_index_commits: Arc<Mutex<HashMap<String, usize>>>,
+    pending_index_commits: Arc<RwLock<HashMap<String, usize>>>,
     rls_maps: Arc<RwLock<RlsPolicyMaps>>,
     rls_policy_version: Arc<AtomicU64>,
     rls_role_maps: Arc<RwLock<HashMap<String, (u64, Arc<RlsPolicyMaps>)>>>,
@@ -7520,11 +7520,11 @@ struct IndexState {
     valid: bool,
 }
 
-struct PendingIndexCommit(Arc<Mutex<HashMap<String, usize>>>, Vec<String>);
+struct PendingIndexCommit(Arc<RwLock<HashMap<String, usize>>>, Vec<String>);
 
 impl Drop for PendingIndexCommit {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.0.lock() {
+        if let Ok(mut pending) = self.0.write() {
             for table in &self.1 {
                 if let Some(count) = pending.get_mut(table) {
                     *count -= 1;
@@ -7552,7 +7552,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(RwLock::new(HashMap::new())),
-            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
+            pending_index_commits: Arc::new(RwLock::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -7592,7 +7592,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(RwLock::new(HashMap::new())),
-            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
+            pending_index_commits: Arc::new(RwLock::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -7637,7 +7637,7 @@ where
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(RwLock::new(HashMap::new())),
-            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
+            pending_index_commits: Arc::new(RwLock::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -8961,7 +8961,7 @@ where
             isolation: self.isolation,
             catalog: Arc::new(Mutex::new(catalog)),
             indexes: Arc::new(RwLock::new(indexes)),
-            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
+            pending_index_commits: Arc::new(RwLock::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(rls_maps)),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -10813,6 +10813,7 @@ where
         read_ts: u64,
     ) -> Result<Option<Vec<Vec<u8>>>> {
         self.ensure_index_entries_for_tenant(table)?;
+        let has_pending_commit = self.has_pending_index_commit(table);
         let indexes =
             self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let mut matching_indexes = Vec::new();
@@ -10830,7 +10831,7 @@ where
                 index_filter_value(&state.definition, filter)
             };
             let Some(key) = key else { continue };
-            if !state.valid || self.has_pending_index_commit(table) || read_ts < state.applied_ts {
+            if !state.valid || has_pending_commit || read_ts < state.applied_ts {
                 return Ok(None);
             }
             let Some(pks) = state.entries.get(&self.tenant).and_then(|entries| entries.get(&key))
@@ -10862,6 +10863,7 @@ where
         read_ts: u64,
     ) -> Result<Option<Vec<Vec<u8>>>> {
         self.ensure_index_entries_for_tenant(table)?;
+        let has_pending_commit = self.has_pending_index_commit(table);
         let indexes =
             self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(state) = indexes.get(table).and_then(|states| {
@@ -10869,7 +10871,7 @@ where
         }) else {
             return Ok(None);
         };
-        if !state.valid || self.has_pending_index_commit(table) || read_ts < state.applied_ts {
+        if !state.valid || has_pending_commit || read_ts < state.applied_ts {
             return Ok(None);
         }
         Ok(Some(
@@ -10919,6 +10921,7 @@ where
         excluded_pk: Option<&[u8]>,
     ) -> Result<()> {
         self.ensure_index_entries_for_tenant(table)?;
+        let has_pending_commit = self.has_pending_index_commit(table);
         let indexes =
             self.indexes.read().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let Some(table_indexes) = indexes.get(table) else { return Ok(()) };
@@ -10927,10 +10930,7 @@ where
         }
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
-            let conflict = if !state.valid
-                || self.has_pending_index_commit(table)
-                || txn.read_ts < state.applied_ts
-            {
+            let conflict = if !state.valid || has_pending_commit || txn.read_ts < state.applied_ts {
                 self.scan_all_rows_in_transaction(txn, table)?.iter().any(
                     |(existing_pk, existing_value)| {
                         existing_pk.as_slice() != pk
@@ -11000,7 +11000,7 @@ where
 
     fn has_pending_index_commit(&self, table: &str) -> bool {
         self.pending_index_commits
-            .lock()
+            .read()
             .map(|pending| pending.get(table).copied().unwrap_or_default() > 0)
             .unwrap_or(true)
     }
@@ -11008,7 +11008,7 @@ where
     fn begin_index_commit(&self, mut tables: Vec<String>) -> PendingIndexCommit {
         tables.sort_unstable();
         tables.dedup();
-        if let Ok(mut pending) = self.pending_index_commits.lock() {
+        if let Ok(mut pending) = self.pending_index_commits.write() {
             for table in &tables {
                 *pending.entry(table.clone()).or_default() += 1;
             }
