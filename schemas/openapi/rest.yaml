@@ -549,6 +549,8 @@ paths:
   /v1/auth/passkey/challenge:
     post:
       tags: [auth]
+      security: []
+      description: "Start a passkey assertion without an API key. The response is identical for known and unknown users; attempts are rate-limited."
       requestBody:
         required: true
         content:
@@ -558,8 +560,10 @@ paths:
       responses:
         '200':
           description: WebAuthn challenge
-        '401':
-          $ref: '#/components/responses/Unauthorized'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          description: Authentication challenge rate limit exceeded
   /v1/auth/passkey/register:
     post:
       tags: [auth]

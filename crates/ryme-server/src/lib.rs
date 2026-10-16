@@ -6416,25 +6416,24 @@ async fn otp_verify(
 
 async fn passkey_challenge(
     State(state): State<SharedState>,
-    headers: HeaderMap,
+    Extension(client_ip): Extension<AuthClientIp>,
     body: axum::body::Bytes,
 ) -> Response {
     let request: PasskeyChallengeRequest = match json_body(&body) {
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
-    let principal = match state.principal(&headers) {
-        Ok(principal) => principal,
-        Err(error) => return error_response(error),
-    };
-    if !principal.can_read() {
-        return error_response(ryme_error::RymeError::Forbidden);
-    }
-    if request.user.is_empty() {
+    if request.user.is_empty() || request.user.len() > ryme_auth::MAX_USER_LEN {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
     }
-    if !can_manage_user(&state, &principal, &request.user) {
-        return error_response(ryme_error::RymeError::Forbidden);
+    if state.passkey_rp_id.is_empty() {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from(
+            "passkey rp_id",
+        )));
+    }
+    let attempt_key = auth_attempt_key("passkey-challenge", &request.user);
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
+        return error_response(error);
     }
     match state.passkeys.lock() {
         Ok(mut registry) => match registry.challenge(&request.user) {

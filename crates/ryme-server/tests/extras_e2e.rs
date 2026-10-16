@@ -2133,14 +2133,36 @@ async fn extras_passkey_full_ceremony_issues_keys() {
     )
     .await;
     assert_eq!(status, 201);
-    let (status, body) =
-        http_request(http, "POST /v1/auth/passkey/challenge", b"{\"user\":\"pkada\"}").await;
-    assert_eq!(status, 200);
+    let (unknown_status, _) = http_request_no_auth(
+        http,
+        "POST /v1/auth/passkey/challenge",
+        b"{\"user\":\"missing-user\"}",
+    )
+    .await;
+    assert_eq!(unknown_status, 200);
+    let mut body = Vec::new();
+    for _ in 0..5 {
+        let (status, challenge_body) = http_request_no_auth(
+            http,
+            "POST /v1/auth/passkey/challenge",
+            b"{\"user\":\"pkada\"}",
+        )
+        .await;
+        assert_eq!(status, 200);
+        body = challenge_body;
+    }
+    let (limited_status, _) = http_request_no_auth(
+        http,
+        "POST /v1/auth/passkey/challenge",
+        b"{\"user\":\"pkada\"}",
+    )
+    .await;
+    assert_eq!(limited_status, 429);
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let challenge = parsed.get("challenge").and_then(|v| v.as_str()).unwrap().to_string();
     let (auth_data, client_data, signature) =
         webauthn_assertion(&secret, "auth.test", "https://auth.test", &challenge, 1);
-    let (status, body) = http_request(
+    let (status, body) = http_request_no_auth(
         http,
         "POST /v1/auth/passkey/verify",
         format!("{{\"user\":\"pkada\",\"credential_id\":\"cred-9\",\"authenticator_data\":\"{auth_data}\",\"client_data_json\":\"{client_data}\",\"signature\":\"{signature}\"}}")
@@ -2153,7 +2175,7 @@ async fn extras_passkey_full_ceremony_issues_keys() {
     assert!(key.starts_with("ryme_"));
     let (status, _) = bearer_request(http, &key, "GET /v1/billing/invoice", b"").await;
     assert_eq!(status, 200);
-    let (status, _) = http_request(
+    let (status, _) = http_request_no_auth(
         http,
         "POST /v1/auth/passkey/verify",
         format!("{{\"user\":\"pkada\",\"credential_id\":\"cred-9\",\"authenticator_data\":\"{auth_data}\",\"client_data_json\":\"{client_data}\",\"signature\":\"{signature}\"}}")

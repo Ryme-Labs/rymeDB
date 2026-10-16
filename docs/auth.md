@@ -142,6 +142,12 @@ must return the same nonce. Bind the returned `state` to the initiating
 browser session in your application or BFF. The database validates that state
 is pending and single-use, but does not itself bind it to a browser session.
 
+Passkey challenge and assertion endpoints are usable without an existing API
+key so they can start a login. Challenge responses do not reveal whether a user
+exists, and challenge creation is rate-limited by client and user. Passkey
+registration still requires an authenticated principal authorized to manage
+that user.
+
 To log out and invalidate a rotating refresh token, send it in the body of
 `DELETE /v1/auth/session` over HTTPS:
 
