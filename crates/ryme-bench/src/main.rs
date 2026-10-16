@@ -172,6 +172,8 @@ enum Command {
         rows: usize,
         #[arg(long, default_value_t = 1000)]
         ops: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
         #[arg(long)]
         json: bool,
     },
@@ -330,7 +332,9 @@ async fn main() {
             })
             .await;
         }
-        Some(Command::SqlLocal { rows, ops, json }) => sql_local_bench(rows, ops, json).await,
+        Some(Command::SqlLocal { rows, ops, concurrency, json }) => {
+            sql_local_bench(rows, ops, concurrency, json).await
+        }
         Some(Command::TxnReadBatch {
             records,
             candidates,
@@ -2466,9 +2470,16 @@ async fn sql_bench(config: SqlBench) {
     }
 }
 
-async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
-    if rows == 0 || rows > 50_000 || ops == 0 || ops > 1_000_000 {
-        eprintln!("rows must be 1..=50000 and ops must be 1..=1000000");
+async fn sql_local_bench(rows: usize, ops: usize, concurrency: usize, json: bool) {
+    if rows == 0
+        || rows > 50_000
+        || ops == 0
+        || ops > 1_000_000
+        || concurrency == 0
+        || concurrency > 64
+        || concurrency > ops
+    {
+        eprintln!("rows must be 1..=50000, ops 1..=1000000, and concurrency 1..=64");
         return;
     }
 
@@ -2526,22 +2537,44 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
         }
     }
 
-    let mut samples_ns = Vec::with_capacity(ops);
-    let started = Instant::now();
-    for _ in 0..ops {
-        let operation_started = Instant::now();
-        match executor.execute(statement.clone()).await {
-            Ok(QueryResult::Table { rows, .. }) if rows.len() == expected_rows => {}
-            Ok(_) => {
-                eprintln!("in-process SQL benchmark returned an unexpected result");
-                return;
+    let barrier = Arc::new(tokio::sync::Barrier::new(concurrency + 1));
+    let mut workers = Vec::with_capacity(concurrency);
+    for worker in 0..concurrency {
+        let executor = executor.clone();
+        let statement = statement.clone();
+        let barrier = Arc::clone(&barrier);
+        let worker_ops = ops / concurrency + usize::from(worker < ops % concurrency);
+        workers.push(tokio::spawn(async move {
+            let mut samples = Vec::with_capacity(worker_ops);
+            barrier.wait().await;
+            for _ in 0..worker_ops {
+                let operation_started = Instant::now();
+                match executor.execute(statement.clone()).await {
+                    Ok(QueryResult::Table { rows, .. }) if rows.len() == expected_rows => {}
+                    Ok(_) => return Err(String::from("unexpected query result")),
+                    Err(error) => return Err(error.to_string()),
+                }
+                samples
+                    .push(operation_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
             }
-            Err(error) => {
+            Ok(samples)
+        }));
+    }
+    let started = Instant::now();
+    barrier.wait().await;
+    let mut samples_ns = Vec::with_capacity(ops);
+    for worker in workers {
+        match worker.await {
+            Ok(Ok(mut samples)) => samples_ns.append(&mut samples),
+            Ok(Err(error)) => {
                 eprintln!("in-process SQL benchmark query failed: {error}");
                 return;
             }
+            Err(error) => {
+                eprintln!("in-process SQL benchmark worker failed: {error}");
+                return;
+            }
         }
-        samples_ns.push(operation_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
     }
     let seconds = started.elapsed().as_secs_f64().max(0.000001);
     samples_ns.sort_unstable();
@@ -2556,6 +2589,7 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
         "result_rows": expected_rows,
         "warmup_ops": warmup_ops,
         "ops": ops,
+        "concurrency": concurrency,
         "seconds": (seconds * 1000.0).round() / 1000.0,
         "qps": (ops as f64 / seconds).round() as u64,
         "p50_ns": percentile(50),
@@ -2568,7 +2602,7 @@ async fn sql_local_bench(rows: usize, ops: usize, json: bool) {
         println!("{output}");
     } else {
         println!(
-            "execution=in-process workload=filtered-projection-three-predicates rows={rows} result_rows={expected_rows} ops={ops} qps={:.0} p50={}ns p95={}ns p99={}ns max={}ns",
+            "execution=in-process workload=filtered-projection-three-predicates rows={rows} result_rows={expected_rows} ops={ops} concurrency={concurrency} qps={:.0} p50={}ns p95={}ns p99={}ns max={}ns",
             ops as f64 / seconds,
             percentile(50),
             percentile(95),
