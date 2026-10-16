@@ -2785,19 +2785,23 @@ impl SharedState {
     }
 
     fn principal(&self, headers: &HeaderMap) -> ryme_error::Result<Principal> {
-        if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-            return self.keys.authenticate(value);
-        }
-        if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                if let Ok(principal) = self.keys.authenticate(token) {
-                    return Ok(principal);
-                }
-                if let Some(verifier) = self.jwt.as_ref() {
-                    return verifier.principal_from_token(token, now_secs());
-                }
-                return Err(ryme_error::RymeError::Unauthorized);
+        if headers.contains_key(axum::http::header::AUTHORIZATION) {
+            let value = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or(ryme_error::RymeError::Unauthorized)?;
+            let token = value.strip_prefix("Bearer ").ok_or(ryme_error::RymeError::Unauthorized)?;
+            if let Ok(principal) = self.keys.authenticate(token) {
+                return Ok(principal);
             }
+            return self
+                .jwt
+                .as_ref()
+                .ok_or(ryme_error::RymeError::Unauthorized)?
+                .principal_from_token(token, now_secs());
+        }
+        if let Some(value) = headers.get("x-api-key").and_then(|value| value.to_str().ok()) {
+            return self.keys.authenticate(value);
         }
         Err(ryme_error::RymeError::Unauthorized)
     }
@@ -2807,11 +2811,13 @@ impl SharedState {
         headers: &HeaderMap,
         api_key: Option<&str>,
     ) -> ryme_error::Result<Principal> {
+        let has_header_credential = headers.contains_key(axum::http::header::AUTHORIZATION)
+            || headers.contains_key("x-api-key");
+        if has_header_credential {
+            return self.principal(headers);
+        }
         match api_key {
-            Some(key) => match self.principal(headers) {
-                Ok(principal) => Ok(principal),
-                Err(_) => self.keys.authenticate(key),
-            },
+            Some(key) => self.keys.authenticate(key),
             None => self.principal(headers),
         }
     }
@@ -2873,11 +2879,21 @@ mod websocket_credential_precedence_tests {
         let mut headers = HeaderMap::new();
         headers
             .insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer user-key"));
+        headers.insert("x-api-key", HeaderValue::from_static("query-admin-key"));
 
         let principal = state.principal_with_query(&headers, Some("query-admin-key")).unwrap();
         assert_eq!(principal.id, "app-user");
         assert_eq!(principal.tenant, "tenant-a");
         assert!(!principal.can_platform_admin());
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid-key"),
+        );
+        assert!(matches!(
+            state.principal_with_query(&headers, Some("query-admin-key")),
+            Err(ryme_error::RymeError::Unauthorized)
+        ));
 
         let _ = std::fs::remove_dir_all(dir);
     }
