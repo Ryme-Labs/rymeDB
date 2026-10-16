@@ -597,16 +597,18 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Opt
         "benchmark=txn-local value_bytes={value_bytes} keyspace={keyspace} warmup_ops={warmup_ops} metadata={}",
         machine_metadata()
     );
-    let start = Instant::now();
+    let start_gate = Arc::new(Barrier::new(workers + 1));
     let mut handles = Vec::with_capacity(workers);
     for worker in 0..workers {
         let manager = Arc::clone(&manager);
+        let start_gate = Arc::clone(&start_gate);
         let value = value.clone();
         let base = ops / workers;
         let extra = ops % workers;
         let first = worker * base + worker.min(extra);
         let end = first + base + usize::from(worker < extra);
         handles.push(std::thread::spawn(move || {
+            start_gate.wait();
             let mut applied = 0usize;
             let mut failed = 0usize;
             for index in first..end {
@@ -627,6 +629,8 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Opt
             (applied, failed)
         }));
     }
+    let start = Instant::now();
+    start_gate.wait();
     let (applied, failed) = handles
         .into_iter()
         .map(|handle| handle.join().expect("local benchmark worker panicked"))
