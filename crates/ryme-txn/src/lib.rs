@@ -260,6 +260,7 @@ struct CommitIndex {
     by_timestamp: BTreeMap<u64, Vec<RecordKey>>,
     by_key: BTreeMap<RecordKey, Vec<u64>>,
     by_table: BTreeMap<(String, String, String), Vec<u64>>,
+    pruned_through: u64,
 }
 
 impl CommitIndex {
@@ -279,6 +280,7 @@ impl CommitIndex {
     }
 
     fn prune_through(&mut self, floor: u64) {
+        self.pruned_through = self.pruned_through.max(floor);
         let mut affected_tables = BTreeSet::new();
         while self.by_timestamp.first_key_value().is_some_and(|(ts, _)| *ts <= floor) {
             let Some((commit_ts, keys)) = self.by_timestamp.pop_first() else {
@@ -1019,7 +1021,6 @@ impl TxnManager {
             active: Arc::clone(&self.inner.active),
             additional: Mutex::new(Vec::new()),
         });
-        pin.active.insert(id, 0);
         pin.active.insert(id, state.read_ts);
         Ok(Transaction {
             id,
@@ -1164,6 +1165,9 @@ impl TxnManager {
             return Err(RymeError::Conflict(String::from(
                 "commit timestamp must be newer than transaction snapshot",
             )));
+        }
+        if txn.read_ts < committed.pruned_through {
+            return Err(RymeError::Conflict(String::from("transaction snapshot too old")));
         }
         if let Some(floor) = self.inner.active.oldest() {
             committed.prune_through(floor);
@@ -3585,6 +3589,34 @@ mod tests {
         let mut fresh = manager.begin();
         let current = manager.get(&mut fresh, &key).unwrap();
         assert_eq!(current, Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn restored_snapshot_rejects_validation_after_conflict_history_pruning() {
+        let manager = TxnManager::new();
+        let observed_key = RecordKey::new("t", "d", "stale-snapshot", b"observed");
+        let output_key = RecordKey::new("t", "d", "stale-snapshot", b"output");
+        let advance_key = RecordKey::new("t", "d", "stale-snapshot", b"advance");
+
+        let mut stale = manager.begin();
+        assert_eq!(manager.get(&mut stale, &observed_key).unwrap(), None);
+        manager.put(&mut stale, output_key, b"derived from old read".to_vec());
+        let stale_state = stale.state();
+        drop(stale);
+
+        let mut concurrent = manager.begin();
+        manager.put(&mut concurrent, observed_key, b"new value".to_vec());
+        manager.commit(concurrent).unwrap();
+
+        let mut newer = manager.begin();
+        manager.put(&mut newer, advance_key, b"advance gc horizon".to_vec());
+        manager.commit(newer).unwrap();
+
+        let restored = manager.from_state(stale_state).unwrap();
+        assert!(matches!(
+            manager.commit(restored),
+            Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
+        ));
     }
 
     #[test]
