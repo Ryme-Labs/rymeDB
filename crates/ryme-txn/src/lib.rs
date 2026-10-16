@@ -242,18 +242,20 @@ struct TxnInner {
 #[derive(Debug, Default)]
 struct CommitIndex {
     by_timestamp: BTreeMap<u64, Vec<RecordKey>>,
-    by_key: BTreeMap<RecordKey, BTreeSet<u64>>,
-    by_table: BTreeMap<(String, String, String), BTreeSet<u64>>,
+    by_key: BTreeMap<RecordKey, Vec<u64>>,
+    by_table: BTreeMap<(String, String, String), Vec<u64>>,
 }
 
 impl CommitIndex {
     fn record(&mut self, commit_ts: u64, keys: Vec<RecordKey>) {
         for key in &keys {
-            self.by_key.entry(key.clone()).or_default().insert(commit_ts);
-            self.by_table
-                .entry((key.tenant.clone(), key.database.clone(), key.table.clone()))
-                .or_default()
-                .insert(commit_ts);
+            record_commit_timestamp(self.by_key.entry(key.clone()).or_default(), commit_ts);
+            record_commit_timestamp(
+                self.by_table
+                    .entry((key.tenant.clone(), key.database.clone(), key.table.clone()))
+                    .or_default(),
+                commit_ts,
+            );
         }
         if !keys.is_empty() {
             self.by_timestamp.entry(commit_ts).or_default().extend(keys);
@@ -261,34 +263,63 @@ impl CommitIndex {
     }
 
     fn prune_through(&mut self, floor: u64) {
+        let mut affected_tables = BTreeSet::new();
         while self.by_timestamp.first_key_value().is_some_and(|(ts, _)| *ts <= floor) {
             let Some((commit_ts, keys)) = self.by_timestamp.pop_first() else {
                 break;
             };
             for key in keys {
-                let remove_key = self.by_key.get_mut(&key).is_some_and(|timestamps| {
-                    timestamps.remove(&commit_ts);
-                    timestamps.is_empty()
+                let remove_key = self.by_key.get_mut(&key).is_some_and(|history| {
+                    if let Ok(index) = history.binary_search(&commit_ts) {
+                        history.remove(index);
+                    }
+                    history.is_empty()
                 });
                 if remove_key {
                     self.by_key.remove(&key);
                 }
-                let table = (key.tenant, key.database, key.table);
-                let remove_table = self.by_table.get_mut(&table).is_some_and(|timestamps| {
-                    timestamps.remove(&commit_ts);
-                    timestamps.is_empty()
-                });
-                if remove_table {
-                    self.by_table.remove(&table);
-                }
+                affected_tables.insert((key.tenant, key.database, key.table));
             }
         }
+        prune_commit_histories(&mut self.by_table, affected_tables, floor);
     }
 
     fn clear(&mut self) {
         self.by_timestamp.clear();
         self.by_key.clear();
         self.by_table.clear();
+    }
+}
+
+fn record_commit_timestamp(history: &mut Vec<u64>, commit_ts: u64) {
+    if history.last().is_some_and(|latest| *latest < commit_ts) {
+        history.push(commit_ts);
+        return;
+    }
+    if let Err(index) = history.binary_search(&commit_ts) {
+        history.insert(index, commit_ts);
+    }
+}
+
+fn has_commit_between(history: &[u64], read_ts: u64, commit_ts: u64) -> bool {
+    let index = history.partition_point(|timestamp| *timestamp <= read_ts);
+    history.get(index).is_some_and(|timestamp| *timestamp < commit_ts)
+}
+
+fn prune_commit_histories<K: Ord>(
+    histories: &mut BTreeMap<K, Vec<u64>>,
+    keys: BTreeSet<K>,
+    floor: u64,
+) {
+    for key in keys {
+        let remove = histories.get_mut(&key).is_some_and(|history| {
+            let count = history.partition_point(|timestamp| *timestamp <= floor);
+            history.drain(..count);
+            history.is_empty()
+        });
+        if remove {
+            histories.remove(&key);
+        }
     }
 }
 
@@ -1076,9 +1107,10 @@ impl TxnManager {
             committed.prune_through(floor);
         }
         for key in txn.writes.keys() {
-            let conflicts = committed.by_key.get(key).is_some_and(|timestamps| {
-                timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
-            });
+            let conflicts = committed
+                .by_key
+                .get(key)
+                .is_some_and(|timestamps| has_commit_between(timestamps, txn.read_ts, commit_ts));
             if conflicts {
                 return Err(RymeError::Conflict(String::from("write-write conflict")));
             }
@@ -1086,7 +1118,7 @@ impl TxnManager {
         if txn.isolation == Isolation::Serializable {
             for key in txn.read_set.iter() {
                 let conflicts = committed.by_key.get(key).is_some_and(|timestamps| {
-                    timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
+                    has_commit_between(timestamps, txn.read_ts, commit_ts)
                 });
                 if conflicts {
                     return Err(RymeError::Conflict(String::from("read-write conflict")));
@@ -1094,7 +1126,7 @@ impl TxnManager {
             }
             for table in txn.scanned.iter() {
                 let phantom = committed.by_table.get(table).is_some_and(|timestamps| {
-                    timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
+                    has_commit_between(timestamps, txn.read_ts, commit_ts)
                 });
                 if phantom {
                     return Err(RymeError::Conflict(String::from("phantom conflict")));
@@ -1102,9 +1134,10 @@ impl TxnManager {
             }
         }
         for table in txn.constraint_scanned.iter() {
-            let conflict = committed.by_table.get(table).is_some_and(|timestamps| {
-                timestamps.range((Excluded(txn.read_ts), Excluded(commit_ts))).next().is_some()
-            });
+            let conflict = committed
+                .by_table
+                .get(table)
+                .is_some_and(|timestamps| has_commit_between(timestamps, txn.read_ts, commit_ts));
             if conflict {
                 return Err(RymeError::Conflict(String::from("constraint conflict")));
             }
@@ -2963,15 +2996,30 @@ mod tests {
         index.record(2, vec![key.clone()]);
 
         index.prune_through(2);
-        assert_eq!(index.by_key.get(&key), Some(&BTreeSet::from([3])));
+        assert_eq!(index.by_key.get(&key), Some(&vec![3]));
         assert_eq!(
             index.by_table.get(&(String::from("t"), String::from("d"), String::from("messages"),)),
-            Some(&BTreeSet::from([3]))
+            Some(&vec![3])
         );
 
         index.prune_through(3);
         assert!(!index.by_key.contains_key(&key));
         assert!(index.by_table.is_empty());
+    }
+
+    #[test]
+    fn commit_histories_keep_sorted_unique_timestamps_and_exact_conflict_bounds() {
+        let mut history = Vec::new();
+        record_commit_timestamp(&mut history, 5);
+        record_commit_timestamp(&mut history, 2);
+        record_commit_timestamp(&mut history, 5);
+        record_commit_timestamp(&mut history, 3);
+
+        assert_eq!(history, vec![2, 3, 5]);
+        assert!(has_commit_between(&history, 1, 3));
+        assert!(!has_commit_between(&history, 3, 5));
+        assert!(has_commit_between(&history, 3, 6));
+        assert!(!has_commit_between(&history, 5, 6));
     }
 
     #[test]
