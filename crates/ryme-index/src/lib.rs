@@ -404,16 +404,20 @@ impl VectorSpace {
         if query.iter().any(|value| !value.is_finite()) {
             return Err(RymeError::InvalidArgument(String::from("non-finite vector value")));
         }
-        let norm = (query.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
-        if norm == 0.0 {
+        let norm_squared = query.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>();
+        if norm_squared == 0.0 {
             return Err(RymeError::InvalidArgument(String::from("zero vector")));
         }
-        let normalized: Vec<f64> = query.iter().map(|v| (*v as f64) / norm).collect();
+        let inverse_norm = norm_squared.sqrt().recip();
         Ok(top_k_vector_hits(
             self.ann.id_to_pos.iter().map(|(id, pos)| {
                 let stored = &self.ann.nodes[*pos].vector;
-                let score =
-                    stored.iter().zip(normalized.iter()).map(|(a, b)| (*a as f64) * b).sum();
+                let dot = stored
+                    .iter()
+                    .zip(query.iter())
+                    .map(|(a, b)| (*a as f64) * (*b as f64))
+                    .sum::<f64>();
+                let score = dot * inverse_norm;
                 (id.as_str(), score)
             }),
             top_k,
@@ -937,6 +941,18 @@ mod tests {
         let hits = registry.vector_search("s", &[0.9, 0.1], 2).unwrap();
         assert_eq!(hits[0].id, "a");
         assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn exact_vector_scores_are_cosine_similarity() {
+        let mut registry = IndexRegistry::new();
+        registry.vector_upsert("s", String::from("x"), vec![1.0, 0.0]).unwrap();
+        registry.vector_upsert("s", String::from("y"), vec![0.0, 1.0]).unwrap();
+
+        let hits = registry.vector_search("s", &[3.0, 4.0], 2).unwrap();
+        let scores: HashMap<_, _> = hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
+        assert!((scores["x"] - 0.6).abs() < 1e-12);
+        assert!((scores["y"] - 0.8).abs() < 1e-12);
     }
 
     #[test]
