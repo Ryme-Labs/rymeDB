@@ -302,10 +302,11 @@ impl CommitIndex {
         prune_commit_histories(&mut self.by_table, affected_tables, floor);
     }
 
-    fn clear(&mut self) {
+    fn clear_through(&mut self, floor: u64) {
         self.by_timestamp.clear();
         self.by_key.clear();
         self.by_table.clear();
+        self.pruned_through = floor;
     }
 }
 
@@ -1987,7 +1988,7 @@ impl TxnManager {
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
             engine.replace_from(snapshot);
         }
-        guard.clear();
+        guard.clear_through(max);
         self.inner
             .pending
             .lock()
@@ -2025,7 +2026,7 @@ impl TxnManager {
             .write()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?
             .replace_from(snapshot);
-        guard.clear();
+        guard.clear_through(max);
         self.inner
             .pending
             .lock()
@@ -3611,6 +3612,32 @@ mod tests {
         let mut newer = manager.begin();
         manager.put(&mut newer, advance_key, b"advance gc horizon".to_vec());
         manager.commit(newer).unwrap();
+
+        let restored = manager.from_state(stale_state).unwrap();
+        assert!(matches!(
+            manager.commit(restored),
+            Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
+        ));
+    }
+
+    #[test]
+    fn restored_snapshot_rejects_transactions_older_than_recovered_history() {
+        let manager = TxnManager::new();
+        let observed_key = RecordKey::new("t", "d", "restore-floor", b"observed");
+        let output_key = RecordKey::new("t", "d", "restore-floor", b"output");
+
+        let mut stale = manager.begin();
+        assert_eq!(manager.get(&mut stale, &observed_key).unwrap(), None);
+        manager.put(&mut stale, output_key, b"derived from old read".to_vec());
+        let stale_state = stale.state();
+        drop(stale);
+
+        let mut writer = manager.begin();
+        manager.put(&mut writer, observed_key, b"committed before snapshot".to_vec());
+        manager.commit(writer).unwrap();
+
+        let snapshot = manager.encode_snapshot().unwrap();
+        manager.restore_snapshot(&snapshot).unwrap();
 
         let restored = manager.from_state(stale_state).unwrap();
         assert!(matches!(
