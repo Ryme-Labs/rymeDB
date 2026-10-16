@@ -58,7 +58,7 @@ impl Ord for ScoredId<'_> {
     }
 }
 
-fn top_k_vector_hits<'a, I, S>(hits: I, top_k: usize) -> Vec<VectorHit>
+fn top_k_scored_ids<'a, I, S>(hits: I, top_k: usize) -> Vec<ScoredId<'a>>
 where
     I: IntoIterator<Item = (S, f64)>,
     S: Into<Cow<'a, str>>,
@@ -76,12 +76,20 @@ where
             best.push(candidate);
         }
     }
-    let mut selected: Vec<VectorHit> = best
-        .into_iter()
-        .map(|hit| VectorHit { id: hit.id.into_owned(), score: hit.score })
-        .collect();
+    let mut selected = best.into_vec();
     selected.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     selected
+}
+
+fn top_k_vector_hits<'a, I, S>(hits: I, top_k: usize) -> Vec<VectorHit>
+where
+    I: IntoIterator<Item = (S, f64)>,
+    S: Into<Cow<'a, str>>,
+{
+    top_k_scored_ids(hits, top_k)
+        .into_iter()
+        .map(|hit| VectorHit { id: hit.id.into_owned(), score: hit.score })
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -531,11 +539,10 @@ impl TextSpace {
                 *scores.entry(doc.as_str()).or_insert(0.0) += idf * tf;
             }
         }
-        let mut hits: Vec<TextHit> =
-            scores.into_iter().map(|(id, score)| TextHit { id: id.to_string(), score }).collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-        hits.truncate(top_k.clamp(1, MAX_TOP_K));
-        hits
+        top_k_scored_ids(scores, top_k)
+            .into_iter()
+            .map(|hit| TextHit { id: hit.id.into_owned(), score: hit.score })
+            .collect()
     }
 }
 
@@ -894,9 +901,10 @@ impl PartitionedIndex {
                 merged.extend(texts.search_terms(&terms, top_k, doc_count, &document_frequencies));
             }
         }
-        merged.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-        merged.truncate(top_k.clamp(1, MAX_TOP_K));
-        Ok(merged)
+        Ok(top_k_scored_ids(merged.into_iter().map(|hit| (hit.id, hit.score)), top_k)
+            .into_iter()
+            .map(|hit| TextHit { id: hit.id.into_owned(), score: hit.score })
+            .collect())
     }
 
     pub fn spaces(&self) -> Vec<String> {
@@ -1174,6 +1182,16 @@ mod tests {
         let hits = registry.text_search("docs", "quick fox", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "d1");
+    }
+
+    #[test]
+    fn text_top_k_ties_are_stable_and_bounded() {
+        let mut registry = IndexRegistry::new();
+        for id in ["z", "a", "m", "b"] {
+            registry.text_index("docs", id.to_string(), "same score").unwrap();
+        }
+        let hits = registry.text_search("docs", "same", 2).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     }
 
     #[test]

@@ -83,6 +83,21 @@ recall/latency tradeoff better fits the workload. These are local index-only
 measurements; see the [raw profile](../bench/results/vector-hnsw-ef-profile.json)
 and benchmark your own corpus before choosing a production value.
 
+To measure full-text search when a common term matches every document:
+
+```bash
+cargo run --locked --release -j 1 -p ryme-bench -- text-index \
+  --documents 10000 --queries 500 --partitions 4 --top-k 10 --json
+```
+
+The benchmark returns p50/p95/p99 and QPS for a warmed, in-process index. On
+the same host and corpus, bounded top-k selection reduced median query p50 from
+1.716 ms to 0.837 ms and raised median QPS from 566 to 1,129 across three runs.
+Scoring still visits every matching posting; the optimization avoids allocating
+an owned ID and sorting every match when only a small top-k is requested. See
+the [raw runs](../bench/results/text-search-bounded-topk.json). This does not
+measure network, persistence, or replicated database latency.
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash

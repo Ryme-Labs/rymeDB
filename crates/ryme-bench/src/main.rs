@@ -110,6 +110,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    TextIndex {
+        #[arg(long, default_value_t = 10_000)]
+        documents: usize,
+        #[arg(long, default_value_t = 300)]
+        queries: usize,
+        #[arg(long, default_value_t = 4)]
+        partitions: usize,
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        #[arg(long)]
+        json: bool,
+    },
     Resp {
         #[arg(long, default_value = "127.0.0.1:6380")]
         addr: String,
@@ -235,6 +247,9 @@ async fn main() {
             json,
         }) => {
             vector_index_bench(vectors, dimensions, queries, partitions, top_k, ann_ef, json);
+        }
+        Some(Command::TextIndex { documents, queries, partitions, top_k, json }) => {
+            text_index_bench(documents, queries, partitions, top_k, json);
         }
         Some(Command::Resp {
             addr,
@@ -1536,6 +1551,75 @@ fn vector_index_bench(
             output["adaptive_ann_p50_ns"].as_u64().unwrap_or(0),
             output["adaptive_ann_p99_ns"].as_u64().unwrap_or(0),
             output["mean_recall_at_k"].as_f64().unwrap_or(0.0),
+        );
+    }
+}
+
+fn text_index_bench(documents: usize, queries: usize, partitions: usize, top_k: usize, json: bool) {
+    if documents == 0
+        || documents > ryme_index::MAX_DOCS_PER_SPACE
+        || queries == 0
+        || queries > 100_000
+        || !(1..=ryme_index::MAX_PARTITIONS).contains(&partitions)
+        || !(1..=ryme_index::MAX_TOP_K).contains(&top_k)
+    {
+        eprintln!(
+            "text-index benchmark arguments are outside supported limits (documents max: {}, queries max: 100000)",
+            ryme_index::MAX_DOCS_PER_SPACE
+        );
+        std::process::exit(2);
+    }
+
+    let mut index = PartitionedIndex::new(partitions);
+    let build_start = Instant::now();
+    for document in 0..documents {
+        let id = format!("d{document:08}");
+        let text = format!("global bucket{:03}", document % 100);
+        index
+            .text_index("text-index-bench", id, &text)
+            .expect("text index benchmark insert failed");
+    }
+    let index_build_ns = build_start.elapsed().as_nanos();
+    let query = "global";
+    index
+        .text_search("text-index-bench", query, top_k)
+        .expect("text index benchmark warmup failed");
+    let mut query_ns = Vec::with_capacity(queries);
+    for _ in 0..queries {
+        let start = Instant::now();
+        index
+            .text_search("text-index-bench", query, top_k)
+            .expect("text index benchmark search failed");
+        query_ns.push(start.elapsed().as_nanos());
+    }
+    query_ns.sort_unstable();
+    let percentile = |samples: &[u128], percent: usize| {
+        samples[((samples.len() - 1) * percent / 100).min(samples.len() - 1)]
+    };
+    let total_query_ns = query_ns.iter().copied().sum::<u128>().max(1);
+    let output = serde_json::json!({
+        "benchmark": "text-index-common-term-top-k",
+        "machine": machine_metadata(),
+        "documents": documents,
+        "partitions": partitions,
+        "queries": queries,
+        "top_k": top_k,
+        "matched_documents_per_query": documents,
+        "index_build_ns": index_build_ns,
+        "query_qps": queries as f64 * 1_000_000_000.0 / total_query_ns as f64,
+        "query_p50_ns": percentile(&query_ns, 50),
+        "query_p95_ns": percentile(&query_ns, 95),
+        "query_p99_ns": percentile(&query_ns, 99),
+    });
+    if json {
+        println!("{output}");
+    } else {
+        println!(
+            "documents={documents} partitions={partitions} top_k={top_k} index_build={}ns query_qps={:.0} query_p50={}ns query_p99={}ns",
+            output["index_build_ns"].as_u64().unwrap_or(0),
+            output["query_qps"].as_f64().unwrap_or(0.0),
+            output["query_p50_ns"].as_u64().unwrap_or(0),
+            output["query_p99_ns"].as_u64().unwrap_or(0),
         );
     }
 }
