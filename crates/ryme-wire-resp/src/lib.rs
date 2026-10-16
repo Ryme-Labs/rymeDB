@@ -1324,6 +1324,12 @@ where
                 let mut admitted = false;
                 loop {
                     let mut txn = self.manager.begin();
+                    if state.queue.iter().all(is_read_only_command) {
+                        if let Err(error) = txn.set_read_only() {
+                            self.record_timing("EXEC", start.elapsed().as_micros() as u64);
+                            return encode_error(error.to_string());
+                        }
+                    }
                     let mut replies = Vec::with_capacity(state.queue.len());
                     for queued in &state.queue {
                         replies.push(self.dispatch_in(&mut txn, queued.clone()));
@@ -1610,6 +1616,10 @@ where
         let mut admitted = false;
         loop {
             let mut txn = self.manager.begin();
+            if let Err(error) = set_command_read_only(&mut txn, &command) {
+                self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
+                return encode_error(error.to_string());
+            }
             let reply = self.dispatch_in(&mut txn, command.clone());
             if let Err(error) = txn.ensure_healthy() {
                 self.record_timing(&fingerprint, start.elapsed().as_micros() as u64);
@@ -1687,6 +1697,9 @@ where
                     Err(error) => return Some(encode_error(error.to_string())),
                 };
                 let mut local = self.manager.begin();
+                if let Err(error) = local.set_read_only() {
+                    return Some(encode_error(error.to_string()));
+                }
                 let mut saw_remote = false;
                 let mut values = Vec::with_capacity(results.len());
                 for (key, result) in command.args.iter().zip(results) {
@@ -1728,6 +1741,9 @@ where
                     Err(error) => return Some(encode_error(error.to_string())),
                 };
                 let mut local = self.manager.begin();
+                if let Err(error) = local.set_read_only() {
+                    return Some(encode_error(error.to_string()));
+                }
                 let mut saw_remote = false;
                 let mut found = 0i64;
                 for (key, result) in command.args.iter().zip(results) {
@@ -5134,6 +5150,58 @@ fn retries_conflict_safely(command: &RespCommand) -> bool {
     !matches!(command.name.as_str(), "EVAL" | "EVALSHA" | "PUBLISH")
 }
 
+fn set_command_read_only(txn: &mut Transaction, command: &RespCommand) -> ryme_error::Result<()> {
+    if is_read_only_command(command) {
+        txn.set_read_only()?;
+    }
+    Ok(())
+}
+
+// Keep this an allowlist: read-only transactions reject writes, so an
+// ambiguous command must retain normal transaction tracking.
+fn is_read_only_command(command: &RespCommand) -> bool {
+    matches!(
+        command.name.as_str(),
+        "GET"
+            | "TTL"
+            | "PTTL"
+            | "EXISTS"
+            | "TYPE"
+            | "STRLEN"
+            | "MGET"
+            | "HGET"
+            | "HEXISTS"
+            | "HLEN"
+            | "HGETALL"
+            | "HKEYS"
+            | "HVALS"
+            | "LLEN"
+            | "LRANGE"
+            | "SMEMBERS"
+            | "SCARD"
+            | "SISMEMBER"
+            | "ZSCORE"
+            | "ZRANK"
+            | "ZREVRANK"
+            | "ZRANGE"
+            | "ZCARD"
+            | "ZCOUNT"
+            | "SCAN"
+            | "KEYS"
+            | "XRANGE"
+            | "XREVRANGE"
+            | "XLEN"
+            | "XREAD"
+            | "XPENDING"
+            | "XINFO"
+            | "PFCOUNT"
+            | "GEODIST"
+            | "GEOPOS"
+            | "GEOSEARCH"
+            | "GEOHASH"
+    )
+}
+
 #[derive(Debug)]
 enum LuaRespValue {
     Null,
@@ -6097,6 +6165,56 @@ fn slice_list(list: &[String], start: i64, stop: i64) -> Vec<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autocommit_get_uses_a_read_only_transaction() {
+        let gateway = RespGateway::new(String::from("tenant"), String::from("database"));
+        let key = RecordKey::new("tenant", "database", KV_TABLE, b"key");
+        let mut seed = gateway.manager.begin();
+        gateway.manager.put(&mut seed, key, b"value".to_vec());
+        gateway.manager.commit(seed).unwrap();
+
+        let command = RespCommand { name: String::from("GET"), args: vec![b"key".to_vec()] };
+        let mut txn = gateway.manager.begin();
+        set_command_read_only(&mut txn, &command).unwrap();
+
+        assert_eq!(gateway.dispatch_in(&mut txn, command), encode_bulk(b"value"));
+        assert!(txn.read_keys().is_empty());
+        assert!(txn.writes().is_empty());
+    }
+
+    #[test]
+    fn read_only_command_allowlist_excludes_mutating_and_ambiguous_commands() {
+        for name in [
+            "GET",
+            "MGET",
+            "EXISTS",
+            "HGETALL",
+            "LRANGE",
+            "SMEMBERS",
+            "ZRANGE",
+            "XRANGE",
+            "XREAD",
+            "GEOSEARCH",
+        ] {
+            assert!(is_read_only_command(&RespCommand { name: name.to_string(), args: vec![] }));
+        }
+
+        for name in [
+            "GETEX",
+            "GETDEL",
+            "SET",
+            "EVAL",
+            "PUBLISH",
+            "XREADGROUP",
+            "GEORADIUS",
+            "GEORADIUSBYMEMBER",
+            "GEOSEARCHSTORE",
+            "ZRANGESTORE",
+        ] {
+            assert!(!is_read_only_command(&RespCommand { name: name.to_string(), args: vec![] }));
+        }
+    }
 
     #[test]
     fn collection_payloads_are_bounded() {
