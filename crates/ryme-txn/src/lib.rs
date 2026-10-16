@@ -2503,6 +2503,8 @@ impl DurableManager {
         Ok((pruned, wal_removed))
     }
 
+    /// Compacts one bounded delta run in Standard mode, or snapshots resident
+    /// state in Hot mode.
     pub fn compact_segments(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
@@ -2511,7 +2513,7 @@ impl DurableManager {
 
     fn compact_segments_locked(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
         if self.mode == StorageMode::Standard {
-            return self.segments.compact();
+            return self.segments.compact_delta_run();
         }
         let _guard = self
             .inner
@@ -4064,6 +4066,60 @@ mod tests {
         for index in 0..SEGMENT_COMPACTION_THRESHOLD {
             let key = RecordKey::new("tenant", "db", "items", &(index as u64).to_be_bytes());
             assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(vec![index as u8]));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_standard_compaction_uses_bounded_delta_runs() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-manual-compaction-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+
+        let keys: Vec<_> =
+            (0..3).map(|index| RecordKey::new("tenant", "db", "items", &[index])).collect();
+        for (index, key) in keys.iter().enumerate() {
+            let mut txn = manager.begin();
+            manager.put(&mut txn, key.clone(), vec![index as u8]);
+            manager.commit(txn).unwrap();
+        }
+        assert_eq!(manager.segments.segment_paths().unwrap().len(), 3);
+
+        let compacted = manager.compact_segments().unwrap().unwrap();
+        assert!(compacted.max_commit_ts > 0);
+        let compacted_paths = manager.segments.segment_paths().unwrap();
+        assert_eq!(compacted_paths.len(), 1);
+        assert_eq!(compacted_paths[0].extension().and_then(|value| value.to_str()), Some("cmp"));
+        drop(manager);
+
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reopened = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut probe = reopened.begin();
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(reopened.get(&mut probe, key).unwrap(), Some(vec![index as u8]));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
