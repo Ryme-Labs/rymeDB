@@ -44,7 +44,18 @@ Standard mode seeds a temporary segment-backed database, warms its cache, and
 removes the temporary directory after the run. This measures cached point-read
 overhead, not cold disk latency or a full networked deployment. Compare modes
 on the same idle machine; the output includes the storage mode and read
-percentiles.
+percentiles. `read_only_batched_read` models the transaction-core access path
+used by RESP `MGET`: one read-only transaction with repeated `get_many` calls.
+Its speedup is reported against `read_only_single_read`, so neither side pays
+conflict-observation tracking.
+
+On an AMD Ryzen 5 4500, two sequential release captures with 10,000 records,
+1,024 reads/iteration, 100 iterations, and batches of 256 showed read-only
+batch p50 of 588–592 µs versus 812–817 µs for individual read-only gets in
+Standard mode (1.38× in both captures). Hot mode measured 275–277 µs versus
+291–295 µs (1.05–1.07×). The Hot-mode p99 varied substantially, so treat these
+as preliminary in-process results, not end-to-end RESP latency claims. See the
+[read-only batch captures](../bench/results/txn-read-batch-readonly.json).
 
 Two sequential release captures on an AMD Ryzen 5 4500 (10,000 records,
 1,024 reads/iteration, 100 iterations, 256-key batches) measured Standard-mode
