@@ -844,11 +844,31 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
             .expect("owned segment warmup failed"),
     );
 
-    let encoded_segment = ImmutableSegment::from_entries(0, &template)
-        .expect("decode benchmark segment build failed")
-        .encode()
-        .expect("decode benchmark segment encode failed");
+    let lookup_segment = ImmutableSegment::from_entries(0, &template)
+        .expect("decode benchmark segment build failed");
+    let encoded_segment = lookup_segment.encode().expect("decode benchmark segment encode failed");
     drop(ImmutableSegment::decode(&encoded_segment).expect("segment decode warmup failed"));
+
+    let lookup_count = iterations.saturating_mul(256);
+    let mut lookup_state = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..lookup_count.min(256) {
+        lookup_state ^= lookup_state << 13;
+        lookup_state ^= lookup_state >> 7;
+        lookup_state ^= lookup_state << 17;
+        let key = &template[lookup_state as usize % entries].key;
+        std::hint::black_box(lookup_segment.get(key, 1, 0).expect("lookup warmup failed"));
+    }
+    let lookup_start = Instant::now();
+    for _ in 0..lookup_count {
+        lookup_state ^= lookup_state << 13;
+        lookup_state ^= lookup_state >> 7;
+        lookup_state ^= lookup_state << 17;
+        let key = &template[lookup_state as usize % entries].key;
+        let value = lookup_segment.get(key, 1, 0).expect("segment lookup failed");
+        assert!(value.is_some(), "segment lookup missed a generated key");
+        std::hint::black_box(value);
+    }
+    let lookup_elapsed_ns = lookup_start.elapsed().as_nanos();
 
     let mut borrowed_ns = Vec::with_capacity(iterations);
     let mut owned_ns = Vec::with_capacity(iterations);
@@ -903,6 +923,8 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
             "owned_p50_speedup": borrowed_median as f64 / owned_median as f64,
             "decode_p50_ns": percentile(&decoded_ns, 50),
             "decode_p95_ns": percentile(&decoded_ns, 95),
+            "lookup_ops": lookup_count,
+            "lookup_mean_ns": lookup_elapsed_ns / lookup_count.max(1) as u128,
         })
     );
 }

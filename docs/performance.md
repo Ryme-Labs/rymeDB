@@ -123,6 +123,11 @@ engine into the segment, borrowed-path median time fell from 1.314 ms to
 segment-construction evidence; it does not establish a transaction-throughput
 or end-to-end latency gain. Rerun on the target workload.
 
+The same `segment-build` command also reports `lookup_mean_ns` for
+deterministic pseudo-random point hits against one already-built segment. This
+includes the segment Bloom/key checks, engine lookup, and returned-value clone;
+compare only identical entry counts, payloads, build profiles, and hardware.
+
 ## Delta-segment pointer experiment
 
 A paired release microbenchmark used the same 12-logical-CPU AMD Ryzen 5 4500,
