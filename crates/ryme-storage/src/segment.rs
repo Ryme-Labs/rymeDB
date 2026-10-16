@@ -685,7 +685,27 @@ impl SegmentStore {
         read_ts: u64,
         now: u64,
     ) -> Result<Vec<Option<Vec<u8>>>> {
-        if keys.is_empty() {
+        self.get_many_with(keys.len(), |index| &keys[index], read_ts, now)
+    }
+
+    /// Read borrowed keys as a batch without allocating owned key copies.
+    pub fn get_many_borrowed(
+        &self,
+        keys: &[&RecordKey],
+        read_ts: u64,
+        now: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.get_many_with(keys.len(), |index| keys[index], read_ts, now)
+    }
+
+    fn get_many_with<'a>(
+        &self,
+        key_count: usize,
+        key_at: impl Fn(usize) -> &'a RecordKey,
+        read_ts: u64,
+        now: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        if key_count == 0 {
             return Ok(Vec::new());
         }
 
@@ -694,9 +714,9 @@ impl SegmentStore {
             .read()
             .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
         let paths = self.newest_paths()?;
-        let mut values = vec![None; keys.len()];
-        let mut unresolved = (0..keys.len()).collect::<Vec<_>>();
-        let mut next_unresolved = Vec::with_capacity(keys.len());
+        let mut values = vec![None; key_count];
+        let mut unresolved = (0..key_count).collect::<Vec<_>>();
+        let mut next_unresolved = Vec::with_capacity(key_count);
         let mut cached_segments =
             self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
 
@@ -708,7 +728,7 @@ impl SegmentStore {
             let is_snapshot = segment.is_snapshot();
             next_unresolved.clear();
             for index in unresolved.drain(..) {
-                if let Some((_, value, expires_at)) = segment.version_at(&keys[index], read_ts) {
+                if let Some((_, value, expires_at)) = segment.version_at(key_at(index), read_ts) {
                     values[index] = if expires_at != 0 && expires_at <= now { None } else { value };
                 } else if !is_snapshot {
                     next_unresolved.push(index);

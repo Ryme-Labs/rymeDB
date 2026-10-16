@@ -2937,7 +2937,9 @@ impl DurableManager {
                     return Ok(Vec::new());
                 }
                 let now = now_unix();
-                let mut values = self.segments.get_many(keys, txn.read_ts, now)?;
+                let mut values = vec![None; keys.len()];
+                let mut segment_indices = Vec::with_capacity(keys.len());
+                let mut segment_keys = Vec::with_capacity(keys.len());
                 for (index, key) in keys.iter().enumerate() {
                     if let Some(staged) = txn.writes.get(key) {
                         values[index] = if staged.expires_at != 0 && staged.expires_at <= now {
@@ -2946,7 +2948,18 @@ impl DurableManager {
                             staged.value.clone()
                         };
                     } else {
-                        txn.record_read_ref(key, values[index].is_some())?;
+                        segment_indices.push(index);
+                        segment_keys.push(key);
+                    }
+                }
+                if !segment_keys.is_empty() {
+                    let segment_values =
+                        self.segments.get_many_borrowed(&segment_keys, txn.read_ts, now)?;
+                    for ((index, key), value) in
+                        segment_indices.into_iter().zip(segment_keys).zip(segment_values)
+                    {
+                        txn.record_read_ref(key, value.is_some())?;
+                        values[index] = value;
                     }
                 }
                 Ok(values)
@@ -4247,6 +4260,37 @@ mod tests {
             manager.get_many(&mut current, &[first, second, missing]).unwrap(),
             vec![Some(b"new".to_vec()), None, Some(b"staged".to_vec())]
         );
+
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_mode_batch_reads_skip_segment_lookup_for_staged_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-batch-staged-read-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let key = RecordKey::new("t", "d", "items", b"staged");
+        let mut seed = manager.begin();
+        manager.put(&mut seed, key.clone(), b"durable".to_vec());
+        manager.commit(seed).unwrap();
+
+        let mut txn = manager.begin();
+        manager.put(&mut txn, key.clone(), b"staged".to_vec());
+        let before = manager.segment_cache_stats();
+        assert_eq!(manager.get_many(&mut txn, &[key]).unwrap(), vec![Some(b"staged".to_vec())]);
+        assert_eq!(manager.segment_cache_stats(), before);
 
         drop(manager);
         let _ = std::fs::remove_dir_all(&dir);
