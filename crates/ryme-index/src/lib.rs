@@ -119,6 +119,7 @@ struct HnswIndex {
     id_to_pos: HashMap<String, usize>,
     entry: Option<usize>,
     rng: u64,
+    tombstones: usize,
 }
 
 impl HnswIndex {
@@ -146,13 +147,17 @@ impl HnswIndex {
         if dim != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
-        if let Some(pos) = self.id_to_pos.get(&id).copied() {
-            if let Some(node) = self.nodes.get_mut(pos) {
-                node.vector = vector;
-                node.tombstoned = false;
-            }
-            return Ok(());
+        if self.id_to_pos.contains_key(&id) {
+            self.remove(&id);
         }
+        self.insert_new(id, vector)?;
+        if self.tombstones >= 64 && self.tombstones >= self.id_to_pos.len() {
+            self.rebuild()?;
+        }
+        Ok(())
+    }
+
+    fn insert_new(&mut self, id: String, vector: Vec<f32>) -> Result<()> {
         let level = self.sample_level();
         let pos = self.nodes.len();
         self.nodes.push(HnswNode {
@@ -187,6 +192,23 @@ impl HnswIndex {
         }
         if level > entry_level {
             self.entry = Some(pos);
+        }
+        Ok(())
+    }
+
+    fn rebuild(&mut self) -> Result<()> {
+        let active: Vec<(String, Vec<f32>)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(pos, node)| !node.tombstoned && self.id_to_pos.get(&node.id) == Some(pos))
+            .map(|(_, node)| (node.id.clone(), node.vector.clone()))
+            .collect();
+        let dim = self.dim;
+        *self = Self::default();
+        self.dim = dim;
+        for (id, vector) in active {
+            self.insert_new(id, vector)?;
         }
         Ok(())
     }
@@ -247,12 +269,11 @@ impl HnswIndex {
         let mut candidates: BinaryHeap<Scored> = BinaryHeap::new();
         let mut results: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::new();
         for start in starts {
-            if self.nodes[start].tombstoned {
-                continue;
-            }
             let score = dot(query, &self.nodes[start].vector);
             candidates.push(Scored(score, start));
-            results.push(std::cmp::Reverse(Scored(score, start)));
+            if !self.nodes[start].tombstoned {
+                results.push(std::cmp::Reverse(Scored(score, start)));
+            }
         }
         while let Some(Scored(score, pos)) = candidates.pop() {
             let worst = results.peek().map(|s| (s.0).0).unwrap_or(f64::NEG_INFINITY);
@@ -261,16 +282,18 @@ impl HnswIndex {
             }
             let neighbors = self.nodes[pos].neighbors.get(layer).map(Vec::as_slice).unwrap_or(&[]);
             for &neighbor in neighbors {
-                if !visited.insert(neighbor) || self.nodes[neighbor].tombstoned {
+                if !visited.insert(neighbor) {
                     continue;
                 }
                 let neighbor_score = dot(query, &self.nodes[neighbor].vector);
                 let worst = results.peek().map(|s| (s.0).0).unwrap_or(f64::NEG_INFINITY);
                 if neighbor_score > worst || results.len() < ef {
                     candidates.push(Scored(neighbor_score, neighbor));
-                    results.push(std::cmp::Reverse(Scored(neighbor_score, neighbor)));
-                    if results.len() > ef {
-                        results.pop();
+                    if !self.nodes[neighbor].tombstoned {
+                        results.push(std::cmp::Reverse(Scored(neighbor_score, neighbor)));
+                        if results.len() > ef {
+                            results.pop();
+                        }
                     }
                 }
             }
@@ -307,6 +330,7 @@ impl HnswIndex {
         if let Some(pos) = self.id_to_pos.remove(id) {
             if let Some(node) = self.nodes.get_mut(pos) {
                 node.tombstoned = true;
+                self.tombstones += 1;
             }
             true
         } else {
@@ -962,7 +986,7 @@ mod tests {
         registry.vector_upsert("s", String::from("a"), vec![1.0, 0.0]).unwrap();
         assert!(registry.vector_remove("s", "a"));
         assert!(!registry.vector_remove("s", "a"));
-        assert!(registry.vector_search("s", &[1.0, 0.0], 1).unwrap().is_empty());
+        assert!(matches!(registry.vector_search("s", &[1.0, 0.0], 1), Err(RymeError::NotFound(_))));
     }
 
     #[test]
@@ -974,6 +998,33 @@ mod tests {
         let hits = registry.ann_search("s", &[0.0, 1.0], 1, 16).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "new");
+    }
+
+    #[test]
+    fn ann_vector_updates_relink_nodes_and_bound_tombstones() {
+        let mut registry = IndexRegistry::new();
+        for index in 0..128 {
+            let angle = index as f32 * std::f32::consts::TAU / 128.0;
+            registry
+                .vector_upsert("s", format!("v{index}"), vec![angle.cos(), angle.sin()])
+                .unwrap();
+        }
+
+        for revision in 0..256 {
+            let angle = (revision as f32 * 0.37) % std::f32::consts::TAU;
+            registry
+                .vector_upsert("s", String::from("v0"), vec![angle.cos(), angle.sin()])
+                .unwrap();
+        }
+
+        let query = [0.0, 1.0];
+        let exact = registry.vector_search("s", &query, 1).unwrap();
+        let approximate = registry.ann_search("s", &query, 1, 256).unwrap();
+        assert_eq!(approximate[0].id, exact[0].id);
+
+        let ann = &registry.vectors["s"].ann;
+        assert!(ann.nodes.len() <= ann.id_to_pos.len() + 63);
+        assert!(ann.nodes.iter().filter(|node| node.tombstoned).count() < 64);
     }
 
     #[test]
