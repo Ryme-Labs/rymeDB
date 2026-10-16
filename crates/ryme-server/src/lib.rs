@@ -888,6 +888,18 @@ mod auth_attempt_limiter_tests {
     }
 
     #[test]
+    fn oidc_login_starts_are_rate_limited_per_client() {
+        let mut limiter = AuthAttemptLimiter::default();
+        let client = "192.0.2.10".parse().unwrap();
+        let attempt_key = auth_attempt_key("oidc-login", "start");
+        for _ in 0..AUTH_ATTEMPTS_PER_IDENTITY {
+            assert!(limiter.admit(client, &attempt_key, 100).is_ok());
+        }
+        assert!(limiter.admit(client, &attempt_key, 100).is_err());
+        assert!(limiter.admit("192.0.2.11".parse().unwrap(), &attempt_key, 100).is_ok());
+    }
+
+    #[test]
     fn forwarded_client_ip_is_trusted_only_through_configured_proxy_chain() {
         let proxy: ipnet::IpNet = "10.0.0.0/8".parse().unwrap();
         let trusted = [proxy];
@@ -6570,7 +6582,11 @@ pub struct OidcTokenRequest {
     pub state: String,
 }
 
-async fn oidc_login(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
+async fn oidc_login(
+    State(state): State<SharedState>,
+    Extension(client_ip): Extension<AuthClientIp>,
+    body: axum::body::Bytes,
+) -> Response {
     let request: OidcLoginRequest = match json_body(&body) {
         Ok(request) => request,
         Err(e) => return error_response(e),
@@ -6578,6 +6594,10 @@ async fn oidc_login(State(state): State<SharedState>, body: axum::body::Bytes) -
     let Some(config) = state.oidc.clone() else {
         return error_response(ryme_error::RymeError::Unavailable(String::from("oidc")));
     };
+    let attempt_key = auth_attempt_key("oidc-login", "start");
+    if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
+        return error_response(error);
+    }
     let client_state = request.state;
     let state_value = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(32));
     match config.auth_url(&request.redirect_uri, &state_value) {

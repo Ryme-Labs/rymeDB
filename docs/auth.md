@@ -154,6 +154,12 @@ When OIDC is enabled, `RYME_OIDC_REDIRECT_URIS` is required. It must contain
 the exact callback URLs accepted by `/v1/auth/oidc/login`; arbitrary callback
 URLs are rejected.
 
+Authentication attempts are limited to 5 per credential and client IP, and
+120 total per client IP, per 60-second window. OIDC login initiation is
+included to prevent one client from filling the pending-state table. Limits
+are local to each server process; multi-node deployments should also rate
+limit authentication routes at a trusted edge.
+
 ## Row-level security
 
 For simple tenant tables, configure a tenant column:
