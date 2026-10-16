@@ -2937,6 +2937,15 @@ impl DurableManager {
                     return Ok(Vec::new());
                 }
                 let now = now_unix();
+                if txn.writes.is_empty() {
+                    let values = self.segments.get_many(keys, txn.read_ts, now)?;
+                    if !txn.read_only {
+                        for (key, value) in keys.iter().zip(&values) {
+                            txn.record_read_ref(key, value.is_some())?;
+                        }
+                    }
+                    return Ok(values);
+                }
                 let mut values = vec![None; keys.len()];
                 let mut segment_indices = Vec::with_capacity(keys.len());
                 let mut segment_keys = Vec::with_capacity(keys.len());
