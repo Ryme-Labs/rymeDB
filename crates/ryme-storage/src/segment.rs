@@ -2,12 +2,13 @@ use super::{Engine, RecordKey};
 use ryme_error::{Result, RymeError};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SEGMENT_MAGIC: u32 = 0x5259_5347;
-const SEGMENT_VERSION: u16 = 1;
+const SEGMENT_VERSION: u16 = 2;
 const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
@@ -340,6 +341,7 @@ impl ImmutableSegment {
         out.extend_from_slice(&SEGMENT_VERSION.to_be_bytes());
         out.extend_from_slice(&(self.kind as u16).to_be_bytes());
         out.extend_from_slice(&self.meta.id.to_be_bytes());
+        out.extend_from_slice(&self.meta.max_commit_ts.to_be_bytes());
         out.extend_from_slice(
             &(u32::try_from(payload.len())
                 .map_err(|_| RymeError::InvalidArgument(String::from("segment size")))?)
@@ -366,8 +368,8 @@ impl ImmutableSegment {
         if input.len() > MAX_SEGMENT_BYTES {
             return Err(RymeError::Overload(String::from("segment")));
         }
-        const HEADER: usize = 4 + 2 + 2 + 8 + 4;
-        if input.len() < HEADER + 4 {
+        const V1_HEADER: usize = 4 + 2 + 2 + 8 + 4;
+        if input.len() < V1_HEADER + 4 {
             return Err(RymeError::Corrupt(String::from("segment header")));
         }
         let stored = u32::from_be_bytes(
@@ -387,10 +389,12 @@ impl ImmutableSegment {
             _ => return Err(RymeError::Corrupt(String::from("segment kind"))),
         };
         let id = take_u64(&mut cursor)?;
-        let payload_len = take_u32(&mut cursor)? as usize;
-        if magic != SEGMENT_MAGIC || version != SEGMENT_VERSION {
+        if magic != SEGMENT_MAGIC || (version != 1 && version != SEGMENT_VERSION) {
             return Err(RymeError::Corrupt(String::from("segment magic")));
         }
+        let declared_max =
+            if version == SEGMENT_VERSION { Some(take_u64(&mut cursor)?) } else { None };
+        let payload_len = take_u32(&mut cursor)? as usize;
         if cursor.len() < payload_len + 4 {
             return Err(RymeError::Corrupt(String::from("segment length")));
         }
@@ -398,6 +402,9 @@ impl ImmutableSegment {
         cursor = &cursor[payload_len..];
         let engine = Engine::decode_snapshot(payload)?;
         let segment = Self::from_engine_owned(id, engine, kind);
+        if declared_max.is_some_and(|declared| declared != segment.meta.max_commit_ts) {
+            return Err(RymeError::Corrupt(String::from("segment commit")));
+        }
         if segment.meta.max_commit_ts != segment.engine.max_commit_ts() {
             return Err(RymeError::Corrupt(String::from("segment commit")));
         }
@@ -694,8 +701,7 @@ impl SegmentStore {
     pub fn max_commit_ts(&self) -> Result<u64> {
         let mut max_commit_ts = 0;
         for path in self.segment_paths()? {
-            let segment = ImmutableSegment::decode(&read_segment_file(&path)?)?;
-            max_commit_ts = max_commit_ts.max(segment.meta.max_commit_ts);
+            max_commit_ts = max_commit_ts.max(read_segment_max_commit_ts(&path)?);
         }
         Ok(max_commit_ts)
     }
@@ -975,6 +981,68 @@ fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
+    const V2_HEADER: usize = 4 + 2 + 2 + 8 + 8 + 4;
+    let file_len = std::fs::metadata(path)?.len();
+    if file_len > MAX_SEGMENT_BYTES as u64 {
+        return Err(RymeError::Overload(String::from("segment")));
+    }
+    if file_len < 6 {
+        return Err(RymeError::Corrupt(String::from("segment header")));
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    let mut prefix = [0; 6];
+    file.read_exact(&mut prefix)?;
+    let version = u16::from_be_bytes([prefix[4], prefix[5]]);
+    if version == 1 {
+        let bytes = read_segment_file(path)?;
+        return Ok(ImmutableSegment::decode(&bytes)?.meta.max_commit_ts);
+    }
+    if version != SEGMENT_VERSION || file_len < (V2_HEADER + 4) as u64 {
+        return Err(RymeError::Corrupt(String::from("segment header")));
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0; V2_HEADER];
+    file.read_exact(&mut header)?;
+    let mut cursor = &header[..];
+    let magic = take_u32(&mut cursor)?;
+    let _version = take_u16(&mut cursor)?;
+    let kind = take_u16(&mut cursor)?;
+    let id = take_u64(&mut cursor)?;
+    let max_commit_ts = take_u64(&mut cursor)?;
+    let payload_len = take_u32(&mut cursor)? as u64;
+    let expected_id =
+        parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
+    if magic != SEGMENT_MAGIC
+        || !matches!(kind, 0 | 1)
+        || expected_id != Some(id)
+        || payload_len > file_len.saturating_sub((V2_HEADER + 4) as u64)
+    {
+        return Err(RymeError::Corrupt(String::from("segment header")));
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let checksum_len = file_len - 4;
+    let mut remaining = checksum_len;
+    let mut buffer = [0; 64 * 1024];
+    let mut hasher = crc32fast::Hasher::new();
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        hasher.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    let mut stored_checksum = [0; 4];
+    file.read_exact(&mut stored_checksum)?;
+    if hasher.finalize() != u32::from_be_bytes(stored_checksum) {
+        return Err(RymeError::Corrupt(String::from("segment checksum")));
+    }
+
+    Ok(max_commit_ts)
+}
+
 fn discover_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     let entries = match std::fs::read_dir(dir) {
@@ -1136,6 +1204,18 @@ fn take_field<'a>(cursor: &mut &'a [u8]) -> Result<&'a [u8]> {
 mod tests {
     use super::*;
 
+    fn encode_v1_segment(segment: &ImmutableSegment) -> Vec<u8> {
+        let v2 = segment.encode().unwrap();
+        let mut v1 = Vec::with_capacity(v2.len() - 8);
+        v1.extend_from_slice(&v2[..4]);
+        v1.extend_from_slice(&1u16.to_be_bytes());
+        v1.extend_from_slice(&v2[6..16]);
+        v1.extend_from_slice(&v2[24..v2.len() - 4]);
+        let checksum = crc32fast::hash(&v1);
+        v1.extend_from_slice(&checksum.to_be_bytes());
+        v1
+    }
+
     #[test]
     fn immutable_segment_roundtrip_uses_index_and_bloom() {
         let mut engine = Engine::new();
@@ -1157,6 +1237,53 @@ mod tests {
     }
 
     #[test]
+    fn segment_v1_remains_readable_after_header_upgrade() {
+        let key = RecordKey::new("tenant", "db", "items", b"legacy");
+        let mut engine = Engine::new();
+        engine.apply(key.clone(), 42, Some(b"value".to_vec())).unwrap();
+        let segment = ImmutableSegment::from_engine(42, &engine);
+
+        let restored = ImmutableSegment::decode(&encode_v1_segment(&segment)).unwrap();
+        assert_eq!(restored.meta().max_commit_ts, 42);
+        assert_eq!(restored.get(&key, 42, 0).unwrap(), Some(b"value".to_vec()));
+
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-v1-max-ts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(segment_name(42)), encode_v1_segment(&segment)).unwrap();
+        assert_eq!(SegmentStore::open(&dir).unwrap().max_commit_ts().unwrap(), 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_max_commit_reads_header_and_checks_checksum() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-max-ts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let key = RecordKey::new("tenant", "db", "items", b"row");
+        let mut engine = Engine::new();
+        engine.apply(key, 42, Some(b"value".to_vec())).unwrap();
+        let (_, path) = store.write(42, &engine).unwrap();
+        assert_eq!(store.max_commit_ts().unwrap(), 42);
+
+        let mut encoded = std::fs::read(&path).unwrap();
+        encoded[32] ^= 1;
+        std::fs::write(path, encoded).unwrap();
+        assert!(
+            matches!(store.max_commit_ts(), Err(RymeError::Corrupt(message)) if message == "segment checksum")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn decode_rejects_sparse_index_mismatch_without_accepting_bad_metadata() {
         let key = RecordKey::new("tenant", "db", "items", b"a");
         let mut engine = Engine::new();
@@ -1164,8 +1291,8 @@ mod tests {
         let segment = ImmutableSegment::from_engine(7, &engine);
         let mut encoded = segment.encode().unwrap();
 
-        let payload_len = u32::from_be_bytes(encoded[16..20].try_into().unwrap()) as usize;
-        let metadata_offset = 20 + payload_len;
+        let payload_len = u32::from_be_bytes(encoded[24..28].try_into().unwrap()) as usize;
+        let metadata_offset = 28 + payload_len;
         let bloom_len =
             u32::from_be_bytes(encoded[metadata_offset..metadata_offset + 4].try_into().unwrap())
                 as usize;
