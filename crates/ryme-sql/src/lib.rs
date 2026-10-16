@@ -10436,16 +10436,26 @@ where
         }
     }
 
-    fn project_row(
+    fn project_rows(
         &self,
         table: &str,
+        columns: &[String],
+        rows: impl Iterator<Item = Row>,
+    ) -> Vec<Vec<Vec<u8>>> {
+        let definitions = self.catalog_columns(table);
+        let primary_keys =
+            definitions.iter().filter(|definition| definition.primary_key).collect::<Vec<_>>();
+        rows.map(|(pk, value)| Self::project_row(&definitions, &primary_keys, columns, &pk, &value))
+            .collect()
+    }
+
+    fn project_row(
+        definitions: &[ColumnDefinition],
+        primary_keys: &[&ColumnDefinition],
         columns: &[String],
         pk: &[u8],
         value: &[u8],
     ) -> Vec<Vec<u8>> {
-        let definitions = self.catalog_columns(table);
-        let primary_keys =
-            definitions.iter().filter(|definition| definition.primary_key).collect::<Vec<_>>();
         let composite_parts = (primary_keys.len() > 1).then(|| decode_key_parts(pk)).flatten();
         let object = serde_json::from_slice::<serde_json::Value>(value).ok();
         columns
@@ -10533,12 +10543,7 @@ where
             .filter(|(pk, value)| filter.iter().all(|predicate| predicate.matches(pk, value)))
             .collect();
         rows.sort_by(|left, right| compare_order(&order, left, right));
-        let rows = rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
-            .collect();
+        let rows = self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
         let output_columns = columns
             .iter()
             .enumerate()
@@ -10601,12 +10606,12 @@ where
         if columns.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("COPY table columns")));
         }
-        let rows = self
-            .scan_all_rows_in_transaction(txn, &table)?
-            .into_iter()
-            .filter(|(_, value)| self.rls_allows(&table, value))
-            .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
-            .collect();
+        let source_rows = self.scan_all_rows_in_transaction(txn, &table)?;
+        let rows = self.project_rows(
+            &table,
+            &columns,
+            source_rows.into_iter().filter(|(_, value)| self.rls_allows(&table, value)),
+        );
         Ok(QueryResult::Table { columns, rows })
     }
 
@@ -14553,12 +14558,8 @@ where
                     })
                     .collect();
                 rows.sort_by(|left, right| compare_order(&order, left, right));
-                let rows = rows
-                    .into_iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
-                    .collect();
+                let rows =
+                    self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
                 let output_columns = columns
                     .iter()
                     .enumerate()
@@ -14585,12 +14586,8 @@ where
                     })
                     .collect();
                 rows.sort_by(|left, right| compare_order(&order, left, right));
-                let rows = rows
-                    .into_iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|(pk, value)| self.project_row(&table, &columns, &pk, &value))
-                    .collect();
+                let rows =
+                    self.project_rows(&table, &columns, rows.into_iter().skip(offset).take(limit));
                 let output_columns = columns
                     .iter()
                     .enumerate()
