@@ -1363,6 +1363,13 @@ fn rls_uid_policies_allow(
 
 pub type Row = (Vec<u8>, Vec<u8>);
 
+enum ProjectionSource {
+    PrimaryKey(usize),
+    Key,
+    RawValue,
+    Json(String),
+}
+
 // Queries that need a complete row set (aggregates, joins, grouped queries and
 // write-from scans) must fail closed before an unbounded tenant-sized
 // allocation becomes possible.  The byte limit accounts for row payloads and
@@ -10445,64 +10452,78 @@ where
         let definitions = self.catalog_columns(table);
         let primary_keys =
             definitions.iter().filter(|definition| definition.primary_key).collect::<Vec<_>>();
-        rows.map(|(pk, value)| Self::project_row(&definitions, &primary_keys, columns, &pk, &value))
-            .collect()
-    }
-
-    fn project_row(
-        definitions: &[ColumnDefinition],
-        primary_keys: &[&ColumnDefinition],
-        columns: &[String],
-        pk: &[u8],
-        value: &[u8],
-    ) -> Vec<Vec<u8>> {
-        let composite_parts = (primary_keys.len() > 1).then(|| decode_key_parts(pk)).flatten();
-        let object = serde_json::from_slice::<serde_json::Value>(value).ok();
-        columns
+        let projection = columns
             .iter()
             .map(|column| {
-                let schema_column = definitions
-                    .iter()
-                    .any(|definition| definition.name.eq_ignore_ascii_case(column));
-                if let Some(primary_index) = primary_keys
+                if let Some(index) = primary_keys
                     .iter()
                     .position(|definition| definition.name.eq_ignore_ascii_case(column))
                 {
-                    if let Some(parts) = composite_parts.as_ref() {
-                        return parts.get(primary_index).cloned().unwrap_or_default();
-                    }
-                    return pk.to_vec();
-                }
-                if column.eq_ignore_ascii_case("key")
+                    ProjectionSource::PrimaryKey(index)
+                } else if column.eq_ignore_ascii_case("key")
                     || column.eq_ignore_ascii_case("pk")
                     || column.eq_ignore_ascii_case("id")
                 {
-                    return pk.to_vec();
-                }
-                if !schema_column
+                    ProjectionSource::Key
+                } else if !definitions
+                    .iter()
+                    .any(|definition| definition.name.eq_ignore_ascii_case(column))
                     && (column.eq_ignore_ascii_case("value")
                         || column.eq_ignore_ascii_case("val")
                         || column.eq_ignore_ascii_case("data"))
                 {
-                    return value.to_vec();
+                    ProjectionSource::RawValue
+                } else {
+                    ProjectionSource::Json(column.clone())
                 }
-                let Some(serde_json::Value::Object(object)) = object.as_ref() else {
-                    return value.to_vec();
-                };
-                if let Some((projected, text_result)) = json_projection_value(column, object) {
-                    return if projected.is_null() {
-                        SQL_NULL_SENTINEL.to_vec()
-                    } else if text_result {
-                        json_result_bytes(projected)
-                    } else {
-                        serde_json::to_vec(projected).unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let needs_json =
+            projection.iter().any(|source| matches!(source, ProjectionSource::Json(_)));
+        rows.map(|(pk, value)| {
+            Self::project_row(&primary_keys, &projection, needs_json, &pk, &value)
+        })
+        .collect()
+    }
+
+    fn project_row(
+        primary_keys: &[&ColumnDefinition],
+        projection: &[ProjectionSource],
+        needs_json: bool,
+        pk: &[u8],
+        value: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let composite_parts = (primary_keys.len() > 1).then(|| decode_key_parts(pk)).flatten();
+        let object =
+            needs_json.then(|| serde_json::from_slice::<serde_json::Value>(value).ok()).flatten();
+        projection
+            .iter()
+            .map(|source| match source {
+                ProjectionSource::PrimaryKey(index) => composite_parts
+                    .as_ref()
+                    .map(|parts| parts.get(*index).cloned().unwrap_or_default())
+                    .unwrap_or_else(|| pk.to_vec()),
+                ProjectionSource::Key => pk.to_vec(),
+                ProjectionSource::RawValue => value.to_vec(),
+                ProjectionSource::Json(column) => {
+                    let Some(serde_json::Value::Object(object)) = object.as_ref() else {
+                        return value.to_vec();
                     };
+                    if let Some((projected, text_result)) = json_projection_value(column, object) {
+                        return if projected.is_null() {
+                            SQL_NULL_SENTINEL.to_vec()
+                        } else if text_result {
+                            json_result_bytes(projected)
+                        } else {
+                            serde_json::to_vec(projected).unwrap_or_default()
+                        };
+                    }
+                    object
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                        .map(|(_, value)| json_result_bytes_or_null(value))
+                        .unwrap_or_default()
                 }
-                object
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                    .map(|(_, value)| json_result_bytes_or_null(value))
-                    .unwrap_or_default()
             })
             .collect()
     }
