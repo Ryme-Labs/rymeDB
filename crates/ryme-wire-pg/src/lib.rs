@@ -28,7 +28,7 @@ use tokio::sync::broadcast;
 
 pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
 pub type PgAuditHook =
-    Arc<dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+    Arc<dyn Fn(String, String, u16) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Default admission limit for the convenience `serve` method.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
@@ -3384,7 +3384,7 @@ where
             } else {
                 200
             };
-            hook(limits.audit_actor.clone(), status).await;
+            hook(limits.audit_actor.clone(), limits.tenant.clone(), status).await;
         }
     }
     response
@@ -4901,9 +4901,9 @@ mod tests {
     async fn admin_and_schema_statements_invoke_audit_hook() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let audit_events = Arc::clone(&events);
-        let hook: PgAuditHook = Arc::new(move |actor, status| {
+        let hook: PgAuditHook = Arc::new(move |actor, tenant, status| {
             let events = Arc::clone(&audit_events);
-            Box::pin(async move { events.lock().unwrap().push((actor, status)) })
+            Box::pin(async move { events.lock().unwrap().push((actor, tenant, status)) })
         });
         let mut limits = ConnLimits {
             tenant: String::from("tenant"),
@@ -4935,7 +4935,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.first(), Some(&b'E'));
-        assert_eq!(events.lock().unwrap().as_slice(), [(String::from("reader-id"), 403)]);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [(String::from("reader-id"), String::from("tenant"), 403)]
+        );
 
         limits.admin_allowed = true;
         let mut active = None;
@@ -4951,7 +4954,10 @@ mod tests {
         assert_eq!(response.first(), Some(&b'C'));
         assert_eq!(
             events.lock().unwrap().as_slice(),
-            [(String::from("reader-id"), 403), (String::from("reader-id"), 200)]
+            [
+                (String::from("reader-id"), String::from("tenant"), 403),
+                (String::from("reader-id"), String::from("tenant"), 200),
+            ]
         );
 
         let mut active = None;

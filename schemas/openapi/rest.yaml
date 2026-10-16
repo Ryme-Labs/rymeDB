@@ -131,7 +131,7 @@ paths:
   /v1/audit:
     get:
       tags: [node]
-      description: Recent persisted authentication and administrative actions. Only a platform superuser may read the audit trail.
+      description: Recent persisted authentication and administrative actions, including privileged SQL statements over HTTP and the PostgreSQL wire protocol. Only a platform superuser may read the audit trail.
       parameters:
         - in: query
           name: limit
@@ -2247,11 +2247,16 @@ components:
           type: string
           nullable: true
           description: authenticated principal ID, or null for unauthenticated attempts
+        tenant:
+          type: string
+          nullable: true
+          description: authenticated principal tenant, or null when no principal tenant is available
         method:
           type: string
+          description: HTTP method, or PG for PostgreSQL wire protocol events
         action:
           type: string
-          description: matched route template; request bodies and credentials are never recorded
+          description: matched route template or privileged SQL statement class; raw SQL, request bodies, and credentials are never recorded
         status:
           type: integer
         outcome:

@@ -557,6 +557,8 @@ const MAX_AUDIT_FILE_BYTES: usize = 4 * 1024 * 1024;
 struct AuditEvent {
     timestamp_secs: u64,
     actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
     method: String,
     action: String,
     status: u16,
@@ -3109,9 +3111,9 @@ async fn record_http_status(
             .map(|matched| matched.as_str().to_owned())
             .unwrap_or_else(|| String::from("/v1/admin-action"))
     });
-    let actor = audit_action
-        .as_ref()
-        .and_then(|_| state.principal(request.headers()).ok().map(|principal| principal.id));
+    let identity = audit_action.as_ref().and_then(|_| {
+        state.principal(request.headers()).ok().map(|principal| (principal.id, principal.tenant))
+    });
     let response = next.run(request).await;
     let status = response.status().as_u16();
     state.http_request_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3121,7 +3123,9 @@ async fn record_http_status(
         state.http_5xx_count.fetch_add(1, AtomicOrdering::Relaxed);
     }
     if let Some(action) = audit_action {
-        record_audit_event(&state, actor, method, action, status).await;
+        let (actor, tenant) =
+            identity.map_or((None, None), |(actor, tenant)| (Some(actor), Some(tenant)));
+        record_audit_event(&state, actor, tenant, method, action, status).await;
     }
     response
 }
@@ -3129,6 +3133,7 @@ async fn record_http_status(
 async fn record_audit_event(
     state: &SharedState,
     actor: Option<String>,
+    tenant: Option<String>,
     method: String,
     action: String,
     status: u16,
@@ -3136,6 +3141,7 @@ async fn record_audit_event(
     let event = AuditEvent {
         timestamp_secs: now_secs(),
         actor,
+        tenant,
         method,
         action,
         status,
@@ -3585,12 +3591,13 @@ fn spawn_gateways(
         .with_metering(state.metering.clone())
         .with_observe(state.latency.clone(), state.histogram.clone(), state.slow_log.clone())
         .with_range_hook(range_hook.clone())
-        .with_audit_hook(Arc::new(move |actor, status| {
+        .with_audit_hook(Arc::new(move |actor, tenant, status| {
             let state = pg_audit_state.clone();
             Box::pin(async move {
                 record_audit_event(
                     &state,
                     Some(actor),
+                    Some(tenant),
                     String::from("PG"),
                     String::from("/pg/sql/admin-or-schema-change"),
                     status,
@@ -9956,6 +9963,7 @@ async fn sql_exec(
         record_audit_event(
             &state,
             Some(principal.id.clone()),
+            Some(principal.tenant.clone()),
             String::from("POST"),
             String::from("/v1/sql/admin-or-schema-change"),
             StatusCode::FORBIDDEN.as_u16(),
@@ -10078,6 +10086,7 @@ async fn sql_exec(
         record_audit_event(
             &state,
             Some(principal.id.clone()),
+            Some(principal.tenant.clone()),
             String::from("POST"),
             String::from("/v1/sql/admin-or-schema-change"),
             result.status().as_u16(),
@@ -14621,6 +14630,7 @@ mod realtime_policy_tests {
                 .record(AuditEvent {
                     timestamp_secs: status as u64,
                     actor: Some(String::from("operator")),
+                    tenant: Some(String::from("default")),
                     method: String::from("POST"),
                     action: String::from("/v1/cluster/members"),
                     status,
@@ -14662,6 +14672,12 @@ mod realtime_policy_tests {
         assert!(!is_audited_sql(
             &ryme_sql::parse("INSERT INTO messages (id) VALUES ('one')").unwrap()
         ));
+
+        let legacy_event: AuditEvent = serde_json::from_str(
+            r#"{"timestamp_secs":1,"actor":null,"method":"POST","action":"/v1/auth/token","status":401,"outcome":"failure"}"#,
+        )
+        .unwrap();
+        assert!(legacy_event.tenant.is_none());
     }
 
     #[tokio::test]
@@ -14701,6 +14717,7 @@ mod realtime_policy_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let event = state.audit_log.recent(1).pop().unwrap();
         assert_eq!(event.actor.as_deref(), Some("reader"));
+        assert_eq!(event.tenant.as_deref(), Some("default"));
         assert_eq!(event.action, "/v1/sql/admin-or-schema-change");
         assert_eq!(event.status, StatusCode::FORBIDDEN.as_u16());
         assert_eq!(event.outcome, "failure");
