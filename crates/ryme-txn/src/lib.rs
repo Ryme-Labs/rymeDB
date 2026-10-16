@@ -2511,11 +2511,9 @@ impl DurableManager {
     pub fn retention_sweep(&self, snapshot_keep: usize) -> Result<(usize, usize)> {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
-        let pruned = self.prune_snapshots(snapshot_keep)?;
-        let _segments_pruned = self.segments.prune(snapshot_keep)?;
-        if self.segments.segment_paths()?.len() >= SEGMENT_COMPACTION_THRESHOLD {
-            self.compact_segments_locked()?;
-        }
+        // WAL retention is justified by the oldest durable snapshot and does
+        // not depend on segment pruning or compaction succeeding. Perform it
+        // first so an oversized or damaged segment cannot stall WAL cleanup.
         let wal_removed = match self.oldest_snapshot()? {
             Some(floor) => self
                 .wal
@@ -2524,6 +2522,11 @@ impl DurableManager {
                 .truncate_below(floor)?,
             None => 0,
         };
+        let pruned = self.prune_snapshots(snapshot_keep)?;
+        let _segments_pruned = self.segments.prune(snapshot_keep)?;
+        if self.segments.segment_paths()?.len() >= SEGMENT_COMPACTION_THRESHOLD {
+            self.compact_segments_locked()?;
+        }
         Ok((pruned, wal_removed))
     }
 
@@ -4124,6 +4127,51 @@ mod tests {
             let key = RecordKey::new("t", "d", "s", &[i]);
             assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(vec![i]));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_truncates_wal_before_segment_pruning_can_fail() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-retain-corrupt-segment-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            64,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        for index in 0..10u8 {
+            let mut txn = manager.begin();
+            manager.put(&mut txn, RecordKey::new("t", "d", "s", &[index]), vec![index]);
+            manager.commit(txn).unwrap();
+        }
+        manager.write_snapshot().unwrap();
+        for index in 10..73u8 {
+            let mut txn = manager.begin();
+            manager.put(&mut txn, RecordKey::new("t", "d", "s", &[index]), vec![index]);
+            manager.commit(txn).unwrap();
+        }
+
+        let records_before = Wal::read_all(&dir).unwrap();
+        assert!(records_before.iter().any(|record| record.commit_ts < 10));
+        let latest_segment = manager.segments.segment_paths().unwrap().pop().unwrap();
+        let mut bytes = std::fs::read(&latest_segment).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(latest_segment, bytes).unwrap();
+
+        assert!(manager.retention_sweep(1).is_err());
+        let records_after = Wal::read_all(&dir).unwrap();
+        assert!(records_after.iter().all(|record| record.commit_ts >= 10));
+        assert!(records_after.len() < records_before.len());
+
+        drop(manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
