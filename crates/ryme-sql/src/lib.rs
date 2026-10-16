@@ -3374,27 +3374,95 @@ fn parse_policy_expression(raw: &str, keyword: &str) -> Option<String> {
 }
 
 fn policy_tenant_column(expression: &str) -> Option<String> {
-    if !expression.to_ascii_lowercase().contains("auth.uid()") {
+    let expression = strip_policy_outer_parens(expression.trim());
+    let (left, right) = split_policy_equality(expression)?;
+    if policy_auth_uid_side(left) {
+        policy_column_name(right)
+    } else if policy_auth_uid_side(right) {
+        policy_column_name(left)
+    } else {
+        None
+    }
+}
+
+fn strip_policy_outer_parens(mut expression: &str) -> &str {
+    loop {
+        expression = expression.trim();
+        if !expression.starts_with('(')
+            || matching_paren(expression, 0) != Some(expression.len().saturating_sub(1))
+        {
+            return expression;
+        }
+        expression = &expression[1..expression.len() - 1];
+    }
+}
+
+fn split_policy_equality(expression: &str) -> Option<(&str, &str)> {
+    let bytes = expression.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut equality = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                if bytes.get(index + 1) == Some(&delimiter) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            depth = depth.checked_sub(1)?;
+        } else if byte == b'=' && depth == 0 {
+            if matches!(bytes.get(index.wrapping_sub(1)), Some(b'!' | b'<' | b'>' | b'='))
+                || matches!(bytes.get(index + 1), Some(b'='))
+                || equality.is_some()
+            {
+                return None;
+            }
+            equality = Some(index);
+        }
+        index += 1;
+    }
+    if quote.is_some() || depth != 0 {
         return None;
     }
-    expression.split('=').map(str::trim).find_map(|side| {
-        let candidate = side.trim_matches(|character: char| {
-            character.is_ascii_whitespace() || character == '"' || character == '\''
-        });
-        if policy_auth_uid_side(candidate) {
-            return None;
-        }
-        if candidate.is_empty()
-            || candidate.contains('(')
-            || candidate.contains(')')
-            || !candidate.chars().all(|character| {
-                character.is_ascii_alphanumeric() || character == '_' || character == '.'
-            })
+    let equality = equality?;
+    Some((expression[..equality].trim(), expression[equality + 1..].trim()))
+}
+
+fn policy_column_name(side: &str) -> Option<String> {
+    let candidate = strip_policy_outer_parens(side);
+    let candidate = if candidate.starts_with('"') && candidate.ends_with('"') {
+        unquote(candidate)
+    } else {
+        candidate.to_string()
+    };
+    let mut parts = candidate.split('.').peekable();
+    while let Some(part) = parts.next() {
+        let mut characters = part.chars();
+        let first = characters.next()?;
+        if !(first.is_ascii_alphabetic() || first == '_')
+            || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
         {
             return None;
         }
-        Some(candidate.rsplit('.').next().unwrap_or(candidate).to_string())
-    })
+        if parts.peek().is_none()
+            && matches!(part.to_ascii_uppercase().as_str(), "TRUE" | "FALSE" | "NULL")
+        {
+            return None;
+        }
+    }
+    candidate.rsplit('.').next().map(str::to_string)
 }
 
 fn policy_auth_uid_side(side: &str) -> bool {
@@ -17336,6 +17404,27 @@ mod tests {
             "docs",
             br#"{"tenant_id":"tenant-b","body":"must stay hidden"}"#,
         ));
+    }
+
+    #[tokio::test]
+    async fn rls_rejects_boolean_composition_it_cannot_evaluate_safely() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE docs (id TEXT PRIMARY KEY, owner_id TEXT, other INT)").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let policy = executor
+            .execute(
+                parse(
+                    "CREATE POLICY unsafe ON docs FOR SELECT USING (auth.uid() = owner_id OR other = 0)",
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(policy, Err(RymeError::InvalidArgument(_))));
     }
 
     #[tokio::test]
