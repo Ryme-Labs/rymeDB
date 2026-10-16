@@ -329,6 +329,10 @@ impl ImmutableSegment {
         Ok(())
     }
 
+    fn merge_owned_into(self, target: &mut Engine) -> Result<()> {
+        target.merge_owned(self.engine)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let payload = self.engine.encode_snapshot()?;
         let mut out = Vec::with_capacity(4 + 2 + 2 + 8 + 4 + payload.len() + 4);
@@ -679,7 +683,7 @@ impl SegmentStore {
             if segment.is_snapshot() {
                 engine = segment.into_engine();
             } else {
-                segment.merge_into(&mut engine)?;
+                segment.merge_owned_into(&mut engine)?;
             }
             max_commit_ts = max_commit_ts.max(engine.max_commit_ts());
             found = true;

@@ -219,6 +219,26 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn merge_owned(&mut self, other: Engine) -> Result<()> {
+        let Engine { inner, bytes_held } = other;
+        for (key, mut incoming) in inner {
+            if incoming.is_empty() {
+                continue;
+            }
+            let versions = self.inner.entry(key).or_default();
+            if versions
+                .back()
+                .zip(incoming.front())
+                .is_some_and(|(last, first)| last.commit_ts >= first.commit_ts)
+            {
+                return Err(RymeError::Conflict(String::from("stale commit_ts")));
+            }
+            versions.append(&mut incoming);
+        }
+        self.bytes_held += bytes_held;
+        Ok(())
+    }
+
     fn visible(version: &Version, now: u64) -> Option<Vec<u8>> {
         if version.expires_at != 0 && version.expires_at <= now {
             return None;
@@ -977,6 +997,29 @@ mod tests {
         engine.apply(key.clone(), 30, None).unwrap();
         assert_eq!(engine.read(&key, 30, 1000).unwrap(), None);
         assert_eq!(engine.read(&key, 25, 1000).unwrap(), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn owned_engine_merge_preserves_history_tombstones_and_expiry() {
+        let key = RecordKey::new("t", "d", "items", b"row");
+        let expiring = RecordKey::new("t", "d", "items", b"expiring");
+        let mut base = Engine::new();
+        base.apply(key.clone(), 1, Some(b"old".to_vec())).unwrap();
+
+        let mut delta = Engine::new();
+        delta.apply(key.clone(), 2, Some(b"new".to_vec())).unwrap();
+        delta.apply(key.clone(), 3, None).unwrap();
+        delta.apply_with_expiry(expiring.clone(), 4, Some(b"ttl".to_vec()), 50).unwrap();
+
+        base.merge_owned(delta).unwrap();
+
+        assert_eq!(base.read(&key, 1, 0).unwrap(), Some(b"old".to_vec()));
+        assert_eq!(base.read(&key, 2, 0).unwrap(), Some(b"new".to_vec()));
+        assert_eq!(base.read(&key, 3, 0).unwrap(), None);
+        assert_eq!(base.read(&expiring, 4, 49).unwrap(), Some(b"ttl".to_vec()));
+        assert_eq!(base.read(&expiring, 4, 50).unwrap(), None);
+        assert_eq!(base.max_commit_ts(), 4);
+        assert_eq!(base.bytes_held(), 9);
     }
 
     #[test]
