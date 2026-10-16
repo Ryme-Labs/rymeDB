@@ -2401,7 +2401,8 @@ pub fn bind(sql: &str, params: &[String]) -> String {
     let mut index = 0;
     let mut quote = None;
     let mut line_comment = false;
-    let mut block_comment = false;
+    let mut block_comment_depth = 0usize;
+    let mut dollar_quote: Option<Vec<char>> = None;
     while index < chars.len() {
         let current = chars[index];
         if line_comment {
@@ -2412,13 +2413,28 @@ pub fn bind(sql: &str, params: &[String]) -> String {
             index += 1;
             continue;
         }
-        if block_comment {
+        if block_comment_depth > 0 {
             out.push(current);
-            if current == '*' && chars.get(index + 1) == Some(&'/') {
+            if current == '/' && chars.get(index + 1) == Some(&'*') {
+                out.push('*');
+                block_comment_depth += 1;
+                index += 2;
+            } else if current == '*' && chars.get(index + 1) == Some(&'/') {
                 out.push('/');
-                block_comment = false;
+                block_comment_depth -= 1;
                 index += 2;
             } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = dollar_quote.as_ref() {
+            if chars[index..].starts_with(delimiter.as_slice()) {
+                out.extend(delimiter.iter());
+                index += delimiter.len();
+                dollar_quote = None;
+            } else {
+                out.push(current);
                 index += 1;
             }
             continue;
@@ -2453,9 +2469,17 @@ pub fn bind(sql: &str, params: &[String]) -> String {
         if current == '/' && chars.get(index + 1) == Some(&'*') {
             out.push('/');
             out.push('*');
-            block_comment = true;
+            block_comment_depth = 1;
             index += 2;
             continue;
+        }
+        if current == '$' && dollar_token_boundary(&chars, index) {
+            if let Some((delimiter, end)) = dollar_quote_delimiter(&chars, index) {
+                out.extend(delimiter.iter());
+                dollar_quote = Some(delimiter);
+                index = end;
+                continue;
+            }
         }
         if current == '\'' || current == '"' {
             quote = Some(current);
@@ -2463,7 +2487,7 @@ pub fn bind(sql: &str, params: &[String]) -> String {
             index += 1;
             continue;
         }
-        if current == '$' {
+        if current == '$' && dollar_token_boundary(&chars, index) {
             let mut end = index + 1;
             while chars.get(end).is_some_and(char::is_ascii_digit) {
                 end += 1;
@@ -2487,6 +2511,38 @@ pub fn bind(sql: &str, params: &[String]) -> String {
         index += 1;
     }
     out
+}
+
+fn dollar_token_boundary(chars: &[char], index: usize) -> bool {
+    index == 0
+        || !chars[index - 1].is_alphanumeric() && chars[index - 1] != '_' && chars[index - 1] != '$'
+}
+
+fn dollar_quote_delimiter(chars: &[char], start: usize) -> Option<(Vec<char>, usize)> {
+    if chars.get(start) != Some(&'$') {
+        return None;
+    }
+    let mut end = start + 1;
+    if chars.get(end) == Some(&'$') {
+        end += 1;
+        return Some((chars[start..end].to_vec(), end));
+    }
+    if !chars.get(end).is_some_and(|character| character.is_ascii_alphabetic() || *character == '_')
+    {
+        return None;
+    }
+    end += 1;
+    while chars
+        .get(end)
+        .is_some_and(|character| character.is_ascii_alphanumeric() || *character == '_')
+    {
+        end += 1;
+    }
+    if chars.get(end) != Some(&'$') {
+        return None;
+    }
+    end += 1;
+    Some((chars[start..end].to_vec(), end))
 }
 
 fn bind_literal(value: &str) -> String {
@@ -19937,6 +19993,18 @@ mod tests {
             &(1..=10).map(|value| value.to_string()).collect::<Vec<_>>(),
         );
         assert_eq!(sql, "SELECT '$1', \"$2\", 1, 10 -- $2\n/* $3 */");
+    }
+
+    #[test]
+    fn bind_params_respects_dollar_quotes_and_nested_block_comments() {
+        let sql = bind(
+            "SELECT field$tag$part, $body$ $1 /* not a comment */ $body$, $1, /* outer /* $1 */ still $1 */ $1",
+            &[String::from("value")],
+        );
+        assert_eq!(
+            sql,
+            "SELECT field$tag$part, $body$ $1 /* not a comment */ $body$, 'value', /* outer /* $1 */ still $1 */ 'value'"
+        );
     }
 
     #[test]
