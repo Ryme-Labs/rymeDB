@@ -2200,9 +2200,8 @@ fn txn_read_batch_bench(
     standard_mode: bool,
     json: bool,
 ) {
-    if records == 0 || candidates == 0 || candidates > records || iterations == 0 || batch_size == 0
-    {
-        eprintln!("records, candidates, iterations, and batch-size must be positive; candidates must not exceed records");
+    if records == 0 || candidates == 0 || iterations == 0 || batch_size == 0 {
+        eprintln!("records, candidates, iterations, and batch-size must be positive");
         return;
     }
 
@@ -2247,13 +2246,13 @@ fn txn_read_batch_bench(
         eprintln!("failed to seed batch-read benchmark: {error}");
         return;
     }
-    let keys = &keys[..candidates];
+    let keys = (0..candidates).map(|index| keys[index % records].clone()).collect::<Vec<_>>();
 
     for _ in 0..5 {
-        std::hint::black_box(measure_single_reads(&manager, keys, false));
-        std::hint::black_box(measure_single_reads(&manager, keys, true));
-        std::hint::black_box(measure_batched_reads(&manager, keys, batch_size, false));
-        std::hint::black_box(measure_batched_reads(&manager, keys, batch_size, true));
+        std::hint::black_box(measure_single_reads(&manager, &keys, false));
+        std::hint::black_box(measure_single_reads(&manager, &keys, true));
+        std::hint::black_box(measure_batched_reads(&manager, &keys, batch_size, false));
+        std::hint::black_box(measure_batched_reads(&manager, &keys, batch_size, true));
     }
 
     let mut single_samples = Vec::with_capacity(iterations);
@@ -2261,10 +2260,10 @@ fn txn_read_batch_bench(
     let mut batch_samples = Vec::with_capacity(iterations);
     let mut read_only_batch_samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        single_samples.push(measure_single_reads(&manager, keys, false));
-        read_only_samples.push(measure_single_reads(&manager, keys, true));
-        batch_samples.push(measure_batched_reads(&manager, keys, batch_size, false));
-        read_only_batch_samples.push(measure_batched_reads(&manager, keys, batch_size, true));
+        single_samples.push(measure_single_reads(&manager, &keys, false));
+        read_only_samples.push(measure_single_reads(&manager, &keys, true));
+        batch_samples.push(measure_batched_reads(&manager, &keys, batch_size, false));
+        read_only_batch_samples.push(measure_batched_reads(&manager, &keys, batch_size, true));
     }
     single_samples.sort_unstable();
     read_only_samples.sort_unstable();
@@ -2295,6 +2294,7 @@ fn txn_read_batch_bench(
         "machine": machine_metadata(),
         "records": records,
         "candidates_per_iteration": candidates,
+        "distinct_keys_per_iteration": candidates.min(records),
         "iterations": iterations,
         "batch_size": batch_size,
         "value_bytes": value_bytes,

@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_store_point_reads_merge_newest_versions() {
+    fn segment_store_point_and_batch_reads_merge_newest_versions() {
         let dir = std::env::temp_dir().join(format!(
             "ryme-segment-read-{}-{}",
             std::process::id(),
@@ -1969,6 +1969,17 @@ mod tests {
         assert_eq!(store.get(&first, 11, 0).unwrap(), Some(b"one".to_vec()));
         assert_eq!(store.get(&first, 12, 0).unwrap(), None);
         assert_eq!(store.get(&second, 11, 0).unwrap(), Some(b"two".to_vec()));
+        let missing = RecordKey::new("tenant", "db", "items", b"missing");
+        assert_eq!(
+            store
+                .get_many(
+                    &[second.clone(), first.clone(), missing, second.clone(), first.clone()],
+                    12,
+                    0,
+                )
+                .unwrap(),
+            vec![Some(b"two".to_vec()), None, None, Some(b"two".to_vec()), None,]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

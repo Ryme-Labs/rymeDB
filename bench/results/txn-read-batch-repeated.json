@@ -1,0 +1,47 @@
+{
+  "benchmark": "transaction-batch-read-repeated-keys",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "records": 64,
+  "candidates_per_iteration": 1024,
+  "distinct_keys_per_iteration": 64,
+  "iterations": 100,
+  "batch_size": 256,
+  "value_bytes": 128,
+  "notes": "Two sequential release captures per storage mode. The benchmark cycles through 64 seeded keys for 1,024 reads per iteration (16 reads per key). Standard mode uses warmed segment cache and SyncPolicy::Never. In-process core benchmark only; not cold disk, network, or end-to-end RESP latency.",
+  "captures": [
+    {
+      "storage_mode": "hot",
+      "single_read": { "p50_ns": 315578, "p95_ns": 333081, "p99_ns": 542367, "rows_per_second": 3168519 },
+      "read_only_single_read": { "p50_ns": 184440, "p95_ns": 188967, "p99_ns": 242069, "rows_per_second": 5461579 },
+      "batched_read": { "p50_ns": 289468, "p95_ns": 307662, "p99_ns": 352998, "rows_per_second": 3493135 },
+      "read_only_batched_read": { "p50_ns": 157448, "p95_ns": 168739, "p99_ns": 240134, "rows_per_second": 6330161 }
+    },
+    {
+      "storage_mode": "hot",
+      "single_read": { "p50_ns": 317240, "p95_ns": 321439, "p99_ns": 339152, "rows_per_second": 3230413 },
+      "read_only_single_read": { "p50_ns": 184559, "p95_ns": 191092, "p99_ns": 216400, "rows_per_second": 5451038 },
+      "batched_read": { "p50_ns": 293105, "p95_ns": 304837, "p99_ns": 315568, "rows_per_second": 3463698 },
+      "read_only_batched_read": { "p50_ns": 160674, "p95_ns": 169581, "p99_ns": 179259, "rows_per_second": 6296724 }
+    },
+    {
+      "storage_mode": "standard",
+      "single_read": { "p50_ns": 685258, "p95_ns": 741885, "p99_ns": 754208, "rows_per_second": 1474832 },
+      "read_only_single_read": { "p50_ns": 535865, "p95_ns": 594275, "p99_ns": 603623, "rows_per_second": 1889322 },
+      "batched_read": { "p50_ns": 466203, "p95_ns": 526176, "p99_ns": 545804, "rows_per_second": 2156449 },
+      "read_only_batched_read": { "p50_ns": 322711, "p95_ns": 374839, "p99_ns": 377815, "rows_per_second": 3124008 }
+    },
+    {
+      "storage_mode": "standard",
+      "single_read": { "p50_ns": 684936, "p95_ns": 905674, "p99_ns": 1045209, "rows_per_second": 1443813 },
+      "read_only_single_read": { "p50_ns": 536365, "p95_ns": 586370, "p99_ns": 649360, "rows_per_second": 1881773 },
+      "batched_read": { "p50_ns": 465762, "p95_ns": 653588, "p99_ns": 745030, "rows_per_second": 2113999 },
+      "read_only_batched_read": { "p50_ns": 325547, "p95_ns": 406880, "p99_ns": 527979, "rows_per_second": 3035008 }
+    }
+  ]
+}

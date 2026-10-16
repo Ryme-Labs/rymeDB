@@ -49,6 +49,23 @@ used by RESP `MGET`: one read-only transaction with repeated `get_many` calls.
 Its speedup is reported against `read_only_single_read`, so neither side pays
 conflict-observation tracking.
 
+`--candidates` may exceed `--records`; the benchmark then cycles through the
+seeded keys, measuring repeated-key batches. JSON reports the number of
+distinct keys per iteration. For example, use `--records 64 --candidates 1024`
+to measure 16 reads per distinct key while keeping batch size fixed.
+
+On an AMD Ryzen 5 4500, two release captures with 64 records, 1,024 reads per
+iteration, and batches of 256 measured read-only batched p50 at 157–161 µs vs
+184–185 µs for individual reads in Hot mode (1.15–1.17×). Standard mode
+measured 323–326 µs vs 536 µs (1.65–1.66×). This is a warmed, repeated-key
+core workload, not end-to-end RESP or cold-disk latency; see the
+[raw captures](../bench/results/txn-read-batch-repeated.json).
+
+A segment-batch duplicate-elimination prototype was not retained: its unique-key
+read-only p50 regressed from 490 µs to 588 µs with hashing and 529 µs with
+sorting. Repeated-key batches benefited, but the general path must not penalize
+the unique-key workload without a cheaper exact duplicate check.
+
 On an AMD Ryzen 5 4500, two sequential release captures with 10,000 records,
 1,024 reads/iteration, 100 iterations, and batches of 256 showed read-only
 batch p50 of 588–592 µs versus 812–817 µs for individual read-only gets in
