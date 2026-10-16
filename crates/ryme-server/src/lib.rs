@@ -1636,6 +1636,22 @@ fn sync_metadata_directory(_path: &std::path::Path) -> ryme_error::Result<()> {
     Ok(())
 }
 
+fn create_auth_snapshot_temp(
+    auth_path: &std::path::Path,
+) -> ryme_error::Result<(std::path::PathBuf, std::fs::File)> {
+    let suffix = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(16));
+    let temporary = auth_path.with_extension(format!("tmp-{suffix}"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&temporary)?;
+    Ok((temporary, file))
+}
+
 impl SharedState {
     fn branch_schema_path(&self, tenant: &str, branch: &str) -> std::path::PathBuf {
         let tenant = ryme_auth::base64_url_encode(tenant.as_bytes());
@@ -1675,10 +1691,9 @@ impl SharedState {
         if let Some(parent) = self.auth_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary = self.auth_path.with_extension("tmp");
+        let (temporary, mut file) = create_auth_snapshot_temp(&self.auth_path)?;
         {
             use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_data()?;
         }
@@ -14028,6 +14043,25 @@ fn archive_target(
 mod auth_persistence_tests {
     use super::*;
 
+    #[test]
+    fn auth_snapshot_temp_is_private_before_writing_secrets() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-auth-temp-permissions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, file) = create_auth_snapshot_temp(&dir.join("auth.json")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn revocations_restore_credentials_when_snapshot_replace_fails() {
         let dir = std::env::temp_dir().join(format!(
@@ -14037,7 +14071,7 @@ mod auth_persistence_tests {
         ));
         let mut config = Config::default();
         config.data_dir = dir.clone();
-        let state = SharedState::build(&config).unwrap();
+        let mut state = SharedState::build(&config).unwrap();
         let admin = Principal {
             id: String::from("admin"),
             tenant: String::from("default"),
@@ -14058,8 +14092,9 @@ mod auth_persistence_tests {
         let refresh_token = state.refresh_tokens.issue(user, now).unwrap();
         state.persist_auth().unwrap();
 
-        let blocked_temporary = state.auth_path.with_extension("tmp");
-        std::fs::create_dir(&blocked_temporary).unwrap();
+        let blocked_parent = dir.join("blocked-parent");
+        std::fs::File::create(&blocked_parent).unwrap();
+        state.auth_path = blocked_parent.join("auth.json");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -14085,7 +14120,6 @@ mod auth_persistence_tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(state.refresh_tokens.len(), 1);
 
-        std::fs::remove_dir(&blocked_temporary).unwrap();
         drop(state);
         let restarted = SharedState::build(&config).unwrap();
         assert!(restarted.keys.authenticate("user-key").is_ok());
