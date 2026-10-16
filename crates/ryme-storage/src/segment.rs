@@ -856,15 +856,17 @@ impl SegmentStore {
 
     fn remember_segment(&self, path: PathBuf) {
         let Ok(mut paths) = self.paths.write() else { return };
-        if paths.iter().any(|candidate| candidate == &path) {
-            return;
-        }
-        let mut updated = (**paths).clone();
-        updated.push(path);
-        updated.sort_by_key(|candidate| {
+        let id = parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
+        let Some(id) = id else { return };
+        let index = paths.binary_search_by_key(&id, |candidate| {
             parse_segment_name(candidate.file_name().and_then(|name| name.to_str()).unwrap_or(""))
+                .unwrap_or(u64::MAX)
         });
-        *paths = Arc::new(updated);
+        match index {
+            Ok(index) if paths[index] == path => {}
+            Ok(index) => Arc::make_mut(&mut paths)[index] = path,
+            Err(index) => Arc::make_mut(&mut paths).insert(index, path),
+        }
     }
 
     fn forget_segment(&self, path: &Path) {
@@ -876,9 +878,7 @@ impl SegmentStore {
             }
         }
         if let Ok(mut paths) = self.paths.write() {
-            let mut updated = (**paths).clone();
-            updated.retain(|candidate| candidate != path);
-            *paths = Arc::new(updated);
+            Arc::make_mut(&mut paths).retain(|candidate| candidate != path);
         }
     }
 
@@ -1573,6 +1573,44 @@ mod tests {
             scan_thread.join().unwrap();
         });
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_paths_stay_sorted_when_delta_ids_arrive_out_of_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-path-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let key = RecordKey::new("tenant", "db", "items", b"row");
+        for commit_ts in [30, 10, 20] {
+            store
+                .write_delta_owned_with_sync(
+                    commit_ts,
+                    vec![SegmentEntry {
+                        key: key.clone(),
+                        commit_ts,
+                        value: Some(commit_ts.to_be_bytes().to_vec()),
+                        expires_at: 0,
+                    }],
+                    false,
+                )
+                .unwrap();
+        }
+
+        let paths = store.segment_paths().unwrap();
+        let ids = paths
+            .iter()
+            .map(|path| {
+                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![10, 20, 30]);
+        assert_eq!(store.get(&key, 30, 0).unwrap(), Some(30u64.to_be_bytes().to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
