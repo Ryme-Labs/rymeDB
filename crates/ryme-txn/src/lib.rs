@@ -1089,7 +1089,8 @@ impl TxnManager {
         }
         let observed_missing = observed
             .iter()
-            .filter_map(|(key, existed)| (!existed).then(|| key.clone()))
+            .filter(|entry| !*entry.1)
+            .map(|(key, _)| key.clone())
             .collect::<BTreeSet<_>>();
         let scanned: BTreeSet<_> = state.scanned.into_iter().collect();
         let constraint_scanned: BTreeSet<_> = state.constraint_scanned.into_iter().collect();
@@ -4267,15 +4268,16 @@ mod tests {
             StorageMode::Standard,
         )
         .unwrap();
-        let mut seed = manager.begin();
         let keys = (0..64)
-            .map(|id| {
-                let key = RecordKey::new("t", "d", "items", &(id as u64).to_be_bytes());
-                manager.put(&mut seed, key.clone(), b"value".to_vec());
-                key
-            })
+            .map(|id| RecordKey::new("t", "d", "items", &(id as u64).to_be_bytes()))
             .collect::<Vec<_>>();
-        manager.commit(seed).unwrap();
+        for batch in keys.chunks(16) {
+            let mut seed = manager.begin();
+            for key in batch {
+                manager.put(&mut seed, key.clone(), b"value".to_vec());
+            }
+            manager.commit(seed).unwrap();
+        }
 
         let mut first_read = manager.begin();
         assert!(manager.get_many(&mut first_read, &keys).unwrap().iter().all(Option::is_some));
@@ -4283,7 +4285,7 @@ mod tests {
         let mut second_read = manager.begin();
         assert!(manager.get_many(&mut second_read, &keys).unwrap().iter().all(Option::is_some));
         let after_cached_batch = manager.segment_cache_stats();
-        assert_eq!(after_cached_batch.hits - before_cached_batch.hits, 1);
+        assert_eq!(after_cached_batch.hits - before_cached_batch.hits, 4);
 
         drop(manager);
         let _ = std::fs::remove_dir_all(&dir);

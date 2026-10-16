@@ -694,9 +694,15 @@ impl SegmentStore {
         let paths = self.newest_paths()?;
         let mut values = vec![None; keys.len()];
         let mut unresolved = (0..keys.len()).collect::<Vec<_>>();
+        let mut cached_segments =
+            self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
 
         for path in paths.iter().rev() {
-            let segment = self.read_segment_under_lock(path)?;
+            let segment = if let Some(cached_segments) = cached_segments.as_mut() {
+                cached_segments.next().expect("cached segment path")
+            } else {
+                self.read_segment_under_lock(path)?
+            };
             let is_snapshot = segment.is_snapshot();
             let mut next_unresolved = Vec::with_capacity(unresolved.len());
             for index in unresolved {

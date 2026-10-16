@@ -41,6 +41,13 @@ p99 at 308–328 µs, with zero errors. This remains a localhost, memory-durabil
 smoke benchmark, not a production or cross-database comparison; see the
 [raw captures](../bench/results/resp-mget-standard-8clients.json).
 
+The Standard-mode batch-read path resolves all segment handles under one cache
+lock when the active segments are resident, instead of reacquiring the cache
+lock for each segment. With 80 active segments, eight clients, and 16-key MGETs,
+two local captures measured 41.8k–45.3k commands/s and p99 at 456–501 µs, with
+zero errors. Treat these as a local scaling baseline, not a cross-database
+comparison; see the [raw captures](../bench/results/resp-mget-standard-80segments-8clients.json).
+
 To isolate the in-memory transaction core from networking and WAL durability:
 
 ```bash
