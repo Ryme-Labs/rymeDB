@@ -415,7 +415,7 @@ pub struct Transaction {
     pub read_ts: u64,
     writes: BTreeMap<RecordKey, WriteOp>,
     read_set: BTreeSet<RecordKey>,
-    observed: BTreeMap<RecordKey, bool>,
+    observed_missing: BTreeSet<RecordKey>,
     scanned: BTreeSet<(String, String, String)>,
     constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
@@ -445,7 +445,7 @@ pub struct TransactionCheckpoint {
     read_ts: u64,
     writes: BTreeMap<RecordKey, WriteOp>,
     read_set: BTreeSet<RecordKey>,
-    observed: BTreeMap<RecordKey, bool>,
+    observed_missing: BTreeSet<RecordKey>,
     scanned: BTreeSet<(String, String, String)>,
     constraint_scanned: BTreeSet<(String, String, String)>,
     isolation: Isolation,
@@ -466,7 +466,7 @@ impl Transaction {
             read_ts: self.read_ts,
             writes: self.writes.clone(),
             read_set: self.read_set.clone(),
-            observed: self.observed.clone(),
+            observed_missing: self.observed_missing.clone(),
             scanned: self.scanned.clone(),
             constraint_scanned: self.constraint_scanned.clone(),
             isolation: self.isolation,
@@ -481,11 +481,25 @@ impl Transaction {
     }
 
     pub fn state(&self) -> TransactionState {
+        let mut missing = self.observed_missing.iter().peekable();
+        let observed = self
+            .read_set
+            .iter()
+            .map(|key| {
+                let existed = if missing.peek().is_some_and(|missing_key| *missing_key == key) {
+                    missing.next();
+                    false
+                } else {
+                    true
+                };
+                (key.clone(), existed)
+            })
+            .collect();
         TransactionState {
             read_ts: self.read_ts,
             writes: self.writes.iter().map(|(key, op)| (key.clone(), op.clone())).collect(),
             read_set: self.read_set.iter().cloned().collect(),
-            observed: self.observed.iter().map(|(key, value)| (key.clone(), *value)).collect(),
+            observed,
             scanned: self.scanned.iter().cloned().collect(),
             constraint_scanned: self.constraint_scanned.iter().cloned().collect(),
             isolation: self.isolation,
@@ -497,7 +511,7 @@ impl Transaction {
         self.read_ts = checkpoint.read_ts;
         self.writes.clone_from(&checkpoint.writes);
         self.read_set.clone_from(&checkpoint.read_set);
-        self.observed.clone_from(&checkpoint.observed);
+        self.observed_missing.clone_from(&checkpoint.observed_missing);
         self.scanned.clone_from(&checkpoint.scanned);
         self.constraint_scanned.clone_from(&checkpoint.constraint_scanned);
         self.isolation = checkpoint.isolation;
@@ -533,29 +547,23 @@ impl Transaction {
     }
 
     pub fn observed_existed(&self, key: &RecordKey) -> Option<bool> {
-        self.observed.get(key).copied()
+        self.read_set.contains(key).then(|| !self.observed_missing.contains(key))
     }
 
     pub fn record_read(&mut self, key: RecordKey, existed: bool) -> Result<()> {
-        // from_state validates that both structures have identical keys, so
-        // the observed map can answer whether this key is already tracked.
-        let add_read = !self.observed.contains_key(&key);
-        let add_observed = add_read;
-        let added_bytes = (if add_read { transaction_key_bytes(&key) } else { 0 }).saturating_add(
-            if add_observed { transaction_key_bytes(&key).saturating_add(1) } else { 0 },
-        );
-        let read_count = self.read_set.len().saturating_add(usize::from(add_read));
-        let observed_count = self.observed.len().saturating_add(usize::from(add_observed));
+        if self.read_set.contains(&key) {
+            return Ok(());
+        }
+        let key_bytes = transaction_key_bytes(&key);
+        let added_bytes = key_bytes.saturating_add(key_bytes.saturating_add(1));
         self.ensure_growth(
-            read_count <= MAX_TRANSACTION_READ_KEYS && observed_count <= MAX_TRANSACTION_READ_KEYS,
+            self.read_set.len() < MAX_TRANSACTION_READ_KEYS,
             added_bytes,
             "read set",
         )?;
-        if add_read {
-            self.read_set.insert(key.clone());
-        }
-        if add_observed {
-            self.observed.insert(key, existed);
+        self.read_set.insert(key.clone());
+        if !existed {
+            self.observed_missing.insert(key);
         }
         self.state_bytes = self.state_bytes.saturating_add(added_bytes);
         Ok(())
@@ -996,7 +1004,7 @@ impl TxnManager {
             read_ts,
             writes: BTreeMap::new(),
             read_set: BTreeSet::new(),
-            observed: BTreeMap::new(),
+            observed_missing: BTreeSet::new(),
             scanned: BTreeSet::new(),
             constraint_scanned: BTreeSet::new(),
             isolation: Isolation::Serializable,
@@ -1040,6 +1048,10 @@ impl TxnManager {
         {
             return Err(RymeError::Corrupt(String::from("transaction read state")));
         }
+        let observed_missing = observed
+            .iter()
+            .filter_map(|(key, existed)| (!existed).then(|| key.clone()))
+            .collect::<BTreeSet<_>>();
         let scanned: BTreeSet<_> = state.scanned.into_iter().collect();
         let constraint_scanned: BTreeSet<_> = state.constraint_scanned.into_iter().collect();
         let state_bytes =
@@ -1077,7 +1089,7 @@ impl TxnManager {
             read_ts: state.read_ts,
             writes,
             read_set,
-            observed,
+            observed_missing,
             scanned,
             constraint_scanned,
             isolation: state.isolation,
@@ -3328,12 +3340,18 @@ mod tests {
         let manager = TxnManager::new();
         let first = RecordKey::new("t", "d", "s", b"first");
         let second = RecordKey::new("t", "d", "s", b"second");
+        let missing = RecordKey::new("t", "d", "s", b"missing");
+        let after_checkpoint = RecordKey::new("t", "d", "s", b"after-checkpoint");
         let mut txn = manager.begin();
         manager.put(&mut txn, first.clone(), b"one".to_vec());
+        assert_eq!(manager.get(&mut txn, &missing).unwrap(), None);
         let checkpoint = txn.checkpoint();
         manager.put(&mut txn, second.clone(), b"two".to_vec());
+        assert_eq!(manager.get(&mut txn, &after_checkpoint).unwrap(), None);
         txn.restore_checkpoint(&checkpoint);
 
+        assert_eq!(txn.observed_existed(&missing), Some(false));
+        assert_eq!(txn.observed_existed(&after_checkpoint), None);
         assert_eq!(manager.get(&mut txn, &first).unwrap(), Some(b"one".to_vec()));
         assert_eq!(manager.get(&mut txn, &second).unwrap(), None);
         manager.commit(txn).unwrap();
@@ -3397,6 +3415,7 @@ mod tests {
     fn transaction_state_roundtrip_preserves_validation_metadata() {
         let manager = TxnManager::new();
         let watched = RecordKey::new("t", "d", "state", b"watched");
+        let missing = RecordKey::new("t", "d", "state", b"missing");
         let written = RecordKey::new("t", "d", "state", b"written");
         let mut seed = manager.begin();
         manager.put(&mut seed, watched.clone(), b"v1".to_vec());
@@ -3404,6 +3423,9 @@ mod tests {
 
         let mut txn = manager.begin();
         assert_eq!(manager.get(&mut txn, &watched).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(manager.get(&mut txn, &missing).unwrap(), None);
+        assert_eq!(txn.observed_existed(&watched), Some(true));
+        assert_eq!(txn.observed_existed(&missing), Some(false));
         assert_eq!(manager.scan(&mut txn, "t", "d", "state", 10).unwrap().len(), 1);
         manager.put(&mut txn, written, b"value".to_vec());
         txn.set_isolation(Isolation::Snapshot);
@@ -3411,6 +3433,8 @@ mod tests {
         let restored = manager.from_state(state.clone()).unwrap();
 
         assert_eq!(restored.state(), state);
+        assert_eq!(restored.observed_existed(&watched), Some(true));
+        assert_eq!(restored.observed_existed(&missing), Some(false));
     }
 
     #[test]
