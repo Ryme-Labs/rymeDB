@@ -385,6 +385,56 @@ where
         }
     }
 
+    pub async fn get_many_async(
+        &self,
+        principal: &Principal,
+        table: &str,
+        pks: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        validate_table(table)?;
+        if pks.len() > MAX_BATCH_ROWS {
+            return Err(RymeError::Overload(String::from("batch read rows")));
+        }
+        for pk in pks {
+            validate_key(pk)?;
+        }
+        self.policies.predicate(principal, table)?;
+        if pks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(reader) =
+            self.remote_reader.as_ref().filter(|_| self.branch.eq_ignore_ascii_case("main"))
+        else {
+            return pks.iter().map(|pk| self.get(principal, table, pk)).collect();
+        };
+
+        let keys = pks
+            .iter()
+            .map(|pk| RecordKey::new(&principal.tenant, &self.database, table, pk))
+            .collect();
+        let remote_reads = reader.read_many(keys).await?;
+        if remote_reads.len() != pks.len() {
+            return Err(RymeError::Corrupt(String::from("range read batch count")));
+        }
+
+        remote_reads
+            .into_iter()
+            .zip(pks)
+            .map(|(remote, pk)| match remote {
+                RemoteRead::Local => self.get(principal, table, pk),
+                RemoteRead::Value { value, expires_at } => {
+                    match remote_value_if_live(value, expires_at) {
+                        Some(value) if self.policies.row_allowed(principal, table, &value)? => {
+                            Ok(Some(value))
+                        }
+                        _ => Ok(None),
+                    }
+                }
+            })
+            .collect()
+    }
+
     pub async fn put(
         &self,
         principal: &Principal,
@@ -1034,6 +1084,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_batch_reads_use_one_remote_batch_and_apply_row_policies() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = batch_calls.clone();
+        let reader = RemoteReader::new(|_| async {
+            Err(RymeError::Internal(String::from("single read path used")))
+        })
+        .with_batch_reader(move |keys| {
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+            async move {
+                Ok(keys
+                    .into_iter()
+                    .map(|key| {
+                        let value = match key.pk.as_slice() {
+                            b"visible" => Some(br#"{"tenant_id":"t"}"#.to_vec()),
+                            b"hidden" => Some(br#"{"tenant_id":"other"}"#.to_vec()),
+                            _ => None,
+                        };
+                        RemoteRead::Value { value, expires_at: Some(ryme_txn::now_unix() + 60) }
+                    })
+                    .collect())
+            }
+        });
+        let mut policies = PolicyEngine::new();
+        policies.allow_table(String::from("messages"), String::from("tenant_id"));
+        let gateway = Gateway::new(
+            String::from("t"),
+            String::from("d"),
+            String::from("main"),
+            policies,
+            Realtime::new(16),
+        )
+        .with_remote_reader(reader);
+
+        let values = gateway
+            .get_many_async(
+                &owner(),
+                "messages",
+                &[b"visible".to_vec(), b"hidden".to_vec(), b"missing".to_vec()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(values[0], Some(br#"{"tenant_id":"t"}"#.to_vec()));
+        assert_eq!(values[1], None);
+        assert_eq!(values[2], None);
+    }
+
+    #[tokio::test]
     async fn branch_gateways_do_not_use_main_remote_reader() {
         let gateway = gateway();
         let principal = owner();
@@ -1050,6 +1150,10 @@ mod tests {
         assert_eq!(
             branch.get_async(&principal, "docs", b"k").await.unwrap(),
             Some(b"branch-value".to_vec())
+        );
+        assert_eq!(
+            branch.get_many_async(&principal, "docs", &[b"k".to_vec()]).await.unwrap(),
+            vec![Some(b"branch-value".to_vec())]
         );
         assert_eq!(branch.ttl_of_async(&principal, "docs", b"k").await.unwrap(), Ttl::Persistent);
         let mut changes = branch.realtime().subscribe_branch("t", "d", "feature", "docs");

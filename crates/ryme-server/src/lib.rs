@@ -8984,9 +8984,11 @@ async fn filter_vector_hits(
         return Ok(hits);
     }
     let gateway = branch_gateway(state, headers, &principal.tenant)?;
+    let pks = hits.iter().map(|hit| hit.id.as_bytes().to_vec()).collect::<Vec<_>>();
+    let rows = gateway.get_many_async(principal, table, &pks).await?;
     let mut visible = Vec::with_capacity(hits.len());
-    for hit in hits {
-        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await? {
+    for (hit, value) in hits.into_iter().zip(rows) {
+        if let Some(value) = value {
             if executor.row_allowed_by_rls(table, &value) {
                 visible.push(hit);
             }
@@ -9007,9 +9009,11 @@ async fn filter_text_hits(
         return Ok(hits);
     }
     let gateway = branch_gateway(state, headers, &principal.tenant)?;
+    let pks = hits.iter().map(|hit| hit.id.as_bytes().to_vec()).collect::<Vec<_>>();
+    let rows = gateway.get_many_async(principal, table, &pks).await?;
     let mut visible = Vec::with_capacity(hits.len());
-    for hit in hits {
-        if let Some(value) = gateway.get_async(principal, table, hit.id.as_bytes()).await? {
+    for (hit, value) in hits.into_iter().zip(rows) {
+        if let Some(value) = value {
             if executor.row_allowed_by_rls(table, &value) {
                 visible.push(hit);
             }
@@ -15220,6 +15224,100 @@ mod realtime_policy_tests {
         assert_eq!(filtered.op, ryme_realtime::Operation::Delete);
         assert_eq!(filtered.before, leaving.before);
         assert!(filtered.after.is_none());
+    }
+
+    #[tokio::test]
+    async fn vector_and_text_hits_batch_load_rows_before_sql_rls_filtering() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-index-rls-batch-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ryme_config::Config::default();
+        config.node_id = String::from("index-rls-batch");
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse("CREATE TABLE messages (id TEXT PRIMARY KEY, user_id TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .executor
+            .execute(
+                ryme_sql::parse(
+                    "CREATE POLICY own_messages ON messages FOR SELECT USING (auth.uid() = user_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .executor
+            .execute(ryme_sql::parse("ALTER TABLE messages ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+
+        let principal = Principal {
+            id: String::from("user-a"),
+            tenant: String::from("default"),
+            roles: [ryme_auth::Role::Owner].into_iter().collect(),
+        };
+        state
+            .gateway
+            .put(&principal, "messages", b"visible".to_vec(), br#"{"user_id":"user-a"}"#.to_vec())
+            .await
+            .unwrap();
+        state
+            .gateway
+            .put(&principal, "messages", b"hidden".to_vec(), br#"{"user_id":"user-b"}"#.to_vec())
+            .await
+            .unwrap();
+
+        let executor = state
+            .executor
+            .clone()
+            .with_role(String::from("authenticated"))
+            .with_auth_uid(String::from("user-a"));
+        let headers = HeaderMap::new();
+        let vector_hits = filter_vector_hits(
+            &state,
+            &headers,
+            &principal,
+            &executor,
+            "messages",
+            vec![
+                VectorHit { id: String::from("hidden"), score: 1.0 },
+                VectorHit { id: String::from("visible"), score: 0.9 },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(vector_hits.len(), 1);
+        assert_eq!(vector_hits[0].id, "visible");
+
+        let text_hits = filter_text_hits(
+            &state,
+            &headers,
+            &principal,
+            &executor,
+            "messages",
+            vec![
+                TextHit { id: String::from("hidden"), score: 2.0 },
+                TextHit { id: String::from("visible"), score: 1.0 },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(text_hits.len(), 1);
+        assert_eq!(text_hits[0].id, "visible");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
