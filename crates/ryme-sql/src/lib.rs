@@ -7471,6 +7471,7 @@ pub struct Executor<B = TxnManager> {
     isolation: Isolation,
     catalog: Arc<Mutex<HashMap<String, Vec<ColumnDefinition>>>>,
     indexes: Arc<Mutex<HashMap<String, Vec<IndexState>>>>,
+    pending_index_commits: Arc<Mutex<HashMap<String, usize>>>,
     rls_maps: Arc<RwLock<RlsPolicyMaps>>,
     rls_policy_version: Arc<AtomicU64>,
     rls_role_maps: Arc<RwLock<HashMap<String, (u64, Arc<RlsPolicyMaps>)>>>,
@@ -7515,6 +7516,25 @@ impl<B: std::fmt::Debug> std::fmt::Debug for Executor<B> {
 struct IndexState {
     definition: IndexDefinition,
     entries: BTreeMap<String, BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>>>,
+    applied_ts: u64,
+    valid: bool,
+}
+
+struct PendingIndexCommit(Arc<Mutex<HashMap<String, usize>>>, Vec<String>);
+
+impl Drop for PendingIndexCommit {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.0.lock() {
+            for table in &self.1 {
+                if let Some(count) = pending.get_mut(table) {
+                    *count -= 1;
+                    if *count == 0 {
+                        pending.remove(table);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Executor<TxnManager> {
@@ -7532,6 +7552,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
+            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -7571,6 +7592,7 @@ impl Executor<TxnManager> {
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
+            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -7615,6 +7637,7 @@ where
             isolation: Isolation::Serializable,
             catalog: Arc::new(Mutex::new(HashMap::new())),
             indexes: Arc::new(Mutex::new(HashMap::new())),
+            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(RlsPolicyMaps::default())),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -8511,6 +8534,7 @@ where
             isolation: self.isolation,
             catalog: self.catalog,
             indexes: self.indexes,
+            pending_index_commits: self.pending_index_commits,
             rls_maps: self.rls_maps,
             rls_policy_version: self.rls_policy_version,
             rls_role_maps: self.rls_role_maps,
@@ -8937,6 +8961,7 @@ where
             isolation: self.isolation,
             catalog: Arc::new(Mutex::new(catalog)),
             indexes: Arc::new(Mutex::new(indexes)),
+            pending_index_commits: Arc::new(Mutex::new(HashMap::new())),
             rls_maps: Arc::new(RwLock::new(rls_maps)),
             rls_policy_version: Arc::new(AtomicU64::new(0)),
             rls_role_maps: Arc::new(RwLock::new(HashMap::new())),
@@ -10642,8 +10667,13 @@ where
     }
 
     fn scan_all_rows(&self, table: &str) -> Result<Vec<Row>> {
+        self.scan_all_rows_with_ts(table).map(|(rows, _)| rows)
+    }
+
+    fn scan_all_rows_with_ts(&self, table: &str) -> Result<(Vec<Row>, u64)> {
         const PAGE: usize = 10_000;
         let mut txn = self.begin_with(self.isolation);
+        let read_ts = txn.read_ts;
         let mut rows = self.manager.scan(&mut txn, &self.tenant, &self.database, table, PAGE)?;
         let mut budget = MaterializationBudget::default();
         budget.add_rows(&rows)?;
@@ -10667,7 +10697,7 @@ where
             rows.extend(next);
         }
         ensure_materialized_rows(&rows)?;
-        Ok(rows)
+        Ok((rows, read_ts))
     }
 
     fn copy_to_in_transaction(
@@ -10724,7 +10754,7 @@ where
                 return Err(RymeError::Conflict(String::from("index exists")));
             }
         }
-        let rows = self.scan_all_rows(&definition.table)?;
+        let (rows, applied_ts) = self.scan_all_rows_with_ts(&definition.table)?;
         let mut tenant_entries: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> =
             BTreeMap::new();
         for (pk, value) in rows {
@@ -10739,7 +10769,9 @@ where
         let mut indexes =
             self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
         let table_indexes = indexes.entry(definition.table.clone()).or_default();
-        table_indexes.push(IndexState { definition, entries });
+        let valid = !self.has_pending_index_commit(&definition.table)
+            && self.manager.begin().read_ts == applied_ts;
+        table_indexes.push(IndexState { definition, entries, applied_ts, valid });
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -10778,6 +10810,7 @@ where
         &self,
         table: &str,
         filter: &[Predicate],
+        read_ts: u64,
     ) -> Result<Option<Vec<Vec<u8>>>> {
         self.ensure_index_entries_for_tenant(table)?;
         let indexes =
@@ -10797,6 +10830,9 @@ where
                 index_filter_value(&state.definition, filter)
             };
             let Some(key) = key else { continue };
+            if !state.valid || self.has_pending_index_commit(table) || read_ts < state.applied_ts {
+                return Ok(None);
+            }
             let Some(pks) = state.entries.get(&self.tenant).and_then(|entries| entries.get(&key))
             else {
                 return Ok(Some(Vec::new()));
@@ -10823,6 +10859,7 @@ where
         table: &str,
         definition: &IndexDefinition,
         indexed: &[u8],
+        read_ts: u64,
     ) -> Result<Option<Vec<Vec<u8>>>> {
         self.ensure_index_entries_for_tenant(table)?;
         let indexes =
@@ -10832,6 +10869,9 @@ where
         }) else {
             return Ok(None);
         };
+        if !state.valid || self.has_pending_index_commit(table) || read_ts < state.applied_ts {
+            return Ok(None);
+        }
         Ok(Some(
             state
                 .entries
@@ -10843,14 +10883,17 @@ where
     }
 
     fn ensure_index_entries_for_tenant(&self, table: &str) -> Result<()> {
-        let needs_rebuild = self
-            .indexes
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("index lock")))?
-            .get(table)
-            .is_some_and(|states| {
-                states.iter().any(|state| !state.entries.contains_key(&self.tenant))
-            });
+        let needs_rebuild = !self.has_pending_index_commit(table)
+            && self
+                .indexes
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("index lock")))?
+                .get(table)
+                .is_some_and(|states| {
+                    states
+                        .iter()
+                        .any(|state| !state.valid || !state.entries.contains_key(&self.tenant))
+                });
         if needs_rebuild {
             self.rebuild_index_entries(table)?;
         }
@@ -10884,7 +10927,22 @@ where
         }
         for state in table_indexes.iter().filter(|state| state.definition.unique) {
             let Some(indexed) = index_value(&state.definition, pk, value) else { continue };
-            if self.unique_index_conflicts_with_transaction(txn, state, &indexed, pk, excluded_pk) {
+            let conflict = if !state.valid
+                || self.has_pending_index_commit(table)
+                || txn.read_ts < state.applied_ts
+            {
+                self.scan_all_rows_in_transaction(txn, table)?.iter().any(
+                    |(existing_pk, existing_value)| {
+                        existing_pk.as_slice() != pk
+                            && excluded_pk.is_none_or(|excluded| existing_pk.as_slice() != excluded)
+                            && index_value(&state.definition, existing_pk, existing_value)
+                                .is_some_and(|current| current == indexed)
+                    },
+                )
+            } else {
+                self.unique_index_conflicts_with_transaction(txn, state, &indexed, pk, excluded_pk)
+            };
+            if conflict {
                 return Err(RymeError::Conflict(format!("unique index {}", state.definition.name)));
             }
         }
@@ -10940,27 +10998,65 @@ where
         })
     }
 
-    fn apply_index_change(&self, change: &TransactionChange) {
+    fn has_pending_index_commit(&self, table: &str) -> bool {
+        self.pending_index_commits
+            .lock()
+            .map(|pending| pending.get(table).copied().unwrap_or_default() > 0)
+            .unwrap_or(true)
+    }
+
+    fn begin_index_commit(&self, mut tables: Vec<String>) -> PendingIndexCommit {
+        tables.sort_unstable();
+        tables.dedup();
+        if let Ok(mut pending) = self.pending_index_commits.lock() {
+            for table in &tables {
+                *pending.entry(table.clone()).or_default() += 1;
+            }
+        }
+        PendingIndexCommit(Arc::clone(&self.pending_index_commits), tables)
+    }
+
+    fn apply_index_changes(&self, changes: &[TransactionChange], commit_ts: u64) {
         let Ok(mut indexes) = self.indexes.lock() else { return };
-        let Some(table_indexes) = indexes.get_mut(&change.table) else { return };
-        for state in table_indexes {
-            let Some(entries) = state.entries.get_mut(&self.tenant) else { continue };
-            let previous_pk = change.previous_pk.as_deref().unwrap_or(&change.pk);
-            if let Some(before) = change.before.as_ref() {
-                if let Some(indexed) = index_value(&state.definition, previous_pk, before) {
-                    if let Some(pks) = entries.get_mut(&indexed) {
-                        pks.remove(previous_pk);
-                        if pks.is_empty() {
-                            entries.remove(&indexed);
+        let changed_tables =
+            changes.iter().map(|change| change.table.as_str()).collect::<HashSet<_>>();
+        for table in changed_tables {
+            let Some(table_indexes) = indexes.get_mut(table) else { continue };
+            for state in table_indexes {
+                if !state.valid {
+                    continue;
+                }
+                if commit_ts <= state.applied_ts {
+                    state.valid = false;
+                    continue;
+                }
+                if let Some(tenant_entries) = state.entries.get_mut(&self.tenant) {
+                    for change in changes.iter().filter(|change| change.table == table) {
+                        let previous_pk = change.previous_pk.as_deref().unwrap_or(&change.pk);
+                        if let Some(before) = change.before.as_ref() {
+                            if let Some(indexed) =
+                                index_value(&state.definition, previous_pk, before)
+                            {
+                                if let Some(pks) = tenant_entries.get_mut(&indexed) {
+                                    pks.remove(previous_pk);
+                                    if pks.is_empty() {
+                                        tenant_entries.remove(&indexed);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(after) = change.after.as_ref() {
+                            if let Some(indexed) = index_value(&state.definition, &change.pk, after)
+                            {
+                                tenant_entries
+                                    .entry(indexed)
+                                    .or_default()
+                                    .insert(change.pk.clone());
+                            }
                         }
                     }
                 }
-            }
-            if let Some(after) = change.after.as_ref() {
-                let Some(indexed) = index_value(&state.definition, &change.pk, after) else {
-                    continue;
-                };
-                entries.entry(indexed).or_default().insert(change.pk.clone());
+                state.applied_ts = commit_ts;
             }
         }
     }
@@ -10993,7 +11089,7 @@ where
             return Ok(Vec::new());
         }
         if txn.writes().is_empty() {
-            if let Some(candidates) = self.indexed_candidates(table, filter)? {
+            if let Some(candidates) = self.indexed_candidates(table, filter, txn.read_ts)? {
                 let mut rows = Vec::with_capacity(candidates.len().min(limit));
                 if let [pk] = candidates.as_slice() {
                     let key = RecordKey::new(&self.tenant, &self.database, table, pk);
@@ -11257,7 +11353,7 @@ where
                 .collect());
         }
         if txn.writes().is_empty() {
-            if let Some(candidates) = self.indexed_candidates(table, filter)? {
+            if let Some(candidates) = self.indexed_candidates(table, filter, txn.read_ts)? {
                 let mut rows = Vec::with_capacity(candidates.len().min(limit));
                 if let [pk] = candidates.as_slice() {
                     let key = RecordKey::new(&self.tenant, &self.database, table, pk);
@@ -11448,6 +11544,8 @@ where
                                 entries: [(self.tenant.clone(), BTreeMap::new())]
                                     .into_iter()
                                     .collect(),
+                                applied_ts: self.manager.begin().read_ts,
+                                valid: !self.has_pending_index_commit(&table_name),
                             });
                         }
                     }
@@ -11807,7 +11905,7 @@ where
     }
 
     fn rebuild_index_entries(&self, table: &str) -> Result<()> {
-        let rows = self.scan_all_rows(table)?;
+        let (rows, applied_ts) = self.scan_all_rows_with_ts(table)?;
         let definitions = {
             let indexes =
                 self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
@@ -11841,6 +11939,9 @@ where
                     self.tenant.clone(),
                     entries.remove(&state.definition.name).unwrap_or_default(),
                 );
+                state.applied_ts = applied_ts;
+                state.valid = !self.has_pending_index_commit(table)
+                    && self.manager.begin().read_ts == applied_ts;
             }
         }
         Ok(())
@@ -12247,6 +12348,9 @@ where
             total_rows += rows.len();
             rows_by_table.push((table, rows));
         }
+        let _pending_index_commit =
+            (total_rows > 0).then(|| self.begin_index_commit(tables.clone()));
+        let mut truncate_commit_ts = None;
         if total_rows > 0 {
             let mut txn = self.begin_with(self.isolation);
             for (table, rows) in &rows_by_table {
@@ -12255,7 +12359,7 @@ where
                         .delete(&mut txn, RecordKey::new(&self.tenant, &self.database, table, pk));
                 }
             }
-            self.manager.commit(txn).await?;
+            truncate_commit_ts = Some(self.manager.commit(txn).await?);
         }
         {
             let mut indexes =
@@ -12264,6 +12368,10 @@ where
                 if let Some(table_indexes) = indexes.get_mut(table) {
                     for state in table_indexes {
                         state.entries.remove(&self.tenant);
+                        if let Some(commit_ts) = truncate_commit_ts {
+                            state.applied_ts = commit_ts;
+                            state.valid = false;
+                        }
                     }
                 }
             }
@@ -12308,7 +12416,7 @@ where
             return Err(RymeError::Conflict(String::from("column")));
         }
 
-        let rows = self.scan_all_rows(&table)?;
+        let (rows, rows_read_ts) = self.scan_all_rows_with_ts(&table)?;
         let index_definition = IndexDefinition {
             name: format!("{}_{}_unique", table, column.name),
             table: table.clone(),
@@ -12359,6 +12467,7 @@ where
             updates.push((pk, before, after));
         }
 
+        let mut applied_ts = rows_read_ts;
         if !updates.is_empty() {
             let mut txn = self.begin_with(self.isolation);
             for (pk, _, after) in &updates {
@@ -12368,7 +12477,7 @@ where
                     after.clone(),
                 );
             }
-            self.manager.commit(txn).await?;
+            applied_ts = self.manager.commit(txn).await?;
         }
         {
             let mut catalog = self
@@ -12383,11 +12492,14 @@ where
         if column.unique {
             let mut indexes =
                 self.indexes.lock().map_err(|_| RymeError::Internal(String::from("index lock")))?;
-            let table_indexes = indexes.entry(table).or_default();
+            let table_indexes = indexes.entry(table.clone()).or_default();
             if !table_indexes.iter().any(|state| state.definition.name == index_definition.name) {
                 table_indexes.push(IndexState {
                     definition: index_definition,
                     entries: [(self.tenant.clone(), index_entries)].into_iter().collect(),
+                    applied_ts,
+                    valid: !self.has_pending_index_commit(&table)
+                        && self.manager.begin().read_ts == applied_ts,
                 });
             }
         }
@@ -12546,7 +12658,7 @@ where
             return Err(RymeError::Conflict(String::from("column")));
         }
 
-        let rows = self.scan_all_rows(&table)?;
+        let (rows, rows_read_ts) = self.scan_all_rows_with_ts(&table)?;
         let mut updates = Vec::with_capacity(rows.len());
         for (pk, before) in rows {
             let serde_json::Value::Object(mut object) = serde_json::from_slice(&before)
@@ -12566,6 +12678,7 @@ where
             updates.push((pk, before, after));
         }
 
+        let mut applied_ts = rows_read_ts;
         if !updates.is_empty() {
             let mut txn = self.begin_with(self.isolation);
             for (pk, _, after) in &updates {
@@ -12575,7 +12688,7 @@ where
                     after.clone(),
                 );
             }
-            self.manager.commit(txn).await?;
+            applied_ts = self.manager.commit(txn).await?;
         }
         {
             let mut catalog = self
@@ -12616,6 +12729,7 @@ where
                                 }
                             }
                             state.entries.insert(self.tenant.clone(), entries);
+                            state.applied_ts = applied_ts;
                         }
                     }
                     if let Some(indexed) = state.definition.column.as_deref() {
@@ -12632,6 +12746,7 @@ where
                                 }
                             }
                             state.entries.insert(self.tenant.clone(), entries);
+                            state.applied_ts = applied_ts;
                         }
                     }
                 }
@@ -13759,9 +13874,12 @@ where
             });
             if let Some(unique_index) = unique_index {
                 if let Some(incoming_index) = index_value(&unique_index, pk, value) {
-                    if let Some(candidates) =
-                        self.indexed_candidates_for_value(table, &unique_index, &incoming_index)?
-                    {
+                    if let Some(candidates) = self.indexed_candidates_for_value(
+                        table,
+                        &unique_index,
+                        &incoming_index,
+                        txn.read_ts,
+                    )? {
                         txn.record_constraint_scan(&self.tenant, &self.database, table)?;
                         let mut candidate_pks = candidates;
                         candidate_pks.extend(
@@ -14520,6 +14638,8 @@ where
                 "schema changes and row changes cannot share a transaction",
             )));
         }
+        let _pending_index_commit =
+            self.begin_index_commit(changes.iter().map(|change| change.table.clone()).collect());
         let commit_ts = match self.manager.commit(txn).await {
             Ok(commit_ts) => commit_ts,
             Err(error) => {
@@ -14539,8 +14659,8 @@ where
                 }
             }
         }
+        self.apply_index_changes(&changes, commit_ts);
         for change in changes {
-            self.apply_index_change(&change);
             self.emit(&change.table, change.pk, change.op, change.before, change.after, commit_ts)?;
         }
         if let Err(error) = self.persist_schema_if_configured() {
@@ -15708,15 +15828,19 @@ where
                 self.check_unique(&mut txn, &table, &pk, &value)?;
                 let after = self.realtime.as_ref().map(|_| value.clone());
                 self.manager.put(&mut txn, key, value.clone());
+                let _pending_index_commit = self.begin_index_commit(vec![table.clone()]);
                 let commit_ts = self.manager.commit(txn).await?;
-                self.apply_index_change(&TransactionChange {
-                    table: table.clone(),
-                    pk: pk.clone(),
-                    previous_pk: None,
-                    op: Operation::Insert,
-                    before: before.clone(),
-                    after: Some(value.clone()),
-                });
+                self.apply_index_changes(
+                    &[TransactionChange {
+                        table: table.clone(),
+                        pk: pk.clone(),
+                        previous_pk: None,
+                        op: Operation::Insert,
+                        before: before.clone(),
+                        after: Some(value.clone()),
+                    }],
+                    commit_ts,
+                );
                 if let Some(after) = after {
                     self.emit(&table, pk, Operation::Insert, None, Some(after), commit_ts)?;
                 }
@@ -16024,9 +16148,11 @@ where
                 staged.append(&mut changes);
             }
             self.check_transaction_uniqueness(&staged)?;
+            let _pending_index_commit =
+                self.begin_index_commit(staged.iter().map(|change| change.table.clone()).collect());
             let commit_ts = self.manager.commit(txn).await?;
+            self.apply_index_changes(&staged, commit_ts);
             for change in staged {
-                self.apply_index_change(&change);
                 if self.realtime.is_some() {
                     self.emit(
                         &change.table,
@@ -19784,6 +19910,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexed_reads_preserve_older_transaction_snapshots() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO docs (id, body) VALUES ('a', 'old')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX docs_body_idx ON docs (body)").unwrap())
+            .await
+            .unwrap();
+
+        let mut snapshot = executor.begin_transaction(Isolation::Snapshot);
+        executor
+            .execute(parse("UPDATE docs SET body = 'new' WHERE id = 'a'").unwrap())
+            .await
+            .unwrap();
+        let applied_ts = executor.indexes.lock().unwrap()["docs"][0].applied_ts;
+        assert!(snapshot.read_ts < applied_ts, "{} !< {applied_ts}", snapshot.read_ts);
+        assert_eq!(
+            executor.manager.get(&mut snapshot, &RecordKey::new("t", "d", "docs", b"a"),).unwrap(),
+            Some(br#"{"body":"old","id":"a"}"#.to_vec())
+        );
+        let result = executor
+            .execute_in_transaction(
+                &mut snapshot,
+                parse("SELECT * FROM docs WHERE body = 'old'").unwrap(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            matches!(result, QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"a"),
+            "snapshot read_ts={}, result={result:?}",
+            snapshot.read_ts
+        );
+    }
+
+    #[tokio::test]
+    async fn index_candidates_fall_back_during_and_after_out_of_order_commits() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE docs (id TEXT PRIMARY KEY, body TEXT)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("INSERT INTO docs (id, body) VALUES ('a', 'body')").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX docs_body_idx ON docs (body)").unwrap())
+            .await
+            .unwrap();
+
+        let filter = vec![Predicate {
+            field: Field::Value,
+            column: Some(String::from("body")),
+            op: Cmp::Eq,
+            operand: b"body".to_vec(),
+            operands: Vec::new(),
+            alternatives: Vec::new(),
+        }];
+        let read_ts = executor.manager.latest_commit();
+        let pending = executor.begin_index_commit(vec![String::from("docs")]);
+        assert_eq!(executor.indexed_candidates("docs", &filter, read_ts).unwrap(), None);
+        drop(pending);
+
+        let applied_ts = executor.indexes.lock().unwrap()["docs"][0].applied_ts;
+        executor.apply_index_changes(
+            &[TransactionChange {
+                table: String::from("docs"),
+                pk: b"a".to_vec(),
+                previous_pk: None,
+                op: Operation::Update,
+                before: Some(br#"{"body":"body","id":"a"}"#.to_vec()),
+                after: Some(br#"{"body":"new","id":"a"}"#.to_vec()),
+            }],
+            applied_ts.saturating_sub(1),
+        );
+        assert!(!executor.indexes.lock().unwrap()["docs"][0].valid);
+        assert_eq!(
+            executor.indexed_candidates("docs", &filter, read_ts).unwrap(),
+            Some(vec![b"a".to_vec()])
+        );
+    }
+
+    #[tokio::test]
     async fn indexed_candidates_intersect_matching_indexes() {
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor
@@ -19831,7 +20047,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            executor.indexed_candidates("docs", &filter).unwrap(),
+            executor.indexed_candidates("docs", &filter, executor.manager.latest_commit()).unwrap(),
             Some(vec![b"a".to_vec()])
         );
 
@@ -19871,6 +20087,7 @@ mod tests {
                         operands: Vec::new(),
                         alternatives: Vec::new(),
                     }],
+                    executor.manager.latest_commit(),
                 )
                 .unwrap(),
             Some(Vec::new())
@@ -20564,6 +20781,7 @@ mod tests {
             .await
             .unwrap();
 
+        let mut historical = executor.begin_transaction(Isolation::Snapshot);
         executor.execute(parse("TRUNCATE TABLE events").unwrap()).await.unwrap();
         assert_eq!(executor.catalog_tables(), vec![String::from("events")]);
         assert!(executor.catalog_columns("events").iter().any(|column| column.name == "name"));
@@ -20573,6 +20791,15 @@ mod tests {
             .any(|index| index.name == "events_name_idx"));
         let result = executor.execute(parse("SELECT name FROM events").unwrap()).await.unwrap();
         assert!(matches!(result, QueryResult::Table { rows, .. } if rows.is_empty()));
+        let historical_result = executor
+            .execute_in_transaction(
+                &mut historical,
+                parse("SELECT * FROM events WHERE name = 'hello'").unwrap(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(matches!(historical_result, QueryResult::Rows { rows } if rows.len() == 1));
 
         executor
             .execute(parse("INSERT INTO events (id, name) VALUES ('e2', 'world')").unwrap())
