@@ -85,6 +85,14 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         iterations: usize,
     },
+    SegmentPrune {
+        #[arg(long, default_value_t = 10_000)]
+        rows: usize,
+        #[arg(long, default_value_t = 100)]
+        deltas: usize,
+        #[arg(long, default_value_t = 10)]
+        iterations: usize,
+    },
     Resp {
         #[arg(long, default_value = "127.0.0.1:6380")]
         addr: String,
@@ -196,6 +204,9 @@ async fn main() {
         }
         Some(Command::SegmentStartup { rows, superseded_deltas, deltas, iterations }) => {
             segment_startup_bench(rows, superseded_deltas, deltas, iterations);
+        }
+        Some(Command::SegmentPrune { rows, deltas, iterations }) => {
+            segment_prune_bench(rows, deltas, iterations);
         }
         Some(Command::Resp {
             addr,
@@ -1221,6 +1232,116 @@ fn segment_startup_bench(rows: usize, superseded_deltas: usize, deltas: usize, i
             "header_scan_p50_ns": header_scan_p50,
             "header_scan_p95_ns": percentile(&header_scan_ns, 95),
             "p50_speedup": full_decode_p50 as f64 / header_scan_p50.max(1) as f64,
+        })
+    );
+
+    drop(store);
+    if let Err(error) = std::fs::remove_dir_all(&data_dir) {
+        eprintln!("could not remove temporary benchmark data {}: {error}", data_dir.display());
+    }
+}
+
+fn segment_prune_bench(rows: usize, deltas: usize, iterations: usize) {
+    if rows == 0 || rows > 100_000 || deltas > 1_024 || iterations == 0 || iterations > 100 {
+        eprintln!("rows, deltas, or iterations exceed segment prune benchmark bounds");
+        std::process::exit(2);
+    }
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "ryme-bench-segment-prune-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let store = SegmentStore::open_with_cache(&data_dir, 0)
+        .expect("could not open temporary segment prune benchmark store");
+    let mut engine = Engine::new();
+    for index in 0..rows {
+        let key = RecordKey::new("bench", "bench", "prune", format!("k-{index:08}").as_bytes());
+        engine.apply(key, 1, Some(vec![7; 64])).expect("could not build prune snapshot");
+    }
+    store.write(1, &engine).expect("could not write prune snapshot");
+    drop(engine);
+    for index in 0..deltas {
+        let commit_ts = index as u64 + 2;
+        let key =
+            RecordKey::new("bench", "bench", "prune", format!("k-{:08}", index % rows).as_bytes());
+        store
+            .write_delta_owned_with_sync(
+                commit_ts,
+                vec![SegmentEntry { key, commit_ts, value: Some(vec![9; 64]), expires_at: 0 }],
+                false,
+            )
+            .expect("could not write prune delta");
+    }
+
+    let full_decode_scan = || {
+        let mut segments = Vec::new();
+        for path in store.segment_paths().expect("could not list prune segments") {
+            let bytes = std::fs::read(&path).expect("could not read prune segment");
+            let segment = ImmutableSegment::decode(&bytes).expect("could not decode prune segment");
+            segments.push((segment.meta().id, path, segment.is_snapshot()));
+        }
+        segments.sort_by_key(|(id, _, _)| *id);
+        let latest_full =
+            segments.iter().filter_map(|(id, _, is_snapshot)| is_snapshot.then_some(*id)).max();
+        let keep_paths = segments
+            .iter()
+            .filter(|(id, _, is_snapshot)| {
+                Some(*id) == latest_full
+                    || latest_full.is_some_and(|latest| *id > latest && !is_snapshot)
+            })
+            .map(|(_, path, _)| path)
+            .collect::<Vec<_>>();
+        std::hint::black_box(&keep_paths);
+    };
+
+    // Warm the file cache and both code paths before collecting paired samples.
+    full_decode_scan();
+    assert_eq!(store.prune(1).expect("prune benchmark warmup failed"), 0);
+    let mut full_decode_ns = Vec::with_capacity(iterations);
+    let mut metadata_prune_ns = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        if iteration % 2 == 0 {
+            let start = Instant::now();
+            full_decode_scan();
+            full_decode_ns.push(start.elapsed().as_nanos());
+
+            let start = Instant::now();
+            assert_eq!(store.prune(1).expect("metadata prune benchmark failed"), 0);
+            metadata_prune_ns.push(start.elapsed().as_nanos());
+        } else {
+            let start = Instant::now();
+            assert_eq!(store.prune(1).expect("metadata prune benchmark failed"), 0);
+            metadata_prune_ns.push(start.elapsed().as_nanos());
+
+            let start = Instant::now();
+            full_decode_scan();
+            full_decode_ns.push(start.elapsed().as_nanos());
+        }
+    }
+    full_decode_ns.sort_unstable();
+    metadata_prune_ns.sort_unstable();
+    let percentile = |samples: &[u128], percent: usize| {
+        samples[((samples.len() - 1) * percent / 100).min(samples.len() - 1)]
+    };
+    let full_decode_p50 = percentile(&full_decode_ns, 50);
+    let metadata_prune_p50 = percentile(&metadata_prune_ns, 50);
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "segment-prune-metadata",
+            "machine": machine_metadata(),
+            "snapshot_rows": rows,
+            "delta_segments": deltas,
+            "iterations": iterations,
+            "full_decode_p50_ns": full_decode_p50,
+            "full_decode_p95_ns": percentile(&full_decode_ns, 95),
+            "metadata_prune_p50_ns": metadata_prune_p50,
+            "metadata_prune_p95_ns": percentile(&metadata_prune_ns, 95),
+            "p50_speedup": full_decode_p50 as f64 / metadata_prune_p50.max(1) as f64,
         })
     );
 

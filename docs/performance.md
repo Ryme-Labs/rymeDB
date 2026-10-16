@@ -89,6 +89,23 @@ cargo run --locked --release -j 1 -p ryme-bench -- segment-startup \
   --rows 10000 --superseded-deltas 500 --deltas 500 --iterations 10
 ```
 
+To compare retention's former full-row decode scan with checksum-verified
+metadata pruning:
+
+```bash
+cargo run --locked --release -j 1 -p ryme-bench -- segment-prune \
+  --rows 10000 --deltas 100 --iterations 10
+```
+
+This creates one snapshot and a live delta tail, then alternates the previous
+decode-and-classify scan with `SegmentStore::prune`. No files are eligible for
+deletion in this setup, so the measurement isolates retention's segment scan
+and validation cost rather than filesystem cleanup. Both paths validate the
+segment checksum; the baseline also parses and rebuilds row indexes. The
+optimized path uses fixed-buffer checksum verification without rebuilding row
+indexes. Results use a warm filesystem cache and should be repeated on the
+target storage and workload.
+
 The command creates an initial snapshot, a superseded delta run, a newer
 snapshot, and a live delta tail. It alternates the two measurements to reduce
 filesystem-cache ordering bias, and reports p50/p95 plus their p50 ratio. The
@@ -103,6 +120,12 @@ rows, 500 superseded deltas, 500 live deltas, and 10 iterations measured p50
 at 35.1 ms for full decode versus 4.45 ms for the optimized path (7.88×).
 Files were locally cached; this is a startup-work microbenchmark, not a full
 server restart measurement.
+
+On the same AMD Ryzen 5 4500, the segment-prune scan with a 10,000-row
+snapshot, 100 delta segments, and 10 iterations measured 14.87 ms p50 for the
+full-decode scan versus 1.84 ms for metadata pruning (8.09×). This measures
+only the warm-cache retention scan with no segment deletion; it is not an
+end-to-end database latency result.
 
 Two sequential A/B pairs on an AMD Ryzen 5 4500 (12 logical CPUs), comparing
 the pre-merge implementation at `0202d42` with the k-way merge, measured p50
