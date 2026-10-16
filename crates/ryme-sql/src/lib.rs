@@ -1212,6 +1212,7 @@ pub type Row = (Vec<u8>, Vec<u8>);
 const MAX_QUERY_MATERIALIZED_ROWS: usize = 100_000;
 const MAX_QUERY_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
 const MATERIALIZED_ROW_OVERHEAD: usize = 64;
+const INDEX_READ_BATCH_SIZE: usize = 256;
 
 fn materialization_overload() -> RymeError {
     RymeError::Overload(String::from("query materialization"))
@@ -10522,11 +10523,17 @@ where
         if txn.writes().is_empty() {
             if let Some(candidates) = self.indexed_candidates(table, filter)? {
                 let mut rows = Vec::with_capacity(candidates.len());
-                for pk in candidates {
-                    let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
-                    if let Some(value) = self.manager.get_async(txn, &key).await? {
-                        rows.push((pk, value));
-                    }
+                for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
+                    let keys = candidate_batch
+                        .iter()
+                        .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
+                        .collect::<Vec<_>>();
+                    let values = self.manager.get_many_async(txn, &keys).await?;
+                    rows.extend(
+                        keys.into_iter()
+                            .zip(values)
+                            .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
+                    );
                 }
                 ensure_materialized_rows(&rows)?;
                 let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
@@ -10767,11 +10774,17 @@ where
         if txn.writes().is_empty() {
             if let Some(candidates) = self.indexed_candidates(table, filter)? {
                 let mut rows = Vec::with_capacity(candidates.len());
-                for pk in candidates {
-                    let key = RecordKey::new(&self.tenant, &self.database, table, &pk);
-                    if let Some(value) = self.manager.get(txn, &key)? {
-                        rows.push((pk, value));
-                    }
+                for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
+                    let keys = candidate_batch
+                        .iter()
+                        .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
+                        .collect::<Vec<_>>();
+                    let values = self.manager.get_many(txn, &keys)?;
+                    rows.extend(
+                        keys.into_iter()
+                            .zip(values)
+                            .filter_map(|(key, value)| value.map(|value| (key.pk, value))),
+                    );
                 }
                 ensure_materialized_rows(&rows)?;
                 let rows = self.filter_rls_rows_with_context(table, rows, rls_applies);
@@ -19086,6 +19099,28 @@ mod tests {
             .execute(parse("INSERT INTO messages KEY '4' VALUE 'three'").unwrap())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn indexed_reads_fetch_large_candidate_sets_in_bounded_batches() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor.execute(parse("CREATE TABLE messages").unwrap()).await.unwrap();
+        let values =
+            (0..600).map(|id| format!("('row-{id}', 'shared')")).collect::<Vec<_>>().join(", ");
+        executor
+            .execute(parse(&format!("INSERT INTO messages (id, value) VALUES {values}")).unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX messages_value_idx ON messages (value)").unwrap())
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(parse("SELECT * FROM messages WHERE value = 'shared' LIMIT 1000").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 600));
     }
 
     #[tokio::test]

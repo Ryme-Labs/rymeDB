@@ -98,6 +98,34 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
+    fn get_many(
+        &self,
+        txn: &mut ryme_txn::Transaction,
+        keys: &[ryme_storage::RecordKey],
+    ) -> ryme_error::Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Single(manager) => ryme_txn::TxnBackend::get_many(manager, txn, keys),
+            Self::Cluster(backend) => ryme_txn::TxnBackend::get_many(backend, txn, keys),
+            Self::Sharded(shards) => ryme_txn::TxnBackend::get_many(shards, txn, keys),
+            Self::Hybrid(hybrid) => ryme_txn::TxnBackend::get_many(hybrid, txn, keys),
+        }
+    }
+
+    fn get_many_async<'a>(
+        &'a self,
+        txn: &'a mut ryme_txn::Transaction,
+        keys: &'a [ryme_storage::RecordKey],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = ryme_error::Result<Vec<Option<Vec<u8>>>>> + Send + 'a>,
+    > {
+        match self {
+            Self::Single(manager) => ryme_txn::TxnBackend::get_many_async(manager, txn, keys),
+            Self::Cluster(backend) => ryme_txn::TxnBackend::get_many_async(backend, txn, keys),
+            Self::Sharded(shards) => ryme_txn::TxnBackend::get_many_async(shards, txn, keys),
+            Self::Hybrid(hybrid) => ryme_txn::TxnBackend::get_many_async(hybrid, txn, keys),
+        }
+    }
+
     fn put(
         &self,
         txn: &mut ryme_txn::Transaction,

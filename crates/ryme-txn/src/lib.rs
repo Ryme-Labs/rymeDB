@@ -726,12 +726,28 @@ pub trait TxnBackend: Clone + Send + Sync + 'static {
         txn
     }
     fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>>;
+    fn get_many(&self, txn: &mut Transaction, keys: &[RecordKey]) -> Result<Vec<Option<Vec<u8>>>> {
+        keys.iter().map(|key| self.get(txn, key)).collect()
+    }
     fn get_async<'a>(
         &'a self,
         txn: &'a mut Transaction,
         key: &'a RecordKey,
     ) -> TxnFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move { self.get(txn, key) })
+    }
+    fn get_many_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        keys: &'a [RecordKey],
+    ) -> TxnFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(self.get_async(txn, key).await?);
+            }
+            Ok(values)
+        })
     }
     fn scan_async<'a>(
         &'a self,
@@ -808,6 +824,18 @@ impl TxnBackend for TxnManager {
         TxnManager::get(self, txn, key)
     }
 
+    fn get_many(&self, txn: &mut Transaction, keys: &[RecordKey]) -> Result<Vec<Option<Vec<u8>>>> {
+        TxnManager::get_many(self, txn, keys)
+    }
+
+    fn get_many_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        keys: &'a [RecordKey],
+    ) -> TxnFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move { TxnManager::get_many(self, txn, keys) })
+    }
+
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
         TxnManager::put(self, txn, key, value)
     }
@@ -864,6 +892,18 @@ impl TxnBackend for DurableManager {
 
     fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
         DurableManager::get(self, txn, key)
+    }
+
+    fn get_many(&self, txn: &mut Transaction, keys: &[RecordKey]) -> Result<Vec<Option<Vec<u8>>>> {
+        DurableManager::get_many(self, txn, keys)
+    }
+
+    fn get_many_async<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        keys: &'a [RecordKey],
+    ) -> TxnFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move { DurableManager::get_many(self, txn, keys) })
     }
 
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
@@ -1056,6 +1096,44 @@ impl TxnManager {
         };
         txn.record_read(key.clone(), value.is_some())?;
         Ok(value)
+    }
+
+    pub fn get_many(
+        &self,
+        txn: &mut Transaction,
+        keys: &[RecordKey],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        txn.ensure_healthy()?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = now_unix();
+        let mut values = Vec::with_capacity(keys.len());
+        {
+            let engine = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+            for key in keys {
+                if let Some(staged) = txn.writes.get(key) {
+                    values.push(if staged.expires_at != 0 && staged.expires_at <= now {
+                        None
+                    } else {
+                        staged.value.clone()
+                    });
+                } else {
+                    values.push(engine.read(key, txn.read_ts, now)?);
+                }
+            }
+        }
+        for (key, value) in keys.iter().zip(&values) {
+            if !txn.writes.contains_key(key) {
+                txn.record_read(key.clone(), value.is_some())?;
+            }
+        }
+        Ok(values)
     }
 
     pub fn get_with(
@@ -2783,6 +2861,17 @@ impl DurableManager {
         }
     }
 
+    pub fn get_many(
+        &self,
+        txn: &mut Transaction,
+        keys: &[RecordKey],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match self.mode {
+            StorageMode::Hot => self.inner.get_many(txn, keys),
+            StorageMode::Standard => keys.iter().map(|key| self.get(txn, key)).collect(),
+        }
+    }
+
     pub fn try_put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) -> Result<()> {
         self.inner.try_put(txn, key, value)
     }
@@ -3130,6 +3219,36 @@ mod tests {
         let mut second = manager.begin();
         let value = manager.get(&mut second, &key).unwrap();
         assert_eq!(value, Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn batched_reads_preserve_snapshot_and_staged_write_semantics() {
+        let manager = TxnManager::new();
+        let first = RecordKey::new("t", "d", "s", b"first");
+        let second = RecordKey::new("t", "d", "s", b"second");
+        let staged = RecordKey::new("t", "d", "s", b"staged");
+        let missing = RecordKey::new("t", "d", "s", b"missing");
+        let mut seed = manager.begin();
+        manager.put(&mut seed, first.clone(), b"v1".to_vec());
+        manager.put(&mut seed, second.clone(), b"v2".to_vec());
+        manager.commit(seed).unwrap();
+
+        let mut reader = manager.begin();
+        manager.put(&mut reader, staged.clone(), b"pending".to_vec());
+        let mut writer = manager.begin();
+        manager.put(&mut writer, first.clone(), b"new".to_vec());
+        manager.commit(writer).unwrap();
+
+        assert_eq!(
+            manager
+                .get_many(
+                    &mut reader,
+                    &[first.clone(), staged.clone(), missing.clone(), first.clone()],
+                )
+                .unwrap(),
+            vec![Some(b"v1".to_vec()), Some(b"pending".to_vec()), None, Some(b"v1".to_vec()),]
+        );
+        assert_eq!(reader.read_keys(), &BTreeSet::from([first, missing]));
     }
 
     #[test]
