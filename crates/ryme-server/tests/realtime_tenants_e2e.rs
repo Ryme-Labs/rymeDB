@@ -143,15 +143,33 @@ async fn realtime_streams_use_authenticated_tenant() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let alpha = mint_jwt("alpha");
-    let (status, _) = http_request(http, API_KEY, "PUT /v1/kv/docs/default-row", b"default").await;
-    assert_eq!(status, 200);
+    let (status, body) = http_request(
+        http,
+        API_KEY,
+        "POST /v1/sql",
+        br#"{"sql":"CREATE TABLE docs (id TEXT PRIMARY KEY)"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http_request(
+        http,
+        API_KEY,
+        "POST /v1/sql",
+        br#"{"sql":"GRANT SELECT, INSERT, UPDATE ON TABLE docs TO authenticated"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) =
+        http_request(http, API_KEY, "PUT /v1/kv/docs/default-row", b"default").await;
+    assert_eq!(status, 200, "{body}");
     let alpha_copy = serde_json::json!({
         "table": "docs",
         "rows": [{"key": "alpha-row", "value": "alpha"}]
     })
     .to_string();
-    let (status, _) = http_request(http, &alpha, "POST /v1/sql/copy", alpha_copy.as_bytes()).await;
-    assert_eq!(status, 200);
+    let (status, body) =
+        http_request(http, &alpha, "POST /v1/sql/copy", alpha_copy.as_bytes()).await;
+    assert_eq!(status, 200, "{body}");
 
     let query_url = format!("ws://{http}/v1/query-stream?table=docs&limit=100");
     let (mut query, _) =
