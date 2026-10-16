@@ -33,6 +33,7 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
 type PubSubCounts = Arc<Mutex<std::collections::HashMap<PubSubKey, usize>>>;
+type ScriptCache = Arc<Mutex<std::collections::HashMap<(String, String), Vec<u8>>>>;
 
 fn check_collection_bytes(bytes: &[u8]) -> std::result::Result<(), String> {
     if bytes.len() > RESP_MAX_COLLECTION_BYTES {
@@ -61,7 +62,7 @@ pub struct RespGateway<B = TxnManager> {
     traces: Option<Arc<Mutex<TraceCollector>>>,
     range_hook: RangeLoadHook,
     pubsub: PubSubBus,
-    scripts: Arc<Mutex<std::collections::HashMap<(String, String), Vec<u8>>>>,
+    scripts: ScriptCache,
     next_client_id: Arc<AtomicU64>,
     read_only: bool,
     read_allowed: bool,

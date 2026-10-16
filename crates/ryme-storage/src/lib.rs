@@ -22,6 +22,7 @@ pub struct TableVersion {
 }
 
 pub type TableRows = Vec<(Vec<u8>, Vec<TableVersion>)>;
+type ImportHistory<'a> = BTreeMap<RecordKey, (Option<u64>, BTreeMap<u64, (Option<&'a [u8]>, u64)>)>;
 
 /// Routing-key formats are part of persisted range topology. Keep the legacy
 /// format readable so an existing deployment can restart, while new
@@ -398,8 +399,7 @@ impl Engine {
         // Validate every key's incoming history before changing the engine. A
         // malformed later row must not leave an earlier part of the import
         // visible to readers.
-        let mut histories: BTreeMap<RecordKey, (Option<u64>, BTreeMap<u64, (Option<&[u8]>, u64)>)> =
-            BTreeMap::new();
+        let mut histories: ImportHistory<'_> = BTreeMap::new();
         for (pk, versions) in &rows {
             let key = RecordKey {
                 tenant: tenant.to_string(),
@@ -528,7 +528,8 @@ impl Engine {
             .map(|key| in_range(key).map(|matched| (key, matched)))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .filter_map(|(key, matched)| matched.then(|| key.clone()))
+            .filter(|(_, matched)| *matched)
+            .map(|(key, _)| key.clone())
             .collect();
         let replacement_rows: Vec<_> = replacement
             .inner

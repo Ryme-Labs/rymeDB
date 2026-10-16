@@ -1169,7 +1169,7 @@ fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
     let expected_id =
         parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
     if magic != SEGMENT_MAGIC
-        || !matches!(kind, 0 | 1 | 2)
+        || !matches!(kind, 0..=2)
         || expected_id != Some(id)
         || payload_len > file_len.saturating_sub((V2_HEADER + 4) as u64)
     {
@@ -1315,10 +1315,8 @@ fn discover_active_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
         let id = parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
         if is_compacted_segment_path(path) {
             id == Some(marker.output_id)
-        } else if id.is_some_and(|id| id > marker.snapshot_id && id <= marker.through_id) {
-            false
         } else {
-            true
+            !id.is_some_and(|id| id > marker.snapshot_id && id <= marker.through_id)
         }
     });
     Ok(paths)

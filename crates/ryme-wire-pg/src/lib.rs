@@ -3104,9 +3104,7 @@ fn normalize_savepoint_name(value: &str) -> Option<String> {
         return None;
     }
     let name = unquote_literal(value);
-    if name.is_empty() {
-        None
-    } else if name.as_bytes().len() > MAX_SAVEPOINT_NAME_BYTES {
+    if name.is_empty() || name.len() > MAX_SAVEPOINT_NAME_BYTES {
         None
     } else if value.starts_with('"') && value.ends_with('"') {
         Some(name)
@@ -4076,13 +4074,13 @@ fn normalize_notification_name(value: &str) -> Option<String> {
     }
     if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
         let name = value[1..value.len() - 1].replace("\"\"", "\"");
-        return (name.as_bytes().len() <= MAX_NOTIFICATION_CHANNEL_BYTES).then_some(name);
+        return (name.len() <= MAX_NOTIFICATION_CHANNEL_BYTES).then_some(name);
     }
     if value.chars().any(char::is_whitespace) {
         return None;
     }
     let name = value.to_ascii_lowercase();
-    (name.as_bytes().len() <= MAX_NOTIFICATION_CHANNEL_BYTES).then_some(name)
+    (name.len() <= MAX_NOTIFICATION_CHANNEL_BYTES).then_some(name)
 }
 
 fn unquote_literal(value: &str) -> String {

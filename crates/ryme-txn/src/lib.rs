@@ -539,10 +539,9 @@ impl Transaction {
     pub fn record_read(&mut self, key: RecordKey, existed: bool) -> Result<()> {
         let add_read = !self.read_set.contains(&key);
         let add_observed = !self.observed.contains_key(&key);
-        let added_bytes =
-            add_read.then(|| transaction_key_bytes(&key)).unwrap_or(0).saturating_add(
-                add_observed.then(|| transaction_key_bytes(&key).saturating_add(1)).unwrap_or(0),
-            );
+        let added_bytes = (if add_read { transaction_key_bytes(&key) } else { 0 }).saturating_add(
+            if add_observed { transaction_key_bytes(&key).saturating_add(1) } else { 0 },
+        );
         let read_count = self.read_set.len().saturating_add(usize::from(add_read));
         let observed_count = self.observed.len().saturating_add(usize::from(add_observed));
         self.ensure_growth(

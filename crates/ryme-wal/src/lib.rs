@@ -393,8 +393,7 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
     let mut previous_lsn = None;
 
     for id in ids {
-        let raw;
-        if id == active_id {
+        let raw = if id == active_id {
             let length = active.metadata()?.len();
             if length > MAX_WAL_SEGMENT_BYTES {
                 return Err(RymeError::Overload(String::from("wal segment")));
@@ -405,10 +404,10 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
             if contents.len() as u64 > MAX_WAL_SEGMENT_BYTES {
                 return Err(RymeError::Overload(String::from("wal segment")));
             }
-            raw = contents;
+            contents
         } else {
-            raw = read_segment_file(&dir.join(segment_name(id)))?;
-        }
+            read_segment_file(&dir.join(segment_name(id)))?
+        };
         let mut cursor = raw.as_slice();
         while !cursor.is_empty() {
             match decode_frame(cursor)? {
