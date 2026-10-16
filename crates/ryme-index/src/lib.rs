@@ -178,8 +178,7 @@ impl HnswIndex {
             current = self.greedy(&self.nodes[pos].vector, current, layer);
         }
         for layer in (0..=level.min(entry_level)).rev() {
-            let candidates =
-                self.beam(&self.nodes[pos].vector, vec![current], HNSW_EF_BUILD, layer);
+            let candidates = self.beam(&self.nodes[pos].vector, &[current], HNSW_EF_BUILD, layer);
             current = candidates.first().map(|(_, p)| *p).unwrap_or(current);
             let selected = select_neighbors(&candidates, HNSW_M, &self.nodes);
             self.nodes[pos].neighbors[layer] = selected.clone();
@@ -240,13 +239,7 @@ impl HnswIndex {
         current
     }
 
-    fn beam(
-        &self,
-        query: &[f32],
-        starts: Vec<usize>,
-        ef: usize,
-        layer: usize,
-    ) -> Vec<(f64, usize)> {
+    fn beam(&self, query: &[f32], starts: &[usize], ef: usize, layer: usize) -> Vec<(f64, usize)> {
         use std::cmp::Ordering;
         use std::collections::{BinaryHeap, HashSet};
         #[derive(Clone, Copy)]
@@ -270,7 +263,7 @@ impl HnswIndex {
         let mut visited: HashSet<usize> = starts.iter().copied().collect();
         let mut candidates: BinaryHeap<Scored> = BinaryHeap::new();
         let mut results: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::new();
-        for start in starts {
+        for &start in starts {
             let score = dot(query, &self.nodes[start].vector);
             candidates.push(Scored(score, start));
             if !self.nodes[start].tombstoned {
@@ -320,7 +313,7 @@ impl HnswIndex {
         }
         let ef = ef.clamp(top_k.clamp(1, MAX_TOP_K), 256);
         let hits = self
-            .beam(query, vec![current], ef, 0)
+            .beam(query, &[current], ef, 0)
             .into_iter()
             .map(|(score, pos)| (score, self.nodes[pos].id.clone()))
             .take(top_k.clamp(1, MAX_TOP_K))
