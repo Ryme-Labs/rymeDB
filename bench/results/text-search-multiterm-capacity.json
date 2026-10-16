@@ -1,0 +1,34 @@
+{
+  "experiment": "text-search-multiterm-score-map-capacity",
+  "captured_date": "2026-10-17",
+  "baseline_revision": "632a014",
+  "candidate": "working tree with bounded posting-derived score-map preallocation",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087875584,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "parameters": {
+    "documents": 10000,
+    "matched_documents_per_query": 10000,
+    "partitions": 4,
+    "queries": 500,
+    "top_k": 10,
+    "query_terms": 2,
+    "build_profile": "release",
+    "command": "ryme-bench text-index --documents 10000 --queries 500 --partitions 4 --top-k 10 --query-terms 2 --json"
+  },
+  "baseline_runs": [
+    { "index_build_ns": 16959945, "query_p50_ns": 1278981, "query_p95_ns": 1779088, "query_p99_ns": 2216446, "query_qps": 745.225 },
+    { "index_build_ns": 17722188, "query_p50_ns": 1269894, "query_p95_ns": 1510199, "query_p99_ns": 1731478, "query_qps": 767.619 },
+    { "index_build_ns": 17840803, "query_p50_ns": 1288279, "query_p95_ns": 1890478, "query_p99_ns": 2209092, "query_qps": 725.498 }
+  ],
+  "candidate_runs": [
+    { "index_build_ns": 18838321, "query_p50_ns": 736324, "query_p95_ns": 1315109, "query_p99_ns": 1734764, "query_qps": 1201.205 },
+    { "index_build_ns": 19458245, "query_p50_ns": 694434, "query_p95_ns": 1331179, "query_p99_ns": 1683557, "query_qps": 1270.150 },
+    { "index_build_ns": 16992968, "query_p50_ns": 696339, "query_p95_ns": 1113017, "query_p99_ns": 1525027, "query_qps": 1327.098 }
+  ],
+  "caveat": "Three sequential runs per version on one host. Median p50 fell from 1.279 ms to 696 us and median QPS rose from 745 to 1270. Same all-documents-match workload; local in-memory index only."
+}

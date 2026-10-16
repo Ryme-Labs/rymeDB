@@ -119,6 +119,8 @@ enum Command {
         partitions: usize,
         #[arg(long, default_value_t = 10)]
         top_k: usize,
+        #[arg(long, default_value_t = 1, help = "Common query terms (1 or 2)")]
+        query_terms: usize,
         #[arg(long)]
         json: bool,
     },
@@ -248,8 +250,8 @@ async fn main() {
         }) => {
             vector_index_bench(vectors, dimensions, queries, partitions, top_k, ann_ef, json);
         }
-        Some(Command::TextIndex { documents, queries, partitions, top_k, json }) => {
-            text_index_bench(documents, queries, partitions, top_k, json);
+        Some(Command::TextIndex { documents, queries, partitions, top_k, query_terms, json }) => {
+            text_index_bench(documents, queries, partitions, top_k, query_terms, json);
         }
         Some(Command::Resp {
             addr,
@@ -1555,13 +1557,21 @@ fn vector_index_bench(
     }
 }
 
-fn text_index_bench(documents: usize, queries: usize, partitions: usize, top_k: usize, json: bool) {
+fn text_index_bench(
+    documents: usize,
+    queries: usize,
+    partitions: usize,
+    top_k: usize,
+    query_terms: usize,
+    json: bool,
+) {
     if documents == 0
         || documents > ryme_index::MAX_DOCS_PER_SPACE
         || queries == 0
         || queries > 100_000
         || !(1..=ryme_index::MAX_PARTITIONS).contains(&partitions)
         || !(1..=ryme_index::MAX_TOP_K).contains(&top_k)
+        || !(1..=2).contains(&query_terms)
     {
         eprintln!(
             "text-index benchmark arguments are outside supported limits (documents max: {}, queries max: 100000)",
@@ -1574,13 +1584,13 @@ fn text_index_bench(documents: usize, queries: usize, partitions: usize, top_k: 
     let build_start = Instant::now();
     for document in 0..documents {
         let id = format!("d{document:08}");
-        let text = format!("global bucket{:03}", document % 100);
+        let text = format!("global shared bucket{:03}", document % 100);
         index
             .text_index("text-index-bench", id, &text)
             .expect("text index benchmark insert failed");
     }
     let index_build_ns = build_start.elapsed().as_nanos();
-    let query = "global";
+    let query = if query_terms == 1 { "global" } else { "global shared" };
     index
         .text_search("text-index-bench", query, top_k)
         .expect("text index benchmark warmup failed");
@@ -1604,6 +1614,7 @@ fn text_index_bench(documents: usize, queries: usize, partitions: usize, top_k: 
         "partitions": partitions,
         "queries": queries,
         "top_k": top_k,
+        "query_terms": query_terms,
         "matched_documents_per_query": documents,
         "index_build_ns": index_build_ns,
         "query_qps": queries as f64 * 1_000_000_000.0 / total_query_ns as f64,
@@ -1615,7 +1626,7 @@ fn text_index_bench(documents: usize, queries: usize, partitions: usize, top_k: 
         println!("{output}");
     } else {
         println!(
-            "documents={documents} partitions={partitions} top_k={top_k} index_build={}ns query_qps={:.0} query_p50={}ns query_p99={}ns",
+            "documents={documents} partitions={partitions} top_k={top_k} query_terms={query_terms} index_build={}ns query_qps={:.0} query_p50={}ns query_p99={}ns",
             output["index_build_ns"].as_u64().unwrap_or(0),
             output["query_qps"].as_f64().unwrap_or(0.0),
             output["query_p50_ns"].as_u64().unwrap_or(0),

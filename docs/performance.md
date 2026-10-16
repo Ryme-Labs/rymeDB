@@ -100,6 +100,12 @@ the [bounded top-k runs](../bench/results/text-search-bounded-topk.json) and
 [single-term fast-path runs](../bench/results/text-search-single-term-fast-path.json).
 These measurements exclude network, persistence, and replication.
 
+To profile multi-term accumulation, rerun with `--query-terms 2`; both common
+terms then match every document. Reserving the score map from the capped sum of
+posting lengths reduced median p50 from 1.279 ms to 696 µs and raised QPS from
+745 to 1,270 in three runs. The estimate is capped at the table's document
+count to bound memory. See the [raw profile](../bench/results/text-search-multiterm-capacity.json).
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash

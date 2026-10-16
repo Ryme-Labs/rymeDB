@@ -545,7 +545,12 @@ impl TextSpace {
             .collect();
         }
 
-        let mut scores: HashMap<&str, f64> = HashMap::new();
+        let candidate_capacity = terms
+            .iter()
+            .filter_map(|term| self.postings.get(term))
+            .fold(0usize, |count, posting| count.saturating_add(posting.len()))
+            .min(self.docs.len());
+        let mut scores: HashMap<&str, f64> = HashMap::with_capacity(candidate_capacity);
         for term in terms {
             let Some(posting) = self.postings.get(term) else {
                 continue;
