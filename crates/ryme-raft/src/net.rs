@@ -33,13 +33,27 @@ static RPC_FRAME_BUDGET: LazyLock<Semaphore> =
 
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
 
-#[derive(Default)]
-struct RpcFrameBuffer {
+struct RpcFrameBuffer<'a> {
     bytes: Vec<u8>,
     exceeded_limit: bool,
+    exhausted_budget: bool,
+    budget: &'a Semaphore,
+    permits: Vec<tokio::sync::SemaphorePermit<'a>>,
 }
 
-impl std::io::Write for RpcFrameBuffer {
+impl<'a> RpcFrameBuffer<'a> {
+    fn new(budget: &'a Semaphore) -> Self {
+        Self {
+            bytes: Vec::new(),
+            exceeded_limit: false,
+            exhausted_budget: false,
+            budget,
+            permits: Vec::new(),
+        }
+    }
+}
+
+impl std::io::Write for RpcFrameBuffer<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let Some(required) = self.bytes.len().checked_add(bytes.len()) else {
             self.exceeded_limit = true;
@@ -52,9 +66,21 @@ impl std::io::Write for RpcFrameBuffer {
         if required > self.bytes.capacity() {
             let doubled = self.bytes.capacity().saturating_mul(2).max(8 * 1024);
             let capacity = required.max(doubled).min(MAX_RPC_FRAME_BYTES);
+            let permits = capacity
+                .div_ceil(RPC_FRAME_BUDGET_UNIT_BYTES)
+                .saturating_mul(RPC_FRAME_DECODE_WEIGHT);
+            let permit = match self.budget.try_acquire_many(permits as u32) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.exhausted_budget = true;
+                    return Err(std::io::Error::other("rpc frame budget"));
+                }
+            };
             self.bytes
                 .try_reserve_exact(capacity.saturating_sub(self.bytes.len()))
                 .map_err(std::io::Error::other)?;
+            self.permits.clear();
+            self.permits.push(permit);
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -554,10 +580,13 @@ async fn write_frame<S>(socket: &mut S, rpc: &Rpc) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    let mut frame = RpcFrameBuffer::default();
+    let mut frame = RpcFrameBuffer::new(&RPC_FRAME_BUDGET);
     if let Err(error) = serde_json::to_writer(&mut frame, rpc) {
         if frame.exceeded_limit {
             return Err(RymeError::Overload(String::from("rpc frame")));
+        }
+        if frame.exhausted_budget {
+            return Err(RymeError::Overload(String::from("rpc frame budget")));
         }
         return Err(RymeError::Internal(error.to_string()));
     }
@@ -6248,10 +6277,21 @@ mod tests {
     #[test]
     fn rpc_frame_writer_stops_at_the_serialized_size_limit() {
         let rpc = Rpc::Realtime { payload: vec![u8::MAX; 5 * 1024 * 1024] };
-        let mut frame = RpcFrameBuffer::default();
+        let budget = Semaphore::new(RPC_FRAME_BUDGET_PERMITS);
+        let mut frame = RpcFrameBuffer::new(&budget);
         assert!(serde_json::to_writer(&mut frame, &rpc).is_err());
         assert!(frame.exceeded_limit);
         assert!(frame.bytes.len() <= MAX_RPC_FRAME_BYTES);
+    }
+
+    #[test]
+    fn rpc_frame_writer_reserves_aggregate_budget_before_growth() {
+        let rpc = Rpc::VoteRequest { term: 1, candidate: 0, last_term: 0, last_index: 0 };
+        let budget = Semaphore::new(0);
+        let mut frame = RpcFrameBuffer::new(&budget);
+        assert!(serde_json::to_writer(&mut frame, &rpc).is_err());
+        assert!(frame.exhausted_budget);
+        assert!(frame.bytes.is_empty());
     }
 
     #[tokio::test]
