@@ -10840,16 +10840,26 @@ where
             };
             matching_indexes.push(pks);
         }
-        let Some(smallest) = matching_indexes.iter().min_by_key(|pks| pks.len()) else {
+        let Some((smallest_index, smallest)) =
+            matching_indexes.iter().enumerate().min_by_key(|(_, pks)| pks.len())
+        else {
             return Ok(None);
         };
         if smallest.len() > MAX_QUERY_MATERIALIZED_ROWS {
             return Err(materialization_overload());
         }
+        if matching_indexes.len() == 1 {
+            return Ok(Some(smallest.iter().cloned().collect()));
+        }
         Ok(Some(
             smallest
                 .iter()
-                .filter(|pk| matching_indexes.iter().all(|pks| pks.contains(*pk)))
+                .filter(|pk| {
+                    matching_indexes
+                        .iter()
+                        .enumerate()
+                        .all(|(index, pks)| index == smallest_index || pks.contains(*pk))
+                })
                 .cloned()
                 .collect(),
         ))
