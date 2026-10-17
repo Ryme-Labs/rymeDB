@@ -1,0 +1,58 @@
+{
+  "benchmark": "transaction-batch-read-read-set-insert",
+  "machine": {
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "arch": "x86_64",
+    "os": "linux"
+  },
+  "parameters": {
+    "build_profile": "release",
+    "storage_mode": "hot",
+    "records": 10000,
+    "candidates_per_iteration": 1024,
+    "distinct_keys_per_iteration": 1024,
+    "iterations": 50,
+    "batch_size": 256,
+    "value_bytes": 128
+  },
+  "method": "Two sequential captures before and after replacing read-set contains-then-insert with insert-result checking. Each rejected new read is removed if transaction resource limits are exceeded.",
+  "captures": {
+    "before": [
+      {
+        "single_read_p50_ns": 1069916,
+        "batched_read_p50_ns": 860629,
+        "read_only_single_read_p50_ns": 274710,
+        "read_only_batched_read_p50_ns": 85051,
+        "staged_write_single_read_p50_ns": 1078052,
+        "staged_write_batched_read_p50_ns": 865339
+      },
+      {
+        "single_read_p50_ns": 1069195,
+        "batched_read_p50_ns": 862714,
+        "read_only_single_read_p50_ns": 274630,
+        "read_only_batched_read_p50_ns": 85653,
+        "staged_write_single_read_p50_ns": 1081158,
+        "staged_write_batched_read_p50_ns": 867482
+      }
+    ],
+    "after": [
+      {
+        "single_read_p50_ns": 736575,
+        "batched_read_p50_ns": 528982,
+        "read_only_single_read_p50_ns": 268369,
+        "read_only_batched_read_p50_ns": 81986,
+        "staged_write_single_read_p50_ns": 750521,
+        "staged_write_batched_read_p50_ns": 562134
+      },
+      {
+        "single_read_p50_ns": 751273,
+        "batched_read_p50_ns": 532048,
+        "read_only_single_read_p50_ns": 288487,
+        "read_only_batched_read_p50_ns": 81525,
+        "staged_write_single_read_p50_ns": 771170,
+        "staged_write_batched_read_p50_ns": 560422
+      }
+    ]
+  },
+  "caveat": "Single-host in-process microbenchmark with two sequential captures per revision; not a controlled cross-database or end-to-end network benchmark."
+}

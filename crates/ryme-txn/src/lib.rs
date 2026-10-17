@@ -576,17 +576,19 @@ impl Transaction {
         if self.read_only {
             return Ok(());
         }
-        if self.read_set.contains(key) {
+        if !self.read_set.insert(key.clone()) {
             return Ok(());
         }
         let key_bytes = transaction_key_bytes(key);
         let added_bytes = key_bytes.saturating_add(key_bytes.saturating_add(1));
-        self.ensure_growth(
-            self.read_set.len() < MAX_TRANSACTION_READ_KEYS,
+        if let Err(error) = self.ensure_growth(
+            self.read_set.len() <= MAX_TRANSACTION_READ_KEYS,
             added_bytes,
             "read set",
-        )?;
-        self.read_set.insert(key.clone());
+        ) {
+            self.read_set.remove(key);
+            return Err(error);
+        }
         if !existed {
             self.observed_missing.insert(key.clone());
         }
@@ -3429,6 +3431,19 @@ mod tests {
             b"value".to_vec(),
         );
         assert!(manager.commit(ignored_write).is_err());
+    }
+
+    #[test]
+    fn rejected_read_tracking_rolls_back_the_inserted_key() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "items", b"over-budget");
+        let mut txn = manager.begin();
+        txn.state_bytes = MAX_TRANSACTION_STATE_BYTES;
+
+        assert!(matches!(txn.record_read(key.clone(), false), Err(RymeError::Overload(_))));
+        assert!(!txn.read_keys().contains(&key));
+        assert!(!txn.observed_missing.contains(&key));
+        assert!(matches!(manager.commit(txn), Err(RymeError::Overload(_))));
     }
 
     #[test]
