@@ -480,11 +480,19 @@ impl TextSpace {
             return Err(RymeError::Overload(String::from("text space")));
         }
         let mut terms: HashMap<String, u32> = HashMap::new();
-        for term in tokenize(text) {
-            if terms.len() >= MAX_TERMS_PER_DOCUMENT && !terms.contains_key(&term) {
-                return Err(RymeError::Overload(String::from("text terms")));
+        let complete = visit_tokens(text, |term| {
+            if let Some(frequency) = terms.get_mut(term) {
+                *frequency += 1;
+                true
+            } else if terms.len() >= MAX_TERMS_PER_DOCUMENT {
+                false
+            } else {
+                terms.insert(term.to_owned(), 1);
+                true
             }
-            *terms.entry(term).or_insert(0) += 1;
+        });
+        if !complete {
+            return Err(RymeError::Overload(String::from("text terms")));
         }
         let count = terms.len();
         self.remove(&id);
@@ -575,8 +583,7 @@ impl TextSpace {
     }
 }
 
-pub fn tokenize(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+fn visit_tokens(text: &str, mut visit: impl FnMut(&str) -> bool) -> bool {
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_alphanumeric() {
@@ -586,12 +593,21 @@ pub fn tokenize(text: &str) -> Vec<String> {
                 current.extend(ch.to_lowercase());
             }
         } else if !current.is_empty() {
-            out.push(std::mem::take(&mut current));
+            if !visit(&current) {
+                return false;
+            }
+            current.clear();
         }
     }
-    if !current.is_empty() {
-        out.push(current);
-    }
+    current.is_empty() || visit(&current)
+}
+
+pub fn tokenize(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    visit_tokens(text, |term| {
+        out.push(term.to_owned());
+        true
+    });
     out
 }
 
@@ -1262,6 +1278,27 @@ mod tests {
     #[test]
     fn tokenizer_lowercases_unicode_letters() {
         assert_eq!(tokenize("RÉSUMÉ"), tokenize("résumé"));
+    }
+
+    #[test]
+    fn text_index_streams_repeated_terms_and_enforces_distinct_term_limit() {
+        let mut registry = IndexRegistry::new();
+        let repeated = "needle ".repeat(MAX_TERMS_PER_DOCUMENT + 1);
+        assert_eq!(registry.text_index("docs", String::from("existing"), &repeated).unwrap(), 1);
+
+        let mut too_many_distinct = String::new();
+        for term in 0..=MAX_TERMS_PER_DOCUMENT {
+            if term > 0 {
+                too_many_distinct.push(' ');
+            }
+            too_many_distinct.push('x');
+            too_many_distinct.push_str(&term.to_string());
+        }
+        assert!(matches!(
+            registry.text_index("docs", String::from("existing"), &too_many_distinct),
+            Err(RymeError::Overload(message)) if message == "text terms"
+        ));
+        assert_eq!(registry.text_search("docs", "needle", 1).unwrap()[0].id, "existing");
     }
 
     #[test]
