@@ -330,12 +330,13 @@ impl HnswIndex {
         for layer in (1..=entry_level).rev() {
             current = self.greedy(query, current, layer);
         }
-        let ef = ef.clamp(top_k.clamp(1, MAX_TOP_K), 256);
+        let top_k = top_k.clamp(1, MAX_TOP_K);
+        let ef = ef.clamp(top_k, 256);
         let hits = self
             .beam(query, &[current], ef, 0)
             .into_iter()
+            .take(top_k)
             .map(|(score, pos)| (score, self.nodes[pos].id.clone()))
-            .take(top_k.clamp(1, MAX_TOP_K))
             .collect();
         Ok(hits)
     }
