@@ -933,13 +933,13 @@ impl Engine {
 
     pub fn encode_snapshot(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(&0x52594D53u32.to_be_bytes());
-        out.extend_from_slice(&2u16.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&self.max_commit_ts().to_be_bytes());
+        push_snapshot_bytes(&mut out, &0x52594D53u32.to_be_bytes())?;
+        push_snapshot_bytes(&mut out, &2u16.to_be_bytes())?;
+        push_snapshot_bytes(&mut out, &0u16.to_be_bytes())?;
+        push_snapshot_bytes(&mut out, &self.max_commit_ts().to_be_bytes())?;
         let count = u32::try_from(self.inner.len())
             .map_err(|_| RymeError::InvalidArgument(String::from("snapshot size")))?;
-        out.extend_from_slice(&count.to_be_bytes());
+        push_snapshot_bytes(&mut out, &count.to_be_bytes())?;
         for (key, versions) in &self.inner {
             push_field(&mut out, key.tenant.as_bytes())?;
             push_field(&mut out, key.database.as_bytes())?;
@@ -947,25 +947,23 @@ impl Engine {
             push_chunk(&mut out, &key.pk)?;
             let vcount = u32::try_from(versions.len())
                 .map_err(|_| RymeError::InvalidArgument(String::from("snapshot size")))?;
-            out.extend_from_slice(&vcount.to_be_bytes());
+            push_snapshot_bytes(&mut out, &vcount.to_be_bytes())?;
             for version in versions {
-                out.extend_from_slice(&version.commit_ts.to_be_bytes());
+                push_snapshot_bytes(&mut out, &version.commit_ts.to_be_bytes())?;
                 match version.value.as_ref() {
                     Some(value) => {
-                        out.push(0);
+                        push_snapshot_bytes(&mut out, &[0])?;
                         push_chunk(&mut out, value)?;
                     }
                     None => {
-                        out.push(1);
+                        push_snapshot_bytes(&mut out, &[1])?;
                     }
                 }
-                out.extend_from_slice(&version.expires_at.to_be_bytes());
+                push_snapshot_bytes(&mut out, &version.expires_at.to_be_bytes())?;
             }
         }
-        if out.len() > MAX_SNAPSHOT_BYTES.saturating_sub(4) {
-            return Err(RymeError::Overload(String::from("snapshot")));
-        }
         let crc = crc32fast::hash(&out);
+        out.try_reserve(4).map_err(|_| RymeError::Overload(String::from("snapshot")))?;
         out.extend_from_slice(&crc.to_be_bytes());
         Ok(out)
     }
@@ -1077,8 +1075,8 @@ fn push_field(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     if bytes.len() > u16::MAX as usize {
         return Err(RymeError::InvalidArgument(String::from("snapshot field")));
     }
-    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(bytes);
+    push_snapshot_bytes(out, &(bytes.len() as u16).to_be_bytes())?;
+    push_snapshot_bytes(out, bytes)?;
     Ok(())
 }
 
@@ -1086,7 +1084,23 @@ fn push_chunk(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     if bytes.len() > 8 * 1024 * 1024 {
         return Err(RymeError::InvalidArgument(String::from("snapshot chunk")));
     }
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    push_snapshot_bytes(out, &(bytes.len() as u32).to_be_bytes())?;
+    push_snapshot_bytes(out, bytes)?;
+    Ok(())
+}
+
+fn push_snapshot_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    push_bounded_bytes(out, bytes, MAX_SNAPSHOT_BYTES - 4)
+}
+
+fn push_bounded_bytes(out: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<()> {
+    let new_len = out
+        .len()
+        .checked_add(bytes.len())
+        .filter(|length| *length <= limit)
+        .ok_or_else(|| RymeError::Overload(String::from("snapshot")))?;
+    out.try_reserve(new_len - out.len())
+        .map_err(|_| RymeError::Overload(String::from("snapshot")))?;
     out.extend_from_slice(bytes);
     Ok(())
 }
@@ -1596,6 +1610,17 @@ mod tests {
         let last = raw.len() - 1;
         raw[last] ^= 0xff;
         assert!(Engine::decode_snapshot(&raw).is_err());
+    }
+
+    #[test]
+    fn bounded_snapshot_append_rejects_overflow_without_appending() {
+        let mut out = vec![1, 2];
+        push_bounded_bytes(&mut out, &[3], 3).unwrap();
+        assert!(matches!(
+            push_bounded_bytes(&mut out, &[4], 3),
+            Err(RymeError::Overload(message)) if message == "snapshot"
+        ));
+        assert_eq!(out, [1, 2, 3]);
     }
 
     #[test]
