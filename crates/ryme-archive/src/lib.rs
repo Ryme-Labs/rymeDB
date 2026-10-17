@@ -5,6 +5,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
+pub const MAX_ARCHIVE_OBJECT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_ARCHIVE_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_ARCHIVE_FILES: usize = 262_144;
+
 pub mod local;
 pub mod s3;
 
@@ -12,6 +16,13 @@ pub mod s3;
 pub trait ObjectStore: Send + Sync {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
+    async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let bytes = self.get(key).await?;
+        if bytes.len() > max_bytes {
+            return Err(RymeError::Overload(String::from("archive object")));
+        }
+        Ok(bytes)
+    }
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn delete(&self, key: &str) -> Result<()>;
 }
@@ -97,6 +108,9 @@ fn validate_manifest(manifest_key: &str, manifest: &BackupManifest) -> Result<()
     if manifest_key != manifest.manifest_key() {
         return Err(RymeError::Corrupt(String::from("manifest key")));
     }
+    if manifest.files.len() > MAX_ARCHIVE_FILES {
+        return Err(RymeError::Overload(String::from("archive manifest files")));
+    }
     let prefix = manifest.prefix();
     let mut names = HashSet::with_capacity(manifest.files.len());
     for file in &manifest.files {
@@ -178,10 +192,16 @@ impl<S: ObjectStore> Archiver<S> {
         if !valid_backup_id(backup_id) {
             return Err(RymeError::InvalidArgument(String::from("backup_id")));
         }
+        if files.len() > MAX_ARCHIVE_FILES {
+            return Err(RymeError::Overload(String::from("archive manifest files")));
+        }
         let prefix = format!("backups/{commit_ts:020}-{backup_id}/");
         let mut entries = Vec::new();
         let mut names = HashSet::with_capacity(files.len());
         for (name, bytes) in files {
+            if bytes.len() > MAX_ARCHIVE_OBJECT_BYTES {
+                return Err(RymeError::Overload(String::from("archive object")));
+            }
             if !safe_relative_name(&name) {
                 return Err(RymeError::InvalidArgument(String::from("filename")));
             }
@@ -190,10 +210,13 @@ impl<S: ObjectStore> Archiver<S> {
             }
             let key = format!("{prefix}{name}");
             let (stored, encryption) = protect(&bytes)?;
+            if stored.len() > MAX_ARCHIVE_OBJECT_BYTES {
+                return Err(RymeError::Overload(String::from("archive object")));
+            }
             let digest = sha256_hex(&stored);
             let length = stored.len() as u64;
             self.store.put(&key, stored).await?;
-            let roundtrip = self.store.get(&key).await?;
+            let roundtrip = self.store.get_bounded(&key, MAX_ARCHIVE_OBJECT_BYTES).await?;
             if sha256_hex(&roundtrip) != digest {
                 return Err(RymeError::Corrupt(String::from("archive verify")));
             }
@@ -206,6 +229,12 @@ impl<S: ObjectStore> Archiver<S> {
             files: entries,
         };
         let raw = serde_json::to_vec(&manifest).map_err(|e| RymeError::Internal(e.to_string()))?;
+        if raw.len() > MAX_ARCHIVE_MANIFEST_BYTES {
+            for file in &manifest.files {
+                let _ = self.store.delete(&file.key).await;
+            }
+            return Err(RymeError::Overload(String::from("archive manifest")));
+        }
         self.store.put(&manifest.manifest_key(), raw).await?;
         Ok(manifest)
     }
@@ -217,7 +246,7 @@ impl<S: ObjectStore> Archiver<S> {
             if !key.ends_with("/manifest.json") {
                 continue;
             }
-            let raw = self.store.get(&key).await?;
+            let raw = self.store.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await?;
             let manifest: BackupManifest = serde_json::from_slice(&raw)
                 .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
             validate_manifest(&key, &manifest)?;
@@ -241,7 +270,7 @@ impl<S: ObjectStore> Archiver<S> {
         dest_dir: &std::path::Path,
         open: &(impl Fn(&Option<FileEncryption>, &[u8]) -> Result<Vec<u8>> + Send + Sync),
     ) -> Result<u64> {
-        let raw = self.store.get(manifest_key).await?;
+        let raw = self.store.get_bounded(manifest_key, MAX_ARCHIVE_MANIFEST_BYTES).await?;
         let manifest: BackupManifest = serde_json::from_slice(&raw)
             .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
         validate_manifest(manifest_key, &manifest)?;
@@ -255,7 +284,7 @@ impl<S: ObjectStore> Archiver<S> {
         std::fs::create_dir(&staging)?;
         let restore_result: Result<()> = async {
             for file in &manifest.files {
-                let bytes = self.store.get(&file.key).await?;
+                let bytes = self.store.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
                 if bytes.len() as u64 != file.bytes || sha256_hex(&bytes) != file.sha256 {
                     return Err(RymeError::Corrupt(String::from("restore verify")));
                 }
@@ -292,13 +321,13 @@ impl<S: ObjectStore> Archiver<S> {
         manifest_key: &str,
         open: &(impl Fn(&Option<FileEncryption>, &[u8]) -> Result<Vec<u8>> + Send + Sync),
     ) -> Result<u64> {
-        let raw = self.store.get(manifest_key).await?;
+        let raw = self.store.get_bounded(manifest_key, MAX_ARCHIVE_MANIFEST_BYTES).await?;
         let manifest: BackupManifest = serde_json::from_slice(&raw)
             .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
         validate_manifest(manifest_key, &manifest)?;
         let mut verified = 0u64;
         for file in &manifest.files {
-            let bytes = self.store.get(&file.key).await?;
+            let bytes = self.store.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
             if bytes.len() as u64 != file.bytes || sha256_hex(&bytes) != file.sha256 {
                 return Err(RymeError::Corrupt(String::from("restore verify")));
             }
@@ -334,12 +363,12 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
     validate_manifest(&manifest.manifest_key(), manifest)?;
     let mut copied = 0u64;
     for file in &manifest.files {
-        let bytes = source.get(&file.key).await?;
+        let bytes = source.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
         if bytes.len() as u64 != file.bytes || sha256_hex(&bytes) != file.sha256 {
             return Err(RymeError::Corrupt(String::from("copy verify")));
         }
         dest.put(&file.key, bytes).await?;
-        let roundtrip = dest.get(&file.key).await?;
+        let roundtrip = dest.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
         if sha256_hex(&roundtrip) != file.sha256 {
             dest.delete(&file.key).await?;
             return Err(RymeError::Corrupt(String::from("copy verify")));
@@ -347,7 +376,7 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
         copied += 1;
     }
     let key = manifest.manifest_key();
-    let raw = source.get(&key).await?;
+    let raw = source.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await?;
     let copied_manifest: BackupManifest =
         serde_json::from_slice(&raw).map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
     validate_manifest(&key, &copied_manifest)?;

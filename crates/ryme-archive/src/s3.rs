@@ -1,5 +1,27 @@
 use ryme_error::{Result, RymeError};
 
+const MAX_S3_LIST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+async fn response_bytes_bounded(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    if response.content_length().is_some_and(|length| length > max_bytes as u64) {
+        return Err(RymeError::Overload(label.to_string()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) =
+        response.chunk().await.map_err(|error| RymeError::Io(error.to_string()))?
+    {
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(RymeError::Overload(label.to_string()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Config {
     pub endpoint: String,
@@ -137,7 +159,7 @@ impl S3Store {
         if !response.status().is_success() {
             return Err(RymeError::Unavailable(format!("list {}", response.status())));
         }
-        let body = response.bytes().await.map_err(|e| RymeError::Io(e.to_string()))?;
+        let body = response_bytes_bounded(response, MAX_S3_LIST_RESPONSE_BYTES, "s3 list").await?;
         let text = String::from_utf8_lossy(&body).into_owned();
         Ok((extract_keys(&text), extract_token(&text)))
     }
@@ -172,6 +194,10 @@ impl crate::ObjectStore for S3Store {
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.get_bounded(key, crate::MAX_ARCHIVE_OBJECT_BYTES).await
+    }
+
+    async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let response = self.signed("GET", key, "", None, crate::now_unix()).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RymeError::NotFound(String::from("key")));
@@ -179,7 +205,7 @@ impl crate::ObjectStore for S3Store {
         if !response.status().is_success() {
             return Err(RymeError::Unavailable(format!("get {}", response.status())));
         }
-        response.bytes().await.map(|b| b.to_vec()).map_err(|e| RymeError::Io(e.to_string()))
+        response_bytes_bounded(response, max_bytes, "archive object").await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {

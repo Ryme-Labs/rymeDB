@@ -73,6 +73,7 @@ impl LocalStore {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::ObjectStore;
 
     #[test]
     fn local_store_rejects_rooted_and_traversal_keys() {
@@ -127,6 +128,24 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&outside).unwrap();
     }
+
+    #[tokio::test]
+    async fn local_store_bounds_object_reads() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-local-store-bounds-{}-{}",
+            std::process::id(),
+            crate::now_unix()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = LocalStore::new(root.clone());
+        store.put("small", b"123".to_vec()).await.unwrap();
+        assert!(matches!(store.get_bounded("small", 2).await, Err(RymeError::Overload(_))));
+
+        let oversized = std::fs::File::create(root.join("oversized")).unwrap();
+        oversized.set_len((super::super::MAX_ARCHIVE_OBJECT_BYTES + 1) as u64).unwrap();
+        assert!(matches!(store.get("oversized").await, Err(RymeError::Overload(_))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 impl crate::ObjectStore for LocalStore {
@@ -142,14 +161,29 @@ impl crate::ObjectStore for LocalStore {
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.get_bounded(key, super::MAX_ARCHIVE_OBJECT_BYTES).await
+    }
+
+    async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+
         let path = self.path(key)?;
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(bytes),
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(RymeError::NotFound(String::from("key")))
+                return Err(RymeError::NotFound(String::from("key")));
             }
-            Err(e) => Err(RymeError::from(e)),
+            Err(e) => return Err(RymeError::from(e)),
+        };
+        if file.metadata()?.len() > max_bytes as u64 {
+            return Err(RymeError::Overload(String::from("archive object")));
         }
+        let mut bytes = Vec::new();
+        file.take((max_bytes as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            return Err(RymeError::Overload(String::from("archive object")));
+        }
+        Ok(bytes)
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
