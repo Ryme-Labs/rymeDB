@@ -107,6 +107,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Audit Rust SDK dependencies
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: ./sdks/rust/Cargo.toml
+          command: check
+          arguments: --all-features --locked
+
       - name: Test
         run: cargo test --manifest-path sdks/rust/Cargo.toml --locked
 
