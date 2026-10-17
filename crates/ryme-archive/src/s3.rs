@@ -93,11 +93,8 @@ impl S3Store {
             None => crate::sha256_hex(&[]),
         };
         let host = self.host()?;
-        let path = if self.config.path_style {
-            format!("/{}/{}", self.config.bucket, encode_key(key)?)
-        } else {
-            format!("/{}", encode_key(key)?)
-        };
+        let mut url = self.url(key)?;
+        let path = canonical_uri(&url)?;
         let (datestamp, amztime) = amz_datetime(now);
         let headers = vec![
             (String::from("host"), host.clone()),
@@ -122,7 +119,6 @@ impl S3Store {
             "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
             self.config.access_key, scope, signed_headers, signature
         );
-        let mut url = self.url(key)?;
         if !query.is_empty() {
             url.push('?');
             url.push_str(query);
@@ -166,6 +162,12 @@ impl S3Store {
         let text = String::from_utf8_lossy(&body).into_owned();
         Ok((extract_keys(&text), extract_token(&text)))
     }
+}
+
+fn canonical_uri(url: &str) -> Result<String> {
+    reqwest::Url::parse(url)
+        .map(|url| url.path().to_string())
+        .map_err(|_| RymeError::InvalidArgument(String::from("s3 url")))
 }
 
 fn validate_endpoint(endpoint: &str, allow_insecure_http: bool) -> Result<()> {
@@ -445,6 +447,14 @@ mod tests {
                 ("continuation-token", "page-1"),
             ]),
             "continuation-token=page-1&list-type=2&max-keys=1000&prefix=backups%2F"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_includes_custom_endpoint_path_prefix() {
+        assert_eq!(
+            canonical_uri("https://s3.example.com/custom/prefix/bucket/backups/file").unwrap(),
+            "/custom/prefix/bucket/backups/file"
         );
     }
 
