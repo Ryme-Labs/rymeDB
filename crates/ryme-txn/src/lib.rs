@@ -15,6 +15,8 @@ pub const MAX_TRANSACTION_READ_KEYS: usize = 100_000;
 pub const MAX_TRANSACTION_SCANNED_TABLES: usize = 10_000;
 pub const MAX_TRANSACTION_CONSTRAINT_SCANS: usize = 10_000;
 pub const MAX_TRANSACTION_STATE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_GROUP_COMMIT_TRANSACTIONS: usize = 16;
+pub const MAX_GROUP_COMMIT_BYTES: usize = 32 * 1024 * 1024;
 
 const TRANSACTION_ENTRY_OVERHEAD: usize = 64;
 const MVCC_GC_KEYS_PER_LOCK: usize = 1_024;
@@ -1859,6 +1861,144 @@ impl TxnManager {
         Ok(commit_ts)
     }
 
+    fn batch_commit_conflicts(
+        txn: &Transaction,
+        commit_ts: u64,
+        previous: &Transaction,
+        previous_ts: u64,
+    ) -> Option<&'static str> {
+        if previous_ts <= txn.read_ts || previous_ts >= commit_ts {
+            return None;
+        }
+        let prior_writes = &previous.writes;
+        if txn.writes.keys().any(|key| prior_writes.contains_key(key)) {
+            return Some("write-write conflict");
+        }
+        if txn.isolation == Isolation::Serializable {
+            if txn.read_set.iter().any(|key| prior_writes.contains_key(key)) {
+                return Some("read-write conflict");
+            }
+            if txn.scanned.iter().any(|table| {
+                prior_writes.keys().any(|key| {
+                    key.tenant == table.0 && key.database == table.1 && key.table == table.2
+                })
+            }) {
+                return Some("phantom conflict");
+            }
+        }
+        txn.constraint_scanned
+            .iter()
+            .any(|table| {
+                prior_writes.keys().any(|key| {
+                    key.tenant == table.0 && key.database == table.1 && key.table == table.2
+                })
+            })
+            .then_some("constraint conflict")
+    }
+
+    /// Commits a group of shard-local transactions under one validation lock.
+    /// The persistence callback must durably persist the whole accepted group
+    /// before this method publishes any transaction to the in-memory engine.
+    fn commit_durable_batch_at_owned(
+        &self,
+        commits: Vec<(Transaction, u64)>,
+        persist: impl FnOnce(&[(u64, Vec<u8>, BTreeMap<RecordKey, WriteOp>)]) -> Result<()>,
+    ) -> Vec<Result<u64>> {
+        if commits.is_empty() {
+            return Vec::new();
+        }
+        let mut commits: Vec<Option<(Transaction, u64)>> = commits.into_iter().map(Some).collect();
+        let mut guard = match self.inner.commit.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return commits
+                    .iter()
+                    .map(|_| Err(RymeError::Internal(String::from("commit lock"))))
+                    .collect();
+            }
+        };
+        let mut results: Vec<Option<Result<u64>>> =
+            std::iter::repeat_with(|| None).take(commits.len()).collect();
+        let mut payloads: Vec<Option<Vec<u8>>> =
+            std::iter::repeat_with(|| None).take(commits.len()).collect();
+        let mut accepted: Vec<usize> = Vec::with_capacity(commits.len());
+
+        for index in 0..commits.len() {
+            let (txn, commit_ts) = commits[index].as_ref().expect("unconsumed batch commit");
+            let validation = txn.ensure_healthy().and_then(|()| {
+                self.check_locked(txn, *commit_ts, &mut guard)?;
+                for previous in &accepted {
+                    let (previous_txn, previous_ts) =
+                        commits[*previous].as_ref().expect("accepted batch commit");
+                    if let Some(message) =
+                        Self::batch_commit_conflicts(txn, *commit_ts, previous_txn, *previous_ts)
+                    {
+                        return Err(RymeError::Conflict(String::from(message)));
+                    }
+                }
+                Ok(())
+            });
+            if let Err(error) = validation {
+                results[index] = Some(Err(error));
+                continue;
+            }
+            match encode_writes(&txn.writes) {
+                Ok(payload) => {
+                    payloads[index] = Some(payload);
+                    accepted.push(index);
+                }
+                Err(error) => results[index] = Some(Err(error)),
+            }
+        }
+
+        if accepted.is_empty() {
+            return results
+                .into_iter()
+                .map(|result| {
+                    result.unwrap_or_else(|| Err(RymeError::Internal(String::from("batch result"))))
+                })
+                .collect();
+        }
+
+        let mut prepared = Vec::with_capacity(accepted.len());
+        let mut txn_ids = Vec::with_capacity(accepted.len());
+        for index in accepted.iter().copied() {
+            let (txn, commit_ts) = commits[index].take().expect("accepted batch commit");
+            txn_ids.push(txn.id);
+            prepared.push((
+                commit_ts,
+                payloads[index].take().expect("validated commit payload"),
+                txn.writes,
+            ));
+        }
+        if let Err(error) = persist(&prepared) {
+            for index in accepted {
+                results[index] = Some(Err(error.clone()));
+            }
+            return results
+                .into_iter()
+                .map(|result| {
+                    result.unwrap_or_else(|| Err(RymeError::Internal(String::from("batch result"))))
+                })
+                .collect();
+        }
+
+        for ((index, (commit_ts, _, writes)), txn_id) in
+            accepted.into_iter().zip(prepared).zip(txn_ids)
+        {
+            let result = self
+                .apply_owned_locked(commit_ts, writes, &mut guard, Some(txn_id))
+                .map(|()| commit_ts);
+            results[index] = Some(result);
+        }
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| Err(RymeError::Internal(String::from("batch result"))))
+            })
+            .collect()
+    }
+
     pub fn scan(
         &self,
         txn: &mut Transaction,
@@ -3331,6 +3471,85 @@ impl DurableManager {
         result
     }
 
+    /// Persists several independent commits with one WAL sync and one delta
+    /// segment. Transactions keep separate commit timestamps and conflict
+    /// outcomes.
+    pub fn commit_at_batch_owned(&self, commits: Vec<(Transaction, u64)>) -> Vec<Result<u64>> {
+        if commits.windows(2).any(|pair| pair[0].1 >= pair[1].1) {
+            return commits
+                .iter()
+                .map(|_| Err(RymeError::InvalidArgument(String::from("commit batch order"))))
+                .collect();
+        }
+        let group_bytes =
+            commits.iter().fold(0usize, |total, (txn, _)| total.saturating_add(txn.state_bytes()));
+        if commits.len() > MAX_GROUP_COMMIT_TRANSACTIONS
+            || (commits.len() > 1 && group_bytes > MAX_GROUP_COMMIT_BYTES)
+        {
+            return commits
+                .iter()
+                .map(|_| Err(RymeError::Overload(String::from("commit batch"))))
+                .collect();
+        }
+        let _gate = match self.gate.lock() {
+            Ok(gate) => gate,
+            Err(_) => {
+                return commits
+                    .iter()
+                    .map(|_| Err(RymeError::Internal(String::from("durable gate"))))
+                    .collect();
+            }
+        };
+        let policy = self.policy;
+        let results = self.inner.commit_durable_batch_at_owned(commits, |prepared| {
+            {
+                let mut wal =
+                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                for (commit_ts, payload, _) in prepared {
+                    wal.append_lsn(*commit_ts, payload)?;
+                }
+                if policy == SyncPolicy::Always {
+                    wal.sync()?;
+                }
+            }
+            let Some((last_commit_ts, _, _)) = prepared.last() else {
+                return Ok(());
+            };
+            let group_bytes = prepared
+                .iter()
+                .fold(0usize, |total, (_, payload, _)| total.saturating_add(payload.len()));
+            if group_bytes <= MAX_GROUP_COMMIT_BYTES {
+                let entries = prepared
+                    .iter()
+                    .flat_map(|(commit_ts, _, writes)| segment_entries(*commit_ts, writes))
+                    .collect();
+                self.segments.write_delta_owned_with_sync(
+                    *last_commit_ts,
+                    entries,
+                    policy == SyncPolicy::Always,
+                )?;
+            } else {
+                for (commit_ts, _, writes) in prepared {
+                    self.segments.write_delta_owned_with_sync(
+                        *commit_ts,
+                        segment_entries(*commit_ts, writes),
+                        policy == SyncPolicy::Always,
+                    )?;
+                }
+            }
+            Ok(())
+        });
+        if self.mode == StorageMode::Standard && results.iter().any(Result::is_ok) {
+            if let Err(error) = self.inner.clear_engine() {
+                return results
+                    .into_iter()
+                    .map(|result| result.and_then(|_| Err(error.clone())))
+                    .collect();
+            }
+        }
+        results
+    }
+
     /// Commits an owned single-shard transaction, avoiding filtered write-map
     /// copies on the durable path.
     pub fn commit_at_owned(&self, txn: Transaction, commit_ts: u64) -> Result<()> {
@@ -4471,6 +4690,128 @@ mod tests {
         let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"v".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_batch_commits_conflicts_and_recovers_from_one_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-durable-batch-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let shared = RecordKey::new("t", "d", "items", b"shared");
+        let independent = RecordKey::new("t", "d", "items", b"independent");
+        let mut first = manager.begin();
+        manager.put(&mut first, shared.clone(), b"first".to_vec());
+        let mut conflicting = manager.begin();
+        manager.put(&mut conflicting, shared, b"conflicting".to_vec());
+        let mut independent_txn = manager.begin();
+        manager.put(&mut independent_txn, independent.clone(), b"third".to_vec());
+        let first_ts = manager.latest_commit() + 1;
+
+        let results = manager.commit_at_batch_owned(vec![
+            (first, first_ts),
+            (conflicting, first_ts + 1),
+            (independent_txn, first_ts + 2),
+        ]);
+        assert_eq!(results[0], Ok(first_ts));
+        assert!(matches!(results[1], Err(RymeError::Conflict(_))));
+        assert_eq!(results[2], Ok(first_ts + 2));
+        assert_eq!(
+            SegmentStore::open(&manager.segment_dir()).unwrap().segment_paths().unwrap().len(),
+            1
+        );
+        drop(manager);
+
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &independent).unwrap(), Some(b"third".to_vec()));
+        assert_eq!(
+            reopened.get(&mut probe, &RecordKey::new("t", "d", "items", b"shared")).unwrap(),
+            Some(b"first".to_vec())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_batch_preserves_serializable_read_conflicts() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-durable-batch-serializable-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let read_key = RecordKey::new("t", "d", "items", b"observed");
+        let output_key = RecordKey::new("t", "d", "items", b"output");
+        let mut writer = manager.begin();
+        manager.put(&mut writer, read_key.clone(), b"value".to_vec());
+        let mut reader = manager.begin();
+        assert_eq!(manager.get(&mut reader, &read_key).unwrap(), None);
+        manager.put(&mut reader, output_key, b"derived".to_vec());
+        let first_ts = manager.latest_commit() + 1;
+
+        let results =
+            manager.commit_at_batch_owned(vec![(writer, first_ts), (reader, first_ts + 1)]);
+        assert_eq!(results[0], Ok(first_ts));
+        assert!(matches!(
+            &results[1],
+            Err(RymeError::Conflict(message)) if message == "read-write conflict"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_mode_durable_batch_keeps_the_resident_engine_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-durable-batch-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let first_key = RecordKey::new("t", "d", "items", b"first");
+        let second_key = RecordKey::new("t", "d", "items", b"second");
+        let mut first = manager.begin();
+        manager.put(&mut first, first_key.clone(), b"one".to_vec());
+        let mut second = manager.begin();
+        manager.put(&mut second, second_key.clone(), b"two".to_vec());
+        let first_ts = manager.latest_commit() + 1;
+
+        let results =
+            manager.commit_at_batch_owned(vec![(first, first_ts), (second, first_ts + 1)]);
+        assert_eq!(results, vec![Ok(first_ts), Ok(first_ts + 1)]);
+        assert_eq!(manager.resident_bytes().unwrap(), 0);
+        drop(manager);
+
+        let reopened = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &first_key).unwrap(), Some(b"one".to_vec()));
+        assert_eq!(reopened.get(&mut probe, &second_key).unwrap(), Some(b"two".to_vec()));
+        assert_eq!(reopened.resident_bytes().unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

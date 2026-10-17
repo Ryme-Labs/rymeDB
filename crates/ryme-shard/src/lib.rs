@@ -2,13 +2,14 @@ use ryme_error::{Result, RymeError};
 use ryme_storage::{RecordKey, SegmentCacheStats, StorageMode};
 use ryme_txn::{
     decode_writes, encode_writes, DurableManager, SyncPolicy, Transaction, TxnBackend, TxnTracker,
+    MAX_GROUP_COMMIT_BYTES, MAX_GROUP_COMMIT_TRANSACTIONS,
 };
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TableRef {
@@ -59,6 +60,25 @@ struct ShardCtx {
 }
 
 #[derive(Debug)]
+struct CommitRequest {
+    txn: Transaction,
+    reply: mpsc::SyncSender<Result<u64>>,
+}
+
+#[derive(Debug, Default)]
+struct CommitQueueState {
+    pending: Vec<CommitRequest>,
+    pending_bytes: usize,
+    processing: bool,
+}
+
+#[derive(Debug, Default)]
+struct CommitQueue {
+    state: Mutex<CommitQueueState>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
 struct ShardInner {
     base_dir: std::path::PathBuf,
     placement_path: std::path::PathBuf,
@@ -76,7 +96,8 @@ struct ShardInner {
 pub struct ShardSet {
     inner: Arc<Mutex<ShardInner>>,
     commit: Arc<RwLock<()>>,
-    shard_commit_locks: Arc<Vec<Mutex<()>>>,
+    commit_queues: Arc<Vec<CommitQueue>>,
+    group_commit_delay: Duration,
     commit_clock: Arc<AtomicU64>,
 }
 
@@ -99,6 +120,8 @@ type DecisionParts = Vec<(u32, Vec<u8>)>;
 
 const COORDINATOR_DECISION_VERSION: u8 = 1;
 const COORDINATOR_PLACEMENT_VERSION: u8 = 2;
+const MAX_PENDING_GROUP_COMMITS: usize = 128;
+const MAX_PENDING_GROUP_COMMIT_BYTES: usize = 64 * 1024 * 1024;
 
 fn encode_decision(commit_ts: u64, parts: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -323,7 +346,12 @@ impl ShardSet {
                 coordinator: Mutex::new(coordinator),
             })),
             commit: Arc::new(RwLock::new(())),
-            shard_commit_locks: Arc::new((0..shards).map(|_| Mutex::new(())).collect()),
+            commit_queues: Arc::new((0..shards).map(|_| CommitQueue::default()).collect()),
+            group_commit_delay: if policy == SyncPolicy::Always {
+                Duration::from_micros(100)
+            } else {
+                Duration::ZERO
+            },
             commit_clock: Arc::new(AtomicU64::new(latest_commit)),
         };
         set.recover_coordinator()?;
@@ -794,15 +822,112 @@ impl ShardSet {
                 .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
             manager
         };
-        let _shard_commit = self
-            .shard_commit_locks
+        self.enqueue_group_commit(shard, manager, txn)
+    }
+
+    fn enqueue_group_commit(
+        &self,
+        shard: usize,
+        manager: DurableManager,
+        txn: Transaction,
+    ) -> Result<u64> {
+        let queue = self
+            .commit_queues
             .get(shard)
-            .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("shard commit lock")))?;
-        let commit_ts = self.reserve_commit_ts(0, txn.read_ts)?;
-        manager.commit_at_owned(txn, commit_ts)?;
-        Ok(commit_ts)
+            .ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
+        let (reply, result) = mpsc::sync_channel(1);
+        let is_processor = {
+            let mut state = queue
+                .state
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("commit queue")))?;
+            let txn_bytes = txn.state_bytes();
+            if state.pending.len() >= MAX_PENDING_GROUP_COMMITS
+                || (!state.pending.is_empty()
+                    && state.pending_bytes.saturating_add(txn_bytes)
+                        > MAX_PENDING_GROUP_COMMIT_BYTES)
+            {
+                return Err(RymeError::Overload(String::from("commit queue")));
+            }
+            state.pending_bytes = state.pending_bytes.saturating_add(txn_bytes);
+            state.pending.push(CommitRequest { txn, reply });
+            let is_processor = !state.processing;
+            if is_processor {
+                state.processing = true;
+            }
+            if state.pending.len() >= MAX_GROUP_COMMIT_TRANSACTIONS {
+                queue.ready.notify_one();
+            }
+            is_processor
+        };
+
+        if is_processor {
+            loop {
+                let batch = {
+                    let mut state = queue
+                        .state
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("commit queue")))?;
+                    if state.pending.len() < MAX_GROUP_COMMIT_TRANSACTIONS
+                        && !self.group_commit_delay.is_zero()
+                    {
+                        state = queue
+                            .ready
+                            .wait_timeout(state, self.group_commit_delay)
+                            .map_err(|_| RymeError::Internal(String::from("commit queue")))?
+                            .0;
+                    }
+                    let mut count = 0usize;
+                    let mut group_bytes = 0usize;
+                    for request in state.pending.iter().take(MAX_GROUP_COMMIT_TRANSACTIONS) {
+                        let request_bytes = request.txn.state_bytes();
+                        if count > 0
+                            && group_bytes.saturating_add(request_bytes) > MAX_GROUP_COMMIT_BYTES
+                        {
+                            break;
+                        }
+                        group_bytes = group_bytes.saturating_add(request_bytes);
+                        count += 1;
+                    }
+                    let batch = state.pending.drain(..count).collect::<Vec<_>>();
+                    let batch_bytes = batch.iter().fold(0usize, |total, request| {
+                        total.saturating_add(request.txn.state_bytes())
+                    });
+                    state.pending_bytes = state.pending_bytes.saturating_sub(batch_bytes);
+                    batch
+                };
+
+                let mut replies = Vec::with_capacity(batch.len());
+                let mut commits = Vec::with_capacity(batch.len());
+                for request in batch {
+                    match self.reserve_commit_ts(0, request.txn.read_ts) {
+                        Ok(commit_ts) => {
+                            commits.push((request.txn, commit_ts));
+                            replies.push(request.reply);
+                        }
+                        Err(error) => {
+                            let _ = request.reply.send(Err(error));
+                        }
+                    }
+                }
+                for (reply, result) in
+                    replies.into_iter().zip(manager.commit_at_batch_owned(commits))
+                {
+                    let _ = reply.send(result);
+                }
+
+                let mut state = queue
+                    .state
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("commit queue")))?;
+                if state.pending.is_empty() {
+                    state.processing = false;
+                    break;
+                }
+            }
+        }
+
+        result.recv().map_err(|_| RymeError::Unavailable(String::from("commit queue closed")))?
     }
 
     fn commit_two_phase(&self, txn: Transaction) -> Result<u64> {
@@ -2041,6 +2166,63 @@ mod tests {
         let mut probe = backend.begin();
         assert_eq!(backend.get(&mut probe, &left_key).unwrap(), Some(b"left".to_vec()));
         assert_eq!(backend.get(&mut probe, &right_key).unwrap(), Some(b"right".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_durable_commits_share_one_segment_and_recover_without_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-group-commit-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut backend = ShardSet::open(&dir, 4, SyncPolicy::Always).unwrap();
+        backend.group_commit_delay = Duration::from_millis(50);
+        let table = "group_commit_rows";
+        let shard = backend.route(&TableRef::new("t", "d", table));
+        let commits = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(commits + 1));
+        let mut workers = Vec::with_capacity(commits);
+        let mut keys = Vec::with_capacity(commits);
+        for index in 0..commits {
+            let key = RecordKey::new("t", "d", table, &(index as u64).to_be_bytes());
+            let mut txn = backend.begin();
+            backend.put(&mut txn, key.clone(), format!("value-{index}").into_bytes());
+            keys.push(key);
+            let worker_backend = backend.clone();
+            let worker_barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                futures_executor_block_on(worker_backend.commit(txn))
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let segment_dir = backend.shard_manager(shard).unwrap().segment_dir();
+        assert_eq!(
+            ryme_storage::SegmentStore::open(&segment_dir).unwrap().segment_paths().unwrap().len(),
+            1
+        );
+        drop(backend);
+
+        let wal_dir = dir.join("shards").join(shard.to_string()).join("wal");
+        for entry in std::fs::read_dir(&wal_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reopened = ShardSet::open(&dir, 4, SyncPolicy::Always).unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            let mut probe = reopened.begin();
+            assert_eq!(
+                reopened.get(&mut probe, key).unwrap(),
+                Some(format!("value-{index}").into_bytes())
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
