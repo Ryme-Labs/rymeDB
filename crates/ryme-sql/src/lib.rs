@@ -3,6 +3,7 @@ use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,36 @@ const fn default_sequence_cache() -> i64 {
 
 const fn default_sequence_called() -> bool {
     true
+}
+
+const MAX_SQL_STATEMENT_BYTES: usize = 1024 * 1024;
+const MAX_SQL_TOKENS: usize = 65_536;
+const MAX_SQL_PARSE_DEPTH: usize = 64;
+
+thread_local! {
+    static SQL_PARSE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct SqlParseDepthGuard;
+
+impl SqlParseDepthGuard {
+    fn enter() -> bool {
+        SQL_PARSE_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= MAX_SQL_PARSE_DEPTH {
+                false
+            } else {
+                depth.set(current + 1);
+                true
+            }
+        })
+    }
+}
+
+impl Drop for SqlParseDepthGuard {
+    fn drop(&mut self) {
+        SQL_PARSE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1967,7 +1998,17 @@ impl Statement {
 }
 
 pub fn parse(input: &str) -> Result<Statement> {
+    if input.len() > MAX_SQL_STATEMENT_BYTES {
+        return Err(RymeError::Overload(String::from("SQL statement bytes")));
+    }
+    if !SqlParseDepthGuard::enter() {
+        return Err(RymeError::Overload(String::from("SQL parse nesting")));
+    }
+    let _depth = SqlParseDepthGuard;
     let tokens = tokenize(input);
+    if tokens.len() > MAX_SQL_TOKENS {
+        return Err(RymeError::Overload(String::from("SQL statement tokens")));
+    }
     if tokens.is_empty() {
         return Err(RymeError::InvalidArgument(String::from("empty statement")));
     }
@@ -2768,6 +2809,9 @@ fn tokenize(input: &str) -> Vec<String> {
     let mut current = String::new();
     let mut quoted: Option<char> = None;
     for ch in input.chars() {
+        if out.len() > MAX_SQL_TOKENS {
+            return out;
+        }
         if let Some(q) = quoted {
             current.push(ch);
             if ch == q {
@@ -16204,6 +16248,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_parser_bounds_bytes_tokens_and_recursive_nesting() {
+        let oversized = "x".repeat(MAX_SQL_STATEMENT_BYTES + 1);
+        assert!(matches!(
+            parse(&oversized),
+            Err(RymeError::Overload(message)) if message == "SQL statement bytes"
+        ));
+
+        let mut token_heavy = String::from("SELECT");
+        for _ in 0..MAX_SQL_TOKENS {
+            token_heavy.push_str(" x");
+        }
+        assert!(matches!(
+            parse(&token_heavy),
+            Err(RymeError::Overload(message)) if message == "SQL statement tokens"
+        ));
+
+        let within_depth = (0..MAX_SQL_PARSE_DEPTH - 1).fold(
+            String::from("SELECT * FROM source"),
+            |query, level| format!("WITH c{level} AS ({query}) SELECT * FROM c{level}"),
+        );
+        assert!(parse(&within_depth).is_ok());
+
+        let nested = (0..MAX_SQL_PARSE_DEPTH + 1).fold(
+            String::from("SELECT * FROM source"),
+            |query, level| format!("WITH c{level} AS ({query}) SELECT * FROM c{level}"),
+        );
+        assert!(matches!(
+            parse(&nested),
+            Err(RymeError::Overload(message)) if message == "SQL parse nesting"
+        ));
+        assert!(parse("SELECT 1").is_ok());
+    }
 
     #[test]
     fn query_materialization_budget_is_bounded_without_partial_accounting() {

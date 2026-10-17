@@ -20,6 +20,13 @@ This is a compatibility-oriented subset, not a promise to run arbitrary
 PostgreSQL extensions or PL/pgSQL unchanged. Check [migration](migration.md)
 before cutover.
 
+## Query resource bounds
+
+Each SQL statement is limited to 1 MiB, 65,536 tokens, and 64 recursive parse
+levels. Larger or more deeply nested statements are rejected before execution.
+Split generated SQL into smaller statements when it exceeds these limits; use
+the bulk-copy endpoints for large data loads.
+
 ## HTTP SQL
 
 ```bash
