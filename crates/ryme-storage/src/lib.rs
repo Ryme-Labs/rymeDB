@@ -291,8 +291,9 @@ impl Engine {
         self.read_with_presence(key, read_ts, now).map(|(_, value)| value)
     }
 
-    /// Reads a sorted, same-table batch with one ordered map walk when keys
-    /// are dense. Sparse or unsorted batches use point lookups instead.
+    /// Reads a same-table batch with one ordered map walk when keys are dense.
+    /// Unsorted unique keys are ordered internally and returned in input order;
+    /// sparse batches and duplicates use point lookups instead.
     pub fn read_many(
         &self,
         keys: &[RecordKey],
@@ -322,19 +323,40 @@ impl Engine {
             return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
         }
         let first = keys[0].record_key();
-        let last = keys[keys.len() - 1].record_key();
         let mut previous = first;
+        let mut ordered = true;
         for key in &keys[1..] {
             let key = key.record_key();
             if key.tenant != first.tenant
                 || key.database != first.database
                 || key.table != first.table
-                || previous >= key
             {
                 return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
             }
+            ordered &= previous < key;
             previous = key;
         }
+
+        if !ordered {
+            let mut sorted = keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| (index, key.record_key()))
+                .collect::<Vec<_>>();
+            sorted.sort_unstable_by(|left, right| left.1.cmp(right.1));
+            if sorted.windows(2).any(|pair| pair[0].1 == pair[1].1) {
+                return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
+            }
+            let sorted_keys = sorted.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+            let sorted_values = self.read_many_impl(&sorted_keys, read_ts, now)?;
+            let mut values = vec![None; keys.len()];
+            for ((original_index, _), value) in sorted.into_iter().zip(sorted_values) {
+                values[original_index] = value;
+            }
+            return Ok(values);
+        }
+
+        let last = keys[keys.len() - 1].record_key();
 
         let mut entries =
             self.inner.range((Bound::Included(first), Bound::Included(last))).peekable();
@@ -1211,6 +1233,9 @@ mod tests {
             .collect::<Vec<_>>();
         let mut unsorted = dense.clone();
         unsorted.swap(0, 1);
+        let reversed = dense.iter().rev().cloned().collect::<Vec<_>>();
+        let duplicated =
+            dense.iter().take(32).chain(dense.iter().take(32)).cloned().collect::<Vec<_>>();
         let cross_table = (0u64..32)
             .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
             .chain((32u64..64).map(|id| RecordKey::new("t", "d", "other", &id.to_be_bytes())))
@@ -1221,6 +1246,8 @@ mod tests {
             (&dense[..], 20, 50),
             (&sparse[..], 20, 0),
             (&unsorted[..], 20, 0),
+            (&reversed[..], 20, 0),
+            (&duplicated[..], 20, 0),
             (&cross_table[..], 20, 0),
         ] {
             let expected =
