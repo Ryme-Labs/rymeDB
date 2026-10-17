@@ -14647,9 +14647,10 @@ fn error_response(error: ryme_error::RymeError) -> Response {
         ryme_error::RymeError::Forbidden => (StatusCode::FORBIDDEN, String::from("forbidden")),
         ryme_error::RymeError::Overload(detail) => (StatusCode::TOO_MANY_REQUESTS, detail.clone()),
         ryme_error::RymeError::Timeout => (StatusCode::GATEWAY_TIMEOUT, String::from("timeout")),
-        ryme_error::RymeError::Unavailable(detail) => {
-            (StatusCode::SERVICE_UNAVAILABLE, detail.clone())
-        }
+        ryme_error::RymeError::Unavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            String::from("service unavailable"),
+        ),
         ryme_error::RymeError::ReadOnly(detail) => {
             (StatusCode::SERVICE_UNAVAILABLE, detail.clone())
         }
@@ -14683,6 +14684,17 @@ mod http_error_response_tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["error"], "internal server error");
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_errors_hide_backend_details_from_http_clients() {
+        let response = error_response(ryme_error::RymeError::Unavailable(String::from(
+            "https://storage.internal:9000 credentials=private",
+        )));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "service unavailable");
     }
 }
 
