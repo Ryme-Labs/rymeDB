@@ -5601,6 +5601,24 @@ mod rest_compatibility_tests {
             Some(serde_json::json!("patched"))
         );
 
+        let wrong_conflict_target = rest_insert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("on_conflict=payload"))),
+            axum::body::Bytes::from_static(
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"different"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(wrong_conflict_target.status(), StatusCode::CONFLICT);
+        let row = state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap();
+        let row = row.and_then(|row| serde_json::from_slice::<serde_json::Value>(&row).ok());
+        assert_eq!(
+            row.and_then(|row| row.get("payload").cloned()),
+            Some(serde_json::json!("patched"))
+        );
+
         state
             .gateway
             .put(
@@ -5857,7 +5875,7 @@ async fn rest_insert(
     }
     let allow_upsert = conflict_field.is_some();
     let (_, written) = match gateway
-        .put_many_transform(&principal, &table, pending, |_, before, after| {
+        .put_many_transform(&principal, &table, pending, |pk, before, after| {
             if !executor.row_allowed_for_command(&table, after, RlsCommand::Insert) {
                 return Err(ryme_error::RymeError::Forbidden);
             }
@@ -5867,6 +5885,13 @@ async fn rest_insert(
                 }
                 if !executor.row_allowed_by_rls(&table, before) {
                     return Err(ryme_error::RymeError::NotFound(String::from("row")));
+                }
+                if let Some(field) = conflict_field.as_deref() {
+                    let existing = rest_row_to_json(pk, before);
+                    let proposed = rest_row_to_json(pk, after);
+                    if proposed.get(field).is_none() || existing.get(field) != proposed.get(field) {
+                        return Err(ryme_error::RymeError::Conflict(String::from("on_conflict")));
+                    }
                 }
                 if !executor.row_allowed_for_command(&table, before, RlsCommand::Update)
                     || !executor.row_allowed_for_command(&table, after, RlsCommand::Update)
