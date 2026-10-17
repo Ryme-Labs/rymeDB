@@ -729,6 +729,7 @@ pub fn random_bytes(count: usize) -> Vec<u8> {
 }
 
 pub const REFRESH_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+pub const MAX_REFRESH_TOKEN_LEN: usize = 128;
 const MAX_REFRESH_SESSIONS: usize = 100_000;
 
 #[derive(Debug, Clone)]
@@ -775,7 +776,7 @@ impl RefreshTokenStore {
     where
         F: FnOnce(&Principal) -> Result<T>,
     {
-        if presented.is_empty() {
+        if presented.is_empty() || presented.len() > MAX_REFRESH_TOKEN_LEN {
             return Err(RymeError::Unauthorized);
         }
         let digest = Self::digest(presented);
@@ -805,10 +806,16 @@ impl RefreshTokenStore {
     }
 
     pub fn remove_record(&self, presented: &str) -> Option<RefreshTokenRecord> {
+        if presented.is_empty() || presented.len() > MAX_REFRESH_TOKEN_LEN {
+            return None;
+        }
         self.inner.write().ok()?.remove(&Self::digest(presented))
     }
 
     pub fn restore_record(&self, presented: &str, record: RefreshTokenRecord) -> Result<()> {
+        if presented.is_empty() || presented.len() > MAX_REFRESH_TOKEN_LEN {
+            return Err(RymeError::InvalidArgument(String::from("refresh token")));
+        }
         record.principal.validate()?;
         let digest = Self::digest(presented);
         let mut sessions =
@@ -1469,6 +1476,7 @@ mod tests {
         roles.insert(Role::ReadWrite);
         let principal = Principal { id: String::from("u"), tenant: String::from("t"), roles };
         let first = store.issue(principal.clone(), 100).unwrap();
+        assert!(first.len() <= MAX_REFRESH_TOKEN_LEN);
         let (rotated_principal, second) = store.rotate(&first, 101).unwrap();
         assert_eq!(rotated_principal.id, principal.id);
         assert_ne!(first, second);
@@ -1481,6 +1489,17 @@ mod tests {
         let (_, third) = store.rotate(&second, 101).unwrap();
         assert!(store.rotate(&third, 101 + REFRESH_TOKEN_TTL_SECS).is_err());
         assert_eq!(store.len(), 0);
+
+        let oversized = "x".repeat(MAX_REFRESH_TOKEN_LEN + 1);
+        assert!(store.rotate(&oversized, 101).is_err());
+        assert!(!store.revoke(&oversized));
+        assert!(store.remove_record(&oversized).is_none());
+        assert!(store
+            .restore_record(
+                &oversized,
+                RefreshTokenRecord { principal, expires_at: 200 },
+            )
+            .is_err());
     }
 
     #[test]

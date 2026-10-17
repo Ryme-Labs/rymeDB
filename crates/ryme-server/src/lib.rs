@@ -6350,6 +6350,9 @@ async fn auth_verify(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    if request.id.len() > ryme_auth::MAX_USER_LEN {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("id")));
+    }
     let attempt_key = format!("password:{}", request.id);
     if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
@@ -6430,10 +6433,22 @@ async fn auth_token(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
-    let attempt_key = if request.refresh_token.is_some()
-        || request.grant_type.as_deref() == Some("refresh_token")
+    let refreshing = request.refresh_token.is_some()
+        || request.grant_type.as_deref() == Some("refresh_token");
+    if request
+        .refresh_token
+        .as_deref()
+        .is_some_and(|token| token.len() > ryme_auth::MAX_REFRESH_TOKEN_LEN)
     {
-        auth_attempt_key("refresh", request.refresh_token.as_deref().unwrap_or(&request.id))
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from(
+            "refresh_token",
+        )));
+    }
+    if !refreshing && request.id.len() > ryme_auth::MAX_USER_LEN {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("id")));
+    }
+    let attempt_key = if refreshing {
+        auth_attempt_key("refresh", request.refresh_token.as_deref().unwrap_or(""))
     } else {
         format!("password:{}", request.id)
     };
@@ -6580,7 +6595,9 @@ async fn auth_revoke_session(
         Ok(request) => request,
         Err(error) => return error_response(error),
     };
-    if request.refresh_token.is_empty() || request.refresh_token.len() > 128 {
+    if request.refresh_token.is_empty()
+        || request.refresh_token.len() > ryme_auth::MAX_REFRESH_TOKEN_LEN
+    {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from(
             "refresh_token",
         )));
