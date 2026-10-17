@@ -987,6 +987,7 @@ fn matching_totp_step(secret: &[u8], code: &str, unix_secs: u64) -> Option<u64> 
 #[derive(Debug, Default)]
 pub struct PasskeyRegistry {
     challenges: HashMap<String, (String, u64)>,
+    next_challenge_expiry: Option<u64>,
     credentials: HashMap<String, PasskeyCredential>,
 }
 
@@ -1013,7 +1014,7 @@ pub struct PasskeyAssertion<'a> {
 }
 impl PasskeyRegistry {
     pub fn new() -> Self {
-        Self { challenges: HashMap::new(), credentials: HashMap::new() }
+        Self { challenges: HashMap::new(), next_challenge_expiry: None, credentials: HashMap::new() }
     }
 
     pub fn challenge(&mut self, user: &str) -> Result<String> {
@@ -1028,16 +1029,32 @@ impl PasskeyRegistry {
         if user.is_empty() || user.len() > MAX_USER_LEN {
             return Err(RymeError::InvalidArgument(String::from("user")));
         }
-        self.challenges.retain(|_, (_, issued_at)| {
-            issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) > now_secs
-        });
+        self.prune_expired_challenges(now_secs);
         if self.challenges.len() >= MAX_CHALLENGES {
             return Err(RymeError::Overload(String::from("challenges")));
         }
         let raw = random_bytes(32);
         let encoded = base64_url_encode(&raw);
+        let expires_at = now_secs.saturating_add(PASSKEY_CHALLENGE_TTL_SECS);
+        self.next_challenge_expiry = Some(
+            self.next_challenge_expiry.map_or(expires_at, |current| current.min(expires_at)),
+        );
         self.challenges.insert(encoded.clone(), (user.to_string(), now_secs));
         Ok(encoded)
+    }
+
+    fn prune_expired_challenges(&mut self, now_secs: u64) {
+        if !self.next_challenge_expiry.is_some_and(|expires_at| expires_at <= now_secs) {
+            return;
+        }
+        self.challenges.retain(|_, (_, issued_at)| {
+            issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS) > now_secs
+        });
+        self.next_challenge_expiry = self
+            .challenges
+            .values()
+            .map(|(_, issued_at)| issued_at.saturating_add(PASSKEY_CHALLENGE_TTL_SECS))
+            .min();
     }
 
     pub fn register(&mut self, user: &str, credential_id: String, public_key: &[u8]) -> Result<()> {
@@ -1082,7 +1099,7 @@ impl PasskeyRegistry {
         if credentials.len() > MAX_PASSKEY_CREDENTIALS {
             return Err(RymeError::Corrupt(String::from("passkey snapshot")));
         }
-        Ok(Self { challenges: HashMap::new(), credentials })
+        Ok(Self { challenges: HashMap::new(), next_challenge_expiry: None, credentials })
     }
 
     pub fn verify_assertion(&mut self, assertion: &PasskeyAssertion<'_>) -> Result<()> {
@@ -2164,6 +2181,19 @@ mod tests {
         assert!(registry.challenge_at("one-more", 1000).is_err());
         assert!(registry.challenge_at("user-0", 1000).is_err());
         assert!(registry.challenge_at("fresh", 1000 + PASSKEY_CHALLENGE_TTL_SECS).is_ok());
+    }
+
+    #[test]
+    fn challenge_map_is_swept_at_the_oldest_expiration() {
+        let mut registry = PasskeyRegistry::new();
+        registry.challenge_at("ada", 1000).unwrap();
+        registry.challenge_at("grace", 1001).unwrap();
+        assert_eq!(registry.challenges.len(), 2);
+        assert_eq!(registry.next_challenge_expiry, Some(1000 + PASSKEY_CHALLENGE_TTL_SECS));
+
+        registry.challenge_at("lin", 1000 + PASSKEY_CHALLENGE_TTL_SECS).unwrap();
+        assert_eq!(registry.challenges.len(), 2);
+        assert_eq!(registry.next_challenge_expiry, Some(1001 + PASSKEY_CHALLENGE_TTL_SECS));
     }
 
     #[test]
