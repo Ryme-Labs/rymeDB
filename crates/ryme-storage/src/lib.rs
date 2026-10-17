@@ -34,6 +34,22 @@ pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 const MIN_ORDERED_BATCH_READ: usize = 16;
 const MAX_ORDERED_BATCH_READ_GAP: usize = 64;
 
+trait RecordKeyRef {
+    fn record_key(&self) -> &RecordKey;
+}
+
+impl RecordKeyRef for RecordKey {
+    fn record_key(&self) -> &RecordKey {
+        self
+    }
+}
+
+impl RecordKeyRef for &RecordKey {
+    fn record_key(&self) -> &RecordKey {
+        self
+    }
+}
+
 pub fn validate_routing_version(version: u8) -> Result<()> {
     match version {
         LEGACY_ROUTING_VERSION | SCOPED_ROUTING_VERSION => Ok(()),
@@ -283,17 +299,37 @@ impl Engine {
         read_ts: u64,
         now: u64,
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.read_many_impl(keys, read_ts, now)
+    }
+
+    /// Reads a batch of borrowed keys without cloning their routing components.
+    pub fn read_many_borrowed(
+        &self,
+        keys: &[&RecordKey],
+        read_ts: u64,
+        now: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.read_many_impl(keys, read_ts, now)
+    }
+
+    fn read_many_impl<K: RecordKeyRef>(
+        &self,
+        keys: &[K],
+        read_ts: u64,
+        now: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
         if keys.len() < MIN_ORDERED_BATCH_READ {
-            return keys.iter().map(|key| self.read(key, read_ts, now)).collect();
+            return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
         }
-        let first = &keys[0];
-        let last = &keys[keys.len() - 1];
+        let first = keys[0].record_key();
+        let last = keys[keys.len() - 1].record_key();
         let same_table = keys.iter().all(|key| {
+            let key = key.record_key();
             key.tenant == first.tenant && key.database == first.database && key.table == first.table
         });
-        let sorted_unique = keys.windows(2).all(|pair| pair[0] < pair[1]);
+        let sorted_unique = keys.windows(2).all(|pair| pair[0].record_key() < pair[1].record_key());
         if !same_table || !sorted_unique {
-            return keys.iter().map(|key| self.read(key, read_ts, now)).collect();
+            return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
         }
 
         let mut entries =
@@ -301,6 +337,7 @@ impl Engine {
         let mut values = Vec::with_capacity(keys.len());
         let mut skipped_entries = 0usize;
         for key in keys {
+            let key = key.record_key();
             loop {
                 let Some((stored_key, versions)) = entries.peek().copied() else {
                     values.push(None);
@@ -310,7 +347,10 @@ impl Engine {
                     std::cmp::Ordering::Less => {
                         skipped_entries += 1;
                         if skipped_entries > MAX_ORDERED_BATCH_READ_GAP {
-                            return keys.iter().map(|key| self.read(key, read_ts, now)).collect();
+                            return keys
+                                .iter()
+                                .map(|key| self.read(key.record_key(), read_ts, now))
+                                .collect();
                         }
                         entries.next();
                     }
@@ -1099,6 +1139,8 @@ mod tests {
             let expected =
                 keys.iter().map(|key| engine.read(key, read_ts, now).unwrap()).collect::<Vec<_>>();
             assert_eq!(engine.read_many(keys, read_ts, now).unwrap(), expected);
+            let borrowed = keys.iter().collect::<Vec<_>>();
+            assert_eq!(engine.read_many_borrowed(&borrowed, read_ts, now).unwrap(), expected);
         }
     }
 

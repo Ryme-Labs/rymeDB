@@ -1221,11 +1221,12 @@ impl TxnManager {
                         };
                     } else {
                         pending_indices.push(index);
-                        pending_keys.push(key.clone());
+                        pending_keys.push(key);
                     }
                 }
                 if !pending_keys.is_empty() {
-                    let pending_values = engine.read_many(&pending_keys, txn.read_ts, now)?;
+                    let pending_values =
+                        engine.read_many_borrowed(&pending_keys, txn.read_ts, now)?;
                     for (index, value) in pending_indices.into_iter().zip(pending_values) {
                         values[index] = value;
                     }
