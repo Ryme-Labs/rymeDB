@@ -216,7 +216,7 @@ impl PolicyEngine {
 
 #[derive(Debug, Clone)]
 pub struct ApiKeyStore {
-    inner: Arc<RwLock<HashMap<String, ApiKeyRecord>>>,
+    inner: Arc<RwLock<ApiKeyState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,11 +225,82 @@ struct ApiKeyRecord {
     expires_at: Option<u64>,
 }
 
+#[derive(Debug, Default)]
+struct ExpirationIndex {
+    by_expiry: BTreeMap<u64, HashSet<String>>,
+}
+
+impl ExpirationIndex {
+    fn insert(&mut self, digest: String, expires_at: u64) {
+        self.by_expiry.entry(expires_at).or_default().insert(digest);
+    }
+
+    fn remove(&mut self, digest: &str, expires_at: u64) {
+        if let Some(digests) = self.by_expiry.get_mut(&expires_at) {
+            digests.remove(digest);
+            if digests.is_empty() {
+                self.by_expiry.remove(&expires_at);
+            }
+        }
+    }
+
+    fn pop_expired(&mut self, now_secs: u64) -> Option<(u64, HashSet<String>)> {
+        if !self.by_expiry.first_key_value().is_some_and(|(expires_at, _)| *expires_at <= now_secs)
+        {
+            return None;
+        }
+        self.by_expiry.pop_first()
+    }
+
+}
+
+#[derive(Debug, Default)]
+struct ApiKeyState {
+    records: HashMap<String, ApiKeyRecord>,
+    expirations: ExpirationIndex,
+}
+
+impl ApiKeyState {
+    fn insert(&mut self, digest: String, record: ApiKeyRecord) {
+        if let Some(previous) = self.records.remove(&digest) {
+            if let Some(expires_at) = previous.expires_at {
+                self.expirations.remove(&digest, expires_at);
+            }
+        }
+        if let Some(expires_at) = record.expires_at {
+            self.expirations.insert(digest.clone(), expires_at);
+        }
+        self.records.insert(digest, record);
+    }
+
+    fn remove(&mut self, digest: &str) -> Option<ApiKeyRecord> {
+        let record = self.records.remove(digest)?;
+        if let Some(expires_at) = record.expires_at {
+            self.expirations.remove(digest, expires_at);
+        }
+        Some(record)
+    }
+
+    fn prune_expired(&mut self, now_secs: u64) {
+        while let Some((expires_at, digests)) = self.expirations.pop_expired(now_secs) {
+            for digest in digests {
+                if self
+                    .records
+                    .get(&digest)
+                    .is_some_and(|record| record.expires_at == Some(expires_at))
+                {
+                    self.records.remove(&digest);
+                }
+            }
+        }
+    }
+}
+
 const MAX_API_KEYS: usize = 100_000;
 
 impl ApiKeyStore {
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(HashMap::new())) }
+        Self { inner: Arc::new(RwLock::new(ApiKeyState::default())) }
     }
 
     pub fn insert(&self, api_key: String, principal: Principal) -> Result<()> {
@@ -258,13 +329,13 @@ impl ApiKeyStore {
             return Err(RymeError::InvalidArgument(String::from("api key expiration")));
         }
         let digest = Self::digest(&api_key);
-        let mut guard =
+        let mut state =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        guard.retain(|_, record| record.expires_at.is_none_or(|expiry| expiry > now_secs));
-        if guard.len() >= MAX_API_KEYS && !guard.contains_key(&digest) {
+        state.prune_expired(now_secs);
+        if state.records.len() >= MAX_API_KEYS && !state.records.contains_key(&digest) {
             return Err(RymeError::Overload(String::from("api keys")));
         }
-        guard.insert(digest, ApiKeyRecord { principal, expires_at });
+        state.insert(digest, ApiKeyRecord { principal, expires_at });
         Ok(())
     }
 
@@ -273,10 +344,7 @@ impl ApiKeyStore {
     }
 
     pub fn remove_with_expiry(&self, api_key: &str) -> Option<(Principal, Option<u64>)> {
-        self.inner
-            .write()
-            .ok()?
-            .remove(&Self::digest(api_key))
+        self.inner.write().ok()?.remove(&Self::digest(api_key))
             .map(|record| (record.principal, record.expires_at))
     }
 
@@ -288,12 +356,12 @@ impl ApiKeyStore {
     ) -> Result<()> {
         principal.validate()?;
         let digest = Self::digest(api_key);
-        let mut guard =
+        let mut state =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        if guard.len() >= MAX_API_KEYS && !guard.contains_key(&digest) {
+        if state.records.len() >= MAX_API_KEYS && !state.records.contains_key(&digest) {
             return Err(RymeError::Overload(String::from("api keys")));
         }
-        guard.insert(digest, ApiKeyRecord { principal, expires_at });
+        state.insert(digest, ApiKeyRecord { principal, expires_at });
         Ok(())
     }
 
@@ -303,7 +371,7 @@ impl ApiKeyStore {
 
     pub fn owner_of_at(&self, presented: &str, now_secs: u64) -> Option<Principal> {
         let guard = self.inner.read().ok()?;
-        let record = guard.get(&Self::digest(presented))?;
+        let record = guard.records.get(&Self::digest(presented))?;
         if record.expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
             return None;
         }
@@ -317,7 +385,7 @@ impl ApiKeyStore {
     pub fn authenticate_at(&self, presented: &str, now_secs: u64) -> Result<Principal> {
         let guard =
             self.inner.read().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        let record = guard.get(&Self::digest(presented)).ok_or(RymeError::Unauthorized)?;
+        let record = guard.records.get(&Self::digest(presented)).ok_or(RymeError::Unauthorized)?;
         if record.expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
             return Err(RymeError::Unauthorized);
         }
@@ -329,6 +397,7 @@ impl ApiKeyStore {
             .read()
             .map(|guard| {
                 guard
+                    .records
                     .iter()
                     .map(|(digest, record)| (digest.clone(), record.principal.clone()))
                     .collect()
@@ -345,6 +414,7 @@ impl ApiKeyStore {
             .read()
             .map(|guard| {
                 guard
+                    .records
                     .iter()
                     .filter_map(|(digest, record)| {
                         record.expires_at.map(|expires_at| (digest.clone(), expires_at))
@@ -369,14 +439,12 @@ impl ApiKeyStore {
         {
             return Err(RymeError::Corrupt(String::from("api key expiration snapshot")));
         }
-        let records = snapshot
-            .into_iter()
-            .map(|(digest, principal)| {
-                let expires_at = expirations.get(&digest).copied();
-                (digest, ApiKeyRecord { principal, expires_at })
-            })
-            .collect();
-        Ok(Self { inner: Arc::new(RwLock::new(records)) })
+        let mut state = ApiKeyState::default();
+        for (digest, principal) in snapshot {
+            let expires_at = expirations.get(&digest).copied();
+            state.insert(digest, ApiKeyRecord { principal, expires_at });
+        }
+        Ok(Self { inner: Arc::new(RwLock::new(state)) })
     }
 
     fn digest(api_key: &str) -> String {
@@ -740,40 +808,26 @@ pub struct RefreshTokenStore {
 #[derive(Debug, Default)]
 struct RefreshTokenState {
     sessions: HashMap<String, RefreshTokenRecord>,
-    expirations: BTreeMap<u64, HashSet<String>>,
+    expirations: ExpirationIndex,
 }
 
 impl RefreshTokenState {
     fn insert(&mut self, digest: String, record: RefreshTokenRecord) {
         let expires_at = record.expires_at;
         if let Some(previous) = self.sessions.insert(digest.clone(), record) {
-            self.remove_expiration(previous.expires_at, &digest);
+            self.expirations.remove(&digest, previous.expires_at);
         }
-        self.expirations.entry(expires_at).or_default().insert(digest);
+        self.expirations.insert(digest, expires_at);
     }
 
     fn remove(&mut self, digest: &str) -> Option<RefreshTokenRecord> {
         let record = self.sessions.remove(digest)?;
-        self.remove_expiration(record.expires_at, digest);
+        self.expirations.remove(digest, record.expires_at);
         Some(record)
     }
 
-    fn remove_expiration(&mut self, expires_at: u64, digest: &str) {
-        if let Some(digests) = self.expirations.get_mut(&expires_at) {
-            digests.remove(digest);
-            if digests.is_empty() {
-                self.expirations.remove(&expires_at);
-            }
-        }
-    }
-
     fn prune_expired(&mut self, now_secs: u64) {
-        while self
-            .expirations
-            .first_key_value()
-            .is_some_and(|(expires_at, _)| *expires_at <= now_secs)
-        {
-            let Some((expires_at, digests)) = self.expirations.pop_first() else { break };
+        while let Some((expires_at, digests)) = self.expirations.pop_expired(now_secs) {
             for digest in digests {
                 if self
                     .sessions
@@ -1501,7 +1555,9 @@ mod tests {
         let mut roles = HashSet::new();
         roles.insert(Role::ReadWrite);
         let principal = Principal { id: String::from("u"), tenant: String::from("t"), roles };
-        store.insert_with_expiry(String::from("short-key"), principal, 200, 100).unwrap();
+        store
+            .insert_with_expiry(String::from("short-key"), principal.clone(), 200, 100)
+            .unwrap();
 
         assert!(store.authenticate_at("short-key", 199).is_ok());
         assert!(store.authenticate_at("short-key", 200).is_err());
@@ -1514,6 +1570,16 @@ mod tests {
         .unwrap();
         assert!(restored.authenticate_at("short-key", 199).is_ok());
         assert!(restored.authenticate_at("short-key", 200).is_err());
+
+        restored.insert_with_expiry(String::from("new-key"), principal, 400, 200).unwrap();
+        assert!(restored
+            .snapshot()
+            .unwrap()
+            .get(&ApiKeyStore::digest("short-key"))
+            .is_none());
+        let key_expirations = restored.inner.read().unwrap();
+        assert!(!key_expirations.expirations.by_expiry.contains_key(&200));
+        assert!(key_expirations.expirations.by_expiry.contains_key(&400));
     }
 
     #[test]
@@ -1584,18 +1650,19 @@ mod tests {
         };
         let first = store.issue(principal.clone(), 100).unwrap();
         let first_expiry = 100 + REFRESH_TOKEN_TTL_SECS;
-        assert!(store.inner.read().unwrap().expirations.contains_key(&first_expiry));
+        assert!(store.inner.read().unwrap().expirations.by_expiry.contains_key(&first_expiry));
 
         let (_, rotated) = store.rotate(&first, 101).unwrap();
-        assert!(!store.inner.read().unwrap().expirations.contains_key(&first_expiry));
+        assert!(!store.inner.read().unwrap().expirations.by_expiry.contains_key(&first_expiry));
         assert!(store
             .inner
             .read()
             .unwrap()
             .expirations
+            .by_expiry
             .contains_key(&(101 + REFRESH_TOKEN_TTL_SECS)));
         assert!(store.revoke(&rotated));
-        assert!(store.inner.read().unwrap().expirations.is_empty());
+        assert!(store.inner.read().unwrap().expirations.by_expiry.is_empty());
 
         store
             .restore_record(
@@ -1616,7 +1683,7 @@ mod tests {
             .unwrap()
             .get(&RefreshTokenStore::digest("expired-token"))
             .is_none());
-        assert!(restored.inner.read().unwrap().expirations.contains_key(&500));
+        assert!(restored.inner.read().unwrap().expirations.by_expiry.contains_key(&500));
         assert_eq!(restored.len(), 2);
     }
 
