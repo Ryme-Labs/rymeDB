@@ -37,5 +37,20 @@
     "median_capture_p50_ns_after": 74150,
     "median_p50_improvement_percent": 10.4
   },
+  "scale_check_10000_rows_417_results": {
+    "revision": "d64634b",
+    "operations_per_capture": 1000,
+    "warmup_operations": 100,
+    "baseline_p50_ns": [981779, 987350, 973994],
+    "after_covered_predicates_p50_ns": [930583, 933829, 904383],
+    "median_p50_before_ns": 981779,
+    "median_p50_after_ns": 930583,
+    "median_p50_improvement_percent": 5.2,
+    "after_capture_metrics": [
+      { "seconds": 0.961, "qps": 1041, "p50_ns": 930583, "p95_ns": 1146351, "p99_ns": 1343104, "max_ns": 1697204 },
+      { "seconds": 0.995, "qps": 1005, "p50_ns": 933829, "p95_ns": 1264474, "p99_ns": 1423356, "max_ns": 1768028 },
+      { "seconds": 0.912, "qps": 1096, "p50_ns": 904383, "p95_ns": 956902, "p99_ns": 1031533, "max_ns": 1198239 }
+    ]
+  },
   "caveat": "Single-host in-process microbenchmark, not end-to-end or cross-database performance. Sequential captures reduce but do not eliminate system noise; tail latency varied."
 }
