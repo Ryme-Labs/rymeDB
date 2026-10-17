@@ -55,16 +55,22 @@ set it as `RYME_API_KEY` (or pass `--api-key`) for these commands:
 
 ```bash
 rymedb-cli auth keys create website-production
+rymedb-cli auth keys create browser-app --role anon
 rymedb-cli auth keys list
 rymedb-cli auth keys revoke <id-from-list>
 ```
 
-The generated secret is shown only once, inherits the creating principal's
-permissions, and expires after 90 days. Lists contain names and non-secret IDs,
-never key material. Revoking a key takes effect immediately. A named key is
-still a bearer credential: keep server keys server-side. For browser access,
-use `RYME_PUBLIC_API_KEY` with deliberate anon grants/RLS, or a short-lived,
-least-privilege user token.
+Without `--role`, the key inherits the creating principal's roles. An explicit
+`--role` scopes it to one role and is accepted only when the caller is allowed
+to delegate that role; non-admin principals cannot switch between authenticated,
+anonymous, and realtime security domains. The `anon` scope is intended for
+public/browser clients and has no authenticated user identity. Enable RLS and
+grant only the intended SQL privileges before exposing it; an `anon` key alone
+does not make tables safe. The generated secret is shown only once and expires
+after 90 days. Lists contain names, roles, and non-secret IDs, never key
+material. Revoking a key takes effect immediately. Other roles remain bearer
+credentials and should stay server-side unless their permissions were reviewed
+for public exposure.
 
 When a listener is bound beyond loopback, its API key or protocol password must
 contain at least 16 bytes. Use a randomly generated value rather than a sample

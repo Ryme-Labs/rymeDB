@@ -256,12 +256,17 @@ export const authToken = (c: Connection, id: string, password: string) =>
 export interface ApiKeyInfo {
   id: string;
   name: string;
+  roles: string[];
   created_at: number;
   expires_at: number | null;
 }
 export const fetchApiKeys = (c: Connection) => get<{ keys: ApiKeyInfo[] }>(c, "/v1/auth/keys");
-export const createApiKey = (c: Connection, name: string) =>
-  post<{ id: string; name: string; key: string; created_at: number; expires_at: number }>(c, "/v1/auth/keys", { name });
+export const createApiKey = (c: Connection, name: string, role?: string) =>
+  post<{ id: string; name: string; roles: string[]; key: string; created_at: number; expires_at: number }>(
+    c,
+    "/v1/auth/keys",
+    { name, ...(role ? { role } : {}) },
+  );
 export const revokeApiKey = (c: Connection, id: string) =>
   api(c, "DELETE", `/v1/auth/keys/${encodeURIComponent(id)}`);
 

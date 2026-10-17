@@ -477,7 +477,7 @@ paths:
     post:
       tags: [auth]
       summary: Create a named API key
-      description: Creates a key with the authenticated principal's permissions. The secret is returned once and expires after 90 days.
+      description: Creates a named key. An optional role narrows the key to that role and must not exceed the caller's authority. Without role, the key inherits the caller's roles. Use anon for browser/public clients and enforce row-level security on every exposed table; an anon key is not a substitute for RLS.
       requestBody:
         required: true
         content:
@@ -490,6 +490,10 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 64
+                role:
+                  type: string
+                  enum: [superuser, owner, admin, developer, read_write, read_only, anon, realtime_publisher, realtime_subscriber]
+                  description: Optional delegated role. The server rejects scopes the caller cannot grant.
       responses:
         '201':
           description: Created API key; secret is returned only in this response.
@@ -2207,13 +2211,18 @@ components:
   schemas:
     NamedApiKey:
       type: object
-      required: [id, name, created_at, expires_at]
+      required: [id, name, roles, created_at, expires_at]
       properties:
         id:
           type: string
           description: Stable non-secret key identifier; never accepted as a credential.
         name:
           type: string
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [superuser, owner, admin, developer, read_write, read_only, anon, realtime_publisher, realtime_subscriber]
         created_at:
           type: integer
           format: int64

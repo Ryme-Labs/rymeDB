@@ -36,6 +36,7 @@ export default function AuthPage() {
   const [err, setErr] = useState<unknown>(null);
   const [pending, setPending] = useState(false);
   const [keyName, setKeyName] = useState("");
+  const [keyRole, setKeyRole] = useState("");
   const [apiKeys, setApiKeys] = useState<Awaited<ReturnType<typeof fetchApiKeys>>["keys"]>([]);
   const [newKey, setNewKey] = useState("");
 
@@ -118,23 +119,34 @@ export default function AuthPage() {
         </Card>
       </div>
       <Card className="mt-3">
-        <CardHeader title="API keys" description="Create named keys for apps and services. Each secret is shown once and expires after 90 days; revocation is immediate." />
+        <CardHeader title="API keys" description="Create named, role-scoped keys. Each secret is shown once and expires after 90 days; revocation is immediate." />
         <CardContent>
           <Row>
             <Field label="Key name"><Input value={keyName} maxLength={64} onChange={(e) => setKeyName(e.target.value)} placeholder="e.g. website production" /></Field>
+            <Field label="Role scope">
+              <select value={keyRole} onChange={(e) => setKeyRole(e.target.value)} className="h-8 rounded-md border border-border-default bg-surface-100 px-2.5 text-[13px] text-foreground-default">
+                <option value="">same as current permissions</option>
+                <option value="anon">anon — public/browser (RLS required)</option>
+                <option value="read_only">read_only</option>
+                <option value="read_write">read_write</option>
+                <option value="developer">developer</option>
+                <option value="realtime_subscriber">realtime_subscriber</option>
+                <option value="realtime_publisher">realtime_publisher</option>
+              </select>
+            </Field>
             <Button variant="primary" disabled={pending || !keyName.trim()} onClick={() => void act(async () => {
-              const created = await createApiKey(conn, keyName);
+              const created = await createApiKey(conn, keyName, keyRole || undefined);
               setNewKey(created.key);
               setKeyName("");
               await refreshKeys();
-              return { id: created.id, name: created.name, expires_at: created.expires_at };
+              return { id: created.id, name: created.name, roles: created.roles, expires_at: created.expires_at };
             })}>Create key</Button>
             <Button disabled={pending} onClick={() => void act(refreshKeys)}>Refresh</Button>
           </Row>
           {newKey ? <p className="mt-3 break-all rounded border border-warning/30 bg-warning/10 p-3 text-xs">Copy this secret now; it cannot be retrieved later: <code>{newKey}</code></p> : null}
           <div className="mt-3 divide-y divide-border-muted">
             {apiKeys.map((apiKey) => <div key={apiKey.id} className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm">
-              <span><strong>{apiKey.name}</strong><span className="ml-2 text-xs text-foreground-muted">expires {apiKey.expires_at ? new Date(apiKey.expires_at * 1000).toLocaleDateString() : "never"}</span><code className="ml-2 text-xs text-foreground-muted">{apiKey.id.slice(0, 12)}…</code></span>
+              <span><strong>{apiKey.name}</strong><span className="ml-2 text-xs text-foreground-muted">{apiKey.roles.join(", ")} · expires {apiKey.expires_at ? new Date(apiKey.expires_at * 1000).toLocaleDateString() : "never"}</span><code className="ml-2 text-xs text-foreground-muted">{apiKey.id.slice(0, 12)}…</code></span>
               <Button variant="danger" disabled={pending} onClick={() => void act(async () => {
                 await revokeApiKey(conn, apiKey.id);
                 await refreshKeys();

@@ -34,7 +34,9 @@ groups:
                                       issue a usable API key
   auth revoke <key>                   revoke an API key by value
   auth keys list                      list named keys owned by this account
-  auth keys create <name>             create a key (secret shown once, expires in 90 days)
+  auth keys create <name> [--role ROLE]
+                                      scopes: anon, read_only, read_write, developer,
+                                      realtime_subscriber, realtime_publisher; anon needs RLS
   auth keys revoke <id>               revoke a named key by its listed id
   auth passkey-register <user> <cred-id> <pubkey-b64>
                                       enroll a P-256 credential
@@ -326,7 +328,13 @@ async function main(): Promise<void> {
           await call(options, "GET", "/v1/auth/keys");
         } else if (operation === "create") {
           need(keyArgs, 1, "rymedb-cli auth keys create <name>");
-          await call(options, "POST", "/v1/auth/keys", JSON.stringify({ name: keyArgs.join(" ") }));
+          const role = flag(options, "role");
+          await call(
+            options,
+            "POST",
+            "/v1/auth/keys",
+            JSON.stringify({ name: keyArgs.join(" "), ...(role ? { role } : {}) }),
+          );
         } else if (operation === "revoke") {
           need(keyArgs, 1, "rymedb-cli auth keys revoke <id>");
           await call(options, "DELETE", `/v1/auth/keys/${encodeURIComponent(keyArgs[0]!)}`);

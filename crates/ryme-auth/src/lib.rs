@@ -80,6 +80,27 @@ impl Principal {
     pub fn can_publish(&self) -> bool {
         self.can_write() || self.roles.contains(&Role::RealtimePublisher)
     }
+
+    /// Whether this principal may mint a key carrying only `role`.
+    ///
+    /// Keep this role hierarchy explicit: a scoped key is a credential
+    /// delegation boundary, and broad capability checks alone cannot model
+    /// distinctions such as anonymous versus authenticated RLS identity.
+    pub fn can_delegate_role(&self, role: &Role) -> bool {
+        if self.can_platform_admin() {
+            return true;
+        }
+        match role {
+            Role::Superuser => false,
+            Role::Owner => self.roles.contains(&Role::Owner),
+            Role::Admin => self.can_admin(),
+            _ if self.can_admin() => true,
+            Role::Developer | Role::ReadWrite => self.roles.len() == 1 && self.roles.contains(role),
+            Role::ReadOnly | Role::Anon | Role::RealtimePublisher | Role::RealtimeSubscriber => {
+                self.roles.len() == 1 && self.roles.contains(role)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1652,6 +1673,48 @@ impl CredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_api_key_roles_cannot_escalate_or_add_authenticated_identity() {
+        let anon = Principal {
+            id: String::from("browser"),
+            tenant: String::from("tenant"),
+            roles: [Role::Anon].into_iter().collect(),
+        };
+        assert!(anon.can_delegate_role(&Role::Anon));
+        assert!(!anon.can_delegate_role(&Role::ReadOnly));
+        assert!(!anon.can_delegate_role(&Role::Developer));
+        assert!(!anon.can_delegate_role(&Role::Superuser));
+
+        let read_write = Principal {
+            id: String::from("service"),
+            tenant: String::from("tenant"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        assert!(read_write.can_delegate_role(&Role::ReadWrite));
+        assert!(!read_write.can_delegate_role(&Role::Anon));
+        assert!(!read_write.can_delegate_role(&Role::ReadOnly));
+        assert!(!read_write.can_delegate_role(&Role::RealtimePublisher));
+        assert!(!read_write.can_delegate_role(&Role::Admin));
+
+        let owner = Principal {
+            id: String::from("owner"),
+            tenant: String::from("tenant"),
+            roles: [Role::Owner].into_iter().collect(),
+        };
+        assert!(owner.can_delegate_role(&Role::Anon));
+        assert!(owner.can_delegate_role(&Role::RealtimePublisher));
+        assert!(!owner.can_delegate_role(&Role::Superuser));
+
+        let realtime_only = Principal {
+            id: String::from("subscriber"),
+            tenant: String::from("tenant"),
+            roles: [Role::RealtimeSubscriber].into_iter().collect(),
+        };
+        assert!(realtime_only.can_delegate_role(&Role::RealtimeSubscriber));
+        assert!(!realtime_only.can_delegate_role(&Role::Anon));
+        assert!(!realtime_only.can_delegate_role(&Role::ReadOnly));
+    }
 
     #[test]
     fn api_key_roundtrip() {

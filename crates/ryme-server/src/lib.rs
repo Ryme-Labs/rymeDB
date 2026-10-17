@@ -6389,6 +6389,8 @@ pub struct AuthRevokeRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AuthCreateKeyRequest {
     pub name: String,
+    #[serde(default)]
+    pub role: Option<Role>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -6643,6 +6645,27 @@ fn issue_api_key(
     Ok((key, principal.tenant.clone()))
 }
 
+fn principal_role_names(principal: &Principal) -> Vec<String> {
+    let mut roles = principal
+        .roles
+        .iter()
+        .map(|role| match role {
+            Role::Superuser => "superuser",
+            Role::Owner => "owner",
+            Role::Admin => "admin",
+            Role::Developer => "developer",
+            Role::ReadWrite => "read_write",
+            Role::ReadOnly => "read_only",
+            Role::Anon => "anon",
+            Role::RealtimePublisher => "realtime_publisher",
+            Role::RealtimeSubscriber => "realtime_subscriber",
+        })
+        .map(String::from)
+        .collect::<Vec<_>>();
+    roles.sort();
+    roles
+}
+
 struct AuthIssueRollback {
     api_key: String,
     new_refresh_token: String,
@@ -6843,6 +6866,7 @@ async fn auth_list_keys(State(state): State<SharedState>, headers: HeaderMap) ->
                 serde_json::json!({
                     "id": id,
                     "name": metadata.name,
+                    "roles": principal_role_names(owner),
                     "created_at": metadata.created_at,
                     "expires_at": expiration,
                 })
@@ -6867,6 +6891,15 @@ async fn auth_create_key(
         Ok(_) => return error_response(ryme_error::RymeError::Forbidden),
         Err(error) => return error_response(error),
     };
+    let key_principal = match request.role {
+        Some(role) if principal.can_delegate_role(&role) => Principal {
+            id: principal.id.clone(),
+            tenant: principal.tenant.clone(),
+            roles: [role].into_iter().collect(),
+        },
+        Some(_) => return error_response(ryme_error::RymeError::Forbidden),
+        None => principal.clone(),
+    };
     let name = request.name.trim();
     if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from(
@@ -6886,7 +6919,7 @@ async fn auth_create_key(
     let created_at = ryme_txn::now_unix();
     let expires_at = created_at.saturating_add(90 * 24 * 60 * 60);
     if let Err(error) =
-        state.keys.insert_with_expiry(key.clone(), principal, expires_at, created_at)
+        state.keys.insert_with_expiry(key.clone(), key_principal.clone(), expires_at, created_at)
     {
         return error_response(error);
     }
@@ -6909,6 +6942,7 @@ async fn auth_create_key(
             Json(serde_json::json!({
                 "id": id,
                 "name": name,
+                "roles": principal_role_names(&key_principal),
                 "key": key,
                 "created_at": created_at,
                 "expires_at": expires_at,
@@ -15932,6 +15966,7 @@ mod realtime_policy_tests {
                 .unwrap();
         let id = created["id"].as_str().unwrap().to_string();
         let secret = created["key"].as_str().unwrap();
+        assert_eq!(created["roles"], serde_json::json!(["owner"]));
         assert_eq!(state.keys.authenticate(secret).unwrap().id, "owner-1");
 
         let listed = auth_list_keys(State(state.clone()), headers.clone()).await;
@@ -15941,6 +15976,7 @@ mod realtime_policy_tests {
                 .unwrap();
         assert_eq!(listed["keys"][0]["id"], id);
         assert_eq!(listed["keys"][0]["name"], "browser app");
+        assert_eq!(listed["keys"][0]["roles"], serde_json::json!(["owner"]));
         assert!(listed["keys"][0].get("key").is_none());
 
         let revoked =
@@ -15948,6 +15984,100 @@ mod realtime_policy_tests {
         assert_eq!(revoked.status(), StatusCode::OK);
         assert!(state.keys.authenticate(secret).is_err());
         drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn named_api_keys_can_be_scoped_to_anon_without_role_escalation() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-scoped-api-key-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let state =
+            SharedState::build(&Config { data_dir: dir.clone(), ..Config::default() }).unwrap();
+        state
+            .keys
+            .insert(
+                String::from("scoped-key-owner"),
+                Principal {
+                    id: String::from("writer-1"),
+                    tenant: String::from("default"),
+                    roles: [Role::Owner].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer scoped-key-owner"),
+        );
+        state
+            .keys
+            .insert(
+                String::from("scoped-key-writer"),
+                Principal {
+                    id: String::from("writer-only"),
+                    tenant: String::from("default"),
+                    roles: [Role::ReadWrite].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut writer_headers = HeaderMap::new();
+        writer_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer scoped-key-writer"),
+        );
+        let writer_scope = auth_create_key(
+            State(state.clone()),
+            writer_headers,
+            axum::body::Bytes::from_static(br#"{"name":"browser","role":"anon"}"#),
+        )
+        .await;
+        assert_eq!(writer_scope.status(), StatusCode::FORBIDDEN);
+
+        let created = auth_create_key(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{"name":"browser","role":"anon"}"#),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(created.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(created["roles"], serde_json::json!(["anon"]));
+        let key = created["key"].as_str().unwrap();
+        let public_principal = state.keys.authenticate(key).unwrap();
+        assert_eq!(public_principal.roles, [Role::Anon].into_iter().collect());
+        assert!(public_principal.can_read());
+        assert!(!public_principal.can_write());
+        assert_eq!(public_principal.sql_auth_uid(), None);
+
+        let escalation = auth_create_key(
+            State(state.clone()),
+            headers,
+            axum::body::Bytes::from_static(br#"{"name":"elevated","role":"superuser"}"#),
+        )
+        .await;
+        assert_eq!(escalation.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            state
+                .keys
+                .snapshot()
+                .unwrap()
+                .values()
+                .filter(|principal| principal.id == "writer-1")
+                .count(),
+            2
+        );
+        drop(state);
+        let restored =
+            SharedState::build(&Config { data_dir: dir.clone(), ..Config::default() }).unwrap();
+        let restored_public = restored.keys.authenticate(key).unwrap();
+        assert_eq!(restored_public.roles, [Role::Anon].into_iter().collect());
+        assert_eq!(restored_public.sql_auth_uid(), None);
+        drop(restored);
         let _ = std::fs::remove_dir_all(dir);
     }
 
