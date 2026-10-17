@@ -4232,6 +4232,26 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_constraint_scan_conflicts_without_retained_local_history() {
+        let manager = TxnManager::new();
+        let mut stale = manager.begin();
+        stale.record_constraint_scan("t", "d", "unique").unwrap();
+        let stale_state = stale.state();
+        drop(stale);
+
+        let mut writer = manager.begin();
+        manager.put(&mut writer, RecordKey::new("t", "d", "unique", b"new-row"), b"value".to_vec());
+        manager.commit(writer).unwrap();
+
+        let mut forwarded = manager.from_state(stale_state).unwrap();
+        manager.put(&mut forwarded, RecordKey::new("t", "d", "other", b"write"), b"v".to_vec());
+        assert!(matches!(
+            manager.commit(forwarded),
+            Err(RymeError::Conflict(message)) if message == "constraint conflict"
+        ));
+    }
+
+    #[test]
     fn snapshot_keeps_write_write_conflicts() {
         let manager = TxnManager::new();
         let key = RecordKey::new("t", "d", "iso", b"ww");
