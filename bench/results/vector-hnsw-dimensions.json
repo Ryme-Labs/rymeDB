@@ -16,9 +16,9 @@
       "top_k": 10,
       "ann_ef": 64,
       "m": 16,
-      "index_build_ns": 140044754,
-      "adaptive_ann_p50_ns": 57319,
-      "exact_p50_ns": 99228,
+      "index_build_ns": 143048953,
+      "adaptive_ann_p50_ns": 57549,
+      "exact_p50_ns": 100180,
       "mean_recall_at_k": 0.9825
     },
     {
@@ -56,10 +56,36 @@
       "top_k": 10,
       "ann_ef": 64,
       "m": 32,
-      "index_build_ns": 1291709174,
-      "adaptive_ann_p50_ns": 696909,
+      "index_build_ns": 1297428736,
+      "adaptive_ann_p50_ns": 709263,
       "exact_p50_ns": 1058826,
       "mean_recall_at_k": 0.891
+    },
+    {
+      "dimensions": 384,
+      "vectors": 3000,
+      "partitions": 1,
+      "queries": 100,
+      "top_k": 10,
+      "ann_ef": 128,
+      "m": 32,
+      "index_build_ns": 1295130974,
+      "adaptive_ann_p50_ns": 983212,
+      "exact_p50_ns": 1050910,
+      "mean_recall_at_k": 0.971
+    },
+    {
+      "dimensions": 384,
+      "vectors": 3000,
+      "partitions": 1,
+      "queries": 100,
+      "top_k": 10,
+      "ann_ef": 256,
+      "m": 32,
+      "index_build_ns": 1314346444,
+      "adaptive_ann_p50_ns": 1223487,
+      "exact_p50_ns": 1058294,
+      "mean_recall_at_k": 1.0
     },
     {
       "dimensions": 64,
@@ -73,6 +99,20 @@
       "adaptive_ann_p50_ns": 1459333,
       "exact_p50_ns": 3445976,
       "mean_recall_at_k": 0.988
+    },
+    {
+      "dimensions": 64,
+      "vectors": 20480,
+      "partitions": 4,
+      "queries": 100,
+      "top_k": 10,
+      "ann_ef": 64,
+      "m": 32,
+      "index_build_ns": 4343678806,
+      "adaptive_ann_p50_ns": 1464213,
+      "exact_p50_ns": 3438121,
+      "mean_recall_at_k": 0.988,
+      "note": "Serial repeat against the pushed dimension-aware graph implementation."
     }
   ]
 }
