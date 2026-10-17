@@ -1465,41 +1465,45 @@ pub enum ArchiveTarget {
 }
 
 impl ArchiveTarget {
-    async fn archive_files(
+    async fn archive_files_from<I>(
         &self,
         backup_id: &str,
         commit_ts: u64,
-        files: Vec<(String, Vec<u8>)>,
-    ) -> ryme_error::Result<BackupManifest> {
+        files: I,
+    ) -> ryme_error::Result<BackupManifest>
+    where
+        I: IntoIterator<Item = ryme_error::Result<(String, Vec<u8>)>>,
+    {
         match self {
             Self::Local(store) => {
-                Archiver::new(store.clone()).archive_files(backup_id, commit_ts, files).await
+                Archiver::new(store.clone()).archive_files_from(backup_id, commit_ts, files).await
             }
             Self::S3(store) => {
-                Archiver::new(store.clone()).archive_files(backup_id, commit_ts, files).await
+                Archiver::new(store.clone()).archive_files_from(backup_id, commit_ts, files).await
             }
         }
     }
 
-    async fn archive_files_encrypted<F>(
+    async fn archive_files_encrypted_from<I, F>(
         &self,
         backup_id: &str,
         commit_ts: u64,
-        files: Vec<(String, Vec<u8>)>,
+        files: I,
         seal: &F,
     ) -> ryme_error::Result<BackupManifest>
     where
+        I: IntoIterator<Item = ryme_error::Result<(String, Vec<u8>)>>,
         F: Fn(&[u8]) -> ryme_error::Result<(Vec<u8>, ryme_archive::FileEncryption)> + Send + Sync,
     {
         match self {
             Self::Local(store) => {
                 Archiver::new(store.clone())
-                    .archive_files_encrypted(backup_id, commit_ts, files, seal)
+                    .archive_files_encrypted_from(backup_id, commit_ts, files, seal)
                     .await
             }
             Self::S3(store) => {
                 Archiver::new(store.clone())
-                    .archive_files_encrypted(backup_id, commit_ts, files, seal)
+                    .archive_files_encrypted_from(backup_id, commit_ts, files, seal)
                     .await
             }
         }
@@ -2892,19 +2896,18 @@ impl SharedState {
             .clone()
             .ok_or_else(|| ryme_error::RymeError::InvalidArgument(String::from("archive")))?;
         let snapshots = snapshot_backend_files(self).await?;
-        let mut files = Vec::new();
+        let mut sources = Vec::new();
         let mut commit = 0u64;
         for (snapshot_commit, snapshot_path) in snapshots {
             commit = commit.max(snapshot_commit);
-            let snapshot_bytes = std::fs::read(&snapshot_path)?;
             let snapshot_name = snapshot_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| ryme_error::RymeError::Internal(String::from("snapshot name")))?
                 .to_string();
-            files.push((snapshot_name, snapshot_bytes));
+            sources.push((snapshot_name, snapshot_path));
         }
-        files.extend(archive_metadata_files(&self.data_dir)?);
+        sources.extend(archive_metadata_paths(&self.data_dir)?);
         let log_dirs: Vec<(String, std::path::PathBuf)> = match &self.backend {
             Backend::Single(_) => vec![(String::from("wal-"), self.wal_dir.clone())],
             Backend::Cluster(_) => vec![(String::from("raft-"), self.data_dir.join("raft"))],
@@ -2928,7 +2931,7 @@ impl SharedState {
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| ryme_error::RymeError::Internal(String::from("segment name")))?
                     .to_string();
-                files.push((format!("{prefix}{name}"), std::fs::read(&path)?));
+                sources.push((format!("{prefix}{name}"), path));
             }
             for path in immutable_segment_files(&log_dir)? {
                 let name = path
@@ -2936,14 +2939,20 @@ impl SharedState {
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| ryme_error::RymeError::Internal(String::from("segment name")))?
                     .to_string();
-                files.push((format!("{prefix}sst-{name}"), std::fs::read(&path)?));
+                sources.push((format!("{prefix}sst-{name}"), path));
             }
         }
+        if sources.len() > ryme_archive::MAX_ARCHIVE_FILES {
+            return Err(ryme_error::RymeError::Overload(String::from("archive manifest files")));
+        }
         let id = backup_id.unwrap_or_else(|| format!("auto-{commit}"));
+        let files = sources
+            .into_iter()
+            .map(|(name, path)| read_archive_source_file(&path).map(|bytes| (name, bytes)));
         let manifest = match self.active_dek() {
             Some(dek) => {
                 target
-                    .archive_files_encrypted(&id, commit, files, &|bytes| {
+                    .archive_files_encrypted_from(&id, commit, files, &|bytes| {
                         let envelope = ryme_crypto::seal_with(&dek, bytes);
                         Ok((
                             ryme_auth::base64_url_decode(&envelope.blob_b64).map_err(|_| {
@@ -2958,7 +2967,7 @@ impl SharedState {
                     })
                     .await?
             }
-            None => target.archive_files(&id, commit, files).await?,
+            None => target.archive_files_from(&id, commit, files).await?,
         };
         let _ = target.prune(self.archive_keep).await;
         Ok(manifest)
@@ -14737,9 +14746,9 @@ fn immutable_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std:
     Ok(out)
 }
 
-fn archive_metadata_files(
+fn archive_metadata_paths(
     data_dir: &std::path::Path,
-) -> ryme_error::Result<Vec<(String, Vec<u8>)>> {
+) -> ryme_error::Result<Vec<(String, std::path::PathBuf)>> {
     let mut files = Vec::new();
     for name in [
         "schema.json",
@@ -14751,8 +14760,15 @@ fn archive_metadata_files(
         "placements.json",
     ] {
         let path = data_dir.join(name);
-        match std::fs::read(&path) {
-            Ok(bytes) => files.push((String::from(name), bytes)),
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                files.push((String::from(name), path));
+            }
+            Ok(_) => {
+                return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                    "archive source file",
+                )));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -14781,11 +14797,21 @@ fn archive_metadata_files(
                 .strip_prefix(data_dir)
                 .map_err(|_| ryme_error::RymeError::Internal(String::from("archive path")))?;
             let name = relative.to_string_lossy().replace('\\', "/");
-            files.push((name, std::fs::read(path)?));
+            if files.len() == ryme_archive::MAX_ARCHIVE_FILES {
+                return Err(ryme_error::RymeError::Overload(String::from(
+                    "archive manifest files",
+                )));
+            }
+            files.push((name, path));
         }
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
+}
+
+fn read_archive_source_file(path: &std::path::Path) -> ryme_error::Result<Vec<u8>> {
+    read_bounded_state_file(path, ryme_archive::MAX_ARCHIVE_OBJECT_BYTES, "archive object")?
+        .ok_or_else(|| ryme_error::RymeError::NotFound(String::from("archive source file")))
 }
 
 async fn snapshot_backend_files(
@@ -16251,7 +16277,11 @@ mod realtime_policy_tests {
         std::fs::write(dir.join("branch-schemas/tenant/preview/schema.json"), b"branch-schema")
             .unwrap();
 
-        let files = archive_metadata_files(&dir).unwrap();
+        let files = archive_metadata_paths(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, path)| (name, read_archive_source_file(&path).unwrap()))
+            .collect::<Vec<_>>();
         let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
@@ -16264,6 +16294,27 @@ mod realtime_policy_tests {
         );
         assert_eq!(files[0].1, b"branch-schema".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_source_file_rejects_oversized_objects_before_reading() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-archive-source-bound-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oversized.sst");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len((ryme_archive::MAX_ARCHIVE_OBJECT_BYTES + 1) as u64)
+            .unwrap();
+
+        assert!(matches!(
+            read_archive_source_file(&path),
+            Err(ryme_error::RymeError::Overload(message)) if message == "archive object"
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

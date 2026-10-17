@@ -158,6 +158,19 @@ impl<S: ObjectStore> Archiver<S> {
         commit_ts: u64,
         files: Vec<(String, Vec<u8>)>,
     ) -> Result<BackupManifest> {
+        self.archive_files_from(backup_id, commit_ts, files.into_iter().map(Ok)).await
+    }
+
+    /// Archives a fallible, lazy source so callers need not hold every file in memory.
+    pub async fn archive_files_from<I>(
+        &self,
+        backup_id: &str,
+        commit_ts: u64,
+        files: I,
+    ) -> Result<BackupManifest>
+    where
+        I: IntoIterator<Item = Result<(String, Vec<u8>)>>,
+    {
         self.archive_files_inner(backup_id, commit_ts, files, &|bytes| Ok((bytes.to_vec(), None)))
             .await
     }
@@ -172,6 +185,22 @@ impl<S: ObjectStore> Archiver<S> {
     where
         F: Fn(&[u8]) -> Result<(Vec<u8>, FileEncryption)> + Send + Sync,
     {
+        self.archive_files_encrypted_from(backup_id, commit_ts, files.into_iter().map(Ok), seal)
+            .await
+    }
+
+    /// Archives and encrypts a fallible, lazy source one object at a time.
+    pub async fn archive_files_encrypted_from<I, F>(
+        &self,
+        backup_id: &str,
+        commit_ts: u64,
+        files: I,
+        seal: &F,
+    ) -> Result<BackupManifest>
+    where
+        I: IntoIterator<Item = Result<(String, Vec<u8>)>>,
+        F: Fn(&[u8]) -> Result<(Vec<u8>, FileEncryption)> + Send + Sync,
+    {
         self.archive_files_inner(backup_id, commit_ts, files, &|bytes| {
             let (sealed, encryption) = seal(bytes)?;
             Ok((sealed, Some(encryption)))
@@ -179,26 +208,33 @@ impl<S: ObjectStore> Archiver<S> {
         .await
     }
 
-    async fn archive_files_inner<F>(
+    async fn archive_files_inner<I, F>(
         &self,
         backup_id: &str,
         commit_ts: u64,
-        files: Vec<(String, Vec<u8>)>,
+        files: I,
         protect: &F,
     ) -> Result<BackupManifest>
     where
+        I: IntoIterator<Item = Result<(String, Vec<u8>)>>,
         F: Fn(&[u8]) -> Result<(Vec<u8>, Option<FileEncryption>)> + Send + Sync,
     {
         if !valid_backup_id(backup_id) {
             return Err(RymeError::InvalidArgument(String::from("backup_id")));
         }
-        if files.len() > MAX_ARCHIVE_FILES {
+        let files = files.into_iter();
+        let (file_count_lower_bound, _) = files.size_hint();
+        if file_count_lower_bound > MAX_ARCHIVE_FILES {
             return Err(RymeError::Overload(String::from("archive manifest files")));
         }
         let prefix = format!("backups/{commit_ts:020}-{backup_id}/");
-        let mut entries = Vec::new();
-        let mut names = HashSet::with_capacity(files.len());
-        for (name, bytes) in files {
+        let mut entries = Vec::with_capacity(file_count_lower_bound);
+        let mut names = HashSet::with_capacity(file_count_lower_bound);
+        for file in files {
+            if entries.len() == MAX_ARCHIVE_FILES {
+                return Err(RymeError::Overload(String::from("archive manifest files")));
+            }
+            let (name, bytes) = file?;
             if bytes.len() > MAX_ARCHIVE_OBJECT_BYTES {
                 return Err(RymeError::Overload(String::from("archive object")));
             }
@@ -417,6 +453,34 @@ mod tests {
         assert_eq!(commit, 42);
         assert_eq!(std::fs::read(dest.join("snap.rsnap")).unwrap(), b"snapshot-bytes");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn archive_files_from_consumes_a_lazy_source() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-lazy-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let archiver = Archiver::new(LocalStore::new(root.clone()));
+        let mut next = 0;
+        let files = std::iter::from_fn(move || {
+            let file = match next {
+                0 => (String::from("first"), b"one".to_vec()),
+                1 => (String::from("second"), b"two".to_vec()),
+                _ => return None,
+            };
+            next += 1;
+            Some(Ok(file))
+        });
+
+        let manifest = archiver.archive_files_from("lazy", 17, files).await.unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        let restored = root.join("restored");
+        archiver.restore_backup(&manifest.manifest_key(), &restored).await.unwrap();
+        assert_eq!(std::fs::read(restored.join("first")).unwrap(), b"one");
+        assert_eq!(std::fs::read(restored.join("second")).unwrap(), b"two");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
