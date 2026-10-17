@@ -1,6 +1,9 @@
 use ryme_error::{Result, RymeError};
 
 const MAX_S3_LIST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_S3_LIST_PAGES: usize = 100;
+const MAX_S3_LIST_KEYS: usize = 100_000;
+const MAX_S3_LIST_KEY_BYTES: usize = 64 * 1024 * 1024;
 
 async fn response_bytes_bounded(
     mut response: reqwest::Response,
@@ -211,11 +214,23 @@ impl crate::ObjectStore for S3Store {
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let now = crate::now_unix();
         let mut out = Vec::new();
+        let mut total_key_bytes = 0usize;
         let mut token: Option<String> = None;
-        for _ in 0..100 {
+        for page in 0..MAX_S3_LIST_PAGES {
             let (keys, next) = self.list_page(prefix, token.as_deref(), now).await?;
-            out.extend(keys.into_iter().filter(|k| k.starts_with(prefix)));
+            for key in keys.into_iter().filter(|key| key.starts_with(prefix)) {
+                total_key_bytes = total_key_bytes
+                    .checked_add(key.len())
+                    .ok_or_else(|| RymeError::Overload(String::from("s3 list results")))?;
+                if out.len() == MAX_S3_LIST_KEYS || total_key_bytes > MAX_S3_LIST_KEY_BYTES {
+                    return Err(RymeError::Overload(String::from("s3 list results")));
+                }
+                out.push(key);
+            }
             match next {
+                Some(_) if page + 1 == MAX_S3_LIST_PAGES => {
+                    return Err(RymeError::Overload(String::from("s3 list pages")));
+                }
                 Some(next) => token = Some(next),
                 None => break,
             }
@@ -406,6 +421,7 @@ mod tests {
     struct FakeS3 {
         files: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
         seen_auth: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+        list_pages: Option<usize>,
     }
 
     async fn read_http_request(
@@ -460,6 +476,7 @@ mod tests {
             };
             let files = state.files.clone();
             let seen = state.seen_auth.clone();
+            let list_pages = state.list_pages;
             tokio::spawn(async move {
                 loop {
                     let Some((method, target, headers, body)) =
@@ -483,6 +500,11 @@ mod tests {
                         files.lock().await.remove(&key);
                         "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n".to_string()
                     } else if query.contains("list-type=2") {
+                        let page = query
+                            .split('&')
+                            .find_map(|part| part.strip_prefix("continuation-token=page-"))
+                            .and_then(|page| page.parse::<usize>().ok())
+                            .unwrap_or(0);
                         let prefix =
                             query.split('&').find_map(|p| p.strip_prefix("prefix=")).unwrap_or("");
                         let guard = files.lock().await;
@@ -492,7 +514,14 @@ mod tests {
                                 body.push_str(&format!("<Key>{name}</Key>"));
                             }
                         }
-                        body.push_str("<IsTruncated>false</IsTruncated></ListBucketResult>");
+                        if list_pages.is_some_and(|pages| page + 1 < pages) {
+                            body.push_str(&format!(
+                                "<IsTruncated>true</IsTruncated><NextContinuationToken>page-{}</NextContinuationToken></ListBucketResult>",
+                                page + 1
+                            ));
+                        } else {
+                            body.push_str("<IsTruncated>false</IsTruncated></ListBucketResult>");
+                        }
                         format!(
                             "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{}",
                             body.len(),
@@ -549,7 +578,8 @@ mod tests {
     async fn s3_roundtrip_against_fake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = FakeS3 { files: Default::default(), seen_auth: Default::default() };
+        let state =
+            FakeS3 { files: Default::default(), seen_auth: Default::default(), list_pages: None };
         let seen = state.seen_auth.clone();
         tokio::spawn(run_fake_s3(listener, state));
         let store = S3Store::new(test_s3_config(&format!("http://{addr}"), true)).unwrap();
@@ -563,5 +593,23 @@ mod tests {
         assert!(auths
             .iter()
             .all(|a| a.starts_with("AWS4-HMAC-SHA256 ") && a.contains("Signature=")));
+    }
+
+    #[tokio::test]
+    async fn s3_list_errors_instead_of_returning_truncated_results() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = FakeS3 {
+            files: Default::default(),
+            seen_auth: Default::default(),
+            list_pages: Some(MAX_S3_LIST_PAGES + 1),
+        };
+        tokio::spawn(run_fake_s3(listener, state));
+        let store = S3Store::new(test_s3_config(&format!("http://{addr}"), true)).unwrap();
+
+        assert!(matches!(
+            store.list("backups/").await,
+            Err(RymeError::Overload(message)) if message == "s3 list pages"
+        ));
     }
 }
