@@ -1033,7 +1033,7 @@ impl Engine {
             if vcount == 0 || vcount > 1_000_000 {
                 return Err(RymeError::Corrupt(String::from("snapshot versions")));
             }
-            let mut versions = VecDeque::with_capacity(vcount.min(64));
+            let mut versions = VecDeque::with_capacity(vcount.min(4));
             let mut previous_commit_ts = None;
             for _ in 0..vcount {
                 let commit_ts = take_u64(&mut cursor)?;
@@ -1615,6 +1615,18 @@ mod tests {
         assert_eq!(back.read(&first, 20, 1000).unwrap(), Some(b"b".to_vec()));
         assert_eq!(back.read(&second, 15, 1000).unwrap(), None);
         assert_eq!(back.max_commit_ts(), 20);
+    }
+
+    #[test]
+    fn snapshot_decode_does_not_overallocate_single_version_history() {
+        let mut engine = Engine::new();
+        let key = RecordKey::new("t", "d", "users", b"1");
+        engine.apply(key.clone(), 10, Some(b"a".to_vec())).unwrap();
+
+        let raw = engine.encode_snapshot().unwrap();
+        let decoded = Engine::decode_snapshot(&raw).unwrap();
+
+        assert!(decoded.inner.get(&key).unwrap().capacity() <= 4);
     }
 
     #[test]
