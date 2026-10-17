@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 // The heartbeat loop runs every 60 ms. Keep several heartbeat intervals in
 // the election window so TLS handshakes, disk syncs, and executor contention
@@ -23,6 +23,13 @@ const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
 const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_RAFT_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const RPC_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RPC_FRAME_BUDGET_UNIT_BYTES: usize = 16 * 1024;
+const RPC_FRAME_DECODE_WEIGHT: usize = 4;
+const RPC_FRAME_BUDGET_PERMITS: usize = RPC_FRAME_BUDGET_BYTES / RPC_FRAME_BUDGET_UNIT_BYTES;
+static RPC_FRAME_BUDGET: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(RPC_FRAME_BUDGET_PERMITS));
 
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
 
@@ -516,7 +523,7 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let body = serde_json::to_vec(rpc).map_err(|e| RymeError::Internal(e.to_string()))?;
-    if body.len() > 16 * 1024 * 1024 {
+    if body.len() > MAX_RPC_FRAME_BYTES {
         return Err(RymeError::Overload(String::from("rpc frame")));
     }
     socket
@@ -531,12 +538,25 @@ async fn read_frame<S>(socket: &mut S) -> Result<Rpc>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
+    read_frame_with_budget(socket, &RPC_FRAME_BUDGET).await
+}
+
+async fn read_frame_with_budget<S>(socket: &mut S, budget: &Semaphore) -> Result<Rpc>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut header = [0u8; 4];
     socket.read_exact(&mut header).await.map_err(|e| RymeError::Io(e.to_string()))?;
     let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > 16 * 1024 * 1024 {
+    if length == 0 || length > MAX_RPC_FRAME_BYTES {
         return Err(RymeError::InvalidArgument(String::from("rpc frame")));
     }
+    let permits =
+        length.div_ceil(RPC_FRAME_BUDGET_UNIT_BYTES).saturating_mul(RPC_FRAME_DECODE_WEIGHT);
+    let _budget = budget
+        .acquire_many(permits as u32)
+        .await
+        .map_err(|_| RymeError::Unavailable(String::from("rpc frame budget")))?;
     let mut body = vec![0u8; length];
     socket.read_exact(&mut body).await.map_err(|e| RymeError::Io(e.to_string()))?;
     serde_json::from_slice(&body).map_err(|_| RymeError::Corrupt(String::from("rpc decode")))
@@ -6185,6 +6205,25 @@ impl ResetFlag for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rpc_frame_reader_waits_for_decode_budget_before_allocating_body() {
+        let rpc = Rpc::VoteRequest { term: 1, candidate: 0, last_term: 0, last_index: 0 };
+        let body = serde_json::to_vec(&rpc).unwrap();
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        let (mut sender, mut receiver) = tokio::io::duplex(frame.len());
+        sender.write_all(&frame).await.unwrap();
+
+        let exhausted_budget = Semaphore::new(0);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            read_frame_with_budget(&mut receiver, &exhausted_budget)
+        )
+        .await
+        .is_err());
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
