@@ -951,7 +951,7 @@ impl Engine {
                 .map_err(|_| RymeError::Corrupt(String::from("snapshot table")))?;
             let pk = take_chunk(&mut cursor)?.to_vec();
             let vcount = take_u32(&mut cursor)? as usize;
-            if vcount > 1_000_000 {
+            if vcount == 0 || vcount > 1_000_000 {
                 return Err(RymeError::Corrupt(String::from("snapshot versions")));
             }
             let mut versions = VecDeque::with_capacity(vcount.min(64));
@@ -1537,6 +1537,22 @@ mod tests {
         let last = raw.len() - 1;
         raw[last] ^= 0xff;
         assert!(Engine::decode_snapshot(&raw).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_empty_history_even_when_other_rows_have_versions() {
+        let mut engine = Engine::new();
+        engine.apply(RecordKey::new("t", "d", "s", b"a"), 1, Some(b"a".to_vec())).unwrap();
+        engine.apply(RecordKey::new("t", "d", "s", b"z"), 2, Some(b"z".to_vec())).unwrap();
+        let mut raw = engine.encode_snapshot().unwrap();
+
+        // The fixed header and the first row's three 16-bit-length one-byte
+        // fields and PK chunk occupy 34 bytes; then comes its version count.
+        raw[34..38].copy_from_slice(&0u32.to_be_bytes());
+        raw.drain(38..60); // Remove that row's encoded one-version history.
+        refresh_snapshot_checksum(&mut raw);
+
+        assert!(matches!(Engine::decode_snapshot(&raw), Err(RymeError::Corrupt(_))));
     }
 
     #[test]
