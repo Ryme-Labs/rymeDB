@@ -1154,6 +1154,7 @@ pub struct SharedState {
     auth_persist_lock: Arc<Mutex<()>>,
     migration_lock: Arc<tokio::sync::Mutex<()>>,
     keys: ApiKeyStore,
+    named_api_keys: Arc<Mutex<HashMap<String, NamedApiKey>>>,
     jwt: Option<JwtVerifier>,
     oidc: Option<OidcConfig>,
     oidc_jwt: Option<JwtVerifier>,
@@ -1216,11 +1217,19 @@ struct AuthSnapshot {
     #[serde(default)]
     api_key_expirations: HashMap<String, u64>,
     #[serde(default)]
+    named_api_keys: HashMap<String, NamedApiKey>,
+    #[serde(default)]
     users: HashMap<String, ryme_auth::StoredUser>,
     #[serde(default)]
     refresh_tokens: HashMap<String, RefreshTokenRecord>,
     #[serde(default)]
     passkeys: HashMap<String, ryme_auth::PasskeyCredential>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NamedApiKey {
+    name: String,
+    created_at: u64,
 }
 
 const AUTH_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -1882,6 +1891,11 @@ impl SharedState {
         let snapshot = AuthSnapshot {
             api_keys: self.keys.snapshot()?,
             api_key_expirations: self.keys.expiration_snapshot()?,
+            named_api_keys: self
+                .named_api_keys
+                .lock()
+                .map_err(|_| ryme_error::RymeError::Internal(String::from("named api key lock")))?
+                .clone(),
             users: self
                 .credentials
                 .lock()
@@ -2481,6 +2495,7 @@ impl SharedState {
             )?;
             control.branches.persist(&branch_path)?;
         }
+        let named_api_keys = auth_snapshot.named_api_keys;
         let mut api_key_expirations = auth_snapshot.api_key_expirations;
         let migration_time = ryme_txn::now_unix();
         // Legacy application keys had no expiry. Require users to sign in
@@ -2604,6 +2619,7 @@ impl SharedState {
             auth_persist_lock: Arc::new(Mutex::new(())),
             migration_lock: Arc::new(tokio::sync::Mutex::new(())),
             keys,
+            named_api_keys: Arc::new(Mutex::new(named_api_keys)),
             jwt,
             oidc,
             oidc_jwt,
@@ -3163,7 +3179,8 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/auth/register", post(auth_register))
         .route("/v1/auth/verify", post(auth_verify))
         .route("/v1/auth/token", post(auth_token))
-        .route("/v1/auth/keys", delete(auth_revoke))
+        .route("/v1/auth/keys", get(auth_list_keys).post(auth_create_key).delete(auth_revoke))
+        .route("/v1/auth/keys/{id}", delete(auth_revoke_named_key))
         .route("/v1/auth/session", delete(auth_revoke_session))
         .route("/v1/auth/otp/setup", post(otp_setup))
         .route("/v1/auth/otp/verify", post(otp_verify))
@@ -6321,6 +6338,11 @@ pub struct AuthRevokeRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct AuthCreateKeyRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct AuthSessionRevokeRequest {
     pub refresh_token: String,
 }
@@ -6683,6 +6705,191 @@ async fn auth_token(
         },
         Ok(Err(e)) => error_response(e),
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("task"))),
+    }
+}
+
+async fn auth_list_keys(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let principal = match state.principal(&headers) {
+        Ok(principal) if principal.can_write() => principal,
+        Ok(_) => return error_response(ryme_error::RymeError::Forbidden),
+        Err(error) => return error_response(error),
+    };
+    let principals = match state.keys.snapshot() {
+        Ok(principals) => principals,
+        Err(error) => return error_response(error),
+    };
+    let expirations = match state.keys.expiration_snapshot() {
+        Ok(expirations) => expirations,
+        Err(error) => return error_response(error),
+    };
+    let named = match state.named_api_keys.lock() {
+        Ok(named) => named,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "named api key lock",
+            )))
+        }
+    };
+    let now = ryme_txn::now_unix();
+    let mut keys = named
+        .iter()
+        .filter_map(|(id, metadata)| {
+            let owner = principals.get(id)?;
+            let expiration = expirations.get(id).copied();
+            (owner.tenant == principal.tenant
+                && (principal.can_admin() || owner.id == principal.id)
+                && expiration.is_none_or(|expires_at| expires_at > now))
+            .then(|| {
+                serde_json::json!({
+                    "id": id,
+                    "name": metadata.name,
+                    "created_at": metadata.created_at,
+                    "expires_at": expiration,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| left["created_at"].as_u64().cmp(&right["created_at"].as_u64()));
+    (StatusCode::OK, Json(serde_json::json!({ "keys": keys }))).into_response()
+}
+
+async fn auth_create_key(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: AuthCreateKeyRequest = match json_body(&body) {
+        Ok(request) => request,
+        Err(error) => return error_response(error),
+    };
+    let principal = match state.principal(&headers) {
+        Ok(principal) if principal.can_write() => principal,
+        Ok(_) => return error_response(ryme_error::RymeError::Forbidden),
+        Err(error) => return error_response(error),
+    };
+    let name = request.name.trim();
+    if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from(
+            "key name (1-64 printable bytes)",
+        )));
+    }
+    let _persist_guard = match state.auth_persist_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "auth persist lock",
+            )))
+        }
+    };
+    let key = format!("ryme_{}", ryme_auth::base64_url_encode(&ryme_auth::random_bytes(32)));
+    let id = ApiKeyStore::digest_key(&key);
+    let created_at = ryme_txn::now_unix();
+    let expires_at = created_at.saturating_add(90 * 24 * 60 * 60);
+    if let Err(error) =
+        state.keys.insert_with_expiry(key.clone(), principal, expires_at, created_at)
+    {
+        return error_response(error);
+    }
+    let metadata = NamedApiKey { name: name.to_string(), created_at };
+    match state.named_api_keys.lock() {
+        Ok(mut named) => {
+            named.insert(id.clone(), metadata.clone());
+        }
+        Err(_) => {
+            state.keys.remove_digest_with_expiry(&id);
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "named api key lock",
+            )));
+        }
+    }
+    let mut replaced = false;
+    match state.persist_auth_locked(|| replaced = true) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id": id,
+                "name": name,
+                "key": key,
+                "created_at": created_at,
+                "expires_at": expires_at,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            if !replaced {
+                state.keys.remove_digest_with_expiry(&id);
+                if let Ok(mut named) = state.named_api_keys.lock() {
+                    named.remove(&id);
+                }
+            }
+            error_response(error)
+        }
+    }
+}
+
+async fn auth_revoke_named_key(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let principal = match state.principal(&headers) {
+        Ok(principal) if principal.can_write() => principal,
+        Ok(_) => return error_response(ryme_error::RymeError::Forbidden),
+        Err(error) => return error_response(error),
+    };
+    let _persist_guard = match state.auth_persist_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "auth persist lock",
+            )))
+        }
+    };
+    let owner = match state.keys.snapshot() {
+        Ok(snapshot) => snapshot.get(&id).cloned(),
+        Err(error) => return error_response(error),
+    };
+    let Some(owner) = owner else {
+        return error_response(ryme_error::RymeError::NotFound(String::from("key")));
+    };
+    let is_named = match state.named_api_keys.lock() {
+        Ok(named) => named.contains_key(&id),
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "named api key lock",
+            )))
+        }
+    };
+    if !is_named {
+        return error_response(ryme_error::RymeError::NotFound(String::from("key")));
+    }
+    if owner.tenant != principal.tenant || (!principal.can_admin() && owner.id != principal.id) {
+        return error_response(ryme_error::RymeError::Forbidden);
+    }
+    let Some((removed_owner, expires_at)) = state.keys.remove_digest_with_expiry(&id) else {
+        return error_response(ryme_error::RymeError::NotFound(String::from("key")));
+    };
+    let metadata = match state.named_api_keys.lock() {
+        Ok(mut named) => named.remove(&id),
+        Err(_) => {
+            let _ = state.keys.restore_digest(id, removed_owner, expires_at);
+            return error_response(ryme_error::RymeError::Internal(String::from(
+                "named api key lock",
+            )));
+        }
+    };
+    let mut replaced = false;
+    match state.persist_auth_locked(|| replaced = true) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response(),
+        Err(error) => {
+            if !replaced {
+                let _ = state.keys.restore_digest(id.clone(), removed_owner, expires_at);
+                if let (Some(metadata), Ok(mut named)) = (metadata, state.named_api_keys.lock()) {
+                    named.insert(id, metadata);
+                }
+            }
+            error_response(error)
+        }
     }
 }
 
@@ -15489,6 +15696,63 @@ mod realtime_policy_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn named_api_keys_are_one_time_listable_and_revocable_by_owner() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-named-api-key-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let state =
+            SharedState::build(&Config { data_dir: dir.clone(), ..Config::default() }).unwrap();
+        state
+            .keys
+            .insert(
+                String::from("named-key-owner"),
+                Principal {
+                    id: String::from("owner-1"),
+                    tenant: String::from("default"),
+                    roles: [Role::Owner].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer named-key-owner"),
+        );
+
+        let created = auth_create_key(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{"name":"browser app"}"#),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(created.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        let secret = created["key"].as_str().unwrap();
+        assert_eq!(state.keys.authenticate(secret).unwrap().id, "owner-1");
+
+        let listed = auth_list_keys(State(state.clone()), headers.clone()).await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(listed.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["keys"][0]["id"], id);
+        assert_eq!(listed["keys"][0]["name"], "browser app");
+        assert!(listed["keys"][0].get("key").is_none());
+
+        let revoked =
+            auth_revoke_named_key(State(state.clone()), headers, axum::extract::Path(id)).await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+        assert!(state.keys.authenticate(secret).is_err());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

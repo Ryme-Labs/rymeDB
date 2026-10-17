@@ -453,6 +453,63 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
   /v1/auth/keys:
+    get:
+      tags: [auth]
+      summary: List named API keys
+      description: Lists key metadata for the authenticated user, or for the authenticated tenant administrator. Key secrets are never returned.
+      responses:
+        '200':
+          description: Named API key metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NamedApiKey'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [auth]
+      summary: Create a named API key
+      description: Creates a key with the authenticated principal's permissions. The secret is returned once and expires after 90 days.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+      responses:
+        '201':
+          description: Created API key; secret is returned only in this response.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/NamedApiKey'
+                  - type: object
+                    required: [key]
+                    properties:
+                      key:
+                        type: string
+                        description: Bearer secret; store securely, it cannot be retrieved again.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
     delete:
       tags: [auth]
       description: "Revoke an API key by value. Requires a write-capable principal; the body carries the key so it never appears in access logs."
@@ -479,6 +536,34 @@ paths:
                     type: boolean
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/auth/keys/{id}:
+    delete:
+      tags: [auth]
+      summary: Revoke a named API key
+      description: Revokes a named key by its non-secret ID. Only the owner or a tenant administrator may revoke it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: revocation receipt
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked:
+                    type: boolean
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2120,6 +2205,21 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
   schemas:
+    NamedApiKey:
+      type: object
+      required: [id, name, created_at, expires_at]
+      properties:
+        id:
+          type: string
+          description: Stable non-secret key identifier; never accepted as a credential.
+        name:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: [integer, 'null']
+          format: int64
     IndexMemoryBudget:
       type: object
       required: [used_bytes, limit_bytes]

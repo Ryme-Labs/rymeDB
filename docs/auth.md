@@ -46,6 +46,26 @@ Never put an operator or owner key in a WebSocket URL.
 Never put a long-lived owner key in browser code. Mint a narrowly scoped
 application credential or use a server-side proxy.
 
+## Named API keys
+
+After signing in to the dashboard, create and revoke named keys in **Auth &
+Billing → API keys**. The CLI uses the same authenticated account: run
+`rymedb-cli auth token <id> <password>` to obtain a session credential, then
+set it as `RYME_API_KEY` (or pass `--api-key`) for these commands:
+
+```bash
+rymedb-cli auth keys create website-production
+rymedb-cli auth keys list
+rymedb-cli auth keys revoke <id-from-list>
+```
+
+The generated secret is shown only once, inherits the creating principal's
+permissions, and expires after 90 days. Lists contain names and non-secret IDs,
+never key material. Revoking a key takes effect immediately. A named key is
+still a bearer credential: keep server keys server-side. For browser access,
+use `RYME_PUBLIC_API_KEY` with deliberate anon grants/RLS, or a short-lived,
+least-privilege user token.
+
 When a listener is bound beyond loopback, its API key or protocol password must
 contain at least 16 bytes. Use a randomly generated value rather than a sample
 or human-memorable password.

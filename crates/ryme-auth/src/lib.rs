@@ -349,6 +349,32 @@ impl ApiKeyStore {
             .map(|record| (record.principal, record.expires_at))
     }
 
+    /// Remove a key by its stable digest ID. IDs are not bearer credentials.
+    pub fn remove_digest_with_expiry(&self, digest: &str) -> Option<(Principal, Option<u64>)> {
+        self.inner.write().ok()?.remove(digest).map(|record| (record.principal, record.expires_at))
+    }
+
+    /// Restore a key removed by `remove_digest_with_expiry` after a failed persist.
+    pub fn restore_digest(
+        &self,
+        digest: String,
+        principal: Principal,
+        expires_at: Option<u64>,
+    ) -> Result<()> {
+        principal.validate()?;
+        let mut state =
+            self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
+        if state.records.len() >= MAX_API_KEYS && !state.records.contains_key(&digest) {
+            return Err(RymeError::Overload(String::from("api keys")));
+        }
+        state.insert(digest, ApiKeyRecord { principal, expires_at });
+        Ok(())
+    }
+
+    pub fn digest_key(api_key: &str) -> String {
+        Self::digest(api_key)
+    }
+
     pub fn restore(
         &self,
         api_key: &str,

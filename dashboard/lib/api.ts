@@ -253,6 +253,17 @@ export const authVerify = (c: Connection, id: string, password: string) =>
   post(c, "/v1/auth/verify", { id, password });
 export const authToken = (c: Connection, id: string, password: string) =>
   post<{ key: string; tenant: string; refresh_token?: string }>(c, "/v1/auth/token", { id, password });
+export interface ApiKeyInfo {
+  id: string;
+  name: string;
+  created_at: number;
+  expires_at: number | null;
+}
+export const fetchApiKeys = (c: Connection) => get<{ keys: ApiKeyInfo[] }>(c, "/v1/auth/keys");
+export const createApiKey = (c: Connection, name: string) =>
+  post<{ id: string; name: string; key: string; created_at: number; expires_at: number }>(c, "/v1/auth/keys", { name });
+export const revokeApiKey = (c: Connection, id: string) =>
+  api(c, "DELETE", `/v1/auth/keys/${encodeURIComponent(id)}`);
 
 /** Build an authenticated WebSocket URL for the documented stream paths. */
 export function wsUrl(c: Connection, path: string): string {
