@@ -25,6 +25,7 @@ use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
 use ryme_sql::{bind, parse, Executor, QueryResult, Statement};
 use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
+use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use std::cmp::Ordering;
@@ -9494,14 +9495,74 @@ async fn filter_text_hits(
 pub struct VectorUpsertRequest {
     pub table: String,
     pub id: String,
+    #[serde(deserialize_with = "deserialize_vector")]
     pub vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct VectorSearchRequest {
     pub table: String,
+    #[serde(deserialize_with = "deserialize_vector")]
     pub vector: Vec<f32>,
     pub top_k: Option<usize>,
+}
+
+fn deserialize_vector<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedVectorVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVectorVisitor {
+        type Value = Vec<f32>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a vector with at most MAX_DIM components")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let capacity = sequence.size_hint().unwrap_or(0).min(ryme_index::MAX_DIM);
+            let mut vector = Vec::with_capacity(capacity);
+            while let Some(value) = sequence.next_element()? {
+                if vector.len() == ryme_index::MAX_DIM {
+                    return Err(de::Error::custom("vector dim"));
+                }
+                vector.push(value);
+            }
+            Ok(vector)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVectorVisitor)
+}
+
+#[cfg(test)]
+mod vector_request_tests {
+    use super::{AnnSearchRequest, VectorSearchRequest, VectorUpsertRequest};
+
+    fn vector_request_body(components: usize) -> String {
+        let values = std::iter::repeat("0")
+            .take(components)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"table":"vectors","id":"v","vector":[{values}]}}"#)
+    }
+
+    #[test]
+    fn vector_requests_bound_component_allocation_during_deserialization() {
+        let at_limit = vector_request_body(ryme_index::MAX_DIM);
+        assert!(serde_json::from_str::<VectorUpsertRequest>(&at_limit).is_ok());
+        assert!(serde_json::from_str::<VectorSearchRequest>(&at_limit).is_ok());
+        assert!(serde_json::from_str::<AnnSearchRequest>(&at_limit).is_ok());
+
+        let over_limit = vector_request_body(ryme_index::MAX_DIM + 1);
+        assert!(serde_json::from_str::<VectorUpsertRequest>(&over_limit).is_err());
+        assert!(serde_json::from_str::<VectorSearchRequest>(&over_limit).is_err());
+        assert!(serde_json::from_str::<AnnSearchRequest>(&over_limit).is_err());
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -9648,6 +9709,7 @@ async fn vector_search(
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AnnSearchRequest {
     pub table: String,
+    #[serde(deserialize_with = "deserialize_vector")]
     pub vector: Vec<f32>,
     pub top_k: Option<usize>,
     pub ef: Option<usize>,
