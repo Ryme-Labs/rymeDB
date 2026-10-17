@@ -4859,18 +4859,47 @@ fn rest_list_filtered(rows: Vec<(Vec<u8>, Vec<u8>)>, raw: &str) -> Vec<(Vec<u8>,
 }
 
 const REST_SCAN_PAGE_ROWS: usize = 16;
+const REST_MAX_MATERIALIZED_ROWS: usize = 100_000;
 const REST_MAX_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
+const REST_MATERIALIZED_ROW_OVERHEAD: usize = 64;
+
+#[derive(Default)]
+struct RestMaterializationBudget {
+    rows: usize,
+    bytes: usize,
+}
+
+impl RestMaterializationBudget {
+    fn add_row(&mut self, row: &(Vec<u8>, Vec<u8>)) -> ryme_error::Result<()> {
+        let rows = self
+            .rows
+            .checked_add(1)
+            .ok_or_else(|| ryme_error::RymeError::Overload(String::from("result")))?;
+        let row_bytes = row
+            .0
+            .len()
+            .checked_add(row.1.len())
+            .and_then(|bytes| bytes.checked_add(REST_MATERIALIZED_ROW_OVERHEAD))
+            .ok_or_else(|| ryme_error::RymeError::Overload(String::from("result")))?;
+        let bytes = self
+            .bytes
+            .checked_add(row_bytes)
+            .ok_or_else(|| ryme_error::RymeError::Overload(String::from("result")))?;
+        if rows > REST_MAX_MATERIALIZED_ROWS || bytes > REST_MAX_MATERIALIZED_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("result")));
+        }
+        self.rows = rows;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
 
 fn retain_rest_row(
     rows: &mut Vec<(Vec<u8>, Vec<u8>)>,
     row: (Vec<u8>, Vec<u8>),
-    materialized_bytes: &mut usize,
+    budget: &mut RestMaterializationBudget,
 ) -> ryme_error::Result<()> {
-    let row_bytes = row.0.len().saturating_add(row.1.len());
-    if row_bytes > REST_MAX_MATERIALIZED_BYTES.saturating_sub(*materialized_bytes) {
-        return Err(ryme_error::RymeError::Overload(String::from("result")));
-    }
-    *materialized_bytes += row_bytes;
+    budget.add_row(&row)?;
     rows.push(row);
     Ok(())
 }
@@ -4963,7 +4992,7 @@ async fn rest_list(
     let page_limit = REST_SCAN_PAGE_ROWS;
     let mut cursor = None;
     let mut filtered = Vec::new();
-    let mut materialized_bytes = 0usize;
+    let mut materialized_budget = RestMaterializationBudget::default();
     let mut total = 0usize;
     loop {
         let (page, next) = match gateway
@@ -4980,14 +5009,14 @@ async fn rest_list(
         total = total.saturating_add(matches.len());
         if full_order_scan {
             for row in matches {
-                if let Err(e) = retain_rest_row(&mut filtered, row, &mut materialized_bytes) {
+                if let Err(e) = retain_rest_row(&mut filtered, row, &mut materialized_budget) {
                     return error_response(e);
                 }
             }
         } else {
             let remaining = target.saturating_sub(filtered.len());
             for row in matches.into_iter().take(remaining) {
-                if let Err(e) = retain_rest_row(&mut filtered, row, &mut materialized_bytes) {
+                if let Err(e) = retain_rest_row(&mut filtered, row, &mut materialized_budget) {
                     return error_response(e);
                 }
             }
@@ -5227,6 +5256,31 @@ fn rest_project_row(row: serde_json::Value, select: Option<&str>) -> serde_json:
 #[cfg(test)]
 mod rest_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn rest_materialization_bounds_row_overhead_without_partial_accounting() {
+        let mut rows = Vec::new();
+        let mut budget = RestMaterializationBudget { rows: REST_MAX_MATERIALIZED_ROWS, bytes: 0 };
+        assert!(matches!(
+            retain_rest_row(&mut rows, (Vec::new(), Vec::new()), &mut budget),
+            Err(ryme_error::RymeError::Overload(message)) if message == "result"
+        ));
+        assert!(rows.is_empty());
+        assert_eq!(budget.rows, REST_MAX_MATERIALIZED_ROWS);
+        assert_eq!(budget.bytes, 0);
+
+        let mut budget = RestMaterializationBudget {
+            rows: 0,
+            bytes: REST_MAX_MATERIALIZED_BYTES - REST_MATERIALIZED_ROW_OVERHEAD + 1,
+        };
+        assert!(matches!(
+            retain_rest_row(&mut rows, (Vec::new(), Vec::new()), &mut budget),
+            Err(ryme_error::RymeError::Overload(message)) if message == "result"
+        ));
+        assert!(rows.is_empty());
+        assert_eq!(budget.rows, 0);
+        assert_eq!(budget.bytes, REST_MAX_MATERIALIZED_BYTES - REST_MATERIALIZED_ROW_OVERHEAD + 1);
+    }
 
     #[test]
     fn postgrest_filters_and_projection_are_applied() {
