@@ -1,0 +1,78 @@
+{
+  "benchmark": "vector-index-dimension-aware-hnsw-profile",
+  "machine": {
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "arch": "x86_64",
+    "os": "linux"
+  },
+  "build_profile": "release",
+  "comparison_note": "Single-run local in-memory measurements using the deterministic benchmark corpus; not statistically controlled. M16 runs were captured before dimension-aware graph degree was introduced. M32 runs use the wider graph setting selected for dimensions >= 64.",
+  "runs": [
+    {
+      "dimensions": 32,
+      "vectors": 3000,
+      "partitions": 1,
+      "queries": 200,
+      "top_k": 10,
+      "ann_ef": 64,
+      "m": 16,
+      "index_build_ns": 140044754,
+      "adaptive_ann_p50_ns": 57319,
+      "exact_p50_ns": 99228,
+      "mean_recall_at_k": 0.9825
+    },
+    {
+      "dimensions": 32,
+      "vectors": 3000,
+      "partitions": 1,
+      "queries": 200,
+      "top_k": 10,
+      "ann_ef": 64,
+      "m": 32,
+      "index_build_ns": 190440282,
+      "adaptive_ann_p50_ns": 84240,
+      "exact_p50_ns": 97064,
+      "mean_recall_at_k": 1.0,
+      "note": "Experimental global M=32 run; production retains M=16 below 64 dimensions."
+    },
+    {
+      "dimensions": 384,
+      "vectors": 3000,
+      "partitions": 1,
+      "queries": 100,
+      "top_k": 10,
+      "ann_ef": 64,
+      "m": 16,
+      "index_build_ns": 921322273,
+      "adaptive_ann_p50_ns": 444733,
+      "exact_p50_ns": 1078793,
+      "mean_recall_at_k": 0.645
+    },
+    {
+      "dimensions": 384,
+      "vectors": 3000,
+      "partitions": 1,
+      "queries": 100,
+      "top_k": 10,
+      "ann_ef": 64,
+      "m": 32,
+      "index_build_ns": 1291709174,
+      "adaptive_ann_p50_ns": 696909,
+      "exact_p50_ns": 1058826,
+      "mean_recall_at_k": 0.891
+    },
+    {
+      "dimensions": 64,
+      "vectors": 20480,
+      "partitions": 4,
+      "queries": 100,
+      "top_k": 10,
+      "ann_ef": 64,
+      "m": 32,
+      "index_build_ns": 4206380774,
+      "adaptive_ann_p50_ns": 1459333,
+      "exact_p50_ns": 3445976,
+      "mean_recall_at_k": 0.988
+    }
+  ]
+}

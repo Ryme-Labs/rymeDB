@@ -152,7 +152,8 @@ The command reports dataset generation separately from index-build time, then
 measures exact and adaptive ANN API search latency/QPS and recall@k. Exact and
 ANN call order alternates per query to reduce systematic cache-order bias. The
 ANN API uses exact search when a partition's vector count is no larger than
-`effective_ef × HNSW_M`; otherwise it searches the HNSW graph. The deterministic
+`min(effective_ef × 2 × M, 2048)`; otherwise it searches the HNSW graph. `M` is
+16 below 64 dimensions and 32 at 64 dimensions or above. The deterministic
 SplitMix-derived corpus avoids the duplicate vectors produced by simple
 periodic generators. The vector payload is capped at 16 MiB to avoid
 unexpectedly large allocations; index metadata and graph edges require
@@ -193,6 +194,20 @@ queries per run, three release runs at `ef=64` measured median ANN p50 878 µs,
 recall/latency tradeoff better fits the workload. These are local index-only
 measurements; see the [raw profile](../bench/results/vector-hnsw-ef-profile.json)
 and benchmark your own corpus before choosing a production value.
+
+The graph degree is also dimension-aware. A follow-up release profile on the
+same Ryzen 5 4500 used 3,000 vectors, top-k 10, one partition, and 100 queries.
+At 32 dimensions, `M=16` measured 57.3 µs ANN p50, 99.2 µs exact p50, 0.983
+recall@10, and 140 ms build time. At 384 dimensions, the original `M=16`
+measured 445 µs ANN p50 and 0.645 recall@10; `M=32` measured 709 µs, 0.891
+recall@10, and 1.30 s build time, while exact p50 was 1.07 ms. For a larger
+64-dimensional corpus (20,480 vectors, four partitions), `M=32` measured
+1.46 ms ANN p50, 0.988 recall@10, and 4.21 s build time. These one-run
+measurements show the tradeoff that motivated using a wider graph only for
+embedding dimensions: better recall while ANN remained faster than exact in
+these samples, at the cost of index-build time and memory. They are not stable
+tail-latency or cross-database claims; see the [dimension profile](../bench/results/vector-hnsw-dimensions.json)
+and repeat on your own corpus.
 
 To measure full-text search when a common term matches every document:
 

@@ -16,6 +16,8 @@ pub const MAX_TEXT_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMS_PER_DOCUMENT: usize = 65_536;
 pub const HNSW_M: usize = 16;
 pub const HNSW_EF_BUILD: usize = 64;
+const HNSW_HIGH_DIM_M: usize = 32;
+const HNSW_HIGH_DIM_THRESHOLD: usize = 64;
 const HNSW_EXACT_FALLBACK_MAX: usize = HNSW_M * HNSW_EF_BUILD * 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +129,7 @@ struct HnswNode {
 #[derive(Debug, Default)]
 struct HnswIndex {
     dim: usize,
+    m: usize,
     nodes: Vec<HnswNode>,
     id_to_pos: HashMap<String, usize>,
     entry: Option<usize>,
@@ -149,12 +152,13 @@ impl HnswIndex {
     fn sample_level(&mut self) -> usize {
         let uniform = ((self.next_rand() >> 11) as f64) / ((1u64 << 53) as f64);
         let uniform = uniform.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON);
-        ((-uniform.ln() / (HNSW_M as f64).ln()).floor() as usize).min(8)
+        ((-uniform.ln() / (self.m as f64).ln()).floor() as usize).min(8)
     }
 
     fn upsert(&mut self, dim: usize, id: String, vector: Vec<f32>) -> Result<()> {
         if self.nodes.is_empty() {
             self.dim = dim;
+            self.m = if dim >= HNSW_HIGH_DIM_THRESHOLD { HNSW_HIGH_DIM_M } else { HNSW_M };
         }
         if dim != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
@@ -189,12 +193,12 @@ impl HnswIndex {
         for layer in (0..=level.min(entry_level)).rev() {
             let candidates = self.beam(&self.nodes[pos].vector, &[current], HNSW_EF_BUILD, layer);
             current = candidates.first().map(|(_, p)| *p).unwrap_or(current);
-            let selected = select_neighbors(&candidates, HNSW_M, &self.nodes);
+            let selected = select_neighbors(&candidates, self.m, &self.nodes);
             self.nodes[pos].neighbors[layer] = selected.clone();
             for neighbor in selected {
                 self.nodes[neighbor].neighbors[layer].push(pos);
-                if self.nodes[neighbor].neighbors[layer].len() > HNSW_M * 2 {
-                    let pruned = prune_neighbors(neighbor, layer, &self.nodes);
+                if self.nodes[neighbor].neighbors[layer].len() > self.m * 2 {
+                    let pruned = prune_neighbors(neighbor, layer, self.m, &self.nodes);
                     self.nodes[neighbor].neighbors[layer] = pruned;
                 }
             }
@@ -213,9 +217,10 @@ impl HnswIndex {
 
     fn rebuild(&mut self) {
         let dim = self.dim;
+        let m = self.m;
         let old_nodes = std::mem::take(&mut self.nodes);
         let old_positions = std::mem::take(&mut self.id_to_pos);
-        *self = Self { dim, ..Self::default() };
+        *self = Self { dim, m, ..Self::default() };
         for (pos, node) in old_nodes.into_iter().enumerate() {
             if !node.tombstoned && old_positions.get(&node.id) == Some(&pos) {
                 self.insert_new(node.id, node.vector);
@@ -271,7 +276,7 @@ impl HnswIndex {
         }
         // Positions are internal dense integers, so keyed collision resistance is unnecessary.
         let mut visited = rustc_hash::FxHashSet::with_capacity_and_hasher(
-            ef.saturating_mul(HNSW_M).min(self.nodes.len()),
+            ef.saturating_mul(self.m).min(self.nodes.len()),
             Default::default(),
         );
         visited.extend(starts.iter().copied());
@@ -362,7 +367,7 @@ fn select_neighbors(candidates: &[(f64, usize)], limit: usize, nodes: &[HnswNode
     selected
 }
 
-fn prune_neighbors(pos: usize, layer: usize, nodes: &[HnswNode]) -> Vec<usize> {
+fn prune_neighbors(pos: usize, layer: usize, limit: usize, nodes: &[HnswNode]) -> Vec<usize> {
     let mut scored: Vec<(f64, usize)> = nodes[pos]
         .neighbors
         .get(layer)
@@ -373,7 +378,7 @@ fn prune_neighbors(pos: usize, layer: usize, nodes: &[HnswNode]) -> Vec<usize> {
         .map(|p| (dot(&nodes[pos].vector, &nodes[p].vector), p))
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.into_iter().take(HNSW_M).map(|(_, p)| p).collect()
+    scored.into_iter().take(limit).map(|(_, p)| p).collect()
 }
 
 impl VectorSpace {
@@ -439,7 +444,7 @@ impl VectorSpace {
         // Keep small partitions exact near the measured crossover. Cap this
         // threshold so larger search widths do not force scans of large spaces.
         let exact_fallback_limit =
-            effective_ef.saturating_mul(HNSW_M).saturating_mul(2).min(HNSW_EXACT_FALLBACK_MAX);
+            effective_ef.saturating_mul(self.ann.m).saturating_mul(2).min(HNSW_EXACT_FALLBACK_MAX);
         if self.ann.id_to_pos.len() <= exact_fallback_limit {
             return self.search(query, top_k);
         }
@@ -1148,6 +1153,28 @@ mod tests {
         let hits = registry.ann_search("s", &[0.0, 1.0], 1, 16).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "new");
+    }
+
+    #[test]
+    fn hnsw_uses_and_preserves_wider_graph_for_embedding_dimensions() {
+        let mut low_dim = VectorSpace::default();
+        low_dim.upsert(String::from("v"), vec![1.0; HNSW_HIGH_DIM_THRESHOLD - 1]).unwrap();
+        assert_eq!(low_dim.ann.m, HNSW_M);
+
+        let mut high_dim = VectorSpace::default();
+        for index in 0..65 {
+            let mut vector = vec![0.0; HNSW_HIGH_DIM_THRESHOLD];
+            vector[index % HNSW_HIGH_DIM_THRESHOLD] = 1.0;
+            high_dim.upsert(format!("v{index}"), vector).unwrap();
+        }
+        assert_eq!(high_dim.ann.m, HNSW_HIGH_DIM_M);
+
+        for revision in 0..65 {
+            let mut vector = vec![0.0; HNSW_HIGH_DIM_THRESHOLD];
+            vector[revision % HNSW_HIGH_DIM_THRESHOLD] = 1.0;
+            high_dim.upsert(String::from("v0"), vector).unwrap();
+        }
+        assert_eq!(high_dim.ann.m, HNSW_HIGH_DIM_M);
     }
 
     #[test]
