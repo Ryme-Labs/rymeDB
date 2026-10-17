@@ -770,12 +770,12 @@ impl SegmentStore {
         let mut max_commit_ts = 0;
         for path in paths {
             let segment = ImmutableSegment::decode(&read_segment_file(&path)?)?;
+            max_commit_ts = max_commit_ts.max(segment.meta.max_commit_ts);
             if segment.is_snapshot() {
                 engine = segment.into_engine();
             } else {
                 segment.merge_owned_into(&mut engine)?;
             }
-            max_commit_ts = max_commit_ts.max(engine.max_commit_ts());
             found = true;
         }
         Ok(found.then_some((engine, max_commit_ts)))
