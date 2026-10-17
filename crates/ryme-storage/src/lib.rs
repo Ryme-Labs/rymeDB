@@ -497,6 +497,65 @@ impl Engine {
         out
     }
 
+    pub fn export_table_routing_range(
+        &self,
+        version: u8,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        read_ts: u64,
+        limit: usize,
+    ) -> Result<TableRows> {
+        validate_routing_version(version)?;
+        if !end.is_empty() && start >= end {
+            return Err(RymeError::InvalidArgument(String::from("range")));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let prefix = routing_key(version, tenant, database, table, &[])?;
+        if (start > prefix.as_slice() && !start.starts_with(&prefix))
+            || (!end.is_empty() && end <= prefix.as_slice())
+        {
+            return Ok(Vec::new());
+        }
+
+        let start_pk = start.strip_prefix(prefix.as_slice()).unwrap_or_default();
+        let lower = Bound::Included(RecordKey::new(tenant, database, table, start_pk));
+        let upper = if end.is_empty() {
+            Bound::Unbounded
+        } else if let Some(end_pk) = end.strip_prefix(prefix.as_slice()) {
+            Bound::Excluded(RecordKey::new(tenant, database, table, end_pk))
+        } else {
+            Bound::Unbounded
+        };
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for (key, versions) in self.inner.range((lower, upper)) {
+            if key.tenant != tenant || key.database != database || key.table != table {
+                break;
+            }
+            let versions = versions
+                .iter()
+                .take_while(|version| version.commit_ts <= read_ts)
+                .map(|version| TableVersion {
+                    commit_ts: version.commit_ts,
+                    value: version.value.clone(),
+                    expires_at: version.expires_at,
+                })
+                .collect::<Vec<_>>();
+            if !versions.is_empty() {
+                out.push((key.pk.clone(), versions));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn import_table(
         &mut self,
         tenant: &str,
@@ -1597,6 +1656,107 @@ mod tests {
         assert_eq!(end, b"t\0d\0docs\x01");
         assert!(routing_key(SCOPED_ROUTING_VERSION, "t", "d", "docs", b"z").unwrap() < end);
         assert!(routing_key(SCOPED_ROUTING_VERSION, "t", "d2", "docs", b"a").unwrap() >= end);
+    }
+
+    #[test]
+    fn routing_range_export_seeks_scoped_rows_and_filters_mvcc_history() {
+        let mut engine = Engine::new();
+        for (tenant, database, table, pk, ts, value) in [
+            ("t", "d", "docs", b"a".as_slice(), 1, b"a".as_slice()),
+            ("t", "d", "docs", b"b".as_slice(), 2, b"b".as_slice()),
+            ("t", "d", "docs", b"c".as_slice(), 3, b"old-c".as_slice()),
+            ("t", "d", "docs", b"c".as_slice(), 5, b"new-c".as_slice()),
+            ("t", "d", "docs", b"d".as_slice(), 4, b"d".as_slice()),
+            ("other", "d", "docs", b"b".as_slice(), 2, b"other-b".as_slice()),
+            ("t", "other-db", "docs", b"b".as_slice(), 2, b"other-db-b".as_slice()),
+            ("t", "d", "other-table", b"b".as_slice(), 2, b"other-table-b".as_slice()),
+        ] {
+            engine
+                .apply(RecordKey::new(tenant, database, table, pk), ts, Some(value.to_vec()))
+                .unwrap();
+        }
+
+        let start = routing_key(SCOPED_ROUTING_VERSION, "t", "d", "docs", b"b").unwrap();
+        let end = routing_key(SCOPED_ROUTING_VERSION, "t", "d", "docs", b"e").unwrap();
+        let rows = engine
+            .export_table_routing_range(
+                SCOPED_ROUTING_VERSION,
+                "t",
+                "d",
+                "docs",
+                &start,
+                &end,
+                4,
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|(pk, _)| pk.as_slice()).collect::<Vec<_>>(),
+            [b"b", b"c", b"d"]
+        );
+        let c_versions = &rows[1].1;
+        assert_eq!(c_versions.len(), 1);
+        assert_eq!(c_versions[0].commit_ts, 3);
+        assert_eq!(c_versions[0].value.as_deref(), Some(b"old-c".as_slice()));
+
+        let limited = engine
+            .export_table_routing_range(
+                SCOPED_ROUTING_VERSION,
+                "t",
+                "d",
+                "docs",
+                &start,
+                &end,
+                4,
+                2,
+            )
+            .unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[1].0, b"c");
+    }
+
+    #[test]
+    fn legacy_routing_range_export_includes_matching_keys_across_scopes() {
+        let mut engine = Engine::new();
+        for (tenant, database, pk, value) in [
+            ("t1", "d1", b"b".as_slice(), b"one".as_slice()),
+            ("t2", "d2", b"c".as_slice(), b"two".as_slice()),
+            ("t3", "d3", b"z".as_slice(), b"outside".as_slice()),
+        ] {
+            engine
+                .apply(RecordKey::new(tenant, database, "docs", pk), 1, Some(value.to_vec()))
+                .unwrap();
+        }
+        let mut rows = engine
+            .export_table_routing_range(
+                LEGACY_ROUTING_VERSION,
+                "t1",
+                "d1",
+                "docs",
+                b"docs\0b",
+                b"docs\0d",
+                1,
+                10,
+            )
+            .unwrap();
+        rows.extend(
+            engine
+                .export_table_routing_range(
+                    LEGACY_ROUTING_VERSION,
+                    "t2",
+                    "d2",
+                    "docs",
+                    b"docs\0b",
+                    b"docs\0d",
+                    1,
+                    10,
+                )
+                .unwrap(),
+        );
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, b"b");
+        assert_eq!(rows[1].0, b"c");
     }
 
     #[test]

@@ -5274,15 +5274,19 @@ impl Node {
             {
                 continue;
             }
-            for (pk, table_versions) in self.manager.export_table(&tenant, &database, &table)? {
-                let routing =
-                    ryme_storage::routing_key(routing_version, &tenant, &database, &table, &pk)?;
-                if routing.as_slice() < start || (!end.is_empty() && routing.as_slice() >= end) {
-                    continue;
-                }
+            let remaining = max_rows.saturating_sub(rows.len());
+            for (pk, table_versions) in self.manager.export_table_routing_range(
+                routing_version,
+                &tenant,
+                &database,
+                &table,
+                start,
+                end,
+                snapshot_ts,
+                remaining.saturating_add(1),
+            )? {
                 let versions: Vec<RangeSnapshotVersion> = table_versions
                     .into_iter()
-                    .filter(|version| version.commit_ts <= snapshot_ts)
                     .map(|version| RangeSnapshotVersion {
                         commit_ts: version.commit_ts,
                         value: version.value,

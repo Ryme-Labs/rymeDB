@@ -2133,6 +2133,32 @@ impl TxnManager {
         Ok(engine.export_table(tenant, database, table))
     }
 
+    pub fn export_table_routing_range(
+        &self,
+        version: u8,
+        tenant: &str,
+        database: &str,
+        table: &str,
+        start: &[u8],
+        end: &[u8],
+        read_ts: u64,
+        limit: usize,
+    ) -> Result<ryme_storage::TableRows> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let engine = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+        engine.export_table_routing_range(
+            version, tenant, database, table, start, end, read_ts, limit,
+        )
+    }
+
     pub fn import_table(
         &self,
         tenant: &str,
