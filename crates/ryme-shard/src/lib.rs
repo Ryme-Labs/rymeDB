@@ -971,7 +971,7 @@ impl ShardSet {
             });
             cohort.insert(shard);
         }
-        for table in txn.scanned_tables().iter() {
+        for table in txn.scanned_tables().iter().chain(txn.constraint_scanned_tables().iter()) {
             let table = TableRef::new(&table.0, &table.1, &table.2);
             if inner.paused.contains(&table) {
                 return Err(RymeError::Unavailable(String::from("rescheduling")));
@@ -1275,7 +1275,7 @@ impl TxnBackend for ShardSet {
                 });
                 cohort.insert(shard);
             }
-            for table in txn.scanned_tables().iter() {
+            for table in txn.scanned_tables().iter().chain(txn.constraint_scanned_tables().iter()) {
                 let table = TableRef::new(&table.0, &table.1, &table.2);
                 if guard.ranges.is_empty() {
                     let shard = guard
@@ -1523,11 +1523,16 @@ impl TxnBackend for HybridBackend {
                     .lock()
                     .map_err(|_| RymeError::Internal(String::from("shard lock")))?;
                 let tables =
-                    txn.writes().keys().chain(txn.read_keys().iter()).map(TableRef::of).chain(
-                        txn.scanned_tables().iter().map(|(tenant, database, table)| {
+                    txn.writes()
+                        .keys()
+                        .chain(txn.read_keys().iter())
+                        .map(TableRef::of)
+                        .chain(txn.scanned_tables().iter().map(|(tenant, database, table)| {
                             TableRef::new(tenant, database, table)
-                        }),
-                    );
+                        }))
+                        .chain(txn.constraint_scanned_tables().iter().map(
+                            |(tenant, database, table)| TableRef::new(tenant, database, table),
+                        ));
                 let mut tier = None;
                 for table in tables {
                     let current = if inner.replicated.contains(&table) {

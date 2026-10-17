@@ -4464,7 +4464,9 @@ impl Node {
                 participants.insert(range.id.clone(), range);
             }
         }
-        for (tenant, database, table) in txn.scanned_tables() {
+        for (tenant, database, table) in
+            txn.scanned_tables().iter().chain(txn.constraint_scanned_tables().iter())
+        {
             let Ok((prefix, end)) =
                 ryme_storage::table_routing_bounds(routing_version, tenant, database, table)
             else {
@@ -5880,6 +5882,7 @@ fn transactions_conflict(left: &ryme_txn::Transaction, right: &ryme_txn::Transac
             || right.read_keys().contains(key)
             || (right.isolation() == ryme_txn::Isolation::Serializable
                 && key_matches_scan(key, right.scanned_tables()))
+            || key_matches_scan(key, right.constraint_scanned_tables())
         {
             return true;
         }
@@ -5888,6 +5891,7 @@ fn transactions_conflict(left: &ryme_txn::Transaction, right: &ryme_txn::Transac
         if left.read_keys().contains(key)
             || (left.isolation() == ryme_txn::Isolation::Serializable
                 && key_matches_scan(key, left.scanned_tables()))
+            || key_matches_scan(key, left.constraint_scanned_tables())
         {
             return true;
         }
@@ -5946,7 +5950,8 @@ impl ryme_txn::TxnBackend for ClusterBackend {
             // successful write is immediately visible through a routed read.
             let establish_snapshot = txn.read_keys().is_empty()
                 && txn.writes().is_empty()
-                && txn.scanned_tables().is_empty();
+                && txn.scanned_tables().is_empty()
+                && txn.constraint_scanned_tables().is_empty();
             let read_ts = if establish_snapshot { 0 } else { txn.read_ts };
             let (value, _, observed_read_ts) =
                 node.fetch_range_value_with_ts(owner, key.clone(), read_ts).await?;
@@ -6038,6 +6043,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
         let routed = if !distributed
             && txn.read_keys().is_empty()
             && txn.scanned_tables().is_empty()
+            && txn.constraint_scanned_tables().is_empty()
             && !txn.writes().is_empty()
         {
             let owners = node.range_owners();
@@ -6186,6 +6192,61 @@ mod tests {
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ))
+    }
+
+    #[test]
+    fn constraint_scans_enlist_all_table_ranges_and_conflict_with_inserts() {
+        let dir = temp_dir("constraint-scan-ranges");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let (table_start, table_end) =
+            ryme_storage::table_routing_bounds(0, "t", "d", "docs").unwrap();
+        let mut split = table_start.clone();
+        split.push(0x80);
+        node.set_range_owners(vec![
+            RangeOwner {
+                id: String::from("range-a"),
+                start: table_start.clone(),
+                end: split.clone(),
+                routing_version: 0,
+                owner: 0,
+                replicas: vec![0],
+                epoch: 1,
+            },
+            RangeOwner {
+                id: String::from("range-b"),
+                start: split,
+                end: table_end,
+                routing_version: 0,
+                owner: 1,
+                replicas: vec![1],
+                epoch: 1,
+            },
+        ]);
+
+        let mut constraint_txn = node.manager.begin();
+        constraint_txn.record_constraint_scan("t", "d", "docs").unwrap();
+        node.manager.put(
+            &mut constraint_txn,
+            RecordKey::new("t", "d", "docs", b"row-a"),
+            b"unique-value".to_vec(),
+        );
+        assert_eq!(node.transaction_participant_ranges(&constraint_txn).len(), 2);
+
+        let manager = TxnManager::new();
+        let mut concurrent_insert = manager.begin();
+        manager.put(
+            &mut concurrent_insert,
+            RecordKey::new("t", "d", "docs", b"row-b"),
+            b"same-unique-value".to_vec(),
+        );
+        assert!(transactions_conflict(&constraint_txn, &concurrent_insert));
+        assert_eq!(
+            constraint_txn.state().constraint_scanned,
+            vec![(String::from("t"), String::from("d"), String::from("docs"))]
+        );
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -753,6 +753,10 @@ impl Transaction {
         &self.scanned
     }
 
+    pub fn constraint_scanned_tables(&self) -> &BTreeSet<(String, String, String)> {
+        &self.constraint_scanned
+    }
+
     pub fn scan_overlay_count(
         &self,
         tenant: &str,
