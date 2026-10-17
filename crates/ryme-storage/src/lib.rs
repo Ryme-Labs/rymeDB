@@ -31,6 +31,8 @@ pub const LEGACY_ROUTING_VERSION: u8 = 0;
 pub const SCOPED_ROUTING_VERSION: u8 = 1;
 pub const CURRENT_ROUTING_VERSION: u8 = SCOPED_ROUTING_VERSION;
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+const MIN_ORDERED_BATCH_READ: usize = 16;
+const MAX_ORDERED_BATCH_READ_GAP: usize = 64;
 
 pub fn validate_routing_version(version: u8) -> Result<()> {
     match version {
@@ -261,8 +263,70 @@ impl Engine {
         low.checked_sub(1)
     }
 
+    fn read_versions(versions: &VecDeque<Version>, read_ts: u64, now: u64) -> Option<Vec<u8>> {
+        let version = versions.get(Self::version_index_at(versions, read_ts)?)?;
+        if version.expires_at != 0 && version.expires_at <= now {
+            return None;
+        }
+        version.value.clone()
+    }
+
     pub fn read(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
         self.read_with_presence(key, read_ts, now).map(|(_, value)| value)
+    }
+
+    /// Reads a sorted, same-table batch with one ordered map walk when keys
+    /// are dense. Sparse or unsorted batches use point lookups instead.
+    pub fn read_many(
+        &self,
+        keys: &[RecordKey],
+        read_ts: u64,
+        now: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        if keys.len() < MIN_ORDERED_BATCH_READ {
+            return keys.iter().map(|key| self.read(key, read_ts, now)).collect();
+        }
+        let first = &keys[0];
+        let last = &keys[keys.len() - 1];
+        let same_table = keys.iter().all(|key| {
+            key.tenant == first.tenant && key.database == first.database && key.table == first.table
+        });
+        let sorted_unique = keys.windows(2).all(|pair| pair[0] < pair[1]);
+        if !same_table || !sorted_unique {
+            return keys.iter().map(|key| self.read(key, read_ts, now)).collect();
+        }
+
+        let mut entries =
+            self.inner.range((Bound::Included(first), Bound::Included(last))).peekable();
+        let mut values = Vec::with_capacity(keys.len());
+        let mut skipped_entries = 0usize;
+        for key in keys {
+            loop {
+                let Some((stored_key, versions)) = entries.peek().copied() else {
+                    values.push(None);
+                    break;
+                };
+                match stored_key.cmp(key) {
+                    std::cmp::Ordering::Less => {
+                        skipped_entries += 1;
+                        if skipped_entries > MAX_ORDERED_BATCH_READ_GAP {
+                            return keys.iter().map(|key| self.read(key, read_ts, now)).collect();
+                        }
+                        entries.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        values.push(Self::read_versions(versions, read_ts, now));
+                        entries.next();
+                        break;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        values.push(None);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(values)
     }
 
     pub fn scan(
@@ -998,6 +1062,44 @@ mod tests {
         engine.apply(key.clone(), 30, None).unwrap();
         assert_eq!(engine.read(&key, 30, 1000).unwrap(), None);
         assert_eq!(engine.read(&key, 25, 1000).unwrap(), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn ordered_batch_reads_match_point_reads_for_dense_and_sparse_keys() {
+        let mut engine = Engine::new();
+        for id in 0u64..100 {
+            let key = RecordKey::new("t", "d", "items", &id.to_be_bytes());
+            if id == 15 {
+                engine.apply_with_expiry(key, 1, Some(b"expiring".to_vec()), 50).unwrap();
+            } else {
+                engine.apply(key, 1, Some(id.to_be_bytes().to_vec())).unwrap();
+            }
+        }
+        engine
+            .apply(
+                RecordKey::new("t", "d", "items", &16u64.to_be_bytes()),
+                20,
+                Some(b"new-version".to_vec()),
+            )
+            .unwrap();
+        engine.apply(RecordKey::new("t", "d", "items", &17u64.to_be_bytes()), 20, None).unwrap();
+
+        let dense = (0u64..64)
+            .chain(101..117)
+            .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
+            .collect::<Vec<_>>();
+        let sparse = (0u64..16)
+            .chain(90..106)
+            .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
+            .collect::<Vec<_>>();
+
+        for (keys, read_ts, now) in
+            [(&dense[..], 10, 0), (&dense[..], 20, 50), (&sparse[..], 20, 0)]
+        {
+            let expected =
+                keys.iter().map(|key| engine.read(key, read_ts, now).unwrap()).collect::<Vec<_>>();
+            assert_eq!(engine.read_many(keys, read_ts, now).unwrap(), expected);
+        }
     }
 
     #[test]

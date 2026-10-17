@@ -1178,7 +1178,7 @@ impl TxnManager {
                 .engine
                 .read()
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-            return keys.iter().map(|key| engine.read(key, txn.read_ts, now)).collect();
+            return engine.read_many(keys, txn.read_ts, now);
         }
 
         let mut values = Vec::with_capacity(keys.len());
@@ -3396,6 +3396,37 @@ mod tests {
             b"value".to_vec(),
         );
         assert!(manager.commit(ignored_write).is_err());
+    }
+
+    #[test]
+    fn read_only_ordered_batch_reads_values_without_tracking_conflicts() {
+        let manager = TxnManager::new();
+        let mut seed = manager.begin();
+        for id in 0u64..32 {
+            manager.put(
+                &mut seed,
+                RecordKey::new("t", "d", "items", &id.to_be_bytes()),
+                id.to_be_bytes().to_vec(),
+            );
+        }
+        manager.commit(seed).unwrap();
+
+        let keys = (0u64..32)
+            .chain(40..56)
+            .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
+            .collect::<Vec<_>>();
+        let mut txn = manager.begin();
+        txn.set_read_only().unwrap();
+        let values = manager.get_many(&mut txn, &keys).unwrap();
+
+        assert_eq!(
+            values,
+            (0u64..32)
+                .map(|id| Some(id.to_be_bytes().to_vec()))
+                .chain((40..56).map(|_| None))
+                .collect::<Vec<_>>()
+        );
+        assert!(txn.read_keys().is_empty());
     }
 
     #[test]
