@@ -8,7 +8,7 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use ryme_archive::{Archiver, BackupManifest};
 use ryme_auth::{
     ApiKeyStore, CredentialStore, JwtVerifier, OidcConfig, PasskeyRegistry, PolicyEngine,
-    Principal, RefreshTokenRecord, RefreshTokenStore, Role, RsaJwk,
+    Principal, RefreshTokenRecord, RefreshTokenStore, Role, RsaJwk, MIN_HMAC_JWT_SECRET_BYTES,
 };
 use ryme_backup::Checkpoint;
 use ryme_config::{Config, OtelConfig};
@@ -13832,7 +13832,7 @@ fn hmac_jwt_verifier(
 }
 
 fn validate_hmac_jwt_secret(secret: &[u8]) -> ryme_error::Result<()> {
-    if secret.len() < 16 {
+    if secret.len() < MIN_HMAC_JWT_SECRET_BYTES {
         return Err(ryme_error::RymeError::InvalidArgument(String::from(
             "jwt secret must contain at least 16 bytes",
         )));

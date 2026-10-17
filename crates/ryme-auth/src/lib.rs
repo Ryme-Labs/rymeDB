@@ -502,6 +502,7 @@ pub struct JwtVerifier {
 const MAX_JWT_TOKEN_LEN: usize = 16 * 1024;
 const MAX_PRINCIPAL_ID_LEN: usize = 256;
 const MAX_TENANT_LEN: usize = 256;
+pub const MIN_HMAC_JWT_SECRET_BYTES: usize = 16;
 
 fn validate_tenant(tenant: &str) -> Result<()> {
     if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN {
@@ -563,12 +564,21 @@ impl JwtVerifier {
     /// Only enable this when the verifier accepts tokens from a trusted,
     /// operator-only issuer. Application-user JWTs should use the default.
     pub fn with_platform_admin_claims(mut self, enabled: bool) -> Result<Self> {
+        let weak_hmac_key = matches!(
+            &self.key,
+            JwtKey::Hmac(secret) if secret.len() < MIN_HMAC_JWT_SECRET_BYTES
+        );
+        if enabled && weak_hmac_key {
+            return Err(RymeError::InvalidArgument(String::from(
+                "jwt secret must contain at least 16 bytes",
+            )));
+        }
         if enabled
             && (self.issuer.as_deref().is_none_or(str::is_empty)
                 || self.audience.as_deref().is_none_or(str::is_empty))
         {
             return Err(RymeError::InvalidArgument(String::from(
-                "platform-admin JWT claims require an issuer and audience",
+                "platform-admin JWT claims require a strong key, issuer, and audience",
             )));
         }
         self.allow_platform_admin_claims = enabled;
@@ -600,6 +610,10 @@ impl JwtVerifier {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         if token.len() > MAX_JWT_TOKEN_LEN
+            || matches!(
+                &self.key,
+                JwtKey::Hmac(secret) if secret.len() < MIN_HMAC_JWT_SECRET_BYTES
+            )
             || self.issuer.as_deref().is_some_and(str::is_empty)
             || self.audience.as_deref().is_some_and(str::is_empty)
             || self.issuer.is_some() != self.audience.is_some()
@@ -1697,8 +1711,39 @@ mod tests {
 
     #[test]
     fn jwt_reject_bad_signature() {
-        let verifier = JwtVerifier::new(b"test-secret".to_vec());
+        let verifier = JwtVerifier::new(b"test-secret-2026-key".to_vec());
         assert!(verifier.principal_from_token("a.b.c", 1000).is_err());
+    }
+
+    #[test]
+    fn jwt_verifier_rejects_short_hmac_secrets() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = b"short-secret";
+        let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+        let payload = base64_url_encode(
+            serde_json::to_string(&serde_json::json!({
+                "sub": "ada",
+                "role": "authenticated",
+                "exp": 2000000000u64,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        let input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(input.as_bytes());
+        let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
+
+        assert!(JwtVerifier::new(secret.to_vec()).principal_from_token(&token, 1000).is_err());
+        assert!(JwtVerifier::with_issuer(
+            secret.to_vec(),
+            String::from("https://operator.example"),
+            String::from("rymedb-admin"),
+        )
+        .with_platform_admin_claims(true)
+        .is_err());
     }
 
     #[test]
@@ -1752,11 +1797,11 @@ mod tests {
             let header = base64_url_encode(br#"{"alg":"HS256"}"#);
             let payload = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
             let input = format!("{header}.{payload}");
-            let mut mac = Hmac::<Sha256>::new_from_slice(b"temporal-secret").unwrap();
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"temporal-secret-2026").unwrap();
             mac.update(input.as_bytes());
             format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
         };
-        let verifier = JwtVerifier::new(b"temporal-secret".to_vec());
+        let verifier = JwtVerifier::new(b"temporal-secret-2026".to_vec());
 
         assert!(verifier
             .principal_from_token(&token(serde_json::json!({ "sub": "ada" })), 0)
@@ -1817,11 +1862,11 @@ mod tests {
             let header = base64_url_encode(br#"{"alg":"HS256"}"#);
             let payload = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
             let input = format!("{header}.{payload}");
-            let mut mac = Hmac::<Sha256>::new_from_slice(b"subject-secret").unwrap();
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"subject-secret-2026").unwrap();
             mac.update(input.as_bytes());
             format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
         };
-        let verifier = JwtVerifier::new(b"subject-secret".to_vec());
+        let verifier = JwtVerifier::new(b"subject-secret-2026".to_vec());
 
         assert!(verifier
             .principal_from_token(&token(serde_json::json!({ "exp": 2000000000u64 })), 1000)
@@ -1843,11 +1888,11 @@ mod tests {
             let header = base64_url_encode(br#"{"alg":"HS256"}"#);
             let payload = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
             let input = format!("{header}.{payload}");
-            let mut mac = Hmac::<Sha256>::new_from_slice(b"size-secret").unwrap();
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"size-secret-key-2026").unwrap();
             mac.update(input.as_bytes());
             format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
         };
-        let verifier = JwtVerifier::new(b"size-secret".to_vec());
+        let verifier = JwtVerifier::new(b"size-secret-key-2026".to_vec());
 
         assert!(verifier.principal_from_token(&"x".repeat(MAX_JWT_TOKEN_LEN + 1), 1000).is_err());
         let default_tenant = verifier
@@ -1922,11 +1967,11 @@ mod tests {
                 .as_bytes(),
             );
             let input = format!("{header}.{payload}");
-            let mut mac = Hmac::<Sha256>::new_from_slice(b"temporal-secret").unwrap();
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"temporal-secret-2026").unwrap();
             mac.update(input.as_bytes());
             format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
         };
-        let verifier = JwtVerifier::new(b"temporal-secret".to_vec());
+        let verifier = JwtVerifier::new(b"temporal-secret-2026".to_vec());
         assert!(verifier.principal_from_token(&token("nbf", 1061), 1000).is_err());
         assert!(verifier.principal_from_token(&token("nbf", 1060), 1000).is_ok());
         assert!(verifier.principal_from_token(&token("iat", 1061), 1000).is_err());
@@ -1943,10 +1988,12 @@ mod tests {
         );
         let header = base64_url_encode(br#"{"alg":"RS256"}"#);
         let input = format!("{header}.{payload}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"algorithm-confusion-secret").unwrap();
         mac.update(input.as_bytes());
         let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
-        assert!(JwtVerifier::new(b"secret".to_vec()).principal_from_token(&token, 1000).is_err());
+        assert!(JwtVerifier::new(b"algorithm-confusion-secret".to_vec())
+            .principal_from_token(&token, 1000)
+            .is_err());
     }
 
     #[test]
@@ -1964,10 +2011,10 @@ mod tests {
             .as_bytes(),
         );
         let input = format!("{header}.{payload}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"role-secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"role-secret-key-2026").unwrap();
         mac.update(input.as_bytes());
         let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
-        let principal = JwtVerifier::new(b"role-secret".to_vec())
+        let principal = JwtVerifier::new(b"role-secret-key-2026".to_vec())
             .principal_from_token(&token, 1000)
             .unwrap();
         assert!(!principal.can_read());
@@ -2085,12 +2132,12 @@ mod tests {
         let header_b64 = base64_url_encode(br#"{"alg":"HS256"}"#);
         let payload_b64 = base64_url_encode(&payload_raw);
         let input = format!("{header_b64}.{payload_b64}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"issuer-secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"issuer-secret-key-2026").unwrap();
         mac.update(input.as_bytes());
         let sig_b64 = base64_url_encode(&mac.finalize().into_bytes());
         let token = format!("{input}.{sig_b64}");
         let strict = JwtVerifier::with_issuer(
-            b"issuer-secret".to_vec(),
+            b"issuer-secret-key-2026".to_vec(),
             String::from("https://auth.rymedb.test"),
             String::from("rymedb-app"),
         );
@@ -2098,12 +2145,12 @@ mod tests {
         assert_eq!(principal.id, "ada");
         assert!(principal.roles.contains(&Role::ReadOnly));
         let wrong_issuer = JwtVerifier::with_issuer(
-            b"issuer-secret".to_vec(),
+            b"issuer-secret-key-2026".to_vec(),
             String::from("https://other.test"),
             String::from("rymedb-app"),
         );
         assert!(wrong_issuer.principal_from_token(&token, 1000).is_err());
-        let open = JwtVerifier::new(b"issuer-secret".to_vec());
+        let open = JwtVerifier::new(b"issuer-secret-key-2026".to_vec());
         assert!(open.principal_from_token(&token, 1000).is_ok());
     }
 
@@ -2161,11 +2208,11 @@ mod tests {
         let header_b64 = base64_url_encode(br#"{"alg":"HS256"}"#);
         let payload_b64 = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
         let input = format!("{header_b64}.{payload_b64}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"supabase-secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"supabase-secret-key-2026").unwrap();
         mac.update(input.as_bytes());
         let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
 
-        let principal = JwtVerifier::new(b"supabase-secret".to_vec())
+        let principal = JwtVerifier::new(b"supabase-secret-key-2026".to_vec())
             .principal_from_token(&token, 1000)
             .unwrap();
         assert_eq!(principal.tenant, "project-a");
@@ -2203,7 +2250,7 @@ mod tests {
         OidcConfig {
             issuer: String::from("https://auth.rymedb.test"),
             audience: String::from("rymedb-app"),
-            client_secret: b"issuer-secret".to_vec(),
+            client_secret: b"issuer-secret-key-2026".to_vec(),
             auth_endpoint: String::from("https://auth.rymedb.test/authorize"),
             client_id: String::from("rymedb-app"),
             redirect_uris: vec![
@@ -2235,7 +2282,7 @@ mod tests {
         let header_b64 = base64_url_encode(br#"{"alg":"HS256"}"#);
         let payload_b64 = base64_url_encode(&payload_raw);
         let input = format!("{header_b64}.{payload_b64}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"issuer-secret").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"issuer-secret-key-2026").unwrap();
         mac.update(input.as_bytes());
         let sig_b64 = base64_url_encode(&mac.finalize().into_bytes());
         format!("{input}.{sig_b64}")
