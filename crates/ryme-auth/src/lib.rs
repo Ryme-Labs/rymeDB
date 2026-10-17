@@ -1061,6 +1061,8 @@ const ARGON2ID_TIME_COST: u32 = 2;
 const ARGON2ID_PARALLELISM: u32 = 1;
 const PASSWORD_HASH_LEN: usize = 32;
 const MAX_LEGACY_PASSWORD_ROUNDS: u32 = 1_000_000;
+const MAX_PASSWORD_SALT_BYTES: usize = 1024;
+const MAX_OTP_SECRET_BYTES: usize = 1024;
 pub const MAX_PASSWORD_LEN: usize = 256;
 pub const MAX_USER_LEN: usize = 256;
 pub const MAX_CHALLENGES: usize = 4096;
@@ -1108,6 +1110,9 @@ pub fn hash_password_with_salt(password: &str, salt: &[u8], rounds: u32) -> Pass
 }
 
 pub fn verify_password(password: &str, stored: &PasswordHash) -> bool {
+    if !valid_password_hash(stored) {
+        return false;
+    }
     let Ok(salt) = base64_url_decode(&stored.salt_b64) else {
         return false;
     };
@@ -1124,6 +1129,24 @@ pub fn verify_password(password: &str, stored: &PasswordHash) -> bool {
         hash_password_with_salt(password, &salt, stored.rounds).hash_b64
     };
     constant_time_equal(candidate.as_bytes(), stored.hash_b64.as_bytes())
+}
+
+fn valid_password_hash(stored: &PasswordHash) -> bool {
+    let Ok(salt) = base64_url_decode(&stored.salt_b64) else { return false };
+    let Ok(hash) = base64_url_decode(&stored.hash_b64) else { return false };
+    if hash.len() != PASSWORD_HASH_LEN
+        || base64_url_encode(&salt) != stored.salt_b64
+        || base64_url_encode(&hash) != stored.hash_b64
+    {
+        return false;
+    }
+    if stored.rounds == ARGON2ID_MARKER {
+        salt.len() == 16
+    } else {
+        (1..=MAX_LEGACY_PASSWORD_ROUNDS).contains(&stored.rounds)
+            && !salt.is_empty()
+            && salt.len() <= MAX_PASSWORD_SALT_BYTES
+    }
 }
 
 fn argon2id() -> argon2::Argon2<'static> {
@@ -1560,7 +1583,7 @@ impl CredentialStore {
     }
 
     pub fn set_otp_secret(&mut self, id: &str, secret: Vec<u8>) -> Result<()> {
-        if secret.len() < 16 {
+        if !(16..=MAX_OTP_SECRET_BYTES).contains(&secret.len()) {
             return Err(RymeError::InvalidArgument(String::from("otp secret")));
         }
         let user = self.users.get_mut(id).ok_or(RymeError::NotFound(String::from("user")))?;
@@ -1610,7 +1633,15 @@ impl CredentialStore {
             return Err(RymeError::Corrupt(String::from("user snapshot")));
         }
         if users.keys().any(|id| id.is_empty() || id.len() > MAX_USER_LEN)
-            || users.values().any(|user| validate_tenant(&user.tenant).is_err())
+            || users.values().any(|user| {
+                validate_tenant(&user.tenant).is_err()
+                    || user.password.as_ref().is_some_and(|hash| !valid_password_hash(hash))
+                    || user
+                        .otp_secret
+                        .as_ref()
+                        .is_some_and(|secret| !(16..=MAX_OTP_SECRET_BYTES).contains(&secret.len()))
+                    || (user.otp_secret.is_none() && user.otp_last_used_step.is_some())
+            })
         {
             return Err(RymeError::Corrupt(String::from("user snapshot")));
         }
@@ -1719,6 +1750,53 @@ mod tests {
         assert!(matches!(
             ApiKeyStore::new().restore_digest(String::from("not-a-digest"), principal, None),
             Err(RymeError::InvalidArgument(message)) if message == "api key digest"
+        ));
+    }
+
+    #[test]
+    fn credential_snapshots_reject_malformed_hashes_and_otp_secrets() {
+        let hash = PasswordHash {
+            salt_b64: base64_url_encode(&[0; 16]),
+            hash_b64: base64_url_encode(&[0; PASSWORD_HASH_LEN]),
+            rounds: ARGON2ID_MARKER,
+        };
+        let user = |password, otp_secret| StoredUser {
+            tenant: String::from("t"),
+            roles: HashSet::new(),
+            password,
+            otp_secret,
+            otp_last_used_step: None,
+        };
+        let invalid_rounds = PasswordHash { rounds: ARGON2ID_MARKER - 1, ..hash.clone() };
+        let oversized_salt = PasswordHash {
+            salt_b64: base64_url_encode(&vec![0; MAX_PASSWORD_SALT_BYTES + 1]),
+            ..hash.clone()
+        };
+        let invalid_hash = PasswordHash { hash_b64: String::from("malformed"), ..hash };
+
+        for malformed in [invalid_rounds, oversized_salt, invalid_hash] {
+            assert!(matches!(
+                CredentialStore::from_snapshot(HashMap::from([(
+                    String::from("u"),
+                    user(Some(malformed), None),
+                )])),
+                Err(RymeError::Corrupt(message)) if message == "user snapshot"
+            ));
+        }
+        assert!(matches!(
+            CredentialStore::from_snapshot(HashMap::from([(
+                String::from("u"),
+                user(None, Some(vec![0; MAX_OTP_SECRET_BYTES + 1])),
+            )])),
+            Err(RymeError::Corrupt(message)) if message == "user snapshot"
+        ));
+        assert!(!verify_password(
+            "password",
+            &PasswordHash {
+                salt_b64: base64_url_encode(&vec![0; MAX_PASSWORD_SALT_BYTES + 1]),
+                hash_b64: base64_url_encode(&[0; PASSWORD_HASH_LEN]),
+                rounds: MAX_LEGACY_PASSWORD_ROUNDS,
+            }
         ));
     }
 
