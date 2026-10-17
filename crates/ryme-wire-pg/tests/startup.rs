@@ -120,6 +120,14 @@ async fn password_authenticates_and_routes_the_session_tenant() {
         String::from("d"),
         manager.clone(),
     );
+    executor
+        .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
+        .await
+        .unwrap();
+    executor
+        .execute(ryme_sql::parse("GRANT SELECT, INSERT ON TABLE docs TO authenticated").unwrap())
+        .await
+        .unwrap();
     let gateway =
         ryme_wire_pg::PgGateway::with_executor(executor).with_authenticator(|user, password| {
             if user == "alice" && password == "secret" {
