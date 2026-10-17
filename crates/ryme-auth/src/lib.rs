@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -734,7 +734,57 @@ const MAX_REFRESH_SESSIONS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct RefreshTokenStore {
-    inner: Arc<RwLock<HashMap<String, RefreshTokenRecord>>>,
+    inner: Arc<RwLock<RefreshTokenState>>,
+}
+
+#[derive(Debug, Default)]
+struct RefreshTokenState {
+    sessions: HashMap<String, RefreshTokenRecord>,
+    expirations: BTreeMap<u64, HashSet<String>>,
+}
+
+impl RefreshTokenState {
+    fn insert(&mut self, digest: String, record: RefreshTokenRecord) {
+        let expires_at = record.expires_at;
+        if let Some(previous) = self.sessions.insert(digest.clone(), record) {
+            self.remove_expiration(previous.expires_at, &digest);
+        }
+        self.expirations.entry(expires_at).or_default().insert(digest);
+    }
+
+    fn remove(&mut self, digest: &str) -> Option<RefreshTokenRecord> {
+        let record = self.sessions.remove(digest)?;
+        self.remove_expiration(record.expires_at, digest);
+        Some(record)
+    }
+
+    fn remove_expiration(&mut self, expires_at: u64, digest: &str) {
+        if let Some(digests) = self.expirations.get_mut(&expires_at) {
+            digests.remove(digest);
+            if digests.is_empty() {
+                self.expirations.remove(&expires_at);
+            }
+        }
+    }
+
+    fn prune_expired(&mut self, now_secs: u64) {
+        while self
+            .expirations
+            .first_key_value()
+            .is_some_and(|(expires_at, _)| *expires_at <= now_secs)
+        {
+            let Some((expires_at, digests)) = self.expirations.pop_first() else { break };
+            for digest in digests {
+                if self
+                    .sessions
+                    .get(&digest)
+                    .is_some_and(|record| record.expires_at == expires_at)
+                {
+                    self.sessions.remove(&digest);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,20 +795,20 @@ pub struct RefreshTokenRecord {
 
 impl RefreshTokenStore {
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(HashMap::new())) }
+        Self { inner: Arc::new(RwLock::new(RefreshTokenState::default())) }
     }
 
     pub fn issue(&self, principal: Principal, now_secs: u64) -> Result<String> {
         principal.validate()?;
         let raw = base64_url_encode(&random_bytes(32));
         let digest = Self::digest(&raw);
-        let mut sessions =
+        let mut state =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        sessions.retain(|_, session| session.expires_at > now_secs);
-        if sessions.len() >= MAX_REFRESH_SESSIONS {
+        state.prune_expired(now_secs);
+        if state.sessions.len() >= MAX_REFRESH_SESSIONS {
             return Err(RymeError::Overload(String::from("refresh sessions")));
         }
-        sessions.insert(
+        state.insert(
             digest,
             RefreshTokenRecord {
                 principal,
@@ -780,18 +830,19 @@ impl RefreshTokenStore {
             return Err(RymeError::Unauthorized);
         }
         let digest = Self::digest(presented);
-        let mut sessions =
+        let mut state =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        let session = sessions.get(&digest).cloned().ok_or(RymeError::Unauthorized)?;
+        state.prune_expired(now_secs);
+        let session = state.sessions.get(&digest).cloned().ok_or(RymeError::Unauthorized)?;
         if session.expires_at <= now_secs {
-            sessions.remove(&digest);
+            state.remove(&digest);
             return Err(RymeError::Unauthorized);
         }
         let issued = issue(&session.principal)?;
         let raw = base64_url_encode(&random_bytes(32));
         let next_digest = Self::digest(&raw);
-        sessions.remove(&digest);
-        sessions.insert(
+        state.remove(&digest);
+        state.insert(
             next_digest,
             RefreshTokenRecord {
                 principal: session.principal.clone(),
@@ -818,17 +869,17 @@ impl RefreshTokenStore {
         }
         record.principal.validate()?;
         let digest = Self::digest(presented);
-        let mut sessions =
+        let mut state =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
-        if sessions.len() >= MAX_REFRESH_SESSIONS && !sessions.contains_key(&digest) {
+        if state.sessions.len() >= MAX_REFRESH_SESSIONS && !state.sessions.contains_key(&digest) {
             return Err(RymeError::Overload(String::from("refresh sessions")));
         }
-        sessions.insert(digest, record);
+        state.insert(digest, record);
         Ok(())
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().map(|sessions| sessions.len()).unwrap_or(0)
+        self.inner.read().map(|state| state.sessions.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -838,7 +889,7 @@ impl RefreshTokenStore {
     pub fn snapshot(&self) -> Result<HashMap<String, RefreshTokenRecord>> {
         self.inner
             .read()
-            .map(|sessions| sessions.clone())
+            .map(|state| state.sessions.clone())
             .map_err(|_| RymeError::Internal(String::from("auth lock")))
     }
 
@@ -849,7 +900,11 @@ impl RefreshTokenStore {
         if snapshot.values().any(|record| record.principal.validate().is_err()) {
             return Err(RymeError::Corrupt(String::from("refresh token principal")));
         }
-        Ok(Self { inner: Arc::new(RwLock::new(snapshot)) })
+        let mut state = RefreshTokenState::default();
+        for (digest, record) in snapshot {
+            state.insert(digest, record);
+        }
+        Ok(Self { inner: Arc::new(RwLock::new(state)) })
     }
 
     fn digest(token: &str) -> String {
@@ -1517,6 +1572,52 @@ mod tests {
                 RefreshTokenRecord { principal, expires_at: 200 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn refresh_token_expiry_index_tracks_issue_rotate_revoke_and_cleanup() {
+        let store = RefreshTokenStore::new();
+        let principal = Principal {
+            id: String::from("u"),
+            tenant: String::from("t"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        let first = store.issue(principal.clone(), 100).unwrap();
+        let first_expiry = 100 + REFRESH_TOKEN_TTL_SECS;
+        assert!(store.inner.read().unwrap().expirations.contains_key(&first_expiry));
+
+        let (_, rotated) = store.rotate(&first, 101).unwrap();
+        assert!(!store.inner.read().unwrap().expirations.contains_key(&first_expiry));
+        assert!(store
+            .inner
+            .read()
+            .unwrap()
+            .expirations
+            .contains_key(&(101 + REFRESH_TOKEN_TTL_SECS)));
+        assert!(store.revoke(&rotated));
+        assert!(store.inner.read().unwrap().expirations.is_empty());
+
+        store
+            .restore_record(
+                "expired-token",
+                RefreshTokenRecord { principal: principal.clone(), expires_at: 200 },
+            )
+            .unwrap();
+        store
+            .restore_record(
+                "live-token",
+                RefreshTokenRecord { principal: principal.clone(), expires_at: 500 },
+            )
+            .unwrap();
+        let restored = RefreshTokenStore::from_snapshot(store.snapshot().unwrap()).unwrap();
+        restored.issue(principal, 200).unwrap();
+        assert!(restored
+            .snapshot()
+            .unwrap()
+            .get(&RefreshTokenStore::digest("expired-token"))
+            .is_none());
+        assert!(restored.inner.read().unwrap().expirations.contains_key(&500));
+        assert_eq!(restored.len(), 2);
     }
 
     #[test]
