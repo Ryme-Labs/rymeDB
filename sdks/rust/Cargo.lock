@@ -787,7 +787,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rymedb-client"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "futures-util",
  "percent-encoding",

@@ -1,6 +1,6 @@
 {
   "name": "@rymelabs/rymedb",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "type": "module",
   "description": "Typed npm client for the rymeDB HTTP and realtime APIs",
   "license": "Apache-2.0",
