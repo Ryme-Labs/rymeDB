@@ -24,12 +24,18 @@ const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_RAFT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
-const RPC_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RPC_READ_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RPC_WRITE_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RPC_FRAME_BUDGET_UNIT_BYTES: usize = 16 * 1024;
 const RPC_FRAME_DECODE_WEIGHT: usize = 4;
-const RPC_FRAME_BUDGET_PERMITS: usize = RPC_FRAME_BUDGET_BYTES / RPC_FRAME_BUDGET_UNIT_BYTES;
-static RPC_FRAME_BUDGET: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(RPC_FRAME_BUDGET_PERMITS));
+const RPC_READ_FRAME_BUDGET_PERMITS: usize =
+    RPC_READ_FRAME_BUDGET_BYTES / RPC_FRAME_BUDGET_UNIT_BYTES;
+const RPC_WRITE_FRAME_BUDGET_PERMITS: usize =
+    RPC_WRITE_FRAME_BUDGET_BYTES / RPC_FRAME_BUDGET_UNIT_BYTES;
+static RPC_READ_FRAME_BUDGET: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(RPC_READ_FRAME_BUDGET_PERMITS));
+static RPC_WRITE_FRAME_BUDGET: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(RPC_WRITE_FRAME_BUDGET_PERMITS));
 
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
 
@@ -39,6 +45,11 @@ struct RpcFrameBuffer<'a> {
     exhausted_budget: bool,
     budget: &'a Semaphore,
     permits: Vec<tokio::sync::SemaphorePermit<'a>>,
+}
+
+struct BudgetedRpc<'a> {
+    rpc: Rpc,
+    _permit: tokio::sync::SemaphorePermit<'a>,
 }
 
 impl<'a> RpcFrameBuffer<'a> {
@@ -580,7 +591,7 @@ async fn write_frame<S>(socket: &mut S, rpc: &Rpc) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    let mut frame = RpcFrameBuffer::new(&RPC_FRAME_BUDGET);
+    let mut frame = RpcFrameBuffer::new(&RPC_WRITE_FRAME_BUDGET);
     if let Err(error) = serde_json::to_writer(&mut frame, rpc) {
         if frame.exceeded_limit {
             return Err(RymeError::Overload(String::from("rpc frame")));
@@ -606,10 +617,14 @@ async fn read_frame<S>(socket: &mut S) -> Result<Rpc>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    read_frame_with_budget(socket, &RPC_FRAME_BUDGET).await
+    let frame = read_frame_with_budget(socket, &RPC_READ_FRAME_BUDGET).await?;
+    Ok(frame.rpc)
 }
 
-async fn read_frame_with_budget<S>(socket: &mut S, budget: &Semaphore) -> Result<Rpc>
+async fn read_frame_with_budget<'a, S>(
+    socket: &mut S,
+    budget: &'a Semaphore,
+) -> Result<BudgetedRpc<'a>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -621,13 +636,15 @@ where
     }
     let permits =
         length.div_ceil(RPC_FRAME_BUDGET_UNIT_BYTES).saturating_mul(RPC_FRAME_DECODE_WEIGHT);
-    let _budget = budget
+    let permit = budget
         .acquire_many(permits as u32)
         .await
         .map_err(|_| RymeError::Unavailable(String::from("rpc frame budget")))?;
     let mut body = vec![0u8; length];
     socket.read_exact(&mut body).await.map_err(|e| RymeError::Io(e.to_string()))?;
-    serde_json::from_slice(&body).map_err(|_| RymeError::Corrupt(String::from("rpc decode")))
+    let rpc = serde_json::from_slice(&body)
+        .map_err(|_| RymeError::Corrupt(String::from("rpc decode")))?;
+    Ok(BudgetedRpc { rpc, _permit: permit })
 }
 
 #[derive(Debug)]
@@ -2479,12 +2496,18 @@ impl Node {
             if self.isolated.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(());
             }
-            let rpc =
-                match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut socket)).await {
-                    Ok(Ok(rpc)) => rpc,
-                    _ => return Ok(()),
-                };
+            let request = match tokio::time::timeout(
+                Duration::from_secs(5),
+                read_frame_with_budget(&mut socket, &RPC_READ_FRAME_BUDGET),
+            )
+            .await
+            {
+                Ok(Ok(request)) => request,
+                _ => return Ok(()),
+            };
+            let BudgetedRpc { rpc, _permit } = request;
             let response = self.handle_rpc(rpc).await?;
+            drop(_permit);
             if tokio::time::timeout(Duration::from_secs(5), write_frame(&mut socket, &response))
                 .await
                 .is_err()
@@ -6277,7 +6300,7 @@ mod tests {
     #[test]
     fn rpc_frame_writer_stops_at_the_serialized_size_limit() {
         let rpc = Rpc::Realtime { payload: vec![u8::MAX; 5 * 1024 * 1024] };
-        let budget = Semaphore::new(RPC_FRAME_BUDGET_PERMITS);
+        let budget = Semaphore::new(RPC_WRITE_FRAME_BUDGET_PERMITS);
         let mut frame = RpcFrameBuffer::new(&budget);
         assert!(serde_json::to_writer(&mut frame, &rpc).is_err());
         assert!(frame.exceeded_limit);
@@ -6311,6 +6334,26 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_frame_reader_holds_budget_until_decoded_request_is_dropped() {
+        let rpc = Rpc::Realtime { payload: vec![42; 64 * 1024] };
+        let body = serde_json::to_vec(&rpc).unwrap();
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        let (mut sender, mut receiver) = tokio::io::duplex(frame.len());
+        sender.write_all(&frame).await.unwrap();
+
+        let permits = body.len().div_ceil(RPC_FRAME_BUDGET_UNIT_BYTES) * RPC_FRAME_DECODE_WEIGHT;
+        let budget = Semaphore::new(permits);
+        let request = read_frame_with_budget(&mut receiver, &budget).await.unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        assert!(matches!(&request.rpc, Rpc::Realtime { payload } if payload.len() == 64 * 1024));
+
+        drop(request);
+        assert_eq!(budget.available_permits(), permits);
     }
 
     fn temp_dir(label: &str) -> PathBuf {
