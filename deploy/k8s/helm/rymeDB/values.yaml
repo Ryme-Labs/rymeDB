@@ -11,6 +11,7 @@ service:
 apiKeySecret:
   name: rymedb-api-key
   key: api-key
+publicApiKey: ""
 raftTls:
   enabled: true
   secretName: ""

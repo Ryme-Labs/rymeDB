@@ -32,6 +32,10 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKeySecret.name }}
                   key: {{ .Values.apiKeySecret.key }}
+            {{ with .Values.publicApiKey }}
+            - name: RYME_PUBLIC_API_KEY
+              value: {{ . | quote }}
+            {{ end }}
           ports:
             - name: pg
               containerPort: {{ .Values.service.pg }}

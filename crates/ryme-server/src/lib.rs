@@ -2075,6 +2075,7 @@ impl SharedState {
     pub fn build(config: &Config) -> ryme_error::Result<Self> {
         config.validate()?;
         let configured_api_key = std::env::var("RYME_API_KEY").ok();
+        let configured_public_api_key = std::env::var("RYME_PUBLIC_API_KEY").ok();
         let configured_pg_password = std::env::var("RYME_PG_PASSWORD").ok();
         let configured_resp_password = std::env::var("RYME_RESP_PASSWORD").ok();
         validate_listener_auth(
@@ -2369,6 +2370,9 @@ impl SharedState {
                 api_key,
                 Principal { id: String::from("dev"), tenant: tenant.clone(), roles },
             )?;
+        }
+        if let Some(api_key) = configured_public_api_key {
+            install_public_api_key(&keys, api_key, &tenant)?;
         }
         let credentials = CredentialStore::from_snapshot(auth_snapshot.users)?;
         let refresh_tokens = RefreshTokenStore::from_snapshot(auth_snapshot.refresh_tokens)?;
@@ -6375,6 +6379,29 @@ fn expire_legacy_api_keys(
     for digest in api_keys.keys() {
         expirations.entry(digest.clone()).or_insert(now_secs);
     }
+}
+
+fn install_public_api_key(
+    keys: &ApiKeyStore,
+    api_key: String,
+    tenant: &str,
+) -> ryme_error::Result<()> {
+    if api_key.trim().is_empty() {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "RYME_PUBLIC_API_KEY must not be empty",
+        )));
+    }
+    if keys.authenticate(&api_key).is_ok() {
+        return Err(ryme_error::RymeError::Conflict(String::from(
+            "RYME_PUBLIC_API_KEY conflicts with an existing API key",
+        )));
+    }
+    let principal = Principal {
+        id: String::from("public"),
+        tenant: tenant.to_string(),
+        roles: [Role::ReadOnly].into_iter().collect(),
+    };
+    keys.insert(api_key, principal)
 }
 
 fn issue_api_key(
@@ -15116,6 +15143,40 @@ mod realtime_policy_tests {
             Err(ryme_error::RymeError::InvalidArgument(message))
                 if message.contains("RYME_RESP_PASSWORD")
         ));
+    }
+
+    #[test]
+    fn public_api_key_is_read_only_and_cannot_replace_existing_keys() {
+        let keys = ApiKeyStore::new();
+        let mut admin_roles = HashSet::new();
+        admin_roles.insert(Role::Superuser);
+        keys.insert(
+            String::from("shared-key"),
+            Principal {
+                id: String::from("operator"),
+                tenant: String::from("default"),
+                roles: admin_roles,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            install_public_api_key(&keys, String::from("shared-key"), "default"),
+            Err(ryme_error::RymeError::Conflict(_))
+        ));
+        assert!(keys.authenticate("shared-key").unwrap().can_platform_admin());
+        assert!(matches!(
+            install_public_api_key(&keys, String::from("  "), "default"),
+            Err(ryme_error::RymeError::InvalidArgument(_))
+        ));
+
+        install_public_api_key(&keys, String::from("ryme-public-example"), "default").unwrap();
+        let public = keys.authenticate("ryme-public-example").unwrap();
+        assert!(public.can_read());
+        assert!(!public.can_write());
+        assert!(!public.can_admin());
+        assert_eq!(public.sql_role(), "anon");
+        assert_eq!(public.tenant, "default");
     }
 
     #[test]

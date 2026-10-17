@@ -9,6 +9,7 @@ model supplies a tenant, roles, and capabilities across all gateways.
 | Credential | Configure with | Use |
 | --- | --- | --- |
 | Development API key | `RYME_API_KEY` | Bearer header, `x-api-key`, or WebSocket `api_key` query parameter |
+| Public project key | `RYME_PUBLIC_API_KEY` | Bearer header or `x-api-key`; intentionally public and limited to SQL `anon` / read-only |
 | PostgreSQL password | `RYME_PG_PASSWORD` | Cleartext startup password; unset means local trust mode |
 | RESP password | `RYME_RESP_PASSWORD` | `AUTH` command; unset means local trust mode |
 | HMAC JWT | `RYME_JWT_SECRET` | HS256 bearer tokens |
@@ -56,6 +57,16 @@ or extract it from the shipped files. Supabase's public `anon` key works on
 this same principle; the key is not what protects rows. Do not expose
 `RYME_API_KEY`, a platform `superuser` key, or any other broad operator
 credential in a browser.
+
+For intentionally public browser access, configure `RYME_PUBLIC_API_KEY` and
+ship that value as a project identifier. RymeDB maps it only to the read-only
+SQL `anon` role; it cannot write or administer the platform. Access still
+depends on SQL grants and RLS: grant only the required table privileges, and
+enable RLS with explicit policies for tables that contain user-scoped data.
+With RLS enabled and no matching policy, access is denied. A table granted to
+`PUBLIC` or `anon` without RLS can still be read by anyone holding the public
+key, so treat those grants as deliberate public exposure. The public key is
+not user authentication and must never be treated as a secret.
 
 For a browser-to-database app, use a short-lived user credential and enforce
 access in RymeDB with tenant restrictions or row-level security (RLS). One

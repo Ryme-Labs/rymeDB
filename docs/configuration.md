@@ -84,6 +84,14 @@ must contain at least 16 bytes; loopback-only development listeners retain
 their local trust/development behavior.
 :::
 
+`RYME_PUBLIC_API_KEY` is an optional, intentionally public HTTP credential for
+browser applications. It maps only to the read-only SQL `anon` role and does
+not replace `RYME_API_KEY` for operator access or satisfy the external-listener
+requirement. Its effective access is controlled by SQL grants and RLS policies;
+see [authentication and RLS](auth.md#browser-applications). The Helm chart
+accepts this public value through `publicApiKey`; keep the operator credential
+in the chart's separate `apiKeySecret`.
+
 ## Cluster
 
 ```json

@@ -37,6 +37,21 @@ console.log(await db.ready());
 `kvGet` returns raw text; parse JSON explicitly when your application stores
 JSON. Errors expose HTTP status and response body.
 
+In a browser app, pass the public project key explicitly, for example with a
+framework-exposed variable such as `NEXT_PUBLIC_RYME_PUBLIC_API_KEY`:
+
+```ts
+const db = new RymeHttpClient({
+  base: process.env.NEXT_PUBLIC_RYME_URL!,
+  apiKey: process.env.NEXT_PUBLIC_RYME_PUBLIC_API_KEY!,
+});
+```
+
+That value is intentionally visible to every visitor and is limited to the
+read-only SQL `anon` role. Use a user access token for authenticated operations,
+and enforce row access with SQL grants and RLS; never put `RYME_API_KEY` in
+browser code. See [authentication and RLS](auth.md#browser-applications).
+
 ## Realtime
 
 ```ts
