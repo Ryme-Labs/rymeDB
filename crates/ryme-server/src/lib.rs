@@ -640,6 +640,7 @@ impl AuditLog {
 }
 
 const AUTH_ATTEMPT_WINDOW_SECS: u64 = 60;
+const AUTH_ATTEMPT_SWEEP_SECS: u64 = 10;
 const AUTH_ATTEMPTS_PER_IDENTITY: u32 = 5;
 const AUTH_ATTEMPTS_PER_CLIENT: u32 = 120;
 const AUTH_LIMITER_MAX_IDENTITIES: usize = 8192;
@@ -658,6 +659,7 @@ struct AuthAttemptWindow {
 struct AuthAttemptLimiter {
     clients: HashMap<std::net::IpAddr, AuthAttemptWindow>,
     identities: HashMap<String, AuthAttemptWindow>,
+    last_pruned_at: u64,
 }
 
 impl AuthAttemptLimiter {
@@ -667,15 +669,23 @@ impl AuthAttemptLimiter {
         identity: &str,
         now: u64,
     ) -> ryme_error::Result<()> {
-        Self::evict_oldest_if_full(&mut self.clients, AUTH_LIMITER_MAX_IDENTITIES, &client_ip);
+        self.prune_expired_if_due(now);
+        if !self.clients.contains_key(&client_ip)
+            && self.clients.len() >= AUTH_LIMITER_MAX_IDENTITIES
+        {
+            return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
+        }
+        let identity = Self::identity_key(client_ip, identity);
+        if !self.identities.contains_key(&identity)
+            && self.identities.len() >= AUTH_LIMITER_MAX_IDENTITIES
+        {
+            return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
+        }
         let client = self.clients.entry(client_ip).or_default();
         Self::reset_if_expired(client, now);
         if client.attempts >= AUTH_ATTEMPTS_PER_CLIENT {
             return Err(ryme_error::RymeError::Overload(String::from("auth rate limit")));
         }
-
-        let identity = Self::identity_key(client_ip, identity);
-        Self::evict_oldest_if_full(&mut self.identities, AUTH_LIMITER_MAX_IDENTITIES, &identity);
         let window = self.identities.entry(identity).or_default();
         Self::reset_if_expired(window, now);
         if window.attempts >= AUTH_ATTEMPTS_PER_IDENTITY {
@@ -699,19 +709,19 @@ impl AuthAttemptLimiter {
         ryme_auth::base64_url_encode(&digest.finalize())
     }
 
-    fn evict_oldest_if_full<K: std::hash::Hash + Eq + Clone>(
-        map: &mut HashMap<K, AuthAttemptWindow>,
-        limit: usize,
-        key: &K,
-    ) {
-        if map.contains_key(key) || map.len() < limit {
+    fn prune_expired_if_due(&mut self, now: u64) {
+        if now >= self.last_pruned_at
+            && now.saturating_sub(self.last_pruned_at) < AUTH_ATTEMPT_SWEEP_SECS
+        {
             return;
         }
-        if let Some(oldest) =
-            map.iter().min_by_key(|(_, window)| window.started_at).map(|(key, _)| key.clone())
-        {
-            map.remove(&oldest);
-        }
+        let is_expired = |window: &AuthAttemptWindow| {
+            now < window.started_at
+                || now.saturating_sub(window.started_at) >= AUTH_ATTEMPT_WINDOW_SECS
+        };
+        self.clients.retain(|_, window| !is_expired(window));
+        self.identities.retain(|_, window| !is_expired(window));
+        self.last_pruned_at = now;
     }
 
     fn reset_if_expired(window: &mut AuthAttemptWindow, now: u64) {
@@ -924,6 +934,31 @@ mod auth_attempt_limiter_tests {
         assert!(limiter.admit(client, &identity, 100).is_ok());
         assert_eq!(limiter.identities.len(), 1);
         assert_eq!(limiter.identities.keys().next().map(String::len), Some(43));
+    }
+
+    #[test]
+    fn full_limiter_rejects_new_identities_until_expired_windows_are_pruned() {
+        let mut limiter = AuthAttemptLimiter::default();
+        let first_client = std::net::IpAddr::V4(std::net::Ipv4Addr::from(1u32));
+        for index in 0..AUTH_LIMITER_MAX_IDENTITIES {
+            let client = std::net::IpAddr::V4(std::net::Ipv4Addr::from(index as u32 + 1));
+            assert!(limiter.admit(client, "password:ada", 100).is_ok());
+        }
+        assert_eq!(limiter.clients.len(), AUTH_LIMITER_MAX_IDENTITIES);
+        assert_eq!(limiter.identities.len(), AUTH_LIMITER_MAX_IDENTITIES);
+
+        let new_client = std::net::IpAddr::V4(std::net::Ipv4Addr::from(20_000u32));
+        assert!(limiter.admit(new_client, "password:grace", 101).is_err());
+        for _ in 1..AUTH_ATTEMPTS_PER_IDENTITY {
+            assert!(limiter.admit(first_client, "password:ada", 101).is_ok());
+        }
+        assert!(limiter.admit(first_client, "password:ada", 101).is_err());
+
+        assert!(limiter
+            .admit(new_client, "password:grace", 100 + AUTH_ATTEMPT_WINDOW_SECS)
+            .is_ok());
+        assert_eq!(limiter.clients.len(), 1);
+        assert_eq!(limiter.identities.len(), 1);
     }
 
     #[test]
