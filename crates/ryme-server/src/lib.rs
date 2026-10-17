@@ -860,11 +860,12 @@ fn auth_attempt_key(scope: &str, credential: &str) -> String {
 #[derive(Debug, Default)]
 struct OidcStateStore {
     pending: HashMap<String, OidcPendingState>,
+    expirations: BTreeSet<(u64, String)>,
 }
 
 #[derive(Debug)]
 struct OidcPendingState {
-    issued_at: u64,
+    expires_at: Option<u64>,
     nonce: String,
 }
 
@@ -881,7 +882,17 @@ impl OidcStateStore {
         if self.pending.len() >= OIDC_STATE_MAX_PENDING {
             return Err(ryme_error::RymeError::Overload(String::from("oidc state capacity")));
         }
-        self.pending.insert(state, OidcPendingState { issued_at: now, nonce });
+        let expires_at = now.checked_add(OIDC_STATE_TTL_SECS);
+        if let Some(previous) =
+            self.pending.insert(state.clone(), OidcPendingState { expires_at, nonce })
+        {
+            if let Some(expires_at) = previous.expires_at {
+                self.expirations.remove(&(expires_at, state.clone()));
+            }
+        }
+        if let Some(expires_at) = expires_at {
+            self.expirations.insert((expires_at, state));
+        }
         Ok(())
     }
 
@@ -892,13 +903,24 @@ impl OidcStateStore {
 
     fn consume(&mut self, state: &str, now: u64) -> ryme_error::Result<()> {
         self.prune(now);
-        self.pending.remove(state).map(|_| ()).ok_or(ryme_error::RymeError::Unauthorized)
+        let pending = self.pending.remove(state).ok_or(ryme_error::RymeError::Unauthorized)?;
+        if let Some(expires_at) = pending.expires_at {
+            self.expirations.remove(&(expires_at, state.to_string()));
+        }
+        Ok(())
     }
 
     fn prune(&mut self, now: u64) {
-        self.pending.retain(|_, pending| {
-            now.saturating_sub(pending.issued_at) < OIDC_STATE_TTL_SECS
-        });
+        while self.expirations.first().is_some_and(|(expires_at, _)| *expires_at <= now) {
+            let Some((expires_at, state)) = self.expirations.pop_first() else { break };
+            if self
+                .pending
+                .get(&state)
+                .is_some_and(|pending| pending.expires_at == Some(expires_at))
+            {
+                self.pending.remove(&state);
+            }
+        }
     }
 }
 
@@ -1068,10 +1090,28 @@ mod oidc_state_tests {
         assert_eq!(states.nonce_for("state", 100).as_deref(), Some("nonce"));
         states.consume("state", 100).unwrap();
         assert!(states.nonce_for("state", 100).is_none());
+        assert!(states.expirations.is_empty());
 
         states.issue(String::from("expired"), String::from("nonce"), 100).unwrap();
         assert!(states.nonce_for("expired", 100 + OIDC_STATE_TTL_SECS).is_none());
         assert!(states.consume("expired", 100 + OIDC_STATE_TTL_SECS).is_err());
+    }
+
+    #[test]
+    fn oidc_state_expiry_index_handles_replacement_and_due_entries() {
+        let mut states = OidcStateStore::default();
+        states.issue(String::from("same"), String::from("old"), 100).unwrap();
+        states.issue(String::from("same"), String::from("new"), 200).unwrap();
+        states.issue(String::from("later"), String::from("nonce"), 300).unwrap();
+
+        assert_eq!(states.expirations.len(), 2);
+        assert_eq!(states.nonce_for("same", 700).as_deref(), Some("new"));
+        assert!(states.nonce_for("same", 800).is_none());
+        assert!(!states.pending.contains_key("same"));
+        assert_eq!(states.nonce_for("later", 899).as_deref(), Some("nonce"));
+
+        states.issue(String::from("long-lived"), String::from("nonce"), u64::MAX).unwrap();
+        assert_eq!(states.nonce_for("long-lived", u64::MAX).as_deref(), Some("nonce"));
     }
 
     #[test]
