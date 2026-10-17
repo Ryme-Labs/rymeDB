@@ -128,7 +128,9 @@ export RYME_JWT_JWK_KID=current
 
 Use either a secret or a JWKS source. Configure issuer and audience together.
 JWKS URLs must use HTTPS; loopback HTTP is accepted only for local development
-and test fixtures.
+and test fixtures. JWKS RSA keys must support `RS256`; declared `use` and
+`key_ops` values must allow signature verification, and duplicate key IDs are
+rejected.
 HMAC JWT secrets must contain at least 16 bytes; the verifier rejects shorter
 keys. Production deployments should use a randomly generated secret of
 substantially greater length. If only one

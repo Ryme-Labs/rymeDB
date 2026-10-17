@@ -14026,6 +14026,48 @@ mod jwt_config_tests {
         let oversized_modulus = serde_json::to_vec(&oversized_modulus).unwrap();
         assert!(load_jwks_verifier_bytes(&oversized_modulus, None, None, None).is_err());
     }
+
+    #[test]
+    fn jwks_loader_only_selects_unambiguous_signature_keys() {
+        let modulus = ryme_auth::base64_url_encode(&vec![0xA5; MIN_RSA_MODULUS_BYTES]);
+        let rsa_key = |kid: &str| {
+            serde_json::json!({
+                "kty": "RSA",
+                "kid": kid,
+                "alg": "RS256",
+                "n": modulus.clone(),
+                "e": "AQAB"
+            })
+        };
+        let load = |keys: Vec<serde_json::Value>| {
+            let document = serde_json::to_vec(&serde_json::json!({ "keys": keys })).unwrap();
+            load_jwks_verifier_bytes(&document, None, None, None)
+        };
+
+        let mut encryption_key = rsa_key("encryption");
+        encryption_key["use"] = serde_json::json!("enc");
+        assert!(load(vec![encryption_key]).is_err());
+
+        let mut signing_key = rsa_key("signing");
+        signing_key["use"] = serde_json::json!("sig");
+        signing_key["key_ops"] = serde_json::json!(["verify"]);
+        assert!(load(vec![signing_key.clone()]).is_ok());
+
+        signing_key["key_ops"] = serde_json::json!(["encrypt"]);
+        assert!(load(vec![signing_key]).is_err());
+
+        let mut malformed_key_ops = rsa_key("malformed-ops");
+        malformed_key_ops["key_ops"] = serde_json::json!(["verify", 1]);
+        assert!(load(vec![malformed_key_ops]).is_err());
+
+        let mut malformed_kid = rsa_key("malformed-kid");
+        malformed_kid["kid"] = serde_json::json!(42);
+        assert!(load(vec![malformed_kid]).is_err());
+
+        let first = rsa_key("duplicate");
+        let second = rsa_key("duplicate");
+        assert!(load(vec![first, second]).is_err());
+    }
 }
 
 fn load_jwks_verifier_url(
@@ -14118,10 +14160,20 @@ fn load_jwks_verifier_bytes(
         .iter()
         .filter(|key| key.get("kty").and_then(|value| value.as_str()) == Some("RSA"))
         .filter(|key| {
-            key.get("alg")
-                .and_then(|value| value.as_str())
-                .map(|algorithm| algorithm == "RS256")
-                .unwrap_or(true)
+            key.get("alg").is_none_or(|value| value.as_str() == Some("RS256"))
+        })
+        .filter(|key| {
+            key.get("use").is_none_or(|value| value.as_str() == Some("sig"))
+        })
+        .filter(|key| {
+            key.get("key_ops").is_none_or(|value| {
+                value.as_array().is_some_and(|operations| {
+                    operations.iter().all(|operation| operation.as_str().is_some())
+                        && operations
+                            .iter()
+                            .any(|operation| operation.as_str() == Some("verify"))
+                })
+            })
         })
         .filter(|key| {
             requested_kid
@@ -14130,10 +14182,17 @@ fn load_jwks_verifier_bytes(
                 .unwrap_or(true)
         })
         .map(|key| {
-            let kid = key.get("kid").and_then(|value| value.as_str()).map(String::from);
-            if kid.as_ref().is_some_and(|kid| kid.len() > MAX_JWK_KID_BYTES) {
-                return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks kid")));
-            }
+            let kid = match key.get("kid") {
+                None => None,
+                Some(serde_json::Value::String(kid))
+                    if !kid.is_empty() && kid.len() <= MAX_JWK_KID_BYTES =>
+                {
+                    Some(kid.clone())
+                }
+                Some(_) => {
+                    return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks kid")));
+                }
+            };
             let modulus = key
                 .get("n")
                 .and_then(|value| value.as_str())
@@ -14163,6 +14222,14 @@ fn load_jwks_verifier_bytes(
         .collect::<ryme_error::Result<Vec<_>>>()?;
     if selected_keys.is_empty() {
         return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks rsa key")));
+    }
+    let mut key_ids = std::collections::HashSet::new();
+    for key in &selected_keys {
+        if let Some(kid) = key.kid.as_deref() {
+            if kid.is_empty() || !key_ids.insert(kid) {
+                return Err(ryme_error::RymeError::Corrupt(String::from("jwt jwks kid")));
+            }
+        }
     }
     validate_jwt_claim_configuration(issuer.as_deref(), audience.as_deref(), true, "jwt")?;
     let verifier = match (issuer, audience) {
