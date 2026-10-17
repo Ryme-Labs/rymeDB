@@ -16,11 +16,14 @@ pub const MAX_TEXT_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMS_PER_DOCUMENT: usize = 65_536;
 /// Conservative accounting budget for retained full-text index structures.
 pub const MAX_TEXT_INDEX_BYTES: usize = 128 * 1024 * 1024;
+/// Conservative accounting budget for retained HNSW vector index structures.
+pub const MAX_VECTOR_INDEX_BYTES: usize = 256 * 1024 * 1024;
 pub const HNSW_M: usize = 16;
 pub const HNSW_EF_BUILD: usize = 64;
 const HNSW_HIGH_DIM_M: usize = 32;
 const HNSW_HIGH_DIM_THRESHOLD: usize = 64;
 const HNSW_EXACT_FALLBACK_MAX: usize = HNSW_M * HNSW_EF_BUILD * 2;
+const HNSW_NODE_OVERHEAD_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorHit {
@@ -102,18 +105,57 @@ struct VectorSpace {
     ann: HnswIndex,
 }
 
-fn normalize(vector: &[f32]) -> Result<Vec<f32>> {
+fn vector_norm(vector: &[f32]) -> Result<f64> {
     if vector.is_empty() || vector.len() > MAX_DIM {
         return Err(RymeError::InvalidArgument(String::from("vector dim")));
     }
-    if vector.iter().any(|value| !value.is_finite()) {
-        return Err(RymeError::InvalidArgument(String::from("non-finite vector value")));
+    let mut norm_squared = 0.0;
+    for value in vector {
+        if !value.is_finite() {
+            return Err(RymeError::InvalidArgument(String::from("non-finite vector value")));
+        }
+        norm_squared += (*value as f64) * (*value as f64);
     }
-    let norm = (vector.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()).sqrt();
+    let norm = norm_squared.sqrt();
     if norm == 0.0 {
         return Err(RymeError::InvalidArgument(String::from("zero vector")));
     }
+    Ok(norm)
+}
+
+fn normalize(vector: &[f32]) -> Result<Vec<f32>> {
+    let norm = vector_norm(vector)?;
     Ok(vector.iter().map(|value| (*value as f64 / norm) as f32).collect())
+}
+
+fn estimate_vector_node_bytes(id_bytes: usize, dimension: usize) -> usize {
+    HNSW_NODE_OVERHEAD_BYTES
+        .saturating_add(dimension.saturating_mul(std::mem::size_of::<f32>()))
+        .saturating_add(id_bytes.saturating_mul(2))
+}
+
+fn estimate_vector_id_map_bytes(id_bytes: usize) -> usize {
+    256usize.saturating_add(id_bytes)
+}
+
+fn projected_vector_index_bytes(
+    current: usize,
+    id_bytes: usize,
+    dimension: usize,
+    is_new: bool,
+) -> Result<usize> {
+    let growth = estimate_vector_node_bytes(id_bytes, dimension).saturating_add(if is_new {
+        estimate_vector_id_map_bytes(id_bytes)
+    } else {
+        0
+    });
+    let projected = current
+        .checked_add(growth)
+        .ok_or_else(|| RymeError::Overload(String::from("vector index memory")))?;
+    if projected > MAX_VECTOR_INDEX_BYTES {
+        return Err(RymeError::Overload(String::from("vector index memory")));
+    }
+    Ok(projected)
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
@@ -134,6 +176,7 @@ struct HnswIndex {
     m: usize,
     nodes: Vec<HnswNode>,
     id_to_pos: HashMap<String, usize>,
+    estimated_bytes: usize,
     entry: Option<usize>,
     rng: u64,
     tombstones: usize,
@@ -175,6 +218,10 @@ impl HnswIndex {
 
     fn insert_new(&mut self, id: String, vector: Vec<f32>) {
         let level = self.sample_level();
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(estimate_vector_node_bytes(id.len(), vector.len()))
+            .saturating_add(estimate_vector_id_map_bytes(id.len()));
         let pos = self.nodes.len();
         self.nodes.push(HnswNode {
             id: id.clone(),
@@ -343,8 +390,16 @@ impl HnswIndex {
         Ok(hits)
     }
 
+    fn compact_tombstones(&mut self) {
+        if self.tombstones > 0 {
+            self.rebuild();
+        }
+    }
+
     fn remove(&mut self, id: &str) -> bool {
         if let Some(pos) = self.id_to_pos.remove(id) {
+            self.estimated_bytes =
+                self.estimated_bytes.saturating_sub(estimate_vector_id_map_bytes(id.len()));
             if let Some(node) = self.nodes.get_mut(pos) {
                 node.tombstoned = true;
                 self.tombstones += 1;
@@ -385,11 +440,25 @@ fn prune_neighbors(pos: usize, layer: usize, limit: usize, nodes: &[HnswNode]) -
 }
 
 impl VectorSpace {
+    fn estimated_bytes(&self) -> usize {
+        self.ann.estimated_bytes
+    }
+
+    fn compact_tombstones(&mut self) {
+        self.ann.compact_tombstones();
+    }
+
+    #[cfg(test)]
     fn upsert(&mut self, id: String, vector: Vec<f32>) -> Result<()> {
-        if vector.is_empty() || vector.len() > MAX_DIM {
+        let normalized = normalize(&vector)?;
+        self.upsert_normalized(id, normalized)
+    }
+
+    fn upsert_normalized(&mut self, id: String, normalized: Vec<f32>) -> Result<()> {
+        if normalized.is_empty() || normalized.len() > MAX_DIM {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
-        if self.dim != 0 && vector.len() != self.dim {
+        if self.dim != 0 && normalized.len() != self.dim {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
         }
         if !self.ann.id_to_pos.contains_key(&id)
@@ -397,8 +466,7 @@ impl VectorSpace {
         {
             return Err(RymeError::Overload(String::from("vector space")));
         }
-        let normalized = normalize(&vector)?;
-        let dim = if self.dim == 0 { vector.len() } else { self.dim };
+        let dim = if self.dim == 0 { normalized.len() } else { self.dim };
         self.ann.upsert(dim, id, normalized)?;
         self.dim = dim;
         Ok(())
@@ -536,9 +604,7 @@ impl TextSpace {
     }
 
     fn remove(&mut self, id: &str) -> Option<usize> {
-        let Some(terms) = self.docs.remove(id) else {
-            return None;
-        };
+        let terms = self.docs.remove(id)?;
         let index_bytes = self.doc_index_bytes.remove(id).unwrap_or(0);
         for term in terms.keys() {
             if let Some(posting) = self.postings.get_mut(term) {
@@ -649,6 +715,7 @@ pub struct IndexRegistry {
     vectors: HashMap<String, VectorSpace>,
     texts: HashMap<String, TextSpace>,
     spaces: HashSet<String>,
+    vector_index_bytes: usize,
     text_index_bytes: usize,
 }
 
@@ -660,26 +727,106 @@ impl IndexRegistry {
     pub fn vector_upsert(&mut self, space: &str, id: String, vector: Vec<f32>) -> Result<()> {
         validate_space(space)?;
         validate_id(&id, "vector id")?;
+        if vector.is_empty() || vector.len() > MAX_DIM {
+            return Err(RymeError::InvalidArgument(String::from("vector dim")));
+        }
+        if self
+            .vectors
+            .get(space)
+            .is_some_and(|vectors| vectors.dim != 0 && vectors.dim != vector.len())
+        {
+            return Err(RymeError::InvalidArgument(String::from("vector dim")));
+        }
+        let normalized = normalize(&vector)?;
+        self.vector_upsert_normalized(space, id, normalized)
+    }
+
+    fn vector_upsert_normalized(
+        &mut self,
+        space: &str,
+        id: String,
+        normalized: Vec<f32>,
+    ) -> Result<()> {
+        validate_space(space)?;
+        validate_id(&id, "vector id")?;
         if !self.spaces.contains(space) && self.spaces.len() >= MAX_INDEX_SPACES {
             return Err(RymeError::Overload(String::from("index spaces")));
         }
+        if self
+            .vectors
+            .get(space)
+            .is_some_and(|vectors| vectors.dim != 0 && vectors.dim != normalized.len())
+        {
+            return Err(RymeError::InvalidArgument(String::from("vector dim")));
+        }
+        let is_new =
+            !self.vectors.get(space).is_some_and(|vectors| vectors.ann.id_to_pos.contains_key(&id));
+        if is_new
+            && self
+                .vectors
+                .get(space)
+                .is_some_and(|vectors| vectors.ann.id_to_pos.len() >= MAX_VECTORS_PER_SPACE)
+        {
+            return Err(RymeError::Overload(String::from("vector space")));
+        }
+        if projected_vector_index_bytes(self.vector_index_bytes, id.len(), normalized.len(), is_new)
+            .is_err()
+        {
+            self.compact_vector_space(space);
+            projected_vector_index_bytes(
+                self.vector_index_bytes,
+                id.len(),
+                normalized.len(),
+                is_new,
+            )?;
+        }
+        let previous_space_bytes =
+            self.vectors.get(space).map(VectorSpace::estimated_bytes).unwrap_or(0);
         let result = match self.vectors.entry(space.to_string()) {
-            Entry::Occupied(mut entry) => entry.get_mut().upsert(id, vector),
+            Entry::Occupied(mut entry) => entry.get_mut().upsert_normalized(id, normalized),
             Entry::Vacant(entry) => {
                 let mut vectors = VectorSpace::default();
-                vectors.upsert(id, vector)?;
+                vectors.upsert_normalized(id, normalized)?;
                 entry.insert(vectors);
                 Ok(())
             }
         };
         if result.is_ok() {
+            let next_space_bytes =
+                self.vectors.get(space).map(VectorSpace::estimated_bytes).unwrap_or(0);
+            self.vector_index_bytes = self
+                .vector_index_bytes
+                .saturating_sub(previous_space_bytes)
+                .saturating_add(next_space_bytes);
             self.spaces.insert(space.to_string());
         }
         result
     }
 
+    fn compact_vector_space(&mut self, space: &str) {
+        let Some(vectors) = self.vectors.get_mut(space) else {
+            return;
+        };
+        let previous_bytes = vectors.estimated_bytes();
+        vectors.compact_tombstones();
+        self.vector_index_bytes = self
+            .vector_index_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(vectors.estimated_bytes());
+    }
+
     pub fn vector_remove(&mut self, space: &str, id: &str) -> bool {
+        let previous_space_bytes =
+            self.vectors.get(space).map(VectorSpace::estimated_bytes).unwrap_or(0);
         let removed = self.vectors.get_mut(space).map(|s| s.remove(id)).unwrap_or(false);
+        if removed {
+            let next_space_bytes =
+                self.vectors.get(space).map(VectorSpace::estimated_bytes).unwrap_or(0);
+            self.vector_index_bytes = self
+                .vector_index_bytes
+                .saturating_sub(previous_space_bytes)
+                .saturating_add(next_space_bytes);
+        }
         self.remove_empty_space(space);
         removed
     }
@@ -821,6 +968,7 @@ pub struct PartitionedIndex {
     partitions: Vec<IndexRegistry>,
     dims: HashMap<String, usize>,
     vector_counts: HashMap<String, usize>,
+    vector_index_bytes: usize,
     text_counts: HashMap<String, usize>,
     text_index_bytes: usize,
     spaces: HashSet<String>,
@@ -837,6 +985,7 @@ impl PartitionedIndex {
             partitions: out,
             dims: HashMap::new(),
             vector_counts: HashMap::new(),
+            vector_index_bytes: 0,
             text_counts: HashMap::new(),
             text_index_bytes: 0,
             spaces: HashSet::new(),
@@ -884,8 +1033,48 @@ impl PartitionedIndex {
         if is_new && self.vector_counts.get(space).copied().unwrap_or(0) >= MAX_VECTORS_PER_SPACE {
             return Err(RymeError::Overload(String::from("vector space")));
         }
-        let dim = vector.len();
-        self.partitions[partition].vector_upsert(space, id, vector)?;
+        let normalized = normalize(&vector)?;
+        if projected_vector_index_bytes(self.vector_index_bytes, id.len(), normalized.len(), is_new)
+            .is_err()
+        {
+            let previous_space_bytes = self.partitions[partition]
+                .vectors
+                .get(space)
+                .map(VectorSpace::estimated_bytes)
+                .unwrap_or(0);
+            self.partitions[partition].compact_vector_space(space);
+            let next_space_bytes = self.partitions[partition]
+                .vectors
+                .get(space)
+                .map(VectorSpace::estimated_bytes)
+                .unwrap_or(0);
+            self.vector_index_bytes = self
+                .vector_index_bytes
+                .saturating_sub(previous_space_bytes)
+                .saturating_add(next_space_bytes);
+            projected_vector_index_bytes(
+                self.vector_index_bytes,
+                id.len(),
+                normalized.len(),
+                is_new,
+            )?;
+        }
+        let previous_space_bytes = self.partitions[partition]
+            .vectors
+            .get(space)
+            .map(VectorSpace::estimated_bytes)
+            .unwrap_or(0);
+        let dim = normalized.len();
+        self.partitions[partition].vector_upsert_normalized(space, id, normalized)?;
+        let next_space_bytes = self.partitions[partition]
+            .vectors
+            .get(space)
+            .map(VectorSpace::estimated_bytes)
+            .unwrap_or(0);
+        self.vector_index_bytes = self
+            .vector_index_bytes
+            .saturating_sub(previous_space_bytes)
+            .saturating_add(next_space_bytes);
         self.dims.entry(space.to_string()).or_insert(dim);
         self.spaces.insert(space.to_string());
         if is_new {
@@ -896,8 +1085,22 @@ impl PartitionedIndex {
 
     pub fn vector_remove(&mut self, space: &str, id: &str) -> bool {
         let partition = self.route(space, id);
+        let previous_space_bytes = self.partitions[partition]
+            .vectors
+            .get(space)
+            .map(VectorSpace::estimated_bytes)
+            .unwrap_or(0);
         let removed = self.partitions[partition].vector_remove(space, id);
         if removed {
+            let next_space_bytes = self.partitions[partition]
+                .vectors
+                .get(space)
+                .map(VectorSpace::estimated_bytes)
+                .unwrap_or(0);
+            self.vector_index_bytes = self
+                .vector_index_bytes
+                .saturating_sub(previous_space_bytes)
+                .saturating_add(next_space_bytes);
             decrement_count(&mut self.vector_counts, space);
             self.remove_empty_space(space);
         }
@@ -1251,6 +1454,47 @@ mod tests {
         ));
         assert!(registry.vector_remove("s", "existing"));
         registry.vector_upsert("s", String::from("new"), vec![0.25]).unwrap();
+    }
+
+    #[test]
+    fn vector_index_memory_accounting_tracks_tombstones_and_reclaims_on_compaction() {
+        let mut registry = PartitionedIndex::new(2);
+        registry.vector_upsert("s", String::from("a"), vec![1.0, 0.0]).unwrap();
+        registry.vector_upsert("s", String::from("b"), vec![0.0, 1.0]).unwrap();
+        let two_nodes = registry.vector_index_bytes;
+        assert!(two_nodes > 0);
+
+        registry.vector_upsert("s", String::from("a"), vec![0.5, 0.5]).unwrap();
+        assert!(registry.vector_index_bytes > two_nodes);
+
+        assert!(registry.vector_remove("s", "a"));
+        assert!(registry.vector_index_bytes > 0);
+        assert!(registry.vector_remove("s", "b"));
+        assert_eq!(registry.vector_index_bytes, 0);
+    }
+
+    #[test]
+    fn vector_index_memory_budget_rejects_growth_without_mutating_indexes() {
+        let mut registry = PartitionedIndex::new(2);
+        let id = String::from("v");
+        let growth =
+            estimate_vector_node_bytes(id.len(), 2) + estimate_vector_id_map_bytes(id.len());
+        registry.vector_index_bytes = MAX_VECTOR_INDEX_BYTES - growth + 1;
+
+        assert!(matches!(
+            registry.vector_upsert("vectors", id.clone(), vec![1.0, 0.0]),
+            Err(RymeError::Overload(message)) if message == "vector index memory"
+        ));
+        assert_eq!(registry.vector_index_bytes, MAX_VECTOR_INDEX_BYTES - growth + 1);
+        assert!(!registry.spaces.contains("vectors"));
+        assert!(registry
+            .partitions
+            .iter()
+            .all(|partition| !partition.vectors.contains_key("vectors")));
+
+        registry.vector_index_bytes -= 1;
+        registry.vector_upsert("vectors", id, vec![1.0, 0.0]).unwrap();
+        assert_eq!(registry.vector_index_bytes, MAX_VECTOR_INDEX_BYTES);
     }
 
     #[test]
