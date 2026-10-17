@@ -1,0 +1,58 @@
+{
+  "benchmark": "in-process-sql-indexed-filtered-projection",
+  "date": "2026-10-17",
+  "before_revision": "ad777a9",
+  "after_revision": "254a087",
+  "machine": {
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "arch": "x86_64",
+    "os": "linux",
+    "logical_cpus": 12,
+    "host_memory_bytes": 16087875584
+  },
+  "method": "Sequential release captures before and after replacing full-row serde_json::Value materialization during SQL projection with a visitor that retains only selected JSON roots. The query, row counts, result counts, warmup, and concurrency were held constant.",
+  "captures": {
+    "1000_rows_42_results": {
+      "parameters": {
+        "operations": 10000,
+        "warmup_operations": 100,
+        "concurrency": 1
+      },
+      "before": [
+        { "seconds": 0.887, "qps": 11273, "p50_ns": 86715, "p95_ns": 94449, "p99_ns": 136609, "max_ns": 210228 },
+        { "seconds": 0.862, "qps": 11594, "p50_ns": 84941, "p95_ns": 91533, "p99_ns": 113485, "max_ns": 276814 },
+        { "seconds": 0.877, "qps": 11409, "p50_ns": 86564, "p95_ns": 91233, "p99_ns": 103567, "max_ns": 302963 }
+      ],
+      "after": [
+        { "seconds": 0.830, "qps": 12055, "p50_ns": 82186, "p95_ns": 86924, "p99_ns": 91143, "max_ns": 139935 },
+        { "seconds": 0.837, "qps": 11943, "p50_ns": 82766, "p95_ns": 88137, "p99_ns": 98957, "max_ns": 184259 },
+        { "seconds": 0.857, "qps": 11668, "p50_ns": 83488, "p95_ns": 90612, "p99_ns": 141098, "max_ns": 177086 }
+      ]
+    },
+    "10000_rows_417_results": {
+      "parameters": {
+        "operations": 1000,
+        "warmup_operations": 100,
+        "concurrency": 1
+      },
+      "before": [
+        { "seconds": 1.041, "qps": 961, "p50_ns": 1008059, "p95_ns": 1211364, "p99_ns": 1468952, "max_ns": 1869972 },
+        { "seconds": 1.048, "qps": 954, "p50_ns": 1016835, "p95_ns": 1188251, "p99_ns": 1518786, "max_ns": 1887886 },
+        { "seconds": 1.052, "qps": 950, "p50_ns": 1023698, "p95_ns": 1246721, "p99_ns": 1311804, "max_ns": 1436110 },
+        { "seconds": 1.029, "qps": 972, "p50_ns": 1005414, "p95_ns": 1170467, "p99_ns": 1329017, "max_ns": 1595972 }
+      ],
+      "after": [
+        { "seconds": 1.019, "qps": 981, "p50_ns": 981779, "p95_ns": 1219239, "p99_ns": 1413567, "max_ns": 1724295 },
+        { "seconds": 1.018, "qps": 982, "p50_ns": 987350, "p95_ns": 1212957, "p99_ns": 1295003, "max_ns": 1407766 },
+        { "seconds": 1.006, "qps": 994, "p50_ns": 973994, "p95_ns": 1200574, "p99_ns": 1381386, "max_ns": 1675914 }
+      ]
+    }
+  },
+  "summary": {
+    "median_capture_p50_ns_before_1000_rows": 86564,
+    "median_capture_p50_ns_after_1000_rows": 82766,
+    "median_capture_p50_ns_before_10000_rows": 1012447,
+    "median_capture_p50_ns_after_10000_rows": 981779
+  },
+  "caveat": "Single-host in-process microbenchmark, sequential before/after runs, not a controlled end-to-end or cross-database comparison. Median latency improved consistently, but p95/p99 tails varied between captures. Repeat under controlled CPU frequency and load before making capacity or performance claims."
+}
