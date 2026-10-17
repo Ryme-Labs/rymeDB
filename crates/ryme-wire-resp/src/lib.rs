@@ -1046,17 +1046,10 @@ where
                 let name = std::str::from_utf8(&command)
                     .map_err(|_| mlua::Error::RuntimeError(String::from("command is not UTF-8")))?
                     .to_ascii_uppercase();
-                if matches!(
-                    name.as_str(),
-                    "EVAL" | "EVALSHA" | "SCRIPT" | "SUBSCRIBE" | "PSUBSCRIBE"
-                ) {
-                    return Err(mlua::Error::RuntimeError(String::from(
-                        "command is not allowed in scripts",
-                    )));
-                }
                 let args = values.map(lua_value_bytes).collect::<mlua::Result<Vec<_>>>()?;
-                let reply = self
-                    .dispatch_in(&mut call_transaction.borrow_mut(), RespCommand { name, args });
+                let command = RespCommand { name, args };
+                self.authorize_script_command(&command).map_err(mlua::Error::RuntimeError)?;
+                let reply = self.dispatch_in(&mut call_transaction.borrow_mut(), command);
                 parse_lua_resp(&reply).map_err(mlua::Error::RuntimeError)?.into_lua(lua)
             })?;
             let pcall_transaction = std::rc::Rc::clone(&transaction);
@@ -1069,17 +1062,10 @@ where
                 let name = std::str::from_utf8(&command)
                     .map_err(|_| mlua::Error::RuntimeError(String::from("command is not UTF-8")))?
                     .to_ascii_uppercase();
-                if matches!(
-                    name.as_str(),
-                    "EVAL" | "EVALSHA" | "SCRIPT" | "SUBSCRIBE" | "PSUBSCRIBE"
-                ) {
-                    return Err(mlua::Error::RuntimeError(String::from(
-                        "command is not allowed in scripts",
-                    )));
-                }
                 let args = values.map(lua_value_bytes).collect::<mlua::Result<Vec<_>>>()?;
-                let reply = self
-                    .dispatch_in(&mut pcall_transaction.borrow_mut(), RespCommand { name, args });
+                let command = RespCommand { name, args };
+                self.authorize_script_command(&command).map_err(mlua::Error::RuntimeError)?;
+                let reply = self.dispatch_in(&mut pcall_transaction.borrow_mut(), command);
                 parse_lua_resp(&reply).map_err(mlua::Error::RuntimeError)?.into_lua_pcall(lua)
             })?;
             let redis = lua.create_table()?;
@@ -1095,6 +1081,23 @@ where
         });
         let value = result.map_err(|error| error.to_string())?;
         lua_value_resp(&value)
+    }
+
+    fn authorize_script_command(&self, command: &RespCommand) -> std::result::Result<(), String> {
+        if matches!(
+            command.name.as_str(),
+            "EVAL" | "EVALSHA" | "SCRIPT" | "SUBSCRIBE" | "PSUBSCRIBE"
+        ) {
+            return Err(String::from("command is not allowed in scripts"));
+        }
+        if command.name == "PUBLISH" {
+            if !self.publish_allowed {
+                return Err(String::from("NOPERM permission denied"));
+            }
+        } else if !self.write_allowed && !is_read_only_command(command) {
+            return Err(String::from("NOPERM permission denied"));
+        }
+        Ok(())
     }
 
     fn cdc_pending(&self, txn: &Transaction) -> CdcPending {
@@ -6358,6 +6361,43 @@ mod tests {
         ] {
             assert!(!is_read_only_command(&RespCommand { name: name.to_string(), args: vec![] }));
         }
+    }
+
+    #[test]
+    fn lua_commands_enforce_publish_and_write_permissions_before_dispatch() {
+        let mut gateway = RespGateway::new(String::from("tenant"), String::from("database"));
+        gateway.write_allowed = false;
+        gateway.publish_allowed = false;
+        let mut receiver = gateway.pubsub.subscribe();
+        let mut txn = gateway.manager.begin();
+
+        let denied_publish = gateway.run_lua_script(
+            &mut txn,
+            b"return redis.call('PUBLISH', 'events', 'secret')",
+            &[],
+            &[],
+        );
+        assert!(denied_publish.unwrap_err().contains("NOPERM permission denied"));
+        assert!(matches!(receiver.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+
+        let denied_write =
+            gateway.run_lua_script(&mut txn, b"return redis.call('SET', 'key', 'value')", &[], &[]);
+        assert!(denied_write.unwrap_err().contains("NOPERM permission denied"));
+        assert!(txn.writes().is_empty());
+
+        gateway.publish_allowed = true;
+        assert_eq!(
+            gateway
+                .run_lua_script(
+                    &mut txn,
+                    b"return redis.call('PUBLISH', 'events', 'allowed')",
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            b":0\r\n"
+        );
+        assert_eq!(receiver.try_recv().unwrap().payload, b"allowed");
     }
 
     #[test]
