@@ -9,9 +9,9 @@ use ryme_observe::{
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
-    bind, parse, Executor, Field, ForeignKeyAction, IndexDefinition, InsertValue, QueryResult,
-    ReturningField, RoleDefinition, SchemaSnapshot, Statement, TransactionChange,
-    BUILTIN_SQL_ROLES, SQL_NULL_SENTINEL,
+    bind, parse, schema_snapshot_serialized_size, Executor, Field, ForeignKeyAction,
+    IndexDefinition, InsertValue, QueryResult, ReturningField, RoleDefinition, SchemaSnapshot,
+    Statement, TransactionChange, BUILTIN_SQL_ROLES, SQL_NULL_SENTINEL,
 };
 use ryme_txn::{
     Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager,
@@ -303,6 +303,7 @@ struct Savepoint {
     checkpoint: TransactionCheckpoint,
     changes_len: usize,
     schema_snapshot: Option<SchemaSnapshot>,
+    schema_snapshot_bytes: usize,
     local_settings: HashMap<String, Option<String>>,
     local_values: HashMap<String, Option<String>>,
     notifications_len: usize,
@@ -3296,16 +3297,30 @@ where
                     ),
                 );
             }
+            let schema_snapshot = executor.schema_transaction_snapshot();
+            let schema_snapshot_bytes = match schema_snapshot.as_ref() {
+                Some(snapshot) => match schema_snapshot_serialized_size(snapshot) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        state.failed = true;
+                        return encode_error_code(error_code(&error), error.to_string());
+                    }
+                },
+                None => 0,
+            };
             let position = state.savepoints.iter().position(|savepoint| savepoint.name == name);
             let retained_bytes = state
                 .savepoints
                 .iter()
                 .take(position.unwrap_or(state.savepoints.len()))
-                .map(|savepoint| savepoint.checkpoint.state_bytes())
-                .try_fold(0usize, usize::checked_add);
+                .map(|savepoint| {
+                    savepoint.checkpoint.state_bytes().checked_add(savepoint.schema_snapshot_bytes)
+                })
+                .try_fold(0usize, |total, bytes| total.checked_add(bytes?));
             let next_count = position.unwrap_or(state.savepoints.len()).saturating_add(1);
             let next_bytes = retained_bytes
                 .and_then(|bytes| bytes.checked_add(state.txn.state_bytes()))
+                .and_then(|bytes| bytes.checked_add(schema_snapshot_bytes))
                 .unwrap_or(usize::MAX);
             if next_count > MAX_SAVEPOINTS || next_bytes > MAX_TRANSACTION_STATE_BYTES {
                 state.failed = true;
@@ -3321,7 +3336,8 @@ where
                 name,
                 checkpoint: state.txn.checkpoint(),
                 changes_len: state.changes.len(),
-                schema_snapshot: executor.schema_transaction_snapshot(),
+                schema_snapshot,
+                schema_snapshot_bytes,
                 local_settings: state.local_settings.clone(),
                 local_values: state
                     .local_settings
@@ -5245,6 +5261,47 @@ mod tests {
         )
         .await;
         assert!(active.as_ref().is_some_and(|state| state.failed));
+    }
+
+    #[tokio::test]
+    async fn savepoint_schema_memory_is_included_in_budget() {
+        let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
+        let txn = executor.begin_transaction(Isolation::Serializable);
+        let checkpoint = txn.checkpoint();
+        let mut active = Some(SessionTransaction {
+            txn,
+            changes: Vec::new(),
+            changes_bytes: 0,
+            schema_before: None,
+            local_settings: HashMap::new(),
+            notifications: Vec::new(),
+            notification_bytes: 0,
+            listener_changes: Vec::new(),
+            listener_changes_bytes: 0,
+            failed: false,
+            savepoints: vec![Savepoint {
+                name: String::from("large_schema"),
+                checkpoint,
+                changes_len: 0,
+                schema_snapshot: None,
+                schema_snapshot_bytes: MAX_TRANSACTION_STATE_BYTES,
+                local_settings: HashMap::new(),
+                local_values: HashMap::new(),
+                notifications_len: 0,
+                listener_changes_len: 0,
+            }],
+        });
+
+        handle_transaction_control(
+            TransactionControl::Savepoint(String::from("next")),
+            &executor,
+            &mut active,
+        )
+        .await;
+
+        let state = active.as_ref().unwrap();
+        assert!(state.failed);
+        assert_eq!(state.savepoints.len(), 1);
     }
 
     #[tokio::test]

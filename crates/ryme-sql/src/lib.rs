@@ -1019,6 +1019,34 @@ pub struct SchemaSnapshot {
 pub const MAX_SCHEMA_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SCHEMA_OBJECTS: usize = 100_000;
 
+pub fn schema_snapshot_serialized_size(snapshot: &SchemaSnapshot) -> Result<usize> {
+    struct SizeCounter(usize);
+
+    impl std::io::Write for SizeCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "schema snapshot size")
+            })?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    schema_snapshot_object_count(snapshot)?;
+    validate_role_catalog(&snapshot.roles)?;
+    validate_rls_policy_catalog(snapshot)?;
+    let mut counter = SizeCounter(0);
+    serde_json::to_writer(&mut counter, snapshot)
+        .map_err(|error| RymeError::Internal(format!("schema snapshot size: {error}")))?;
+    if counter.0 > MAX_SCHEMA_SNAPSHOT_BYTES {
+        return Err(RymeError::Overload(String::from("schema snapshot")));
+    }
+    Ok(counter.0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RlsPolicy {
     pub name: String,
@@ -18861,6 +18889,15 @@ mod tests {
             validate_schema_snapshot(&snapshot),
             Err(RymeError::Overload(message)) if message == "schema snapshot objects"
         ));
+    }
+
+    #[test]
+    fn schema_snapshot_serialized_size_matches_json_size() {
+        let snapshot = SchemaSnapshot::default();
+        assert_eq!(
+            schema_snapshot_serialized_size(&snapshot).unwrap(),
+            serde_json::to_vec(&snapshot).unwrap().len()
+        );
     }
 
     #[tokio::test]
