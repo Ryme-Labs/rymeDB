@@ -120,17 +120,14 @@ impl SegmentReadCache {
     }
 
     fn get_many_cached(&mut self, ids: &[u64]) -> Vec<Option<Arc<ImmutableSegment>>> {
-        let segments = ids
-            .iter()
-            .map(|id| self.entries.get(id).map(|entry| Arc::clone(&entry.segment)))
-            .collect::<Vec<_>>();
-        self.hits = self
-            .hits
-            .saturating_add(segments.iter().filter(|segment| segment.is_some()).count() as u64);
+        let mut segments = Vec::with_capacity(ids.len());
         for id in ids {
-            if self.entries.contains_key(id) {
+            let segment = self.entries.get(id).map(|entry| Arc::clone(&entry.segment));
+            if segment.is_some() {
+                self.hits = self.hits.saturating_add(1);
                 self.touch(*id);
             }
+            segments.push(segment);
         }
         segments
     }
@@ -2323,11 +2320,12 @@ mod tests {
         cache.insert(2, Arc::clone(&segment), 1);
         cache.insert(3, Arc::clone(&segment), 1);
 
-        let partial = cache.get_many_cached(&[1, 4, 3]);
+        let partial = cache.get_many_cached(&[1, 4, 3, 1]);
         assert!(partial[0].is_some());
         assert!(partial[1].is_none());
         assert!(partial[2].is_some());
-        assert_eq!(cache.hits, 2);
+        assert!(partial[3].is_some());
+        assert_eq!(cache.hits, 3);
         assert_eq!(cache.misses, 0);
 
         cache.insert(4, segment, 1);
