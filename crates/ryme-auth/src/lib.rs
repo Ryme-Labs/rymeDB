@@ -1541,6 +1541,21 @@ impl CredentialStore {
         password: &str,
         roles: HashSet<Role>,
     ) -> Result<()> {
+        self.validate_password_registration(&id, &tenant, password)?;
+        let password = hash_password(password);
+        self.register_password_hash(id, tenant, password, roles)
+    }
+
+    /// Validate inexpensive registration constraints before doing password
+    /// hashing without holding the credential-store lock. The insertion path
+    /// must still recheck these constraints because another registration may
+    /// race with the hash operation.
+    pub fn validate_password_registration(
+        &self,
+        id: &str,
+        tenant: &str,
+        password: &str,
+    ) -> Result<()> {
         if id.is_empty()
             || id.len() > MAX_USER_LEN
             || password.len() < 8
@@ -1548,7 +1563,32 @@ impl CredentialStore {
         {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
+        validate_tenant(tenant)?;
+        if self.users.contains_key(id) {
+            return Err(RymeError::Conflict(String::from("user")));
+        }
+        if self.users.len() >= MAX_USERS {
+            return Err(RymeError::Overload(String::from("users")));
+        }
+        Ok(())
+    }
+
+    /// Insert a password hash that was computed outside the credential-store
+    /// lock. Registration limits and uniqueness are rechecked atomically here.
+    pub fn register_password_hash(
+        &mut self,
+        id: String,
+        tenant: String,
+        password_hash: PasswordHash,
+        roles: HashSet<Role>,
+    ) -> Result<()> {
+        if id.is_empty() || id.len() > MAX_USER_LEN {
+            return Err(RymeError::InvalidArgument(String::from("credentials")));
+        }
         validate_tenant(&tenant)?;
+        if !valid_password_hash(&password_hash) || password_hash.rounds != ARGON2ID_MARKER {
+            return Err(RymeError::InvalidArgument(String::from("password hash")));
+        }
         if self.users.contains_key(&id) {
             return Err(RymeError::Conflict(String::from("user")));
         }
@@ -1560,7 +1600,7 @@ impl CredentialStore {
             StoredUser {
                 tenant,
                 roles,
-                password: Some(hash_password(password)),
+                password: Some(password_hash),
                 otp_secret: None,
                 otp_last_used_step: None,
             },
@@ -3000,6 +3040,35 @@ mod tests {
         assert!(store.verify_otp("ada", "000000", 1_700_000_000).is_err());
         assert!(store.otp_enrolled("ada"));
         assert!(!store.otp_enrolled("ghost"));
+    }
+
+    #[test]
+    fn credential_store_accepts_precomputed_password_hash_after_rechecking_registration() {
+        let mut store = CredentialStore::new();
+        store.validate_password_registration("ada", "t", "correct-horse").unwrap();
+        let password = hash_password("correct-horse");
+        store
+            .register_password_hash(
+                String::from("ada"),
+                String::from("t"),
+                password,
+                HashSet::from([Role::ReadWrite]),
+            )
+            .unwrap();
+
+        assert!(store.verify_password("ada", "correct-horse").is_ok());
+        assert!(matches!(
+            store.validate_password_registration("ada", "t", "correct-horse"),
+            Err(RymeError::Conflict(message)) if message == "user"
+        ));
+        assert!(store
+            .register_password_hash(
+                String::from("ada"),
+                String::from("t"),
+                hash_password("other-password"),
+                HashSet::new(),
+            )
+            .is_err());
     }
 
     #[test]

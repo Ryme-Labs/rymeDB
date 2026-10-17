@@ -4420,6 +4420,7 @@ fn authorize_dashboard_bootstrap(
     require_platform_admin(state, headers).map(|_| ())
 }
 
+#[cfg(test)]
 fn register_dashboard_admin(
     credentials: &mut ryme_auth::CredentialStore,
     id: String,
@@ -4428,9 +4429,22 @@ fn register_dashboard_admin(
     if !credentials.is_empty() {
         return Err(ryme_error::RymeError::Conflict(String::from("dashboard already initialized")));
     }
+    credentials.validate_password_registration(&id, "default", password)?;
+    let password = ryme_auth::hash_password(password);
+    register_dashboard_admin_with_hash(credentials, id, password)
+}
+
+fn register_dashboard_admin_with_hash(
+    credentials: &mut ryme_auth::CredentialStore,
+    id: String,
+    password: ryme_auth::PasswordHash,
+) -> ryme_error::Result<()> {
+    if !credentials.is_empty() {
+        return Err(ryme_error::RymeError::Conflict(String::from("dashboard already initialized")));
+    }
     let mut roles = std::collections::HashSet::new();
     roles.insert(Role::Superuser);
-    credentials.register_password(id, String::from("default"), password, roles)
+    credentials.register_password_hash(id, String::from("default"), password, roles)
 }
 
 async fn dashboard_bootstrap(
@@ -4446,6 +4460,21 @@ async fn dashboard_bootstrap(
         Ok(request) => request,
         Err(error) => return error_response(error),
     };
+    let preflight = state
+        .credentials
+        .lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))
+        .and_then(|credentials| {
+            if !credentials.is_empty() {
+                return Err(ryme_error::RymeError::Conflict(String::from(
+                    "dashboard already initialized",
+                )));
+            }
+            credentials.validate_password_registration(&request.id, "default", &request.password)
+        });
+    if let Err(error) = preflight {
+        return error_response(error);
+    }
     let hash_slot = match acquire_auth_hash_slot(&state.auth_hash_slots) {
         Ok(slot) => slot,
         Err(error) => return error_response(error),
@@ -4453,10 +4482,11 @@ async fn dashboard_bootstrap(
     let credentials = state.credentials.clone();
     let registered = tokio::task::spawn_blocking(move || {
         let _hash_slot = hash_slot;
+        let password = ryme_auth::hash_password(&request.password);
         let mut credentials = credentials
             .lock()
             .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
-        register_dashboard_admin(&mut credentials, request.id, &request.password)
+        register_dashboard_admin_with_hash(&mut credentials, request.id, password)
     })
     .await;
     let registered = match registered {
@@ -6982,18 +7012,30 @@ async fn auth_register(
     if !principal.can_admin() && (roles.contains(&Role::Owner) || roles.contains(&Role::Admin)) {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let preflight = state
+        .credentials
+        .lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))
+        .and_then(|credentials| {
+            credentials.validate_password_registration(&request.id, &tenant, &request.password)
+        });
+    if let Err(error) = preflight {
+        return error_response(error);
+    }
     let hash_slot = match acquire_auth_hash_slot(&state.auth_hash_slots) {
         Ok(slot) => slot,
         Err(error) => return error_response(error),
     };
     let credentials = state.credentials.clone();
+    let password = request.password;
     let registered = tokio::task::spawn_blocking(move || {
         let _hash_slot = hash_slot;
+        let password = ryme_auth::hash_password(&password);
         let mut store = match credentials.lock() {
             Ok(store) => store,
             Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
         };
-        store.register_password(request.id, tenant, &request.password, roles)
+        store.register_password_hash(request.id, tenant, password, roles)
     })
     .await;
     match registered {
