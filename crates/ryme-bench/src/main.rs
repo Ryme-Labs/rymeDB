@@ -61,6 +61,14 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         iterations: usize,
     },
+    Snapshot {
+        #[arg(long, default_value_t = 10_000)]
+        rows: usize,
+        #[arg(long, default_value_t = 128)]
+        value_bytes: usize,
+        #[arg(long, default_value_t = 10)]
+        iterations: usize,
+    },
     SegmentScan {
         #[arg(long, default_value_t = 10_000)]
         rows: usize,
@@ -250,6 +258,9 @@ async fn main() {
         }
         Some(Command::SegmentBuild { entries, value_bytes, iterations }) => {
             segment_build_bench(entries, value_bytes, iterations);
+        }
+        Some(Command::Snapshot { rows, value_bytes, iterations }) => {
+            snapshot_bench(rows, value_bytes, iterations);
         }
         Some(Command::SegmentScan {
             rows,
@@ -1050,6 +1061,76 @@ fn segment_build_bench(entries: usize, value_bytes: usize, iterations: usize) {
             "decode_p95_ns": percentile(&decoded_ns, 95),
             "lookup_ops": lookup_count,
             "lookup_mean_ns": lookup_elapsed_ns / lookup_count.max(1) as u128,
+        })
+    );
+}
+
+fn snapshot_bench(rows: usize, value_bytes: usize, iterations: usize) {
+    const MAX_ROWS: usize = 100_000;
+    const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+    let input_bytes = rows.checked_mul(value_bytes);
+    if rows == 0
+        || rows > MAX_ROWS
+        || iterations == 0
+        || iterations > 10_000
+        || input_bytes.is_none_or(|bytes| bytes > MAX_INPUT_BYTES)
+    {
+        eprintln!("rows, value bytes, or iterations exceed snapshot benchmark bounds");
+        std::process::exit(2);
+    }
+
+    let mut engine = Engine::new();
+    for index in 0..rows {
+        let key = RecordKey::new("bench", "bench", "snapshot", format!("k-{index:08}").as_bytes());
+        engine.apply(key, 1, Some(vec![7; value_bytes])).expect("could not build snapshot fixture");
+    }
+    let reference = engine.encode_snapshot().expect("could not encode snapshot fixture");
+
+    // Warm the legacy serialization round-trip and the clone-and-encode path.
+    let decoded = Engine::decode_snapshot(&reference).expect("snapshot decode warmup failed");
+    assert_eq!(decoded.encode_snapshot().expect("snapshot re-encode warmup failed"), reference);
+    assert_eq!(engine.clone().encode_snapshot().expect("snapshot clone warmup failed"), reference);
+
+    let mut legacy_ns = Vec::with_capacity(iterations);
+    let mut clone_ns = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let raw = engine.encode_snapshot().expect("legacy snapshot encode failed");
+        let decoded = Engine::decode_snapshot(&raw).expect("legacy snapshot decode failed");
+        let reencoded = decoded.encode_snapshot().expect("legacy snapshot re-encode failed");
+        legacy_ns.push(start.elapsed().as_nanos());
+        assert_eq!(reencoded, reference, "legacy snapshot changed its contents");
+        std::hint::black_box(reencoded);
+
+        let start = Instant::now();
+        let cloned = engine.clone();
+        let encoded = cloned.encode_snapshot().expect("snapshot clone encode failed");
+        clone_ns.push(start.elapsed().as_nanos());
+        assert_eq!(encoded, reference, "cloned snapshot changed its contents");
+        std::hint::black_box(encoded);
+    }
+
+    legacy_ns.sort_unstable();
+    clone_ns.sort_unstable();
+    let percentile = |samples: &[u128], percentile: usize| -> u128 {
+        samples[((samples.len() - 1) * percentile / 100).min(samples.len() - 1)]
+    };
+    let legacy_p50 = percentile(&legacy_ns, 50).max(1);
+    let clone_p50 = percentile(&clone_ns, 50).max(1);
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "snapshot-roundtrip-vs-clone",
+            "machine": machine_metadata(),
+            "rows": rows,
+            "value_bytes": value_bytes,
+            "iterations": iterations,
+            "snapshot_bytes": reference.len(),
+            "legacy_p50_ns": legacy_p50,
+            "legacy_p95_ns": percentile(&legacy_ns, 95),
+            "clone_p50_ns": clone_p50,
+            "clone_p95_ns": percentile(&clone_ns, 95),
+            "p50_speedup": legacy_p50 as f64 / clone_p50 as f64,
         })
     );
 }
