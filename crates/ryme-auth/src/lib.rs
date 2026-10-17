@@ -1312,7 +1312,7 @@ impl CredentialStore {
     }
 
     pub fn verify_password(&self, id: &str, password: &str) -> Result<Principal> {
-        if password.len() > MAX_PASSWORD_LEN {
+        if id.is_empty() || id.len() > MAX_USER_LEN || password.len() > MAX_PASSWORD_LEN {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
         let stored = self.users.get(id).and_then(|user| user.password.as_ref());
@@ -2379,6 +2379,8 @@ mod tests {
             .unwrap();
         assert!(store.verify_password("ada", "correct-horse").is_ok());
         assert!(store.verify_password("ada", "wrong-pass").is_err());
+        assert!(store.verify_password("", "wrong-pass").is_err());
+        assert!(store.verify_password(&"u".repeat(MAX_USER_LEN + 1), "wrong-pass").is_err());
         let huge = "p".repeat(MAX_PASSWORD_LEN + 1);
         assert!(store.verify_password("ada", &huge).is_err());
         assert!(store
