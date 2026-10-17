@@ -46,6 +46,10 @@ events, including privileged SQL statement outcomes from HTTP and PostgreSQL
 wire connections. Events include actor and tenant when available; raw SQL,
 request bodies, and credentials are excluded.
 
+The platform-superuser-only `/v1/index/stats` response includes process-wide
+estimated memory use and limits for full-text and vector indexes, plus usage by
+tenant. These are conservative index accounting estimates, not process RSS.
+
 ## Embedded admin dashboard
 
 Open `http://127.0.0.1:8080/dashboard` (or the configured HTTP address) to use

@@ -10015,6 +10015,7 @@ async fn index_stats(State(state): State<SharedState>, headers: HeaderMap) -> Re
         Json(serde_json::json!({
             "partitions": indexes.len(),
             "spaces": indexes.spaces(),
+            "memory": indexes.memory_usage(),
         })),
     )
         .into_response()

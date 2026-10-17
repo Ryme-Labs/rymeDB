@@ -1018,6 +1018,26 @@ fn validate_id(id: &str, field: &str) -> Result<()> {
 
 pub const MAX_PARTITIONS: usize = 64;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexMemoryBudget {
+    pub used_bytes: usize,
+    pub limit_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TenantIndexMemoryUsage {
+    pub tenant: String,
+    pub full_text: IndexMemoryBudget,
+    pub vector: IndexMemoryBudget,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexMemoryUsage {
+    pub full_text: IndexMemoryBudget,
+    pub vector: IndexMemoryBudget,
+    pub per_tenant: Vec<TenantIndexMemoryUsage>,
+}
+
 #[derive(Debug)]
 pub struct PartitionedIndex {
     partitions: Vec<IndexRegistry>,
@@ -1416,6 +1436,42 @@ impl PartitionedIndex {
         out.sort();
         out.dedup();
         out
+    }
+
+    pub fn memory_usage(&self) -> IndexMemoryUsage {
+        let mut tenants: Vec<String> = self
+            .tenant_text_index_bytes
+            .keys()
+            .chain(self.tenant_vector_index_bytes.keys())
+            .cloned()
+            .collect();
+        tenants.sort();
+        tenants.dedup();
+        let per_tenant = tenants
+            .into_iter()
+            .map(|tenant| TenantIndexMemoryUsage {
+                full_text: IndexMemoryBudget {
+                    used_bytes: self.tenant_text_index_bytes.get(&tenant).copied().unwrap_or(0),
+                    limit_bytes: MAX_TENANT_TEXT_INDEX_BYTES,
+                },
+                vector: IndexMemoryBudget {
+                    used_bytes: self.tenant_vector_index_bytes.get(&tenant).copied().unwrap_or(0),
+                    limit_bytes: MAX_TENANT_VECTOR_INDEX_BYTES,
+                },
+                tenant,
+            })
+            .collect();
+        IndexMemoryUsage {
+            full_text: IndexMemoryBudget {
+                used_bytes: self.text_index_bytes,
+                limit_bytes: MAX_TEXT_INDEX_BYTES,
+            },
+            vector: IndexMemoryBudget {
+                used_bytes: self.vector_index_bytes,
+                limit_bytes: MAX_VECTOR_INDEX_BYTES,
+            },
+            per_tenant,
+        }
     }
 
     fn remove_empty_space(&mut self, space: &str) {
@@ -1901,6 +1957,28 @@ mod tests {
         assert_eq!(registry.tenant_text_index_bytes.get("tenant-a"), Some(&cost));
         assert!(registry.text_remove_scoped("tenant-a", "space-a", &id));
         assert!(!registry.tenant_text_index_bytes.contains_key("tenant-a"));
+    }
+
+    #[test]
+    fn index_memory_usage_reports_global_and_sorted_tenant_budgets() {
+        let mut registry = PartitionedIndex::new(2);
+        registry
+            .vector_upsert_scoped("tenant-z", "space-z", String::from("v"), vec![1.0, 0.0])
+            .unwrap();
+        registry.text_index_scoped("tenant-a", "space-a", String::from("d"), "alpha beta").unwrap();
+
+        let usage = registry.memory_usage();
+        assert_eq!(usage.full_text.used_bytes, registry.text_index_bytes);
+        assert_eq!(usage.full_text.limit_bytes, MAX_TEXT_INDEX_BYTES);
+        assert_eq!(usage.vector.used_bytes, registry.vector_index_bytes);
+        assert_eq!(usage.vector.limit_bytes, MAX_VECTOR_INDEX_BYTES);
+        assert_eq!(
+            usage.per_tenant.iter().map(|entry| entry.tenant.as_str()).collect::<Vec<_>>(),
+            ["tenant-a", "tenant-z"]
+        );
+        assert!(registry.text_remove_scoped("tenant-a", "space-a", "d"));
+        assert!(registry.vector_remove_scoped("tenant-z", "space-z", "v"));
+        assert!(registry.memory_usage().per_tenant.is_empty());
     }
 
     #[test]

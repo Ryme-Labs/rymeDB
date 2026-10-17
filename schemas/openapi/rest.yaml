@@ -1022,16 +1022,46 @@ paths:
   /v1/index/stats:
     get:
       tags: [index]
-      description: Index partition count and namespaces. Writes hash-route by id; reads fan out and merge.
+      description: Platform-superuser index partition layout and estimated process-wide and per-tenant index memory usage. Writes hash-route by id; reads fan out and merge.
       responses:
         '200':
-          description: partition layout
+          description: partition layout and estimated index memory budgets
           content:
             application/json:
               schema:
                 type: object
+                required: [partitions, spaces, memory]
+                properties:
+                  partitions:
+                    type: integer
+                  spaces:
+                    type: array
+                    items:
+                      type: string
+                  memory:
+                    type: object
+                    required: [full_text, vector, per_tenant]
+                    properties:
+                      full_text:
+                        $ref: '#/components/schemas/IndexMemoryBudget'
+                      vector:
+                        $ref: '#/components/schemas/IndexMemoryBudget'
+                      per_tenant:
+                        type: array
+                        items:
+                          type: object
+                          required: [tenant, full_text, vector]
+                          properties:
+                            tenant:
+                              type: string
+                            full_text:
+                              $ref: '#/components/schemas/IndexMemoryBudget'
+                            vector:
+                              $ref: '#/components/schemas/IndexMemoryBudget'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/kv/{table}/{key}:
     get:
       tags: [kv]
@@ -2090,6 +2120,18 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
   schemas:
+    IndexMemoryBudget:
+      type: object
+      required: [used_bytes, limit_bytes]
+      properties:
+        used_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        limit_bytes:
+          type: integer
+          format: int64
+          minimum: 0
     DashboardSetup:
       type: object
       required: [needs_setup]
