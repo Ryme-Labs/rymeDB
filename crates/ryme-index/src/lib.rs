@@ -111,7 +111,7 @@ fn normalize(vector: &[f32]) -> Result<Vec<f32>> {
     if norm == 0.0 {
         return Err(RymeError::InvalidArgument(String::from("zero vector")));
     }
-    Ok(vector.iter().map(|v| *v / norm as f32).collect())
+    Ok(vector.iter().map(|value| (*value as f64 / norm) as f32).collect())
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
@@ -1006,6 +1006,16 @@ mod tests {
         let scores: HashMap<_, _> = hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
         assert!((scores["x"] - 0.6).abs() < 1e-12);
         assert!((scores["y"] - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn vector_normalization_handles_large_finite_components() {
+        let mut registry = IndexRegistry::new();
+        registry.vector_upsert("s", String::from("large"), vec![f32::MAX, f32::MAX]).unwrap();
+
+        let hits = registry.vector_search("s", &[1.0, 1.0], 1).unwrap();
+        assert_eq!(hits[0].id, "large");
+        assert!((hits[0].score - 1.0).abs() < 1e-6);
     }
 
     #[test]
