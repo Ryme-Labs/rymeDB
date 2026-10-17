@@ -16295,16 +16295,16 @@ mod tests {
             Err(RymeError::Overload(message)) if message == "SQL statement tokens"
         ));
 
-        let within_depth = (0..MAX_SQL_PARSE_DEPTH - 1).fold(
-            String::from("SELECT * FROM source"),
-            |query, level| format!("WITH c{level} AS ({query}) SELECT * FROM c{level}"),
-        );
+        let within_depth = (0..MAX_SQL_PARSE_DEPTH - 1)
+            .fold(String::from("SELECT * FROM source"), |query, level| {
+                format!("WITH c{level} AS ({query}) SELECT * FROM c{level}")
+            });
         assert!(parse(&within_depth).is_ok());
 
-        let nested = (0..MAX_SQL_PARSE_DEPTH + 1).fold(
-            String::from("SELECT * FROM source"),
-            |query, level| format!("WITH c{level} AS ({query}) SELECT * FROM c{level}"),
-        );
+        let nested = (0..MAX_SQL_PARSE_DEPTH + 1)
+            .fold(String::from("SELECT * FROM source"), |query, level| {
+                format!("WITH c{level} AS ({query}) SELECT * FROM c{level}")
+            });
         assert!(matches!(
             parse(&nested),
             Err(RymeError::Overload(message)) if message == "SQL parse nesting"
