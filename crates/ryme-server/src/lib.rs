@@ -7273,7 +7273,7 @@ async fn presence_stream(
     let realtime = state.realtime.clone();
     let tenant = principal.tenant.clone();
     let qos = state.qos.clone();
-    upgrade.on_upgrade(move |socket| async move {
+    bounded_realtime_upgrade(upgrade).on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_presence(socket, realtime, qos, &tenant, &channel).await;
     })
@@ -7322,7 +7322,7 @@ async fn supabase_realtime_stream(
     let database = state.database.clone();
     let sender = principal.id.clone();
     let can_publish = principal.can_publish();
-    upgrade.on_upgrade(move |socket| async move {
+    bounded_realtime_upgrade(upgrade).on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_supabase_realtime(
             socket,
@@ -7450,6 +7450,12 @@ const MAX_JWK_KID_BYTES: usize = 256;
 const MIN_RSA_MODULUS_BYTES: usize = 256;
 const MAX_RSA_MODULUS_BYTES: usize = 1024;
 const MAX_RSA_EXPONENT_BYTES: usize = 8;
+
+fn bounded_realtime_upgrade(upgrade: WebSocketUpgrade) -> WebSocketUpgrade {
+    upgrade
+        .max_message_size(REALTIME_MAX_INCOMING_FRAME_BYTES)
+        .max_frame_size(REALTIME_MAX_INCOMING_FRAME_BYTES)
+}
 
 #[derive(Debug, Clone)]
 struct SupabaseChangeSubscription {
@@ -8693,7 +8699,7 @@ async fn broadcast_stream(
     let realtime = state.realtime.clone();
     let tenant = principal.tenant.clone();
     let qos = state.qos.clone();
-    upgrade.on_upgrade(move |socket| async move {
+    bounded_realtime_upgrade(upgrade).on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_broadcast(socket, realtime, qos, &tenant, &channel).await;
     })
@@ -8892,7 +8898,7 @@ async fn durable_stream(
     if from > state.realtime.durable_cursor(&tenant, &partition) {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("cursor")));
     }
-    upgrade.on_upgrade(move |socket| async move {
+    bounded_realtime_upgrade(upgrade).on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_durable_topic(socket, realtime, qos, &tenant, &partition, from).await;
     })
@@ -12560,7 +12566,7 @@ async fn stream(
     if !rls_executor.can_select_table(&table) {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    upgrade.on_upgrade(move |socket| async move {
+    bounded_realtime_upgrade(upgrade).on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_changes(
             socket,
@@ -12928,7 +12934,7 @@ async fn query_stream(
     let dependencies =
         rls_executor.view_dependencies(&table).unwrap_or_else(|| vec![table.clone()]);
     let query_spec = ReactiveQuerySpec::from_query(&query);
-    upgrade.on_upgrade(move |socket| async move {
+    bounded_realtime_upgrade(upgrade).on_upgrade(move |socket| async move {
         let _connection = connection;
         forward_query(
             socket,
