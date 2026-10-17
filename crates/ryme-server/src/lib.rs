@@ -14653,15 +14653,37 @@ fn error_response(error: ryme_error::RymeError) -> Response {
         ryme_error::RymeError::ReadOnly(detail) => {
             (StatusCode::SERVICE_UNAVAILABLE, detail.clone())
         }
-        ryme_error::RymeError::Corrupt(detail) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, detail.clone())
-        }
-        ryme_error::RymeError::Io(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail.clone()),
-        ryme_error::RymeError::Internal(detail) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, detail.clone())
-        }
+        ryme_error::RymeError::Corrupt(_)
+        | ryme_error::RymeError::Io(_)
+        | ryme_error::RymeError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            String::from("internal server error"),
+        ),
     };
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::error!(error = %error, "request failed");
+    }
     (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+#[cfg(test)]
+mod http_error_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn internal_errors_hide_diagnostic_details_from_http_clients() {
+        for error in [
+            ryme_error::RymeError::Internal(String::from("secret internal detail")),
+            ryme_error::RymeError::Corrupt(String::from("/var/lib/rymedb/private.snapshot")),
+            ryme_error::RymeError::Io(String::from("permission denied: /srv/private")),
+        ] {
+            let response = error_response(error);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "internal server error");
+        }
+    }
 }
 
 fn now_secs() -> u64 {
