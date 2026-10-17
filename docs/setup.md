@@ -5,8 +5,8 @@ try rymeDB, Kubernetes is for a cluster deployment, and running from source is
 best for development. All examples use the default PostgreSQL, RESP, and HTTP
 ports: `5433`, `6380`, and `8080`.
 
-Use a unique API key outside local testing. For production settings, TLS,
-backups, and operational guidance, see [configuration](configuration.md),
+Use unique API and protocol credentials outside local testing. For production
+settings, TLS, backups, and operational guidance, see [configuration](configuration.md),
 [security](security.md), and [production operations](production.md).
 
 ## Docker
@@ -25,7 +25,7 @@ docker run --name rymedb --rm \
   -e RYME_API_KEY=local-dev-api-key \
   -e RYME_PG_PASSWORD=local-dev-pg-password \
   -e RYME_RESP_PASSWORD=local-dev-resp-password \
-  -p 5433:5433 -p 6380:6380 -p 8080:8080 \
+  -p 127.0.0.1:5433:5433 -p 127.0.0.1:6380:6380 -p 127.0.0.1:8080:8080 \
   -v rymedb-data:/var/lib/rymedb \
   ghcr.io/ryme-labs/rymedb:latest \
   --pg-listen 0.0.0.0:5433 --resp-listen 0.0.0.0:6380 --http-listen 0.0.0.0:8080
