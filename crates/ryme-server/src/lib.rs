@@ -5473,6 +5473,159 @@ mod rest_compatibility_tests {
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[tokio::test]
+    async fn rest_updates_check_old_row_policy_and_posts_do_not_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-rest-update-rls-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let state =
+            SharedState::build(&Config { data_dir: dir.clone(), ..Config::default() }).unwrap();
+        let admin = state.executor.clone().with_role(String::from("postgres")).without_auth_uid();
+        for sql in [
+            "CREATE TABLE rest_update_rls (id TEXT PRIMARY KEY, owner_id TEXT, visible_to TEXT, payload TEXT)",
+            "GRANT SELECT, INSERT, UPDATE ON TABLE rest_update_rls TO authenticated",
+            "CREATE POLICY rest_read_visible ON rest_update_rls FOR SELECT TO authenticated USING (auth.uid() = visible_to)",
+            "CREATE POLICY rest_update_owner ON rest_update_rls FOR UPDATE TO authenticated USING (auth.uid() = owner_id) WITH CHECK (auth.uid() = owner_id)",
+            "CREATE POLICY rest_insert_owner ON rest_update_rls FOR INSERT TO authenticated WITH CHECK (auth.uid() = owner_id)",
+            "ALTER TABLE rest_update_rls ENABLE ROW LEVEL SECURITY",
+        ] {
+            admin.execute(parse(sql).unwrap()).await.unwrap();
+        }
+        let storage_admin = Principal {
+            id: String::from("admin"),
+            tenant: String::from("default"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        state
+            .gateway
+            .put(
+                &storage_admin,
+                "rest_update_rls",
+                b"row".to_vec(),
+                br#"{"id":"row","owner_id":"user-b","visible_to":"user-a","payload":"original"}"#
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        state
+            .keys
+            .insert(
+                String::from("user-a-key"),
+                Principal {
+                    id: String::from("user-a"),
+                    tenant: String::from("default"),
+                    roles: [Role::ReadWrite].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer user-a-key"),
+        )]);
+        headers.insert("prefer", HeaderValue::from_static("return=minimal"));
+
+        let denied_patch = rest_upsert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("id=eq.row"))),
+            axum::body::Bytes::from_static(br#"{"owner_id":"user-a","payload":"patched"}"#),
+        )
+        .await;
+        assert_eq!(denied_patch.status(), StatusCode::FORBIDDEN);
+
+        let denied_conflict = rest_insert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("on_conflict=id"))),
+            axum::body::Bytes::from_static(
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"upserted"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(denied_conflict.status(), StatusCode::FORBIDDEN);
+
+        let duplicate_post = rest_insert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(None),
+            axum::body::Bytes::from_static(
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"overwritten"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(duplicate_post.status(), StatusCode::CONFLICT);
+
+        let row = state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap();
+        assert_eq!(
+            row.as_deref(),
+            Some(
+                br#"{"id":"row","owner_id":"user-b","visible_to":"user-a","payload":"original"}"#
+                    .as_slice()
+            )
+        );
+
+        state
+            .gateway
+            .put(
+                &storage_admin,
+                "rest_update_rls",
+                b"row".to_vec(),
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"original"}"#
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        let allowed_patch = rest_upsert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("id=eq.row"))),
+            axum::body::Bytes::from_static(br#"{"payload":"patched"}"#),
+        )
+        .await;
+        if allowed_patch.status() != StatusCode::OK {
+            let status = allowed_patch.status();
+            let body = axum::body::to_bytes(allowed_patch.into_body(), usize::MAX).await.unwrap();
+            panic!("allowed PATCH returned {status}: {}", String::from_utf8_lossy(&body));
+        }
+        let row = state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap();
+        let row = row.and_then(|row| serde_json::from_slice::<serde_json::Value>(&row).ok());
+        assert_eq!(
+            row.and_then(|row| row.get("payload").cloned()),
+            Some(serde_json::json!("patched"))
+        );
+
+        let allowed_conflict = rest_insert(
+            State(state.clone()),
+            headers,
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("on_conflict=id"))),
+            axum::body::Bytes::from_static(
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"upserted"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(allowed_conflict.status(), StatusCode::CREATED);
+
+        let row = state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap();
+        assert_eq!(
+            row.and_then(|row| serde_json::from_slice::<serde_json::Value>(&row).ok()),
+            Some(serde_json::json!({
+                "id": "row",
+                "owner_id": "user-a",
+                "visible_to": "user-a",
+                "payload": "upserted"
+            }))
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 fn url_decode(input: &str) -> String {
@@ -5649,28 +5802,45 @@ async fn rest_insert(
                 if let Some(existing) = match rest_conflict_key(
                     &gateway, &principal, &executor, &table, field, expected,
                 ) {
-                        Ok(existing) => existing,
-                        Err(e) => return error_response(e),
+                    Ok(existing) => existing,
+                    Err(e) => return error_response(e),
                 } {
                     key = existing;
                 }
             }
-        }
-        if !executor.row_allowed_for_command(&table, &value, RlsCommand::Insert) {
-            return error_response(ryme_error::RymeError::Forbidden);
-        }
-        if !return_minimal && !executor.row_allowed_by_rls(&table, &value) {
-            return error_response(ryme_error::RymeError::Forbidden);
         }
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
         pending.push((key, value));
     }
-    if let Err(e) = gateway.put_many(&principal, &table, pending.clone()).await {
-        return error_response(e);
-    }
-    let inserted = pending
+    let allow_upsert = conflict_field.is_some();
+    let (_, written) = match gateway
+        .put_many_transform(&principal, &table, pending, |_, before, after| {
+            if !executor.row_allowed_for_command(&table, after, RlsCommand::Insert) {
+                return Err(ryme_error::RymeError::Forbidden);
+            }
+            if let Some(before) = before {
+                if !allow_upsert {
+                    return Err(ryme_error::RymeError::Conflict(String::from("exists")));
+                }
+                if !executor.row_allowed_for_command(&table, before, RlsCommand::Update)
+                    || !executor.row_allowed_for_command(&table, after, RlsCommand::Update)
+                {
+                    return Err(ryme_error::RymeError::Forbidden);
+                }
+            }
+            if !return_minimal && !executor.row_allowed_by_rls(&table, after) {
+                return Err(ryme_error::RymeError::Forbidden);
+            }
+            Ok(after.to_vec())
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return error_response(e),
+    };
+    let inserted = written
         .iter()
         .map(|(key, value)| {
             record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
@@ -5737,44 +5907,53 @@ async fn rest_upsert(
         Ok(keys) => keys,
         Err(e) => return error_response(e),
     };
-    let mut pending = Vec::with_capacity(keys.len());
-    for key in keys {
-        let Some(current) = (match gateway.get(&principal, &table, &key) {
-            Ok(current) => current,
-            Err(e) => return error_response(e),
-        }) else {
-            continue;
+    if keys.is_empty() {
+        return if return_minimal {
+            StatusCode::OK.into_response()
+        } else {
+            (StatusCode::OK, Json(Vec::<serde_json::Value>::new())).into_response()
         };
-        let Some(mut object) = serde_json::from_slice::<serde_json::Value>(&current)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-        else {
-            return error_response(ryme_error::RymeError::InvalidArgument(String::from(
-                "PATCH requires JSON object rows",
-            )));
-        };
-        object.extend(parsed.fields.clone());
-        let value = match serde_json::to_vec(&serde_json::Value::Object(object)) {
-            Ok(value) => value,
-            Err(e) => return error_response(ryme_error::RymeError::InvalidArgument(e.to_string())),
-        };
-        if !executor.row_allowed_for_command(&table, &value, RlsCommand::Update) {
-            return error_response(ryme_error::RymeError::Forbidden);
-        }
-        if !return_minimal && !executor.row_allowed_by_rls(&table, &value) {
-            return error_response(ryme_error::RymeError::Forbidden);
-        }
-        if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
-            return error_response(e);
-        }
-        pending.push((key, value));
     }
-    if !pending.is_empty() {
-        if let Err(e) = gateway.put_many(&principal, &table, pending.clone()).await {
-            return error_response(e);
-        }
-    }
-    let updated = pending
+    let patches = keys.into_iter().map(|key| (key, Vec::new())).collect();
+    let (_, written) = match gateway
+        .put_many_transform(&principal, &table, patches, |key, before, _| {
+            let Some(current) = before else {
+                return Err(ryme_error::RymeError::NotFound(String::from("row")));
+            };
+            if !executor.row_allowed_by_rls(&table, current)
+                || rest_list_filtered(vec![(key.to_vec(), current.to_vec())], &raw).is_empty()
+            {
+                return Err(ryme_error::RymeError::NotFound(String::from("row")));
+            }
+            if !executor.row_allowed_for_command(&table, current, RlsCommand::Update) {
+                return Err(ryme_error::RymeError::Forbidden);
+            }
+            let Some(mut object) = serde_json::from_slice::<serde_json::Value>(current)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+            else {
+                return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                    "PATCH requires JSON object rows",
+                )));
+            };
+            object.extend(parsed.fields.clone());
+            let value = serde_json::to_vec(&serde_json::Value::Object(object))
+                .map_err(|error| ryme_error::RymeError::InvalidArgument(error.to_string()))?;
+            if !executor.row_allowed_for_command(&table, &value, RlsCommand::Update) {
+                return Err(ryme_error::RymeError::Forbidden);
+            }
+            if !return_minimal && !executor.row_allowed_by_rls(&table, &value) {
+                return Err(ryme_error::RymeError::Forbidden);
+            }
+            admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64)?;
+            Ok(value)
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return error_response(e),
+    };
+    let updated = written
         .iter()
         .map(|(key, value)| {
             record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);

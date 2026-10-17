@@ -506,6 +506,38 @@ where
         table: &str,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<u64> {
+        self.put_many_inner(principal, table, rows, false, |_, _, value| Ok(value.to_vec()))
+            .await
+            .map(|(commit_ts, _)| commit_ts)
+    }
+
+    /// Atomically transforms and writes a batch using each row's current value
+    /// from the same transaction that commits the write. The callback can
+    /// enforce application authorization and safely apply partial updates.
+    pub async fn put_many_transform<F>(
+        &self,
+        principal: &Principal,
+        table: &str,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+        transform: F,
+    ) -> Result<(u64, Vec<(Vec<u8>, Vec<u8>)>)>
+    where
+        F: FnMut(&[u8], Option<&[u8]>, &[u8]) -> Result<Vec<u8>>,
+    {
+        self.put_many_inner(principal, table, rows, true, transform).await
+    }
+
+    async fn put_many_inner<F>(
+        &self,
+        principal: &Principal,
+        table: &str,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+        include_written_rows: bool,
+        mut transform: F,
+    ) -> Result<(u64, Vec<(Vec<u8>, Vec<u8>)>)>
+    where
+        F: FnMut(&[u8], Option<&[u8]>, &[u8]) -> Result<Vec<u8>>,
+    {
         self.reject_if_read_only()?;
         validate_table(table)?;
         if rows.is_empty() {
@@ -518,25 +550,32 @@ where
         let mut txn = self.begin();
         let mut seen = HashSet::with_capacity(rows.len());
         let mut changes = Vec::with_capacity(rows.len());
-        for (pk, value) in rows {
+        for (pk, proposed) in rows {
             if pk.is_empty() || pk.len() > MAX_KEY_BYTES {
                 return Err(RymeError::InvalidArgument(String::from("key")));
             }
-            if value.len() > MAX_VALUE_BYTES {
+            if proposed.len() > MAX_VALUE_BYTES {
                 return Err(RymeError::Overload(String::from("value")));
             }
             if !seen.insert(pk.clone()) {
                 return Err(RymeError::Conflict(String::from("duplicate key")));
             }
-            self.policies.check_write_row(principal, table, &value)?;
             let key = RecordKey::new(&principal.tenant, &self.database, table, &pk);
             let before = self.read_for_write(&mut txn, &key).await?;
             self.reject_hidden_existing(principal, table, before.as_ref())?;
+            let value = transform(&pk, before.as_deref(), &proposed)?;
+            if value.len() > MAX_VALUE_BYTES {
+                return Err(RymeError::Overload(String::from("value")));
+            }
+            self.policies.check_write_row(principal, table, &value)?;
             let op = if before.is_some() { Operation::Update } else { Operation::Insert };
             self.manager.try_put(&mut txn, key, value.clone())?;
             changes.push((pk, before, value, op));
         }
         let commit_ts = self.manager.commit(txn).await?;
+        let written = include_written_rows
+            .then(|| changes.iter().map(|(pk, _, after, _)| (pk.clone(), after.clone())).collect())
+            .unwrap_or_default();
         for (pk, before, after, op) in changes {
             self.publish_change(NewChange {
                 tenant: principal.tenant.clone(),
@@ -552,7 +591,7 @@ where
             });
         }
         self.refresh_table(principal, table, commit_ts);
-        Ok(commit_ts)
+        Ok((commit_ts, written))
     }
 
     pub async fn put_with_ttl(

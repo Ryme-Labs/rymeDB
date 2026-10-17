@@ -1328,7 +1328,7 @@ paths:
           $ref: '#/components/responses/Forbidden'
     post:
       tags: [rest]
-      description: "Insert key/value rows, a JSON object or array with an id/key field, and resolve duplicates with on_conflict=<field>. The default row representation requires SELECT on the table; use Prefer: return=minimal for write-only access."
+      description: "Insert key/value rows, a JSON object or array with an id/key field. Duplicate primary keys return 409 unless on_conflict=<field> requests an upsert, which requires INSERT and UPDATE permissions and policies. The default row representation also requires SELECT permission and a matching SELECT policy; use Prefer: return=minimal for write-only access."
       parameters:
         - $ref: '#/components/parameters/TableParam'
       responses:
@@ -1340,9 +1340,11 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
     patch:
       tags: [rest]
-      description: "Upsert key/value rows or partially update JSON object rows selected by PostgREST filters. The default row representation requires SELECT on the table; use Prefer: return=minimal for write-only access."
+      description: "Upsert key/value rows or partially update JSON object rows selected by PostgREST filters. UPDATE policies must allow both the existing row and the resulting row. The default row representation requires SELECT permission and a matching SELECT policy; use Prefer: return=minimal for write-only access."
       parameters:
         - $ref: '#/components/parameters/TableParam'
       responses:
