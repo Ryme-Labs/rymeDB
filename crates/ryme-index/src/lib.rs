@@ -16,14 +16,20 @@ pub const MAX_TEXT_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMS_PER_DOCUMENT: usize = 65_536;
 /// Conservative accounting budget for retained full-text index structures.
 pub const MAX_TEXT_INDEX_BYTES: usize = 128 * 1024 * 1024;
+/// Per-tenant share of the process-wide full-text index budget.
+pub const MAX_TENANT_TEXT_INDEX_BYTES: usize = MAX_TEXT_INDEX_BYTES / 4;
 /// Conservative accounting budget for retained HNSW vector index structures.
 pub const MAX_VECTOR_INDEX_BYTES: usize = 256 * 1024 * 1024;
+/// Per-tenant share of the process-wide HNSW vector index budget.
+pub const MAX_TENANT_VECTOR_INDEX_BYTES: usize = MAX_VECTOR_INDEX_BYTES / 4;
 pub const HNSW_M: usize = 16;
 pub const HNSW_EF_BUILD: usize = 64;
 const HNSW_HIGH_DIM_M: usize = 32;
 const HNSW_HIGH_DIM_THRESHOLD: usize = 64;
 const HNSW_EXACT_FALLBACK_MAX: usize = HNSW_M * HNSW_EF_BUILD * 2;
 const HNSW_NODE_OVERHEAD_BYTES: usize = 8 * 1024;
+const MAX_INDEX_TENANT_BYTES: usize = 256;
+const DEFAULT_INDEX_TENANT: &str = "default";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorHit {
@@ -144,16 +150,33 @@ fn projected_vector_index_bytes(
     dimension: usize,
     is_new: bool,
 ) -> Result<usize> {
+    projected_vector_index_bytes_with_limit(
+        current,
+        id_bytes,
+        dimension,
+        is_new,
+        MAX_VECTOR_INDEX_BYTES,
+        "vector index memory",
+    )
+}
+
+fn projected_vector_index_bytes_with_limit(
+    current: usize,
+    id_bytes: usize,
+    dimension: usize,
+    is_new: bool,
+    limit: usize,
+    error: &'static str,
+) -> Result<usize> {
     let growth = estimate_vector_node_bytes(id_bytes, dimension).saturating_add(if is_new {
         estimate_vector_id_map_bytes(id_bytes)
     } else {
         0
     });
-    let projected = current
-        .checked_add(growth)
-        .ok_or_else(|| RymeError::Overload(String::from("vector index memory")))?;
-    if projected > MAX_VECTOR_INDEX_BYTES {
-        return Err(RymeError::Overload(String::from("vector index memory")));
+    let projected =
+        current.checked_add(growth).ok_or_else(|| RymeError::Overload(String::from(error)))?;
+    if projected > limit {
+        return Err(RymeError::Overload(String::from(error)));
     }
     Ok(projected)
 }
@@ -572,14 +595,46 @@ fn estimate_text_index_bytes(id: &str, terms: &HashMap<String, u32>) -> usize {
 }
 
 fn updated_text_index_bytes(current: usize, previous: usize, next: usize) -> Result<usize> {
+    updated_index_bytes(current, previous, next, MAX_TEXT_INDEX_BYTES, "text index memory")
+}
+
+fn updated_index_bytes(
+    current: usize,
+    previous: usize,
+    next: usize,
+    limit: usize,
+    error: &'static str,
+) -> Result<usize> {
     let total = current
         .saturating_sub(previous)
         .checked_add(next)
-        .ok_or_else(|| RymeError::Overload(String::from("text index memory")))?;
-    if total > MAX_TEXT_INDEX_BYTES {
-        return Err(RymeError::Overload(String::from("text index memory")));
+        .ok_or_else(|| RymeError::Overload(String::from(error)))?;
+    if total > limit {
+        return Err(RymeError::Overload(String::from(error)));
     }
     Ok(total)
+}
+
+fn validate_index_tenant(tenant: &str) -> Result<()> {
+    if tenant.is_empty() || tenant.len() > MAX_INDEX_TENANT_BYTES || tenant.contains('\0') {
+        return Err(RymeError::InvalidArgument(String::from("index tenant")));
+    }
+    Ok(())
+}
+
+fn update_tenant_index_bytes(
+    usage: &mut HashMap<String, usize>,
+    tenant: &str,
+    previous: usize,
+    next: usize,
+) {
+    let total =
+        usage.get(tenant).copied().unwrap_or(0).saturating_sub(previous).saturating_add(next);
+    if total == 0 {
+        usage.remove(tenant);
+    } else {
+        usage.insert(tenant.to_string(), total);
+    }
 }
 
 impl TextSpace {
@@ -969,8 +1024,11 @@ pub struct PartitionedIndex {
     dims: HashMap<String, usize>,
     vector_counts: HashMap<String, usize>,
     vector_index_bytes: usize,
+    tenant_vector_index_bytes: HashMap<String, usize>,
     text_counts: HashMap<String, usize>,
     text_index_bytes: usize,
+    tenant_text_index_bytes: HashMap<String, usize>,
+    space_tenants: HashMap<String, String>,
     spaces: HashSet<String>,
 }
 
@@ -986,8 +1044,11 @@ impl PartitionedIndex {
             dims: HashMap::new(),
             vector_counts: HashMap::new(),
             vector_index_bytes: 0,
+            tenant_vector_index_bytes: HashMap::new(),
             text_counts: HashMap::new(),
             text_index_bytes: 0,
+            tenant_text_index_bytes: HashMap::new(),
+            space_tenants: HashMap::new(),
             spaces: HashSet::new(),
         }
     }
@@ -1009,8 +1070,27 @@ impl PartitionedIndex {
         (hash % self.partitions.len().max(1) as u64) as usize
     }
 
+    fn validate_space_tenant(&self, tenant: &str, space: &str) -> Result<()> {
+        if self.space_tenants.get(space).is_some_and(|owner| owner != tenant) {
+            return Err(RymeError::Forbidden);
+        }
+        Ok(())
+    }
+
     pub fn vector_upsert(&mut self, space: &str, id: String, vector: Vec<f32>) -> Result<()> {
+        self.vector_upsert_scoped(DEFAULT_INDEX_TENANT, space, id, vector)
+    }
+
+    pub fn vector_upsert_scoped(
+        &mut self,
+        tenant: &str,
+        space: &str,
+        id: String,
+        vector: Vec<f32>,
+    ) -> Result<()> {
+        validate_index_tenant(tenant)?;
         validate_space(space)?;
+        self.validate_space_tenant(tenant, space)?;
         validate_id(&id, "vector id")?;
         if vector.is_empty() || vector.len() > MAX_DIM {
             return Err(RymeError::InvalidArgument(String::from("vector dim")));
@@ -1034,9 +1114,24 @@ impl PartitionedIndex {
             return Err(RymeError::Overload(String::from("vector space")));
         }
         let normalized = normalize(&vector)?;
-        if projected_vector_index_bytes(self.vector_index_bytes, id.len(), normalized.len(), is_new)
-            .is_err()
-        {
+        let tenant_bytes = self.tenant_vector_index_bytes.get(tenant).copied().unwrap_or(0);
+        let needs_compaction = projected_vector_index_bytes(
+            self.vector_index_bytes,
+            id.len(),
+            normalized.len(),
+            is_new,
+        )
+        .is_err()
+            || projected_vector_index_bytes_with_limit(
+                tenant_bytes,
+                id.len(),
+                normalized.len(),
+                is_new,
+                MAX_TENANT_VECTOR_INDEX_BYTES,
+                "tenant vector index memory",
+            )
+            .is_err();
+        if needs_compaction {
             let previous_space_bytes = self.partitions[partition]
                 .vectors
                 .get(space)
@@ -1052,11 +1147,25 @@ impl PartitionedIndex {
                 .vector_index_bytes
                 .saturating_sub(previous_space_bytes)
                 .saturating_add(next_space_bytes);
+            update_tenant_index_bytes(
+                &mut self.tenant_vector_index_bytes,
+                tenant,
+                previous_space_bytes,
+                next_space_bytes,
+            );
             projected_vector_index_bytes(
                 self.vector_index_bytes,
                 id.len(),
                 normalized.len(),
                 is_new,
+            )?;
+            projected_vector_index_bytes_with_limit(
+                self.tenant_vector_index_bytes.get(tenant).copied().unwrap_or(0),
+                id.len(),
+                normalized.len(),
+                is_new,
+                MAX_TENANT_VECTOR_INDEX_BYTES,
+                "tenant vector index memory",
             )?;
         }
         let previous_space_bytes = self.partitions[partition]
@@ -1075,8 +1184,15 @@ impl PartitionedIndex {
             .vector_index_bytes
             .saturating_sub(previous_space_bytes)
             .saturating_add(next_space_bytes);
+        update_tenant_index_bytes(
+            &mut self.tenant_vector_index_bytes,
+            tenant,
+            previous_space_bytes,
+            next_space_bytes,
+        );
         self.dims.entry(space.to_string()).or_insert(dim);
         self.spaces.insert(space.to_string());
+        self.space_tenants.entry(space.to_string()).or_insert_with(|| tenant.to_string());
         if is_new {
             *self.vector_counts.entry(space.to_string()).or_default() += 1;
         }
@@ -1084,6 +1200,15 @@ impl PartitionedIndex {
     }
 
     pub fn vector_remove(&mut self, space: &str, id: &str) -> bool {
+        self.vector_remove_scoped(DEFAULT_INDEX_TENANT, space, id)
+    }
+
+    pub fn vector_remove_scoped(&mut self, tenant: &str, space: &str, id: &str) -> bool {
+        if validate_index_tenant(tenant).is_err()
+            || self.validate_space_tenant(tenant, space).is_err()
+        {
+            return false;
+        }
         let partition = self.route(space, id);
         let previous_space_bytes = self.partitions[partition]
             .vectors
@@ -1101,6 +1226,12 @@ impl PartitionedIndex {
                 .vector_index_bytes
                 .saturating_sub(previous_space_bytes)
                 .saturating_add(next_space_bytes);
+            update_tenant_index_bytes(
+                &mut self.tenant_vector_index_bytes,
+                tenant,
+                previous_space_bytes,
+                next_space_bytes,
+            );
             decrement_count(&mut self.vector_counts, space);
             self.remove_empty_space(space);
         }
@@ -1157,7 +1288,19 @@ impl PartitionedIndex {
     }
 
     pub fn text_index(&mut self, space: &str, id: String, text: &str) -> Result<usize> {
+        self.text_index_scoped(DEFAULT_INDEX_TENANT, space, id, text)
+    }
+
+    pub fn text_index_scoped(
+        &mut self,
+        tenant: &str,
+        space: &str,
+        id: String,
+        text: &str,
+    ) -> Result<usize> {
+        validate_index_tenant(tenant)?;
         validate_space(space)?;
+        self.validate_space_tenant(tenant, space)?;
         validate_id(&id, "text id")?;
         if !self.spaces.contains(space) && self.spaces.len() >= MAX_INDEX_SPACES {
             return Err(RymeError::Overload(String::from("index spaces")));
@@ -1180,9 +1323,18 @@ impl PartitionedIndex {
             .unwrap_or(0);
         let next_index_bytes =
             updated_text_index_bytes(self.text_index_bytes, previous_index_bytes, index_bytes)?;
+        let next_tenant_index_bytes = updated_index_bytes(
+            self.tenant_text_index_bytes.get(tenant).copied().unwrap_or(0),
+            previous_index_bytes,
+            index_bytes,
+            MAX_TENANT_TEXT_INDEX_BYTES,
+            "tenant text index memory",
+        )?;
         let terms = self.partitions[partition].text_index_parsed(space, id, terms)?;
         self.text_index_bytes = next_index_bytes;
+        self.tenant_text_index_bytes.insert(tenant.to_string(), next_tenant_index_bytes);
         self.spaces.insert(space.to_string());
+        self.space_tenants.entry(space.to_string()).or_insert_with(|| tenant.to_string());
         if is_new {
             *self.text_counts.entry(space.to_string()).or_default() += 1;
         }
@@ -1190,6 +1342,15 @@ impl PartitionedIndex {
     }
 
     pub fn text_remove(&mut self, space: &str, id: &str) -> bool {
+        self.text_remove_scoped(DEFAULT_INDEX_TENANT, space, id)
+    }
+
+    pub fn text_remove_scoped(&mut self, tenant: &str, space: &str, id: &str) -> bool {
+        if validate_index_tenant(tenant).is_err()
+            || self.validate_space_tenant(tenant, space).is_err()
+        {
+            return false;
+        }
         let partition = self.route(space, id);
         let index_bytes = self.partitions[partition]
             .texts
@@ -1200,6 +1361,7 @@ impl PartitionedIndex {
         let removed = self.partitions[partition].text_remove(space, id);
         if removed {
             self.text_index_bytes = self.text_index_bytes.saturating_sub(index_bytes);
+            update_tenant_index_bytes(&mut self.tenant_text_index_bytes, tenant, index_bytes, 0);
             decrement_count(&mut self.text_counts, space);
             self.remove_empty_space(space);
         }
@@ -1263,6 +1425,7 @@ impl PartitionedIndex {
         if !still_present {
             self.spaces.remove(space);
             self.dims.remove(space);
+            self.space_tenants.remove(space);
         }
     }
 }
@@ -1498,6 +1661,33 @@ mod tests {
     }
 
     #[test]
+    fn vector_index_budget_is_tenant_scoped_and_spaces_keep_their_owner() {
+        let mut registry = PartitionedIndex::new(2);
+        let id = String::from("v");
+        let growth =
+            estimate_vector_node_bytes(id.len(), 2) + estimate_vector_id_map_bytes(id.len());
+        registry
+            .tenant_vector_index_bytes
+            .insert(String::from("tenant-a"), MAX_TENANT_VECTOR_INDEX_BYTES - growth + 1);
+        assert!(matches!(
+            registry.vector_upsert_scoped("tenant-a", "space-a", id.clone(), vec![1.0, 0.0]),
+            Err(RymeError::Overload(message)) if message == "tenant vector index memory"
+        ));
+        assert!(!registry.spaces.contains("space-a"));
+
+        registry.tenant_vector_index_bytes.remove("tenant-a");
+        registry.vector_upsert_scoped("tenant-a", "space-a", id.clone(), vec![1.0, 0.0]).unwrap();
+        assert_eq!(registry.tenant_vector_index_bytes.get("tenant-a"), Some(&growth));
+        assert!(matches!(
+            registry.vector_upsert_scoped("tenant-b", "space-a", id.clone(), vec![0.0, 1.0]),
+            Err(RymeError::Forbidden)
+        ));
+        assert!(!registry.vector_remove_scoped("tenant-b", "space-a", &id));
+        assert!(registry.vector_remove_scoped("tenant-a", "space-a", &id));
+        assert!(!registry.tenant_vector_index_bytes.contains_key("tenant-a"));
+    }
+
+    #[test]
     fn vector_remove_drops_hits() {
         let mut registry = IndexRegistry::new();
         registry.vector_upsert("s", String::from("a"), vec![1.0, 0.0]).unwrap();
@@ -1689,6 +1879,28 @@ mod tests {
         registry.text_index_bytes -= 1;
         registry.text_index("docs", id, "alpha beta").unwrap();
         assert_eq!(registry.text_index_bytes, MAX_TEXT_INDEX_BYTES);
+    }
+
+    #[test]
+    fn text_index_budget_is_tenant_scoped_and_reclaimed_on_delete() {
+        let mut registry = PartitionedIndex::new(2);
+        let id = String::from("doc");
+        let terms = parse_text_terms(&id, "alpha beta").unwrap();
+        let cost = estimate_text_index_bytes(&id, &terms);
+        registry
+            .tenant_text_index_bytes
+            .insert(String::from("tenant-a"), MAX_TENANT_TEXT_INDEX_BYTES - cost + 1);
+        assert!(matches!(
+            registry.text_index_scoped("tenant-a", "space-a", id.clone(), "alpha beta"),
+            Err(RymeError::Overload(message)) if message == "tenant text index memory"
+        ));
+        assert!(!registry.spaces.contains("space-a"));
+
+        registry.tenant_text_index_bytes.remove("tenant-a");
+        registry.text_index_scoped("tenant-a", "space-a", id.clone(), "alpha beta").unwrap();
+        assert_eq!(registry.tenant_text_index_bytes.get("tenant-a"), Some(&cost));
+        assert!(registry.text_remove_scoped("tenant-a", "space-a", &id));
+        assert!(!registry.tenant_text_index_bytes.contains_key("tenant-a"));
     }
 
     #[test]

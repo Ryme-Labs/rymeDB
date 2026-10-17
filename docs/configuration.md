@@ -48,11 +48,13 @@ ryme-server --config /etc/rymedb/node.json
 
 Search indexes have fixed estimated-memory admission budgets shared across all
 index spaces in one server process: 128 MiB for full-text structures and 256
-MiB for vector/HNSW structures. The estimates include index metadata, IDs, and
-retained HNSW tombstones. Full-text replacement/deletion releases its previous
-reservation; vector removal releases ID-map accounting immediately, while
-tombstoned graph-node accounting remains until compaction. Indexing is rejected
-with an overload error when its budget is exhausted. These are
+MiB for vector/HNSW structures. Per-tenant ceilings are one quarter of those
+budgets (32 MiB full-text, 64 MiB vector), so a single tenant cannot consume
+the node-wide search-index allowance. The estimates include index metadata,
+IDs, and retained HNSW tombstones. Full-text replacement/deletion releases its
+previous reservation; vector removal releases ID-map accounting immediately,
+while tombstoned graph-node accounting remains until compaction. Indexing is
+rejected with an overload error when either budget is exhausted. These are
 index-structure budgets, not caps on total process memory, and are not
 currently configurable.
 

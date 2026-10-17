@@ -9639,7 +9639,12 @@ async fn vector_upsert(
     };
     {
         let mut indexes = state.indexes.write().await;
-        match indexes.vector_upsert(&space, request.id, request.vector) {
+        match indexes.vector_upsert_scoped(
+            &principal.tenant,
+            &space,
+            request.id,
+            request.vector,
+        ) {
             Ok(()) => {
                 record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
@@ -9821,7 +9826,7 @@ async fn vector_delete(
         Err(e) => return error_response(e),
     };
     let mut indexes = state.indexes.write().await;
-    let removed = indexes.vector_remove(&space, &id);
+    let removed = indexes.vector_remove_scoped(&principal.tenant, &space, &id);
     (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
 }
 
@@ -9880,7 +9885,12 @@ async fn text_index(
     };
     {
         let mut indexes = state.indexes.write().await;
-        match indexes.text_index(&space, request.id, &request.text) {
+        match indexes.text_index_scoped(
+            &principal.tenant,
+            &space,
+            request.id,
+            &request.text,
+        ) {
             Ok(terms) => {
                 record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "terms": terms }))).into_response()
@@ -9991,7 +10001,7 @@ async fn text_delete(
         Err(e) => return error_response(e),
     };
     let mut indexes = state.indexes.write().await;
-    let removed = indexes.text_remove(&space, &id);
+    let removed = indexes.text_remove_scoped(&principal.tenant, &space, &id);
     (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response()
 }
 
