@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 pub const WAL_MAGIC: u32 = 0x52594D45;
 pub const WAL_VERSION: u16 = 1;
 pub const MAX_WAL_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
+const WAL_FRAME_HEADER_BYTES: usize = 4 + 2 + 2 + 8 + 8 + 4;
+const WAL_FRAME_TRAILER_BYTES: usize = 4;
+const WAL_FRAME_OVERHEAD_BYTES: usize = WAL_FRAME_HEADER_BYTES + WAL_FRAME_TRAILER_BYTES;
+const MAX_WAL_PAYLOAD_BYTES: usize = MAX_WAL_SEGMENT_BYTES as usize - WAL_FRAME_OVERHEAD_BYTES;
 const REWRITE_DIR: &str = ".rewrite";
 const REWRITE_MARKER: &str = ".rewrite-in-progress";
 
@@ -439,7 +443,7 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
 
 fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Result<Vec<u8>> {
     validate_payload_len(payload.len())?;
-    let mut buf = BytesMut::with_capacity(20 + payload.len());
+    let mut buf = BytesMut::with_capacity(WAL_FRAME_OVERHEAD_BYTES + payload.len());
     buf.put_u32(WAL_MAGIC);
     buf.put_u16(WAL_VERSION);
     buf.put_u16(0);
@@ -453,7 +457,7 @@ fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn validate_payload_len(payload_len: usize) -> Result<()> {
-    if payload_len > u32::MAX as usize {
+    if payload_len > MAX_WAL_PAYLOAD_BYTES {
         return Err(RymeError::InvalidArgument(String::from("payload too large")));
     }
     Ok(())
@@ -559,10 +563,11 @@ mod tests {
 
     #[test]
     fn payload_length_matches_wire_format() {
-        assert!(validate_payload_len(u32::MAX as usize).is_ok());
-        if let Some(oversized) = (u32::MAX as usize).checked_add(1) {
-            assert!(matches!(validate_payload_len(oversized), Err(RymeError::InvalidArgument(_))));
-        }
+        assert!(validate_payload_len(MAX_WAL_PAYLOAD_BYTES).is_ok());
+        assert!(matches!(
+            validate_payload_len(MAX_WAL_PAYLOAD_BYTES + 1),
+            Err(RymeError::InvalidArgument(message)) if message == "payload too large"
+        ));
     }
 
     #[test]
