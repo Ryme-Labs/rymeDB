@@ -61,16 +61,21 @@ impl BranchManager {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        if let Ok(metadata) = std::fs::metadata(path) {
-            if metadata.len() > MAX_BRANCH_METADATA_BYTES as u64 {
-                return Err(RymeError::Overload(String::from("branch metadata")));
-            }
-        }
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
+        use std::io::Read;
+
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
             Err(error) => return Err(error.into()),
         };
+        let file_len = file.metadata()?.len();
+        if file_len > MAX_BRANCH_METADATA_BYTES as u64 {
+            return Err(RymeError::Overload(String::from("branch metadata")));
+        }
+        let capacity = usize::try_from(file_len)
+            .map_err(|_| RymeError::Overload(String::from("branch metadata")))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take((MAX_BRANCH_METADATA_BYTES as u64).saturating_add(1)).read_to_end(&mut bytes)?;
         if bytes.len() > MAX_BRANCH_METADATA_BYTES {
             return Err(RymeError::Overload(String::from("branch metadata")));
         }
@@ -1295,6 +1300,23 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&manager).unwrap()).unwrap();
 
         assert!(BranchManager::load(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_rejects_oversized_metadata_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-branches-limit-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_BRANCH_METADATA_BYTES + 1) as u64).unwrap();
+
+        assert!(matches!(
+            BranchManager::load(&path),
+            Err(RymeError::Overload(message)) if message == "branch metadata"
+        ));
         let _ = std::fs::remove_file(path);
     }
 

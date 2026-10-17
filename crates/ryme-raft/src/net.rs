@@ -474,16 +474,20 @@ fn derived_range_id(start: &[u8], end: &[u8], epoch: u64) -> String {
 }
 
 fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > MAX_RAFT_METADATA_BYTES as u64 {
-            return Err(RymeError::Overload(label.to_string()));
-        }
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    use std::io::Read;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    let file_len = file.metadata()?.len();
+    if file_len > MAX_RAFT_METADATA_BYTES as u64 {
+        return Err(RymeError::Overload(label.to_string()));
+    }
+    let capacity = usize::try_from(file_len).map_err(|_| RymeError::Overload(label.to_string()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_RAFT_METADATA_BYTES as u64).saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_RAFT_METADATA_BYTES {
         return Err(RymeError::Overload(label.to_string()));
     }
