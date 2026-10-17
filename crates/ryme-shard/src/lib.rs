@@ -719,24 +719,17 @@ impl ShardSet {
 
     fn touch(&self, txn: &Transaction, key: &RecordKey) -> usize {
         let table = TableRef::of(key);
-        {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if inner.side.len() > 4096 {
-                inner.side.retain(|_, ctx| ctx.touched.elapsed().as_secs() < 120);
-            }
-        }
-        let shard = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let shard = route_record(&inner.ranges, key).unwrap_or_else(|| {
-                inner
-                    .place
-                    .get(&table)
-                    .copied()
-                    .unwrap_or_else(|| hash_table(&table, inner.shards.len()))
-            });
-            shard
-        };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.side.len() > 4096 {
+            inner.side.retain(|_, ctx| ctx.touched.elapsed().as_secs() < 120);
+        }
+        let shard = route_record(&inner.ranges, key).unwrap_or_else(|| {
+            inner
+                .place
+                .get(&table)
+                .copied()
+                .unwrap_or_else(|| hash_table(&table, inner.shards.len()))
+        });
         let entry = inner.side.entry(txn.id).or_insert_with(|| ShardCtx {
             shard: None,
             tables: Vec::new(),
