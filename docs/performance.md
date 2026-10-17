@@ -136,10 +136,18 @@ baseline capture, so treat it as directional, not a general speed claim. The
 optimization is for Hot-mode `Engine::read_many`; Standard segment reads follow
 a separate code path. See the [before/after captures](../bench/results/txn-read-batch-hot-duplicates-20261017.json).
 
-A segment-batch duplicate-elimination prototype was not retained: its unique-key
-read-only p50 regressed from 490 µs to 588 µs with hashing and 529 µs with
-sorting. Repeated-key batches benefited, but the general path must not penalize
-the unique-key workload without a cheaper exact duplicate check.
+Standard segment batch reads now bypass duplicate detection for strictly
+ascending and descending batches. For other batches of at least 16 keys, they
+resolve each distinct key once and fan its value back to duplicate positions.
+On the Ryzen 5 4500, two release captures with 64 records, 1,024 reads per
+iteration, 100 iterations, and batches of 256 measured read-only p50 at
+177.1–177.3 µs, versus 223.2–223.6 µs before this change (about 21% lower).
+Descending repeated-key batches measured 172.2–172.9 µs. This is a local,
+in-process result, not end-to-end RESP latency. The batch benchmark also reports
+a deterministic shuffled-key control: the current 1,024-distinct-key p50 was
+about 518 µs, but there is no matching pre-change shuffled capture, so that
+number does not establish a before/after effect. Use the reproduction command
+above with `--records 64` for repeated keys and `--records 1024` for unique keys.
 
 Standard segment point reads previously Bloom-checked, binary-searched the
 segment key vector, then searched the same key in the segment engine. Removing

@@ -14,6 +14,7 @@ const DELTA_COMPACTION_VERSION: u16 = 1;
 const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
+const MIN_SEGMENT_DEDUP_BATCH_READ: usize = 16;
 const MAX_DELTA_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
@@ -708,14 +709,44 @@ impl SegmentStore {
             return Ok(Vec::new());
         }
 
+        let mut deduplicated = None;
+        if key_count >= MIN_SEGMENT_DEDUP_BATCH_READ {
+            let (mut strictly_ordered, mut strictly_reversed) = (true, true);
+            for index in 1..key_count {
+                strictly_ordered &= key_at(index - 1) < key_at(index);
+                strictly_reversed &= key_at(index - 1) > key_at(index);
+                if !strictly_ordered && !strictly_reversed {
+                    break;
+                }
+            }
+            if !strictly_ordered && !strictly_reversed {
+                let mut unique_indices = Vec::with_capacity(key_count);
+                let mut duplicate_indices = Vec::new();
+                let mut first_indices = HashMap::new();
+                for index in 0..key_count {
+                    let key = key_at(index);
+                    if let Some(first) = first_indices.get(key) {
+                        duplicate_indices.push((index, *first));
+                    } else {
+                        first_indices.insert(key, index);
+                        unique_indices.push(index);
+                    }
+                }
+                if !duplicate_indices.is_empty() {
+                    deduplicated = Some((unique_indices, duplicate_indices));
+                }
+            }
+        }
+
         let _segment_io = self
             .segment_io
             .read()
             .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
         let paths = self.newest_paths()?;
         let mut values = vec![None; key_count];
-        let mut unresolved = (0..key_count).collect::<Vec<_>>();
-        let mut next_unresolved = Vec::with_capacity(key_count);
+        let (mut unresolved, duplicate_indices) =
+            deduplicated.unwrap_or_else(|| ((0..key_count).collect(), Vec::new()));
+        let mut next_unresolved = Vec::with_capacity(unresolved.len());
 
         for path in paths.iter().rev() {
             let segment = self.read_segment_under_lock(path)?;
@@ -732,6 +763,10 @@ impl SegmentStore {
             if unresolved.is_empty() || is_snapshot {
                 break;
             }
+        }
+
+        for (duplicate, first) in duplicate_indices {
+            values[duplicate] = values[first].clone();
         }
 
         Ok(values)
@@ -2078,13 +2113,31 @@ mod tests {
         assert_eq!(
             store
                 .get_many(
-                    &[second.clone(), first.clone(), missing, second.clone(), first.clone()],
+                    &[
+                        second.clone(),
+                        first.clone(),
+                        missing.clone(),
+                        second.clone(),
+                        first.clone(),
+                    ],
                     12,
                     0,
                 )
                 .unwrap(),
             vec![Some(b"two".to_vec()), None, None, Some(b"two".to_vec()), None,]
         );
+        let repeated = (0..24)
+            .map(|index| match index % 3 {
+                0 => second.clone(),
+                1 => first.clone(),
+                _ => missing.clone(),
+            })
+            .collect::<Vec<_>>();
+        let expected =
+            repeated.iter().map(|key| store.get(key, 12, 0).unwrap()).collect::<Vec<_>>();
+        assert_eq!(store.get_many(&repeated, 12, 0).unwrap(), expected);
+        let borrowed = repeated.iter().collect::<Vec<_>>();
+        assert_eq!(store.get_many_borrowed(&borrowed, 12, 0).unwrap(), expected);
         store.cache.lock().unwrap().remove(11);
         let before_partial_cache_read = store.cache_stats();
         assert_eq!(
