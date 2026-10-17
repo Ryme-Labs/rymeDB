@@ -1,0 +1,43 @@
+{
+  "benchmark": "transaction-batch-read",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 16087887872,
+    "logical_cpus": 12,
+    "os": "linux"
+  },
+  "parameters": {
+    "storage_mode": "hot",
+    "records": 64,
+    "candidates_per_iteration": 1024,
+    "iterations": 100,
+    "batch_size": 256,
+    "value_bytes": 128,
+    "profile": "release"
+  },
+  "notes": "One pre-change capture and two sequential post-change captures on the same local host. In-process MVCC reads only; not network, durability, or cross-database performance. The pre-change capture is a single sample and results are directional.",
+  "before": {
+    "single_read": { "p50_ns": 330405, "p95_ns": 337850, "p99_ns": 339223, "rows_per_second": 3091945 },
+    "read_only_single_read": { "p50_ns": 189769, "p95_ns": 194459, "p99_ns": 196943, "rows_per_second": 5371868 },
+    "read_only_batched_read": { "p50_ns": 300129, "p95_ns": 307081, "p99_ns": 307743, "rows_per_second": 3396524 },
+    "batched_read": { "p50_ns": 448530, "p95_ns": 454581, "p99_ns": 455673, "rows_per_second": 2279940 },
+    "staged_write_batched_read": { "p50_ns": 483215, "p95_ns": 488866, "p99_ns": 495479, "rows_per_second": 2117800 }
+  },
+  "after": [
+    {
+      "single_read": { "p50_ns": 328652, "p95_ns": 375121, "p99_ns": 427449, "rows_per_second": 3052776 },
+      "read_only_single_read": { "p50_ns": 186854, "p95_ns": 207473, "p99_ns": 222271, "rows_per_second": 5387353 },
+      "read_only_batched_read": { "p50_ns": 210138, "p95_ns": 255414, "p99_ns": 283427, "rows_per_second": 4745606 },
+      "batched_read": { "p50_ns": 356606, "p95_ns": 378567, "p99_ns": 489177, "rows_per_second": 2818156 },
+      "staged_write_batched_read": { "p50_ns": 392924, "p95_ns": 501200, "p99_ns": 536857, "rows_per_second": 2514608 }
+    },
+    {
+      "single_read": { "p50_ns": 323864, "p95_ns": 333632, "p99_ns": 341918, "rows_per_second": 3141948 },
+      "read_only_single_read": { "p50_ns": 183237, "p95_ns": 191503, "p99_ns": 195070, "rows_per_second": 5527877 },
+      "read_only_batched_read": { "p50_ns": 210299, "p95_ns": 219827, "p99_ns": 242730, "rows_per_second": 4808723 },
+      "batched_read": { "p50_ns": 356014, "p95_ns": 374931, "p99_ns": 396100, "rows_per_second": 2849307 },
+      "staged_write_batched_read": { "p50_ns": 393345, "p95_ns": 412902, "p99_ns": 419515, "rows_per_second": 2586468 }
+    }
+  ]
+}

@@ -345,7 +345,27 @@ impl Engine {
                 .collect::<Vec<_>>();
             sorted.sort_unstable_by(|left, right| left.1.cmp(right.1));
             if sorted.windows(2).any(|pair| pair[0].1 == pair[1].1) {
-                return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
+                let mut unique_keys = Vec::with_capacity(sorted.len());
+                for (_, key) in &sorted {
+                    if unique_keys.last().is_none_or(|previous| *previous != *key) {
+                        unique_keys.push(*key);
+                    }
+                }
+                let unique_values = self.read_many_impl(&unique_keys, read_ts, now)?;
+                let mut values = vec![None; keys.len()];
+                let mut sorted_index = 0;
+                for (key, value) in unique_keys.iter().zip(unique_values) {
+                    let first = sorted_index;
+                    while sorted_index < sorted.len() && sorted[sorted_index].1 == *key {
+                        sorted_index += 1;
+                    }
+                    let first_output = sorted[first].0;
+                    values[first_output] = value;
+                    for (original_index, _) in &sorted[first + 1..sorted_index] {
+                        values[*original_index] = values[first_output].clone();
+                    }
+                }
+                return Ok(values);
             }
             let sorted_keys = sorted.iter().map(|(_, key)| *key).collect::<Vec<_>>();
             let sorted_values = self.read_many_impl(&sorted_keys, read_ts, now)?;
@@ -1234,8 +1254,10 @@ mod tests {
         let mut unsorted = dense.clone();
         unsorted.swap(0, 1);
         let reversed = dense.iter().rev().cloned().collect::<Vec<_>>();
-        let duplicated =
+        let missing = RecordKey::new("t", "d", "items", &999u64.to_be_bytes());
+        let mut duplicated =
             dense.iter().take(32).chain(dense.iter().take(32)).cloned().collect::<Vec<_>>();
+        duplicated.extend([missing.clone(), missing]);
         let cross_table = (0u64..32)
             .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
             .chain((32u64..64).map(|id| RecordKey::new("t", "d", "other", &id.to_be_bytes())))

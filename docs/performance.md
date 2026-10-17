@@ -126,6 +126,16 @@ measured 323–326 µs vs 536 µs (1.65–1.66×). This is a warmed, repeated-ke
 core workload, not end-to-end RESP or cold-disk latency; see the
 [raw captures](../bench/results/txn-read-batch-repeated.json).
 
+Hot-mode unsorted batches with duplicate keys now sort once, read each distinct
+key through the ordered MVCC range path, and fan values back to the original
+positions. In a fresh run with 64 records, 1,024 reads, 100 iterations, and
+256-key batches, read-only batched p50 moved from 300 µs in one pre-change
+capture to 210 µs in both post-change captures (~30% lower); p95 moved from
+307 µs to 220–255 µs. This is a local in-process comparison with only one
+baseline capture, so treat it as directional, not a general speed claim. The
+optimization is for Hot-mode `Engine::read_many`; Standard segment reads follow
+a separate code path. See the [before/after captures](../bench/results/txn-read-batch-hot-duplicates-20261017.json).
+
 A segment-batch duplicate-elimination prototype was not retained: its unique-key
 read-only p50 regressed from 490 µs to 588 µs with hashing and 529 µs with
 sorting. Repeated-key batches benefited, but the general path must not penalize
