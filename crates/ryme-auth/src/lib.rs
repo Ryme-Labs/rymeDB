@@ -151,16 +151,16 @@ impl PolicyEngine {
     pub fn masked_value(&self, table: &str, value: &[u8]) -> Vec<u8> {
         let fields = match self.masked_fields.read() {
             Ok(guard) => guard.get(table).cloned(),
-            Err(_) => None,
+            Err(_) => return b"\"***\"".to_vec(),
         };
         let Some(fields) = fields else {
             return value.to_vec();
         };
         let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(value) else {
-            return value.to_vec();
+            return b"\"***\"".to_vec();
         };
         let Some(obj) = parsed.as_object_mut() else {
-            return value.to_vec();
+            return b"\"***\"".to_vec();
         };
         for field in fields {
             if obj.contains_key(field.as_str()) {
@@ -2464,6 +2464,17 @@ mod tests {
         engine.mask_fields(String::from("users"), vec![String::from("ssn")]).unwrap();
         engine.mask_fields(String::from("users"), Vec::new()).unwrap();
         assert_eq!(engine.masked_value("users", br#"{"ssn":"123"}"#), br#"{"ssn":"123"}"#);
+    }
+
+    #[test]
+    fn configured_mask_redacts_values_it_cannot_parse_as_objects() {
+        let engine = PolicyEngine::new();
+        engine.mask_fields(String::from("users"), vec![String::from("ssn")]).unwrap();
+
+        for value in [b"not-json".as_slice(), br#"[{"ssn":"123"}]"#, b"123"] {
+            assert_eq!(engine.masked_value("users", value), b"\"***\"");
+            assert!(!engine.masked_value("users", value).windows(3).any(|part| part == b"123"));
+        }
     }
 
     #[test]
