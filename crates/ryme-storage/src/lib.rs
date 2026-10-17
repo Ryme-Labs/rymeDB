@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
 
 mod segment;
@@ -325,6 +325,7 @@ impl Engine {
         let first = keys[0].record_key();
         let mut previous = first;
         let mut ordered = true;
+        let mut reversed = true;
         for key in &keys[1..] {
             let key = key.record_key();
             if key.tenant != first.tenant
@@ -334,56 +335,49 @@ impl Engine {
                 return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
             }
             ordered &= previous < key;
+            reversed &= previous > key;
             previous = key;
         }
 
-        if !ordered {
-            let mut sorted = keys
-                .iter()
-                .enumerate()
-                .map(|(index, key)| (index, key.record_key()))
-                .collect::<Vec<_>>();
-            sorted.sort_unstable_by(|left, right| left.1.cmp(right.1));
-            if sorted.windows(2).any(|pair| pair[0].1 == pair[1].1) {
-                let mut unique_keys = Vec::with_capacity(sorted.len());
-                for (_, key) in &sorted {
-                    if unique_keys.last().is_none_or(|previous| *previous != *key) {
-                        unique_keys.push(*key);
-                    }
+        if !ordered && !reversed {
+            let mut first_indices = HashMap::with_capacity(keys.len());
+            let mut unique = Vec::with_capacity(keys.len());
+            let mut duplicates = Vec::new();
+            for (index, key) in keys.iter().enumerate() {
+                let key = key.record_key();
+                if let Some(first) = first_indices.get(key) {
+                    duplicates.push((index, *first));
+                } else {
+                    first_indices.insert(key, index);
+                    unique.push((index, key));
                 }
-                let unique_values = self.read_many_impl(&unique_keys, read_ts, now)?;
-                let mut values = vec![None; keys.len()];
-                let mut sorted_index = 0;
-                for (key, value) in unique_keys.iter().zip(unique_values) {
-                    let first = sorted_index;
-                    while sorted_index < sorted.len() && sorted[sorted_index].1 == *key {
-                        sorted_index += 1;
-                    }
-                    let first_output = sorted[first].0;
-                    values[first_output] = value;
-                    for (original_index, _) in &sorted[first + 1..sorted_index] {
-                        values[*original_index] = values[first_output].clone();
-                    }
-                }
-                return Ok(values);
             }
-            let sorted_keys = sorted.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-            let sorted_values = self.read_many_impl(&sorted_keys, read_ts, now)?;
+            if duplicates.is_empty() {
+                return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
+            }
+            unique.sort_unstable_by(|left, right| left.1.cmp(right.1));
+            let unique_keys = unique.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+            let unique_values = self.read_many_impl(&unique_keys, read_ts, now)?;
             let mut values = vec![None; keys.len()];
-            for ((original_index, _), value) in sorted.into_iter().zip(sorted_values) {
-                values[original_index] = value;
+            for ((index, _), value) in unique.into_iter().zip(unique_values) {
+                values[index] = value;
+            }
+            for (duplicate, first) in duplicates {
+                values[duplicate] = values[first].clone();
             }
             return Ok(values);
         }
 
         let last = keys[keys.len() - 1].record_key();
+        let (range_start, range_end) = if reversed { (last, first) } else { (first, last) };
 
         let mut entries =
-            self.inner.range((Bound::Included(first), Bound::Included(last))).peekable();
+            self.inner.range((Bound::Included(range_start), Bound::Included(range_end))).peekable();
         let mut values = Vec::with_capacity(keys.len());
         let mut skipped_entries = 0usize;
-        for key in keys {
-            let key = key.record_key();
+        for offset in 0..keys.len() {
+            let index = if reversed { keys.len() - 1 - offset } else { offset };
+            let key = keys[index].record_key();
             loop {
                 let Some((stored_key, versions)) = entries.peek().copied() else {
                     values.push(None);
@@ -411,6 +405,9 @@ impl Engine {
                     }
                 }
             }
+        }
+        if reversed {
+            values.reverse();
         }
         Ok(values)
     }
