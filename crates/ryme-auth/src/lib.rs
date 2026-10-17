@@ -361,6 +361,9 @@ impl ApiKeyStore {
         principal: Principal,
         expires_at: Option<u64>,
     ) -> Result<()> {
+        if !is_token_digest(&digest) {
+            return Err(RymeError::InvalidArgument(String::from("api key digest")));
+        }
         principal.validate()?;
         let mut state =
             self.inner.write().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
@@ -457,6 +460,9 @@ impl ApiKeyStore {
     ) -> Result<Self> {
         if snapshot.len() > MAX_API_KEYS {
             return Err(RymeError::Corrupt(String::from("api key snapshot")));
+        }
+        if snapshot.keys().any(|digest| !is_token_digest(digest)) {
+            return Err(RymeError::Corrupt(String::from("api key snapshot digest")));
         }
         if snapshot.values().any(|principal| principal.validate().is_err()) {
             return Err(RymeError::Corrupt(String::from("api key principal")));
@@ -837,6 +843,11 @@ pub fn base64_url_encode(raw: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
+fn is_token_digest(value: &str) -> bool {
+    base64_url_decode(value)
+        .is_ok_and(|decoded| decoded.len() == 32 && base64_url_encode(&decoded) == value)
+}
+
 pub fn random_bytes(count: usize) -> Vec<u8> {
     use ring::rand::{SecureRandom, SystemRandom};
 
@@ -1009,6 +1020,9 @@ impl RefreshTokenStore {
     pub fn from_snapshot(snapshot: HashMap<String, RefreshTokenRecord>) -> Result<Self> {
         if snapshot.len() > MAX_REFRESH_SESSIONS {
             return Err(RymeError::Corrupt(String::from("refresh token snapshot")));
+        }
+        if snapshot.keys().any(|digest| !is_token_digest(digest)) {
+            return Err(RymeError::Corrupt(String::from("refresh token snapshot digest")));
         }
         if snapshot.values().any(|record| record.principal.validate().is_err()) {
             return Err(RymeError::Corrupt(String::from("refresh token principal")));
@@ -1678,6 +1692,33 @@ mod tests {
         assert!(matches!(
             CredentialStore::from_snapshot(users),
             Err(RymeError::Corrupt(message)) if message == "user snapshot"
+        ));
+    }
+
+    #[test]
+    fn auth_snapshots_reject_noncanonical_token_digests() {
+        let principal = Principal {
+            id: String::from("u"),
+            tenant: String::from("t"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        assert!(matches!(
+            ApiKeyStore::from_snapshot(HashMap::from([(
+                String::from("not-a-digest"),
+                principal.clone(),
+            )])),
+            Err(RymeError::Corrupt(message)) if message == "api key snapshot digest"
+        ));
+        assert!(matches!(
+            RefreshTokenStore::from_snapshot(HashMap::from([(
+                String::from("not-a-digest"),
+                RefreshTokenRecord { principal: principal.clone(), expires_at: 200 },
+            )])),
+            Err(RymeError::Corrupt(message)) if message == "refresh token snapshot digest"
+        ));
+        assert!(matches!(
+            ApiKeyStore::new().restore_digest(String::from("not-a-digest"), principal, None),
+            Err(RymeError::InvalidArgument(message)) if message == "api key digest"
         ));
     }
 
