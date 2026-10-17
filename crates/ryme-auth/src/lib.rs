@@ -631,6 +631,9 @@ impl JwtVerifier {
         let header_raw = base64_url_decode(header_b64).map_err(|_| RymeError::Unauthorized)?;
         let header: serde_json::Value =
             serde_json::from_slice(&header_raw).map_err(|_| RymeError::Unauthorized)?;
+        if header.get("crit").is_some() {
+            return Err(RymeError::Unauthorized);
+        }
         let algorithm = header.get("alg").and_then(|value| value.as_str()).unwrap_or("");
         let presented = base64_url_decode(sig_b64).map_err(|_| RymeError::Unauthorized)?;
         match &self.key {
@@ -1994,6 +1997,32 @@ mod tests {
         assert!(JwtVerifier::new(b"algorithm-confusion-secret".to_vec())
             .principal_from_token(&token, 1000)
             .is_err());
+    }
+
+    #[test]
+    fn jwt_rejects_unsupported_critical_header_parameters() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = b"critical-header-test-key";
+        let header = base64_url_encode(
+            br#"{"alg":"HS256","crit":["future_extension"],"future_extension":true}"#,
+        );
+        let payload = base64_url_encode(
+            serde_json::to_string(&serde_json::json!({
+                "sub": "ada",
+                "role": "authenticated",
+                "exp": 2000000000u64,
+            }))
+            .unwrap()
+            .as_bytes(),
+        );
+        let input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(input.as_bytes());
+        let token = format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()));
+
+        assert!(JwtVerifier::new(secret.to_vec()).principal_from_token(&token, 1000).is_err());
     }
 
     #[test]

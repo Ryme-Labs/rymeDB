@@ -137,6 +137,8 @@ substantially greater length. If only one
 of issuer or audience is configured, startup fails rather than silently
 disabling claim validation. Empty issuer or audience values are rejected by
 the server and JWT verifier.
+JWTs with a JOSE `crit` header are rejected because no critical extensions are
+currently supported.
 Expired, not-yet-valid, and future-issued tokens are rejected with clock-skew
 checks. Mount secrets read-only and rotate them through your deployment
 system.
