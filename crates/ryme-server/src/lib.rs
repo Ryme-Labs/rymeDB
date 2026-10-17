@@ -5619,6 +5619,24 @@ mod rest_compatibility_tests {
             Some(serde_json::json!("patched"))
         );
 
+        let wrong_conflict_target = rest_insert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("on_conflict=payload"))),
+            axum::body::Bytes::from_static(
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"different"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(wrong_conflict_target.status(), StatusCode::CONFLICT);
+        let row = state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap();
+        let row = row.and_then(|row| serde_json::from_slice::<serde_json::Value>(&row).ok());
+        assert_eq!(
+            row.and_then(|row| row.get("payload").cloned()),
+            Some(serde_json::json!("patched"))
+        );
+
         state
             .gateway
             .put(
