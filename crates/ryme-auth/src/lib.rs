@@ -12,6 +12,7 @@ pub enum Role {
     Developer,
     ReadWrite,
     ReadOnly,
+    Anon,
     RealtimePublisher,
     RealtimeSubscriber,
 }
@@ -35,6 +36,14 @@ impl Principal {
         self.roles.contains(&Role::Superuser)
     }
 
+    pub fn sql_auth_uid(&self) -> Option<&str> {
+        if self.can_platform_admin() || (self.roles.contains(&Role::Anon) && !self.can_write()) {
+            None
+        } else {
+            Some(&self.id)
+        }
+    }
+
     pub fn can_write(&self) -> bool {
         self.can_platform_admin()
             || self.roles.contains(&Role::Owner)
@@ -54,7 +63,7 @@ impl Principal {
             "postgres"
         } else if self.can_write() {
             "authenticated"
-        } else if self.roles.contains(&Role::ReadOnly) {
+        } else if self.roles.contains(&Role::ReadOnly) || self.roles.contains(&Role::Anon) {
             "anon"
         } else {
             "realtime_subscriber"
@@ -64,6 +73,7 @@ impl Principal {
     pub fn can_read(&self) -> bool {
         self.can_write()
             || self.roles.contains(&Role::ReadOnly)
+            || self.roles.contains(&Role::Anon)
             || self.roles.contains(&Role::RealtimeSubscriber)
     }
 
@@ -691,7 +701,8 @@ fn parse_role(name: &str) -> Option<Role> {
         "admin" => Some(Role::Admin),
         "developer" => Some(Role::Developer),
         "readwrite" | "read_write" | "authenticated" => Some(Role::ReadWrite),
-        "readonly" | "read_only" | "anon" => Some(Role::ReadOnly),
+        "readonly" | "read_only" => Some(Role::ReadOnly),
+        "anon" => Some(Role::Anon),
         "realtime_publisher" => Some(Role::RealtimePublisher),
         "realtime_subscriber" => Some(Role::RealtimeSubscriber),
         _ => None,
@@ -1880,6 +1891,32 @@ mod tests {
         assert_eq!(principal.tenant, "project-a");
         assert!(principal.roles.contains(&Role::ReadWrite));
         assert!(principal.roles.contains(&Role::RealtimeSubscriber));
+    }
+
+    #[test]
+    fn anonymous_and_user_read_only_roles_keep_distinct_identity_semantics() {
+        let anonymous = Principal {
+            id: String::from("public"),
+            tenant: String::from("default"),
+            roles: [Role::Anon].into_iter().collect(),
+        };
+        let user = Principal {
+            id: String::from("user-1"),
+            tenant: String::from("default"),
+            roles: [Role::ReadOnly].into_iter().collect(),
+        };
+
+        assert!(anonymous.can_read());
+        assert!(!anonymous.can_write());
+        assert_eq!(anonymous.sql_role(), "anon");
+        assert_eq!(anonymous.sql_auth_uid(), None);
+        assert!(user.can_read());
+        assert!(!user.can_write());
+        assert_eq!(user.sql_role(), "anon");
+        assert_eq!(user.sql_auth_uid(), Some("user-1"));
+        assert!(claim_roles(&serde_json::json!({ "role": "anon" })).contains(&Role::Anon));
+        assert_eq!(parse_role("anon"), Some(Role::Anon));
+        assert_eq!(parse_role("readonly"), Some(Role::ReadOnly));
     }
 
     fn oidc_test_config() -> OidcConfig {

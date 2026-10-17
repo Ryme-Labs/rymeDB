@@ -876,10 +876,9 @@ where
     let tenant = principal.tenant.clone();
     let role = principal.sql_role().to_string();
     let executor = (*executor).clone().with_tenant(tenant.clone()).with_role(role.clone());
-    let executor = if principal.can_platform_admin() {
-        executor.without_auth_uid()
-    } else {
-        executor.with_auth_uid(principal.id.clone())
+    let executor = match principal.sql_auth_uid() {
+        Some(auth_uid) => executor.with_auth_uid(auth_uid.to_string()),
+        None => executor.without_auth_uid(),
     };
     let executor = Arc::new(executor);
     let mut limits = limits.with_tenant(tenant);

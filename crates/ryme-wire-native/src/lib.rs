@@ -598,10 +598,9 @@ where
             })
             .with_tenant(principal.tenant.clone())
             .with_role(principal.sql_role().to_string());
-        executor = if principal.can_platform_admin() {
-            executor.without_auth_uid()
-        } else {
-            executor.with_auth_uid(principal.id.clone())
+        executor = match principal.sql_auth_uid() {
+            Some(uid) => executor.with_auth_uid(uid.to_string()),
+            None => executor.without_auth_uid(),
         };
         if self.gateway.is_read_only() {
             executor.set_read_only(true);

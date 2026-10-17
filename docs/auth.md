@@ -101,6 +101,10 @@ JWTs accept rymeDB claims (`tenant`, `roles`) and common Supabase claims
 | `superuser` | Platform administration; JWT claim is ignored unless explicitly enabled |
 | `owner` / `admin` | Tenant-local administration; no cluster, archive, or platform access |
 
+The public `anon` principal has no user identity, so `auth.uid()` is `NULL`.
+An authenticated `readonly` user also maps to SQL role `anon`, but retains that
+user's `auth.uid()` for row policies.
+
 The exact policy is still enforced by the server's configured principal and
 table rules. A valid token is not automatically permission to administer the
 cluster. Tokens without a recognized data-access role authenticate without

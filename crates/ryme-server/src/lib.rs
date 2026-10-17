@@ -4657,10 +4657,9 @@ where
     B: ryme_txn::TxnBackend,
 {
     let executor = executor.with_role(principal.sql_role().to_string());
-    if principal.can_platform_admin() {
-        executor.without_auth_uid()
-    } else {
-        executor.with_auth_uid(principal.id.clone())
+    match principal.sql_auth_uid() {
+        Some(auth_uid) => executor.with_auth_uid(auth_uid.to_string()),
+        None => executor.without_auth_uid(),
     }
 }
 
@@ -6274,6 +6273,9 @@ fn parse_roles(
             "readonly" => {
                 roles.insert(Role::ReadOnly);
             }
+            "anon" => {
+                roles.insert(Role::Anon);
+            }
             "realtime_publisher" => {
                 roles.insert(Role::RealtimePublisher);
             }
@@ -6399,7 +6401,7 @@ fn install_public_api_key(
     let principal = Principal {
         id: String::from("public"),
         tenant: tenant.to_string(),
-        roles: [Role::ReadOnly].into_iter().collect(),
+        roles: [Role::Anon].into_iter().collect(),
     };
     keys.insert(api_key, principal)
 }
@@ -15175,6 +15177,7 @@ mod realtime_policy_tests {
         assert!(public.can_read());
         assert!(!public.can_write());
         assert!(!public.can_admin());
+        assert!(public.roles.contains(&Role::Anon));
         assert_eq!(public.sql_role(), "anon");
         assert_eq!(public.tenant, "default");
     }
@@ -15189,6 +15192,17 @@ mod realtime_policy_tests {
         let config = Config { data_dir: dir.clone(), ..Config::default() };
         let state = SharedState::build(&config).unwrap();
         install_public_api_key(&state.keys, String::from("public-test-key"), "default").unwrap();
+        state
+            .keys
+            .insert(
+                String::from("user-test-key"),
+                Principal {
+                    id: String::from("user-1"),
+                    tenant: String::from("default"),
+                    roles: [Role::ReadOnly].into_iter().collect(),
+                },
+            )
+            .unwrap();
 
         let admin = state.executor.clone().with_role(String::from("postgres")).without_auth_uid();
         for sql in [
@@ -15215,9 +15229,27 @@ mod realtime_policy_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
-        assert!(value.to_string().contains("visible"));
+        assert_eq!(value["rows"].as_array().unwrap().len(), 0);
+        assert!(!value.to_string().contains("visible"));
         assert!(!value.to_string().contains("hidden"));
+
+        let mut user_headers = HeaderMap::new();
+        user_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer user-test-key"),
+        );
+        let response = sql_exec(
+            State(state.clone()),
+            user_headers,
+            axum::body::Bytes::from_static(br#"{"sql":"SELECT * FROM public_messages"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
+        assert!(value.to_string().contains("hidden"));
+        assert!(!value.to_string().contains("visible"));
 
         let response = sql_exec(
             State(state),
