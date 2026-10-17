@@ -1172,13 +1172,21 @@ impl TxnManager {
         }
 
         let now = now_unix();
-        if txn.read_only && txn.writes.is_empty() {
-            let engine = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-            return engine.read_many(keys, txn.read_ts, now);
+        if txn.writes.is_empty() {
+            let values = {
+                let engine = self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+                engine.read_many(keys, txn.read_ts, now)?
+            };
+            if !txn.read_only {
+                for (key, value) in keys.iter().zip(&values) {
+                    txn.record_read_ref(key, value.is_some())?;
+                }
+            }
+            return Ok(values);
         }
 
         let mut values = Vec::with_capacity(keys.len());
@@ -3427,6 +3435,10 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(txn.read_keys().is_empty());
+
+        let mut tracked = manager.begin();
+        assert_eq!(manager.get_many(&mut tracked, &keys).unwrap(), values);
+        assert_eq!(tracked.read_keys(), &keys.iter().cloned().collect());
     }
 
     #[test]
