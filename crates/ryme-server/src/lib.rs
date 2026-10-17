@@ -5373,6 +5373,106 @@ mod rest_compatibility_tests {
         assert!(rest_prefer(&headers, "count=exact"));
         assert!(!rest_prefer(&headers, "return=representation"));
     }
+
+    #[tokio::test]
+    async fn rest_write_representations_require_select_privilege() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-rest-returning-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let state =
+            SharedState::build(&Config { data_dir: dir.clone(), ..Config::default() }).unwrap();
+        let admin = state.executor.clone().with_role(String::from("postgres")).without_auth_uid();
+        admin
+            .execute(
+                parse("CREATE TABLE rest_returning (id TEXT PRIMARY KEY, secret TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        admin
+            .execute(
+                parse("GRANT INSERT, UPDATE ON TABLE rest_returning TO authenticated").unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .keys
+            .insert(
+                String::from("write-only-key"),
+                Principal {
+                    id: String::from("write-only-user"),
+                    tenant: String::from("default"),
+                    roles: [Role::ReadWrite].into_iter().collect(),
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer write-only-key"),
+        );
+
+        let denied_insert = rest_insert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_returning")),
+            axum::extract::RawQuery(None),
+            axum::body::Bytes::from_static(br#"{"id":"new","secret":"inserted"}"#),
+        )
+        .await;
+        assert_eq!(denied_insert.status(), StatusCode::FORBIDDEN);
+        let rows = admin
+            .execute(parse("SELECT secret FROM rest_returning WHERE id = 'new'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(rows, QueryResult::Table { ref rows, .. } if rows.is_empty()));
+
+        headers.insert("prefer", HeaderValue::from_static("return=minimal"));
+        let minimal_insert = rest_insert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_returning")),
+            axum::extract::RawQuery(None),
+            axum::body::Bytes::from_static(br#"{"id":"new","secret":"inserted"}"#),
+        )
+        .await;
+        assert_eq!(minimal_insert.status(), StatusCode::CREATED);
+        assert!(axum::body::to_bytes(minimal_insert.into_body(), 1024).await.unwrap().is_empty());
+
+        let denied_patch = rest_upsert(
+            State(state.clone()),
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer write-only-key"),
+            )]),
+            Path(String::from("rest_returning")),
+            axum::extract::RawQuery(Some(String::from("id=eq.new"))),
+            axum::body::Bytes::from_static(br#"{"secret":"patched"}"#),
+        )
+        .await;
+        assert_eq!(denied_patch.status(), StatusCode::FORBIDDEN);
+        let rows = admin
+            .execute(parse("SELECT secret FROM rest_returning WHERE id = 'new'").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(rows, QueryResult::Table { ref rows, .. } if rows == &vec![vec![b"inserted".to_vec()]])
+        );
+
+        let minimal_patch = rest_upsert(
+            State(state.clone()),
+            headers,
+            Path(String::from("rest_returning")),
+            axum::extract::RawQuery(Some(String::from("id=eq.new"))),
+            axum::body::Bytes::from_static(br#"{"secret":"patched"}"#),
+        )
+        .await;
+        assert_eq!(minimal_patch.status(), StatusCode::OK);
+        assert!(axum::body::to_bytes(minimal_patch.into_body(), 1024).await.unwrap().is_empty());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 fn url_decode(input: &str) -> String {
@@ -5486,8 +5586,18 @@ async fn rest_insert(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor =
-        match table_executor_for_principal(&state, &headers, &principal, &table, &["INSERT"]) {
+    let return_minimal = rest_prefer(&headers, "return=minimal");
+    let mut required_privileges = vec!["INSERT"];
+    if !return_minimal {
+        required_privileges.push("SELECT");
+    }
+    let executor = match table_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &required_privileges,
+    ) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -5515,12 +5625,16 @@ async fn rest_insert(
                 .map(str::to_string)
         });
     let executor = if conflict_field.is_some() {
+        let mut required_privileges = vec!["INSERT", "UPDATE"];
+        if !return_minimal {
+            required_privileges.push("SELECT");
+        }
         match table_executor_for_principal(
             &state,
             &headers,
             &principal,
             &table,
-            &["INSERT", "UPDATE"],
+            &required_privileges,
         ) {
             Ok(executor) => executor,
             Err(e) => return error_response(e),
@@ -5545,6 +5659,9 @@ async fn rest_insert(
         if !executor.row_allowed_for_write(&table, &value) {
             return error_response(ryme_error::RymeError::Forbidden);
         }
+        if !return_minimal && !executor.row_allowed_by_rls(&table, &value) {
+            return error_response(ryme_error::RymeError::Forbidden);
+        }
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
@@ -5561,7 +5678,7 @@ async fn rest_insert(
             rest_row_to_json(key, value)
         })
         .collect::<Vec<_>>();
-    if rest_prefer(&headers, "return=minimal") {
+    if return_minimal {
         StatusCode::CREATED.into_response()
     } else {
         (StatusCode::CREATED, Json(inserted)).into_response()
@@ -5596,8 +5713,16 @@ async fn rest_upsert(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor =
-        match table_executor_for_principal(&state, &headers, &principal, &table, &["UPDATE"]) {
+    let return_minimal = rest_prefer(&headers, "return=minimal");
+    let required_privileges =
+        if return_minimal { vec!["UPDATE"] } else { vec!["UPDATE", "SELECT"] };
+    let executor = match table_executor_for_principal(
+        &state,
+        &headers,
+        &principal,
+        &table,
+        &required_privileges,
+    ) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -5636,6 +5761,9 @@ async fn rest_upsert(
         if !executor.row_allowed_for_write(&table, &value) {
             return error_response(ryme_error::RymeError::Forbidden);
         }
+        if !return_minimal && !executor.row_allowed_by_rls(&table, &value) {
+            return error_response(ryme_error::RymeError::Forbidden);
+        }
         if let Err(e) = admit_write(&state, &principal.tenant, (key.len() + value.len()) as u64) {
             return error_response(e);
         }
@@ -5654,7 +5782,7 @@ async fn rest_upsert(
             rest_row_to_json(key, value)
         })
         .collect::<Vec<_>>();
-    if rest_prefer(&headers, "return=minimal") {
+    if return_minimal {
         StatusCode::OK.into_response()
     } else {
         (StatusCode::OK, Json(updated)).into_response()

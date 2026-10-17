@@ -807,6 +807,35 @@ fn same_relation(left: &str, right: &str) -> bool {
         || relation_short_name(left).eq_ignore_ascii_case(relation_short_name(right))
 }
 
+fn relation_map_get<'a, T>(map: &'a HashMap<String, T>, table: &str) -> Option<&'a T> {
+    map.get(table)
+        .or_else(|| map.iter().find(|(name, _)| same_relation(name, table)).map(|(_, value)| value))
+}
+
+fn relation_set_contains(tables: &HashSet<String>, table: &str) -> bool {
+    tables.iter().any(|name| same_relation(name, table))
+}
+
+fn returning_target_table(statement: &Statement) -> Option<&str> {
+    match statement {
+        Statement::Insert { table, .. }
+        | Statement::InsertRow { table, .. }
+        | Statement::InsertRows { table, .. }
+        | Statement::InsertSelect { table, .. }
+        | Statement::Upsert { table, .. }
+        | Statement::InsertIgnore { table, .. }
+        | Statement::InsertConflict { table, .. }
+        | Statement::Update { table, .. }
+        | Statement::UpdateRow { table, .. }
+        | Statement::UpdateWhere { table, .. }
+        | Statement::UpdateFrom { table, .. }
+        | Statement::Delete { table, .. }
+        | Statement::DeleteWhere { table, .. }
+        | Statement::DeleteUsing { table, .. } => Some(table),
+        _ => None,
+    }
+}
+
 fn collect_table_privilege_requirements(
     statement: &Statement,
     required: &mut Vec<(String, &'static str)>,
@@ -815,24 +844,7 @@ fn collect_table_privilege_requirements(
     match statement {
         Statement::Returning { statement, .. } => {
             collect_table_privilege_requirements(statement, required);
-            let returning_table = match statement.as_ref() {
-                Statement::Insert { table, .. }
-                | Statement::InsertRow { table, .. }
-                | Statement::InsertRows { table, .. }
-                | Statement::InsertSelect { table, .. }
-                | Statement::Upsert { table, .. }
-                | Statement::InsertIgnore { table, .. }
-                | Statement::InsertConflict { table, .. }
-                | Statement::Update { table, .. }
-                | Statement::UpdateRow { table, .. }
-                | Statement::UpdateWhere { table, .. }
-                | Statement::UpdateFrom { table, .. }
-                | Statement::Delete { table, .. }
-                | Statement::DeleteWhere { table, .. }
-                | Statement::DeleteUsing { table, .. } => Some(table),
-                _ => None,
-            };
-            if let Some(table) = returning_table {
+            if let Some(table) = returning_target_table(statement) {
                 required.push((table.to_string(), "SELECT"));
             }
         }
@@ -9493,24 +9505,35 @@ where
 
     fn rls_is_enabled(&self, table: &str) -> bool {
         self.platform_rls_applies(table)
-            || self.rls_enabled.read().ok().is_some_and(|tables| tables.contains(table))
+            || self
+                .rls_enabled
+                .read()
+                .ok()
+                .is_some_and(|tables| relation_set_contains(&tables, table))
     }
 
     fn platform_rls_applies(&self, table: &str) -> bool {
-        self.platform_rls_tables.read().ok().is_some_and(|tables| tables.contains(table))
+        self.platform_rls_tables
+            .read()
+            .ok()
+            .is_some_and(|tables| relation_set_contains(&tables, table))
     }
 
     fn rls_applies_to_role(&self, table: &str) -> bool {
         self.rls_is_enabled(table)
             && (self.platform_rls_applies(table)
                 || !self.role_is_superuser()
-                || self.rls_forced.read().ok().is_some_and(|tables| tables.contains(table)))
+                || self
+                    .rls_forced
+                    .read()
+                    .ok()
+                    .is_some_and(|tables| relation_set_contains(&tables, table)))
     }
 
     fn rls_policy_allows(&self, table: &str, value: &[u8]) -> bool {
         let Some(maps) = self.rls_maps_for_current_role() else { return false };
-        let tenant_column = maps.tenant_read.get(table);
-        let uid_column = maps.uid_read.get(table);
+        let tenant_column = relation_map_get(&maps.tenant_read, table);
+        let uid_column = relation_map_get(&maps.uid_read, table);
         if tenant_column.is_none() && uid_column.is_none() {
             return false;
         }
@@ -9556,8 +9579,8 @@ where
         let maps = self
             .rls_maps_for_current_role()
             .ok_or_else(|| RymeError::Internal(String::from("RLS policy lock")))?;
-        let tenant_column = maps.tenant_write.get(table);
-        let uid_column = maps.uid_write.get(table);
+        let tenant_column = relation_map_get(&maps.tenant_write, table);
+        let uid_column = relation_map_get(&maps.uid_write, table);
         if tenant_column.is_none() && uid_column.is_none() {
             return Err(RymeError::Forbidden);
         }
@@ -13339,7 +13362,32 @@ where
         }
         let result = match statement {
             Statement::Returning { statement, fields } => {
-                self.execute_returning_in_transaction(txn, *statement, fields).await
+                let checkpoint = txn.checkpoint();
+                let returning_table = returning_target_table(&statement).map(str::to_string);
+                match self.execute_returning_in_transaction(txn, *statement, fields).await {
+                    Ok((result, changes)) => {
+                        let denied = returning_table.as_deref().is_some_and(|table| {
+                            changes.iter().filter(|change| change.table == table).any(|change| {
+                                let value = if change.op == Operation::Delete {
+                                    change.before.as_deref()
+                                } else {
+                                    change.after.as_deref()
+                                };
+                                value.is_some_and(|value| !self.row_allowed_by_rls(table, value))
+                            })
+                        });
+                        if denied {
+                            txn.restore_checkpoint(&checkpoint);
+                            Err(RymeError::Forbidden)
+                        } else {
+                            Ok((result, changes))
+                        }
+                    }
+                    Err(error) => {
+                        txn.restore_checkpoint(&checkpoint);
+                        Err(error)
+                    }
+                }
             }
             statement => self.execute_in_transaction_base(txn, statement).await,
         }?;
@@ -15298,7 +15346,19 @@ where
         );
         let result = match statement {
             Statement::Returning { statement, fields } => {
-                self.execute_returning(*statement, fields, isolation).await
+                if returning_target_table(&statement).is_none() {
+                    self.execute_returning(*statement, fields, isolation).await
+                } else {
+                    let mut txn = self.begin_with(isolation);
+                    let (result, changes) = self
+                        .execute_in_transaction(
+                            &mut txn,
+                            Statement::Returning { statement, fields },
+                        )
+                        .await?;
+                    self.commit_transaction(txn, changes).await?;
+                    Ok(result)
+                }
             }
             statement => self.execute_with_base(statement, isolation).await,
         };
@@ -17534,6 +17594,63 @@ mod tests {
         assert!(matches!(
             executor.execute(parse("SELECT value FROM public.secrets WHERE id = 'one'").unwrap()).await,
             Ok(QueryResult::Table { ref rows, .. }) if rows == &vec![vec![b"hidden".to_vec()]]
+        ));
+    }
+
+    #[tokio::test]
+    async fn returning_obeys_select_rls_and_restores_transaction_on_denial() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        for sql in [
+            "CREATE TABLE public.scoped_rows (id TEXT PRIMARY KEY, user_id TEXT, visible_to TEXT, secret TEXT)",
+            "GRANT SELECT, INSERT ON TABLE public.scoped_rows TO authenticated",
+            "CREATE POLICY scoped_insert ON public.scoped_rows FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id)",
+            "CREATE POLICY scoped_select ON public.scoped_rows FOR SELECT TO authenticated USING (auth.uid() = visible_to)",
+            "ALTER TABLE public.scoped_rows ENABLE ROW LEVEL SECURITY",
+        ] {
+            executor.execute(parse(sql).unwrap()).await.unwrap();
+        }
+
+        let user = executor
+            .clone()
+            .with_role(String::from("authenticated"))
+            .with_auth_uid(String::from("user-a"));
+        let mut txn = user.begin_transaction(Isolation::Serializable);
+        assert!(matches!(
+            user.execute_in_transaction(
+                &mut txn,
+                parse("INSERT INTO public.scoped_rows (id, user_id, visible_to, secret) VALUES ('hidden', 'user-a', 'user-b', 'secret') RETURNING secret").unwrap(),
+            )
+            .await,
+            Err(RymeError::Forbidden)
+        ));
+        assert!(txn.writes().is_empty());
+
+        assert!(matches!(
+            user.execute(
+                parse("INSERT INTO public.scoped_rows (id, user_id, visible_to, secret) VALUES ('hidden-autocommit', 'user-a', 'user-b', 'secret') RETURNING secret").unwrap(),
+            )
+            .await,
+            Err(RymeError::Forbidden)
+        ));
+
+        let admin = executor.clone().with_role(String::from("postgres"));
+        assert!(matches!(
+            admin.execute(parse("SELECT * FROM public.scoped_rows").unwrap()).await,
+            Ok(QueryResult::Rows { ref rows }) if rows.is_empty()
+        ));
+
+        assert!(user.row_allowed_by_rls(
+            "public.scoped_rows",
+            br#"{"id":"visible","user_id":"user-a","visible_to":"user-a","secret":"shown"}"#,
+        ));
+        let visible = user
+            .execute(parse("INSERT INTO public.scoped_rows (id, user_id, visible_to, secret) VALUES ('visible', 'user-a', 'user-a', 'shown') RETURNING secret").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            visible,
+            QueryResult::Returning { ref rows, .. }
+                if rows == &vec![vec![b"shown".to_vec()]]
         ));
     }
 

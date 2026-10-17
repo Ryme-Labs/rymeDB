@@ -1328,7 +1328,7 @@ paths:
           $ref: '#/components/responses/Forbidden'
     post:
       tags: [rest]
-      description: Insert key/value rows, a JSON object or array with an id/key field, and resolve duplicates with on_conflict=<field>.
+      description: "Insert key/value rows, a JSON object or array with an id/key field, and resolve duplicates with on_conflict=<field>. The default row representation requires SELECT on the table; use Prefer: return=minimal for write-only access."
       parameters:
         - $ref: '#/components/parameters/TableParam'
       responses:
@@ -1342,7 +1342,7 @@ paths:
           $ref: '#/components/responses/Forbidden'
     patch:
       tags: [rest]
-      description: Upsert key/value rows or partially update JSON object rows selected by PostgREST filters.
+      description: "Upsert key/value rows or partially update JSON object rows selected by PostgREST filters. The default row representation requires SELECT on the table; use Prefer: return=minimal for write-only access."
       parameters:
         - $ref: '#/components/parameters/TableParam'
       responses:
