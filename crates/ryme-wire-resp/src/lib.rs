@@ -30,6 +30,8 @@ const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
 const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const RESP_MAX_PUBSUB_SUBSCRIPTIONS: usize = 1024;
 const RESP_MAX_PUBSUB_NAME_BYTES: usize = 4 * 1024;
+const RESP_MAX_GLOBAL_PUBSUB_SUBSCRIPTIONS: usize = 8192;
+const RESP_MAX_GLOBAL_PUBSUB_PATTERNS: usize = 1024;
 const RESP_MAX_CLUSTER_BRIDGES: usize = 10_000;
 const MAX_COMMAND_CONFLICT_RETRIES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
@@ -128,6 +130,7 @@ struct PubSubBus {
     sender: broadcast::Sender<PubSubMessage>,
     counts: PubSubCounts,
     pattern_counts: PubSubCounts,
+    total_subscriptions: Arc<AtomicUsize>,
     cluster_started: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
@@ -136,6 +139,7 @@ fn new_pubsub() -> PubSubBus {
         sender: broadcast::channel(4096).0,
         counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
         pattern_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        total_subscriptions: Arc::new(AtomicUsize::new(0)),
         cluster_started: Arc::new(Mutex::new(std::collections::HashSet::new())),
     }
 }
@@ -145,9 +149,31 @@ impl PubSubBus {
         self.sender.subscribe()
     }
 
-    fn add(&self, tenant: &str, channel: &[u8]) {
+    fn reserve_subscription(&self) -> bool {
+        self.total_subscriptions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < RESP_MAX_GLOBAL_PUBSUB_SUBSCRIPTIONS).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn add(&self, tenant: &str, channel: &[u8]) -> bool {
         if let Ok(mut counts) = self.counts.lock() {
-            *counts.entry((tenant.to_string(), channel.to_vec())).or_default() += 1;
+            let key = (tenant.to_string(), channel.to_vec());
+            if let Some(count) = counts.get_mut(&key) {
+                if !self.reserve_subscription() {
+                    return false;
+                }
+                *count += 1;
+                return true;
+            }
+            if !self.reserve_subscription() {
+                return false;
+            }
+            counts.insert(key, 1);
+            true
+        } else {
+            false
         }
     }
 
@@ -156,6 +182,7 @@ impl PubSubBus {
             let key = (tenant.to_string(), channel.to_vec());
             if let Some(count) = counts.get_mut(&key) {
                 *count = count.saturating_sub(1);
+                self.total_subscriptions.fetch_sub(1, Ordering::Relaxed);
                 if *count == 0 {
                     counts.remove(&key);
                 }
@@ -163,9 +190,23 @@ impl PubSubBus {
         }
     }
 
-    fn add_pattern(&self, tenant: &str, pattern: &[u8]) {
+    fn add_pattern(&self, tenant: &str, pattern: &[u8]) -> bool {
         if let Ok(mut counts) = self.pattern_counts.lock() {
-            *counts.entry((tenant.to_string(), pattern.to_vec())).or_default() += 1;
+            let key = (tenant.to_string(), pattern.to_vec());
+            if let Some(count) = counts.get_mut(&key) {
+                if !self.reserve_subscription() {
+                    return false;
+                }
+                *count += 1;
+                return true;
+            }
+            if counts.len() >= RESP_MAX_GLOBAL_PUBSUB_PATTERNS || !self.reserve_subscription() {
+                return false;
+            }
+            counts.insert(key, 1);
+            true
+        } else {
+            false
         }
     }
 
@@ -174,6 +215,7 @@ impl PubSubBus {
             let key = (tenant.to_string(), pattern.to_vec());
             if let Some(count) = counts.get_mut(&key) {
                 *count = count.saturating_sub(1);
+                self.total_subscriptions.fetch_sub(1, Ordering::Relaxed);
                 if *count == 0 {
                     counts.remove(&key);
                 }
@@ -706,9 +748,18 @@ where
             return encode_error(error.to_string());
         }
         let mut replies = Vec::with_capacity(channels.len());
+        let mut added: Vec<Vec<u8>> = Vec::new();
         for channel in channels {
-            if client.subscriptions.insert(channel.clone()) {
-                self.pubsub.add(&client.tenant, channel);
+            if !client.subscriptions.contains(channel) {
+                if !self.pubsub.add(&client.tenant, channel) {
+                    for added_channel in added {
+                        client.subscriptions.remove(&added_channel);
+                        self.pubsub.remove(&client.tenant, &added_channel);
+                    }
+                    return encode_error(String::from("global pubsub subscription limit exceeded"));
+                }
+                client.subscriptions.insert(channel.clone());
+                added.push(channel.clone());
             }
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"subscribe"),
@@ -756,9 +807,18 @@ where
             return encode_error(error.to_string());
         }
         let mut replies = Vec::with_capacity(patterns.len());
+        let mut added: Vec<Vec<u8>> = Vec::new();
         for pattern in patterns {
-            if client.patterns.insert(pattern.clone()) {
-                self.pubsub.add_pattern(&client.tenant, pattern);
+            if !client.patterns.contains(pattern) {
+                if !self.pubsub.add_pattern(&client.tenant, pattern) {
+                    for added_pattern in added {
+                        client.patterns.remove(&added_pattern);
+                        self.pubsub.remove_pattern(&client.tenant, &added_pattern);
+                    }
+                    return encode_error(String::from("global pubsub subscription limit exceeded"));
+                }
+                client.patterns.insert(pattern.clone());
+                added.push(pattern.clone());
             }
             replies.push(encode_raw_array(vec![
                 encode_bulk(b"psubscribe"),
@@ -6304,6 +6364,39 @@ mod tests {
     fn collection_payloads_are_bounded() {
         assert!(check_collection_bytes(&vec![0; RESP_MAX_COLLECTION_BYTES]).is_ok());
         assert!(check_collection_bytes(&vec![0; RESP_MAX_COLLECTION_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn pubsub_global_subscription_limit_rolls_back_partial_requests() {
+        let gateway = RespGateway::new(String::from("tenant"), String::from("database"));
+        let mut client = gateway.fresh_client();
+        gateway
+            .pubsub
+            .total_subscriptions
+            .store(RESP_MAX_GLOBAL_PUBSUB_SUBSCRIPTIONS - 1, Ordering::Relaxed);
+
+        let reply = gateway.subscribe(&[b"first".to_vec(), b"second".to_vec()], &mut client);
+        assert!(reply.starts_with(b"-ERR global pubsub subscription limit exceeded"));
+        assert!(client.subscriptions.is_empty());
+        assert!(gateway.pubsub.counts.lock().unwrap().is_empty());
+        assert_eq!(
+            gateway.pubsub.total_subscriptions.load(Ordering::Relaxed),
+            RESP_MAX_GLOBAL_PUBSUB_SUBSCRIPTIONS - 1
+        );
+    }
+
+    #[test]
+    fn pubsub_global_pattern_registry_is_bounded() {
+        let bus = new_pubsub();
+        for index in 0..RESP_MAX_GLOBAL_PUBSUB_PATTERNS {
+            assert!(bus.add_pattern("tenant", format!("pattern-{index}").as_bytes()));
+        }
+        assert!(!bus.add_pattern("tenant", b"one-too-many"));
+        assert!(bus.add_pattern("tenant", b"pattern-0"));
+        assert_eq!(
+            bus.total_subscriptions.load(Ordering::Relaxed),
+            RESP_MAX_GLOBAL_PUBSUB_PATTERNS + 1
+        );
     }
 
     #[test]
