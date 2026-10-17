@@ -1172,6 +1172,15 @@ impl TxnManager {
         }
 
         let now = now_unix();
+        if txn.read_only && txn.writes.is_empty() {
+            let engine = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+            return keys.iter().map(|key| engine.read(key, txn.read_ts, now)).collect();
+        }
+
         let mut values = Vec::with_capacity(keys.len());
         {
             let engine = self
@@ -3359,9 +3368,18 @@ mod tests {
     fn read_only_transactions_skip_observations_and_reject_writes() {
         let manager = TxnManager::new();
         let key = RecordKey::new("t", "d", "items", b"row");
+        let stored_key = RecordKey::new("t", "d", "seed", b"row");
+        let mut seed = manager.begin();
+        manager.put(&mut seed, stored_key.clone(), b"value".to_vec());
+        manager.commit(seed).unwrap();
+
         let mut txn = manager.begin();
         txn.set_read_only().unwrap();
 
+        assert_eq!(
+            manager.get_many(&mut txn, &[stored_key, key.clone()]).unwrap(),
+            vec![Some(b"value".to_vec()), None]
+        );
         assert_eq!(manager.get(&mut txn, &key).unwrap(), None);
         assert!(manager.scan(&mut txn, "t", "d", "items", 10).unwrap().is_empty());
         assert!(txn.read_keys().is_empty());
