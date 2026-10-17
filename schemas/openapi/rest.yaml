@@ -639,7 +639,7 @@ paths:
     post:
       tags: [auth]
       security: []
-      description: "Start a passkey assertion without an API key. The response is identical for known and unknown users; attempts are rate-limited."
+      description: "Start a passkey assertion without an API key. The response is identical for known and unknown users; attempts are rate-limited. If an API key or bearer token is supplied, it must be authorized for the requested user."
       requestBody:
         required: true
         content:
@@ -653,6 +653,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '429':
           description: Authentication challenge rate limit exceeded
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/auth/passkey/register:
     post:
       tags: [auth]

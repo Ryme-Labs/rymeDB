@@ -216,8 +216,9 @@ Passkey challenge and assertion endpoints are usable without an existing API
 key so they can start a login. Challenge responses do not reveal whether a user
 exists, and challenge creation is rate-limited by client and user. Passkey
 registration still requires an authenticated principal authorized to manage
-that user. Cross-origin iframe assertions are rejected because RymeDB does not
-configure a trusted `topOrigin` allowlist.
+that user. If a credential is supplied to the public challenge endpoint, it
+must also be authorized for the requested user. Cross-origin iframe assertions
+are rejected because RymeDB does not configure a trusted `topOrigin` allowlist.
 
 To log out and invalidate a rotating refresh token, send it in the body of
 `DELETE /v1/auth/session` over HTTPS:

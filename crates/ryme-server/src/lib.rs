@@ -7715,6 +7715,7 @@ async fn otp_verify(
 
 async fn passkey_challenge(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Extension(client_ip): Extension<AuthClientIp>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -7724,6 +7725,15 @@ async fn passkey_challenge(
     };
     if request.user.is_empty() || request.user.len() > ryme_auth::MAX_USER_LEN {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
+    }
+    if headers.contains_key(axum::http::header::AUTHORIZATION) || headers.contains_key("x-api-key") {
+        let principal = match state.principal(&headers) {
+            Ok(principal) => principal,
+            Err(error) => return error_response(error),
+        };
+        if !can_manage_user(&state, &principal, &request.user) {
+            return error_response(ryme_error::RymeError::Forbidden);
+        }
     }
     if state.passkey_rp_id.is_empty() {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from(
