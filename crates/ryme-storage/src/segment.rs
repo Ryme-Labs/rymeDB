@@ -714,14 +714,9 @@ impl SegmentStore {
         let mut values = vec![None; key_count];
         let mut unresolved = (0..key_count).collect::<Vec<_>>();
         let mut next_unresolved = Vec::with_capacity(key_count);
-        let mut cached_segments =
-            self.read_cached_segments(&paths).map(|segments| segments.into_iter().rev());
 
         for path in paths.iter().rev() {
-            let segment = match cached_segments.as_mut().and_then(Iterator::next).flatten() {
-                Some(segment) => segment,
-                None => self.read_segment_under_lock(path)?,
-            };
+            let segment = self.read_segment_under_lock(path)?;
             let is_snapshot = segment.is_snapshot();
             next_unresolved.clear();
             for index in unresolved.drain(..) {
@@ -2028,8 +2023,42 @@ mod tests {
             vec![None, Some(b"two".to_vec())]
         );
         let after_partial_cache_read = store.cache_stats();
-        assert_eq!(after_partial_cache_read.hits - before_partial_cache_read.hits, 2);
+        assert_eq!(after_partial_cache_read.hits - before_partial_cache_read.hits, 1);
         assert_eq!(after_partial_cache_read.misses - before_partial_cache_read.misses, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_batch_read_does_not_touch_older_cached_segments_after_resolution() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-lazy-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open_with_cache(&dir, 1024 * 1024).unwrap();
+        let key = RecordKey::new("tenant", "db", "items", b"a");
+        let mut engine = Engine::new();
+        engine.apply(key.clone(), 1, Some(b"old".to_vec())).unwrap();
+        store.write(1, &engine).unwrap();
+        store
+            .write_delta(
+                2,
+                &[SegmentEntry {
+                    key: key.clone(),
+                    commit_ts: 2,
+                    value: Some(b"new".to_vec()),
+                    expires_at: 0,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(store.get(&key, 1, 0).unwrap(), Some(b"old".to_vec()));
+        let before = store.cache_stats();
+        assert_eq!(store.get_many(&[key], 2, 0).unwrap(), vec![Some(b"new".to_vec())]);
+        let after = store.cache_stats();
+        assert_eq!(after.hits - before.hits, 1);
+        assert_eq!(after.misses - before.misses, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
