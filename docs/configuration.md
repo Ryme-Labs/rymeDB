@@ -46,6 +46,13 @@ ryme-server --config /etc/rymedb/node.json
 | `autosplit_writes` | `0` | Range write threshold; `0` keeps autosplitting off. |
 | `autosplit_interval_secs` | `30` | Range autosplit scan period; `0` disables it. |
 
+Full-text search indexes also have a fixed 128 MiB estimated-memory admission
+budget shared across all index spaces in one server process. Replacing or
+removing documents releases their accounted usage; further indexing is
+rejected with an overload error when the budget is exhausted. This estimate is
+an index-structure budget, not a cap on total process memory, and is not
+currently configurable.
+
 ## Listener flags
 
 The equivalent CLI flags are `--pg-listen`, `--resp-listen`,

@@ -14,6 +14,8 @@ pub const MAX_INDEX_ID_BYTES: usize = 1024;
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 pub const MAX_TEXT_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMS_PER_DOCUMENT: usize = 65_536;
+/// Conservative accounting budget for retained full-text index structures.
+pub const MAX_TEXT_INDEX_BYTES: usize = 128 * 1024 * 1024;
 pub const HNSW_M: usize = 16;
 pub const HNSW_EF_BUILD: usize = 64;
 const HNSW_HIGH_DIM_M: usize = 32;
@@ -466,47 +468,78 @@ impl VectorSpace {
 struct TextSpace {
     docs: HashMap<String, HashMap<String, u32>>,
     postings: HashMap<String, HashMap<String, u32>>,
+    doc_index_bytes: HashMap<String, usize>,
+}
+
+fn parse_text_terms(id: &str, text: &str) -> Result<HashMap<String, u32>> {
+    validate_id(id, "text id")?;
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(RymeError::Overload(String::from("text document")));
+    }
+    let mut terms: HashMap<String, u32> = HashMap::new();
+    let complete = visit_tokens(text, |term| {
+        if let Some(frequency) = terms.get_mut(term) {
+            *frequency += 1;
+            true
+        } else if terms.len() >= MAX_TERMS_PER_DOCUMENT {
+            false
+        } else {
+            terms.insert(term.to_owned(), 1);
+            true
+        }
+    });
+    if !complete {
+        return Err(RymeError::Overload(String::from("text terms")));
+    }
+    Ok(terms)
+}
+
+fn estimate_text_index_bytes(id: &str, terms: &HashMap<String, u32>) -> usize {
+    terms.iter().fold(256usize.saturating_add(id.len().saturating_mul(2)), |bytes, (term, _)| {
+        bytes
+            .saturating_add(256)
+            .saturating_add(term.len().saturating_mul(2))
+            .saturating_add(id.len())
+    })
+}
+
+fn updated_text_index_bytes(current: usize, previous: usize, next: usize) -> Result<usize> {
+    let total = current
+        .saturating_sub(previous)
+        .checked_add(next)
+        .ok_or_else(|| RymeError::Overload(String::from("text index memory")))?;
+    if total > MAX_TEXT_INDEX_BYTES {
+        return Err(RymeError::Overload(String::from("text index memory")));
+    }
+    Ok(total)
 }
 
 impl TextSpace {
-    fn index_doc(&mut self, id: String, text: &str) -> Result<usize> {
-        if id.is_empty() || id.len() > MAX_INDEX_ID_BYTES {
-            return Err(RymeError::InvalidArgument(String::from("text id")));
-        }
-        if text.len() > MAX_TEXT_BYTES {
-            return Err(RymeError::Overload(String::from("text document")));
-        }
+    fn index_doc(
+        &mut self,
+        id: String,
+        terms: HashMap<String, u32>,
+        index_bytes: usize,
+    ) -> Result<(usize, usize)> {
         if !self.docs.contains_key(&id) && self.docs.len() >= MAX_DOCS_PER_SPACE {
             return Err(RymeError::Overload(String::from("text space")));
         }
-        let mut terms: HashMap<String, u32> = HashMap::new();
-        let complete = visit_tokens(text, |term| {
-            if let Some(frequency) = terms.get_mut(term) {
-                *frequency += 1;
-                true
-            } else if terms.len() >= MAX_TERMS_PER_DOCUMENT {
-                false
-            } else {
-                terms.insert(term.to_owned(), 1);
-                true
-            }
-        });
-        if !complete {
-            return Err(RymeError::Overload(String::from("text terms")));
-        }
         let count = terms.len();
-        self.remove(&id);
+        let previous_index_bytes = self.doc_index_bytes.get(&id).copied().unwrap_or(0);
+        let _ = self.remove(&id);
         for (term, freq) in &terms {
             self.postings.entry(term.clone()).or_default().insert(id.clone(), *freq);
         }
-        self.docs.insert(id, terms);
-        Ok(count)
+        self.docs.insert(id.clone(), terms);
+        self.doc_index_bytes.insert(id, index_bytes);
+        Ok((count, previous_index_bytes))
     }
 
-    fn remove(&mut self, id: &str) -> bool {
+    fn remove(&mut self, id: &str) -> Option<usize> {
         let Some(terms) = self.docs.remove(id) else {
-            return false;
+            return None;
         };
+        let index_bytes = self.doc_index_bytes.remove(id).unwrap_or(0);
         for term in terms.keys() {
             if let Some(posting) = self.postings.get_mut(term) {
                 posting.remove(id);
@@ -515,7 +548,7 @@ impl TextSpace {
                 }
             }
         }
-        true
+        Some(index_bytes)
     }
 
     fn search(&self, query: &str, top_k: usize) -> Result<Vec<TextHit>> {
@@ -616,6 +649,7 @@ pub struct IndexRegistry {
     vectors: HashMap<String, VectorSpace>,
     texts: HashMap<String, TextSpace>,
     spaces: HashSet<String>,
+    text_index_bytes: usize,
 }
 
 impl IndexRegistry {
@@ -675,29 +709,66 @@ impl IndexRegistry {
             .ann_search(query, top_k, ef)
     }
 
-    pub fn text_index(&mut self, space: &str, id: String, text: &str) -> Result<usize> {
+    fn validate_text_index_target(&self, space: &str, id: &str) -> Result<()> {
         validate_space(space)?;
-        validate_id(&id, "text id")?;
+        validate_id(id, "text id")?;
         if !self.spaces.contains(space) && self.spaces.len() >= MAX_INDEX_SPACES {
             return Err(RymeError::Overload(String::from("index spaces")));
         }
+        if self.texts.get(space).is_some_and(|texts| {
+            !texts.docs.contains_key(id) && texts.docs.len() >= MAX_DOCS_PER_SPACE
+        }) {
+            return Err(RymeError::Overload(String::from("text space")));
+        }
+        Ok(())
+    }
+
+    pub fn text_index(&mut self, space: &str, id: String, text: &str) -> Result<usize> {
+        self.validate_text_index_target(space, &id)?;
+        let terms = parse_text_terms(&id, text)?;
+        self.text_index_parsed(space, id, terms)
+    }
+
+    fn text_index_parsed(
+        &mut self,
+        space: &str,
+        id: String,
+        terms: HashMap<String, u32>,
+    ) -> Result<usize> {
+        self.validate_text_index_target(space, &id)?;
+        let index_bytes = estimate_text_index_bytes(&id, &terms);
+        let previous_index_bytes = self
+            .texts
+            .get(space)
+            .and_then(|texts| texts.doc_index_bytes.get(&id))
+            .copied()
+            .unwrap_or(0);
+        let next_index_bytes =
+            updated_text_index_bytes(self.text_index_bytes, previous_index_bytes, index_bytes)?;
         let result = match self.texts.entry(space.to_string()) {
-            Entry::Occupied(mut entry) => entry.get_mut().index_doc(id, text),
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().index_doc(id, terms, index_bytes).map(|(count, _)| count)
+            }
             Entry::Vacant(entry) => {
                 let mut texts = TextSpace::default();
-                let count = texts.index_doc(id, text)?;
+                let (count, _) = texts.index_doc(id, terms, index_bytes)?;
                 entry.insert(texts);
                 Ok(count)
             }
         };
         if result.is_ok() {
+            self.text_index_bytes = next_index_bytes;
             self.spaces.insert(space.to_string());
         }
         result
     }
 
     pub fn text_remove(&mut self, space: &str, id: &str) -> bool {
-        let removed = self.texts.get_mut(space).map(|s| s.remove(id)).unwrap_or(false);
+        let removed_bytes = self.texts.get_mut(space).and_then(|texts| texts.remove(id));
+        let removed = removed_bytes.is_some();
+        if let Some(bytes) = removed_bytes {
+            self.text_index_bytes = self.text_index_bytes.saturating_sub(bytes);
+        }
         self.remove_empty_space(space);
         removed
     }
@@ -751,6 +822,7 @@ pub struct PartitionedIndex {
     dims: HashMap<String, usize>,
     vector_counts: HashMap<String, usize>,
     text_counts: HashMap<String, usize>,
+    text_index_bytes: usize,
     spaces: HashSet<String>,
 }
 
@@ -766,6 +838,7 @@ impl PartitionedIndex {
             dims: HashMap::new(),
             vector_counts: HashMap::new(),
             text_counts: HashMap::new(),
+            text_index_bytes: 0,
             spaces: HashSet::new(),
         }
     }
@@ -894,7 +967,18 @@ impl PartitionedIndex {
         if is_new && self.text_counts.get(space).copied().unwrap_or(0) >= MAX_DOCS_PER_SPACE {
             return Err(RymeError::Overload(String::from("text space")));
         }
-        let terms = self.partitions[partition].text_index(space, id, text)?;
+        let terms = parse_text_terms(&id, text)?;
+        let index_bytes = estimate_text_index_bytes(&id, &terms);
+        let previous_index_bytes = self.partitions[partition]
+            .texts
+            .get(space)
+            .and_then(|texts| texts.doc_index_bytes.get(&id))
+            .copied()
+            .unwrap_or(0);
+        let next_index_bytes =
+            updated_text_index_bytes(self.text_index_bytes, previous_index_bytes, index_bytes)?;
+        let terms = self.partitions[partition].text_index_parsed(space, id, terms)?;
+        self.text_index_bytes = next_index_bytes;
         self.spaces.insert(space.to_string());
         if is_new {
             *self.text_counts.entry(space.to_string()).or_default() += 1;
@@ -904,8 +988,15 @@ impl PartitionedIndex {
 
     pub fn text_remove(&mut self, space: &str, id: &str) -> bool {
         let partition = self.route(space, id);
+        let index_bytes = self.partitions[partition]
+            .texts
+            .get(space)
+            .and_then(|texts| texts.doc_index_bytes.get(id))
+            .copied()
+            .unwrap_or(0);
         let removed = self.partitions[partition].text_remove(space, id);
         if removed {
+            self.text_index_bytes = self.text_index_bytes.saturating_sub(index_bytes);
             decrement_count(&mut self.text_counts, space);
             self.remove_empty_space(space);
         }
@@ -1319,6 +1410,41 @@ mod tests {
         assert!(registry.text_remove("docs", "d1"));
         assert!(registry.text_search("docs", "hello", 10).unwrap().is_empty());
         assert!(registry.text_search("missing", "hello", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_index_memory_accounting_reclaims_replaced_and_removed_documents() {
+        let mut registry = PartitionedIndex::new(4);
+        registry.text_index("docs", String::from("d1"), "alpha beta gamma").unwrap();
+        let original_bytes = registry.text_index_bytes;
+        assert!(original_bytes > 0);
+
+        registry.text_index("docs", String::from("d1"), "alpha").unwrap();
+        assert!(registry.text_index_bytes < original_bytes);
+
+        assert!(registry.text_remove("docs", "d1"));
+        assert_eq!(registry.text_index_bytes, 0);
+    }
+
+    #[test]
+    fn text_index_memory_budget_rejects_growth_without_mutating_indexes() {
+        let mut registry = PartitionedIndex::new(2);
+        let id = String::from("doc");
+        let terms = parse_text_terms(&id, "alpha beta").unwrap();
+        let cost = estimate_text_index_bytes(&id, &terms);
+        registry.text_index_bytes = MAX_TEXT_INDEX_BYTES - cost + 1;
+
+        assert!(matches!(
+            registry.text_index("docs", id.clone(), "alpha beta"),
+            Err(RymeError::Overload(message)) if message == "text index memory"
+        ));
+        assert_eq!(registry.text_index_bytes, MAX_TEXT_INDEX_BYTES - cost + 1);
+        assert!(!registry.spaces.contains("docs"));
+        assert!(registry.partitions.iter().all(|partition| !partition.texts.contains_key("docs")));
+
+        registry.text_index_bytes -= 1;
+        registry.text_index("docs", id, "alpha beta").unwrap();
+        assert_eq!(registry.text_index_bytes, MAX_TEXT_INDEX_BYTES);
     }
 
     #[test]
