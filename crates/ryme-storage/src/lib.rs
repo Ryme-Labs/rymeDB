@@ -1,6 +1,6 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 
 mod segment;
@@ -292,8 +292,8 @@ impl Engine {
     }
 
     /// Reads a same-table batch with one ordered map walk when keys are dense.
-    /// Unsorted unique keys are ordered internally and returned in input order;
-    /// sparse batches and duplicates use point lookups instead.
+    /// Unsorted keys preserve input order; duplicate keys are read once and
+    /// their values are copied to each corresponding output position.
     pub fn read_many(
         &self,
         keys: &[RecordKey],
@@ -340,6 +340,13 @@ impl Engine {
         }
 
         if !ordered && !reversed {
+            let mut seen = HashSet::with_capacity(keys.len());
+            let has_duplicates = keys.iter().any(|key| !seen.insert(key.record_key()));
+            drop(seen);
+            if !has_duplicates {
+                return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
+            }
+
             let mut first_indices = HashMap::with_capacity(keys.len());
             let mut unique = Vec::with_capacity(keys.len());
             let mut duplicates = Vec::new();
@@ -351,9 +358,6 @@ impl Engine {
                     first_indices.insert(key, index);
                     unique.push((index, key));
                 }
-            }
-            if duplicates.is_empty() {
-                return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
             }
             unique.sort_unstable_by(|left, right| left.1.cmp(right.1));
             let unique_keys = unique.iter().map(|(_, key)| *key).collect::<Vec<_>>();
