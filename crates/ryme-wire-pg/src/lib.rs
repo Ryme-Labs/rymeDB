@@ -159,6 +159,21 @@ fn listener_change_bytes(change: &ListenerChange) -> usize {
     })
 }
 
+fn savepoint_settings_bytes(
+    local_settings: &HashMap<String, Option<String>>,
+    session: &HashMap<String, String>,
+) -> Option<usize> {
+    local_settings.iter().try_fold(0usize, |total, (name, previous)| {
+        let previous_bytes = previous.as_ref().map_or(0, String::len);
+        let current_bytes = session.get(name).map_or(0, String::len);
+        total
+            .checked_add(64usize.checked_add(name.len())?)?
+            .checked_add(24usize.checked_add(previous_bytes)?)?
+            .checked_add(24usize.checked_add(name.len())?)?
+            .checked_add(24usize.checked_add(current_bytes)?)
+    })
+}
+
 impl SessionTransaction {
     fn append_changes(&mut self, changes: Vec<TransactionChange>) -> Result<()> {
         let added_bytes = changes
@@ -303,7 +318,7 @@ struct Savepoint {
     checkpoint: TransactionCheckpoint,
     changes_len: usize,
     schema_snapshot: Option<SchemaSnapshot>,
-    schema_snapshot_bytes: usize,
+    metadata_bytes: usize,
     local_settings: HashMap<String, Option<String>>,
     local_values: HashMap<String, Option<String>>,
     notifications_len: usize,
@@ -3308,19 +3323,25 @@ where
                 },
                 None => 0,
             };
+            let settings_bytes =
+                savepoint_settings_bytes(&state.local_settings, session).unwrap_or(usize::MAX);
+            let metadata_bytes = schema_snapshot_bytes
+                .checked_add(settings_bytes)
+                .and_then(|bytes| bytes.checked_add(32usize.saturating_add(name.len())))
+                .unwrap_or(usize::MAX);
             let position = state.savepoints.iter().position(|savepoint| savepoint.name == name);
             let retained_bytes = state
                 .savepoints
                 .iter()
                 .take(position.unwrap_or(state.savepoints.len()))
                 .map(|savepoint| {
-                    savepoint.checkpoint.state_bytes().checked_add(savepoint.schema_snapshot_bytes)
+                    savepoint.checkpoint.state_bytes().checked_add(savepoint.metadata_bytes)
                 })
                 .try_fold(0usize, |total, bytes| total.checked_add(bytes?));
             let next_count = position.unwrap_or(state.savepoints.len()).saturating_add(1);
             let next_bytes = retained_bytes
                 .and_then(|bytes| bytes.checked_add(state.txn.state_bytes()))
-                .and_then(|bytes| bytes.checked_add(schema_snapshot_bytes))
+                .and_then(|bytes| bytes.checked_add(metadata_bytes))
                 .unwrap_or(usize::MAX);
             if next_count > MAX_SAVEPOINTS || next_bytes > MAX_TRANSACTION_STATE_BYTES {
                 state.failed = true;
@@ -3337,7 +3358,7 @@ where
                 checkpoint: state.txn.checkpoint(),
                 changes_len: state.changes.len(),
                 schema_snapshot,
-                schema_snapshot_bytes,
+                metadata_bytes,
                 local_settings: state.local_settings.clone(),
                 local_values: state
                     .local_settings
@@ -5264,7 +5285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn savepoint_schema_memory_is_included_in_budget() {
+    async fn savepoint_snapshot_memory_is_included_in_budget() {
         let executor = Arc::new(Executor::new(String::from("tenant"), String::from("db")));
         let txn = executor.begin_transaction(Isolation::Serializable);
         let checkpoint = txn.checkpoint();
@@ -5284,7 +5305,7 @@ mod tests {
                 checkpoint,
                 changes_len: 0,
                 schema_snapshot: None,
-                schema_snapshot_bytes: MAX_TRANSACTION_STATE_BYTES,
+                metadata_bytes: MAX_TRANSACTION_STATE_BYTES,
                 local_settings: HashMap::new(),
                 local_values: HashMap::new(),
                 notifications_len: 0,
