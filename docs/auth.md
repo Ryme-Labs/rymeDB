@@ -93,6 +93,9 @@ refresh tokens server-side rather than persisting them in browser storage.
 JWTs accept rymeDB claims (`tenant`, `roles`) and common Supabase claims
 (`tenant_id`, `role`, and `app_metadata.roles`). Common role behavior:
 
+If no tenant claim is present, the principal uses tenant `default`. A present
+tenant claim with a non-string, empty, or oversized value is rejected.
+
 | Role | Default capability |
 | --- | --- |
 | `anon` | Read-only public access |

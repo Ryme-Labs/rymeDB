@@ -715,7 +715,8 @@ impl JwtVerifier {
             .get("tenant")
             .or_else(|| claims.get("tenant_id"))
             .or_else(|| claims.get("app_metadata").and_then(|v| v.get("tenant")))
-            .and_then(|v| v.as_str())
+            .map(|value| value.as_str().ok_or(RymeError::Unauthorized))
+            .transpose()?
             .unwrap_or("default");
         if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN {
             return Err(RymeError::Unauthorized);
@@ -1845,6 +1846,13 @@ mod tests {
         let verifier = JwtVerifier::new(b"size-secret".to_vec());
 
         assert!(verifier.principal_from_token(&"x".repeat(MAX_JWT_TOKEN_LEN + 1), 1000).is_err());
+        let default_tenant = verifier
+            .principal_from_token(
+                &token(serde_json::json!({ "sub": "u", "exp": 2000000000u64 })),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(default_tenant.tenant, "default");
         assert!(verifier
             .principal_from_token(
                 &token(serde_json::json!({
@@ -1867,6 +1875,27 @@ mod tests {
         assert!(verifier
             .principal_from_token(
                 &token(serde_json::json!({ "sub": "u", "tenant": "", "exp": 2000000000u64 })),
+                1000,
+            )
+            .is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({
+                    "sub": "u",
+                    "tenant": 42,
+                    "tenant_id": "project-a",
+                    "exp": 2000000000u64,
+                })),
+                1000,
+            )
+            .is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({
+                    "sub": "u",
+                    "app_metadata": { "tenant": null },
+                    "exp": 2000000000u64,
+                })),
                 1000,
             )
             .is_err());
