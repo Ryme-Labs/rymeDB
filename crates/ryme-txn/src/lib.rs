@@ -1659,15 +1659,12 @@ impl TxnManager {
             engine.apply_with_expiry(key.clone(), commit_ts, op.value.clone(), op.expires_at)?;
         }
         drop(engine);
-        if !fresh.is_empty() {
-            let keys = committed_keys
-                .map(|keys| keys.to_vec())
-                .unwrap_or_else(|| fresh.keys().cloned().collect());
+        let keys = committed_keys
+            .map(|keys| keys.to_vec())
+            .unwrap_or_else(|| fresh.keys().cloned().collect());
+        if !keys.is_empty() {
+            committed.record_latest(commit_ts, &keys);
             committed.record(commit_ts, keys);
-        } else if let Some(keys) = committed_keys {
-            if !keys.is_empty() {
-                committed.record(commit_ts, keys.to_vec());
-            }
         }
         let visible_ts = commit_ts.saturating_add(1);
         self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
@@ -4657,6 +4654,14 @@ mod tests {
 
         let mut stale = manager.begin();
         manager.replay_at_filtered(10, &writes, |key| key == &local).unwrap();
+        assert_eq!(
+            manager.inner.commit.lock().unwrap().latest_by_table.get(&(
+                String::from("t"),
+                String::from("d"),
+                String::from("owned")
+            )),
+            Some(&10)
+        );
 
         let mut fresh = manager.begin();
         assert_eq!(manager.get(&mut fresh, &local).unwrap(), Some(b"local-value".to_vec()));
