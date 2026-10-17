@@ -715,6 +715,34 @@ async fn follower_transaction_forwarding_preserves_read_conflicts() {
     let result = backends[client].commit(stale).await;
     assert!(matches!(result, Err(ryme_error::RymeError::Conflict(_))));
 
+    let history_guard = backends[leader].begin();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut probe = backends[client].begin();
+        if backends[client].get(&mut probe, &key("watched")).unwrap() == Some(b"v2".to_vec()) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "update did not reach scan follower");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut stale_scan = backends[client].begin();
+    assert_eq!(stale_scan.read_ts, history_guard.read_ts);
+    assert!(!backends[client]
+        .scan_async(&mut stale_scan, "t", "d", "s", 100)
+        .await
+        .unwrap()
+        .is_empty());
+    let mut insert = backends[leader].begin();
+    backends[leader].put(&mut insert, key("phantom"), b"new-row".to_vec());
+    backends[leader].commit(insert).await.unwrap();
+    backends[client].put(&mut stale_scan, key("scan-write"), b"value".to_vec());
+    let scan_result = backends[client].commit(stale_scan).await;
+    assert!(
+        matches!(scan_result, Err(ryme_error::RymeError::Conflict(ref message)) if message == "phantom conflict"),
+        "expected phantom conflict, got {scan_result:?}"
+    );
+    drop(history_guard);
+
     for (node, task) in nodes.iter().zip(tasks) {
         node.shutdown(task);
     }
