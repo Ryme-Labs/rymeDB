@@ -5601,6 +5601,47 @@ mod rest_compatibility_tests {
             Some(serde_json::json!("patched"))
         );
 
+        state
+            .gateway
+            .put(
+                &storage_admin,
+                "rest_update_rls",
+                b"row".to_vec(),
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-b","payload":"patched"}"#
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        let hidden_conflict = rest_insert(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("on_conflict=id"))),
+            axum::body::Bytes::from_static(
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-b","payload":"hidden-write"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(hidden_conflict.status(), StatusCode::NOT_FOUND);
+        let row = state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap();
+        let row = row.and_then(|row| serde_json::from_slice::<serde_json::Value>(&row).ok());
+        assert_eq!(
+            row.and_then(|row| row.get("payload").cloned()),
+            Some(serde_json::json!("patched"))
+        );
+
+        state
+            .gateway
+            .put(
+                &storage_admin,
+                "rest_update_rls",
+                b"row".to_vec(),
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"patched"}"#
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+
         let allowed_conflict = rest_insert(
             State(state.clone()),
             headers,
@@ -5823,6 +5864,9 @@ async fn rest_insert(
             if let Some(before) = before {
                 if !allow_upsert {
                     return Err(ryme_error::RymeError::Conflict(String::from("exists")));
+                }
+                if !executor.row_allowed_by_rls(&table, before) {
+                    return Err(ryme_error::RymeError::NotFound(String::from("row")));
                 }
                 if !executor.row_allowed_for_command(&table, before, RlsCommand::Update)
                     || !executor.row_allowed_for_command(&table, after, RlsCommand::Update)
