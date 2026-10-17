@@ -284,6 +284,7 @@ struct CommitIndex {
     by_timestamp: BTreeMap<u64, Vec<RecordKey>>,
     by_key: BTreeMap<RecordKey, Vec<u64>>,
     by_table: BTreeMap<(String, String, String), Vec<u64>>,
+    latest_by_table: BTreeMap<(String, String, String), u64>,
     pruned_through: u64,
 }
 
@@ -300,6 +301,16 @@ impl CommitIndex {
         }
         if !keys.is_empty() {
             self.by_timestamp.entry(commit_ts).or_default().extend(keys);
+        }
+    }
+
+    fn record_latest(&mut self, commit_ts: u64, keys: &[RecordKey]) {
+        for key in keys {
+            let table = (key.tenant.clone(), key.database.clone(), key.table.clone());
+            self.latest_by_table
+                .entry(table)
+                .and_modify(|latest| *latest = (*latest).max(commit_ts))
+                .or_insert(commit_ts);
         }
     }
 
@@ -330,6 +341,7 @@ impl CommitIndex {
         self.by_timestamp.clear();
         self.by_key.clear();
         self.by_table.clear();
+        self.latest_by_table.clear();
         self.pruned_through = floor;
     }
 }
@@ -1448,7 +1460,10 @@ impl TxnManager {
             for table in txn.scanned.iter() {
                 let phantom = committed.by_table.get(table).is_some_and(|timestamps| {
                     has_commit_between(timestamps, txn.read_ts, commit_ts)
-                });
+                }) || committed
+                    .latest_by_table
+                    .get(table)
+                    .is_some_and(|timestamp| *timestamp > txn.read_ts && *timestamp < commit_ts);
                 if phantom {
                     return Err(RymeError::Conflict(String::from("phantom conflict")));
                 }
@@ -1456,10 +1471,13 @@ impl TxnManager {
         }
         drop(engine);
         for table in txn.constraint_scanned.iter() {
-            let conflict = committed
-                .by_table
-                .get(table)
-                .is_some_and(|timestamps| has_commit_between(timestamps, txn.read_ts, commit_ts));
+            let conflict =
+                committed.by_table.get(table).is_some_and(|timestamps| {
+                    has_commit_between(timestamps, txn.read_ts, commit_ts)
+                }) || committed
+                    .latest_by_table
+                    .get(table)
+                    .is_some_and(|timestamp| *timestamp > txn.read_ts && *timestamp < commit_ts);
             if conflict {
                 return Err(RymeError::Conflict(String::from("constraint conflict")));
             }
@@ -1741,6 +1759,7 @@ impl TxnManager {
         exclude_active_id: Option<u64>,
     ) -> Result<()> {
         self.inner.active.publish_commit(commit_ts, exclude_active_id, |retain_conflicts| {
+            committed.record_latest(commit_ts, &committed_keys);
             if retain_conflicts {
                 committed.record(commit_ts, committed_keys);
             }
@@ -3702,6 +3721,7 @@ mod tests {
         assert!(committed.by_key.is_empty());
         assert!(committed.by_table.is_empty());
         assert!(committed.by_timestamp.is_empty());
+        assert_eq!(committed.latest_by_table.get(&("t".into(), "d".into(), "kv".into())), Some(&2));
         drop(committed);
 
         let mut reader = manager.begin();
@@ -4191,6 +4211,24 @@ mod tests {
         manager.put(&mut reader, RecordKey::new("t", "d", "iso", b"pw"), b"w".to_vec());
         let conflicted = manager.commit(reader);
         assert!(matches!(conflicted, Err(RymeError::Conflict(_))));
+    }
+
+    #[test]
+    fn forwarded_stale_scan_conflicts_without_retained_local_history() {
+        let manager = TxnManager::new();
+        let mut stale = manager.begin();
+        assert!(manager.scan(&mut stale, "t", "d", "phant", 100).unwrap().is_empty());
+        let stale_state = stale.state();
+        drop(stale);
+
+        let mut writer = manager.begin();
+        manager.put(&mut writer, RecordKey::new("t", "d", "phant", b"new-row"), b"value".to_vec());
+        manager.commit(writer).unwrap();
+        assert!(manager.inner.commit.lock().unwrap().by_table.is_empty());
+
+        let mut forwarded = manager.from_state(stale_state).unwrap();
+        manager.put(&mut forwarded, RecordKey::new("t", "d", "other", b"write"), b"value".to_vec());
+        assert!(matches!(manager.commit(forwarded), Err(RymeError::Conflict(_))));
     }
 
     #[test]
