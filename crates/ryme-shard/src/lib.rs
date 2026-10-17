@@ -122,6 +122,28 @@ const COORDINATOR_DECISION_VERSION: u8 = 1;
 const COORDINATOR_PLACEMENT_VERSION: u8 = 2;
 const MAX_PENDING_GROUP_COMMITS: usize = 128;
 const MAX_PENDING_GROUP_COMMIT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SHARD_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
+fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let file_len = file.metadata()?.len();
+    if file_len > MAX_SHARD_METADATA_BYTES as u64 {
+        return Err(RymeError::Overload(label.to_string()));
+    }
+    let capacity = usize::try_from(file_len).map_err(|_| RymeError::Overload(label.to_string()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_SHARD_METADATA_BYTES as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SHARD_METADATA_BYTES {
+        return Err(RymeError::Overload(label.to_string()));
+    }
+    Ok(Some(bytes))
+}
 
 fn encode_decision(commit_ts: u64, parts: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -187,10 +209,8 @@ fn decode_placement(raw: &[u8]) -> Result<(TableRef, usize)> {
 }
 
 fn load_placements(path: &std::path::Path, shard_count: usize) -> Result<HashMap<TableRef, usize>> {
-    let raw = match std::fs::read(path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(error.into()),
+    let Some(raw) = read_bounded_metadata(path, "placements")? else {
+        return Ok(HashMap::new());
     };
     let entries: Vec<(TableRef, usize)> = serde_json::from_slice(&raw)
         .map_err(|error| RymeError::Corrupt(format!("placements: {error}")))?;
@@ -208,10 +228,8 @@ fn load_range_assignments(
     path: &std::path::Path,
     shard_count: usize,
 ) -> Result<HashMap<String, usize>> {
-    let raw = match std::fs::read(path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(error.into()),
+    let Some(raw) = read_bounded_metadata(path, "range placements")? else {
+        return Ok(HashMap::new());
     };
     let entries: HashMap<String, usize> = serde_json::from_slice(&raw)
         .map_err(|error| RymeError::Corrupt(format!("range placements: {error}")))?;
@@ -227,6 +245,9 @@ fn persist_range_assignments(
 ) -> Result<()> {
     let bytes = serde_json::to_vec(assignments)
         .map_err(|error| RymeError::Internal(format!("range placements: {error}")))?;
+    if bytes.len() > MAX_SHARD_METADATA_BYTES {
+        return Err(RymeError::Overload(String::from("range placements")));
+    }
     let temporary = path.with_extension("json.tmp");
     let mut file = std::fs::File::create(&temporary)?;
     use std::io::Write;
@@ -412,6 +433,9 @@ impl ShardSet {
         };
         let bytes = serde_json::to_vec(&entries)
             .map_err(|error| RymeError::Internal(format!("placements: {error}")))?;
+        if bytes.len() > MAX_SHARD_METADATA_BYTES {
+            return Err(RymeError::Overload(String::from("placements")));
+        }
         let temporary = path.with_extension("json.tmp");
         let mut file = std::fs::File::create(&temporary)?;
         use std::io::Write;
@@ -1569,6 +1593,45 @@ impl TxnBackend for HybridBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_metadata_reads_are_bounded() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-shard-metadata-limit-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        fn assert_oversized_file_rejected<T>(
+            path: &std::path::Path,
+            label: &str,
+            load: impl FnOnce(&std::path::Path) -> Result<T>,
+        ) {
+            let file = std::fs::File::create(path).unwrap();
+            file.set_len((MAX_SHARD_METADATA_BYTES + 1) as u64).unwrap();
+            assert!(matches!(
+                load(path),
+                Err(RymeError::Overload(message)) if message == label
+            ));
+            std::fs::remove_file(path).unwrap();
+        }
+
+        for (name, label) in
+            [("placements.json", "placements"), ("range-placements.json", "range placements")]
+        {
+            let path = dir.join(name);
+            if name == "placements.json" {
+                assert_oversized_file_rejected(&path, label, |path| load_placements(path, 4));
+            } else {
+                assert_oversized_file_rejected(&path, label, |path| {
+                    load_range_assignments(path, 4)
+                });
+            }
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn writes(pairs: Vec<(&str, &str)>) -> Vec<(Vec<u8>, Vec<u8>)> {
         pairs.into_iter().map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())).collect()
