@@ -1233,6 +1233,9 @@ impl PasskeyRegistry {
         if client_data.get("type").and_then(|v| v.as_str()) != Some("webauthn.get") {
             return Err(RymeError::Unauthorized);
         }
+        if client_data.get("crossOrigin").is_some_and(|value| value.as_bool() != Some(false)) {
+            return Err(RymeError::Unauthorized);
+        }
         let presented = client_data.get("challenge").and_then(|v| v.as_str()).unwrap_or("");
         let (challenge_user, issued_at) =
             self.challenges.get(presented).ok_or(RymeError::Unauthorized)?;
@@ -2418,6 +2421,24 @@ mod tests {
                 now_secs: 1100,
             })
         };
+        let cross_origin_challenge = registry.challenge_at("ada", 1001).unwrap();
+        let cross_origin_client_data = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{cross_origin_challenge}\",\"origin\":\"https://auth.test\",\"crossOrigin\":true}}"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(cross_origin_client_data.as_bytes());
+        let mut cross_origin_signed = auth_data.clone();
+        cross_origin_signed.extend_from_slice(&hasher.finalize());
+        let cross_origin_signature: p256::ecdsa::Signature = secret.sign(&cross_origin_signed);
+        let cross_origin_signature = cross_origin_signature.to_der().as_bytes().to_vec();
+        assert!(attempt(
+            &mut registry,
+            &auth_data,
+            cross_origin_client_data.as_bytes(),
+            &cross_origin_signature,
+        )
+        .is_err());
+        assert!(registry.challenges.contains_key(&cross_origin_challenge));
         assert!(attempt(&mut registry, &auth_data, client_data.as_bytes(), &signature).is_ok());
         assert!(attempt(&mut registry, &auth_data, client_data.as_bytes(), &signature).is_err());
         let fresh = registry.challenge_at("ada", 1200).unwrap();
