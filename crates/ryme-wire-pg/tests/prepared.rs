@@ -268,6 +268,49 @@ async fn prepared_statements_and_portals_have_session_limits() {
 }
 
 #[tokio::test]
+async fn prepared_statements_and_portals_have_byte_limits() {
+    let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener).await;
+    });
+    let mut socket = startup(addr).await;
+    let large = "x".repeat(60 * 1024);
+
+    for index in 0..4 {
+        let response = roundtrip(&mut socket, parse_msg(&format!("large-{index}"), &large)).await;
+        assert_eq!(response.first().map(|(tag, _)| *tag), Some(b'1'));
+    }
+    socket.write_all(&parse_msg("large-over-limit", &large)).await.unwrap();
+    let (tag, body) = read_frame(&mut socket).await;
+    assert_eq!(tag, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("prepared statement limit exceeded"));
+    socket.write_all(&sync_msg()).await.unwrap();
+    while read_frame(&mut socket).await.0 != b'Z' {}
+
+    let response = roundtrip(&mut socket, parse_msg("portal-query", "SELECT $1")).await;
+    assert_eq!(response.first().map(|(tag, _)| *tag), Some(b'1'));
+    for index in 0..4 {
+        let response = roundtrip(
+            &mut socket,
+            bind_msg(&format!("large-portal-{index}"), "portal-query", &[&large]),
+        )
+        .await;
+        assert_eq!(response.first().map(|(tag, _)| *tag), Some(b'2'));
+    }
+    socket
+        .write_all(&bind_msg("large-portal-over-limit", "portal-query", &[&large]))
+        .await
+        .unwrap();
+    let (tag, body) = read_frame(&mut socket).await;
+    assert_eq!(tag, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("portal memory limit exceeded"));
+    socket.write_all(&sync_msg()).await.unwrap();
+    while read_frame(&mut socket).await.0 != b'Z' {}
+}
+
+#[tokio::test]
 async fn prepared_sql_execute_caches() {
     let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

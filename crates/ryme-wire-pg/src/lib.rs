@@ -69,6 +69,9 @@ enum DecodedCopy {
 
 const MAX_PREPARED_STATEMENTS: usize = 256;
 const MAX_PORTALS: usize = 256;
+const MAX_PREPARED_STATE_BYTES: usize = 256 * 1024;
+const MAX_PORTAL_STATE_BYTES: usize = 256 * 1024;
+const MAX_CACHED_QUERY_BYTES: usize = 256;
 const MAX_SAVEPOINTS: usize = 256;
 const MAX_SAVEPOINT_NAME_BYTES: usize = 256;
 const MAX_TRANSACTION_CHANGES: usize = 100_000;
@@ -83,6 +86,44 @@ const MAX_SESSION_SETTING_VALUE_BYTES: usize = 64 * 1024;
 const MAX_LISTENING_CHANNELS: usize = 4_096;
 const MAX_NOTIFICATION_CHANNEL_BYTES: usize = 63;
 const MAX_NOTIFICATION_PAYLOAD_BYTES: usize = 8_000;
+
+fn prepared_state_exceeds_limit(
+    statements: &HashMap<String, String>,
+    name: &str,
+    query: &str,
+) -> bool {
+    let used = statements
+        .iter()
+        .map(|(name, query)| name.len().saturating_add(query.len()))
+        .fold(0usize, usize::saturating_add);
+    let replaced =
+        statements.get(name).map(|query| name.len().saturating_add(query.len())).unwrap_or(0);
+    used.saturating_sub(replaced).saturating_add(name.len()).saturating_add(query.len())
+        > MAX_PREPARED_STATE_BYTES
+}
+
+fn portal_state_exceeds_limit(
+    portals: &HashMap<String, Portal>,
+    name: &str,
+    statement: &str,
+    params: &[String],
+) -> bool {
+    let portal_bytes = |name: &str, portal: &Portal| {
+        name.len().saturating_add(portal.statement.len()).saturating_add(
+            portal.params.iter().map(String::len).fold(0usize, usize::saturating_add),
+        )
+    };
+    let used = portals
+        .iter()
+        .map(|(name, portal)| portal_bytes(name, portal))
+        .fold(0usize, usize::saturating_add);
+    let replaced = portals.get(name).map(|portal| portal_bytes(name, portal)).unwrap_or(0);
+    let candidate = name
+        .len()
+        .saturating_add(statement.len())
+        .saturating_add(params.iter().map(String::len).fold(0usize, usize::saturating_add));
+    used.saturating_sub(replaced).saturating_add(candidate) > MAX_PORTAL_STATE_BYTES
+}
 
 struct SessionTransaction {
     txn: Transaction,
@@ -1349,8 +1390,9 @@ where
             }
             b'P' => match parse_prepare(&payload) {
                 Ok((name, query)) => {
-                    if statements.len() >= MAX_PREPARED_STATEMENTS
-                        && !statements.contains_key(&name)
+                    if (statements.len() >= MAX_PREPARED_STATEMENTS
+                        && !statements.contains_key(&name))
+                        || prepared_state_exceeds_limit(&statements, &name, &query)
                     {
                         let response = encode_error_code(
                             "54000",
@@ -1379,6 +1421,17 @@ where
                     if portals.len() >= MAX_PORTALS && !portals.contains_key(&portal) {
                         let response =
                             encode_error_code("54000", String::from("portal limit exceeded"));
+                        socket
+                            .write_all(&response)
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        continue;
+                    }
+                    if portal_state_exceeds_limit(&portals, &portal, &statement, &params) {
+                        let response = encode_error_code(
+                            "54000",
+                            String::from("portal memory limit exceeded"),
+                        );
                         socket
                             .write_all(&response)
                             .await
@@ -1436,8 +1489,12 @@ where
                                 Some(statement) => Ok(statement),
                                 None => match parse(trimmed) {
                                     Ok(statement) => {
-                                        entry.cached =
-                                            Some((trimmed.to_string(), statement.clone()));
+                                        if trimmed.len() <= MAX_CACHED_QUERY_BYTES {
+                                            entry.cached =
+                                                Some((trimmed.to_string(), statement.clone()));
+                                        } else {
+                                            entry.cached = None;
+                                        }
                                         Ok(statement)
                                     }
                                     Err(e) => Err(e),
@@ -3595,7 +3652,9 @@ where
             {
                 return Some(encode_error_code("42601", format!("unsupported statement: {query}")));
             }
-            if statements.len() >= MAX_PREPARED_STATEMENTS && !statements.contains_key(&name) {
+            if (statements.len() >= MAX_PREPARED_STATEMENTS && !statements.contains_key(&name))
+                || prepared_state_exceeds_limit(statements, &name, body)
+            {
                 return Some(encode_error_code(
                     "54000",
                     String::from("prepared statement limit exceeded"),
@@ -3649,8 +3708,12 @@ where
                 Some(statement) => Ok(statement),
                 None => match parse(trimmed) {
                     Ok(statement) => {
-                        prepared_cache
-                            .insert(name.to_string(), (trimmed.to_string(), statement.clone()));
+                        if trimmed.len() <= MAX_CACHED_QUERY_BYTES {
+                            prepared_cache
+                                .insert(name.to_string(), (trimmed.to_string(), statement.clone()));
+                        } else {
+                            prepared_cache.remove(name);
+                        }
                         Ok(statement)
                     }
                     Err(e) => Err(e),
@@ -4857,6 +4920,20 @@ mod tests {
             .is_err());
         set_session_value(&mut session, String::from("setting_0"), String::from("updated"))
             .unwrap();
+    }
+
+    #[test]
+    fn prepared_statements_and_portals_have_aggregate_byte_budgets() {
+        let query = "x".repeat(MAX_PREPARED_STATE_BYTES - 1);
+        let statements = HashMap::from([(String::from("q"), query.clone())]);
+        assert!(!prepared_state_exceeds_limit(&statements, "q", &query));
+        assert!(prepared_state_exceeds_limit(&statements, "other", "x"));
+
+        let params = vec![String::from("x").repeat(MAX_PORTAL_STATE_BYTES - 2)];
+        let portal = Portal { statement: String::from("s"), params: params.clone(), cached: None };
+        let portals = HashMap::from([(String::from("p"), portal)]);
+        assert!(!portal_state_exceeds_limit(&portals, "p", "s", &params));
+        assert!(portal_state_exceeds_limit(&portals, "other", "s", &[String::from("x")]));
     }
 
     #[test]
