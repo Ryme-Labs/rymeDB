@@ -813,9 +813,30 @@ fn collect_table_privilege_requirements(
 ) {
     let mut require = |table: &str, privilege| required.push((table.to_string(), privilege));
     match statement {
-        Statement::Returning { statement, .. }
-        | Statement::Distinct { statement, .. }
-        | Statement::Explain { inner: statement, .. } => {
+        Statement::Returning { statement, .. } => {
+            collect_table_privilege_requirements(statement, required);
+            let returning_table = match statement.as_ref() {
+                Statement::Insert { table, .. }
+                | Statement::InsertRow { table, .. }
+                | Statement::InsertRows { table, .. }
+                | Statement::InsertSelect { table, .. }
+                | Statement::Upsert { table, .. }
+                | Statement::InsertIgnore { table, .. }
+                | Statement::InsertConflict { table, .. }
+                | Statement::Update { table, .. }
+                | Statement::UpdateRow { table, .. }
+                | Statement::UpdateWhere { table, .. }
+                | Statement::UpdateFrom { table, .. }
+                | Statement::Delete { table, .. }
+                | Statement::DeleteWhere { table, .. }
+                | Statement::DeleteUsing { table, .. } => Some(table),
+                _ => None,
+            };
+            if let Some(table) = returning_table {
+                required.push((table.to_string(), "SELECT"));
+            }
+        }
+        Statement::Distinct { statement, .. } | Statement::Explain { inner: statement, .. } => {
             collect_table_privilege_requirements(statement, required);
         }
         Statement::Union { left, right, .. } => {
@@ -17476,6 +17497,43 @@ mod tests {
         assert!(matches!(
             reader.execute(parse("SELECT * FROM public.messages").unwrap()).await,
             Err(RymeError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn returning_requires_select_privilege_on_mutated_rows() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE public.secrets (id TEXT PRIMARY KEY, value TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse("INSERT INTO public.secrets (id, value) VALUES ('one', 'hidden')").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor.execute(parse("CREATE ROLE updater LOGIN").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT UPDATE ON TABLE public.secrets TO updater").unwrap())
+            .await
+            .unwrap();
+
+        let updater = executor.clone().with_role(String::from("updater"));
+        assert!(matches!(
+            updater
+                .execute(
+                    parse("UPDATE public.secrets SET id = 'one' WHERE id = 'one' RETURNING value")
+                        .unwrap(),
+                )
+                .await,
+            Err(RymeError::Forbidden)
+        ));
+        assert!(matches!(
+            executor.execute(parse("SELECT value FROM public.secrets WHERE id = 'one'").unwrap()).await,
+            Ok(QueryResult::Table { ref rows, .. }) if rows == &vec![vec![b"hidden".to_vec()]]
         ));
     }
 
