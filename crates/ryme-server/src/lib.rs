@@ -4913,7 +4913,7 @@ fn retain_rest_row(
     Ok(())
 }
 
-fn rest_matching_keys(
+async fn rest_matching_keys(
     gateway: &Gateway<BranchStorage>,
     principal: &Principal,
     executor: &Executor<BranchStorage>,
@@ -4924,8 +4924,9 @@ fn rest_matching_keys(
     let mut keys = Vec::new();
     let rls_enabled = executor.row_security_enabled(table);
     loop {
-        let (page, next) =
-            gateway.scan_page(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)?;
+        let (page, next) = gateway
+            .scan_page_async(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)
+            .await?;
         let matches = rest_list_filtered(page, raw)
             .into_iter()
             .filter(|(_, value)| !rls_enabled || executor.row_allowed_by_rls(table, value))
@@ -4940,7 +4941,7 @@ fn rest_matching_keys(
     Ok(keys)
 }
 
-fn rest_conflict_key(
+async fn rest_conflict_key(
     gateway: &Gateway<BranchStorage>,
     principal: &Principal,
     executor: &Executor<BranchStorage>,
@@ -4951,8 +4952,9 @@ fn rest_conflict_key(
     let mut cursor = None;
     let rls_enabled = executor.row_security_enabled(table);
     loop {
-        let (page, next) =
-            gateway.scan_page(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)?;
+        let (page, next) = gateway
+            .scan_page_async(principal, table, cursor.as_deref(), REST_SCAN_PAGE_ROWS)
+            .await?;
         for (key, value) in page {
             if rls_enabled && !executor.row_allowed_by_rls(table, &value) {
                 continue;
@@ -5878,7 +5880,9 @@ async fn rest_insert(
             if let Some(expected) = body.fields.get(field) {
                 if let Some(existing) = match rest_conflict_key(
                     &gateway, &principal, &executor, &table, field, expected,
-                ) {
+                )
+                .await
+                {
                     Ok(existing) => existing,
                     Err(e) => return error_response(e),
                 } {
@@ -5990,7 +5994,7 @@ async fn rest_upsert(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    let keys = match rest_matching_keys(&gateway, &principal, &executor, &table, &raw) {
+    let keys = match rest_matching_keys(&gateway, &principal, &executor, &table, &raw).await {
         Ok(keys) => keys,
         Err(e) => return error_response(e),
     };
@@ -6067,9 +6071,9 @@ async fn rest_delete(
     };
     let executor =
         match table_executor_for_principal(&state, &headers, &principal, &table, &["DELETE"]) {
-        Ok(executor) => executor,
-        Err(e) => return error_response(e),
-    };
+            Ok(executor) => executor,
+            Err(e) => return error_response(e),
+        };
     if let Err(e) = validate_branch_selection(&state, &headers, &principal.tenant) {
         return error_response(e);
     }
@@ -6083,7 +6087,7 @@ async fn rest_delete(
         Ok(gateway) => gateway,
         Err(e) => return error_response(e),
     };
-    let keys = match rest_matching_keys(&gateway, &principal, &executor, &table, &raw) {
+    let keys = match rest_matching_keys(&gateway, &principal, &executor, &table, &raw).await {
         Ok(keys) => keys,
         Err(e) => return error_response(e),
     };
@@ -6094,22 +6098,20 @@ async fn rest_delete(
         return (StatusCode::OK, Json(serde_json::json!({ "commit": 0u64, "deleted": 0u64 })))
             .into_response();
     }
-    for key in &keys {
-        let current = match gateway.get(&principal, &table, key) {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                return error_response(ryme_error::RymeError::NotFound(String::from("row")))
+    let last_commit = match gateway
+        .delete_many_transform(&principal, &table, keys.clone(), |key, current| {
+            if !executor.row_allowed_by_rls(&table, current)
+                || rest_list_filtered(vec![(key.to_vec(), current.to_vec())], &raw).is_empty()
+            {
+                return Err(ryme_error::RymeError::NotFound(String::from("row")));
             }
-            Err(e) => return error_response(e),
-        };
-        if !executor.row_allowed_for_command(&table, &current, RlsCommand::Delete) {
-            return error_response(ryme_error::RymeError::Forbidden);
-        }
-        if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {
-            return error_response(e);
-        }
-    }
-    let last_commit = match gateway.delete_many(&principal, &table, keys.clone()).await {
+            if !executor.row_allowed_for_command(&table, current, RlsCommand::Delete) {
+                return Err(ryme_error::RymeError::Forbidden);
+            }
+            admit_write(&state, &principal.tenant, key.len() as u64)
+        })
+        .await
+    {
         Ok(commit) => commit,
         Err(e) => return error_response(e),
     };

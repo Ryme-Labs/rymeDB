@@ -741,6 +741,21 @@ where
         table: &str,
         pks: Vec<Vec<u8>>,
     ) -> Result<u64> {
+        self.delete_many_transform(principal, table, pks, |_, _| Ok(())).await
+    }
+
+    /// Atomically validates the current rows and deletes them under one MVCC
+    /// commit. The callback runs after each transactional read and before its delete.
+    pub async fn delete_many_transform<F>(
+        &self,
+        principal: &Principal,
+        table: &str,
+        pks: Vec<Vec<u8>>,
+        mut validate: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
         self.reject_if_read_only()?;
         validate_table(table)?;
         self.policies.check_write(principal, table)?;
@@ -765,6 +780,7 @@ where
             if !self.policies.row_allowed(principal, table, &current)? {
                 return Err(RymeError::NotFound(String::from("row")));
             }
+            validate(&pk, &current)?;
             self.manager.try_delete(&mut txn, key)?;
             changes.push((pk, current));
         }
@@ -1118,6 +1134,23 @@ mod tests {
             .await
             .is_err());
         assert!(gateway.get(&principal, "docs", b"first").unwrap().is_some());
+        assert!(gateway
+            .delete_many_transform(
+                &principal,
+                "docs",
+                vec![b"first".to_vec(), b"second".to_vec()],
+                |key, _| {
+                    if key == b"second" {
+                        Err(RymeError::Forbidden)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .is_err());
+        assert!(gateway.get(&principal, "docs", b"first").unwrap().is_some());
+        assert!(gateway.get(&principal, "docs", b"second").unwrap().is_some());
 
         let mut changes = gateway.realtime().subscribe("t", "d", "docs");
         let commit = gateway
@@ -1380,6 +1413,42 @@ mod tests {
                 (b"c".to_vec(), b"three".to_vec()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn async_scan_page_uses_remote_scanner_and_cursor() {
+        let gateway = gateway().with_remote_scanner(RemoteScanner::new(
+            |tenant, table, start_after, limit, _read_ts| async move {
+                assert_eq!(tenant, "t");
+                assert_eq!(table, "docs");
+                assert_eq!(limit, 2);
+                if start_after.is_none() {
+                    Ok(RemoteScanPage {
+                        rows: vec![
+                            (b"a".to_vec(), b"one".to_vec()),
+                            (b"b".to_vec(), b"two".to_vec()),
+                        ],
+                        next: Some(b"b".to_vec()),
+                    })
+                } else {
+                    assert_eq!(start_after.as_deref(), Some(b"b".as_slice()));
+                    Ok(RemoteScanPage {
+                        rows: vec![(b"c".to_vec(), b"three".to_vec())],
+                        next: None,
+                    })
+                }
+                .map(RemoteScan::Page)
+            },
+        ));
+
+        let (first, cursor) = gateway.scan_page_async(&owner(), "docs", None, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(cursor, Some(b"b".to_vec()));
+
+        let (second, next) =
+            gateway.scan_page_async(&owner(), "docs", cursor.as_deref(), 2).await.unwrap();
+        assert_eq!(second, vec![(b"c".to_vec(), b"three".to_vec())]);
+        assert!(next.is_none());
     }
 
     #[tokio::test]
