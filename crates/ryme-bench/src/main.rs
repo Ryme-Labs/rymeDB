@@ -2273,28 +2273,51 @@ fn txn_read_batch_bench(
         return;
     }
     let keys = (0..candidates).map(|index| keys[index % records].clone()).collect::<Vec<_>>();
+    let staged_key = RecordKey::new("bench", "default", "staged-write", b"pending");
 
     for _ in 0..5 {
         std::hint::black_box(measure_single_reads(&manager, &keys, false));
         std::hint::black_box(measure_single_reads(&manager, &keys, true));
         std::hint::black_box(measure_batched_reads(&manager, &keys, batch_size, false));
         std::hint::black_box(measure_batched_reads(&manager, &keys, batch_size, true));
+        std::hint::black_box(measure_single_reads_with_staged_write(&manager, &keys, &staged_key));
+        std::hint::black_box(measure_batched_reads_with_staged_write(
+            &manager,
+            &keys,
+            batch_size,
+            &staged_key,
+        ));
     }
 
     let mut single_samples = Vec::with_capacity(iterations);
     let mut read_only_samples = Vec::with_capacity(iterations);
     let mut batch_samples = Vec::with_capacity(iterations);
     let mut read_only_batch_samples = Vec::with_capacity(iterations);
+    let mut staged_single_samples = Vec::with_capacity(iterations);
+    let mut staged_batch_samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         single_samples.push(measure_single_reads(&manager, &keys, false));
         read_only_samples.push(measure_single_reads(&manager, &keys, true));
         batch_samples.push(measure_batched_reads(&manager, &keys, batch_size, false));
         read_only_batch_samples.push(measure_batched_reads(&manager, &keys, batch_size, true));
+        staged_single_samples.push(measure_single_reads_with_staged_write(
+            &manager,
+            &keys,
+            &staged_key,
+        ));
+        staged_batch_samples.push(measure_batched_reads_with_staged_write(
+            &manager,
+            &keys,
+            batch_size,
+            &staged_key,
+        ));
     }
     single_samples.sort_unstable();
     read_only_samples.sort_unstable();
     batch_samples.sort_unstable();
     read_only_batch_samples.sort_unstable();
+    staged_single_samples.sort_unstable();
+    staged_batch_samples.sort_unstable();
     let percentile =
         |samples: &[u64], percent: usize| samples[((samples.len() - 1) * percent) / 100];
     let summarize = |samples: &[u64]| {
@@ -2311,10 +2334,13 @@ fn txn_read_batch_bench(
     let read_only = summarize(&read_only_samples);
     let batched = summarize(&batch_samples);
     let read_only_batched = summarize(&read_only_batch_samples);
+    let staged_single = summarize(&staged_single_samples);
+    let staged_batched = summarize(&staged_batch_samples);
     let single_p50 = single["p50_ns"].as_u64().unwrap_or(0);
     let read_only_p50 = read_only["p50_ns"].as_u64().unwrap_or(0).max(1);
     let batch_p50 = batched["p50_ns"].as_u64().unwrap_or(0).max(1);
     let read_only_batch_p50 = read_only_batched["p50_ns"].as_u64().unwrap_or(0).max(1);
+    let staged_batch_p50 = staged_batched["p50_ns"].as_u64().unwrap_or(0).max(1);
     let output = serde_json::json!({
         "benchmark": "transaction-batch-read",
         "machine": machine_metadata(),
@@ -2329,15 +2355,19 @@ fn txn_read_batch_bench(
         "read_only_single_read": read_only,
         "batched_read": batched,
         "read_only_batched_read": read_only_batched,
+        "staged_write_single_read": staged_single,
+        "staged_write_batched_read": staged_batched,
         "p50_speedup": (single_p50 as f64 / batch_p50 as f64 * 100.0).round() / 100.0,
         "read_only_p50_speedup": (single_p50 as f64 / read_only_p50 as f64 * 100.0).round() / 100.0,
         "read_only_batch_p50_speedup": (read_only_p50 as f64 / read_only_batch_p50 as f64 * 100.0).round() / 100.0,
+        "staged_write_batch_p50_speedup": (staged_single["p50_ns"].as_u64().unwrap_or(0) as f64
+            / staged_batch_p50 as f64 * 100.0).round() / 100.0,
     });
     if json {
         println!("{output}");
     } else {
         println!(
-            "records={records} candidates={} iterations={iterations} batch_size={batch_size} tracked_p50={}ns read_only_p50={}ns read_only_speedup={}x batched_p50={}ns batch_speedup={}x read_only_batched_p50={}ns read_only_batch_speedup={}x",
+            "records={records} candidates={} iterations={iterations} batch_size={batch_size} tracked_p50={}ns read_only_p50={}ns read_only_speedup={}x batched_p50={}ns batch_speedup={}x read_only_batched_p50={}ns read_only_batch_speedup={}x staged_single_p50={}ns staged_batched_p50={}ns staged_batch_speedup={}x",
             candidates,
             output["single_read"]["p50_ns"].as_u64().unwrap_or(0),
             output["read_only_single_read"]["p50_ns"].as_u64().unwrap_or(0),
@@ -2346,6 +2376,9 @@ fn txn_read_batch_bench(
             output["p50_speedup"].as_f64().unwrap_or(0.0),
             output["read_only_batched_read"]["p50_ns"].as_u64().unwrap_or(0),
             output["read_only_batch_p50_speedup"].as_f64().unwrap_or(0.0),
+            output["staged_write_single_read"]["p50_ns"].as_u64().unwrap_or(0),
+            output["staged_write_batched_read"]["p50_ns"].as_u64().unwrap_or(0),
+            output["staged_write_batch_p50_speedup"].as_f64().unwrap_or(0.0),
         );
     }
 }
@@ -2380,6 +2413,44 @@ fn measure_batched_reads(
         found += manager
             .get_many(&mut txn, batch)
             .expect("benchmark batch read")
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+    }
+    std::hint::black_box(found);
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn measure_single_reads_with_staged_write(
+    manager: &BatchReadStore,
+    keys: &[RecordKey],
+    staged_key: &RecordKey,
+) -> u64 {
+    let mut txn = manager.begin();
+    manager.put(&mut txn, staged_key.clone(), b"pending".to_vec());
+    let started = Instant::now();
+    let mut found = 0usize;
+    for key in keys {
+        found += usize::from(manager.get(&mut txn, key).expect("benchmark staged read").is_some());
+    }
+    std::hint::black_box(found);
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn measure_batched_reads_with_staged_write(
+    manager: &BatchReadStore,
+    keys: &[RecordKey],
+    batch_size: usize,
+    staged_key: &RecordKey,
+) -> u64 {
+    let mut txn = manager.begin();
+    manager.put(&mut txn, staged_key.clone(), b"pending".to_vec());
+    let started = Instant::now();
+    let mut found = 0usize;
+    for batch in keys.chunks(batch_size) {
+        found += manager
+            .get_many(&mut txn, batch)
+            .expect("benchmark staged batch read")
             .into_iter()
             .filter(Option::is_some)
             .count();

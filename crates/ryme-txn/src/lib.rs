@@ -19,6 +19,7 @@ pub const MAX_TRANSACTION_STATE_BYTES: usize = 64 * 1024 * 1024;
 const TRANSACTION_ENTRY_OVERHEAD: usize = 64;
 const MVCC_GC_KEYS_PER_LOCK: usize = 1_024;
 const MVCC_GC_VERSIONS_PER_LOCK: usize = 4_096;
+const MIN_ORDERED_BATCH_READ_KEYS: usize = 16;
 
 fn transaction_key_bytes(key: &RecordKey) -> usize {
     TRANSACTION_ENTRY_OVERHEAD
@@ -1189,22 +1190,45 @@ impl TxnManager {
             return Ok(values);
         }
 
-        let mut values = Vec::with_capacity(keys.len());
+        let mut values = vec![None; keys.len()];
         {
             let engine = self
                 .inner
                 .engine
                 .read()
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-            for key in keys {
-                if let Some(staged) = txn.writes.get(key) {
-                    values.push(if staged.expires_at != 0 && staged.expires_at <= now {
-                        None
+            if keys.len() < MIN_ORDERED_BATCH_READ_KEYS {
+                for (index, key) in keys.iter().enumerate() {
+                    values[index] = if let Some(staged) = txn.writes.get(key) {
+                        if staged.expires_at != 0 && staged.expires_at <= now {
+                            None
+                        } else {
+                            staged.value.clone()
+                        }
                     } else {
-                        staged.value.clone()
-                    });
-                } else {
-                    values.push(engine.read(key, txn.read_ts, now)?);
+                        engine.read(key, txn.read_ts, now)?
+                    };
+                }
+            } else {
+                let mut pending_indices = Vec::with_capacity(keys.len());
+                let mut pending_keys = Vec::with_capacity(keys.len());
+                for (index, key) in keys.iter().enumerate() {
+                    if let Some(staged) = txn.writes.get(key) {
+                        values[index] = if staged.expires_at != 0 && staged.expires_at <= now {
+                            None
+                        } else {
+                            staged.value.clone()
+                        };
+                    } else {
+                        pending_indices.push(index);
+                        pending_keys.push(key.clone());
+                    }
+                }
+                if !pending_keys.is_empty() {
+                    let pending_values = engine.read_many(&pending_keys, txn.read_ts, now)?;
+                    for (index, value) in pending_indices.into_iter().zip(pending_values) {
+                        values[index] = value;
+                    }
                 }
             }
         }
@@ -3439,6 +3463,48 @@ mod tests {
         let mut tracked = manager.begin();
         assert_eq!(manager.get_many(&mut tracked, &keys).unwrap(), values);
         assert_eq!(tracked.read_keys(), &keys.iter().cloned().collect());
+    }
+
+    #[test]
+    fn staged_write_ordered_batch_reads_preserve_values_and_conflict_tracking() {
+        let manager = TxnManager::new();
+        let mut seed = manager.begin();
+        for id in 0u64..32 {
+            manager.put(
+                &mut seed,
+                RecordKey::new("t", "d", "items", &id.to_be_bytes()),
+                id.to_be_bytes().to_vec(),
+            );
+        }
+        manager.commit(seed).unwrap();
+
+        let keys = (0u64..32)
+            .chain(40..48)
+            .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
+            .collect::<Vec<_>>();
+        let staged_key = keys[8].clone();
+        let mut txn = manager.begin();
+        manager.put(&mut txn, staged_key.clone(), b"staged".to_vec());
+
+        let values = manager.get_many(&mut txn, &keys).unwrap();
+        assert_eq!(values[8], Some(b"staged".to_vec()));
+        assert_eq!(
+            values,
+            (0u64..32)
+                .map(|id| {
+                    if id == 8 {
+                        Some(b"staged".to_vec())
+                    } else {
+                        Some(id.to_be_bytes().to_vec())
+                    }
+                })
+                .chain((40..48).map(|_| None))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            txn.read_keys(),
+            &keys.iter().filter(|key| **key != staged_key).cloned().collect()
+        );
     }
 
     #[test]
