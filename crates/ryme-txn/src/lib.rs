@@ -576,7 +576,14 @@ impl Transaction {
         if self.read_only {
             return Ok(());
         }
-        if !self.read_set.insert(key.clone()) {
+        if self.read_set.contains(key) {
+            return Ok(());
+        }
+        self.record_unseen_read_ref(key, existed)
+    }
+
+    fn record_unseen_read_ref(&mut self, key: &RecordKey, existed: bool) -> Result<()> {
+        if self.read_only || !self.read_set.insert(key.clone()) {
             return Ok(());
         }
         let key_bytes = transaction_key_bytes(key);
@@ -593,6 +600,35 @@ impl Transaction {
             self.observed_missing.insert(key.clone());
         }
         self.state_bytes = self.state_bytes.saturating_add(added_bytes);
+        Ok(())
+    }
+
+    fn record_read_batch(
+        &mut self,
+        keys: &[RecordKey],
+        values: &[Option<Vec<u8>>],
+        skip_staged_write_check: bool,
+    ) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        debug_assert_eq!(keys.len(), values.len());
+        let sorted_unique = keys.windows(2).all(|pair| pair[0] < pair[1]);
+        let no_existing_reads = sorted_unique
+            && keys
+                .first()
+                .zip(keys.last())
+                .is_none_or(|(first, last)| self.read_set.range(first..=last).next().is_none());
+        for (key, value) in keys.iter().zip(values) {
+            if !skip_staged_write_check && self.writes.contains_key(key) {
+                continue;
+            }
+            if no_existing_reads {
+                self.record_unseen_read_ref(key, value.is_some())?;
+            } else {
+                self.record_read_ref(key, value.is_some())?;
+            }
+        }
         Ok(())
     }
 
@@ -1184,11 +1220,7 @@ impl TxnManager {
                     .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
                 engine.read_many(keys, txn.read_ts, now)?
             };
-            if !txn.read_only {
-                for (key, value) in keys.iter().zip(&values) {
-                    txn.record_read_ref(key, value.is_some())?;
-                }
-            }
+            txn.record_read_batch(keys, &values, true)?;
             return Ok(values);
         }
 
@@ -1235,11 +1267,7 @@ impl TxnManager {
                 }
             }
         }
-        for (key, value) in keys.iter().zip(&values) {
-            if !txn.writes.contains_key(key) {
-                txn.record_read_ref(key, value.is_some())?;
-            }
-        }
+        txn.record_read_batch(keys, &values, false)?;
         Ok(values)
     }
 

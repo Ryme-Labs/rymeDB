@@ -140,16 +140,17 @@ small loss, so this change does not establish a reliable Hot-mode speedup.
 These are single-host microbenchmarks, not cross-database claims; see the
 [raw captures](../bench/results/txn-read-batch-standard.json).
 
-Serializable reads record conflict keys in a `BTreeSet`. Recording each new
-read now uses the set insertion result instead of doing a separate membership
-lookup before insertion; if a resource limit rejects the new key, it is removed
-again so the transaction remains internally consistent. Two sequential Hot-mode
-release captures (10,000 records, 1,024 unique reads, 256-key batches, 128-byte
-values) reduced tracked batched-read p50 from 861–863 µs to 529–532 µs (about
-38%), and staged-write batched-read p50 from 865–867 µs to 560–562 µs (about
-35%). Read-only batched p50 stayed around 82–86 µs. This is an in-process
-transaction benchmark, not end-to-end database latency; see the
-[read-set captures](../bench/results/txn-read-set-insert.json).
+Serializable reads record conflict keys in a `BTreeSet`. For sorted, unique
+batches whose keys do not overlap the transaction's existing read set, tracking
+uses the set insertion result instead of a separate membership lookup. Other
+batch shapes and single-key reads keep duplicate-safe membership checks. If a
+resource limit rejects a newly inserted key, it is removed so the transaction
+remains internally consistent. Two sequential Hot-mode release captures
+(10,000 records, 1,024 unique reads, 256-key batches, 128-byte values) measured
+tracked batched-read p50 at 538–539 µs, down from 861–863 µs (about 38%), and
+staged-write batched-read p50 at 568–569 µs, down from 865–867 µs (about 34%).
+Read-only batched p50 stayed around 82 µs. This is an in-process transaction
+benchmark, not end-to-end database latency; see the [read-set captures](../bench/results/txn-read-set-insert.json).
 
 To measure the in-memory vector index's build, exact-search, and HNSW-search
 paths with the same generated corpus:

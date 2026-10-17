@@ -15,7 +15,7 @@
     "batch_size": 256,
     "value_bytes": 128
   },
-  "method": "Two sequential captures before and after replacing read-set contains-then-insert with insert-result checking. Each rejected new read is removed if transaction resource limits are exceeded.",
+  "method": "Two sequential captures before and after specializing sorted, unique batch read tracking to use the set insertion result when no key overlaps the existing read set. Single-key and duplicate-heavy paths retain membership checks. A newly inserted key is removed if transaction resource limits reject it.",
   "captures": {
     "before": [
       {
@@ -37,22 +37,22 @@
     ],
     "after": [
       {
-        "single_read_p50_ns": 736575,
-        "batched_read_p50_ns": 528982,
-        "read_only_single_read_p50_ns": 268369,
-        "read_only_batched_read_p50_ns": 81986,
-        "staged_write_single_read_p50_ns": 750521,
-        "staged_write_batched_read_p50_ns": 562134
+        "single_read_p50_ns": 1068123,
+        "batched_read_p50_ns": 538550,
+        "read_only_single_read_p50_ns": 267877,
+        "read_only_batched_read_p50_ns": 82416,
+        "staged_write_single_read_p50_ns": 1083031,
+        "staged_write_batched_read_p50_ns": 569278
       },
       {
-        "single_read_p50_ns": 751273,
-        "batched_read_p50_ns": 532048,
-        "read_only_single_read_p50_ns": 288487,
-        "read_only_batched_read_p50_ns": 81525,
-        "staged_write_single_read_p50_ns": 771170,
-        "staged_write_batched_read_p50_ns": 560422
+        "single_read_p50_ns": 1069415,
+        "batched_read_p50_ns": 538110,
+        "read_only_single_read_p50_ns": 267096,
+        "read_only_batched_read_p50_ns": 82406,
+        "staged_write_single_read_p50_ns": 1082139,
+        "staged_write_batched_read_p50_ns": 567505
       }
     ]
   },
-  "caveat": "Single-host in-process microbenchmark with two sequential captures per revision; not a controlled cross-database or end-to-end network benchmark."
+  "caveat": "Single-host in-process microbenchmark with two sequential captures per revision; not a controlled cross-database or end-to-end network benchmark. The single-read figures show no material improvement in the final implementation; the optimization is specific to eligible batches."
 }
