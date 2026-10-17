@@ -6594,6 +6594,43 @@ fn issue_api_key(
     Ok((key, principal.tenant.clone()))
 }
 
+struct AuthIssueRollback {
+    api_key: String,
+    new_refresh_token: String,
+    previous_refresh: Option<(String, ryme_auth::RefreshTokenRecord)>,
+}
+
+fn persist_auth_mutation<T>(
+    state: &SharedState,
+    mutate: impl FnOnce() -> ryme_error::Result<(T, AuthIssueRollback)>,
+) -> ryme_error::Result<T> {
+    let _persist_guard = state
+        .auth_persist_lock
+        .lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+    let (result, rollback) = mutate()?;
+    let mut replaced = false;
+    match state.persist_auth_locked(|| replaced = true) {
+        Ok(()) => Ok(result),
+        Err(error) => {
+            if !replaced {
+                state.keys.remove(&rollback.api_key);
+                state.refresh_tokens.revoke(&rollback.new_refresh_token);
+                if let Some((presented, record)) = rollback.previous_refresh {
+                    if let Err(restore_error) =
+                        state.refresh_tokens.restore_record(&presented, record)
+                    {
+                        return Err(ryme_error::RymeError::Internal(format!(
+                            "auth rollback failed after persistence error: {restore_error}"
+                        )));
+                    }
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn auth_token(
     State(state): State<SharedState>,
     Extension(client_ip): Extension<AuthClientIp>,
@@ -6638,8 +6675,8 @@ async fn auth_token(
         }
     };
     let credentials = state.credentials.clone();
-    let keys = state.keys.clone();
     let refresh_tokens = state.refresh_tokens.clone();
+    let auth_state = state.clone();
     let now = ryme_txn::now_unix();
     let issued = tokio::task::spawn_blocking(move || {
         let _hash_slot = hash_slot;
@@ -6648,13 +6685,23 @@ async fn auth_token(
             if request.grant_type.as_deref().is_some_and(|grant| grant != "refresh_token") {
                 return Err(ryme_error::RymeError::InvalidArgument(String::from("grant_type")));
             }
-            let presented =
-                request.refresh_token.as_deref().ok_or(ryme_error::RymeError::Unauthorized)?;
-            let ((key, tenant), refresh_token) =
-                refresh_tokens.rotate_with(presented, now, |principal| {
-                    issue_api_key(&keys, principal, now)
-                })?;
-            return Ok((key, tenant, refresh_token));
+            let presented = request
+                .refresh_token
+                .as_deref()
+                .ok_or(ryme_error::RymeError::Unauthorized)?
+                .to_string();
+            return persist_auth_mutation(&auth_state, || {
+                let ((key, tenant), new_refresh_token, previous_record) = refresh_tokens
+                    .rotate_with_record(&presented, now, |principal| {
+                        issue_api_key(&auth_state.keys, principal, now)
+                    })?;
+                let rollback = AuthIssueRollback {
+                    api_key: key.clone(),
+                    new_refresh_token: new_refresh_token.clone(),
+                    previous_refresh: Some((presented, previous_record)),
+                };
+                Ok(((key, tenant, new_refresh_token), rollback))
+            });
         }
         if request.grant_type.as_deref().is_some_and(|grant| grant != "password") {
             return Err(ryme_error::RymeError::InvalidArgument(String::from("grant_type")));
@@ -6674,35 +6721,39 @@ async fn auth_token(
                 return Err(ryme_error::RymeError::Unauthorized);
             }
         }
-        let refresh_token = refresh_tokens.issue(principal.clone(), now)?;
-        let (key, tenant) = match issue_api_key(&keys, &principal, now) {
-            Ok(issued) => issued,
-            Err(error) => {
-                let _ = refresh_tokens.revoke(&refresh_token);
-                return Err(error);
-            }
-        };
-        Ok((key, tenant, refresh_token))
+        persist_auth_mutation(&auth_state, || {
+            let refresh_token = refresh_tokens.issue(principal.clone(), now)?;
+            let (key, tenant) = match issue_api_key(&auth_state.keys, &principal, now) {
+                Ok(issued) => issued,
+                Err(error) => {
+                    let _ = refresh_tokens.revoke(&refresh_token);
+                    return Err(error);
+                }
+            };
+            let rollback = AuthIssueRollback {
+                api_key: key.clone(),
+                new_refresh_token: refresh_token.clone(),
+                previous_refresh: None,
+            };
+            Ok(((key, tenant, refresh_token), rollback))
+        })
     })
     .await;
     match issued {
-        Ok(Ok((key, tenant, refresh_token))) => match state.persist_auth() {
-            Ok(()) => {
-                complete_auth_attempt(&state, &attempt_key, client_ip.address);
-                (
-                    StatusCode::CREATED,
-                    Json(serde_json::json!({
-                        "key": key,
-                        "tenant": tenant,
-                        "expires_in": ACCESS_TOKEN_TTL_SECS,
-                        "refresh_token": refresh_token,
-                        "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
-                    })),
-                )
-                    .into_response()
-            }
-            Err(e) => error_response(e),
-        },
+        Ok(Ok((key, tenant, refresh_token))) => {
+            complete_auth_attempt(&state, &attempt_key, client_ip.address);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "key": key,
+                    "tenant": tenant,
+                    "expires_in": ACCESS_TOKEN_TTL_SECS,
+                    "refresh_token": refresh_token,
+                    "refresh_token_expires_in": ryme_auth::REFRESH_TOKEN_TTL_SECS,
+                })),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => error_response(e),
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("task"))),
     }
@@ -15424,6 +15475,52 @@ mod realtime_policy_tests {
             .collect();
         assert!(leftovers.is_empty(), "auth temp files left behind: {leftovers:?}");
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_refresh_persistence_rolls_back_rotation_and_access_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-refresh-persist-rollback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+        let principal = Principal {
+            id: String::from("rollback-user"),
+            tenant: String::from("default"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        let now = ryme_txn::now_unix();
+        let previous_refresh = state.refresh_tokens.issue(principal, now).unwrap();
+        let mut created_credentials = None;
+
+        let result = persist_auth_mutation(&state, || {
+            let ((key, tenant), next_refresh, previous_record) =
+                state.refresh_tokens.rotate_with_record(&previous_refresh, now, |principal| {
+                    issue_api_key(&state.keys, principal, now)
+                })?;
+            created_credentials = Some((key.clone(), next_refresh.clone()));
+            let rollback = AuthIssueRollback {
+                api_key: key.clone(),
+                new_refresh_token: next_refresh.clone(),
+                previous_refresh: Some((previous_refresh.clone(), previous_record)),
+            };
+            Ok(((key, tenant, next_refresh), rollback))
+        });
+
+        assert!(result.is_err());
+        let (new_key, new_refresh) = created_credentials.unwrap();
+        assert!(state.keys.authenticate(&new_key).is_err());
+        assert!(state.refresh_tokens.rotate(&new_refresh, now + 1).is_err());
+        assert_eq!(
+            state.refresh_tokens.rotate(&previous_refresh, now + 1).unwrap().0.id,
+            "rollback-user"
+        );
+        drop(state);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

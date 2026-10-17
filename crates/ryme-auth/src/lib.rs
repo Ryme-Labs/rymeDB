@@ -926,6 +926,19 @@ impl RefreshTokenStore {
     where
         F: FnOnce(&Principal) -> Result<T>,
     {
+        self.rotate_with_record(presented, now_secs, issue)
+            .map(|(issued, next, _previous)| (issued, next))
+    }
+
+    pub fn rotate_with_record<T, F>(
+        &self,
+        presented: &str,
+        now_secs: u64,
+        issue: F,
+    ) -> Result<(T, String, RefreshTokenRecord)>
+    where
+        F: FnOnce(&Principal) -> Result<T>,
+    {
         if presented.is_empty() || presented.len() > MAX_REFRESH_TOKEN_LEN {
             return Err(RymeError::Unauthorized);
         }
@@ -949,7 +962,7 @@ impl RefreshTokenStore {
                 expires_at: now_secs.saturating_add(REFRESH_TOKEN_TTL_SECS),
             },
         );
-        Ok((issued, raw))
+        Ok((issued, raw, session))
     }
 
     pub fn revoke(&self, presented: &str) -> bool {
