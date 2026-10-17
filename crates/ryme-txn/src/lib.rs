@@ -159,6 +159,27 @@ impl ActiveRegistry {
         transactions.by_read_ts.first_key_value().map(|(ts, _)| *ts)
     }
 
+    fn publish_commit(&self, commit_ts: u64, exclude_id: Option<u64>, publish: impl FnOnce(bool)) {
+        let transactions = self.transactions.lock().unwrap_or_else(|error| error.into_inner());
+        let retain_conflicts =
+            transactions.by_read_ts.first_key_value().is_some_and(|(oldest_ts, count)| {
+                if *oldest_ts >= commit_ts {
+                    return false;
+                }
+                let excludes_only_oldest = *count == 1
+                    && exclude_id
+                        .and_then(|id| transactions.by_id.get(&id))
+                        .is_some_and(|read_ts| read_ts == oldest_ts);
+                !excludes_only_oldest
+                    || transactions
+                        .by_read_ts
+                        .range((Excluded(*oldest_ts), Unbounded))
+                        .next()
+                        .is_some_and(|(read_ts, _)| *read_ts < commit_ts)
+            });
+        publish(retain_conflicts);
+    }
+
     fn remove_read_ts(read_timestamps: &mut BTreeMap<u64, usize>, read_ts: u64) {
         let remove = if let Some(count) = read_timestamps.get_mut(&read_ts) {
             if *count == 1 {
@@ -1497,7 +1518,7 @@ impl TxnManager {
             .filter(|(key, _)| keep(key))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        self.apply_owned_locked(commit_ts, writes, &mut guard)?;
+        self.apply_owned_locked(commit_ts, writes, &mut guard, None)?;
         self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
         Ok(())
     }
@@ -1519,6 +1540,7 @@ impl TxnManager {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         self.check_locked(&txn, commit_ts, &mut guard)?;
+        let txn_id = txn.id;
         let writes: BTreeMap<RecordKey, WriteOp> =
             txn.writes.into_iter().filter(|(key, _)| keep(key)).collect();
         if writes.is_empty() {
@@ -1526,7 +1548,7 @@ impl TxnManager {
         }
         let payload = encode_writes(&writes)?;
         persist(commit_ts, &payload, &writes)?;
-        self.apply_owned_locked(commit_ts, writes, &mut guard)?;
+        self.apply_owned_locked(commit_ts, writes, &mut guard, Some(txn_id))?;
         self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
         Ok(())
     }
@@ -1628,7 +1650,7 @@ impl TxnManager {
         writes: &BTreeMap<RecordKey, WriteOp>,
         committed: &mut CommitIndex,
     ) -> Result<()> {
-        self.apply_owned_locked(commit_ts, writes.clone(), committed)
+        self.apply_owned_locked(commit_ts, writes.clone(), committed, None)
     }
 
     fn apply_owned_locked(
@@ -1636,8 +1658,9 @@ impl TxnManager {
         commit_ts: u64,
         writes: BTreeMap<RecordKey, WriteOp>,
         committed: &mut CommitIndex,
+        exclude_active_id: Option<u64>,
     ) -> Result<()> {
-        self.apply_owned_inner(commit_ts, writes, false, committed).map(|_| ())
+        self.apply_owned_inner(commit_ts, writes, false, committed, exclude_active_id).map(|_| ())
     }
 
     fn apply_owned_or_confirm_locked(
@@ -1645,8 +1668,9 @@ impl TxnManager {
         commit_ts: u64,
         writes: BTreeMap<RecordKey, WriteOp>,
         committed: &mut CommitIndex,
+        exclude_active_id: Option<u64>,
     ) -> Result<()> {
-        self.apply_owned_inner(commit_ts, writes, true, committed).map(|_| ())
+        self.apply_owned_inner(commit_ts, writes, true, committed, exclude_active_id).map(|_| ())
     }
 
     fn apply_owned_inner(
@@ -1655,6 +1679,7 @@ impl TxnManager {
         writes: BTreeMap<RecordKey, WriteOp>,
         accept_identical: bool,
         committed: &mut CommitIndex,
+        exclude_active_id: Option<u64>,
     ) -> Result<bool> {
         if writes.is_empty() {
             return Ok(false);
@@ -1682,7 +1707,7 @@ impl TxnManager {
                 engine.apply_with_expiry(key, commit_ts, op.value, op.expires_at)?;
             }
         }
-        self.record_committed_locked(commit_ts, committed_keys, committed)?;
+        self.record_committed_locked(commit_ts, committed_keys, committed, exclude_active_id)?;
         Ok(true)
     }
 
@@ -1691,11 +1716,16 @@ impl TxnManager {
         commit_ts: u64,
         committed_keys: Vec<RecordKey>,
         committed: &mut CommitIndex,
+        exclude_active_id: Option<u64>,
     ) -> Result<()> {
-        committed.record(commit_ts, committed_keys);
-        let visible_ts = commit_ts.saturating_add(1);
-        self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
-        self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
+        self.inner.active.publish_commit(commit_ts, exclude_active_id, |retain_conflicts| {
+            if retain_conflicts {
+                committed.record(commit_ts, committed_keys);
+            }
+            let visible_ts = commit_ts.saturating_add(1);
+            self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
+            self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
+        });
         publish_commit(commit_ts);
         Ok(())
     }
@@ -1711,7 +1741,7 @@ impl TxnManager {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         let commit_ts = self.reserve_locked(&txn, &mut guard)?;
-        self.apply_owned_locked(commit_ts, txn.writes, &mut guard)?;
+        self.apply_owned_locked(commit_ts, txn.writes, &mut guard, Some(txn.id))?;
         Ok(commit_ts)
     }
 
@@ -1746,7 +1776,7 @@ impl TxnManager {
             return Err(RymeError::Conflict(String::from("commit invalidated")));
         }
         self.check_locked(&txn, commit_ts, &mut guard)?;
-        self.apply_owned_or_confirm_locked(commit_ts, txn.writes, &mut guard)?;
+        self.apply_owned_or_confirm_locked(commit_ts, txn.writes, &mut guard, Some(txn.id))?;
         Ok(commit_ts)
     }
 
@@ -1771,7 +1801,7 @@ impl TxnManager {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         self.check_locked(&txn, commit_ts, &mut guard)?;
-        self.apply_owned_or_confirm_locked(commit_ts, txn.writes, &mut guard)?;
+        self.apply_owned_or_confirm_locked(commit_ts, txn.writes, &mut guard, Some(txn.id))?;
         Ok(commit_ts)
     }
 
@@ -1800,7 +1830,7 @@ impl TxnManager {
         let commit_ts = self.reserve_locked(&txn, &mut guard)?;
         let payload = encode_writes(&txn.writes)?;
         persist(commit_ts, &payload, &txn.writes)?;
-        self.apply_owned_locked(commit_ts, txn.writes, &mut guard)?;
+        self.apply_owned_locked(commit_ts, txn.writes, &mut guard, Some(txn.id))?;
         Ok(commit_ts)
     }
 
@@ -1822,9 +1852,10 @@ impl TxnManager {
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
         let commit_ts = self.reserve_locked(&txn, &mut guard)?;
         let payload = encode_writes(&txn.writes)?;
+        let txn_id = txn.id;
         let committed_keys = txn.writes.keys().cloned().collect();
         persist(commit_ts, &payload, txn.writes)?;
-        self.record_committed_locked(commit_ts, committed_keys, &mut guard)?;
+        self.record_committed_locked(commit_ts, committed_keys, &mut guard, Some(txn_id))?;
         Ok(commit_ts)
     }
 
@@ -3397,6 +3428,59 @@ mod tests {
         registry.remove(2);
         assert_eq!(registry.oldest(), None);
         assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn commit_history_horizon_excludes_only_the_committing_transaction() {
+        let registry = ActiveRegistry::default();
+        registry.insert(1, 5);
+        let mut retained = false;
+        registry.publish_commit(10, Some(1), |needed| retained = needed);
+        assert!(!retained);
+
+        registry.insert(2, 5);
+        registry.publish_commit(10, Some(1), |needed| retained = needed);
+        assert!(retained);
+
+        registry.remove(2);
+        registry.insert(3, 8);
+        registry.publish_commit(10, Some(1), |needed| retained = needed);
+        assert!(retained);
+
+        registry.publish_commit(10, None, |needed| retained = needed);
+        assert!(retained);
+    }
+
+    #[test]
+    fn commits_skip_conflict_history_when_no_other_transaction_needs_it() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "kv", b"k");
+        let mut writer = manager.begin();
+        manager.put(&mut writer, key.clone(), b"v1".to_vec());
+        manager.commit(writer).unwrap();
+
+        let committed = manager.inner.commit.lock().unwrap();
+        assert!(committed.by_key.is_empty());
+        assert!(committed.by_table.is_empty());
+        assert!(committed.by_timestamp.is_empty());
+        drop(committed);
+
+        let mut reader = manager.begin();
+        assert_eq!(manager.get(&mut reader, &key).unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn commits_keep_conflict_history_for_older_active_transactions() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "kv", b"k");
+        let mut old_reader = manager.begin();
+        assert_eq!(manager.get(&mut old_reader, &key).unwrap(), None);
+
+        let mut writer = manager.begin();
+        manager.put(&mut writer, key, b"v1".to_vec());
+        manager.commit(writer).unwrap();
+
+        assert!(!manager.inner.commit.lock().unwrap().by_key.is_empty());
     }
 
     #[test]
