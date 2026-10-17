@@ -1412,12 +1412,24 @@ impl TxnManager {
         if let Some(floor) = self.inner.active.oldest() {
             committed.prune_through(floor);
         }
+        let engine = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+        // The conflict index can omit commits when this manager has no older
+        // local snapshots. A transaction from another cluster member can still
+        // carry such a snapshot, so the engine's latest version is authoritative
+        // for point-key validation even when the index has no retained history.
         for key in txn.writes.keys() {
             let conflicts = committed
                 .by_key
                 .get(key)
                 .is_some_and(|timestamps| has_commit_between(timestamps, txn.read_ts, commit_ts));
-            if conflicts {
+            let latest_conflicts = engine
+                .latest_commit_ts(key)
+                .is_some_and(|timestamp| timestamp > txn.read_ts && timestamp < commit_ts);
+            if conflicts || latest_conflicts {
                 return Err(RymeError::Conflict(String::from("write-write conflict")));
             }
         }
@@ -1426,7 +1438,10 @@ impl TxnManager {
                 let conflicts = committed.by_key.get(key).is_some_and(|timestamps| {
                     has_commit_between(timestamps, txn.read_ts, commit_ts)
                 });
-                if conflicts {
+                let latest_conflicts = engine
+                    .latest_commit_ts(key)
+                    .is_some_and(|timestamp| timestamp > txn.read_ts && timestamp < commit_ts);
+                if conflicts || latest_conflicts {
                     return Err(RymeError::Conflict(String::from("read-write conflict")));
                 }
             }
@@ -1439,6 +1454,7 @@ impl TxnManager {
                 }
             }
         }
+        drop(engine);
         for table in txn.constraint_scanned.iter() {
             let conflict = committed
                 .by_table
