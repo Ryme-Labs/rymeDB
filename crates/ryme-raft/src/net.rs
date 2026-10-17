@@ -28,6 +28,7 @@ const RPC_READ_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RPC_WRITE_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RPC_FRAME_BUDGET_UNIT_BYTES: usize = 16 * 1024;
 const RPC_FRAME_DECODE_WEIGHT: usize = 4;
+const RPC_FRAME_WRITE_WEIGHT: usize = 1;
 const RPC_READ_FRAME_BUDGET_PERMITS: usize =
     RPC_READ_FRAME_BUDGET_BYTES / RPC_FRAME_BUDGET_UNIT_BYTES;
 const RPC_WRITE_FRAME_BUDGET_PERMITS: usize =
@@ -85,7 +86,7 @@ impl std::io::Write for RpcFrameBuffer<'_> {
                 None
             } else {
                 match self.budget.try_acquire_many(
-                    additional_units.saturating_mul(RPC_FRAME_DECODE_WEIGHT) as u32,
+                    additional_units.saturating_mul(RPC_FRAME_WRITE_WEIGHT) as u32,
                 ) {
                     Ok(permit) => Some(permit),
                     Err(_) => {
@@ -6328,7 +6329,7 @@ mod tests {
 
     #[test]
     fn rpc_frame_writer_growth_reserves_only_new_budget_units() {
-        let budget = Semaphore::new(RPC_FRAME_DECODE_WEIGHT);
+        let budget = Semaphore::new(RPC_FRAME_WRITE_WEIGHT);
         let mut frame = RpcFrameBuffer::new(&budget);
         std::io::Write::write_all(&mut frame, &vec![0; 8 * 1024]).unwrap();
         std::io::Write::write_all(&mut frame, b"x").unwrap();
