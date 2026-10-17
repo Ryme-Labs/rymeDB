@@ -1,8 +1,12 @@
 # Realtime, CDC, presence, and durable topics
 
 All realtime endpoints are WebSockets. Authenticate with a bearer header,
-`x-api-key`, or `api_key` query parameter. Browser clients normally use the
-query parameter; server clients should prefer headers.
+`x-api-key`, or an `anon`-scoped `api_key` query parameter. Browser clients
+normally use the query parameter because browsers cannot set arbitrary
+WebSocket headers; server clients should use headers for non-anonymous keys.
+Privileged and authenticated-user keys are rejected in query parameters to
+avoid putting secrets in URLs. Configure RLS and SQL grants before exposing an
+`anon` key.
 
 ## Choose a stream
 

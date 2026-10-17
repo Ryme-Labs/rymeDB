@@ -21,8 +21,10 @@ curl -fsS -H 'Authorization: Bearer local-dev-key' \
   http://127.0.0.1:8080/v1/scan/messages?limit=20
 ```
 
-WebSocket clients may use `?api_key=`. Mutating, operator, and archive routes
-require the appropriate principal. See [authentication](auth.md).
+WebSocket clients may use `?api_key=` only with an `anon`-scoped key; other
+credentials must be sent in headers and are rejected in URLs. Mutating,
+operator, and archive routes require the appropriate principal. See
+[authentication](auth.md).
 
 ## Main API groups
 

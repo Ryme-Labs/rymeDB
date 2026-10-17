@@ -805,7 +805,7 @@ paths:
   /v1/presence/{channel}/stream:
     get:
       tags: [streams]
-      description: "Live tenant-scoped presence WebSocket. The first frame is presence_state with the current members; later frames are join/leave events. A lagged consumer receives a fresh presence_state snapshot."
+      description: "Live tenant-scoped presence WebSocket. The first frame is presence_state with the current members; later frames are join/leave events. A lagged consumer receives a fresh presence_state snapshot. Query-string api_key credentials must have exactly the anon role; send all other credentials in headers."
       parameters:
         - name: channel
           in: path
@@ -821,10 +821,12 @@ paths:
           description: presence WebSocket upgrade
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /realtime/v1/websocket:
     get:
       tags: [streams]
-      description: "Supabase Realtime-compatible Phoenix WebSocket for broadcast, presence, and committed postgres_changes subscriptions. Supports v1 JSON objects and v2 JSON arrays, phx_join, phx_leave, heartbeat, broadcast, presence track/untrack, presence_state, presence_diff, postgres_changes, and system events."
+      description: "Supabase Realtime-compatible Phoenix WebSocket for broadcast, presence, and committed postgres_changes subscriptions. Supports v1 JSON objects and v2 JSON arrays, phx_join, phx_leave, heartbeat, broadcast, presence track/untrack, presence_state, presence_diff, postgres_changes, and system events. Query-string apikey credentials must have exactly the anon role; send all other credentials in headers."
       parameters:
         - name: apikey
           in: query
@@ -840,6 +842,8 @@ paths:
           description: Supabase Realtime WebSocket upgrade
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/presence/{channel}:
     get:
       tags: [streams]
@@ -874,7 +878,7 @@ paths:
   /v1/broadcast/{channel}:
     get:
       tags: [streams]
-      description: "Live broadcast subscription for one channel, tenant-scoped like posts. Frames are BroadcastMsg JSON (channel, from, payload, commit_ts, sequence)."
+      description: "Live broadcast subscription for one channel, tenant-scoped like posts. Frames are BroadcastMsg JSON (channel, from, payload, commit_ts, sequence). Query-string api_key credentials must have exactly the anon role; send all other credentials in headers."
       parameters:
         - name: channel
           in: path
@@ -890,6 +894,8 @@ paths:
           description: broadcast stream
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/topics/append:
     post:
       tags: [streams]
@@ -948,7 +954,7 @@ paths:
   /v1/topics/{partition}/stream:
     get:
       tags: [streams]
-      description: "Live durable topic WebSocket. Replays retained messages from the optional cursor, then follows committed appends; a cursor gap outside retention closes the stream."
+      description: "Live durable topic WebSocket. Replays retained messages from the optional cursor, then follows committed appends; a cursor gap outside retention closes the stream. Query-string api_key credentials must have exactly the anon role; send all other credentials in headers."
       parameters:
         - name: partition
           in: path
@@ -971,6 +977,8 @@ paths:
           description: durable topic WebSocket upgrade
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/vector/upsert:
     post:
       tags: [index]
@@ -2091,6 +2099,7 @@ paths:
   /v1/stream:
     get:
       tags: [streams]
+      description: "Live change-feed WebSocket. Query-string api_key credentials must have exactly the anon role; send all other credentials in headers."
       parameters:
         - name: table
           in: query
@@ -2111,13 +2120,17 @@ paths:
           description: change stream
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/query-stream:
     get:
       tags: [streams]
       description: >-
         Opens a live query stream. In addition to table, limit, and branch,
         PostgREST-style select/order controls and field filter query
-        parameters such as status=eq.ready are supported.
+        parameters such as status=eq.ready are supported. Query-string api_key
+        credentials must have exactly the anon role; send all other credentials
+        in headers.
       parameters:
         - name: table
           in: query
@@ -2151,6 +2164,8 @@ paths:
           description: live query stream
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 components:
   securitySchemes:
     bearerAuth:

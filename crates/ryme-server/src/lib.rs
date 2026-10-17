@@ -3009,7 +3009,7 @@ impl SharedState {
         Err(ryme_error::RymeError::Unauthorized)
     }
 
-    fn principal_with_query(
+    fn principal_for_websocket(
         &self,
         headers: &HeaderMap,
         api_key: Option<&str>,
@@ -3020,7 +3020,16 @@ impl SharedState {
             return self.principal(headers);
         }
         match api_key {
-            Some(key) => self.keys.authenticate(key),
+            Some(key) => {
+                // Query credentials appear in URLs and logs, so only the
+                // intentionally public anonymous role is accepted here.
+                let principal = self.keys.authenticate(key)?;
+                if principal.roles.len() == 1 && principal.roles.contains(&Role::Anon) {
+                    Ok(principal)
+                } else {
+                    Err(ryme_error::RymeError::Forbidden)
+                }
+            }
             None => self.principal(headers),
         }
     }
@@ -3043,7 +3052,7 @@ mod websocket_credential_precedence_tests {
     use super::*;
 
     #[test]
-    fn valid_header_identity_takes_precedence_over_query_key() {
+    fn websocket_query_credentials_require_anon_and_headers_take_precedence() {
         let dir = std::env::temp_dir().join(format!(
             "ryme-ws-credential-precedence-{}-{}",
             std::process::id(),
@@ -3078,22 +3087,45 @@ mod websocket_credential_precedence_tests {
                 now,
             )
             .unwrap();
+        state
+            .keys
+            .insert_with_expiry(
+                String::from("query-anon-key"),
+                Principal {
+                    id: String::from("public"),
+                    tenant: String::from("default"),
+                    roles: [Role::Anon].into_iter().collect(),
+                },
+                now + 60,
+                now,
+            )
+            .unwrap();
         let mut headers = HeaderMap::new();
         headers
             .insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer user-key"));
         headers.insert("x-api-key", HeaderValue::from_static("query-admin-key"));
 
-        let principal = state.principal_with_query(&headers, Some("query-admin-key")).unwrap();
+        let principal = state.principal_for_websocket(&headers, Some("query-admin-key")).unwrap();
         assert_eq!(principal.id, "app-user");
         assert_eq!(principal.tenant, "tenant-a");
         assert!(!principal.can_platform_admin());
+
+        let empty_headers = HeaderMap::new();
+        assert!(matches!(
+            state.principal_for_websocket(&empty_headers, Some("query-admin-key")),
+            Err(ryme_error::RymeError::Forbidden)
+        ));
+        let public = state
+            .principal_for_websocket(&empty_headers, Some("query-anon-key"))
+            .unwrap();
+        assert_eq!(public.roles, [Role::Anon].into_iter().collect());
 
         headers.insert(
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer invalid-key"),
         );
         assert!(matches!(
-            state.principal_with_query(&headers, Some("query-admin-key")),
+            state.principal_for_websocket(&headers, Some("query-admin-key")),
             Err(ryme_error::RymeError::Unauthorized)
         ));
 
@@ -8195,7 +8227,7 @@ async fn presence_stream(
     Query(query): Query<PresenceStreamQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let principal = match state.principal_with_query(&headers, query.api_key.as_deref()) {
+    let principal = match state.principal_for_websocket(&headers, query.api_key.as_deref()) {
         Ok(principal) => principal,
         Err(error) => return error_response(error),
     };
@@ -8228,7 +8260,7 @@ async fn supabase_realtime_stream(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let api_key = query.apikey.as_deref().or(query.api_key.as_deref());
-    let principal = match state.principal_with_query(&headers, api_key) {
+    let principal = match state.principal_for_websocket(&headers, api_key) {
         Ok(principal) => principal,
         Err(error) => return error_response(error),
     };
@@ -9621,7 +9653,7 @@ async fn broadcast_stream(
     Query(query): Query<BroadcastStreamQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let principal = match state.principal_with_query(&headers, query.api_key.as_deref()) {
+    let principal = match state.principal_for_websocket(&headers, query.api_key.as_deref()) {
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
@@ -9816,7 +9848,7 @@ async fn durable_stream(
     Query(query): Query<DurableStreamQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let principal = match state.principal_with_query(&headers, query.api_key.as_deref()) {
+    let principal = match state.principal_for_websocket(&headers, query.api_key.as_deref()) {
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
@@ -13459,8 +13491,11 @@ async fn stream(
     Query(query): Query<StreamQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let principal = match state.principal_with_query(&headers, query.api_key.as_deref()) {
+    let principal = match state.principal_for_websocket(&headers, query.api_key.as_deref()) {
         Ok(principal) => principal,
+        Err(ryme_error::RymeError::Forbidden) => {
+            return error_response(ryme_error::RymeError::Forbidden)
+        }
         Err(_) => return error_response(ryme_error::RymeError::Unauthorized),
     };
     if !principal.can_read() {
@@ -13814,7 +13849,7 @@ async fn query_stream(
     Query(query): Query<QueryStreamQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let principal = match state.principal_with_query(&headers, query.api_key.as_deref()) {
+    let principal = match state.principal_for_websocket(&headers, query.api_key.as_deref()) {
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };

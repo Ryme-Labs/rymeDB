@@ -8,8 +8,8 @@ model supplies a tenant, roles, and capabilities across all gateways.
 
 | Credential | Configure with | Use |
 | --- | --- | --- |
-| Development API key | `RYME_API_KEY` | Bearer header, `x-api-key`, or WebSocket `api_key` query parameter |
-| Public project key | `RYME_PUBLIC_API_KEY` | Bearer header or `x-api-key`; intentionally public and limited to SQL `anon` / read-only |
+| Development API key | `RYME_API_KEY` | Bearer header or `x-api-key` |
+| Public project key | `RYME_PUBLIC_API_KEY` | Bearer header, `x-api-key`, or WebSocket `api_key` query parameter; intentionally public and limited to SQL `anon` |
 | PostgreSQL password | `RYME_PG_PASSWORD` | Cleartext startup password; unset means local trust mode |
 | RESP password | `RYME_RESP_PASSWORD` | `AUTH` command; unset means local trust mode |
 | HMAC JWT | `RYME_JWT_SECRET` | HS256 bearer tokens |
@@ -29,19 +29,23 @@ responses and returned application data. This limits accidental cache
 retention; it does not hide browser credentials from DevTools.
 
 Browser WebSocket clients can use `?api_key=` because the browser WebSocket
-constructor cannot attach arbitrary headers:
+constructor cannot attach arbitrary headers. The server accepts query-string
+credentials only when the key has exactly the `anon` role; owner, admin,
+authenticated-user, and other secret keys are rejected. Use the public project
+key or create a named key with `--role anon`:
 
 ```text
 wss://db.example.com/v1/stream?table=messages&api_key=...&branch=main
 ```
 
 URL credentials may be captured by reverse-proxy/access logs and monitoring.
-For browser WebSockets, use only a short-lived, least-privilege user
-credential, and configure every proxy in the path to redact `api_key` query
-parameters. `Authorization` is checked before `x-api-key`. If an explicit
-header credential fails authentication, the request does not downgrade to a
-query-string key.
-Never put an operator or owner key in a WebSocket URL.
+An `anon` key is designed to be public, but configure every proxy in the path
+to redact `api_key` query parameters. Server-side WebSocket clients should use
+`Authorization` or `x-api-key` headers for non-anonymous credentials.
+`Authorization` is checked before `x-api-key`. If an explicit header credential
+fails authentication, the request does not downgrade to a query-string key.
+Configure RLS and SQL grants before exposing an `anon` key; the role alone does
+not make tables safe.
 
 Never put a long-lived owner key in browser code. Mint a narrowly scoped
 application credential or use a server-side proxy.
