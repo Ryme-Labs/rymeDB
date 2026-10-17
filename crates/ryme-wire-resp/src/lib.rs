@@ -22,6 +22,9 @@ use tokio::sync::broadcast;
 const KV_TABLE: &str = "_kv";
 const RESP_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
+const RESP_LUA_MAX_NESTING: usize = 64;
+const RESP_LUA_MAX_ARRAY_ITEMS: usize = 65_536;
+const RESP_LUA_MAX_REPLY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
 const RESP_SCRIPT_MAX_BYTES: usize = 1024 * 1024;
 const RESP_SCRIPT_CACHE_MAX_ENTRIES: usize = 256;
 const RESP_SCRIPT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -5285,6 +5288,18 @@ fn lua_bytes_table(lua: &Lua, values: &[Vec<u8>]) -> mlua::Result<mlua::Table> {
 }
 
 fn lua_value_resp(value: &LuaValue) -> std::result::Result<Vec<u8>, String> {
+    let encoded = lua_value_resp_at(value, 0)?;
+    if encoded.len() > RESP_LUA_MAX_REPLY_BYTES {
+        Err(String::from("script reply exceeds the 16 MiB limit"))
+    } else {
+        Ok(encoded)
+    }
+}
+
+fn lua_value_resp_at(value: &LuaValue, depth: usize) -> std::result::Result<Vec<u8>, String> {
+    if depth > RESP_LUA_MAX_NESTING {
+        return Err(String::from("script reply nesting limit exceeded"));
+    }
     match value {
         LuaValue::Nil | LuaValue::Boolean(false) => Ok(encode_null()),
         LuaValue::Boolean(true) => Ok(encode_integer(1)),
@@ -5298,20 +5313,56 @@ fn lua_value_resp(value: &LuaValue) -> std::result::Result<Vec<u8>, String> {
         LuaValue::String(value) => Ok(encode_bulk(value.as_bytes().as_ref())),
         LuaValue::Table(table) => {
             if let Ok(LuaValue::String(error)) = table.get::<LuaValue>("err") {
-                return Ok(encode_raw_error(&error.as_bytes()));
+                let encoded = encode_raw_error(&error.as_bytes());
+                return if encoded.len() <= RESP_LUA_MAX_REPLY_BYTES {
+                    Ok(encoded)
+                } else {
+                    Err(String::from("script reply exceeds the 16 MiB limit"))
+                };
             }
             let mut values = Vec::new();
+            let mut values_bytes = 0usize;
             for value in table.sequence_values::<LuaValue>() {
-                values.push(lua_value_resp(&value.map_err(|error| error.to_string())?)?);
+                if values.len() >= RESP_LUA_MAX_ARRAY_ITEMS {
+                    return Err(String::from("script reply array item limit exceeded"));
+                }
+                let encoded =
+                    lua_value_resp_at(&value.map_err(|error| error.to_string())?, depth + 1)?;
+                values_bytes = values_bytes
+                    .checked_add(encoded.len())
+                    .ok_or_else(|| String::from("script reply exceeds the 16 MiB limit"))?;
+                if values_bytes > RESP_LUA_MAX_REPLY_BYTES {
+                    return Err(String::from("script reply exceeds the 16 MiB limit"));
+                }
+                values.push(encoded);
             }
-            Ok(encode_raw_array(values))
+            let header = format!("*{}\r\n", values.len());
+            if values_bytes.saturating_add(header.len()) > RESP_LUA_MAX_REPLY_BYTES {
+                return Err(String::from("script reply exceeds the 16 MiB limit"));
+            }
+            let encoded = encode_raw_array(values);
+            if encoded.len() > RESP_LUA_MAX_REPLY_BYTES {
+                Err(String::from("script reply exceeds the 16 MiB limit"))
+            } else {
+                Ok(encoded)
+            }
         }
         _ => Err(String::from("script returned an unsupported value")),
     }
 }
 
 fn parse_lua_resp(input: &[u8]) -> std::result::Result<LuaRespValue, String> {
-    fn parse(input: &[u8], offset: &mut usize) -> std::result::Result<LuaRespValue, String> {
+    if input.len() > RESP_LUA_MAX_REPLY_BYTES {
+        return Err(String::from("reply exceeds the 16 MiB limit"));
+    }
+    fn parse(
+        input: &[u8],
+        offset: &mut usize,
+        depth: usize,
+    ) -> std::result::Result<LuaRespValue, String> {
+        if depth > RESP_LUA_MAX_NESTING {
+            return Err(String::from("reply nesting limit exceeded"));
+        }
         let kind = *input.get(*offset).ok_or_else(|| String::from("short reply"))?;
         *offset += 1;
         let line_end = find_crlf(&input[*offset..])
@@ -5337,12 +5388,14 @@ fn parse_lua_resp(input: &[u8]) -> std::result::Result<LuaRespValue, String> {
                     return Ok(LuaRespValue::Null);
                 }
                 let length = usize::try_from(length).map_err(|_| String::from("bulk too large"))?;
-                let end = (*offset).saturating_add(length);
-                if end + 2 > input.len() || &input[end..end + 2] != b"\r\n" {
+                let end =
+                    (*offset).checked_add(length).ok_or_else(|| String::from("bulk too large"))?;
+                let frame_end = end.checked_add(2).ok_or_else(|| String::from("bulk too large"))?;
+                if frame_end > input.len() || input.get(end..frame_end) != Some(b"\r\n") {
                     return Err(String::from("short bulk reply"));
                 }
                 let value = input[*offset..end].to_vec();
-                *offset = end + 2;
+                *offset = frame_end;
                 Ok(LuaRespValue::Bulk(value))
             }
             b'*' => {
@@ -5353,9 +5406,17 @@ fn parse_lua_resp(input: &[u8]) -> std::result::Result<LuaRespValue, String> {
                 if length < 0 {
                     return Ok(LuaRespValue::Null);
                 }
-                let mut values = Vec::with_capacity(length as usize);
+                let length = usize::try_from(length)
+                    .map_err(|_| String::from("array length is too large"))?;
+                if length > RESP_LUA_MAX_ARRAY_ITEMS {
+                    return Err(String::from("array length exceeds limit"));
+                }
+                if length > input.len().saturating_sub(*offset) / 3 {
+                    return Err(String::from("array length exceeds reply"));
+                }
+                let mut values = Vec::with_capacity(length);
                 for _ in 0..length {
-                    values.push(parse(input, offset)?);
+                    values.push(parse(input, offset, depth + 1)?);
                 }
                 Ok(LuaRespValue::Array(values))
             }
@@ -5364,7 +5425,7 @@ fn parse_lua_resp(input: &[u8]) -> std::result::Result<LuaRespValue, String> {
     }
 
     let mut offset = 0;
-    let value = parse(input, &mut offset)?;
+    let value = parse(input, &mut offset, 0)?;
     if offset != input.len() {
         return Err(String::from("trailing reply data"));
     }
@@ -6261,6 +6322,40 @@ mod tests {
         assert!(matches!(
             decode_array(input),
             Err(RymeError::InvalidArgument(message)) if message == "resp"
+        ));
+    }
+
+    #[test]
+    fn lua_script_replies_reject_excessive_nesting() {
+        let lua = Lua::new();
+        let value: LuaValue = lua
+            .load("local value = 'leaf'; for _ = 1, 65 do value = { value } end; return value")
+            .eval()
+            .unwrap();
+        assert!(matches!(
+            lua_value_resp(&value),
+            Err(message) if message == "script reply nesting limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn lua_resp_parser_bounds_array_allocation_and_nesting() {
+        assert!(parse_lua_resp(b"*9223372036854775807\r\n").is_err());
+        let too_many_items = format!("*{}\r\n", RESP_LUA_MAX_ARRAY_ITEMS + 1);
+        assert!(parse_lua_resp(too_many_items.as_bytes()).is_err());
+
+        let mut nested = Vec::new();
+        for _ in 0..=RESP_LUA_MAX_NESTING {
+            nested.extend_from_slice(b"*1\r\n");
+        }
+        nested.extend_from_slice(b"$-1\r\n");
+        assert!(matches!(
+            parse_lua_resp(&nested),
+            Err(message) if message == "reply nesting limit exceeded"
+        ));
+        assert!(matches!(
+            parse_lua_resp(b"*1\r\n$1\r\nx\r\n"),
+            Ok(LuaRespValue::Array(values)) if values.len() == 1
         ));
     }
 
