@@ -599,7 +599,11 @@ impl JwtVerifier {
     ) -> Result<Principal> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
-        if token.len() > MAX_JWT_TOKEN_LEN {
+        if token.len() > MAX_JWT_TOKEN_LEN
+            || self.issuer.as_deref().is_some_and(str::is_empty)
+            || self.audience.as_deref().is_some_and(str::is_empty)
+            || self.issuer.is_some() != self.audience.is_some()
+        {
             return Err(RymeError::Unauthorized);
         }
         let mut parts = token.split('.');
@@ -2101,6 +2105,46 @@ mod tests {
         assert!(wrong_issuer.principal_from_token(&token, 1000).is_err());
         let open = JwtVerifier::new(b"issuer-secret".to_vec());
         assert!(open.principal_from_token(&token, 1000).is_ok());
+    }
+
+    #[test]
+    fn jwt_rejects_empty_expected_issuer_or_audience() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let sign = |claims: serde_json::Value| {
+            let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+            let payload = base64_url_encode(serde_json::to_string(&claims).unwrap().as_bytes());
+            let input = format!("{header}.{payload}");
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"empty-claim-secret").unwrap();
+            mac.update(input.as_bytes());
+            format!("{input}.{}", base64_url_encode(&mac.finalize().into_bytes()))
+        };
+        let no_issuer = sign(serde_json::json!({
+            "sub": "ada",
+            "aud": "app",
+            "exp": 2000000000u64,
+        }));
+        let no_audience = sign(serde_json::json!({
+            "sub": "ada",
+            "iss": "https://issuer.test",
+            "exp": 2000000000u64,
+        }));
+
+        assert!(JwtVerifier::with_issuer(
+            b"empty-claim-secret".to_vec(),
+            String::new(),
+            String::from("app"),
+        )
+        .principal_from_token(&no_issuer, 1000)
+        .is_err());
+        assert!(JwtVerifier::with_issuer(
+            b"empty-claim-secret".to_vec(),
+            String::from("https://issuer.test"),
+            String::new(),
+        )
+        .principal_from_token(&no_audience, 1000)
+        .is_err());
     }
 
     #[test]

@@ -132,7 +132,8 @@ and test fixtures.
 HMAC JWT secrets must contain at least 16 bytes; production deployments should
 use a randomly generated secret of substantially greater length. If only one
 of issuer or audience is configured, startup fails rather than silently
-disabling claim validation.
+disabling claim validation. Empty issuer or audience values are rejected by
+the server and JWT verifier.
 Expired, not-yet-valid, and future-issued tokens are rejected with clock-skew
 checks. Mount secrets read-only and rotate them through your deployment
 system.
