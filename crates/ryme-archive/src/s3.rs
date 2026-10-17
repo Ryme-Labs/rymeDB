@@ -150,11 +150,11 @@ impl S3Store {
         token: Option<&str>,
         now: u64,
     ) -> Result<(Vec<String>, Option<String>)> {
-        let mut query = format!("list-type=2&max-keys=1000&prefix={}", encode_query(prefix)?);
+        let mut query_params = vec![("list-type", "2"), ("max-keys", "1000"), ("prefix", prefix)];
         if let Some(token) = token {
-            query.push_str("&continuation-token=");
-            query.push_str(&encode_query(token)?);
+            query_params.push(("continuation-token", token));
         }
+        let query = canonical_query(&query_params);
         let response = self.signed("GET", "", &query, None, now).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok((Vec::new(), None));
@@ -293,6 +293,15 @@ pub fn canonical_request(
     head
 }
 
+fn canonical_query(params: &[(&str, &str)]) -> String {
+    let mut encoded = params
+        .iter()
+        .map(|(name, value)| (encode_query_component(name), encode_query_component(value)))
+        .collect::<Vec<_>>();
+    encoded.sort();
+    encoded.into_iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("&")
+}
+
 pub fn signature_hex(
     secret: &str,
     date: &str,
@@ -333,8 +342,16 @@ fn encode_segment(segment: &str) -> String {
     out
 }
 
-fn encode_query(value: &str) -> Result<String> {
-    Ok(value.split('/').map(encode_segment).collect::<Vec<_>>().join("/"))
+fn encode_query_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 fn extract_keys(xml: &str) -> Vec<String> {
@@ -416,6 +433,19 @@ mod tests {
         let xml = "<?xml version=\"1.0\"?><ListBucketResult><Key>a</Key><Key>b/c</Key><IsTruncated>false</IsTruncated></ListBucketResult>";
         assert_eq!(extract_keys(xml), vec![String::from("a"), String::from("b/c")]);
         assert_eq!(extract_token(xml), None);
+    }
+
+    #[test]
+    fn list_query_is_sigv4_sorted_and_encodes_slashes() {
+        assert_eq!(
+            canonical_query(&[
+                ("list-type", "2"),
+                ("max-keys", "1000"),
+                ("prefix", "backups/"),
+                ("continuation-token", "page-1"),
+            ]),
+            "continuation-token=page-1&list-type=2&max-keys=1000&prefix=backups%2F"
+        );
     }
 
     struct FakeS3 {
@@ -505,12 +535,17 @@ mod tests {
                             .find_map(|part| part.strip_prefix("continuation-token=page-"))
                             .and_then(|page| page.parse::<usize>().ok())
                             .unwrap_or(0);
-                        let prefix =
-                            query.split('&').find_map(|p| p.strip_prefix("prefix=")).unwrap_or("");
+                        let prefix = reqwest::Url::parse(&format!("http://localhost/?{query}"))
+                            .unwrap()
+                            .query_pairs()
+                            .find_map(|(name, value)| {
+                                (name == "prefix").then(|| value.into_owned())
+                            })
+                            .unwrap_or_default();
                         let guard = files.lock().await;
                         let mut body = String::from("<?xml version=\"1.0\"?><ListBucketResult>");
                         for name in guard.keys() {
-                            if name.starts_with(prefix) {
+                            if name.starts_with(&prefix) {
                                 body.push_str(&format!("<Key>{name}</Key>"));
                             }
                         }
