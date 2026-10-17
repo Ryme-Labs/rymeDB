@@ -22,7 +22,9 @@ Create a persistent volume and start a single node:
 ```bash
 docker volume create rymedb-data
 docker run --name rymedb --rm \
-  -e RYME_API_KEY=local-dev-key \
+  -e RYME_API_KEY=local-dev-api-key \
+  -e RYME_PG_PASSWORD=local-dev-pg-password \
+  -e RYME_RESP_PASSWORD=local-dev-resp-password \
   -p 5433:5433 -p 6380:6380 -p 8080:8080 \
   -v rymedb-data:/var/lib/rymedb \
   ghcr.io/ryme-labs/rymedb:latest \
@@ -37,9 +39,9 @@ containers.
 Check readiness and connect over PostgreSQL and RESP:
 
 ```bash
-curl -fsS -H 'Authorization: Bearer local-dev-key' http://127.0.0.1:8080/ready
-psql 'postgresql://postgres@127.0.0.1:5433/postgres' -c 'SELECT 1;'
-redis-cli -p 6380 PING
+curl -fsS -H 'Authorization: Bearer local-dev-api-key' http://127.0.0.1:8080/ready
+psql 'postgresql://postgres:local-dev-pg-password@127.0.0.1:5433/postgres' -c 'SELECT 1;'
+REDISCLI_AUTH=local-dev-resp-password redis-cli -p 6380 PING
 ```
 
 To build the image from a checkout instead, run
@@ -53,15 +55,21 @@ default. Install `kubectl`, Helm, and a cluster with a persistent-volume
 storage class. The chart defaults to a storage class named `nvme`; override it
 if your cluster uses another name.
 
-Create a namespace and API-key Secret before installing the chart. The prompt
-below avoids putting the key itself in your shell history:
+Create a namespace and Secrets before installing the chart. These prompts
+avoid putting credentials in shell history; use distinct random values of at
+least 16 bytes for the API key and both protocol passwords:
 
 ```bash
 kubectl create namespace rymedb
 read -rsp 'API key: ' RYME_API_KEY; echo
+read -rsp 'PostgreSQL password: ' RYME_PG_PASSWORD; echo
+read -rsp 'RESP password: ' RYME_RESP_PASSWORD; echo
 kubectl -n rymedb create secret generic rymedb-api-key \
   --from-literal=api-key="$RYME_API_KEY"
-unset RYME_API_KEY
+kubectl -n rymedb create secret generic rymedb-protocol-passwords \
+  --from-literal=pg-password="$RYME_PG_PASSWORD" \
+  --from-literal=resp-password="$RYME_RESP_PASSWORD"
+unset RYME_API_KEY RYME_PG_PASSWORD RYME_RESP_PASSWORD
 
 kubectl -n rymedb create secret generic rymedb-raft-tls \
   --from-file=tls.crt=./tls.crt \
@@ -95,8 +103,8 @@ In another terminal, verify the forwarded endpoints:
 
 ```bash
 curl -fsS -H 'Authorization: Bearer replace-with-a-long-random-key' http://127.0.0.1:8080/ready
-psql 'postgresql://postgres@127.0.0.1:5433/postgres' -c 'SELECT 1;'
-redis-cli -p 6380 PING
+PGPASSWORD='your-postgres-password' psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -c 'SELECT 1;'
+REDISCLI_AUTH='your-resp-password' redis-cli -h 127.0.0.1 -p 6380 PING
 ```
 
 The chart's Service is internal to the cluster; use an intentional ingress or

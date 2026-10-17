@@ -11,6 +11,10 @@ service:
 apiKeySecret:
   name: rymedb-api-key
   key: api-key
+protocolPasswordsSecret:
+  name: rymedb-protocol-passwords
+  pgKey: pg-password
+  respKey: resp-password
 publicApiKey: ""
 raftTls:
   enabled: true

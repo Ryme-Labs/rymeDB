@@ -12,9 +12,17 @@ kubectl -n rymedb set image statefulset/rymedb \
 ```
 
 ```sh
-kubectl apply -f deploy/k8s/base/statefulset.yaml
+kubectl create namespace rymedb
+read -rsp 'API key (at least 16 bytes): ' RYME_API_KEY; echo
+read -rsp 'PostgreSQL password (at least 16 bytes): ' RYME_PG_PASSWORD; echo
+read -rsp 'RESP password (at least 16 bytes): ' RYME_RESP_PASSWORD; echo
 kubectl -n rymedb create secret generic rymedb-api-key \
-  --from-literal=api-key=<key> --dry-run=client -o yaml | kubectl apply -f -
+  --from-literal=api-key="$RYME_API_KEY"
+kubectl -n rymedb create secret generic rymedb-protocol-passwords \
+  --from-literal=pg-password="$RYME_PG_PASSWORD" \
+  --from-literal=resp-password="$RYME_RESP_PASSWORD"
+unset RYME_API_KEY RYME_PG_PASSWORD RYME_RESP_PASSWORD
+kubectl apply -f deploy/k8s/base/statefulset.yaml
 kubectl -n rymedb get pods -w
 curl http://$(kubectl -n rymedb get svc rymedb -o jsonpath='{.spec.clusterIP}'):8080/health
 ```

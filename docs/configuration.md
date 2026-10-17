@@ -102,7 +102,8 @@ not replace `RYME_API_KEY` for operator access or satisfy the external-listener
 requirement. Its effective access is controlled by SQL grants and RLS policies;
 see [authentication and RLS](auth.md#browser-applications). The Helm chart
 accepts this public value through `publicApiKey`; keep the operator credential
-in the chart's separate `apiKeySecret`.
+in the chart's `apiKeySecret`; PostgreSQL and RESP passwords come from the
+`protocolPasswordsSecret`.
 
 ## Cluster
 

@@ -32,6 +32,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.apiKeySecret.name }}
                   key: {{ .Values.apiKeySecret.key }}
+            - name: RYME_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.protocolPasswordsSecret.name }}
+                  key: {{ .Values.protocolPasswordsSecret.pgKey }}
+            - name: RYME_RESP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.protocolPasswordsSecret.name }}
+                  key: {{ .Values.protocolPasswordsSecret.respKey }}
             {{ with .Values.publicApiKey }}
             - name: RYME_PUBLIC_API_KEY
               value: {{ . | quote }}

@@ -6,15 +6,6 @@ metadata:
     app.kubernetes.io/name: rymedb
 ---
 apiVersion: v1
-kind: Secret
-metadata:
-  name: rymedb-api-key
-  namespace: rymedb
-type: Opaque
-stringData:
-  api-key: CHANGE-ME-ryme-dev-key
----
-apiVersion: v1
 kind: Service
 metadata:
   name: rymedb-headless
@@ -81,6 +72,16 @@ spec:
                 secretKeyRef:
                   name: rymedb-api-key
                   key: api-key
+            - name: RYME_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rymedb-protocol-passwords
+                  key: pg-password
+            - name: RYME_RESP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rymedb-protocol-passwords
+                  key: resp-password
           args:
             - --data-dir
             - /var/lib/rymedb
