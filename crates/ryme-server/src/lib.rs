@@ -15179,6 +15179,59 @@ mod realtime_policy_tests {
         assert_eq!(public.tenant, "default");
     }
 
+    #[tokio::test]
+    async fn public_api_key_obeys_rls_and_rejects_sql_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-public-api-key-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let config = Config { data_dir: dir.clone(), ..Config::default() };
+        let state = SharedState::build(&config).unwrap();
+        install_public_api_key(&state.keys, String::from("public-test-key"), "default").unwrap();
+
+        let admin = state.executor.clone().with_role(String::from("postgres")).without_auth_uid();
+        for sql in [
+            "CREATE TABLE public_messages (id TEXT PRIMARY KEY, owner_id TEXT, body TEXT)",
+            "INSERT INTO public_messages (id, owner_id, body) VALUES ('public', 'public', 'visible'), ('private', 'user-1', 'hidden')",
+            "GRANT SELECT ON TABLE public_messages TO anon",
+            "CREATE POLICY public_message_rows ON public_messages FOR SELECT TO anon USING (auth.uid() = owner_id)",
+            "ALTER TABLE public_messages ENABLE ROW LEVEL SECURITY",
+        ] {
+            admin.execute(parse(sql).unwrap()).await.unwrap();
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer public-test-key"),
+        );
+        let response = sql_exec(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{"sql":"SELECT * FROM public_messages"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
+        assert!(value.to_string().contains("visible"));
+        assert!(!value.to_string().contains("hidden"));
+
+        let response = sql_exec(
+            State(state),
+            headers,
+            axum::body::Bytes::from_static(
+                br#"{"sql":"INSERT INTO public_messages (id, owner_id, body) VALUES ('injected', 'public', 'write')"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn server_build_rejects_empty_rls_tenant_field() {
         let config = Config {
