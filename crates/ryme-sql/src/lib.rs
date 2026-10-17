@@ -1397,6 +1397,12 @@ fn rls_uid_policies_allow(
 
 pub type Row = (Vec<u8>, Vec<u8>);
 
+#[derive(Debug, PartialEq, Eq)]
+struct IndexedCandidates {
+    pks: Vec<Vec<u8>>,
+    covered_predicates: Vec<usize>,
+}
+
 enum ProjectionSource {
     PrimaryKey(usize),
     Key,
@@ -1905,6 +1911,24 @@ fn predicates_match(predicates: &[Predicate], pk: &[u8], value: &[u8]) -> bool {
         .flatten();
     let object = parsed.as_ref().and_then(serde_json::Value::as_object);
     predicates.iter().all(|predicate| predicate.matches_with_object(pk, value, object))
+}
+
+fn predicates_match_except(
+    predicates: &[Predicate],
+    skipped: &[usize],
+    pk: &[u8],
+    value: &[u8],
+) -> bool {
+    let needs_object = predicates
+        .iter()
+        .enumerate()
+        .any(|(index, predicate)| !skipped.contains(&index) && predicate.requires_row_object());
+    let parsed =
+        needs_object.then(|| serde_json::from_slice::<serde_json::Value>(value).ok()).flatten();
+    let object = parsed.as_ref().and_then(serde_json::Value::as_object);
+    predicates.iter().enumerate().all(|(index, predicate)| {
+        skipped.contains(&index) || predicate.matches_with_object(pk, value, object)
+    })
 }
 
 fn is_null_bytes(value: &[u8]) -> bool {
@@ -6736,13 +6760,17 @@ fn index_value(definition: &IndexDefinition, pk: &[u8], value: &[u8]) -> Option<
     })
 }
 
-fn index_filter_value(definition: &IndexDefinition, filter: &[Predicate]) -> Option<Vec<u8>> {
+fn index_filter_value(
+    definition: &IndexDefinition,
+    filter: &[Predicate],
+) -> Option<(Vec<u8>, Vec<usize>)> {
     if definition.columns.is_empty() {
         return None;
     }
     let mut encoded = Vec::new();
+    let mut covered = Vec::with_capacity(definition.columns.len());
     for column in &definition.columns {
-        let predicate = filter.iter().find(|predicate| {
+        let (predicate_index, predicate) = filter.iter().enumerate().find(|(_, predicate)| {
             predicate.op == Cmp::Eq
                 && predicate.field == Field::Value
                 && predicate
@@ -6756,8 +6784,9 @@ fn index_filter_value(definition: &IndexDefinition, filter: &[Predicate]) -> Opt
         let length = u32::try_from(predicate.operand.len()).ok()?;
         encoded.extend_from_slice(&length.to_be_bytes());
         encoded.extend_from_slice(&predicate.operand);
+        covered.push(predicate_index);
     }
-    Some(encoded)
+    Some((encoded, covered))
 }
 
 fn rename_index_column(indexed: &str, from: &str, to: &str) -> String {
@@ -10950,7 +10979,7 @@ where
         table: &str,
         filter: &[Predicate],
         read_ts: u64,
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<IndexedCandidates>> {
         self.ensure_index_entries_for_tenant(table)?;
         let has_pending_commit = self.has_pending_index_commit(table);
         let indexes =
@@ -10960,44 +10989,57 @@ where
             let key = if state.definition.columns.is_empty() {
                 filter
                     .iter()
+                    .enumerate()
                     .find(|predicate| {
+                        let (_, predicate) = predicate;
                         predicate.op == Cmp::Eq
                             && state.definition.field == predicate.field
                             && state.definition.column == predicate.column
                     })
-                    .map(|predicate| predicate.operand.clone())
+                    .map(|(index, predicate)| (predicate.operand.clone(), vec![index]))
             } else {
                 index_filter_value(&state.definition, filter)
             };
-            let Some(key) = key else { continue };
+            let Some((key, covered)) = key else { continue };
             if !state.valid || has_pending_commit || read_ts < state.applied_ts {
                 return Ok(None);
             }
             let Some(pks) = state.entries.get(&self.tenant).and_then(|entries| entries.get(&key))
             else {
-                return Ok(Some(Vec::new()));
+                return Ok(Some(IndexedCandidates {
+                    pks: Vec::new(),
+                    covered_predicates: covered,
+                }));
             };
-            matching_indexes.push(pks);
+            matching_indexes.push((pks, covered));
         }
         let Some((smallest_index, smallest)) =
-            matching_indexes.iter().enumerate().min_by_key(|(_, pks)| pks.len())
+            matching_indexes.iter().enumerate().min_by_key(|(_, (pks, _))| pks.len())
         else {
             return Ok(None);
         };
-        if smallest.len() > MAX_QUERY_MATERIALIZED_ROWS {
+        if smallest.0.len() > MAX_QUERY_MATERIALIZED_ROWS {
             return Err(materialization_overload());
         }
+        let covered_predicates =
+            matching_indexes.iter().flat_map(|(_, covered)| covered.iter().copied()).collect();
         if matching_indexes.len() == 1 {
-            return Ok(Some(smallest.iter().cloned().collect()));
+            return Ok(Some(IndexedCandidates {
+                pks: smallest.0.iter().cloned().collect(),
+                covered_predicates,
+            }));
         }
-        let mut candidates: Vec<_> = smallest.iter().collect();
-        for (index, other) in matching_indexes.iter().enumerate() {
+        let mut candidates: Vec<_> = smallest.0.iter().collect();
+        for (index, (other, _)) in matching_indexes.iter().enumerate() {
             if index == smallest_index || candidates.is_empty() {
                 continue;
             }
             candidates = intersect_index_candidates(candidates, other);
         }
-        Ok(Some(candidates.into_iter().cloned().collect()))
+        Ok(Some(IndexedCandidates {
+            pks: candidates.into_iter().cloned().collect(),
+            covered_predicates,
+        }))
     }
 
     fn indexed_candidates_for_value(
@@ -11236,13 +11278,15 @@ where
             return Ok(Vec::new());
         }
         if txn.writes().is_empty() {
-            if let Some(candidates) = self.indexed_candidates(table, filter, txn.read_ts)? {
+            if let Some(indexed) = self.indexed_candidates(table, filter, txn.read_ts)? {
+                let candidates = indexed.pks;
+                let covered_predicates = indexed.covered_predicates;
                 let mut rows = Vec::with_capacity(candidates.len().min(limit));
                 if let [pk] = candidates.as_slice() {
                     let key = RecordKey::new(&self.tenant, &self.database, table, pk);
                     if let Some(value) = self.manager.get_async(txn, &key).await? {
                         if self.rls_allows_with_context(table, &value, rls_applies)
-                            && predicates_match(filter, pk, &value)
+                            && predicates_match_except(filter, &covered_predicates, pk, &value)
                         {
                             rows.push((pk.clone(), value));
                         }
@@ -11262,7 +11306,7 @@ where
                         ensure_materialized_rows(&batch_rows)?;
                         rows.extend(batch_rows.into_iter().filter(|(pk, value)| {
                             self.rls_allows_with_context(table, value, rls_applies)
-                                && predicates_match(filter, pk, value)
+                                && predicates_match_except(filter, &covered_predicates, pk, value)
                         }));
                         if rows.len() >= limit {
                             rows.truncate(limit);
@@ -11500,13 +11544,15 @@ where
                 .collect());
         }
         if txn.writes().is_empty() {
-            if let Some(candidates) = self.indexed_candidates(table, filter, txn.read_ts)? {
+            if let Some(indexed) = self.indexed_candidates(table, filter, txn.read_ts)? {
+                let candidates = indexed.pks;
+                let covered_predicates = indexed.covered_predicates;
                 let mut rows = Vec::with_capacity(candidates.len().min(limit));
                 if let [pk] = candidates.as_slice() {
                     let key = RecordKey::new(&self.tenant, &self.database, table, pk);
                     if let Some(value) = self.manager.get(txn, &key)? {
                         if self.rls_allows_with_context(table, &value, rls_applies)
-                            && predicates_match(filter, pk, &value)
+                            && predicates_match_except(filter, &covered_predicates, pk, &value)
                         {
                             rows.push((pk.clone(), value));
                         }
@@ -11526,7 +11572,7 @@ where
                         ensure_materialized_rows(&batch_rows)?;
                         rows.extend(batch_rows.into_iter().filter(|(pk, value)| {
                             self.rls_allows_with_context(table, value, rls_applies)
-                                && predicates_match(filter, pk, value)
+                                && predicates_match_except(filter, &covered_predicates, pk, value)
                         }));
                         if rows.len() >= limit {
                             rows.truncate(limit);
@@ -20207,7 +20253,7 @@ mod tests {
         assert!(!executor.indexes.read().unwrap()["docs"][0].valid);
         assert_eq!(
             executor.indexed_candidates("docs", &filter, read_ts).unwrap(),
-            Some(vec![b"a".to_vec()])
+            Some(IndexedCandidates { pks: vec![b"a".to_vec()], covered_predicates: vec![0] })
         );
     }
 
@@ -20279,7 +20325,7 @@ mod tests {
         ];
         assert_eq!(
             executor.indexed_candidates("docs", &filter, executor.manager.latest_commit()).unwrap(),
-            Some(vec![b"a".to_vec()])
+            Some(IndexedCandidates { pks: vec![b"a".to_vec()], covered_predicates: vec![0, 1] })
         );
 
         let result = executor
@@ -20289,6 +20335,12 @@ mod tests {
         assert!(
             matches!(result, QueryResult::Rows { rows } if rows.len() == 1 && rows[0].0 == b"a")
         );
+
+        let contradictory = executor
+            .execute(parse("SELECT * FROM docs WHERE tenant = 't1' AND tenant = 't2'").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(contradictory, QueryResult::Rows { rows } if rows.is_empty()));
     }
 
     #[tokio::test]
@@ -20321,7 +20373,7 @@ mod tests {
                     executor.manager.latest_commit(),
                 )
                 .unwrap(),
-            Some(Vec::new())
+            Some(IndexedCandidates { pks: Vec::new(), covered_predicates: vec![0] })
         );
 
         let result = executor

@@ -1,0 +1,41 @@
+{
+  "benchmark": "in-process-sql-indexed-filtered-projection",
+  "date": "2026-10-17",
+  "before_revision": "36c0e11",
+  "after_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "arch": "x86_64",
+    "os": "linux",
+    "logical_cpus": 12,
+    "host_memory_bytes": 16087875584
+  },
+  "method": "Three sequential release captures, one worker, 10,000 measured operations and 100 warmups. Compared with the immediately preceding same-workload captures in sql-json-projection-20261017.json. The change records equality predicates covered by valid index lookups and avoids reparsing/rechecking only those predicates; residual filtering remains active.",
+  "parameters": {
+    "build_profile": "release",
+    "execution": "in-process",
+    "storage_mode": "hot",
+    "rows": 1000,
+    "result_rows": 42,
+    "operations_per_capture": 10000,
+    "warmup_operations": 100,
+    "concurrency": 1,
+    "workload": "indexed-filtered-projection-three-predicates"
+  },
+  "before": [
+    { "seconds": 0.830, "qps": 12055, "p50_ns": 82186, "p95_ns": 86924, "p99_ns": 91143, "max_ns": 139935 },
+    { "seconds": 0.837, "qps": 11943, "p50_ns": 82766, "p95_ns": 88137, "p99_ns": 98957, "max_ns": 184259 },
+    { "seconds": 0.857, "qps": 11668, "p50_ns": 83488, "p95_ns": 90612, "p99_ns": 141098, "max_ns": 177086 }
+  ],
+  "after": [
+    { "seconds": 0.749, "qps": 13358, "p50_ns": 74150, "p95_ns": 78809, "p99_ns": 84821, "max_ns": 137120 },
+    { "seconds": 0.764, "qps": 13092, "p50_ns": 75143, "p95_ns": 80793, "p99_ns": 105129, "max_ns": 135046 },
+    { "seconds": 0.753, "qps": 13276, "p50_ns": 74121, "p95_ns": 78969, "p99_ns": 104237, "max_ns": 284289 }
+  ],
+  "summary": {
+    "median_capture_p50_ns_before": 82766,
+    "median_capture_p50_ns_after": 74150,
+    "median_p50_improvement_percent": 10.4
+  },
+  "caveat": "Single-host in-process microbenchmark, not end-to-end or cross-database performance. Sequential captures reduce but do not eliminate system noise; tail latency varied."
+}
