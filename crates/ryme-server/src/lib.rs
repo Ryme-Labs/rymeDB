@@ -14583,9 +14583,7 @@ fn snapshot_manager(
     dir: &std::path::Path,
 ) -> ryme_error::Result<(u64, std::path::PathBuf)> {
     std::fs::create_dir_all(dir)?;
-    let raw = manager.encode_snapshot()?;
-    let snapshot = ryme_storage::Engine::decode_snapshot(&raw)?;
-    let max = snapshot.max_commit_ts();
+    let (raw, max) = manager.encode_snapshot_with_commit()?;
     let path = write_server_snapshot(dir, max, &raw)?;
     let name = path
         .file_name()

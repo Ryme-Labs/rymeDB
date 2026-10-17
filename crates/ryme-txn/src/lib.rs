@@ -2171,6 +2171,10 @@ impl TxnManager {
     }
 
     pub fn encode_snapshot(&self) -> Result<Vec<u8>> {
+        self.encode_snapshot_with_commit().map(|(raw, _)| raw)
+    }
+
+    pub fn encode_snapshot_with_commit(&self) -> Result<(Vec<u8>, u64)> {
         let _guard = self
             .inner
             .commit
@@ -2181,7 +2185,23 @@ impl TxnManager {
             .engine
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        engine.encode_snapshot()
+        let max_commit_ts = engine.max_commit_ts();
+        let raw = engine.encode_snapshot()?;
+        Ok((raw, max_commit_ts))
+    }
+
+    fn clone_engine_snapshot(&self) -> Result<Engine> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        let engine = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+        Ok(engine.clone())
     }
 
     pub fn restore_snapshot(&self, raw: &[u8]) -> Result<u64> {
@@ -2667,7 +2687,7 @@ impl DurableManager {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let snapshot = match self.mode {
-            StorageMode::Hot => Engine::decode_snapshot(&self.inner.encode_snapshot()?)?,
+            StorageMode::Hot => self.inner.clone_engine_snapshot()?,
             StorageMode::Standard => {
                 self.segments.load_all()?.map(|(engine, _)| engine).unwrap_or_default()
             }
@@ -3765,6 +3785,18 @@ mod tests {
         manager.commit(writer).unwrap();
         manager.put(&mut reader, other.clone(), b"w".to_vec());
         assert!(manager.commit(reader).is_ok());
+    }
+
+    #[test]
+    fn encoded_snapshot_returns_its_commit_timestamp() {
+        let manager = TxnManager::new();
+        let mut txn = manager.begin();
+        manager.put(&mut txn, RecordKey::new("t", "d", "snapshot", b"row"), b"v".to_vec());
+        manager.commit(txn).unwrap();
+
+        let (raw, commit_ts) = manager.encode_snapshot_with_commit().unwrap();
+        let decoded = Engine::decode_snapshot(&raw).unwrap();
+        assert_eq!(decoded.max_commit_ts(), commit_ts);
     }
 
     #[test]
