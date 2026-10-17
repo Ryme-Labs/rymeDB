@@ -3038,8 +3038,7 @@ mod websocket_credential_precedence_tests {
             std::process::id(),
             now_secs()
         ));
-        let mut config = Config::default();
-        config.data_dir = dir.clone();
+        let config = Config { data_dir: dir.clone(), ..Config::default() };
         let state = SharedState::build(&config).unwrap();
         let now = now_secs();
         state
@@ -9531,7 +9530,7 @@ mod vector_request_tests {
     use super::{AnnSearchRequest, VectorSearchRequest, VectorUpsertRequest};
 
     fn vector_request_body(components: usize) -> String {
-        let values = std::iter::repeat("0").take(components).collect::<Vec<_>>().join(",");
+        let values = std::iter::repeat_n("0", components).collect::<Vec<_>>().join(",");
         format!(r#"{{"table":"vectors","id":"v","vector":[{values}]}}"#)
     }
 

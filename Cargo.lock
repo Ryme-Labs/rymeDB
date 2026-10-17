@@ -1838,6 +1838,7 @@ dependencies = [
  "ryme-txn",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

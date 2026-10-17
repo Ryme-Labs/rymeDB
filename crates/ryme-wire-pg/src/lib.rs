@@ -5541,6 +5541,7 @@ mod tests {
                 command: String::from("SELECT"),
                 using: Some(String::from("tenant_id = auth.uid()")),
                 check: None,
+                roles: Vec::new(),
                 read: true,
                 write: false,
             },

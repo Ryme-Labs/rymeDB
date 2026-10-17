@@ -70,6 +70,7 @@ impl LocalStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

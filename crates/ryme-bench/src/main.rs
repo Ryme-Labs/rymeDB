@@ -778,6 +778,7 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Opt
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the sharded-local benchmark's independent CLI options.
 fn sharded_local_bench(
     ops: usize,
     concurrency: usize,

@@ -1611,7 +1611,7 @@ mod tests {
         assert!(restored.authenticate_at("short-key", 200).is_err());
 
         restored.insert_with_expiry(String::from("new-key"), principal, 400, 200).unwrap();
-        assert!(restored.snapshot().unwrap().get(&ApiKeyStore::digest("short-key")).is_none());
+        assert!(!restored.snapshot().unwrap().contains_key(&ApiKeyStore::digest("short-key")));
         let key_expirations = restored.inner.read().unwrap();
         assert!(!key_expirations.expirations.by_expiry.contains_key(&200));
         assert!(key_expirations.expirations.by_expiry.contains_key(&400));
@@ -1710,11 +1710,10 @@ mod tests {
             .unwrap();
         let restored = RefreshTokenStore::from_snapshot(store.snapshot().unwrap()).unwrap();
         restored.issue(principal, 200).unwrap();
-        assert!(restored
+        assert!(!restored
             .snapshot()
             .unwrap()
-            .get(&RefreshTokenStore::digest("expired-token"))
-            .is_none());
+            .contains_key(&RefreshTokenStore::digest("expired-token")));
         assert!(restored.inner.read().unwrap().expirations.by_expiry.contains_key(&500));
         assert_eq!(restored.len(), 2);
     }
