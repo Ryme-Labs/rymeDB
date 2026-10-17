@@ -127,12 +127,7 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
-    fn put(
-        &self,
-        txn: &mut ryme_txn::Transaction,
-        key: ryme_storage::RecordKey,
-        value: Vec<u8>,
-    ) {
+    fn put(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey, value: Vec<u8>) {
         match self {
             Self::Single(manager) => manager.put(txn, key, value),
             Self::Cluster(backend) => backend.put(txn, key, value),
@@ -156,11 +151,7 @@ impl ryme_txn::TxnBackend for Backend {
         }
     }
 
-    fn delete(
-        &self,
-        txn: &mut ryme_txn::Transaction,
-        key: ryme_storage::RecordKey,
-    ) {
+    fn delete(&self, txn: &mut ryme_txn::Transaction, key: ryme_storage::RecordKey) {
         match self {
             Self::Single(manager) => manager.delete(txn, key),
             Self::Cluster(backend) => backend.delete(txn, key),
@@ -940,6 +931,27 @@ mod auth_hash_capacity_tests {
         assert!(acquire_auth_hash_slot(&slots).is_ok());
         drop(second);
     }
+
+    #[test]
+    fn password_verification_releases_credential_lock_during_hash_work() {
+        let credentials = Mutex::new(CredentialStore::new());
+        credentials
+            .lock()
+            .unwrap()
+            .register_password(
+                String::from("ada"),
+                String::from("tenant-a"),
+                "correct-horse",
+                [Role::ReadWrite].into_iter().collect(),
+            )
+            .unwrap();
+
+        let principal = verify_password_with_store(&credentials, "ada", "correct-horse").unwrap();
+        assert_eq!(principal.tenant, "tenant-a");
+        assert!(credentials.try_lock().is_ok());
+        assert!(verify_password_with_store(&credentials, "ada", "wrong-password").is_err());
+        assert!(verify_password_with_store(&credentials, "missing", "wrong-password").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1071,7 +1083,8 @@ mod auth_attempt_limiter_tests {
             auth_client_ip(loopback, Some("127.0.0.1"), &trusted_loopback).allow_loopback_bootstrap
         );
         assert!(
-            !auth_client_ip(loopback, Some("not-an-ip"), &trusted_loopback).allow_loopback_bootstrap
+            !auth_client_ip(loopback, Some("not-an-ip"), &trusted_loopback)
+                .allow_loopback_bootstrap
         );
         assert!(
             !auth_client_ip_from_peer(None, Some("127.0.0.1"), &trusted_loopback)
@@ -2473,11 +2486,7 @@ impl SharedState {
         // Legacy application keys had no expiry. Require users to sign in
         // again after upgrade; the configured operator key is reinserted
         // below with its intended non-expiring lifetime.
-        expire_legacy_api_keys(
-            &auth_snapshot.api_keys,
-            &mut api_key_expirations,
-            migration_time,
-        );
+        expire_legacy_api_keys(&auth_snapshot.api_keys, &mut api_key_expirations, migration_time);
         let keys = ApiKeyStore::from_snapshot_with_expirations(
             auth_snapshot.api_keys,
             api_key_expirations,
@@ -4339,11 +4348,7 @@ fn dashboard_file(path: &str) -> Response {
         "woff2" => "font/woff2",
         _ => "application/octet-stream",
     };
-    (
-        [(axum::http::header::CONTENT_TYPE, content_type)],
-        asset.data.into_owned(),
-    )
-        .into_response()
+    ([(axum::http::header::CONTENT_TYPE, content_type)], asset.data.into_owned()).into_response()
 }
 
 async fn dashboard_setup(State(state): State<SharedState>) -> Response {
@@ -4934,13 +4939,8 @@ async fn rest_list(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match table_executor_for_principal(
-        &state,
-        &headers,
-        &principal,
-        &table,
-        &["SELECT"],
-    ) {
+    let executor =
+        match table_executor_for_principal(&state, &headers, &principal, &table, &["SELECT"]) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -5421,13 +5421,8 @@ async fn rest_insert(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match table_executor_for_principal(
-        &state,
-        &headers,
-        &principal,
-        &table,
-        &["INSERT"],
-    ) {
+    let executor =
+        match table_executor_for_principal(&state, &headers, &principal, &table, &["INSERT"]) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -5472,12 +5467,12 @@ async fn rest_insert(
     for (body, (mut key, value)) in rows {
         if let Some(field) = conflict_field.as_deref() {
             if let Some(expected) = body.fields.get(field) {
-                if let Some(existing) =
-                    match rest_conflict_key(&gateway, &principal, &executor, &table, field, expected) {
+                if let Some(existing) = match rest_conflict_key(
+                    &gateway, &principal, &executor, &table, field, expected,
+                ) {
                         Ok(existing) => existing,
                         Err(e) => return error_response(e),
-                    }
-                {
+                } {
                     key = existing;
                 }
             }
@@ -5536,13 +5531,8 @@ async fn rest_upsert(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match table_executor_for_principal(
-        &state,
-        &headers,
-        &principal,
-        &table,
-        &["UPDATE"],
-    ) {
+    let executor =
+        match table_executor_for_principal(&state, &headers, &principal, &table, &["UPDATE"]) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -5616,13 +5606,8 @@ async fn rest_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match table_executor_for_principal(
-        &state,
-        &headers,
-        &principal,
-        &table,
-        &["DELETE"],
-    ) {
+    let executor =
+        match table_executor_for_principal(&state, &headers, &principal, &table, &["DELETE"]) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -5782,13 +5767,8 @@ async fn graphql_exec(
             )))
         }
     };
-    let executor = match table_executor_for_principal(
-        &state,
-        &headers,
-        &principal,
-        &table,
-        &["SELECT"],
-    ) {
+    let executor =
+        match table_executor_for_principal(&state, &headers, &principal, &table, &["SELECT"]) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
@@ -6511,10 +6491,7 @@ async fn auth_verify(
     let credentials = state.credentials.clone();
     let verified = tokio::task::spawn_blocking(move || {
         let _hash_slot = hash_slot;
-        match credentials.lock() {
-            Ok(store) => store.verify_password(&request.id, &request.password),
-            Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
-        }
+        verify_password_with_store(&credentials, &request.id, &request.password)
     })
     .await;
     match verified {
@@ -6529,6 +6506,24 @@ async fn auth_verify(
 }
 
 const ACCESS_TOKEN_TTL_SECS: u64 = 15 * 60;
+
+fn verify_password_with_store(
+    credentials: &Mutex<CredentialStore>,
+    id: &str,
+    password: &str,
+) -> Result<Principal, ryme_error::RymeError> {
+    let hash = credentials
+        .lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?
+        .password_hash_snapshot(id);
+    if !ryme_auth::verify_password(password, &hash) {
+        return Err(ryme_error::RymeError::Unauthorized);
+    }
+    credentials
+        .lock()
+        .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?
+        .principal_after_password_verification(id, &hash)
+}
 
 fn expire_legacy_api_keys(
     api_keys: &HashMap<String, Principal>,
@@ -6587,8 +6582,8 @@ async fn auth_token(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
-    let refreshing = request.refresh_token.is_some()
-        || request.grant_type.as_deref() == Some("refresh_token");
+    let refreshing =
+        request.refresh_token.is_some() || request.grant_type.as_deref() == Some("refresh_token");
     if request
         .refresh_token
         .as_deref()
@@ -6643,13 +6638,7 @@ async fn auth_token(
         if request.grant_type.as_deref().is_some_and(|grant| grant != "password") {
             return Err(ryme_error::RymeError::InvalidArgument(String::from("grant_type")));
         }
-        let principal = match credentials.lock() {
-            Ok(store) => match store.verify_password(&request.id, &request.password) {
-                Ok(principal) => principal,
-                Err(e) => return Err(e),
-            },
-            Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
-        };
+        let principal = verify_password_with_store(&credentials, &request.id, &request.password)?;
         let otp_enrolled = match credentials.lock() {
             Ok(store) => store.otp_enrolled(&request.id),
             Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
@@ -7149,8 +7138,7 @@ async fn oidc_token(
             };
             complete_auth_attempt(&state, &attempt_key, client_ip.address);
             match state.persist_auth() {
-                Ok(()) => {
-                    (
+                Ok(()) => (
                         StatusCode::CREATED,
                         Json(serde_json::json!({
                             "key": key,
@@ -7158,8 +7146,7 @@ async fn oidc_token(
                             "expires_in": ACCESS_TOKEN_TTL_SECS,
                         })),
                     )
-                        .into_response()
-                }
+                    .into_response(),
                 Err(e) => error_response(e),
             }
         }
@@ -9544,10 +9531,7 @@ mod vector_request_tests {
     use super::{AnnSearchRequest, VectorSearchRequest, VectorUpsertRequest};
 
     fn vector_request_body(components: usize) -> String {
-        let values = std::iter::repeat("0")
-            .take(components)
-            .collect::<Vec<_>>()
-            .join(",");
+        let values = std::iter::repeat("0").take(components).collect::<Vec<_>>().join(",");
         format!(r#"{{"table":"vectors","id":"v","vector":[{values}]}}"#)
     }
 
@@ -9610,18 +9594,11 @@ async fn vector_upsert(
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = index_row_visible(
-        &state,
-        &headers,
-        &principal,
-        &executor,
-        &request.table,
-        &request.id,
-    )
+    if let Err(e) =
+        index_row_visible(&state, &headers, &principal, &executor, &request.table, &request.id)
     .await
-    .and_then(|visible| {
-        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
-    }) {
+            .and_then(|visible| visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden))
+    {
         return error_response(e);
     }
     if let Err(e) = admit_write(&state, &principal.tenant, (request.vector.len() * 4) as u64) {
@@ -9639,12 +9616,7 @@ async fn vector_upsert(
     };
     {
         let mut indexes = state.indexes.write().await;
-        match indexes.vector_upsert_scoped(
-            &principal.tenant,
-            &space,
-            request.id,
-            request.vector,
-        ) {
+        match indexes.vector_upsert_scoped(&principal.tenant, &space, request.id, request.vector) {
             Ok(()) => {
                 record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
@@ -9695,18 +9667,14 @@ async fn vector_search(
         indexes.vector_search(&space, &request.vector, request.top_k.unwrap_or(10))
     };
     match result {
-        Ok(hits) => match filter_vector_hits(
-            &state,
-            &headers,
-            &principal,
-            &executor,
-            &request.table,
-            hits,
-        )
-        .await {
+        Ok(hits) => {
+            match filter_vector_hits(&state, &headers, &principal, &executor, &request.table, hits)
+                .await
+            {
             Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
             Err(e) => error_response(e),
-        },
+            }
+        }
         Err(e) => error_response(e),
     }
 }
@@ -9766,18 +9734,14 @@ async fn vector_ann_search(
         )
     };
     match result {
-        Ok(hits) => match filter_vector_hits(
-            &state,
-            &headers,
-            &principal,
-            &executor,
-            &request.table,
-            hits,
-        )
-        .await {
+        Ok(hits) => {
+            match filter_vector_hits(&state, &headers, &principal, &executor, &request.table, hits)
+                .await
+            {
             Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
             Err(e) => error_response(e),
-        },
+            }
+        }
         Err(e) => error_response(e),
     }
 }
@@ -9791,37 +9755,19 @@ async fn vector_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match table_executor_for_principal(
-        &state,
-        &headers,
-        &principal,
-        &table,
-        &["DELETE"],
-    ) {
+    let executor =
+        match table_executor_for_principal(&state, &headers, &principal, &table, &["DELETE"]) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = index_row_visible(
-        &state,
-        &headers,
-        &principal,
-        &executor,
-        &table,
-        &id,
-    )
+    if let Err(e) = index_row_visible(&state, &headers, &principal, &executor, &table, &id)
     .await
-    .and_then(|visible| {
-        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
-    }) {
+        .and_then(|visible| visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden))
+    {
         return error_response(e);
     }
-    let space = match request_index_space(
-        &state,
-        &headers,
-        &principal.tenant,
-        &state.database,
-        &table,
-    ) {
+    let space =
+        match request_index_space(&state, &headers, &principal.tenant, &state.database, &table) {
         Ok(space) => space,
         Err(e) => return error_response(e),
     };
@@ -9856,18 +9802,11 @@ async fn text_index(
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = index_row_visible(
-        &state,
-        &headers,
-        &principal,
-        &executor,
-        &request.table,
-        &request.id,
-    )
+    if let Err(e) =
+        index_row_visible(&state, &headers, &principal, &executor, &request.table, &request.id)
     .await
-    .and_then(|visible| {
-        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
-    }) {
+            .and_then(|visible| visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden))
+    {
         return error_response(e);
     }
     if let Err(e) = admit_write(&state, &principal.tenant, request.text.len() as u64) {
@@ -9885,12 +9824,7 @@ async fn text_index(
     };
     {
         let mut indexes = state.indexes.write().await;
-        match indexes.text_index_scoped(
-            &principal.tenant,
-            &space,
-            request.id,
-            &request.text,
-        ) {
+        match indexes.text_index_scoped(&principal.tenant, &space, request.id, &request.text) {
             Ok(terms) => {
                 record_meter(&state, &principal.tenant, Metric::WriteUnit, 1);
                 (StatusCode::OK, Json(serde_json::json!({ "terms": terms }))).into_response()
@@ -9941,18 +9875,14 @@ async fn text_search(
         indexes.text_search(&space, &request.query, request.top_k.unwrap_or(10))
     };
     match result {
-        Ok(hits) => match filter_text_hits(
-            &state,
-            &headers,
-            &principal,
-            &executor,
-            &request.table,
-            hits,
-        )
-        .await {
+        Ok(hits) => {
+            match filter_text_hits(&state, &headers, &principal, &executor, &request.table, hits)
+                .await
+            {
             Ok(hits) => (StatusCode::OK, Json(hits)).into_response(),
             Err(e) => error_response(e),
-        },
+            }
+        }
         Err(e) => error_response(e),
     }
 }
@@ -9966,37 +9896,19 @@ async fn text_delete(
         Ok(principal) => principal,
         Err(e) => return error_response(e),
     };
-    let executor = match table_executor_for_principal(
-        &state,
-        &headers,
-        &principal,
-        &table,
-        &["DELETE"],
-    ) {
+    let executor =
+        match table_executor_for_principal(&state, &headers, &principal, &table, &["DELETE"]) {
         Ok(executor) => executor,
         Err(e) => return error_response(e),
     };
-    if let Err(e) = index_row_visible(
-        &state,
-        &headers,
-        &principal,
-        &executor,
-        &table,
-        &id,
-    )
+    if let Err(e) = index_row_visible(&state, &headers, &principal, &executor, &table, &id)
     .await
-    .and_then(|visible| {
-        visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden)
-    }) {
+        .and_then(|visible| visible.then_some(()).ok_or(ryme_error::RymeError::Forbidden))
+    {
         return error_response(e);
     }
-    let space = match request_index_space(
-        &state,
-        &headers,
-        &principal.tenant,
-        &state.database,
-        &table,
-    ) {
+    let space =
+        match request_index_space(&state, &headers, &principal.tenant, &state.database, &table) {
         Ok(space) => space,
         Err(e) => return error_response(e),
     };
@@ -14203,9 +14115,7 @@ fn load_jwks_verifier(
         ryme_error::RymeError::InvalidArgument(format!("jwt jwks file {}: {error}", path.display()))
     })?;
     let mut raw = Vec::new();
-    file.take((MAX_JWKS_DOCUMENT_BYTES + 1) as u64)
-        .read_to_end(&mut raw)
-        .map_err(|error| {
+    file.take((MAX_JWKS_DOCUMENT_BYTES + 1) as u64).read_to_end(&mut raw).map_err(|error| {
             ryme_error::RymeError::Corrupt(format!("jwt jwks file {}: {error}", path.display()))
         })?;
     load_jwks_verifier_bytes(&raw, requested_kid, issuer, audience)
@@ -14232,19 +14142,13 @@ fn load_jwks_verifier_bytes(
     let selected_keys = keys
         .iter()
         .filter(|key| key.get("kty").and_then(|value| value.as_str()) == Some("RSA"))
-        .filter(|key| {
-            key.get("alg").is_none_or(|value| value.as_str() == Some("RS256"))
-        })
-        .filter(|key| {
-            key.get("use").is_none_or(|value| value.as_str() == Some("sig"))
-        })
+        .filter(|key| key.get("alg").is_none_or(|value| value.as_str() == Some("RS256")))
+        .filter(|key| key.get("use").is_none_or(|value| value.as_str() == Some("sig")))
         .filter(|key| {
             key.get("key_ops").is_none_or(|value| {
                 value.as_array().is_some_and(|operations| {
                     operations.iter().all(|operation| operation.as_str().is_some())
-                        && operations
-                            .iter()
-                            .any(|operation| operation.as_str() == Some("verify"))
+                        && operations.iter().any(|operation| operation.as_str() == Some("verify"))
                 })
             })
         })
@@ -15011,7 +14915,10 @@ mod realtime_policy_tests {
         }
         assert_eq!(audit.recent(1)[0].status, 403);
         let reopened = AuditLog::load(path.clone()).unwrap();
-        assert_eq!(reopened.recent(2).iter().map(|event| event.status).collect::<Vec<_>>(), [403, 200]);
+        assert_eq!(
+            reopened.recent(2).iter().map(|event| event.status).collect::<Vec<_>>(),
+            [403, 200]
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -15138,10 +15045,9 @@ mod realtime_policy_tests {
         let mut config = Config::default();
         config.data_dir = dir.clone();
         let state = SharedState::build(&config).unwrap();
-        for (key, id, role) in [
-            ("admin-key", "operator", Role::Superuser),
-            ("reader-key", "reader", Role::ReadOnly),
-        ] {
+        for (key, id, role) in
+            [("admin-key", "operator", Role::Superuser), ("reader-key", "reader", Role::ReadOnly)]
+        {
             state
                 .keys
                 .insert(
@@ -15154,11 +15060,8 @@ mod realtime_policy_tests {
                 )
                 .unwrap();
         }
-        let unauthorized = audit_events(
-            State(state.clone()),
-            HeaderMap::new(),
-            Query(AuditQuery { limit: None }),
-        )
+        let unauthorized =
+            audit_events(State(state.clone()), HeaderMap::new(), Query(AuditQuery { limit: None }))
         .await;
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
         let mut reader_headers = HeaderMap::new();
@@ -15166,11 +15069,8 @@ mod realtime_policy_tests {
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer reader-key"),
         );
-        let forbidden = audit_events(
-            State(state.clone()),
-            reader_headers,
-            Query(AuditQuery { limit: None }),
-        )
+        let forbidden =
+            audit_events(State(state.clone()), reader_headers, Query(AuditQuery { limit: None }))
         .await;
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
         let mut admin_headers = HeaderMap::new();
@@ -15178,12 +15078,8 @@ mod realtime_policy_tests {
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer admin-key"),
         );
-        let allowed = audit_events(
-            State(state),
-            admin_headers,
-            Query(AuditQuery { limit: None }),
-        )
-        .await;
+        let allowed =
+            audit_events(State(state), admin_headers, Query(AuditQuery { limit: None })).await;
         assert_eq!(allowed.status(), StatusCode::OK);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -15233,9 +15129,7 @@ mod realtime_policy_tests {
             State(state.clone()),
             HeaderMap::new(),
             Extension(AuthClientIp { address: remote, allow_loopback_bootstrap: false }),
-            axum::body::Bytes::from_static(
-                br#"{"id":"first-admin","password":"long-password"}"#,
-            ),
+            axum::body::Bytes::from_static(br#"{"id":"first-admin","password":"long-password"}"#),
         )
         .await;
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
@@ -15261,9 +15155,7 @@ mod realtime_policy_tests {
             State(state),
             headers,
             Extension(AuthClientIp { address: remote, allow_loopback_bootstrap: false }),
-            axum::body::Bytes::from_static(
-                br#"{"id":"first-admin","password":"long-password"}"#,
-            ),
+            axum::body::Bytes::from_static(br#"{"id":"first-admin","password":"long-password"}"#),
         )
         .await;
         assert_eq!(allowed.status(), StatusCode::CREATED);
@@ -15849,7 +15741,10 @@ mod realtime_policy_tests {
 
         assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![].into())));
         assert!(queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![].into())));
-        assert!(!queue_realtime_message(&outgoing, axum::extract::ws::Message::Ping(vec![].into())));
+        assert!(!queue_realtime_message(
+            &outgoing,
+            axum::extract::ws::Message::Ping(vec![].into())
+        ));
 
         assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));
     }
@@ -15861,7 +15756,8 @@ mod realtime_policy_tests {
 
         let sender = outgoing.clone();
         let pending = tokio::spawn(async move {
-            queue_realtime_message_wait(&sender, axum::extract::ws::Message::Ping(vec![].into())).await
+            queue_realtime_message_wait(&sender, axum::extract::ws::Message::Ping(vec![].into()))
+                .await
         });
         tokio::task::yield_now().await;
         assert!(matches!(queued.recv().await, Some(axum::extract::ws::Message::Ping(_))));

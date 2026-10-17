@@ -245,13 +245,11 @@ impl ExpirationIndex {
     }
 
     fn pop_expired(&mut self, now_secs: u64) -> Option<(u64, HashSet<String>)> {
-        if !self.by_expiry.first_key_value().is_some_and(|(expires_at, _)| *expires_at <= now_secs)
-        {
+        if self.by_expiry.first_key_value().is_none_or(|(expires_at, _)| *expires_at > now_secs) {
             return None;
         }
         self.by_expiry.pop_first()
     }
-
 }
 
 #[derive(Debug, Default)]
@@ -344,7 +342,10 @@ impl ApiKeyStore {
     }
 
     pub fn remove_with_expiry(&self, api_key: &str) -> Option<(Principal, Option<u64>)> {
-        self.inner.write().ok()?.remove(&Self::digest(api_key))
+        self.inner
+            .write()
+            .ok()?
+            .remove(&Self::digest(api_key))
             .map(|record| (record.principal, record.expires_at))
     }
 
@@ -851,10 +852,7 @@ impl RefreshTokenState {
     fn prune_expired(&mut self, now_secs: u64) {
         while let Some((expires_at, digests)) = self.expirations.pop_expired(now_secs) {
             for digest in digests {
-                if self
-                    .sessions
-                    .get(&digest)
-                    .is_some_and(|record| record.expires_at == expires_at)
+                if self.sessions.get(&digest).is_some_and(|record| record.expires_at == expires_at)
                 {
                     self.sessions.remove(&digest);
                 }
@@ -995,7 +993,7 @@ impl Default for RefreshTokenStore {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasswordHash {
     pub salt_b64: String,
     pub hash_b64: String,
@@ -1014,6 +1012,14 @@ pub const MAX_PASSWORD_LEN: usize = 256;
 pub const MAX_USER_LEN: usize = 256;
 pub const MAX_CHALLENGES: usize = 4096;
 const MAX_USERS: usize = 100_000;
+
+fn dummy_password_hash() -> PasswordHash {
+    PasswordHash {
+        salt_b64: base64_url_encode(&[0u8; 16]),
+        hash_b64: base64_url_encode(&[0u8; PASSWORD_HASH_LEN]),
+        rounds: ARGON2ID_MARKER,
+    }
+}
 
 pub fn hash_password(password: &str) -> PasswordHash {
     let salt = random_bytes(16);
@@ -1145,7 +1151,11 @@ pub struct PasskeyAssertion<'a> {
 }
 impl PasskeyRegistry {
     pub fn new() -> Self {
-        Self { challenges: HashMap::new(), next_challenge_expiry: None, credentials: HashMap::new() }
+        Self {
+            challenges: HashMap::new(),
+            next_challenge_expiry: None,
+            credentials: HashMap::new(),
+        }
     }
 
     pub fn challenge(&mut self, user: &str) -> Result<String> {
@@ -1167,15 +1177,14 @@ impl PasskeyRegistry {
         let raw = random_bytes(32);
         let encoded = base64_url_encode(&raw);
         let expires_at = now_secs.saturating_add(PASSKEY_CHALLENGE_TTL_SECS);
-        self.next_challenge_expiry = Some(
-            self.next_challenge_expiry.map_or(expires_at, |current| current.min(expires_at)),
-        );
+        self.next_challenge_expiry =
+            Some(self.next_challenge_expiry.map_or(expires_at, |current| current.min(expires_at)));
         self.challenges.insert(encoded.clone(), (user.to_string(), now_secs));
         Ok(encoded)
     }
 
     fn prune_expired_challenges(&mut self, now_secs: u64) {
-        if !self.next_challenge_expiry.is_some_and(|expires_at| expires_at <= now_secs) {
+        if self.next_challenge_expiry.is_none_or(|expires_at| expires_at > now_secs) {
             return;
         }
         self.challenges.retain(|_, (_, issued_at)| {
@@ -1466,23 +1475,34 @@ impl CredentialStore {
         if id.is_empty() || id.len() > MAX_USER_LEN || password.len() > MAX_PASSWORD_LEN {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
-        let stored = self.users.get(id).and_then(|user| user.password.as_ref());
-        let dummy;
-        let reference: &PasswordHash = match stored {
-            Some(hash) => hash,
-            None => {
-                dummy = PasswordHash {
-                    salt_b64: base64_url_encode(&[0u8; 16]),
-                    hash_b64: base64_url_encode(&[0u8; 32]),
-                    rounds: ARGON2ID_MARKER,
-                };
-                &dummy
-            }
-        };
-        if !verify_password(password, reference) {
+        let snapshot = self.password_hash_snapshot(id);
+        if !verify_password(password, &snapshot) {
             return Err(RymeError::Unauthorized);
         }
+        self.principal_after_password_verification(id, &snapshot)
+    }
+
+    /// Clone the password hash for expensive verification without holding the
+    /// credential-store lock. Missing users receive a dummy Argon2id hash so
+    /// callers can preserve comparable work before returning Unauthorized.
+    pub fn password_hash_snapshot(&self, id: &str) -> PasswordHash {
+        self.users
+            .get(id)
+            .and_then(|user| user.password.clone())
+            .unwrap_or_else(dummy_password_hash)
+    }
+
+    /// Return current principal only if the verified hash is still current.
+    /// This makes lock-free Argon2 work safe across concurrent credential edits.
+    pub fn principal_after_password_verification(
+        &self,
+        id: &str,
+        verified_hash: &PasswordHash,
+    ) -> Result<Principal> {
         let user = self.users.get(id).ok_or(RymeError::Unauthorized)?;
+        if user.password.as_ref() != Some(verified_hash) {
+            return Err(RymeError::Unauthorized);
+        }
         Ok(Principal { id: id.to_string(), tenant: user.tenant.clone(), roles: user.roles.clone() })
     }
 
@@ -1517,11 +1537,7 @@ impl CredentialStore {
             return Err(RymeError::Unauthorized);
         }
         user.otp_last_used_step = Some(step);
-        Ok(Principal {
-            id: id.to_string(),
-            tenant: user.tenant.clone(),
-            roles: user.roles.clone(),
-        })
+        Ok(Principal { id: id.to_string(), tenant: user.tenant.clone(), roles: user.roles.clone() })
     }
 
     pub fn len(&self) -> usize {
@@ -1580,9 +1596,7 @@ mod tests {
         let mut roles = HashSet::new();
         roles.insert(Role::ReadWrite);
         let principal = Principal { id: String::from("u"), tenant: String::from("t"), roles };
-        store
-            .insert_with_expiry(String::from("short-key"), principal.clone(), 200, 100)
-            .unwrap();
+        store.insert_with_expiry(String::from("short-key"), principal.clone(), 200, 100).unwrap();
 
         assert!(store.authenticate_at("short-key", 199).is_ok());
         assert!(store.authenticate_at("short-key", 200).is_err());
@@ -1597,11 +1611,7 @@ mod tests {
         assert!(restored.authenticate_at("short-key", 200).is_err());
 
         restored.insert_with_expiry(String::from("new-key"), principal, 400, 200).unwrap();
-        assert!(restored
-            .snapshot()
-            .unwrap()
-            .get(&ApiKeyStore::digest("short-key"))
-            .is_none());
+        assert!(restored.snapshot().unwrap().get(&ApiKeyStore::digest("short-key")).is_none());
         let key_expirations = restored.inner.read().unwrap();
         assert!(!key_expirations.expirations.by_expiry.contains_key(&200));
         assert!(key_expirations.expirations.by_expiry.contains_key(&400));
@@ -1658,10 +1668,7 @@ mod tests {
         assert!(!store.revoke(&oversized));
         assert!(store.remove_record(&oversized).is_none());
         assert!(store
-            .restore_record(
-                &oversized,
-                RefreshTokenRecord { principal, expires_at: 200 },
-            )
+            .restore_record(&oversized, RefreshTokenRecord { principal, expires_at: 200 },)
             .is_err());
     }
 
@@ -2352,9 +2359,8 @@ mod tests {
     #[test]
     fn oidc_encodes_untrusted_query_values() {
         let config = oidc_test_config();
-        let url = config
-            .auth_url("https://app.test/callback?next=/home&state=evil", "x y&z")
-            .unwrap();
+        let url =
+            config.auth_url("https://app.test/callback?next=/home&state=evil", "x y&z").unwrap();
         assert!(url.contains(
             "redirect_uri=https%3A%2F%2Fapp.test%2Fcallback%3Fnext%3D%2Fhome%26state%3Devil"
         ));
@@ -2763,6 +2769,32 @@ mod tests {
         assert!(store.verify_otp("ada", "000000", 1_700_000_000).is_err());
         assert!(store.otp_enrolled("ada"));
         assert!(!store.otp_enrolled("ghost"));
+    }
+
+    #[test]
+    fn password_hash_snapshot_rejects_stale_password_after_concurrent_change() {
+        let mut store = CredentialStore::new();
+        store
+            .register_password(
+                String::from("ada"),
+                String::from("t"),
+                "correct-horse",
+                HashSet::from([Role::ReadWrite]),
+            )
+            .unwrap();
+
+        let old_hash = store.password_hash_snapshot("ada");
+        assert!(verify_password("correct-horse", &old_hash));
+        assert!(store.principal_after_password_verification("ada", &old_hash).is_ok());
+
+        let mut users = store.snapshot();
+        users.get_mut("ada").unwrap().password = Some(hash_password("new-password"));
+        let updated_store = CredentialStore::from_snapshot(users).unwrap();
+        assert!(matches!(
+            updated_store.principal_after_password_verification("ada", &old_hash),
+            Err(RymeError::Unauthorized)
+        ));
+        assert!(!verify_password("correct-horse", &updated_store.password_hash_snapshot("ada")));
     }
 
     #[test]
