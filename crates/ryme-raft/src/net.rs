@@ -1,6 +1,6 @@
 use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
-use ryme_storage::{Engine, RecordKey, TableVersion};
+use ryme_storage::{Engine, RecordKey};
 use ryme_txn::{decode_writes, encode_writes, now_unix, TxnManager};
 use ryme_wal::{Wal, WalRecord};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,6 @@ const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_RAFT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
-type RangeTableRows = BTreeMap<(String, String, String), Vec<(Vec<u8>, Vec<TableVersion>)>>;
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2706,6 +2705,7 @@ impl Node {
                 Ok(Rpc::RangeSnapshotResponse { snapshot })
             }
             Rpc::RangeInstallRequest { snapshot } => {
+                let _commit = self.txn_commit_lock.lock().await;
                 let rows = self.install_range_snapshot(&snapshot)?;
                 Ok(Rpc::RangeInstallResponse { rows })
             }
@@ -5538,8 +5538,45 @@ impl Node {
         if !snapshot.end.is_empty() && snapshot.start >= snapshot.end {
             return Err(RymeError::InvalidArgument(String::from("range")));
         }
+        if snapshot.rows.len() > 100_000 {
+            return Err(RymeError::Overload(String::from("range snapshot")));
+        }
+        ryme_storage::validate_routing_version(snapshot.routing_version)?;
         if self.manager.latest_commit() > snapshot.snapshot_ts {
             return Err(RymeError::Unavailable(String::from("target ahead")));
+        }
+        let mut replacement = Engine::new();
+        let mut seen = BTreeSet::new();
+        for row in &snapshot.rows {
+            let key = RecordKey::new(&row.tenant, &row.database, &row.table, &row.pk);
+            let routing_key = ryme_storage::record_routing_key(snapshot.routing_version, &key)?;
+            if routing_key.as_slice() < snapshot.start.as_slice()
+                || (!snapshot.end.is_empty() && routing_key.as_slice() >= snapshot.end.as_slice())
+            {
+                return Err(RymeError::Corrupt(String::from("range snapshot scope")));
+            }
+            if !seen.insert(key.clone()) || row.versions.is_empty() {
+                return Err(RymeError::Corrupt(String::from("range snapshot row")));
+            }
+            let mut previous_commit_ts = 0;
+            for version in &row.versions {
+                if version.commit_ts <= previous_commit_ts
+                    || version.commit_ts > snapshot.snapshot_ts
+                {
+                    return Err(RymeError::Corrupt(String::from("range snapshot version order")));
+                }
+                previous_commit_ts = version.commit_ts;
+                replacement
+                    .apply_with_expiry(
+                        key.clone(),
+                        version.commit_ts,
+                        version.value.clone(),
+                        version.expires_at,
+                    )
+                    .map_err(|error| {
+                        RymeError::Corrupt(format!("range snapshot version: {error}"))
+                    })?;
+            }
         }
         let existing = self.snapshot_range_for_version(
             snapshot.routing_version,
@@ -5553,50 +5590,13 @@ impl Node {
         if existing.truncated {
             return Err(RymeError::Overload(String::from("target range")));
         }
-        let wanted: std::collections::HashSet<(String, String, String, Vec<u8>)> = snapshot
-            .rows
-            .iter()
-            .map(|row| {
-                (row.tenant.clone(), row.database.clone(), row.table.clone(), row.pk.clone())
-            })
-            .collect();
-        let purge: Vec<RecordKey> = existing
-            .rows
-            .iter()
-            .filter(|row| {
-                !wanted.contains(&(
-                    row.tenant.clone(),
-                    row.database.clone(),
-                    row.table.clone(),
-                    row.pk.clone(),
-                ))
-            })
-            .map(|row| RecordKey::new(&row.tenant, &row.database, &row.table, &row.pk))
-            .collect();
-        if !purge.is_empty() {
-            self.manager.purge_keys(&purge)?;
-        }
-        let mut tables: RangeTableRows = BTreeMap::new();
-        for row in &snapshot.rows {
-            tables
-                .entry((row.tenant.clone(), row.database.clone(), row.table.clone()))
-                .or_default()
-                .push((
-                    row.pk.clone(),
-                    row.versions
-                        .iter()
-                        .map(|version| TableVersion {
-                            commit_ts: version.commit_ts,
-                            value: version.value.clone(),
-                            expires_at: version.expires_at,
-                        })
-                        .collect(),
-                ));
-        }
-        for ((tenant, database, table), rows) in tables {
-            self.manager.import_table(&tenant, &database, &table, rows)?;
-        }
-        self.manager.advance_to(snapshot.snapshot_ts.saturating_sub(1));
+        self.manager.install_routing_range_snapshot(
+            snapshot.routing_version,
+            &snapshot.start,
+            &snapshot.end,
+            snapshot.snapshot_ts,
+            replacement,
+        )?;
         Ok(snapshot.rows.len() as u64)
     }
 
@@ -6768,6 +6768,69 @@ mod tests {
         assert_eq!(snapshot.snapshot_ts, 10);
         assert_eq!(snapshot.rows.len(), 1);
         assert_eq!(snapshot.rows[0].versions[0].value, Some(b"old".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejected_range_snapshot_preserves_existing_rows_and_rejects_scope_escape() {
+        let dir = temp_dir("range-snapshot-reject");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let existing = RecordKey::new("t", "d", "docs", b"existing");
+        let mut seed = BTreeMap::new();
+        seed.insert(existing.clone(), ryme_txn::WriteOp::put(b"keep".to_vec()));
+        node.manager.replay_at(10, &seed).unwrap();
+
+        let snapshot = RangeSnapshot {
+            start: b"docs\0".to_vec(),
+            end: b"docs\0\xff".to_vec(),
+            routing_version: ryme_storage::LEGACY_ROUTING_VERSION,
+            snapshot_ts: 20,
+            applied_commit: 20,
+            rows: vec![RangeSnapshotRow {
+                tenant: String::from("t"),
+                database: String::from("d"),
+                table: String::from("docs"),
+                pk: b"incoming".to_vec(),
+                value: b"new".to_vec(),
+                expires_at: 0,
+                versions: vec![
+                    RangeSnapshotVersion {
+                        commit_ts: 20,
+                        value: Some(b"new".to_vec()),
+                        expires_at: 0,
+                    },
+                    RangeSnapshotVersion {
+                        commit_ts: 15,
+                        value: Some(b"older".to_vec()),
+                        expires_at: 0,
+                    },
+                ],
+            }],
+            truncated: false,
+        };
+        assert!(matches!(node.install_range_snapshot(&snapshot), Err(RymeError::Corrupt(_))));
+
+        let mut probe = node.manager.begin();
+        assert_eq!(node.manager.get(&mut probe, &existing).unwrap(), Some(b"keep".to_vec()));
+        assert_eq!(
+            node.manager.get(&mut probe, &RecordKey::new("t", "d", "docs", b"incoming")).unwrap(),
+            None
+        );
+
+        let mut escaped = snapshot;
+        escaped.rows[0].table = String::from("other");
+        escaped.rows[0].versions = vec![RangeSnapshotVersion {
+            commit_ts: 20,
+            value: Some(b"escaped".to_vec()),
+            expires_at: 0,
+        }];
+        assert!(matches!(node.install_range_snapshot(&escaped), Err(RymeError::Corrupt(_))));
+        let mut probe = node.manager.begin();
+        assert_eq!(node.manager.get(&mut probe, &existing).unwrap(), Some(b"keep".to_vec()));
+        assert_eq!(
+            node.manager.get(&mut probe, &RecordKey::new("t", "d", "other", b"incoming")).unwrap(),
+            None
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

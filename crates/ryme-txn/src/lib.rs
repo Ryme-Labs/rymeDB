@@ -2085,6 +2085,35 @@ impl TxnManager {
         engine.replace_routing_range_for_version(version, start, end, &replacement)
     }
 
+    pub fn install_routing_range_snapshot(
+        &self,
+        version: u8,
+        start: &[u8],
+        end: &[u8],
+        snapshot_ts: u64,
+        replacement: Engine,
+    ) -> Result<usize> {
+        let _guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        if self.inner.applied.load(Ordering::SeqCst) > snapshot_ts {
+            return Err(RymeError::Unavailable(String::from("target ahead")));
+        }
+        let mut engine = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
+        let removed =
+            engine.replace_routing_range_for_version(version, start, end, &replacement)?;
+        let visible_ts = snapshot_ts.max(1);
+        self.inner.clock.fetch_max(visible_ts, Ordering::SeqCst);
+        self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
+        Ok(removed)
+    }
+
     pub fn export_table(
         &self,
         tenant: &str,
