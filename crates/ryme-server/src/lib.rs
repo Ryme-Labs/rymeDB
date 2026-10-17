@@ -644,6 +644,7 @@ const AUTH_ATTEMPT_SWEEP_SECS: u64 = 10;
 const AUTH_ATTEMPTS_PER_IDENTITY: u32 = 5;
 const AUTH_ATTEMPTS_PER_CLIENT: u32 = 120;
 const AUTH_LIMITER_MAX_IDENTITIES: usize = 8192;
+const AUTH_HASH_CONCURRENCY: usize = 2;
 const MAX_FORWARDED_FOR_HOPS: usize = 32;
 const OIDC_STATE_TTL_SECS: u64 = 600;
 const OIDC_STATE_MAX_PENDING: usize = 8192;
@@ -660,6 +661,14 @@ struct AuthAttemptLimiter {
     clients: HashMap<std::net::IpAddr, AuthAttemptWindow>,
     identities: HashMap<String, AuthAttemptWindow>,
     last_pruned_at: u64,
+}
+
+fn acquire_auth_hash_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+) -> ryme_error::Result<tokio::sync::OwnedSemaphorePermit> {
+    Arc::clone(slots)
+        .try_acquire_owned()
+        .map_err(|_| ryme_error::RymeError::Overload(String::from("password hashing capacity")))
 }
 
 impl AuthAttemptLimiter {
@@ -894,6 +903,23 @@ impl OidcStateStore {
 }
 
 #[cfg(test)]
+mod auth_hash_capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn password_hash_capacity_fails_fast_and_releases_slots() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(AUTH_HASH_CONCURRENCY));
+        let first = acquire_auth_hash_slot(&slots).unwrap();
+        let second = acquire_auth_hash_slot(&slots).unwrap();
+        assert!(acquire_auth_hash_slot(&slots).is_err());
+
+        drop(first);
+        assert!(acquire_auth_hash_slot(&slots).is_ok());
+        drop(second);
+    }
+}
+
+#[cfg(test)]
 mod auth_attempt_limiter_tests {
     use super::*;
 
@@ -1093,6 +1119,7 @@ pub struct SharedState {
     http_max_body_bytes: u64,
     credentials: Arc<Mutex<CredentialStore>>,
     auth_attempts: Arc<Mutex<AuthAttemptLimiter>>,
+    auth_hash_slots: Arc<tokio::sync::Semaphore>,
     trusted_proxy_cidrs: Vec<ipnet::IpNet>,
     oidc_states: Arc<Mutex<OidcStateStore>>,
     refresh_tokens: RefreshTokenStore,
@@ -2546,6 +2573,7 @@ impl SharedState {
             http_max_body_bytes: config.http_max_body_bytes,
             credentials: Arc::new(Mutex::new(credentials)),
             auth_attempts: Arc::new(Mutex::new(AuthAttemptLimiter::default())),
+            auth_hash_slots: Arc::new(tokio::sync::Semaphore::new(AUTH_HASH_CONCURRENCY)),
             trusted_proxy_cidrs,
             oidc_states: Arc::new(Mutex::new(OidcStateStore::default())),
             refresh_tokens,
@@ -4329,11 +4357,22 @@ async fn dashboard_bootstrap(
         Ok(request) => request,
         Err(error) => return error_response(error),
     };
-    let registered = match state.credentials.lock() {
-        Ok(mut credentials) => {
-            register_dashboard_admin(&mut credentials, request.id, &request.password)
-        }
-        Err(_) => Err(ryme_error::RymeError::Internal(String::from("auth lock"))),
+    let hash_slot = match acquire_auth_hash_slot(&state.auth_hash_slots) {
+        Ok(slot) => slot,
+        Err(error) => return error_response(error),
+    };
+    let credentials = state.credentials.clone();
+    let registered = tokio::task::spawn_blocking(move || {
+        let _hash_slot = hash_slot;
+        let mut credentials = credentials
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
+        register_dashboard_admin(&mut credentials, request.id, &request.password)
+    })
+    .await;
+    let registered = match registered {
+        Ok(result) => result,
+        Err(_) => Err(ryme_error::RymeError::Internal(String::from("task"))),
     };
     match registered {
         Ok(()) => match state.persist_auth() {
@@ -6361,6 +6400,13 @@ async fn auth_register(
     if !principal.can_write() {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    if request.id.is_empty()
+        || request.id.len() > ryme_auth::MAX_USER_LEN
+        || request.password.len() < 8
+        || request.password.len() > ryme_auth::MAX_PASSWORD_LEN
+    {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("credentials")));
+    }
     let tenant = request.tenant.unwrap_or_else(|| principal.tenant.clone());
     if tenant != principal.tenant && !principal.can_platform_admin() {
         return error_response(ryme_error::RymeError::Forbidden);
@@ -6372,8 +6418,13 @@ async fn auth_register(
     if !principal.can_admin() && (roles.contains(&Role::Owner) || roles.contains(&Role::Admin)) {
         return error_response(ryme_error::RymeError::Forbidden);
     }
+    let hash_slot = match acquire_auth_hash_slot(&state.auth_hash_slots) {
+        Ok(slot) => slot,
+        Err(error) => return error_response(error),
+    };
     let credentials = state.credentials.clone();
     let registered = tokio::task::spawn_blocking(move || {
+        let _hash_slot = hash_slot;
         let mut store = match credentials.lock() {
             Ok(store) => store,
             Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
@@ -6402,17 +6453,27 @@ async fn auth_verify(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
-    if request.id.len() > ryme_auth::MAX_USER_LEN {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("id")));
+    if request.id.is_empty()
+        || request.id.len() > ryme_auth::MAX_USER_LEN
+        || request.password.len() > ryme_auth::MAX_PASSWORD_LEN
+    {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("credentials")));
     }
     let attempt_key = format!("password:{}", request.id);
     if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
     }
+    let hash_slot = match acquire_auth_hash_slot(&state.auth_hash_slots) {
+        Ok(slot) => slot,
+        Err(error) => return error_response(error),
+    };
     let credentials = state.credentials.clone();
-    let verified = tokio::task::spawn_blocking(move || match credentials.lock() {
-        Ok(store) => store.verify_password(&request.id, &request.password),
-        Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
+    let verified = tokio::task::spawn_blocking(move || {
+        let _hash_slot = hash_slot;
+        match credentials.lock() {
+            Ok(store) => store.verify_password(&request.id, &request.password),
+            Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
+        }
     })
     .await;
     match verified {
@@ -6496,8 +6557,12 @@ async fn auth_token(
             "refresh_token",
         )));
     }
-    if !refreshing && request.id.len() > ryme_auth::MAX_USER_LEN {
-        return error_response(ryme_error::RymeError::InvalidArgument(String::from("id")));
+    if !refreshing
+        && (request.id.is_empty()
+            || request.id.len() > ryme_auth::MAX_USER_LEN
+            || request.password.len() > ryme_auth::MAX_PASSWORD_LEN)
+    {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("credentials")));
     }
     let attempt_key = if refreshing {
         auth_attempt_key("refresh", request.refresh_token.as_deref().unwrap_or(""))
@@ -6507,11 +6572,20 @@ async fn auth_token(
     if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
     }
+    let hash_slot = if refreshing {
+        None
+    } else {
+        match acquire_auth_hash_slot(&state.auth_hash_slots) {
+            Ok(slot) => Some(slot),
+            Err(error) => return error_response(error),
+        }
+    };
     let credentials = state.credentials.clone();
     let keys = state.keys.clone();
     let refresh_tokens = state.refresh_tokens.clone();
     let now = ryme_txn::now_unix();
     let issued = tokio::task::spawn_blocking(move || {
+        let _hash_slot = hash_slot;
         if request.refresh_token.is_some() || request.grant_type.as_deref() == Some("refresh_token")
         {
             if request.grant_type.as_deref().is_some_and(|grant| grant != "refresh_token") {
