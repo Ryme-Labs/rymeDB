@@ -5488,10 +5488,11 @@ mod rest_compatibility_tests {
         let admin = state.executor.clone().with_role(String::from("postgres")).without_auth_uid();
         for sql in [
             "CREATE TABLE rest_update_rls (id TEXT PRIMARY KEY, owner_id TEXT, visible_to TEXT, payload TEXT)",
-            "GRANT SELECT, INSERT, UPDATE ON TABLE rest_update_rls TO authenticated",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE rest_update_rls TO authenticated",
             "CREATE POLICY rest_read_visible ON rest_update_rls FOR SELECT TO authenticated USING (auth.uid() = visible_to)",
             "CREATE POLICY rest_update_owner ON rest_update_rls FOR UPDATE TO authenticated USING (auth.uid() = owner_id) WITH CHECK (auth.uid() = owner_id)",
             "CREATE POLICY rest_insert_owner ON rest_update_rls FOR INSERT TO authenticated WITH CHECK (auth.uid() = owner_id)",
+            "CREATE POLICY rest_delete_owner ON rest_update_rls FOR DELETE TO authenticated USING (auth.uid() = owner_id)",
             "ALTER TABLE rest_update_rls ENABLE ROW LEVEL SECURITY",
         ] {
             admin.execute(parse(sql).unwrap()).await.unwrap();
@@ -5682,7 +5683,7 @@ mod rest_compatibility_tests {
 
         let allowed_conflict = rest_insert(
             State(state.clone()),
-            headers,
+            headers.clone(),
             Path(String::from("rest_update_rls")),
             axum::extract::RawQuery(Some(String::from("on_conflict=id"))),
             axum::body::Bytes::from_static(
@@ -5702,6 +5703,48 @@ mod rest_compatibility_tests {
                 "payload": "upserted"
             }))
         );
+
+        state
+            .gateway
+            .put(
+                &storage_admin,
+                "rest_update_rls",
+                b"row".to_vec(),
+                br#"{"id":"row","owner_id":"user-b","visible_to":"user-a","payload":"upserted"}"#
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        let denied_delete = rest_delete(
+            State(state.clone()),
+            headers.clone(),
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("id=eq.row"))),
+        )
+        .await;
+        assert_eq!(denied_delete.status(), StatusCode::FORBIDDEN);
+        assert!(state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap().is_some());
+
+        state
+            .gateway
+            .put(
+                &storage_admin,
+                "rest_update_rls",
+                b"row".to_vec(),
+                br#"{"id":"row","owner_id":"user-a","visible_to":"user-a","payload":"upserted"}"#
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        let allowed_delete = rest_delete(
+            State(state.clone()),
+            headers,
+            Path(String::from("rest_update_rls")),
+            axum::extract::RawQuery(Some(String::from("id=eq.row"))),
+        )
+        .await;
+        assert_eq!(allowed_delete.status(), StatusCode::OK);
+        assert!(state.gateway.get(&storage_admin, "rest_update_rls", b"row").unwrap().is_none());
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }
