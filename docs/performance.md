@@ -78,6 +78,13 @@ throughput. This isolates executor/storage work for one fixed query shape; it
 does not measure SQL parsing, concurrent clients, WAL durability, network
 overhead, or establish a cross-database performance claim.
 
+On an AMD Ryzen 5 4500, three sequential release captures with 1,000 rows,
+10,000 operations, one worker, and 42 result rows measured p50 at 84.9–86.7 µs
+and throughput at 11.3k–11.6k queries/s. p99 ranged from 103.6–136.6 µs, so
+tail latency was less stable than the median. These are local in-process
+baselines, not end-to-end database results; see the
+[raw captures](../bench/results/sql-local-indexed-filtered-20261017.json).
+
 To compare tracked single-key reads with read-only and batched reads in both
 storage modes:
 
