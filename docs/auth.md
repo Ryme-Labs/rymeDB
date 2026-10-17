@@ -238,11 +238,10 @@ without a matching policy follows default-deny behavior. Inspect policy
 metadata through `pg_catalog.pg_policies`. Complex policy expressions need a
 manual compatibility review. Supported permissive `auth.uid()` equality
 policies combine with PostgreSQL's OR semantics; configured `rls_tables`
-tenant restrictions remain an additional mandatory filter. Unsupported
-composite policy expressions are rejected instead of being approximated.
-Policies scoped with `TO role` or declared `AS RESTRICTIVE` are also rejected
-until those semantics are supported; use the default permissive mode or
-`TO PUBLIC` for currently supported policies.
+tenant restrictions remain an additional mandatory filter. Policies scoped
+with `TO role` are supported and apply only to that effective request role.
+Unsupported composite policy expressions and `AS RESTRICTIVE` policies are
+rejected instead of being approximated; use the default permissive mode.
 
 SQL schema, role, and privilege changes operate on the shared database
 catalog and require a platform `superuser` credential. Tenant
