@@ -646,6 +646,7 @@ const AUTH_LIMITER_MAX_IDENTITIES: usize = 8192;
 const MAX_FORWARDED_FOR_HOPS: usize = 32;
 const OIDC_STATE_TTL_SECS: u64 = 600;
 const OIDC_STATE_MAX_PENDING: usize = 8192;
+const OIDC_STATE_MAX_LEN: usize = 256;
 
 #[derive(Debug, Default)]
 struct AuthAttemptWindow {
@@ -850,7 +851,11 @@ struct OidcPendingState {
 
 impl OidcStateStore {
     fn issue(&mut self, state: String, nonce: String, now: u64) -> ryme_error::Result<()> {
-        if state.is_empty() || nonce.is_empty() {
+        if state.is_empty()
+            || state.len() > OIDC_STATE_MAX_LEN
+            || nonce.is_empty()
+            || nonce.len() > OIDC_STATE_MAX_LEN
+        {
             return Err(ryme_error::RymeError::InvalidArgument(String::from("oidc state")));
         }
         self.prune(now);
@@ -1006,6 +1011,18 @@ mod oidc_state_tests {
         states.issue(String::from("expired"), String::from("nonce"), 100).unwrap();
         assert!(states.nonce_for("expired", 100 + OIDC_STATE_TTL_SECS).is_none());
         assert!(states.consume("expired", 100 + OIDC_STATE_TTL_SECS).is_err());
+    }
+
+    #[test]
+    fn oidc_state_and_nonce_lengths_are_bounded() {
+        let mut states = OidcStateStore::default();
+        assert!(states.issue("s".repeat(OIDC_STATE_MAX_LEN), String::from("nonce"), 100).is_ok());
+        assert!(states
+            .issue("s".repeat(OIDC_STATE_MAX_LEN + 1), String::from("nonce"), 100)
+            .is_err());
+        assert!(states
+            .issue(String::from("state"), "n".repeat(OIDC_STATE_MAX_LEN + 1), 100)
+            .is_err());
     }
 }
 
@@ -6676,6 +6693,9 @@ async fn otp_verify(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    if request.id.is_empty() || request.id.len() > ryme_auth::MAX_USER_LEN {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("id")));
+    }
     let attempt_key = format!("otp:{}", request.id);
     if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
@@ -6783,6 +6803,9 @@ async fn passkey_verify(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    if request.user.is_empty() || request.user.len() > ryme_auth::MAX_USER_LEN {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
+    }
     let attempt_key = format!("passkey:{}", request.user);
     if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
@@ -6934,6 +6957,9 @@ async fn oidc_token(
         Ok(request) => request,
         Err(e) => return error_response(e),
     };
+    if request.state.is_empty() || request.state.len() > OIDC_STATE_MAX_LEN {
+        return error_response(ryme_error::RymeError::InvalidArgument(String::from("oidc state")));
+    }
     let attempt_key = auth_attempt_key("oidc", &request.state);
     if let Err(error) = admit_auth_attempt(&state, &attempt_key, client_ip.address) {
         return error_response(error);
