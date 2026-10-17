@@ -7564,6 +7564,39 @@ struct IndexState {
     valid: bool,
 }
 
+fn intersect_index_candidates<'a>(
+    mut candidates: Vec<&'a Vec<u8>>,
+    other: &BTreeSet<Vec<u8>>,
+) -> Vec<&'a Vec<u8>> {
+    let lookup_depth = usize::BITS.saturating_sub(other.len().max(1).leading_zeros());
+    let lookup_work = candidates.len().saturating_mul(lookup_depth as usize);
+    let merge_work = candidates.len().saturating_add(other.len());
+    if merge_work <= lookup_work {
+        let mut left = candidates.into_iter().peekable();
+        let mut right = other.iter().peekable();
+        let mut intersection = Vec::with_capacity(left.len().min(right.len()));
+        while let (Some(candidate), Some(indexed)) = (left.peek().copied(), right.peek().copied()) {
+            match candidate.as_slice().cmp(indexed.as_slice()) {
+                std::cmp::Ordering::Less => {
+                    left.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    right.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    intersection.push(candidate);
+                    left.next();
+                    right.next();
+                }
+            }
+        }
+        intersection
+    } else {
+        candidates.retain(|pk| other.contains(*pk));
+        candidates
+    }
+}
+
 struct PendingIndexCommit(Arc<RwLock<HashMap<String, usize>>>, Vec<String>);
 
 impl Drop for PendingIndexCommit {
@@ -10895,18 +10928,14 @@ where
         if matching_indexes.len() == 1 {
             return Ok(Some(smallest.iter().cloned().collect()));
         }
-        Ok(Some(
-            smallest
-                .iter()
-                .filter(|pk| {
-                    matching_indexes
-                        .iter()
-                        .enumerate()
-                        .all(|(index, pks)| index == smallest_index || pks.contains(*pk))
-                })
-                .cloned()
-                .collect(),
-        ))
+        let mut candidates: Vec<_> = smallest.iter().collect();
+        for (index, other) in matching_indexes.iter().enumerate() {
+            if index == smallest_index || candidates.is_empty() {
+                continue;
+            }
+            candidates = intersect_index_candidates(candidates, other);
+        }
+        Ok(Some(candidates.into_iter().cloned().collect()))
     }
 
     fn indexed_candidates_for_value(
@@ -20097,6 +20126,25 @@ mod tests {
             executor.indexed_candidates("docs", &filter, read_ts).unwrap(),
             Some(vec![b"a".to_vec()])
         );
+    }
+
+    #[test]
+    fn index_candidate_intersection_handles_dense_and_skewed_sets() {
+        let dense_left: BTreeSet<Vec<u8>> =
+            (0..80).map(|key| format!("key-{key:03}").into_bytes()).collect();
+        let dense_right: BTreeSet<Vec<u8>> =
+            (40..120).map(|key| format!("key-{key:03}").into_bytes()).collect();
+        let dense = intersect_index_candidates(dense_left.iter().collect(), &dense_right);
+        assert_eq!(
+            dense.into_iter().cloned().collect::<Vec<_>>(),
+            (40..80).map(|key| format!("key-{key:03}").into_bytes()).collect::<Vec<_>>()
+        );
+
+        let skewed_left = BTreeSet::from([b"key-050".to_vec()]);
+        let skewed_right: BTreeSet<Vec<u8>> =
+            (0..1000).map(|key| format!("key-{key:03}").into_bytes()).collect();
+        let skewed = intersect_index_candidates(skewed_left.iter().collect(), &skewed_right);
+        assert_eq!(skewed.into_iter().cloned().collect::<Vec<_>>(), vec![b"key-050".to_vec()]);
     }
 
     #[tokio::test]
