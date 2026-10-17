@@ -45,6 +45,7 @@ struct RpcFrameBuffer<'a> {
     exhausted_budget: bool,
     budget: &'a Semaphore,
     permits: Vec<tokio::sync::SemaphorePermit<'a>>,
+    reserved_units: usize,
 }
 
 struct BudgetedRpc<'a> {
@@ -60,6 +61,7 @@ impl<'a> RpcFrameBuffer<'a> {
             exhausted_budget: false,
             budget,
             permits: Vec::new(),
+            reserved_units: 0,
         }
     }
 }
@@ -77,21 +79,28 @@ impl std::io::Write for RpcFrameBuffer<'_> {
         if required > self.bytes.capacity() {
             let doubled = self.bytes.capacity().saturating_mul(2).max(8 * 1024);
             let capacity = required.max(doubled).min(MAX_RPC_FRAME_BYTES);
-            let permits = capacity
-                .div_ceil(RPC_FRAME_BUDGET_UNIT_BYTES)
-                .saturating_mul(RPC_FRAME_DECODE_WEIGHT);
-            let permit = match self.budget.try_acquire_many(permits as u32) {
-                Ok(permit) => permit,
-                Err(_) => {
-                    self.exhausted_budget = true;
-                    return Err(std::io::Error::other("rpc frame budget"));
+            let reserved_units = capacity.div_ceil(RPC_FRAME_BUDGET_UNIT_BYTES);
+            let additional_units = reserved_units.saturating_sub(self.reserved_units);
+            let permit = if additional_units == 0 {
+                None
+            } else {
+                match self.budget.try_acquire_many(
+                    additional_units.saturating_mul(RPC_FRAME_DECODE_WEIGHT) as u32,
+                ) {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        self.exhausted_budget = true;
+                        return Err(std::io::Error::other("rpc frame budget"));
+                    }
                 }
             };
             self.bytes
                 .try_reserve_exact(capacity.saturating_sub(self.bytes.len()))
                 .map_err(std::io::Error::other)?;
-            self.permits.clear();
-            self.permits.push(permit);
+            if let Some(permit) = permit {
+                self.permits.push(permit);
+            }
+            self.reserved_units = reserved_units;
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -6315,6 +6324,18 @@ mod tests {
         assert!(serde_json::to_writer(&mut frame, &rpc).is_err());
         assert!(frame.exhausted_budget);
         assert!(frame.bytes.is_empty());
+    }
+
+    #[test]
+    fn rpc_frame_writer_growth_reserves_only_new_budget_units() {
+        let budget = Semaphore::new(RPC_FRAME_DECODE_WEIGHT);
+        let mut frame = RpcFrameBuffer::new(&budget);
+        std::io::Write::write_all(&mut frame, &vec![0; 8 * 1024]).unwrap();
+        std::io::Write::write_all(&mut frame, b"x").unwrap();
+
+        assert_eq!(frame.bytes.len(), 8 * 1024 + 1);
+        assert!(!frame.exhausted_budget);
+        assert_eq!(budget.available_permits(), 0);
     }
 
     #[tokio::test]
