@@ -1234,23 +1234,39 @@ struct NamedApiKey {
 
 const AUTH_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const KEYRING_MAX_BYTES: usize = 64 * 1024 * 1024;
+const BRANCH_PROMOTION_JOURNAL_MAX_BYTES: usize = 768 * 1024 * 1024;
 
-fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot> {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > AUTH_SNAPSHOT_MAX_BYTES as u64 {
-            return Err(ryme_error::RymeError::Overload(String::from("auth snapshot")));
-        }
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AuthSnapshot::default())
-        }
+fn read_bounded_state_file(
+    path: &std::path::Path,
+    max_bytes: usize,
+    label: &str,
+) -> ryme_error::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if bytes.len() > AUTH_SNAPSHOT_MAX_BYTES {
-        return Err(ryme_error::RymeError::Overload(String::from("auth snapshot")));
+    let file_len = file.metadata()?.len();
+    if file_len > max_bytes as u64 {
+        return Err(ryme_error::RymeError::Overload(String::from(label)));
     }
+    let capacity = usize::try_from(file_len)
+        .map_err(|_| ryme_error::RymeError::Overload(String::from(label)))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((max_bytes as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(ryme_error::RymeError::Overload(String::from(label)));
+    }
+    Ok(Some(bytes))
+}
+
+fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot> {
+    let Some(bytes) = read_bounded_state_file(path, AUTH_SNAPSHOT_MAX_BYTES, "auth snapshot")?
+    else {
+        return Ok(AuthSnapshot::default());
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1334,19 +1350,11 @@ const BRANCH_METADATA_JOURNAL_MAX_BYTES: usize = 128 * 1024 * 1024;
 fn load_durable_snapshot(
     path: &std::path::Path,
 ) -> ryme_error::Result<Vec<ryme_realtime::DurableTopicSnapshot>> {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > DURABLE_SNAPSHOT_MAX_BYTES as u64 {
-            return Err(ryme_error::RymeError::Overload(String::from("durable snapshot")));
-        }
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
+    let Some(bytes) =
+        read_bounded_state_file(path, DURABLE_SNAPSHOT_MAX_BYTES, "durable snapshot")?
+    else {
+        return Ok(Vec::new());
     };
-    if bytes.len() > DURABLE_SNAPSHOT_MAX_BYTES {
-        return Err(ryme_error::RymeError::Overload(String::from("durable snapshot")));
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1361,21 +1369,11 @@ fn load_durable_snapshot(
 }
 
 fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::SchemaSnapshot> {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > ryme_sql::MAX_SCHEMA_SNAPSHOT_BYTES as u64 {
-            return Err(ryme_error::RymeError::Overload(String::from("schema snapshot")));
-        }
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ryme_sql::SchemaSnapshot::default())
-        }
-        Err(error) => return Err(error.into()),
+    let Some(bytes) =
+        read_bounded_state_file(path, ryme_sql::MAX_SCHEMA_SNAPSHOT_BYTES, "schema snapshot")?
+    else {
+        return Ok(ryme_sql::SchemaSnapshot::default());
     };
-    if bytes.len() > ryme_sql::MAX_SCHEMA_SNAPSHOT_BYTES {
-        return Err(ryme_error::RymeError::Overload(String::from("schema snapshot")));
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1444,21 +1442,11 @@ fn validate_listener_auth(
 }
 
 fn load_control_snapshot(path: &std::path::Path) -> ryme_error::Result<ControlSnapshot> {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > CONTROL_SNAPSHOT_MAX_BYTES as u64 {
-            return Err(ryme_error::RymeError::Overload(String::from("control snapshot")));
-        }
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ControlSnapshot::default())
-        }
-        Err(error) => return Err(error.into()),
+    let Some(bytes) =
+        read_bounded_state_file(path, CONTROL_SNAPSHOT_MAX_BYTES, "control snapshot")?
+    else {
+        return Ok(ControlSnapshot::default());
     };
-    if bytes.len() > CONTROL_SNAPSHOT_MAX_BYTES {
-        return Err(ryme_error::RymeError::Overload(String::from("control snapshot")));
-    }
     let snapshot: ControlSnapshot = serde_json::from_slice(&bytes)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("control snapshot: {error}")))?;
     snapshot
@@ -1988,6 +1976,9 @@ impl SharedState {
         let bytes = serde_json::to_vec(journal).map_err(|error| {
             ryme_error::RymeError::Internal(format!("branch promotion journal: {error}"))
         })?;
+        if bytes.len() > BRANCH_PROMOTION_JOURNAL_MAX_BYTES {
+            return Err(ryme_error::RymeError::Overload(String::from("branch promotion journal")));
+        }
         if let Some(parent) = self.promotion_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -2043,14 +2034,13 @@ impl SharedState {
     }
 
     fn load_branch_metadata_journal(&self) -> ryme_error::Result<Option<BranchMetadataJournal>> {
-        let bytes = match std::fs::read(&self.branch_metadata_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(bytes) = read_bounded_state_file(
+            &self.branch_metadata_path,
+            BRANCH_METADATA_JOURNAL_MAX_BYTES,
+            "branch metadata journal",
+        )? else {
+            return Ok(None);
         };
-        if bytes.len() > BRANCH_METADATA_JOURNAL_MAX_BYTES {
-            return Err(ryme_error::RymeError::Overload(String::from("branch metadata journal")));
-        }
         let journal = serde_json::from_slice(&bytes).map_err(|error| {
             ryme_error::RymeError::Corrupt(format!("branch metadata journal: {error}"))
         })?;
@@ -2166,10 +2156,12 @@ impl SharedState {
     }
 
     fn load_branch_promotion_journal(&self) -> ryme_error::Result<Option<BranchPromotionJournal>> {
-        let bytes = match std::fs::read(&self.promotion_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(bytes) = read_bounded_state_file(
+            &self.promotion_path,
+            BRANCH_PROMOTION_JOURNAL_MAX_BYTES,
+            "branch promotion journal",
+        )? else {
+            return Ok(None);
         };
         let journal = serde_json::from_slice(&bytes).map_err(|error| {
             ryme_error::RymeError::Corrupt(format!("branch promotion journal: {error}"))
@@ -15435,6 +15427,22 @@ mod realtime_policy_tests {
         };
         assert!(can_manage_user_for_tenant(&admin, "alice", Some("tenant-a")));
         assert!(!can_manage_user_for_tenant(&admin, "alice", Some("tenant-b")));
+    }
+
+    #[test]
+    fn bounded_state_file_rejects_oversized_input() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-bounded-state-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, b"12345").unwrap();
+
+        assert!(matches!(
+            read_bounded_state_file(&path, 4, "test state file"),
+            Err(ryme_error::RymeError::Overload(message)) if message == "test state file"
+        ));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
