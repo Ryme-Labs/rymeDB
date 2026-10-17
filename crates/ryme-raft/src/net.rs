@@ -33,6 +33,38 @@ static RPC_FRAME_BUDGET: LazyLock<Semaphore> =
 
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
 
+#[derive(Default)]
+struct RpcFrameBuffer {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+impl std::io::Write for RpcFrameBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(required) = self.bytes.len().checked_add(bytes.len()) else {
+            self.exceeded_limit = true;
+            return Err(std::io::Error::other("rpc frame limit"));
+        };
+        if required > MAX_RPC_FRAME_BYTES {
+            self.exceeded_limit = true;
+            return Err(std::io::Error::other("rpc frame limit"));
+        }
+        if required > self.bytes.capacity() {
+            let doubled = self.bytes.capacity().saturating_mul(2).max(8 * 1024);
+            let capacity = required.max(doubled).min(MAX_RPC_FRAME_BYTES);
+            self.bytes
+                .try_reserve_exact(capacity.saturating_sub(self.bytes.len()))
+                .map_err(std::io::Error::other)?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Rpc {
     VoteRequest {
@@ -522,8 +554,15 @@ async fn write_frame<S>(socket: &mut S, rpc: &Rpc) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
-    let body = serde_json::to_vec(rpc).map_err(|e| RymeError::Internal(e.to_string()))?;
-    if body.len() > MAX_RPC_FRAME_BYTES {
+    let mut frame = RpcFrameBuffer::default();
+    if let Err(error) = serde_json::to_writer(&mut frame, rpc) {
+        if frame.exceeded_limit {
+            return Err(RymeError::Overload(String::from("rpc frame")));
+        }
+        return Err(RymeError::Internal(error.to_string()));
+    }
+    let body = frame.bytes;
+    if body.is_empty() {
         return Err(RymeError::Overload(String::from("rpc frame")));
     }
     socket
@@ -6205,6 +6244,15 @@ impl ResetFlag for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_frame_writer_stops_at_the_serialized_size_limit() {
+        let rpc = Rpc::Realtime { payload: vec![u8::MAX; 5 * 1024 * 1024] };
+        let mut frame = RpcFrameBuffer::default();
+        assert!(serde_json::to_writer(&mut frame, &rpc).is_err());
+        assert!(frame.exceeded_limit);
+        assert!(frame.bytes.len() <= MAX_RPC_FRAME_BYTES);
+    }
 
     #[tokio::test]
     async fn rpc_frame_reader_waits_for_decode_budget_before_allocating_body() {
