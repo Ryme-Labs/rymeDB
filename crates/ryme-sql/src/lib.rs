@@ -2,6 +2,7 @@ use ryme_error::{Result, RymeError};
 use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_storage::RecordKey;
 use ryme_txn::{Isolation, Transaction, TxnBackend, TxnManager};
+use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1044,6 +1045,8 @@ struct RlsPolicyMaps {
     uid_write: HashMap<String, Vec<String>>,
 }
 
+type RlsRoleMapCache = Arc<RwLock<HashMap<String, (u64, Arc<RlsPolicyMaps>)>>>;
+
 fn default_rls_policy_command() -> String {
     String::from("ALL")
 }
@@ -1399,6 +1402,66 @@ enum ProjectionSource {
     Key,
     RawValue,
     Json(String),
+}
+
+struct ProjectedJsonObjectSeed<'a> {
+    projection: &'a [ProjectionSource],
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ProjectedJsonObjectSeed<'_> {
+    type Value = serde_json::Map<String, serde_json::Value>;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ProjectedJsonObjectVisitor { projection: self.projection })
+    }
+}
+
+struct ProjectedJsonObjectVisitor<'a> {
+    projection: &'a [ProjectionSource],
+}
+
+impl<'de> serde::de::Visitor<'de> for ProjectedJsonObjectVisitor<'_> {
+    type Value = serde_json::Map<String, serde_json::Value>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut selected = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let needed = self.projection.iter().any(|source| {
+                let ProjectionSource::Json(column) = source else { return false };
+                if let Some((root, _)) = column.split_once("->") {
+                    key == root.trim()
+                } else {
+                    key.eq_ignore_ascii_case(column)
+                }
+            });
+            if needed {
+                selected.insert(key, map.next_value()?);
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(selected)
+    }
+}
+
+fn projected_json_object(
+    value: &[u8],
+    projection: &[ProjectionSource],
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut deserializer = serde_json::Deserializer::from_slice(value);
+    let selected = ProjectedJsonObjectSeed { projection }.deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    Some(selected)
 }
 
 // Queries that need a complete row set (aggregates, joins, grouped queries and
@@ -7518,7 +7581,7 @@ pub struct Executor<B = TxnManager> {
     pending_index_commits: Arc<RwLock<HashMap<String, usize>>>,
     rls_maps: Arc<RwLock<RlsPolicyMaps>>,
     rls_policy_version: Arc<AtomicU64>,
-    rls_role_maps: Arc<RwLock<HashMap<String, (u64, Arc<RlsPolicyMaps>)>>>,
+    rls_role_maps: RlsRoleMapCache,
     rls_enabled: Arc<RwLock<HashSet<String>>>,
     rls_forced: Arc<RwLock<HashSet<String>>>,
     platform_rls_tables: Arc<RwLock<HashSet<String>>>,
@@ -10664,8 +10727,7 @@ where
         value: &[u8],
     ) -> Vec<Vec<u8>> {
         let composite_parts = (primary_keys.len() > 1).then(|| decode_key_parts(pk)).flatten();
-        let object =
-            needs_json.then(|| serde_json::from_slice::<serde_json::Value>(value).ok()).flatten();
+        let object = needs_json.then(|| projected_json_object(value, projection)).flatten();
         projection
             .iter()
             .map(|source| match source {
@@ -10676,7 +10738,7 @@ where
                 ProjectionSource::Key => pk.to_vec(),
                 ProjectionSource::RawValue => value.to_vec(),
                 ProjectionSource::Json(column) => {
-                    let Some(serde_json::Value::Object(object)) = object.as_ref() else {
+                    let Some(object) = object.as_ref() else {
                         return value.to_vec();
                     };
                     if let Some((projected, text_result)) = json_projection_value(column, object) {
@@ -16277,6 +16339,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_projection_parses_only_selected_roots_and_keeps_projection_semantics() {
+        let projection = vec![
+            ProjectionSource::Json(String::from("payload->'meta'->>'role'")),
+            ProjectionSource::Json(String::from("STATE")),
+            ProjectionSource::Json(String::from("field name")),
+        ];
+        let value = br#"{"discard":{"nested":[1,2,3]},"payload":{"meta":{"role":"first"}},"payload":{"meta":{"role":"admin"}},"state":"ready","field\u0020name":"escaped"}"#;
+        let selected = projected_json_object(value, &projection).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert!(!selected.contains_key("discard"));
+
+        let row = Executor::<TxnManager>::project_row(&[], &projection, true, b"pk", value);
+        assert_eq!(row, vec![b"admin".to_vec(), b"ready".to_vec(), b"escaped".to_vec()]);
+        assert_eq!(
+            Executor::<TxnManager>::project_row(&[], &projection, true, b"pk", b"not-json"),
+            vec![b"not-json".to_vec(); projection.len()]
+        );
+        assert!(projected_json_object(b"[]", &projection).is_none());
+    }
 
     #[test]
     fn sql_parser_bounds_bytes_tokens_and_recursive_nesting() {
