@@ -17,6 +17,8 @@ const MIN_BLOOM_BYTES: usize = 64;
 const MAX_DELTA_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SEGMENT_POINTER_BYTES: usize = 64;
+const DELTA_COMPACTION_MARKER_BYTES: usize = 4 + 2 + 8 + 8 + 8 + 4;
 static NEXT_SEGMENT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
@@ -797,7 +799,12 @@ impl SegmentStore {
     }
 
     fn latest_snapshot_id(&self) -> Option<u64> {
-        let raw = std::fs::read(self.dir.join("latest")).ok()?;
+        let raw = read_bounded_metadata_file(
+            &self.dir.join("latest"),
+            MAX_SEGMENT_POINTER_BYTES,
+            "segment pointer",
+        )
+        .ok()??;
         let name = std::str::from_utf8(&raw).ok()?.trim();
         let id = parse_segment_name(name)?;
         let path = self.dir.join(name);
@@ -908,7 +915,9 @@ impl SegmentStore {
 
     pub fn latest_path(&self) -> Result<Option<PathBuf>> {
         let pointer = self.dir.join("latest");
-        let pointed = if let Ok(raw) = std::fs::read(&pointer) {
+        let pointed = if let Some(raw) =
+            read_bounded_metadata_file(&pointer, MAX_SEGMENT_POINTER_BYTES, "segment pointer")?
+        {
             let name = String::from_utf8(raw)
                 .map_err(|_| RymeError::Corrupt(String::from("segment pointer")))?;
             let name = name.trim();
@@ -1154,23 +1163,39 @@ impl SegmentStore {
 }
 
 fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > MAX_SEGMENT_BYTES as u64 {
-            return Err(RymeError::Overload(String::from("segment")));
-        }
+    read_bounded_metadata_file(path, MAX_SEGMENT_BYTES, "segment")?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "segment file missing").into()
+    })
+}
+
+fn read_bounded_metadata_file(
+    path: &Path,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let file_len = file.metadata()?.len();
+    if file_len > max_bytes as u64 {
+        return Err(RymeError::Overload(String::from(label)));
     }
-    let bytes = std::fs::read(path)?;
-    if bytes.len() > MAX_SEGMENT_BYTES {
-        return Err(RymeError::Overload(String::from("segment")));
+    let capacity = usize::try_from(file_len).map_err(|_| RymeError::Overload(label.to_string()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((max_bytes as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(RymeError::Overload(String::from(label)));
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
     const V1_HEADER: u64 = 4 + 2 + 2 + 8 + 4;
     const V2_HEADER: u64 = V1_HEADER + 8;
-    let file_len = std::fs::metadata(path)?.len();
     let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut prefix = [0; 16];
     file.read_exact(&mut prefix)?;
     let mut cursor = &prefix[..];
@@ -1196,7 +1221,8 @@ fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
 
 fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
     const V2_HEADER: usize = 4 + 2 + 2 + 8 + 8 + 4;
-    let file_len = std::fs::metadata(path)?.len();
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
     if file_len > MAX_SEGMENT_BYTES as u64 {
         return Err(RymeError::Overload(String::from("segment")));
     }
@@ -1204,7 +1230,6 @@ fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
         return Err(RymeError::Corrupt(String::from("segment header")));
     }
 
-    let mut file = std::fs::File::open(path)?;
     let mut prefix = [0; 6];
     file.read_exact(&mut prefix)?;
     let version = u16::from_be_bytes([prefix[4], prefix[5]]);
@@ -1258,13 +1283,15 @@ fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
 
 fn read_delta_compaction_marker(dir: &Path) -> Result<Option<DeltaCompactionMarker>> {
     let path = dir.join("delta-compaction");
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(bytes) = read_bounded_metadata_file(
+        &path,
+        DELTA_COMPACTION_MARKER_BYTES,
+        "delta compaction marker",
+    )?
+    else {
+        return Ok(None);
     };
-    const MARKER_LEN: usize = 4 + 2 + 8 + 8 + 8 + 4;
-    if bytes.len() != MARKER_LEN {
+    if bytes.len() != DELTA_COMPACTION_MARKER_BYTES {
         return Err(RymeError::Corrupt(String::from("delta compaction marker")));
     }
     let checksum_offset = bytes.len() - 4;
@@ -1295,7 +1322,7 @@ fn read_delta_compaction_marker(dir: &Path) -> Result<Option<DeltaCompactionMark
 }
 
 fn publish_delta_compaction_marker(dir: &Path, marker: DeltaCompactionMarker) -> Result<()> {
-    let mut bytes = Vec::with_capacity(4 + 2 + 8 + 8 + 8 + 4);
+    let mut bytes = Vec::with_capacity(DELTA_COMPACTION_MARKER_BYTES);
     bytes.extend_from_slice(&DELTA_COMPACTION_MAGIC.to_be_bytes());
     bytes.extend_from_slice(&DELTA_COMPACTION_VERSION.to_be_bytes());
     bytes.extend_from_slice(&marker.snapshot_id.to_be_bytes());
@@ -1317,7 +1344,12 @@ fn publish_delta_compaction_marker(dir: &Path, marker: DeltaCompactionMarker) ->
 }
 
 fn latest_snapshot_id_in_dir(dir: &Path) -> Option<u64> {
-    let raw = std::fs::read(dir.join("latest")).ok()?;
+    let raw = read_bounded_metadata_file(
+        &dir.join("latest"),
+        MAX_SEGMENT_POINTER_BYTES,
+        "segment pointer",
+    )
+    .ok()??;
     let name = std::str::from_utf8(&raw).ok()?.trim();
     let id = parse_segment_name(name)?;
     let path = dir.join(name);
@@ -1809,6 +1841,43 @@ mod tests {
         assert!(
             matches!(store.latest(), Err(RymeError::Corrupt(message)) if message == "segment pointer")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_store_rejects_oversized_latest_pointer() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-pointer-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let pointer = std::fs::File::create(dir.join("latest")).unwrap();
+        pointer.set_len((MAX_SEGMENT_POINTER_BYTES + 1) as u64).unwrap();
+
+        assert!(matches!(
+            store.latest(),
+            Err(RymeError::Overload(message)) if message == "segment pointer"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delta_compaction_marker_rejects_oversized_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-delta-marker-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let marker = std::fs::File::create(dir.join("delta-compaction")).unwrap();
+        marker.set_len((DELTA_COMPACTION_MARKER_BYTES + 1) as u64).unwrap();
+
+        assert!(matches!(
+            read_delta_compaction_marker(&dir),
+            Err(RymeError::Overload(message)) if message == "delta compaction marker"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
