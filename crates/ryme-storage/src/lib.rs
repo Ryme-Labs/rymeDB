@@ -323,13 +323,17 @@ impl Engine {
         }
         let first = keys[0].record_key();
         let last = keys[keys.len() - 1].record_key();
-        let same_table = keys.iter().all(|key| {
+        let mut previous = first;
+        for key in &keys[1..] {
             let key = key.record_key();
-            key.tenant == first.tenant && key.database == first.database && key.table == first.table
-        });
-        let sorted_unique = keys.windows(2).all(|pair| pair[0].record_key() < pair[1].record_key());
-        if !same_table || !sorted_unique {
-            return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
+            if key.tenant != first.tenant
+                || key.database != first.database
+                || key.table != first.table
+                || previous >= key
+            {
+                return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
+            }
+            previous = key;
         }
 
         let mut entries =
@@ -1132,10 +1136,20 @@ mod tests {
             .chain(90..106)
             .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
             .collect::<Vec<_>>();
+        let mut unsorted = dense.clone();
+        unsorted.swap(0, 1);
+        let cross_table = (0u64..32)
+            .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
+            .chain((32u64..64).map(|id| RecordKey::new("t", "d", "other", &id.to_be_bytes())))
+            .collect::<Vec<_>>();
 
-        for (keys, read_ts, now) in
-            [(&dense[..], 10, 0), (&dense[..], 20, 50), (&sparse[..], 20, 0)]
-        {
+        for (keys, read_ts, now) in [
+            (&dense[..], 10, 0),
+            (&dense[..], 20, 50),
+            (&sparse[..], 20, 0),
+            (&unsorted[..], 20, 0),
+            (&cross_table[..], 20, 0),
+        ] {
             let expected =
                 keys.iter().map(|key| engine.read(key, read_ts, now).unwrap()).collect::<Vec<_>>();
             assert_eq!(engine.read_many(keys, read_ts, now).unwrap(), expected);
