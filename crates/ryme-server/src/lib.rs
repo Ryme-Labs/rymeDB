@@ -23,7 +23,7 @@ use ryme_raft::net::{ClusterBackend, Node, RangeOwner};
 use ryme_realtime::Realtime;
 use ryme_router::Range;
 use ryme_shard::{HybridBackend, ShardSet, TableRef};
-use ryme_sql::{bind, parse, Executor, QueryResult, Statement};
+use ryme_sql::{bind, parse, Executor, QueryResult, RlsCommand, Statement};
 use ryme_txn::{DurableManager, SyncPolicy, TxnBackend, TxnManager};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -5656,7 +5656,7 @@ async fn rest_insert(
                 }
             }
         }
-        if !executor.row_allowed_for_write(&table, &value) {
+        if !executor.row_allowed_for_command(&table, &value, RlsCommand::Insert) {
             return error_response(ryme_error::RymeError::Forbidden);
         }
         if !return_minimal && !executor.row_allowed_by_rls(&table, &value) {
@@ -5758,7 +5758,7 @@ async fn rest_upsert(
             Ok(value) => value,
             Err(e) => return error_response(ryme_error::RymeError::InvalidArgument(e.to_string())),
         };
-        if !executor.row_allowed_for_write(&table, &value) {
+        if !executor.row_allowed_for_command(&table, &value, RlsCommand::Update) {
             return error_response(ryme_error::RymeError::Forbidden);
         }
         if !return_minimal && !executor.row_allowed_by_rls(&table, &value) {
@@ -5836,7 +5836,7 @@ async fn rest_delete(
             }
             Err(e) => return error_response(e),
         };
-        if !executor.row_allowed_for_write(&table, &current) {
+        if !executor.row_allowed_for_command(&table, &current, RlsCommand::Delete) {
             return error_response(ryme_error::RymeError::Forbidden);
         }
         if let Err(e) = admit_write(&state, &principal.tenant, key.len() as u64) {

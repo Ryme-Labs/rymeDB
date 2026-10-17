@@ -1101,9 +1101,24 @@ pub struct RlsPolicy {
 #[derive(Debug, Clone, Default)]
 struct RlsPolicyMaps {
     tenant_read: HashMap<String, String>,
-    tenant_write: HashMap<String, String>,
     uid_read: HashMap<String, Vec<String>>,
+    tenant_write: HashMap<String, String>,
     uid_write: HashMap<String, Vec<String>>,
+    tenant_insert: HashMap<String, String>,
+    uid_insert: HashMap<String, Vec<String>>,
+    tenant_update: HashMap<String, String>,
+    uid_update: HashMap<String, Vec<String>>,
+    tenant_delete: HashMap<String, String>,
+    uid_delete: HashMap<String, Vec<String>>,
+}
+
+/// SQL command whose row-level security policy should be evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RlsCommand {
+    Select,
+    Insert,
+    Update,
+    Delete,
 }
 
 type RlsRoleMapCache = Arc<RwLock<HashMap<String, (u64, Arc<RlsPolicyMaps>)>>>;
@@ -1394,18 +1409,41 @@ fn rls_policy_maps_for_role<'a>(
             continue;
         }
         let is_uid_policy = policy_uses_auth_uid(policy) || policy.column.is_empty();
-        if policy.read {
-            if is_uid_policy {
-                merge_uid_rls_policy_column(&mut maps.uid_read, &policy.table, &policy.column);
-            } else {
-                merge_rls_policy_column(&mut maps.tenant_read, &policy.table, &policy.column);
-            }
-        }
         if policy.write {
             if is_uid_policy {
                 merge_uid_rls_policy_column(&mut maps.uid_write, &policy.table, &policy.column);
             } else {
                 merge_rls_policy_column(&mut maps.tenant_write, &policy.table, &policy.column);
+            }
+        }
+        let mut commands = Vec::with_capacity(4);
+        match policy.command.to_ascii_uppercase().as_str() {
+            "SELECT" if policy.read => commands.push(RlsCommand::Select),
+            "INSERT" if policy.write => commands.push(RlsCommand::Insert),
+            "UPDATE" if policy.write => commands.push(RlsCommand::Update),
+            "DELETE" if policy.write => commands.push(RlsCommand::Delete),
+            "ALL" => {
+                if policy.read {
+                    commands.push(RlsCommand::Select);
+                }
+                if policy.write {
+                    commands.extend([RlsCommand::Insert, RlsCommand::Update, RlsCommand::Delete]);
+                }
+            }
+            "SELECT" | "INSERT" | "UPDATE" | "DELETE" => {}
+            _ => continue,
+        }
+        for command in commands {
+            let (tenant_map, uid_map) = match command {
+                RlsCommand::Select => (&mut maps.tenant_read, &mut maps.uid_read),
+                RlsCommand::Insert => (&mut maps.tenant_insert, &mut maps.uid_insert),
+                RlsCommand::Update => (&mut maps.tenant_update, &mut maps.uid_update),
+                RlsCommand::Delete => (&mut maps.tenant_delete, &mut maps.uid_delete),
+            };
+            if is_uid_policy {
+                merge_uid_rls_policy_column(uid_map, &policy.table, &policy.column);
+            } else {
+                merge_rls_policy_column(tenant_map, &policy.table, &policy.column);
             }
         }
     }
@@ -7949,7 +7987,10 @@ where
         let table_names: HashSet<String> = rls_tables.keys().cloned().collect();
         self.rls_maps = Arc::new(RwLock::new(RlsPolicyMaps {
             tenant_read: rls_tables.clone(),
-            tenant_write: rls_tables,
+            tenant_write: rls_tables.clone(),
+            tenant_insert: rls_tables.clone(),
+            tenant_update: rls_tables.clone(),
+            tenant_delete: rls_tables,
             ..RlsPolicyMaps::default()
         }));
         self.rls_enabled = Arc::new(RwLock::new(table_names.clone()));
@@ -7967,6 +8008,9 @@ where
         if let Ok(mut maps) = self.rls_maps.write() {
             maps.tenant_read.extend(rls_tables.clone());
             maps.tenant_write.extend(rls_tables.clone());
+            maps.tenant_insert.extend(rls_tables.clone());
+            maps.tenant_update.extend(rls_tables.clone());
+            maps.tenant_delete.extend(rls_tables.clone());
         }
         if let Ok(mut enabled) = self.rls_enabled.write() {
             enabled.extend(rls_tables.keys().cloned());
@@ -9531,9 +9575,24 @@ where
     }
 
     fn rls_policy_allows(&self, table: &str, value: &[u8]) -> bool {
+        self.rls_policy_allows_for_command(table, value, RlsCommand::Select)
+    }
+
+    fn rls_policy_allows_for_command(
+        &self,
+        table: &str,
+        value: &[u8],
+        command: RlsCommand,
+    ) -> bool {
         let Some(maps) = self.rls_maps_for_current_role() else { return false };
-        let tenant_column = relation_map_get(&maps.tenant_read, table);
-        let uid_column = relation_map_get(&maps.uid_read, table);
+        let (tenant_map, uid_map) = match command {
+            RlsCommand::Select => (&maps.tenant_read, &maps.uid_read),
+            RlsCommand::Insert => (&maps.tenant_insert, &maps.uid_insert),
+            RlsCommand::Update => (&maps.tenant_update, &maps.uid_update),
+            RlsCommand::Delete => (&maps.tenant_delete, &maps.uid_delete),
+        };
+        let tenant_column = relation_map_get(tenant_map, table);
+        let uid_column = relation_map_get(uid_map, table);
         if tenant_column.is_none() && uid_column.is_none() {
             return false;
         }
@@ -9569,31 +9628,20 @@ where
     }
 
     pub fn row_allowed_for_write(&self, table: &str, value: &[u8]) -> bool {
-        self.enforce_rls(table, value).is_ok()
+        self.row_allowed_for_command(table, value, RlsCommand::Update)
     }
 
-    fn enforce_rls(&self, table: &str, value: &[u8]) -> Result<()> {
+    /// Checks a row against policies for one SQL command and the current role.
+    pub fn row_allowed_for_command(&self, table: &str, value: &[u8], command: RlsCommand) -> bool {
+        !self.rls_applies_to_role(table)
+            || self.rls_policy_allows_for_command(table, value, command)
+    }
+
+    fn enforce_rls(&self, table: &str, value: &[u8], command: RlsCommand) -> Result<()> {
         if !self.rls_applies_to_role(table) {
             return Ok(());
         }
-        let maps = self
-            .rls_maps_for_current_role()
-            .ok_or_else(|| RymeError::Internal(String::from("RLS policy lock")))?;
-        let tenant_column = relation_map_get(&maps.tenant_write, table);
-        let uid_column = relation_map_get(&maps.uid_write, table);
-        if tenant_column.is_none() && uid_column.is_none() {
-            return Err(RymeError::Forbidden);
-        }
-        let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(value) else {
-            return Err(RymeError::Forbidden);
-        };
-        if rls_tenant_column_allows(&object, tenant_column, &self.tenant)
-            && rls_uid_policies_allow(
-                &object,
-                uid_column.map(Vec::as_slice),
-                self.auth_uid.as_deref(),
-            )
-        {
+        if self.rls_policy_allows_for_command(table, value, command) {
             Ok(())
         } else {
             Err(RymeError::Forbidden)
@@ -10616,7 +10664,7 @@ where
         let sources = self.scan_rows_async(txn, &source_table, &source_filter, usize::MAX).await?;
         let mut changes = Vec::new();
         for (pk, before) in targets {
-            self.enforce_rls(&table, &before)?;
+            self.enforce_rls(&table, &before, RlsCommand::Update)?;
             let Some((_, source_value)) = sources.iter().find(|(source_pk, source_value)| {
                 self.row_column_value(&table, &pk, &before, &target_column)
                     .zip(self.row_column_value(
@@ -10638,7 +10686,7 @@ where
             )?;
             let after = self.apply_before_triggers(&table, "UPDATE", &after)?;
             let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
-            self.enforce_rls(&table, &after)?;
+            self.enforce_rls(&table, &after, RlsCommand::Update)?;
             self.enforce_checks(&table, &new_pk, &after)?;
             self.enforce_foreign_keys_async(txn, &table, &new_pk, &after).await?;
             self.check_unique_excluding(txn, &table, &new_pk, &after, Some(&pk))?;
@@ -10697,7 +10745,7 @@ where
         let sources = self.scan_rows_async(txn, &source_table, &source_filter, usize::MAX).await?;
         let mut changes = Vec::new();
         for (pk, value) in targets {
-            self.enforce_rls(&table, &value)?;
+            self.enforce_rls(&table, &value, RlsCommand::Delete)?;
             let matched = sources.iter().any(|(source_pk, source_value)| {
                 self.row_column_value(&table, &pk, &value, &target_column)
                     .zip(self.row_column_value(
@@ -13767,7 +13815,7 @@ where
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let value = self.apply_before_triggers(&table, "INSERT", &value)?;
-                self.enforce_rls(&table, &value)?;
+                self.enforce_rls(&table, &value, RlsCommand::Insert)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys_async(txn, &table, &pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -13792,7 +13840,7 @@ where
             Statement::InsertIgnore { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let value = self.apply_before_triggers(&table, "INSERT", &value)?;
-                self.enforce_rls(&table, &value)?;
+                self.enforce_rls(&table, &value, RlsCommand::Insert)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys_async(txn, &table, &pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -13843,13 +13891,14 @@ where
             Statement::Upsert { table, pk, value } => {
                 self.reject_if_read_only()?;
                 let value = self.apply_before_triggers(&table, "INSERT", &value)?;
-                self.enforce_rls(&table, &value)?;
+                self.enforce_rls(&table, &value, RlsCommand::Insert)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 self.enforce_foreign_keys_async(txn, &table, &pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
                 let before = self.manager.get_async(txn, &key).await?;
                 if let Some(before) = before.as_deref() {
-                    self.enforce_rls(&table, before)?;
+                    self.enforce_rls(&table, before, RlsCommand::Update)?;
+                    self.enforce_rls(&table, &value, RlsCommand::Update)?;
                 }
                 self.check_unique(txn, &table, &pk, &value)?;
                 self.manager.put(txn, key, value.clone());
@@ -13894,12 +13943,12 @@ where
                 let rows = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, before) in rows {
-                    self.enforce_rls(&table, &before)?;
+                    self.enforce_rls(&table, &before, RlsCommand::Update)?;
                     let after =
                         self.materialize_update_row(&table, &pk, assignments.clone(), &before)?;
                     let after = self.apply_before_triggers(&table, "UPDATE", &after)?;
                     let new_pk = self.primary_key_for_row(&table, &pk, &after)?;
-                    self.enforce_rls(&table, &after)?;
+                    self.enforce_rls(&table, &after, RlsCommand::Update)?;
                     self.enforce_checks(&table, &new_pk, &after)?;
                     self.enforce_foreign_keys_async(txn, &table, &new_pk, &after).await?;
                     self.check_unique_excluding(txn, &table, &new_pk, &after, Some(&pk))?;
@@ -13973,7 +14022,7 @@ where
                 let value = self.apply_before_triggers(&table, "UPDATE", &value)?;
                 let before_key = pk.clone();
                 let new_pk = self.primary_key_for_row(&table, &pk, &value)?;
-                self.enforce_rls(&table, &value)?;
+                self.enforce_rls(&table, &value, RlsCommand::Update)?;
                 self.enforce_checks(&table, &new_pk, &value)?;
                 self.enforce_foreign_keys_async(txn, &table, &new_pk, &value).await?;
                 let key = RecordKey::new(&self.tenant, &self.database, &table, &pk);
@@ -13981,7 +14030,11 @@ where
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
-                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
+                self.enforce_rls(
+                    &table,
+                    before.as_deref().unwrap_or_default(),
+                    RlsCommand::Update,
+                )?;
                 self.check_unique_excluding(txn, &table, &new_pk, &value, Some(&pk))?;
                 if new_pk != pk
                     && self
@@ -14033,7 +14086,11 @@ where
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
-                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
+                self.enforce_rls(
+                    &table,
+                    before.as_deref().unwrap_or_default(),
+                    RlsCommand::Delete,
+                )?;
                 let mut changes = Vec::new();
                 self.delete_row_with_references_async(
                     txn,
@@ -14060,7 +14117,7 @@ where
                 let rows = self.scan_rows_async(txn, &table, &filter, usize::MAX).await?;
                 let mut changes = Vec::with_capacity(rows.len());
                 for (pk, before) in rows {
-                    self.enforce_rls(&table, &before)?;
+                    self.enforce_rls(&table, &before, RlsCommand::Delete)?;
                     self.delete_row_with_references_async(
                         txn,
                         &table,
@@ -14370,7 +14427,7 @@ where
         do_nothing: bool,
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         self.reject_if_read_only()?;
-        self.enforce_rls(&table, &value)?;
+        self.enforce_rls(&table, &value, RlsCommand::Insert)?;
         let conflict = self.find_conflict_row(txn, &table, &pk, &value, &target_columns)?;
         let Some((existing_pk, existing_value)) = conflict else {
             let statement = Statement::Insert { table, pk, value };
@@ -16128,7 +16185,7 @@ where
             }
             Statement::Insert { table, pk, value } => {
                 self.reject_if_read_only()?;
-                self.enforce_rls(&table, &value)?;
+                self.enforce_rls(&table, &value, RlsCommand::Insert)?;
                 self.enforce_checks(&table, &pk, &value)?;
                 let mut txn = self.begin_with(isolation);
                 self.enforce_foreign_keys_async(&mut txn, &table, &pk, &value).await?;
@@ -16365,7 +16422,11 @@ where
                 if before.is_none() {
                     return Err(RymeError::NotFound(String::from("row")));
                 }
-                self.enforce_rls(&table, before.as_deref().unwrap_or_default())?;
+                self.enforce_rls(
+                    &table,
+                    before.as_deref().unwrap_or_default(),
+                    RlsCommand::Delete,
+                )?;
                 let mut changes = Vec::new();
                 self.delete_row_with_references_async(
                     &mut txn,
@@ -17651,6 +17712,82 @@ mod tests {
             visible,
             QueryResult::Returning { ref rows, .. }
                 if rows == &vec![vec![b"shown".to_vec()]]
+        ));
+    }
+
+    #[tokio::test]
+    async fn rls_policies_are_scoped_to_their_sql_command() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        for sql in [
+            "CREATE TABLE command_scoped (id TEXT PRIMARY KEY, owner_id TEXT, value TEXT)",
+            "INSERT INTO command_scoped (id, owner_id, value) VALUES ('one', 'user-a', 'before')",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE command_scoped TO authenticated",
+            "CREATE POLICY update_owner ON command_scoped FOR UPDATE TO authenticated USING (auth.uid() = owner_id) WITH CHECK (auth.uid() = owner_id)",
+            "ALTER TABLE command_scoped ENABLE ROW LEVEL SECURITY",
+        ] {
+            executor.execute(parse(sql).unwrap()).await.unwrap();
+        }
+
+        let user = executor
+            .clone()
+            .with_role(String::from("authenticated"))
+            .with_auth_uid(String::from("user-a"));
+        let row = br#"{"id":"one","owner_id":"user-a","value":"before"}"#;
+        assert!(!user.row_allowed_by_rls("command_scoped", row));
+        assert!(matches!(
+            user.execute(parse("SELECT * FROM command_scoped").unwrap()).await,
+            Ok(QueryResult::Rows { ref rows }) if rows.is_empty()
+        ));
+        assert!(!user.row_allowed_for_command("command_scoped", row, RlsCommand::Insert));
+        assert!(user.row_allowed_for_command("command_scoped", row, RlsCommand::Update));
+        assert!(!user.row_allowed_for_command("command_scoped", row, RlsCommand::Delete));
+
+        let insert = user
+            .execute(parse("INSERT INTO command_scoped (id, owner_id, value) VALUES ('two', 'user-a', 'inserted')").unwrap())
+            .await;
+        assert!(matches!(insert, Err(RymeError::Forbidden)));
+
+        executor
+            .execute(
+                parse("CREATE POLICY insert_owner ON command_scoped FOR INSERT TO authenticated WITH CHECK (auth.uid() = owner_id)").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(user.row_allowed_for_command("command_scoped", row, RlsCommand::Insert));
+        assert!(!user.row_allowed_for_command("command_scoped", row, RlsCommand::Delete));
+        assert_eq!(
+            user.execute(parse("INSERT INTO command_scoped (id, owner_id, value) VALUES ('two', 'user-a', 'inserted')").unwrap())
+                .await
+                .unwrap(),
+            QueryResult::Ok
+        );
+
+        let mut txn = user.begin_transaction(Isolation::Serializable);
+        assert!(matches!(
+            user.execute_in_transaction(
+                &mut txn,
+                Statement::Delete { table: String::from("command_scoped"), pk: b"one".to_vec() },
+            )
+            .await,
+            Err(RymeError::Forbidden)
+        ));
+
+        let mut txn = user.begin_transaction(Isolation::Serializable);
+        let update = user
+            .execute_in_transaction(
+                &mut txn,
+                Statement::Update {
+                    table: String::from("command_scoped"),
+                    pk: b"one".to_vec(),
+                    value: br#"{"id":"one","owner_id":"user-a","value":"updated"}"#.to_vec(),
+                },
+            )
+            .await;
+        let (_, changes) = update.unwrap();
+        user.commit_transaction(txn, changes).await.unwrap();
+        assert!(matches!(
+            executor.execute(parse("SELECT value FROM command_scoped WHERE id = 'one'").unwrap()).await,
+            Ok(QueryResult::Table { ref rows, .. }) if rows == &vec![vec![b"updated".to_vec()]]
         ));
     }
 
