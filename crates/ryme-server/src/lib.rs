@@ -565,18 +565,10 @@ struct AuditLog {
 
 impl AuditLog {
     fn load(path: std::path::PathBuf) -> ryme_error::Result<Self> {
-        let events = match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.len() > MAX_AUDIT_FILE_BYTES as u64 => {
-                return Err(ryme_error::RymeError::Overload(String::from("audit log")));
-            }
-            Ok(_) => {
-                let bytes = std::fs::read(&path)?;
-                serde_json::from_slice::<VecDeque<AuditEvent>>(&bytes).map_err(|error| {
-                    ryme_error::RymeError::Corrupt(format!("audit log: {error}"))
-                })?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => VecDeque::new(),
-            Err(error) => return Err(error.into()),
+        let events = match read_bounded_state_file(&path, MAX_AUDIT_FILE_BYTES, "audit log")? {
+            Some(bytes) => serde_json::from_slice::<VecDeque<AuditEvent>>(&bytes)
+                .map_err(|error| ryme_error::RymeError::Corrupt(format!("audit log: {error}")))?,
+            None => VecDeque::new(),
         };
         let mut events = events;
         while events.len() > MAX_AUDIT_EVENTS {
@@ -2038,7 +2030,8 @@ impl SharedState {
             &self.branch_metadata_path,
             BRANCH_METADATA_JOURNAL_MAX_BYTES,
             "branch metadata journal",
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let journal = serde_json::from_slice(&bytes).map_err(|error| {
@@ -2160,7 +2153,8 @@ impl SharedState {
             &self.promotion_path,
             BRANCH_PROMOTION_JOURNAL_MAX_BYTES,
             "branch promotion journal",
-        )? else {
+        )?
+        else {
             return Ok(None);
         };
         let journal = serde_json::from_slice(&bytes).map_err(|error| {
@@ -15172,6 +15166,23 @@ mod realtime_policy_tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_log_rejects_oversized_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-audit-oversized-{}-{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_AUDIT_FILE_BYTES + 1) as u64).unwrap();
+
+        assert!(matches!(
+            AuditLog::load(path.clone()),
+            Err(ryme_error::RymeError::Overload(message)) if message == "audit log"
+        ));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
