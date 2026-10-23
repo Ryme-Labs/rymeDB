@@ -20,7 +20,6 @@ use tokio::sync::{Mutex, Semaphore};
 // cannot turn a healthy leader into a needless election under load.
 const ELECTION_TIMEOUT_MIN_MS: u64 = 500;
 const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
-const LEADER_CONTACT_GRACE_MS: u64 = 1_200;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_RAFT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -962,7 +961,6 @@ struct Inner {
     reset_epoch: u64,
     observed_epoch: u64,
     campaign_now: bool,
-    leader_contact_ms: u64,
     leader_id: Option<usize>,
 }
 
@@ -1520,7 +1518,6 @@ impl Node {
                 reset_epoch: 0,
                 observed_epoch: 0,
                 campaign_now: false,
-                leader_contact_ms: 0,
                 leader_id: None,
             })),
             manager,
@@ -2802,10 +2799,10 @@ impl Node {
         match rpc {
             Rpc::VoteRequest { term, candidate, last_term, last_index } => {
                 let mut inner = self.inner.lock().await;
-                if term < inner.term {
+                if term == 0 || term < inner.term {
                     return Ok(Rpc::VoteResponse { term: inner.term, granted: false });
                 }
-                if !inner.is_member(candidate) && recent_leader(inner.leader_contact_ms) {
+                if !inner.is_member(candidate) {
                     return Ok(Rpc::VoteResponse { term: inner.term, granted: false });
                 }
                 let term_changed = term > inner.term;
@@ -2841,7 +2838,7 @@ impl Node {
                 if term <= inner.term {
                     return Ok(Rpc::PreVoteResponse { term: inner.term, granted: false });
                 }
-                if !inner.is_member(candidate) && recent_leader(inner.leader_contact_ms) {
+                if !inner.is_member(candidate) {
                     return Ok(Rpc::PreVoteResponse { term: inner.term, granted: false });
                 }
                 let (last_t, last_i) = inner.last_position();
@@ -2850,9 +2847,13 @@ impl Node {
                 }
                 Ok(Rpc::PreVoteResponse { term: inner.term, granted: true })
             }
-            Rpc::TransferRequest { term, from: _ } => {
+            Rpc::TransferRequest { term, from } => {
                 let mut inner = self.inner.lock().await;
-                if term < inner.term {
+                if term < inner.term
+                    || term == 0
+                    || !inner.is_member(from)
+                    || inner.leader_id != Some(from)
+                {
                     return Ok(Rpc::TransferResponse { term: inner.term, accepted: false });
                 }
                 if term > inner.term {
@@ -3131,7 +3132,7 @@ impl Node {
             Rpc::AppendRequest { term, leader, prev_index, prev_term, entries, leader_commit } => {
                 let (result, applied_now) = {
                     let mut inner = self.inner.lock().await;
-                    if term < inner.term {
+                    if term < inner.term || term == 0 || !inner.is_member(leader) {
                         let term = inner.term;
                         (
                             Rpc::AppendResponse {
@@ -3151,7 +3152,6 @@ impl Node {
                         inner.role = Role::Follower;
                         inner.leader_id = Some(leader);
                         inner.bump_reset();
-                        inner.leader_contact_ms = now_ms();
                         let outcome = append_to_log(
                             &mut inner,
                             term,
@@ -6714,10 +6714,6 @@ impl ryme_txn::TxnBackend for ClusterBackend {
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-fn recent_leader(contact_ms: u64) -> bool {
-    contact_ms != 0 && now_ms().saturating_sub(contact_ms) < LEADER_CONTACT_GRACE_MS
 }
 
 fn append_to_log(

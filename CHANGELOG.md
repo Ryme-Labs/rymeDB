@@ -41,6 +41,8 @@ All notable changes to rymeDB are recorded here. Format follows
   commit indexes beyond the recovered WAL while retaining exact duplicate frames.
 - Raft followers now validate replicated entries before WAL writes and reject
   same-term index conflicts and overflowing append indexes.
+- Raft voting, append, and leadership-transfer requests now require the claimed
+  candidate or leader to belong to the active or joint membership.
 
 ### Performance
 
