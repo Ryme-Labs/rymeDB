@@ -19,6 +19,8 @@ All notable changes to rymeDB are recorded here. Format follows
   file-based and byte-based constructors.
 - Local archive object reads verify the opened file identity to detect symlink
   swaps between path validation and file access.
+- Raft, RESP, native, and HTTPS TLS handshakes now time out after 10 seconds so
+  incomplete handshakes cannot hold connection slots indefinitely.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique

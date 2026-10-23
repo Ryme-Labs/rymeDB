@@ -24,7 +24,7 @@ static NATIVE_INPUT_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     Arc::new(Semaphore::new(NATIVE_INPUT_BUDGET_BYTES / NATIVE_INPUT_BUDGET_UNIT_BYTES))
 });
 
-pub use ryme_tls::TlsAcceptor;
+pub use ryme_tls::{TlsAcceptor, TLS_HANDSHAKE_TIMEOUT};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -285,7 +285,9 @@ where
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let Ok(tls) = acceptor.accept(socket).await else {
+                let Ok(Ok(tls)) =
+                    tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await
+                else {
                     return;
                 };
                 let _ = service.handle_stream(tls).await;

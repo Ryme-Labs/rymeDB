@@ -2,7 +2,9 @@ use ryme_error::{Result, RymeError};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TLS_PEM_BYTES: usize = 4 * 1024 * 1024;
 
 fn read_pem_file(path: &Path) -> Result<Vec<u8>> {

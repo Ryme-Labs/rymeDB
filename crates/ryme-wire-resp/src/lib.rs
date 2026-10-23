@@ -1195,7 +1195,12 @@ where
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let Ok(tls) = acceptor.accept(socket).await else {
+                let Ok(Ok(tls)) = tokio::time::timeout(
+                    ryme_wire_native::TLS_HANDSHAKE_TIMEOUT,
+                    acceptor.accept(socket),
+                )
+                .await
+                else {
                     return;
                 };
                 let _ = service.handle(tls).await;

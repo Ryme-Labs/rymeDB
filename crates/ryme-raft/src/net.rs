@@ -1703,7 +1703,12 @@ impl Node {
                         }
                     };
                     if let Some(transport) = transport {
-                        let Ok(tls) = transport.acceptor.acceptor().accept(socket).await else {
+                        let Ok(Ok(tls)) = tokio::time::timeout(
+                            ryme_tls::TLS_HANDSHAKE_TIMEOUT,
+                            transport.acceptor.acceptor().accept(socket),
+                        )
+                        .await
+                        else {
                             return;
                         };
                         let _ = node.serve_connection(tls).await;

@@ -4308,7 +4308,12 @@ pub async fn serve_https_with_listener(
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let Ok(tls) = acceptor.accept(socket).await else {
+            let Ok(Ok(tls)) = tokio::time::timeout(
+                ryme_tls::TLS_HANDSHAKE_TIMEOUT,
+                acceptor.accept(socket),
+            )
+            .await
+            else {
                 return;
             };
             let app = router(service).layer(Extension(axum::extract::ConnectInfo(peer_addr)));
