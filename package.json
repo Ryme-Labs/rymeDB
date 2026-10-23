@@ -30,6 +30,7 @@
   "pnpm": {
     "overrides": {
       "katex": "0.18.2",
+      "dompurify": "3.4.17",
       "postcss-selector-parser": "7.1.6",
       "serialize-javascript": "7.1.2",
       "tinypool": "2.2.0",

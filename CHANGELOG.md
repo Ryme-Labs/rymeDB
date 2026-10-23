@@ -11,6 +11,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Empty Raft heartbeats preserve follower log entries unless an incoming entry
   conflicts.
 - Transient range cleanup failures are retried after range splits.
+- Next.js and DOMPurify dependencies are updated to patched versions for known
+  security advisories.
 
 ## [2.0.2] — 2026-10-23
 
