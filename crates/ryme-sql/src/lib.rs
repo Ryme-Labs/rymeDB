@@ -9005,11 +9005,8 @@ where
             .iter()
             .map(|(name, definition)| (name.clone(), definition.clone()))
             .collect();
-        let roles = self
-            .roles
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("role lock")))?
-            .clone();
+        let roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?.clone();
         let privileges = self
             .privileges
             .lock()
@@ -9566,16 +9563,11 @@ where
 
     fn rls_is_enabled(&self, table: &str) -> bool {
         self.platform_rls_applies(table)
-            || self
-                .rls_enabled
-                .read()
-                .map_or(true, |tables| relation_set_contains(&tables, table))
+            || self.rls_enabled.read().map_or(true, |tables| relation_set_contains(&tables, table))
     }
 
     fn platform_rls_applies(&self, table: &str) -> bool {
-        self.platform_rls_tables
-            .read()
-            .map_or(true, |tables| relation_set_contains(&tables, table))
+        self.platform_rls_tables.read().map_or(true, |tables| relation_set_contains(&tables, table))
     }
 
     fn rls_applies_to_role(&self, table: &str) -> bool {
@@ -13366,11 +13358,8 @@ where
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         self.enforce_statement_privileges(&statement)?;
         let schema_statement = statement.is_schema_change();
-        let previous_schema = if schema_statement {
-            Some(self.try_schema_snapshot()?)
-        } else {
-            None
-        };
+        let previous_schema =
+            if schema_statement { Some(self.try_schema_snapshot()?) } else { None };
         let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         match &statement {
             Statement::CreateSchema { .. }
@@ -14994,11 +14983,8 @@ where
         self.check_transaction_uniqueness(&changes)?;
         let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         let previous_schema = schema_before.clone();
-        let schema_after = if schema_before.is_some() {
-            Some(self.try_schema_snapshot()?)
-        } else {
-            None
-        };
+        let schema_after =
+            if schema_before.is_some() { Some(self.try_schema_snapshot()?) } else { None };
         let schema_changed = schema_after
             .as_ref()
             .is_some_and(|after| schema_before.as_ref().is_some_and(|before| before != after));
@@ -15360,11 +15346,8 @@ where
     ) -> Result<QueryResult> {
         self.enforce_statement_privileges(&statement)?;
         let schema_statement = statement.is_schema_change();
-        let previous_schema = if schema_statement {
-            Some(self.try_schema_snapshot()?)
-        } else {
-            None
-        };
+        let previous_schema =
+            if schema_statement { Some(self.try_schema_snapshot()?) } else { None };
         let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         match &statement {
             Statement::CreateSchema { .. }
