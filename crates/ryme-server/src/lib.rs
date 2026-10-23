@@ -14440,9 +14440,9 @@ fn scan_realtime_rows_with_executor<B: TxnBackend>(
     read_ts: Option<u64>,
     filters: &[(String, String)],
     order: Option<&str>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+) -> ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     if limit == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut txn = backend.begin();
     if let Some(read_ts) = read_ts {
@@ -14454,10 +14454,10 @@ fn scan_realtime_rows_with_executor<B: TxnBackend>(
     let page_limit = if full_order_scan { 256 } else { limit };
     loop {
         let page = match start_after.as_deref() {
-            Some(start_after) => backend
-                .scan_after(&mut txn, tenant, database, table, start_after, page_limit)
-                .unwrap_or_default(),
-            None => backend.scan(&mut txn, tenant, database, table, page_limit).unwrap_or_default(),
+            Some(start_after) => {
+                backend.scan_after(&mut txn, tenant, database, table, start_after, page_limit)?
+            }
+            None => backend.scan(&mut txn, tenant, database, table, page_limit)?,
         };
         if page.is_empty() {
             break;
@@ -14478,7 +14478,7 @@ fn scan_realtime_rows_with_executor<B: TxnBackend>(
     }
     let mut visible = order_rows(visible, order);
     visible.truncate(limit);
-    visible
+    Ok(visible)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14501,7 +14501,7 @@ async fn scan_realtime_rows_for_query<B: TxnBackend>(
             return Ok(rows);
         }
     }
-    Ok(scan_realtime_rows_with_executor(
+    scan_realtime_rows_with_executor(
         backend,
         rls_executor,
         tenant,
@@ -14511,7 +14511,7 @@ async fn scan_realtime_rows_for_query<B: TxnBackend>(
         read_ts,
         filters,
         order,
-    ))
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
