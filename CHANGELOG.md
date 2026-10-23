@@ -21,6 +21,8 @@ All notable changes to rymeDB are recorded here. Format follows
   swaps between path validation and file access.
 - Raft, RESP, native, and HTTPS TLS handshakes now time out after 10 seconds so
   incomplete handshakes cannot hold connection slots indefinitely.
+- WAL segment readers and append handles verify opened file identity to detect
+  symlink swaps during recovery or writes.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique

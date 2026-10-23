@@ -513,9 +513,14 @@ fn parse_segment_name(name: &str) -> Option<u64> {
 }
 
 fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
-    ensure_regular_file(path)?;
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(RymeError::Corrupt(String::from("wal segment file")));
+    }
     let file = File::open(path)?;
-    let length = file.metadata()?.len();
+    let metadata = file.metadata()?;
+    verify_opened_segment(&path_metadata, &metadata)?;
+    let length = metadata.len();
     if length > MAX_WAL_SEGMENT_BYTES {
         return Err(RymeError::Overload(String::from("wal segment")));
     }
@@ -527,13 +532,25 @@ fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-fn ensure_regular_file(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_file() {
-        Ok(())
-    } else {
-        Err(RymeError::Corrupt(String::from("wal segment file")))
+fn verify_opened_segment(
+    path_metadata: &std::fs::Metadata,
+    opened_metadata: &std::fs::Metadata,
+) -> Result<()> {
+    if !opened_metadata.is_file() {
+        return Err(RymeError::Corrupt(String::from("wal segment file")));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != opened_metadata.dev()
+            || path_metadata.ino() != opened_metadata.ino()
+        {
+            return Err(RymeError::Corrupt(String::from("wal segment file identity")));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path_metadata;
+    Ok(())
 }
 
 fn ensure_regular_or_missing(path: &Path) -> Result<()> {
@@ -548,7 +565,9 @@ fn ensure_regular_or_missing(path: &Path) -> Result<()> {
 fn open_segment_append(path: &Path, create: bool) -> Result<File> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            Ok(OpenOptions::new().read(true).append(true).open(path)?)
+            let file = OpenOptions::new().read(true).append(true).open(path)?;
+            verify_opened_segment(&metadata, &file.metadata()?)?;
+            Ok(file)
         }
         Ok(_) => Err(RymeError::Corrupt(String::from("wal segment file"))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
