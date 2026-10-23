@@ -64,6 +64,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and symlink or non-file entries using segment filenames.
 - Segment archives now include compacted delta outputs and the latest/compaction
   markers required to recover a segment chain during delta compaction.
+- Bounded state readers now open Windows files without following final
+  reparse points, closing a path-swap gap after symlink checks.
 - RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
   and scan the keyspace in bounded pages.
 - RESP `MGET` reads values incrementally and rejects combined results above

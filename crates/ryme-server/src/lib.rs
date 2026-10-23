@@ -1268,7 +1268,7 @@ fn read_bounded_state_file(
     if !path_metadata.file_type().is_file() {
         return Err(ryme_error::RymeError::Corrupt(format!("{label} file type")));
     }
-    let file = match std::fs::File::open(path) {
+    let file = match ryme_error::open_read_no_follow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -15299,7 +15299,7 @@ fn read_keyring(path: &std::path::Path) -> ryme_error::Result<Option<Vec<u8>>> {
     if !path_metadata.file_type().is_file() {
         return Err(ryme_error::RymeError::Corrupt(String::from("keyring file")));
     }
-    let file = std::fs::File::open(path)?;
+    let file = ryme_error::open_read_no_follow(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(ryme_error::RymeError::Corrupt(String::from("keyring file")));

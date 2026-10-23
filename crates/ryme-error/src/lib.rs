@@ -30,6 +30,32 @@ pub enum RymeError {
 
 pub type Result<T> = std::result::Result<T, RymeError>;
 
+/// Open a file for reading without following a Windows reparse point at the
+/// final path component. Callers should still validate the expected file type.
+pub fn open_read_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to read a reparse point",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        options.open(path)
+    }
+}
+
 impl From<std::io::Error> for RymeError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value.to_string())

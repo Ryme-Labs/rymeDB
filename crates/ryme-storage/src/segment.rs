@@ -1242,7 +1242,7 @@ fn read_bounded_metadata_file(
     if !metadata.file_type().is_file() {
         return Err(RymeError::Corrupt(label.to_string()));
     }
-    let file = match std::fs::File::open(path) {
+    let file = match ryme_error::open_read_no_follow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -1293,7 +1293,7 @@ fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
     if !metadata.file_type().is_file() {
         return Err(RymeError::Corrupt(String::from("segment file")));
     }
-    let mut file = std::fs::File::open(path)?;
+    let mut file = ryme_error::open_read_no_follow(path)?;
     verify_opened_file(&metadata, &file, "segment file")?;
     let file_len = file.metadata()?.len();
     let mut prefix = [0; 16];
@@ -1325,7 +1325,7 @@ fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
     if !metadata.file_type().is_file() {
         return Err(RymeError::Corrupt(String::from("segment file")));
     }
-    let mut file = std::fs::File::open(path)?;
+    let mut file = ryme_error::open_read_no_follow(path)?;
     verify_opened_file(&metadata, &file, "segment file")?;
     let file_len = file.metadata()?.len();
     if file_len > MAX_SEGMENT_BYTES as u64 {

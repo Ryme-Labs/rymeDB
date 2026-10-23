@@ -560,7 +560,7 @@ fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
     if !path_metadata.file_type().is_file() {
         return Err(RymeError::Corrupt(String::from("wal segment file")));
     }
-    let file = File::open(path)?;
+    let file = ryme_error::open_read_no_follow(path)?;
     let metadata = verify_opened_segment(&path_metadata, &file)?;
     let length = metadata.len();
     if length > MAX_WAL_SEGMENT_BYTES {
