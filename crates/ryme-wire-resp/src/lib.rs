@@ -22,6 +22,7 @@ use tokio::sync::broadcast;
 
 const KV_TABLE: &str = "_kv";
 const RESP_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const RESP_MAX_COMMAND_ARGS: usize = 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
 const RESP_LUA_MAX_NESTING: usize = 64;
 const RESP_LUA_MAX_ARRAY_ITEMS: usize = 65_536;
@@ -5943,17 +5944,16 @@ fn decode_inline(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
         return Err(RymeError::Overload(String::from("request")));
     }
     let line = String::from_utf8_lossy(&input[..end]).into_owned();
-    let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
-    if parts.is_empty() {
+    let mut tokens = line.split_whitespace();
+    let Some(name) = tokens.next() else {
         return Err(RymeError::InvalidArgument(String::from("resp")));
+    };
+    let args: Vec<Vec<u8>> =
+        tokens.take(RESP_MAX_COMMAND_ARGS + 1).map(|part| part.as_bytes().to_vec()).collect();
+    if args.len() > RESP_MAX_COMMAND_ARGS {
+        return Err(RymeError::InvalidArgument(String::from("resp arity")));
     }
-    Ok(Some((
-        RespCommand {
-            name: parts[0].to_ascii_uppercase(),
-            args: parts[1..].iter().map(|s| s.as_bytes().to_vec()).collect(),
-        },
-        end + 2,
-    )))
+    Ok(Some((RespCommand { name: name.to_ascii_uppercase(), args }, end + 2)))
 }
 
 fn decode_array(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
@@ -5963,7 +5963,7 @@ fn decode_array(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
     let count: usize = String::from_utf8_lossy(&input[1..first_end])
         .parse()
         .map_err(|_| RymeError::InvalidArgument(String::from("resp")))?;
-    if count == 0 || count > 1025 {
+    if count == 0 || count > RESP_MAX_COMMAND_ARGS + 1 {
         return Err(RymeError::InvalidArgument(String::from("resp arity")));
     }
     let mut offset =

@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP inline requests now enforce the same 1,024-argument limit as array
+  requests, bounding per-argument allocations for oversized token lists.
 - SQL auto-increment IDs now report exhaustion instead of reusing the maximum
   integer and producing duplicate identifiers.
 - API key storage and authentication now reject empty or oversized bearer keys

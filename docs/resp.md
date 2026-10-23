@@ -37,10 +37,10 @@ Redis semantics.
 ## Request limits
 
 Each incoming RESP command is limited to a 1 MiB frame, including RESP framing
-bytes. Larger commands are rejected before bulk arguments are copied into
-command storage. This is a deliberate resource bound; clients sending large
-values should split the data or use another gateway with a suitable request
-limit.
+bytes, and may contain at most 1,024 arguments. Larger commands are rejected
+before bulk arguments are copied into command storage. This is a deliberate
+resource bound; clients sending large values should split the data or use
+another gateway with a suitable request limit.
 
 ## Transaction notes
 
