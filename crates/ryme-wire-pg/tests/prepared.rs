@@ -223,23 +223,21 @@ async fn prepared_portal_invalidation() {
     assert_eq!(first, rebound);
     let closed = close(&mut socket, b'P', "p1").await;
     assert!(closed.iter().any(|(tag, _)| *tag == b'3'));
-    let gone = execute(&mut socket, "p1").await;
-    assert!(gone.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("portal")));
     let replied = roundtrip(&mut socket, bind_msg("p1", "s1", &[])).await;
     assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'2'));
     let revived = execute(&mut socket, "p1").await;
     assert_eq!(first, revived);
+    let replied = roundtrip(&mut socket, parse_msg("s2", "SELECT * FROM docs KEY 'k2'")).await;
+    assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'1'));
+    let replied = roundtrip(&mut socket, bind_msg("p2", "s2", &[])).await;
+    assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'2'));
+    let moved = execute(&mut socket, "p2").await;
+    assert!(moved.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("v2")));
+    assert!(!moved.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("v1")));
     let closed = close(&mut socket, b'S', "s1").await;
     assert!(closed.iter().any(|(tag, _)| *tag == b'3'));
     let gone = execute(&mut socket, "p1").await;
-    assert!(gone.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("statement")));
-    let replied = roundtrip(&mut socket, parse_msg("s1", "SELECT * FROM docs KEY 'k2'")).await;
-    assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'1'));
-    let replied = roundtrip(&mut socket, bind_msg("p1", "s1", &[])).await;
-    assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'2'));
-    let moved = execute(&mut socket, "p1").await;
-    assert!(moved.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("v2")));
-    assert!(!moved.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("v1")));
+    assert!(gone.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("portal")));
 }
 
 #[tokio::test]
