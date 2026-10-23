@@ -15,14 +15,12 @@ pub mod s3;
 #[allow(async_fn_in_trait)]
 pub trait ObjectStore: Send + Sync {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()>;
-    async fn get(&self, key: &str) -> Result<Vec<u8>>;
-    async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        let bytes = self.get(key).await?;
-        if bytes.len() > max_bytes {
-            return Err(RymeError::Overload(String::from("archive object")));
-        }
-        Ok(bytes)
+    async fn get(&self, key: &str) -> Result<Vec<u8>> {
+        self.get_bounded(key, MAX_ARCHIVE_OBJECT_BYTES).await
     }
+    /// Read an object without buffering more than `max_bytes` from the backend.
+    /// Implementations must enforce this limit while receiving the object.
+    async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn delete(&self, key: &str) -> Result<()>;
 }
