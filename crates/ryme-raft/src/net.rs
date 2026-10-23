@@ -2147,7 +2147,9 @@ impl Node {
             self.range_tick().await;
             self.retry_pending_resolutions().await;
             if self.take_campaign().await {
-                self.campaign(true).await;
+                if let Err(error) = self.campaign(true).await {
+                    tracing::warn!(node = self.id, %error, "raft election campaign failed");
+                }
                 continue;
             }
             let (is_leader, can_campaign) = {
@@ -2165,7 +2167,9 @@ impl Node {
             } else {
                 let timeout = self.next_election_timeout().await;
                 if tokio::time::timeout(timeout, self.wait_for_reset()).await.is_err() {
-                    self.campaign(false).await;
+                    if let Err(error) = self.campaign(false).await {
+                        tracing::warn!(node = self.id, %error, "raft election campaign failed");
+                    }
                 }
             }
         }
@@ -2194,23 +2198,23 @@ impl Node {
         }
     }
 
-    async fn campaign(self: &Arc<Self>, skip_prevote: bool) {
+    async fn campaign(self: &Arc<Self>, skip_prevote: bool) -> Result<()> {
         if self.inner.lock().await.learner {
-            return;
+            return Ok(());
         }
-        if !skip_prevote && !self.prevote().await {
-            return;
+        if !skip_prevote && !self.prevote().await? {
+            return Ok(());
         }
         let (term, last_term, last_index) = {
             let mut inner = self.inner.lock().await;
             if inner.role == Role::Leader {
-                return;
+                return Ok(());
             }
             inner.term += 1;
             inner.role = Role::Candidate;
             inner.voted_for = Some(self.id);
             inner.leader_id = None;
-            let _ = inner.persist_meta();
+            inner.persist_meta()?;
             let (last_term, last_index) = inner.last_position();
             (inner.term, last_term, last_index)
         };
@@ -2230,8 +2234,8 @@ impl Node {
                     inner.role = Role::Follower;
                     inner.voted_for = None;
                     inner.leader_id = None;
-                    let _ = inner.persist_meta();
-                    return;
+                    inner.persist_meta()?;
+                    return Ok(());
                 }
                 if granted && inner.term == term && !votes.contains(&peer) {
                     votes.push(peer);
@@ -2240,7 +2244,7 @@ impl Node {
         }
         let mut inner = self.inner.lock().await;
         if inner.term != term || inner.role != Role::Candidate {
-            return;
+            return Ok(());
         }
         let win_current = votes_win(&votes, &inner.current);
         let win_joint = inner.joint.as_ref().map(|joint| votes_win(&votes, joint)).unwrap_or(true);
@@ -2267,13 +2271,14 @@ impl Node {
             inner.role = Role::Follower;
             inner.leader_id = None;
         }
+        Ok(())
     }
 
-    async fn prevote(&self) -> bool {
+    async fn prevote(&self) -> Result<bool> {
         let (prospective, last_term, last_index) = {
             let inner = self.inner.lock().await;
             if inner.role == Role::Leader {
-                return false;
+                return Ok(false);
             }
             let (last_term, last_index) = inner.last_position();
             (inner.term + 1, last_term, last_index)
@@ -2301,9 +2306,9 @@ impl Node {
                             inner.role = Role::Follower;
                             inner.voted_for = None;
                             inner.leader_id = None;
-                            let _ = inner.persist_meta();
+                            inner.persist_meta()?;
                         }
-                        return false;
+                        return Ok(false);
                     }
                     if granted && !votes.contains(&peer) {
                         votes.push(peer);
@@ -2313,8 +2318,8 @@ impl Node {
             }
         }
         let inner = self.inner.lock().await;
-        votes_win(&votes, &inner.current)
-            && inner.joint.as_ref().map(|joint| votes_win(&votes, joint)).unwrap_or(true)
+        Ok(votes_win(&votes, &inner.current)
+            && inner.joint.as_ref().map(|joint| votes_win(&votes, joint)).unwrap_or(true))
     }
 
     pub async fn transfer(self: &Arc<Self>, target: usize) -> Result<()> {
@@ -2494,7 +2499,7 @@ impl Node {
                     self.clear_prepared_for_commit(commit_ts)?;
                 }
                 ApplyPayload::Conf { change } => {
-                    self.apply_conf(change).await;
+                    self.apply_conf(change).await?;
                 }
                 ApplyPayload::Metadata { payload } => {
                     self.apply_metadata(payload)?;
@@ -2618,7 +2623,7 @@ impl Node {
         Ok(())
     }
 
-    async fn apply_conf(&self, change: crate::ConfChange) {
+    async fn apply_conf(&self, change: crate::ConfChange) -> Result<()> {
         let members = {
             let mut inner = self.inner.lock().await;
             inner.current = normalize_members(change.old.clone());
@@ -2635,7 +2640,7 @@ impl Node {
                 inner.role = Role::Follower;
                 inner.campaign_now = false;
             }
-            let _ = inner.persist_meta();
+            inner.persist_meta()?;
             let mut members = inner.current.clone();
             if let Some(joint) = inner.joint.as_ref() {
                 members.extend(joint.iter().cloned());
@@ -2643,6 +2648,7 @@ impl Node {
             members
         };
         self.reconcile_pools(&members);
+        Ok(())
     }
 
     async fn serve_connection<S>(self: &Arc<Self>, mut socket: S) -> Result<()>
@@ -5484,7 +5490,8 @@ impl Node {
                             inner.term = peer_term;
                             inner.role = Role::Follower;
                             inner.voted_for = None;
-                            let _ = inner.persist_meta();
+                            inner.leader_id = None;
+                            inner.persist_meta()?;
                             return Err(RymeError::Unavailable(String::from("stepped down")));
                         }
                         if inner.term != term || inner.role != Role::Leader {
