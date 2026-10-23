@@ -3014,7 +3014,8 @@ impl DurableManager {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(RymeError::from(e)),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let Some(rest) = name.strip_prefix("snap-").and_then(|n| n.strip_suffix(".rsnap"))
@@ -3029,11 +3030,17 @@ impl DurableManager {
         snaps.sort_by_key(|(commit, _)| *commit);
         let excess = snaps.len().saturating_sub(keep.max(1));
         let mut removed = 0;
-        for (_, path) in snaps.iter().take(excess) {
-            if std::fs::remove_file(path).is_ok() {
+        let removal_result = (|| -> Result<()> {
+            for (_, path) in snaps.iter().take(excess) {
+                std::fs::remove_file(path)?;
                 removed += 1;
             }
+            Ok(())
+        })();
+        if removed > 0 {
+            sync_directory(&dir)?;
         }
+        removal_result?;
         Ok(removed)
     }
 
@@ -3045,7 +3052,8 @@ impl DurableManager {
             Err(e) => return Err(RymeError::from(e)),
         };
         let mut oldest: Option<u64> = None;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(rest) = name.strip_prefix("snap-").and_then(|n| n.strip_suffix(".rsnap"))
             else {
@@ -3067,7 +3075,8 @@ impl DurableManager {
             Err(e) => return Err(RymeError::from(e)),
         };
         let mut newest: Option<u64> = None;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(rest) = name.strip_prefix("snap-").and_then(|n| n.strip_suffix(".rsnap"))
             else {
@@ -3216,7 +3225,8 @@ impl DurableManager {
             Err(e) => return Err(RymeError::from(e)),
         };
         let mut best: Option<(u64, std::path::PathBuf)> = None;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let Some(commit) = snapshot_commit(name) else { continue };
