@@ -79,6 +79,8 @@ All notable changes to rymeDB are recorded here. Format follows
   string and reject embedded NULs or trailing bytes.
 - PostgreSQL Execute messages with a positive `max_rows` now return
   `0A000` instead of silently returning more rows than the client requested.
+- RESP command names and inline commands now reject malformed UTF-8 instead of
+  replacing invalid bytes; array bulk arguments remain binary-safe.
 - RESP array commands split at TCP read boundaries now remain buffered instead
   of being rejected as malformed.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment

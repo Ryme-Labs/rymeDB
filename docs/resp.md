@@ -41,6 +41,8 @@ bytes, and may contain at most 1,024 arguments. Larger commands are rejected
 before bulk arguments are copied into command storage. This is a deliberate
 resource bound; clients sending large values should split the data or use
 another gateway with a suitable request limit.
+RESP command names and inline commands must be valid UTF-8; array bulk-string
+arguments remain binary-safe.
 Commands may be split across TCP reads; incomplete frames remain buffered until
 the rest of the command arrives, subject to the frame and process-wide memory
 limits.

@@ -6182,7 +6182,8 @@ fn decode_inline(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
     if frame_end > RESP_MAX_FRAME_BYTES {
         return Err(RymeError::Overload(String::from("request")));
     }
-    let line = String::from_utf8_lossy(&input[..end]).into_owned();
+    let line = std::str::from_utf8(&input[..end])
+        .map_err(|_| RymeError::InvalidArgument(String::from("resp utf8")))?;
     let mut tokens = line.split_whitespace();
     let Some(name) = tokens.next() else {
         return Err(RymeError::InvalidArgument(String::from("resp")));
@@ -6247,7 +6248,9 @@ fn decode_array(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
     }
     Ok(Some((
         RespCommand {
-            name: String::from_utf8_lossy(&parts[0]).to_ascii_uppercase(),
+            name: std::str::from_utf8(&parts[0])
+                .map_err(|_| RymeError::InvalidArgument(String::from("resp command name")))?
+                .to_ascii_uppercase(),
             args: parts[1..].to_vec(),
         },
         offset,
