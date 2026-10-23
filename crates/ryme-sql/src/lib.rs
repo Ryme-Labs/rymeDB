@@ -8565,7 +8565,7 @@ where
             } else if filter_is_empty && offset == 0 {
                 limit.clamp(1, 10_000)
             } else {
-                limit.saturating_add(offset).clamp(1, 10_000)
+                limit.saturating_add(offset).clamp(1, MAX_QUERY_MATERIALIZED_ROWS.saturating_add(1))
             };
             return Ok((cap, is_view));
         }

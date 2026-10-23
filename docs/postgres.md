@@ -34,6 +34,9 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
 - Ordered SQL scans sort the full result up to the query materialization bound
   of 100,000 rows and 64 MiB; larger ordered results fail with an overload error
   instead of returning a partial, incorrectly ordered result.
+- `LIMIT` and `OFFSET` each accept values up to 10,000; primary-key-ordered
+  scans size the read window from their combined values so offset pages retain
+  all requested rows.
 
 ## Compatibility boundary
 
