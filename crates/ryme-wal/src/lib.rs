@@ -137,7 +137,7 @@ impl Wal {
     pub fn truncate_below(&mut self, floor_commit_ts: u64) -> Result<usize> {
         let mut ids = segment_ids(&self.dir)?;
         ids.sort_unstable();
-        let mut removed = 0;
+        let mut obsolete = Vec::new();
         for id in ids {
             if id >= self.active_id {
                 continue;
@@ -159,10 +159,22 @@ impl Wal {
                 }
             }
             if !keep {
-                std::fs::remove_file(&path)?;
-                removed += 1;
+                obsolete.push(path);
             }
         }
+
+        let mut removed = 0;
+        let removal_result = (|| -> Result<()> {
+            for path in obsolete {
+                std::fs::remove_file(path)?;
+                removed += 1;
+            }
+            Ok(())
+        })();
+        if removed > 0 {
+            sync_directory(&self.dir)?;
+        }
+        removal_result?;
         Ok(removed)
     }
 
