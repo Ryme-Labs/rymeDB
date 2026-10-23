@@ -1066,6 +1066,9 @@ where
             match tag {
                 b'S' => {
                     ignore_until_sync = false;
+                    if active_transaction.is_none() {
+                        portals.clear();
+                    }
                     send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                 }
                 b'X' => return Ok(()),
@@ -1238,6 +1241,9 @@ where
                         }
                     }
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    if active_transaction.is_none() {
+                        portals.clear();
+                    }
                     send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
@@ -1247,6 +1253,9 @@ where
                     }
                     let response = encode_error_code("57014", copy_fail_message(&payload));
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    if active_transaction.is_none() {
+                        portals.clear();
+                    }
                     send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
@@ -1260,6 +1269,9 @@ where
                     }
                     let response = encode_error_code("22P04", message);
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    if active_transaction.is_none() {
+                        portals.clear();
+                    }
                     send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
@@ -1271,6 +1283,9 @@ where
                     let response =
                         encode_error_code("08P01", String::from("unexpected message during COPY"));
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                    if active_transaction.is_none() {
+                        portals.clear();
+                    }
                     send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
@@ -1281,6 +1296,9 @@ where
         match tag {
             b'X' => return Ok(()),
             b'Q' => {
+                statements.remove("");
+                prepared_cache.remove("");
+                portals.remove("");
                 let query = String::from_utf8_lossy(&payload);
                 let mut out = Vec::new();
                 let mut committed_notifications = Vec::new();
@@ -1472,11 +1490,28 @@ where
                 };
                 socket.write_all(&out).await.map_err(|e| RymeError::Io(e.to_string()))?;
                 if !awaiting_copy {
+                    if active_transaction.is_none() {
+                        portals.clear();
+                    }
                     send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                 }
             }
             b'P' => match parse_prepare(&payload) {
                 Ok((name, query)) => {
+                    if !name.is_empty() && statements.contains_key(&name) {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
+                        socket
+                            .write_all(&encode_error_code(
+                                "42P05",
+                                format!("prepared statement \"{name}\" already exists"),
+                            ))
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        continue;
+                    }
                     if (statements.len() >= MAX_PREPARED_STATEMENTS
                         && !statements.contains_key(&name))
                         || prepared_state_exceeds_limit(&statements, &name, &query)
@@ -1494,6 +1529,9 @@ where
                             .await
                             .map_err(|e| RymeError::Io(e.to_string()))?;
                         continue;
+                    }
+                    if name.is_empty() {
+                        portals.retain(|_, portal| !portal.statement.is_empty());
                     }
                     prepared_cache.remove(&name);
                     statements.insert(name, query);
@@ -1513,6 +1551,34 @@ where
             },
             b'B' => match parse_bind(&payload) {
                 Ok((portal, statement, params)) => {
+                    if !statements.contains_key(&statement) {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
+                        socket
+                            .write_all(&encode_error_code(
+                                "26000",
+                                format!("prepared statement \"{statement}\" does not exist"),
+                            ))
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        continue;
+                    }
+                    if !portal.is_empty() && portals.contains_key(&portal) {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
+                        socket
+                            .write_all(&encode_error_code(
+                                "42P03",
+                                format!("portal \"{portal}\" already exists"),
+                            ))
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        continue;
+                    }
                     if portals.len() >= MAX_PORTALS && !portals.contains_key(&portal) {
                         ignore_until_sync = true;
                         if let Some(transaction) = active_transaction.as_mut() {
@@ -1748,6 +1814,7 @@ where
                 if kind == b'S' {
                     statements.remove(&name);
                     prepared_cache.remove(&name);
+                    portals.retain(|_, portal| portal.statement != name);
                 } else {
                     portals.remove(&name);
                 }
@@ -1757,6 +1824,9 @@ where
                     .map_err(|e| RymeError::Io(e.to_string()))?;
             }
             b'S' => {
+                if active_transaction.is_none() {
+                    portals.clear();
+                }
                 send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
             }
             b'H' => socket.flush().await.map_err(|e| RymeError::Io(e.to_string()))?,
