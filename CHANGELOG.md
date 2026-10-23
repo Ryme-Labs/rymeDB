@@ -32,6 +32,8 @@ All notable changes to rymeDB are recorded here. Format follows
   created exclusively, with cleanup on failed writes or replacement.
 - WAL rewrite staging now creates segments exclusively and installs them from
   synced sibling temp files without copying through destination paths.
+- Keyring loading now rejects symlink and non-regular paths before repairing
+  permissions through the opened file handle.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.

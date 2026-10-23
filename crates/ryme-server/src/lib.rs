@@ -15227,19 +15227,32 @@ fn kms_from_env() -> Option<EnvKms> {
 }
 
 fn read_keyring(path: &std::path::Path) -> ryme_error::Result<Option<Vec<u8>>> {
-    #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(path) {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
-
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    if !path_metadata.file_type().is_file() {
+        return Err(ryme_error::RymeError::Corrupt(String::from("keyring file")));
+    }
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(ryme_error::RymeError::Corrupt(String::from("keyring file")));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err(ryme_error::RymeError::Corrupt(String::from("keyring file")));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
     let length = file.metadata()?.len();
     if length > KEYRING_MAX_BYTES as u64 {
         return Err(ryme_error::RymeError::Overload(String::from("keyring")));
