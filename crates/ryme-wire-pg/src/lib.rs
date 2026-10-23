@@ -929,7 +929,8 @@ fn parse_startup(payload: &[u8]) -> Result<StartupParams> {
     if version != 196608 {
         return Err(RymeError::InvalidArgument(String::from("unsupported protocol")));
     }
-    let mut values = HashMap::new();
+    let mut user = None;
+    let mut database = None;
     let mut offset = 4;
     while offset < payload.len() {
         let Some(end) = payload[offset..].iter().position(|byte| *byte == 0) else {
@@ -938,22 +939,25 @@ fn parse_startup(payload: &[u8]) -> Result<StartupParams> {
         if end == 0 {
             break;
         }
-        let key = String::from_utf8(payload[offset..offset + end].to_vec())
+        let key = std::str::from_utf8(&payload[offset..offset + end])
             .map_err(|_| RymeError::InvalidArgument(String::from("startup parameters")))?;
         offset += end + 1;
         let Some(value_end) = payload[offset..].iter().position(|byte| *byte == 0) else {
             return Err(RymeError::InvalidArgument(String::from("startup parameters")));
         };
-        let value = String::from_utf8(payload[offset..offset + value_end].to_vec())
+        let value = std::str::from_utf8(&payload[offset..offset + value_end])
             .map_err(|_| RymeError::InvalidArgument(String::from("startup parameters")))?;
         offset += value_end + 1;
-        values.insert(key, value);
+        match key {
+            "user" => user = Some(value.to_owned()),
+            "database" => database = Some(value.to_owned()),
+            _ => {}
+        }
     }
-    let user = values
-        .remove("user")
+    let user = user
         .filter(|user| !user.is_empty())
         .ok_or_else(|| RymeError::InvalidArgument(String::from("startup user")))?;
-    let database = values.remove("database").filter(|database| !database.is_empty());
+    let database = database.filter(|database| !database.is_empty());
     Ok(StartupParams { user, database })
 }
 

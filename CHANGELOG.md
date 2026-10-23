@@ -53,6 +53,8 @@ All notable changes to rymeDB are recorded here. Format follows
   object, and sync newly created directory entries before reporting success.
 - WAL recovery now recognizes only canonical, fixed-width segment filenames,
   avoiding duplicate or unreachable segment IDs from alternate spellings.
+- PostgreSQL startup parsing now validates parameters without allocating and
+  retaining unused parameter names and values.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment
   filenames, preventing alternate spellings from duplicating segment IDs.
 - WAL archive enumeration now propagates directory errors and rejects symlink
