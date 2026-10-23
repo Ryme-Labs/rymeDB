@@ -1232,6 +1232,7 @@ fn read_bounded_metadata_file(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    verify_opened_file(&metadata, &file, label)?;
     let file_len = file.metadata()?.len();
     if file_len > max_bytes as u64 {
         return Err(RymeError::Overload(String::from(label)));
@@ -1245,6 +1246,27 @@ fn read_bounded_metadata_file(
     Ok(Some(bytes))
 }
 
+fn verify_opened_file(
+    path_metadata: &std::fs::Metadata,
+    file: &std::fs::File,
+    label: &str,
+) -> Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RymeError::Corrupt(label.to_string()));
+    }
+    #[cfg(not(unix))]
+    let _ = path_metadata;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err(RymeError::Corrupt(label.to_string()));
+        }
+    }
+    Ok(())
+}
+
 fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
     const V1_HEADER: u64 = 4 + 2 + 2 + 8 + 4;
     const V2_HEADER: u64 = V1_HEADER + 8;
@@ -1253,6 +1275,7 @@ fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
         return Err(RymeError::Corrupt(String::from("segment file")));
     }
     let mut file = std::fs::File::open(path)?;
+    verify_opened_file(&metadata, &file, "segment file")?;
     let file_len = file.metadata()?.len();
     let mut prefix = [0; 16];
     file.read_exact(&mut prefix)?;
@@ -1279,7 +1302,12 @@ fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
 
 fn read_segment_max_commit_ts(path: &Path) -> Result<u64> {
     const V2_HEADER: usize = 4 + 2 + 2 + 8 + 8 + 4;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(RymeError::Corrupt(String::from("segment file")));
+    }
     let mut file = std::fs::File::open(path)?;
+    verify_opened_file(&metadata, &file, "segment file")?;
     let file_len = file.metadata()?.len();
     if file_len > MAX_SEGMENT_BYTES as u64 {
         return Err(RymeError::Overload(String::from("segment")));

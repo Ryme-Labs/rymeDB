@@ -42,6 +42,8 @@ All notable changes to rymeDB are recorded here. Format follows
   verifying opened-file identity on Unix.
 - Raft node and range catalog loading now rejects symlinks and non-regular
   files, verifying opened-file identity on Unix.
+- Segment and storage metadata readers now verify the opened file still matches
+  the checked path on Unix before parsing its contents.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.
