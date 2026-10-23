@@ -6441,11 +6441,18 @@ impl ryme_txn::TxnBackend for ClusterBackend {
                 && txn.writes().is_empty()
                 && txn.scanned_tables().is_empty()
                 && txn.constraint_scanned_tables().is_empty();
+            let snapshot_floor = txn.read_ts;
             let read_ts = if establish_snapshot { 0 } else { txn.read_ts };
-            let (value, _, observed_read_ts) =
+            let (mut value, _, observed_read_ts) =
                 node.fetch_range_value_with_ts(owner, key.clone(), read_ts).await?;
-            if establish_snapshot && observed_read_ts != 0 {
-                txn.restamp(observed_read_ts);
+            if establish_snapshot {
+                // A stale range owner must not move the transaction's snapshot backward.
+                let snapshot_ts = snapshot_floor.max(observed_read_ts);
+                if observed_read_ts < snapshot_ts {
+                    value =
+                        node.fetch_range_value_with_ts(owner, key.clone(), snapshot_ts).await?.0;
+                }
+                txn.restamp(snapshot_ts);
             }
             txn.record_read(key.clone(), value.is_some())?;
             Ok(value)
