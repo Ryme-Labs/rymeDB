@@ -4,7 +4,7 @@ Single-node production install. For clustered Raft, use
 `deploy/k8s/helm/rymeDB` which renders peer-aware entrypoints.
 
 The manifest uses the published GHCR image. Replace the tag with a release
-tag when deploying a version other than `2.0.1`:
+tag when deploying a version other than `2.0.2`:
 
 ```sh
 kubectl -n rymedb set image statefulset/rymedb \

@@ -4,6 +4,17 @@ All notable changes to rymeDB are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [2.0.2] — 2026-10-23
+
+### Fixed
+
+- Range leaders are now advertised only after a quorum heartbeat succeeds,
+  keeping writes from routing to candidates that have not established quorum.
+- Rust SDK TLS dependencies and Tokio were updated to address published
+  security advisories.
+- Realtime WebSocket integration fixtures now send operator credentials in
+  authorization headers instead of URL query strings.
+
 ## [2.0.1] — 2026-10-23
 
 ### Fixed
