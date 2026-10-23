@@ -50,6 +50,38 @@ const fn default_sequence_cache() -> i64 {
     1
 }
 
+fn normalize_sequence_data_type(data_type: &str) -> Option<&'static str> {
+    match data_type.to_ascii_lowercase().as_str() {
+        "smallint" | "int2" => Some("smallint"),
+        "integer" | "int" | "int4" => Some("integer"),
+        "bigint" | "int8" => Some("bigint"),
+        _ => None,
+    }
+}
+
+fn sequence_data_type_bounds(data_type: &str) -> Option<(i64, i64)> {
+    match normalize_sequence_data_type(data_type)? {
+        "smallint" => Some((i16::MIN as i64, i16::MAX as i64)),
+        "integer" => Some((i32::MIN as i64, i32::MAX as i64)),
+        "bigint" => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
+fn sequence_definition_is_valid(sequence: &SequenceDefinition) -> bool {
+    sequence_data_type_bounds(&sequence.data_type).is_some_and(|(type_min, type_max)| {
+        sequence.increment != 0
+            && sequence.cache > 0
+            && sequence.min_value >= type_min
+            && sequence.max_value <= type_max
+            && sequence.min_value <= sequence.max_value
+            && (sequence.min_value..=sequence.max_value).contains(&sequence.start)
+            && sequence
+                .last_value
+                .is_none_or(|value| (sequence.min_value..=sequence.max_value).contains(&value))
+    })
+}
+
 const fn default_sequence_called() -> bool {
     true
 }
@@ -1304,6 +1336,9 @@ fn schema_snapshot_object_count(snapshot: &SchemaSnapshot) -> Result<usize> {
 
 fn schema_snapshot_bytes(snapshot: &SchemaSnapshot) -> Result<Vec<u8>> {
     schema_snapshot_object_count(snapshot)?;
+    if snapshot.sequences.values().any(|sequence| !sequence_definition_is_valid(sequence)) {
+        return Err(RymeError::Corrupt(String::from("schema snapshot sequence")));
+    }
     validate_role_catalog(&snapshot.roles)?;
     validate_role_memberships(snapshot)?;
     validate_rls_policy_catalog(snapshot)?;
@@ -3563,9 +3598,9 @@ fn parse_create_sequence(tokens: &[String], kind_index: usize) -> Result<Stateme
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create sequence")))?;
     let mut data_type = default_sequence_data_type();
     let mut increment = default_sequence_increment();
-    let mut min_value = default_sequence_min();
-    let mut max_value = default_sequence_max();
-    let mut start = default_sequence_start();
+    let mut min_value = None;
+    let mut max_value = None;
+    let mut start = None;
     let mut cache = default_sequence_cache();
     let mut cycle = false;
     let mut position = name_index + 1;
@@ -3600,29 +3635,31 @@ fn parse_create_sequence(tokens: &[String], kind_index: usize) -> Result<Stateme
                 } else {
                     position + 1
                 };
-                start = parse_sequence_number(tokens.get(value_pos), "sequence start")?;
+                start = Some(parse_sequence_number(tokens.get(value_pos), "sequence start")?);
                 position = value_pos + 1;
             }
             "MINVALUE" => {
-                min_value = parse_sequence_number(tokens.get(position + 1), "sequence minimum")?;
+                min_value =
+                    Some(parse_sequence_number(tokens.get(position + 1), "sequence minimum")?);
                 position += 2;
             }
             "MAXVALUE" => {
-                max_value = parse_sequence_number(tokens.get(position + 1), "sequence maximum")?;
+                max_value =
+                    Some(parse_sequence_number(tokens.get(position + 1), "sequence maximum")?);
                 position += 2;
             }
             "NO" if tokens
                 .get(position + 1)
                 .is_some_and(|value| value.eq_ignore_ascii_case("MINVALUE")) =>
             {
-                min_value = if increment < 0 { i64::MIN } else { 1 };
+                min_value = None;
                 position += 2;
             }
             "NO" if tokens
                 .get(position + 1)
                 .is_some_and(|value| value.eq_ignore_ascii_case("MAXVALUE")) =>
             {
-                max_value = if increment < 0 { -1 } else { i64::MAX };
+                max_value = None;
                 position += 2;
             }
             "CACHE" => {
@@ -3643,8 +3680,18 @@ fn parse_create_sequence(tokens: &[String], kind_index: usize) -> Result<Stateme
             _ => position += 1,
         }
     }
+    let data_type = normalize_sequence_data_type(&data_type)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("sequence data type")))?
+        .to_string();
+    let (type_min, type_max) = sequence_data_type_bounds(&data_type)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("sequence data type")))?;
+    let min_value = min_value.unwrap_or(if increment < 0 { type_min } else { 1 });
+    let max_value = max_value.unwrap_or(if increment < 0 { -1 } else { type_max });
+    let start = start.unwrap_or(if increment < 0 { -1 } else { 1 });
     if increment == 0
         || cache <= 0
+        || min_value < type_min
+        || max_value > type_max
         || min_value > max_value
         || start < min_value
         || start > max_value
@@ -8489,6 +8536,9 @@ where
     }
 
     fn install_sequence(&self, definition: SequenceDefinition, if_not_exists: bool) -> Result<()> {
+        if !sequence_definition_is_valid(&definition) {
+            return Err(RymeError::InvalidArgument(String::from("invalid sequence definition")));
+        }
         let mut sequences = self
             .sequences
             .lock()

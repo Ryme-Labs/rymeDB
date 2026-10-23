@@ -19,6 +19,8 @@ All notable changes to rymeDB are recorded here. Format follows
   integer and producing duplicate identifiers.
 - SQL sequence arithmetic now reports integer overflow as exhaustion, and
   invalid `ALTER SEQUENCE` options leave the sequence unchanged.
+- SQL sequences now validate `smallint`, `integer`, and `bigint` ranges and use
+  direction-aware defaults for descending sequences.
 - Range split, merge, and leader changes now reject exhausted epochs before
   mutating topology, preserving monotonic routing fences.
 - Branch promotion now rejects exhausted schema versions before changing
