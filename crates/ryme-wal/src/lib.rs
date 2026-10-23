@@ -5,6 +5,31 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+fn configure_private_file(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    use std::os::unix::fs::DirBuilderExt;
+    builder.mode(0o700);
+    builder.create(path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> Result<()> {
+    std::fs::create_dir(path)?;
+    Ok(())
+}
+
 pub const WAL_MAGIC: u32 = 0x52594D45;
 pub const WAL_VERSION: u16 = 1;
 pub const MAX_WAL_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
@@ -356,7 +381,10 @@ impl Wal {
 
 fn create_rewrite_marker(dir: &Path) -> Result<()> {
     let marker = dir.join(REWRITE_MARKER);
-    let file = OpenOptions::new().write(true).create_new(true).open(marker)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_private_file(&mut options);
+    let file = options.open(marker)?;
     file.sync_all()?;
     sync_directory(dir)
 }
@@ -380,7 +408,7 @@ fn prepare_rewrite_directory(dir: &Path) -> Result<PathBuf> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    std::fs::create_dir(&temporary)?;
+    create_private_directory(&temporary)?;
     Ok(temporary)
 }
 
@@ -583,18 +611,27 @@ fn open_segment_append(path: &Path, create: bool) -> Result<File> {
         }
         Ok(_) => Err(RymeError::Corrupt(String::from("wal segment file"))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            Ok(OpenOptions::new().create_new(true).read(true).append(true).open(path)?)
+            let mut options = OpenOptions::new();
+            options.create_new(true).read(true).append(true);
+            configure_private_file(&mut options);
+            Ok(options.open(path)?)
         }
         Err(error) => Err(error.into()),
     }
 }
 
 fn create_segment_append(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new().create_new(true).read(true).append(true).open(path)?)
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).append(true);
+    configure_private_file(&mut options);
+    Ok(options.open(path)?)
 }
 
 fn create_rewrite_segment(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_private_file(&mut options);
+    Ok(options.open(path)?)
 }
 
 fn install_rewrite_segment(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
@@ -603,7 +640,10 @@ fn install_rewrite_segment(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let (temporary, mut file) = loop {
         let id = NEXT_REWRITE_INSTALL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temporary = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), id));
-        match OpenOptions::new().write(true).create_new(true).open(&temporary) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_private_file(&mut options);
+        match options.open(&temporary) {
             Ok(file) => break (temporary, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),

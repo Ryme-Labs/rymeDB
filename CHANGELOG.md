@@ -25,6 +25,8 @@ All notable changes to rymeDB are recorded here. Format follows
   symlink swaps during recovery or writes.
 - WAL recovery rejects symlinked rewrite markers and staging directories before
   installing staged segments.
+- On Unix, newly created WAL segment, rewrite, and marker files use mode 0600;
+  rewrite staging directories use mode 0700.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique
