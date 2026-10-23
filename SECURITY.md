@@ -5,7 +5,7 @@
 | Version | Supported |
 | --- | --- |
 | 2.0.x | Yes |
-| 0.x | No |
+| Earlier versions | No |
 
 ## Reporting a vulnerability
 
