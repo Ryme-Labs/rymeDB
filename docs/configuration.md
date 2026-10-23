@@ -58,6 +58,11 @@ rejected with an overload error when either budget is exhausted. These are
 index-structure budgets, not caps on total process memory, and are not
 currently configurable.
 
+The native TCP/TLS gateway limits request bodies to 4 MiB plus 1 KiB and uses a
+shared 256 MiB budget for connection read buffers and pending framed input.
+Connections are closed when the process-wide input budget is exhausted; this
+budget is not currently configurable.
+
 ## Listener flags
 
 The equivalent CLI flags are `--pg-listen`, `--resp-listen`,

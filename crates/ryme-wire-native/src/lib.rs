@@ -9,13 +9,20 @@ use ryme_observe::{
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const MAX_FRAME: usize = 4 * 1024 * 1024 + 1024;
 pub const VERSION: &str = "ryme-native/1";
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+const NATIVE_READ_CHUNK_BYTES: usize = 64 * 1024;
+const NATIVE_INPUT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const NATIVE_INPUT_BUDGET_UNIT_BYTES: usize = 64 * 1024;
+static NATIVE_INPUT_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(NATIVE_INPUT_BUDGET_BYTES / NATIVE_INPUT_BUDGET_UNIT_BYTES))
+});
 
 pub use ryme_tls::TlsAcceptor;
 
@@ -104,6 +111,11 @@ pub fn encode_frame(body: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn decode_frame(buffer: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
+    let Some((len, frame_bytes)) = complete_frame_length(buffer)? else { return Ok(None) };
+    Ok(Some((buffer[4..4 + len].to_vec(), frame_bytes)))
+}
+
+fn complete_frame_length(buffer: &[u8]) -> Result<Option<(usize, usize)>> {
     if buffer.len() < 4 {
         return Ok(None);
     }
@@ -113,10 +125,12 @@ pub fn decode_frame(buffer: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
     if len > MAX_FRAME {
         return Err(RymeError::Overload(String::from("frame")));
     }
-    if buffer.len() < 4 + len {
+    let frame_bytes =
+        4usize.checked_add(len).ok_or_else(|| RymeError::Overload(String::from("frame")))?;
+    if buffer.len() < frame_bytes {
         return Ok(None);
     }
-    Ok(Some((buffer[4..4 + len].to_vec(), 4 + len)))
+    Ok(Some((len, frame_bytes)))
 }
 
 #[derive(Debug, Clone)]
@@ -290,19 +304,47 @@ where
         // Batch ordinary pipelined replies to reduce syscall overhead while
         // keeping the response buffer bounded for connection-level fairness.
         const WRITE_BATCH_BYTES: usize = 64 * 1024;
+        let mut input_permits: Vec<OwnedSemaphorePermit> = vec![NATIVE_INPUT_BUDGET
+            .clone()
+            .try_acquire_many_owned(1)
+            .map_err(|_| RymeError::Overload(String::from("input memory budget")))?];
         let mut pending: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; 65536];
+        let mut pending_reserved_units = 0usize;
+        let mut chunk = vec![0u8; NATIVE_READ_CHUNK_BYTES];
         loop {
             let read = socket.read(&mut chunk).await.map_err(|e| RymeError::Io(e.to_string()))?;
             if read == 0 {
                 return Ok(());
             }
+            let next_len = pending
+                .len()
+                .checked_add(read)
+                .ok_or_else(|| RymeError::Overload(String::from("request")))?;
+            if next_len > MAX_FRAME + 4 + NATIVE_READ_CHUNK_BYTES {
+                return Err(RymeError::Overload(String::from("request")));
+            }
+            let required_units = next_len.div_ceil(NATIVE_INPUT_BUDGET_UNIT_BYTES);
+            let additional_units = required_units.saturating_sub(pending_reserved_units);
+            if additional_units > 0 {
+                let permit = NATIVE_INPUT_BUDGET
+                    .clone()
+                    .try_acquire_many_owned(additional_units as u32)
+                    .map_err(|_| RymeError::Overload(String::from("input memory budget")))?;
+                input_permits.push(permit);
+            }
+            pending
+                .try_reserve_exact(read)
+                .map_err(|_| RymeError::Overload(String::from("request memory")))?;
+            pending_reserved_units = required_units;
             pending.extend_from_slice(&chunk[..read]);
             let mut consumed = 0usize;
             let mut replies = Vec::with_capacity(WRITE_BATCH_BYTES);
-            while let Some((body, frame_bytes)) = decode_frame(&pending[consumed..])? {
+            while let Some((body_len, frame_bytes)) = complete_frame_length(&pending[consumed..])? {
                 consumed += frame_bytes;
-                let response = self.dispatch(&body).await;
+                let body_start = consumed - frame_bytes + 4;
+                let body_end = body_start + body_len;
+                let body = &pending[body_start..body_end];
+                let response = self.dispatch(body).await;
                 let raw = serde_json::to_vec(&response)
                     .map_err(|e| RymeError::Internal(e.to_string()))?;
                 let frame = encode_frame(&raw)?;
