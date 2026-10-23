@@ -932,11 +932,16 @@ fn parse_startup(payload: &[u8]) -> Result<StartupParams> {
     let mut user = None;
     let mut database = None;
     let mut offset = 4;
+    let mut terminated = false;
     while offset < payload.len() {
         let Some(end) = payload[offset..].iter().position(|byte| *byte == 0) else {
             return Err(RymeError::InvalidArgument(String::from("startup parameters")));
         };
         if end == 0 {
+            if offset + 1 != payload.len() {
+                return Err(RymeError::InvalidArgument(String::from("startup parameters")));
+            }
+            terminated = true;
             break;
         }
         let key = std::str::from_utf8(&payload[offset..offset + end])
@@ -953,6 +958,9 @@ fn parse_startup(payload: &[u8]) -> Result<StartupParams> {
             "database" => database = Some(value.to_owned()),
             _ => {}
         }
+    }
+    if !terminated {
+        return Err(RymeError::InvalidArgument(String::from("startup parameters")));
     }
     let user = user
         .filter(|user| !user.is_empty())

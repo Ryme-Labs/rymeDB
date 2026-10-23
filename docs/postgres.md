@@ -17,6 +17,8 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
 ## Covered protocol behavior
 
 - Startup and authentication, `BackendKeyData`, and cancel requests.
+- Startup parameter lists require PostgreSQL's final zero-byte terminator and
+  reject bytes following it.
 - Startup, TLS negotiation, and authentication must complete within 15 seconds;
   the deadline ends before the authenticated session begins.
 - Simple and extended query flows (`Parse`, `Bind`, `Describe`, `Execute`,

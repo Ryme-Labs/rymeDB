@@ -55,6 +55,8 @@ All notable changes to rymeDB are recorded here. Format follows
   avoiding duplicate or unreachable segment IDs from alternate spellings.
 - PostgreSQL startup parsing now validates parameters without allocating and
   retaining unused parameter names and values.
+- PostgreSQL startup packets now require the final zero-byte parameter
+  terminator and reject trailing bytes.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment
   filenames, preventing alternate spellings from duplicating segment IDs.
 - WAL archive enumeration now propagates directory errors and rejects symlink
