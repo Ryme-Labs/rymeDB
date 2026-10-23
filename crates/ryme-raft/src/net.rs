@@ -1631,7 +1631,13 @@ impl Node {
             if !range.replicas.contains(&self.id) {
                 continue;
             }
-            let state = self.ensure_range_group(&range.id, range.owner);
+            let state = match self.try_ensure_range_group(&range.id, range.owner) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::error!(group_id = %range.id, %error, "range metadata unavailable");
+                    continue;
+                }
+            };
             if state.leader == Some(self.id) {
                 if now.saturating_sub(state.last_heartbeat_ms) >= 100 {
                     if let Ok(mut groups) = self.range_groups.lock() {
@@ -1669,7 +1675,7 @@ impl Node {
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
         }
-        let state = self.ensure_range_group(group_id, self.id);
+        let state = self.try_ensure_range_group(group_id, self.id)?;
         let (last_index, last_term) = self.try_range_last_position(group_id)?;
         for replica in range.replicas.iter().copied().filter(|replica| *replica != self.id) {
             let _ = self
@@ -1986,10 +1992,10 @@ impl Node {
     ) -> Result<(u64, bool)> {
         let Some(range) = self.try_range_owners()?.into_iter().find(|range| range.id == group_id)
         else {
-            return Ok((self.range_term(group_id), false));
+            return Ok((self.try_range_term(group_id)?, false));
         };
         if !range.replicas.contains(&self.id) || !range.replicas.contains(&candidate) {
-            return Ok((self.range_term(group_id), false));
+            return Ok((self.try_range_term(group_id)?, false));
         }
         let (local_last_index, local_last_term) = self.try_range_last_position(group_id)?;
         let mut groups = self
@@ -2800,14 +2806,14 @@ impl Node {
                 );
                 match result {
                     Ok(last_index) => Ok(Rpc::RangeAppendResponse {
-                        term: self.range_term(&group_id),
+                        term: self.try_range_term(&group_id)?,
                         appended: true,
                         last_index,
                         conflict_index: None,
                         error: None,
                     }),
                     Err(error) => Ok(Rpc::RangeAppendResponse {
-                        term: self.range_term(&group_id),
+                        term: self.try_range_term(&group_id)?,
                         appended: false,
                         last_index: self.try_range_last_index(&group_id)?,
                         conflict_index: self.range_conflict_index(
@@ -3967,8 +3973,11 @@ impl Node {
         self.try_range_resolution(group_id, transaction_id, commit_ts).unwrap()
     }
 
-    fn ensure_range_group(&self, group_id: &str, leader: usize) -> RangeGroupState {
-        let mut groups = self.range_groups.lock().unwrap_or_else(|error| error.into_inner());
+    fn try_ensure_range_group(&self, group_id: &str, leader: usize) -> Result<RangeGroupState> {
+        let mut groups = self
+            .range_groups
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
         let state = groups.entry(group_id.to_string()).or_default();
         if state.term == 0 {
             state.term = 1;
@@ -3976,16 +3985,15 @@ impl Node {
         if state.leader.is_none() {
             state.leader = Some(leader);
         }
-        state.clone()
+        Ok(state.clone())
     }
 
-    fn range_term(&self, group_id: &str) -> u64 {
-        self.range_groups
+    fn try_range_term(&self, group_id: &str) -> Result<u64> {
+        let groups = self
+            .range_groups
             .lock()
-            .ok()
-            .and_then(|groups| groups.get(group_id).map(|state| state.term))
-            .unwrap_or(1)
-            .max(1)
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+        Ok(groups.get(group_id).map(|state| state.term).unwrap_or(1).max(1))
     }
 
     fn persist_range_meta(&self) -> Result<()> {
@@ -4321,7 +4329,7 @@ impl Node {
         publish_data: bool,
         kind: RangeEntryKind,
     ) -> Result<u64> {
-        let mut state = self.ensure_range_group(group_id, leader);
+        let mut state = self.try_ensure_range_group(group_id, leader)?;
         if term < state.term {
             return Err(RymeError::Unavailable(String::from("stale range term")));
         }
@@ -4432,7 +4440,7 @@ impl Node {
             .try_range_last_index(group_id)?
             .checked_add(1)
             .ok_or_else(|| RymeError::Corrupt(String::from("range log index overflow")))?;
-        let term = self.ensure_range_group(group_id, self.id).term.max(1);
+        let term = self.try_ensure_range_group(group_id, self.id)?.term.max(1);
         self.append_range_entry(
             group_id,
             index,
@@ -4520,7 +4528,7 @@ impl Node {
                 .sync_range_replica(
                     group_id,
                     replica,
-                    self.range_term(group_id),
+                    self.try_range_term(group_id)?,
                     keep_through,
                     last_term,
                     commit_index,
@@ -5927,7 +5935,10 @@ impl Node {
             }
             range.replicas.sort_unstable();
             range.replicas.dedup();
-            self.ensure_range_group(&range.id, range.owner);
+            if let Err(error) = self.try_ensure_range_group(&range.id, range.owner) {
+                tracing::error!(group_id = %range.id, %error, "range metadata unavailable");
+                return;
+            }
         }
         let _ = self.persist_range_meta();
         owners.sort_by(|left, right| left.start.cmp(&right.start));
