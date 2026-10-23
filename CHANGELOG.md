@@ -46,6 +46,8 @@ All notable changes to rymeDB are recorded here. Format follows
   the checked path on Unix before parsing its contents.
 - Transaction snapshot loading now caps pointer reads at 64 bytes and rejects
   symlinked or non-regular pointer and snapshot files.
+- Local and S3 archive stores now enforce the global object-size ceiling at
+  direct put and bounded-read boundaries.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.

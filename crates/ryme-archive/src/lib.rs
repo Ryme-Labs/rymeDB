@@ -36,12 +36,15 @@ pub mod s3;
 
 #[allow(async_fn_in_trait)]
 pub trait ObjectStore: Send + Sync {
+    /// Store one object. Implementations reject objects larger than
+    /// `MAX_ARCHIVE_OBJECT_BYTES`, including direct calls that bypass `Archiver`.
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         self.get_bounded(key, MAX_ARCHIVE_OBJECT_BYTES).await
     }
     /// Read an object without buffering more than `max_bytes` from the backend.
-    /// Implementations must enforce this limit while receiving the object.
+    /// Implementations must enforce this limit while receiving the object and
+    /// also enforce the global `MAX_ARCHIVE_OBJECT_BYTES` ceiling.
     async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn delete(&self, key: &str) -> Result<()>;

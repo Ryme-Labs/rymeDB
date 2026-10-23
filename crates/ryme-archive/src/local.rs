@@ -150,6 +150,9 @@ mod tests {
 
 impl crate::ObjectStore for LocalStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() > super::MAX_ARCHIVE_OBJECT_BYTES {
+            return Err(RymeError::Overload(String::from("archive object")));
+        }
         let path = self.path(key)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -176,6 +179,7 @@ impl crate::ObjectStore for LocalStore {
     async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
         use std::io::Read;
 
+        let max_bytes = max_bytes.min(super::MAX_ARCHIVE_OBJECT_BYTES);
         let path = self.path(key)?;
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,

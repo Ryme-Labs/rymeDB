@@ -194,6 +194,9 @@ fn validate_endpoint(endpoint: &str, allow_insecure_http: bool) -> Result<()> {
 
 impl crate::ObjectStore for S3Store {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() > crate::MAX_ARCHIVE_OBJECT_BYTES {
+            return Err(RymeError::Overload(String::from("archive object")));
+        }
         let response = self.signed("PUT", key, "", Some(bytes), crate::now_unix()).await?;
         if response.status().is_success() {
             Ok(())
@@ -207,6 +210,7 @@ impl crate::ObjectStore for S3Store {
     }
 
     async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let max_bytes = max_bytes.min(crate::MAX_ARCHIVE_OBJECT_BYTES);
         let response = self.signed("GET", key, "", None, crate::now_unix()).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RymeError::NotFound(String::from("key")));
