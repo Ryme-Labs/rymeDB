@@ -2598,7 +2598,9 @@ fn decode_writes_v2(input: &[u8]) -> Result<BTreeMap<RecordKey, WriteOp>> {
         } else {
             return Err(RymeError::Corrupt(String::from("tombstone")));
         };
-        out.insert(RecordKey::new(&tenant, &database, &table, &pk), op);
+        if out.insert(RecordKey::new(&tenant, &database, &table, &pk), op).is_some() {
+            return Err(RymeError::Corrupt(String::from("duplicate write key")));
+        }
     }
     if !cursor.is_empty() {
         return Err(RymeError::Corrupt(String::from("trailing bytes")));
@@ -2629,7 +2631,9 @@ fn decode_writes_v1(input: &[u8]) -> Result<BTreeMap<RecordKey, WriteOp>> {
         } else {
             return Err(RymeError::Corrupt(String::from("tombstone")));
         };
-        out.insert(RecordKey::new(&tenant, &database, &table, &pk), op);
+        if out.insert(RecordKey::new(&tenant, &database, &table, &pk), op).is_some() {
+            return Err(RymeError::Corrupt(String::from("duplicate write key")));
+        }
     }
     if !cursor.is_empty() {
         return Err(RymeError::Corrupt(String::from("trailing bytes")));
