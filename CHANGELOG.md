@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- WAL segment discovery and reads now reject symlinked or non-regular segment
+  paths before recovery or append operations.
 - Transaction and shard recovery now visit WAL records in LSN order as they
   replay, instead of retaining the complete WAL history in memory.
 - PostgreSQL `COPY FROM STDIN` now shares a process-wide buffer budget, so

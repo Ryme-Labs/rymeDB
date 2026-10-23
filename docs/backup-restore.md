@@ -18,6 +18,8 @@ Checkpoints are metadata. They do not create a durable copy by themselves;
 retention must keep the relevant snapshot and WAL segments available.
 WAL recovery visits records in LSN order one segment at a time, so replay does
 not keep every historical record payload in memory at once.
+WAL segment paths must be regular files; symlinks and other file types are
+rejected during discovery and recovery.
 
 ## Configure retention
 

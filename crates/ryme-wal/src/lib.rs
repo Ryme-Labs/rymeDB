@@ -46,7 +46,7 @@ impl Wal {
         recover_rewrite(dir)?;
         let active_id = latest_segment_id(dir)?;
         let path = dir.join(segment_name(active_id));
-        let mut active = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
+        let mut active = open_segment_append(&path, true)?;
         let next_lsn = recover_next_lsn(dir, active_id, &mut active)?;
         let active_len = active.metadata()?.len();
         Ok(Self {
@@ -276,7 +276,7 @@ impl Wal {
         install_rewrite(&self.dir)?;
         self.active_id = latest_segment_id(&self.dir)?;
         let active_path = self.dir.join(segment_name(self.active_id));
-        self.active = OpenOptions::new().create(true).read(true).append(true).open(active_path)?;
+        self.active = open_segment_append(&active_path, true)?;
         self.active_len = self.active.metadata()?.len();
         self.next_lsn = next_lsn;
         self.poisoned = false;
@@ -337,7 +337,7 @@ impl Wal {
 
         self.active_id = latest_segment_id(&self.dir)?;
         let active_path = self.dir.join(segment_name(self.active_id));
-        self.active = OpenOptions::new().create(true).read(true).append(true).open(active_path)?;
+        self.active = open_segment_append(&active_path, true)?;
         self.active_len = self.active.metadata()?.len();
         self.next_lsn = next_lsn;
         self.poisoned = false;
@@ -351,7 +351,7 @@ impl Wal {
             .checked_add(1)
             .ok_or_else(|| RymeError::Corrupt(String::from("wal segment id overflow")))?;
         let path = self.dir.join(segment_name(next_id));
-        let next = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
+        let next = create_segment_append(&path)?;
         sync_directory(&self.dir)?;
         self.active = next;
         self.active_id = next_id;
@@ -405,6 +405,7 @@ fn install_rewrite(dir: &Path) -> Result<()> {
             previous_lsn = Some(record.lsn);
             cursor = &cursor[consumed..];
         }
+        ensure_regular_or_missing(&dir.join(name))?;
         std::fs::copy(path, dir.join(name))?;
         File::open(dir.join(name))?.sync_all()?;
     }
@@ -488,6 +489,9 @@ fn segment_ids(dir: &Path) -> Result<Vec<u64>> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(id) = parse_segment_name(&name) {
+            if !entry.file_type()?.is_file() {
+                return Err(RymeError::Corrupt(String::from("wal segment file")));
+            }
             ids.push(id);
         }
     }
@@ -509,6 +513,7 @@ fn parse_segment_name(name: &str) -> Option<u64> {
 }
 
 fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
+    ensure_regular_file(path)?;
     let file = File::open(path)?;
     let length = file.metadata()?.len();
     if length > MAX_WAL_SEGMENT_BYTES {
@@ -520,6 +525,41 @@ fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
         return Err(RymeError::Overload(String::from("wal segment")));
     }
     Ok(raw)
+}
+
+fn ensure_regular_file(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(RymeError::Corrupt(String::from("wal segment file")))
+    }
+}
+
+fn ensure_regular_or_missing(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(RymeError::Corrupt(String::from("wal segment file"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_segment_append(path: &Path, create: bool) -> Result<File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            Ok(OpenOptions::new().read(true).append(true).open(path)?)
+        }
+        Ok(_) => Err(RymeError::Corrupt(String::from("wal segment file"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            Ok(OpenOptions::new().create_new(true).read(true).append(true).open(path)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_segment_append(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new().create_new(true).read(true).append(true).open(path)?)
 }
 
 fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64> {
