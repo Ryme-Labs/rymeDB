@@ -5,7 +5,7 @@ info:
   description: >-
     Operator and data-plane HTTP API for a rymeDB node. Requests may receive
     429 Too Many Requests when the node's bounded HTTP request concurrency
-    budget is full.
+    budget is full. HTTP and HTTPS request headers are limited to 64 KiB.
 servers:
   - url: http://127.0.0.1:8080
 security:

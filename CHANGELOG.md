@@ -27,6 +27,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - HTTP request admission now rejects requests with `429 Too Many Requests`
   when the configured request-concurrency budget is full instead of queueing
   additional handlers without a bound.
+- HTTP and HTTPS connections now cap request headers at 64 KiB for both
+  HTTP/1 and HTTP/2, bounding per-connection header memory.
 - WAL segment readers and append handles verify opened file identity to detect
   symlink swaps during recovery or writes.
 - WAL recovery rejects symlinked rewrite markers and staging directories before

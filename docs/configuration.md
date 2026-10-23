@@ -88,6 +88,7 @@ development Raft listeners may remain plaintext.
 
 HTTP authentication requests are limited to 120 attempts per client address
 and 5 attempts per credential/client pair in a 60-second window.
+HTTP and HTTPS request headers are limited to 64 KiB per request.
 When HTTP/HTTPS is behind a reverse proxy,
 set `RYME_TRUSTED_PROXY_CIDRS` to the comma-separated CIDRs of proxies that
 connect directly to RymeDB (for example, `10.20.0.0/16,2001:db8:20::/48`).

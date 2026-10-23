@@ -544,6 +544,7 @@ type BranchStorage = ryme_branch::BranchBackend<Backend>;
 
 const MAX_AUDIT_EVENTS: usize = 512;
 const MAX_AUDIT_FILE_BYTES: usize = 4 * 1024 * 1024;
+const HTTP_MAX_HEADER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct AuditEvent {
@@ -4287,9 +4288,10 @@ pub async fn serve_http_with_listener(
             let _permit = permit;
             let io = TokioIo::new(socket);
             let service = hyper_util::service::TowerToHyperService::new(app);
-            let _ = ConnBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, service)
-                .await;
+            let mut builder = ConnBuilder::new(TokioExecutor::new());
+            builder.http1().max_buf_size(HTTP_MAX_HEADER_BYTES).max_headers(100);
+            builder.http2().max_header_list_size(HTTP_MAX_HEADER_BYTES as u32);
+            let _ = builder.serve_connection_with_upgrades(io, service).await;
         });
     }
 }
@@ -4336,9 +4338,10 @@ pub async fn serve_https_with_listener(
             let app = router(service).layer(Extension(axum::extract::ConnectInfo(peer_addr)));
             let io = TokioIo::new(tls);
             let service = hyper_util::service::TowerToHyperService::new(app);
-            let _ = ConnBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, service)
-                .await;
+            let mut builder = ConnBuilder::new(TokioExecutor::new());
+            builder.http1().max_buf_size(HTTP_MAX_HEADER_BYTES).max_headers(100);
+            builder.http2().max_header_list_size(HTTP_MAX_HEADER_BYTES as u32);
+            let _ = builder.serve_connection_with_upgrades(io, service).await;
         });
     }
 }
