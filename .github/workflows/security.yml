@@ -25,6 +25,13 @@ jobs:
         with:
           command: check
 
+      - name: Audit Rust SDK dependency advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: advisories
+          manifest-path: sdks/rust/Cargo.toml
+
   npm:
     name: npm dependency advisories
     runs-on: ubuntu-24.04
