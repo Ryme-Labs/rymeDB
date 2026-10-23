@@ -38,10 +38,7 @@ async fn serve() -> (std::net::SocketAddr, GrpcGateway) {
         .unwrap();
     executor
         .execute(
-            ryme_sql::parse(
-                "GRANT SELECT, INSERT, UPDATE ON TABLE docs TO authenticated",
-            )
-            .unwrap(),
+            ryme_sql::parse("GRANT SELECT, INSERT, UPDATE ON TABLE docs TO authenticated").unwrap(),
         )
         .await
         .unwrap();
