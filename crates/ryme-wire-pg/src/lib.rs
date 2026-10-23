@@ -22,6 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -72,6 +73,7 @@ const MAX_PORTALS: usize = 256;
 const MAX_PREPARED_STATE_BYTES: usize = 256 * 1024;
 const MAX_PORTAL_STATE_BYTES: usize = 256 * 1024;
 const MAX_CACHED_QUERY_BYTES: usize = 256;
+const PG_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SAVEPOINTS: usize = 256;
 const MAX_SAVEPOINT_NAME_BYTES: usize = 256;
 const MAX_TRANSACTION_CHANGES: usize = 100_000;
@@ -729,14 +731,18 @@ async fn serve_authenticated<B, S>(
     limits: ConnLimits,
     startup: StartupParams,
     authenticator: Option<PgAuthenticator>,
+    startup_deadline: tokio::time::Instant,
 ) -> std::result::Result<(), RymeError>
 where
     B: TxnBackend,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (executor, limits, user) =
-        authenticate_startup(&mut socket, executor, limits, &startup, authenticator.as_ref())
-            .await?;
+    let (executor, limits, user) = tokio::time::timeout_at(
+        startup_deadline,
+        authenticate_startup(&mut socket, executor, limits, &startup, authenticator.as_ref()),
+    )
+    .await
+    .map_err(|_| startup_timeout_error())??;
     let (pid, secret, cancellation) = register_backend();
     let notification_tenant = limits.tenant.clone();
     let notification_database = limits.database.clone();
@@ -775,49 +781,60 @@ where
     B: TxnBackend,
 {
     const CANCEL_REQUEST_CODE: u32 = 80877102;
+    let startup_deadline = tokio::time::Instant::now() + PG_STARTUP_TIMEOUT;
     let mut length_buffer = [0u8; 4];
-    socket.read_exact(&mut length_buffer).await.map_err(|e| RymeError::Io(e.to_string()))?;
+    read_startup_exact(&mut socket, &mut length_buffer, startup_deadline).await?;
     let startup_len = u32::from_be_bytes(length_buffer) as usize;
     if startup_len == 8 {
         let mut magic = [0u8; 4];
-        socket.read_exact(&mut magic).await.map_err(|e| RymeError::Io(e.to_string()))?;
+        read_startup_exact(&mut socket, &mut magic, startup_deadline).await?;
         let code = u32::from_be_bytes(magic);
         if code == 80877103 || code == 80877102 {
             if let Some(acceptor) = tls {
                 socket.write_all(b"S").await.map_err(|e| RymeError::Io(e.to_string()))?;
-                let mut tls_stream = acceptor
-                    .acceptor()
-                    .accept(socket)
-                    .await
-                    .map_err(|e| RymeError::Io(e.to_string()))?;
+                let tls_acceptor = acceptor.acceptor();
+                let mut tls_stream =
+                    tokio::time::timeout_at(startup_deadline, tls_acceptor.accept(socket))
+                        .await
+                        .map_err(|_| startup_timeout_error())?
+                        .map_err(|e| RymeError::Io(e.to_string()))?;
                 let mut encrypted_len = [0u8; 4];
-                tls_stream
-                    .read_exact(&mut encrypted_len)
-                    .await
-                    .map_err(|e| RymeError::Io(e.to_string()))?;
+                read_startup_exact(&mut tls_stream, &mut encrypted_len, startup_deadline).await?;
                 let startup_len = u32::from_be_bytes(encrypted_len) as usize;
                 if !(8..=10240).contains(&startup_len) {
                     return Err(RymeError::InvalidArgument(String::from("startup")));
                 }
                 let mut rest = vec![0u8; startup_len - 4];
-                tls_stream.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                read_startup_exact(&mut tls_stream, &mut rest, startup_deadline).await?;
                 let startup = parse_startup(&rest)?;
-                return serve_authenticated(tls_stream, executor, limits, startup, authenticator)
-                    .await;
+                return serve_authenticated(
+                    tls_stream,
+                    executor,
+                    limits,
+                    startup,
+                    authenticator,
+                    startup_deadline,
+                )
+                .await;
             }
             socket.write_all(b"N").await.map_err(|e| RymeError::Io(e.to_string()))?;
-            socket
-                .read_exact(&mut length_buffer)
-                .await
-                .map_err(|e| RymeError::Io(e.to_string()))?;
+            read_startup_exact(&mut socket, &mut length_buffer, startup_deadline).await?;
             let retry = u32::from_be_bytes(length_buffer) as usize;
             if !(8..=10240).contains(&retry) {
                 return Err(RymeError::InvalidArgument(String::from("startup")));
             }
             let mut rest = vec![0u8; retry - 4];
-            socket.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
+            read_startup_exact(&mut socket, &mut rest, startup_deadline).await?;
             let startup = parse_startup(&rest)?;
-            return serve_authenticated(socket, executor, limits, startup, authenticator).await;
+            return serve_authenticated(
+                socket,
+                executor,
+                limits,
+                startup,
+                authenticator,
+                startup_deadline,
+            )
+            .await;
         }
         return Err(RymeError::InvalidArgument(String::from("startup")));
     }
@@ -825,7 +842,7 @@ where
         return Err(RymeError::InvalidArgument(String::from("startup")));
     }
     let mut rest = vec![0u8; startup_len - 4];
-    socket.read_exact(&mut rest).await.map_err(|e| RymeError::Io(e.to_string()))?;
+    read_startup_exact(&mut socket, &mut rest, startup_deadline).await?;
     // CancelRequest is a standalone 16-byte startup packet containing the
     // backend pid and secret. It has no response; signal the matching live
     // session and close this short-lived cancel connection.
@@ -839,7 +856,26 @@ where
         return Ok(());
     }
     let startup = parse_startup(&rest)?;
-    serve_authenticated(socket, executor, limits, startup, authenticator).await
+    serve_authenticated(socket, executor, limits, startup, authenticator, startup_deadline).await
+}
+
+fn startup_timeout_error() -> RymeError {
+    RymeError::Unavailable(String::from("postgres startup timeout"))
+}
+
+async fn read_startup_exact<S>(
+    stream: &mut S,
+    buffer: &mut [u8],
+    deadline: tokio::time::Instant,
+) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    tokio::time::timeout_at(deadline, stream.read_exact(buffer))
+        .await
+        .map_err(|_| startup_timeout_error())?
+        .map(|_| ())
+        .map_err(|error| RymeError::Io(error.to_string()))
 }
 
 fn parse_startup(payload: &[u8]) -> Result<StartupParams> {
