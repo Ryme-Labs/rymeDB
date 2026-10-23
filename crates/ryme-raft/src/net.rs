@@ -1812,7 +1812,7 @@ impl Node {
                 ..
             } => {
                 if peer_term > term {
-                    self.observe_range_term(group_id, peer_term);
+                    self.observe_range_term(group_id, peer_term)?;
                     return Err(RymeError::Unavailable(String::from("stale range leader")));
                 }
                 if appended {
@@ -1862,7 +1862,7 @@ impl Node {
                     ..
                 } => {
                     if peer_term > term {
-                        self.observe_range_term(group_id, peer_term);
+                        self.observe_range_term(group_id, peer_term)?;
                         return Err(RymeError::Unavailable(String::from("stale range leader")));
                     }
                     next_index = last_index + 1;
@@ -1876,7 +1876,7 @@ impl Node {
                     ..
                 } => {
                     if peer_term > term {
-                        self.observe_range_term(group_id, peer_term);
+                        self.observe_range_term(group_id, peer_term)?;
                         return Err(RymeError::Unavailable(String::from("stale range leader")));
                     }
                     let retry_index = conflict_index
@@ -1919,31 +1919,36 @@ impl Node {
                 Ok(())
             }
             Rpc::RangeAppendResponse { term: peer_term, .. } if peer_term > term => {
-                self.observe_range_term(group_id, peer_term);
+                self.observe_range_term(group_id, peer_term)?;
                 Err(RymeError::Unavailable(String::from("stale range leader")))
             }
             _ => Err(RymeError::Unavailable(String::from("range commit gap"))),
         }
     }
 
-    fn observe_range_term(&self, group_id: &str, term: u64) {
-        let mut changed = false;
-        if let Ok(mut groups) = self.range_groups.lock() {
+    fn observe_range_term(&self, group_id: &str, term: u64) -> Result<()> {
+        {
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
             let state = groups.entry(group_id.to_string()).or_default();
-            if term > state.term {
-                state.term = term;
-                state.voted_for = None;
-                state.leader = None;
-                state.last_contact_ms = now_ms();
-                changed = true;
+            if term <= state.term {
+                return Ok(());
             }
+            state.term = term;
+            state.voted_for = None;
+            state.leader = None;
+            state.last_contact_ms = now_ms();
         }
-        if changed {
-            if let Ok(mut leaders) = self.range_leaders.write() {
-                leaders.remove(group_id);
-            }
-            let _ = self.persist_range_meta();
-        }
+        let leader_update = self
+            .range_leaders
+            .write()
+            .map(|mut leaders| leaders.remove(group_id))
+            .map_err(|_| RymeError::Internal(String::from("range leader metadata lock")));
+        let persist = self.persist_range_meta();
+        leader_update?;
+        persist
     }
 
     async fn campaign_range(self: &Arc<Self>, range: &RangeOwner) -> Result<()> {
@@ -1963,7 +1968,7 @@ impl Node {
             state.last_contact_ms = now_ms();
             (state.term, last_term, last_index)
         };
-        let _ = self.persist_range_meta();
+        self.persist_range_meta()?;
         let mut votes = vec![self.id];
         let mut tasks = Vec::new();
         for replica in range.replicas.iter().copied().filter(|replica| *replica != self.id) {
@@ -1983,7 +1988,7 @@ impl Node {
             let Ok(Ok((response, replica))) = task.await else { continue };
             if let Rpc::RangeVoteResponse { term: peer_term, granted } = response {
                 if peer_term > term {
-                    self.observe_range_term(&range.id, peer_term);
+                    self.observe_range_term(&range.id, peer_term)?;
                     return Ok(());
                 }
                 if granted && !votes.contains(&replica) {
@@ -1994,7 +1999,11 @@ impl Node {
         if votes.len() < majority(range.replicas.len()) {
             return Ok(());
         }
-        let won = if let Ok(mut groups) = self.range_groups.lock() {
+        let won = {
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
             let state = groups.entry(range.id.clone()).or_default();
             if state.term == term && state.voted_for == Some(self.id) && state.leader.is_none() {
                 state.leader = Some(self.id);
@@ -2004,16 +2013,27 @@ impl Node {
             } else {
                 false
             }
-        } else {
-            false
         };
         if !won {
             return Ok(());
         }
-        if let Ok(mut leaders) = self.range_leaders.write() {
-            leaders.insert(range.id.clone(), self.id);
+        if let Err(error) = self.persist_range_meta() {
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+            if let Some(state) = groups.get_mut(&range.id) {
+                if state.term == term && state.leader == Some(self.id) {
+                    state.leader = None;
+                    state.last_heartbeat_ms = 0;
+                }
+            }
+            return Err(error);
         }
-        let _ = self.persist_range_meta();
+        self.range_leaders
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("range leader metadata lock")))?
+            .insert(range.id.clone(), self.id);
         let _ = self.range_heartbeat(&range.id).await;
         self.recover_range_coordinations_for_group(&range.id).await?;
         Ok(())
@@ -4452,14 +4472,19 @@ impl Node {
                 .insert(group_id.to_string(), state.clone());
             self.persist_range_meta()?;
         }
-        if let Ok(mut groups) = self.range_groups.lock() {
-            if let Some(current) = groups.get_mut(group_id) {
-                current.last_contact_ms = now_ms();
-            }
-        }
-        if let Ok(mut leaders) = self.range_leaders.write() {
-            leaders.insert(group_id.to_string(), leader);
-        }
+        let mut groups = self
+            .range_groups
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+        let current = groups
+            .get_mut(group_id)
+            .ok_or_else(|| RymeError::Unavailable(String::from("range metadata unavailable")))?;
+        current.last_contact_ms = now_ms();
+        drop(groups);
+        self.range_leaders
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("range leader metadata lock")))?
+            .insert(group_id.to_string(), leader);
         let mut last = self.try_range_last_index(group_id)?;
         if prev_index > last {
             return Err(RymeError::Unavailable(String::from("range log gap")));
@@ -6092,6 +6117,7 @@ impl Node {
 
     pub fn range_owner(&self, routing_key: &[u8]) -> Option<(usize, u64)> {
         let owners = self.range_owners.read().ok()?;
+        let leaders = self.range_leaders.read().ok()?;
         owners
             .iter()
             .find(|range| {
@@ -6099,12 +6125,7 @@ impl Node {
                     && (range.end.is_empty() || routing_key < range.end.as_slice())
             })
             .map(|range| {
-                let owner = self
-                    .range_leaders
-                    .read()
-                    .ok()
-                    .and_then(|leaders| leaders.get(&range.id).copied())
-                    .unwrap_or(range.owner);
+                let owner = leaders.get(&range.id).copied().unwrap_or(range.owner);
                 (owner, range.epoch)
             })
     }
