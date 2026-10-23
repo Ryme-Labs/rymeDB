@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - SQL grants validate roles atomically, and dropping a role clears its direct
   and default privileges so recreating the role cannot restore stale access.
+- SQL role inheritance now stops at intermediate `NOINHERIT` roles, preventing
+  privileges from passing through those roles to downstream members.
 
 ### Performance
 

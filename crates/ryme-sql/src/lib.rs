@@ -216,14 +216,12 @@ fn effective_sql_roles(
     privileges: &[PrivilegeGrant],
 ) -> Vec<String> {
     let current_role = current_role.to_ascii_lowercase();
-    let inherits = roles
+    let noinherit = roles
         .values()
-        .find(|role| role.name.eq_ignore_ascii_case(&current_role))
-        .is_none_or(|role| role.inherit);
+        .filter(|role| !role.inherit)
+        .map(|role| role.name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let mut effective = vec![current_role.clone()];
-    if !inherits {
-        return effective;
-    }
     let mut parents = HashMap::<String, Vec<String>>::new();
     for membership in privileges.iter().filter(|grant| {
         grant.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
@@ -237,6 +235,12 @@ fn effective_sql_roles(
     let mut pending = vec![current_role.clone()];
     let mut visited = HashSet::from([current_role]);
     while let Some(member) = pending.pop() {
+        // INHERIT controls the privileges this role receives from its own
+        // memberships. A NOINHERIT role may still contribute its direct
+        // grants, but it blocks traversal to roles above it in the chain.
+        if noinherit.contains(&member) {
+            continue;
+        }
         if let Some(role_parents) = parents.get(&member) {
             for role in role_parents {
                 if visited.insert(role.clone()) {
