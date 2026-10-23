@@ -4729,6 +4729,18 @@ impl Node {
         publish_data: bool,
         kind: RangeEntryKind,
     ) -> Result<u64> {
+        if term == 0 {
+            return Err(RymeError::InvalidArgument(String::from("range term")));
+        }
+        let Some(range) = self.try_range_owner_by_id(group_id)? else {
+            return Err(RymeError::NotFound(String::from("range group")));
+        };
+        if !range.replicas.contains(&self.id) || !range.replicas.contains(&leader) {
+            return Err(RymeError::Unavailable(String::from("range replica")));
+        }
+        if prev_index == 0 && prev_term != 0 {
+            return Err(RymeError::InvalidArgument(String::from("range log prefix")));
+        }
         let mut state = self.try_ensure_range_group(group_id, leader)?;
         if term < state.term {
             return Err(RymeError::Unavailable(String::from("stale range term")));
