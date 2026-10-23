@@ -24,6 +24,8 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
 - Simple Query messages require one terminal NUL and valid UTF-8; malformed
   query strings receive a protocol error and close the connection instead of
   being rewritten.
+- Text-format `Bind` parameters require valid UTF-8 and reject embedded NULs;
+  SQL `NULL` remains represented by PostgreSQL's `-1` parameter length.
 - Startup, TLS negotiation, and authentication must complete within 15 seconds;
   the deadline ends before the authenticated session begins.
 - Simple and extended query flows (`Parse`, `Bind`, `Describe`, `Execute`,

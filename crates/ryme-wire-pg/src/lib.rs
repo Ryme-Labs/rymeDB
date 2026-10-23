@@ -5029,7 +5029,12 @@ fn parse_bind(payload: &[u8]) -> std::result::Result<(String, String, Vec<String
         let value = payload
             .get(offset..end)
             .ok_or_else(|| RymeError::InvalidArgument(String::from("bind value")))?;
-        params.push(String::from_utf8_lossy(value).into_owned());
+        let value = std::str::from_utf8(value)
+            .map_err(|_| RymeError::InvalidArgument(String::from("bind value")))?;
+        if value.contains('\0') {
+            return Err(RymeError::InvalidArgument(String::from("bind value")));
+        }
+        params.push(value.to_owned());
         offset = end;
     }
     let result_formats = read_i16(payload, &mut offset)
