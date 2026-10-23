@@ -25,6 +25,8 @@ WAL archive enumeration also fails on directory read errors and rejects
 symlink or non-file entries that use a segment filename.
 Branch-schema archive discovery rejects symlinked roots and non-regular entries;
 it caps traversal at 100,000 directories and 256 levels of nesting.
+Immutable-segment archive discovery rejects a symlinked `segments` directory
+and non-regular entries that use a segment filename.
 Local archive objects and restored files are written through unique temporary
 files created exclusively in their destination directories.
 On Unix, local archive writes sync the published object's containing directory

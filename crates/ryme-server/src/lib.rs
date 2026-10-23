@@ -15433,6 +15433,12 @@ fn wal_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std::path:
 fn immutable_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let segments = dir.join("segments");
+    match std::fs::symlink_metadata(&segments) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(ryme_error::RymeError::Corrupt(String::from("segment directory"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error.into()),
+    }
     let entries = match std::fs::read_dir(&segments) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -15441,11 +15447,11 @@ fn immutable_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std:
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
         if name.starts_with("segment-") && name.ends_with(".sst") {
+            if !entry.file_type()?.is_file() {
+                return Err(ryme_error::RymeError::Corrupt(String::from("segment file")));
+            }
             out.push(path);
         }
     }

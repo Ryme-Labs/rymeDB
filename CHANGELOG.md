@@ -57,6 +57,8 @@ All notable changes to rymeDB are recorded here. Format follows
   or non-file segment entries instead of following or silently skipping them.
 - Branch-schema archive discovery rejects symlinked roots and special files,
   and caps visited directories and nesting depth.
+- Immutable-segment archive discovery rejects symlinked segment directories
+  and symlink or non-file entries using segment filenames.
 - RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
   and scan the keyspace in bounded pages.
 - RESP `MGET` reads values incrementally and rejects combined results above
