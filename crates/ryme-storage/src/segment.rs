@@ -1549,6 +1549,9 @@ fn segment_file_name(id: u64, kind: SegmentKind) -> String {
 fn parse_segment_name(name: &str) -> Option<u64> {
     let name = name.strip_prefix("segment-")?;
     let name = name.strip_suffix(".sst").or_else(|| name.strip_suffix(".cmp"))?;
+    if name.len() != 20 || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
     name.parse().ok()
 }
 

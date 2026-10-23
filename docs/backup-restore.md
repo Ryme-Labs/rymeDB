@@ -21,6 +21,8 @@ not keep every historical record payload in memory at once.
 WAL segment paths must be regular files; symlinks and other file types are
 rejected during discovery and recovery. Segment discovery accepts only the
 canonical `seg-` plus 20-digit ID plus `.wal` filename format.
+Immutable-segment discovery accepts only `segment-` plus a 20-digit ID and the
+`.sst` or `.cmp` extension.
 WAL archive enumeration also fails on directory read errors and rejects
 symlink or non-file entries that use a segment filename.
 Branch-schema archive discovery rejects symlinked roots and non-regular entries;
