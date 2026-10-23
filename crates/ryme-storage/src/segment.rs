@@ -796,7 +796,7 @@ impl SegmentStore {
         paths.sort_by_key(|path| {
             parse_segment_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
         });
-        if let Some(snapshot_id) = self.latest_snapshot_id() {
+        if let Some(snapshot_id) = self.latest_snapshot_id()? {
             paths.retain(|path| {
                 parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
                     .is_some_and(|id| id >= snapshot_id)
@@ -820,7 +820,7 @@ impl SegmentStore {
 
     pub fn max_commit_ts(&self) -> Result<u64> {
         let mut max_commit_ts = 0;
-        let snapshot_id = self.latest_snapshot_id();
+        let snapshot_id = self.latest_snapshot_id()?;
         for path in self.segment_paths()? {
             if snapshot_id.is_some_and(|snapshot_id| {
                 parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
@@ -833,18 +833,8 @@ impl SegmentStore {
         Ok(max_commit_ts)
     }
 
-    fn latest_snapshot_id(&self) -> Option<u64> {
-        let raw = read_bounded_metadata_file(
-            &self.dir.join("latest"),
-            MAX_SEGMENT_POINTER_BYTES,
-            "segment pointer",
-        )
-        .ok()??;
-        let name = std::str::from_utf8(&raw).ok()?.trim();
-        let id = parse_segment_name(name)?;
-        let path = self.dir.join(name);
-        let (stored_id, kind) = read_segment_identity(&path).ok()?;
-        (stored_id == id && kind == SegmentKind::Snapshot).then_some(id)
+    fn latest_snapshot_id(&self) -> Result<Option<u64>> {
+        latest_snapshot_id_in_dir(&self.dir)
     }
 
     pub fn scan(
@@ -1063,7 +1053,7 @@ impl SegmentStore {
             .lock()
             .map_err(|_| RymeError::Internal(String::from("segment compaction lock")))?;
         let paths = self.segment_paths()?;
-        let snapshot_id = self.latest_snapshot_id().unwrap_or(0);
+        let snapshot_id = self.latest_snapshot_id()?.unwrap_or(0);
         let mut selected = Vec::new();
         let mut selected_bytes = 0u64;
         for path in paths {
@@ -1378,18 +1368,27 @@ fn publish_delta_compaction_marker(dir: &Path, marker: DeltaCompactionMarker) ->
     sync_directory(dir)
 }
 
-fn latest_snapshot_id_in_dir(dir: &Path) -> Option<u64> {
-    let raw = read_bounded_metadata_file(
+fn latest_snapshot_id_in_dir(dir: &Path) -> Result<Option<u64>> {
+    let Some(raw) = read_bounded_metadata_file(
         &dir.join("latest"),
         MAX_SEGMENT_POINTER_BYTES,
         "segment pointer",
-    )
-    .ok()??;
-    let name = std::str::from_utf8(&raw).ok()?.trim();
-    let id = parse_segment_name(name)?;
+    )?
+    else {
+        return Ok(None);
+    };
+    let name = std::str::from_utf8(&raw)
+        .map_err(|_| RymeError::Corrupt(String::from("segment pointer")))?
+        .trim();
+    let id = parse_segment_name(name)
+        .ok_or_else(|| RymeError::Corrupt(String::from("segment pointer")))?;
     let path = dir.join(name);
-    let (stored_id, kind) = read_segment_identity(&path).ok()?;
-    (stored_id == id && kind == SegmentKind::Snapshot).then_some(id)
+    let (stored_id, kind) = read_segment_identity(&path)
+        .map_err(|_| RymeError::Corrupt(String::from("segment pointer")))?;
+    if stored_id != id {
+        return Err(RymeError::Corrupt(String::from("segment pointer")));
+    }
+    Ok((kind == SegmentKind::Snapshot).then_some(id))
 }
 
 fn discover_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1422,7 +1421,7 @@ fn discover_active_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
         paths.retain(|path| !is_compacted_segment_path(path));
         return Ok(paths);
     };
-    let latest_snapshot_id = latest_snapshot_id_in_dir(dir).unwrap_or(0);
+    let latest_snapshot_id = latest_snapshot_id_in_dir(dir)?.unwrap_or(0);
     if latest_snapshot_id < marker.snapshot_id {
         return Err(RymeError::Corrupt(String::from("delta compaction snapshot")));
     }

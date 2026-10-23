@@ -36,6 +36,8 @@ All notable changes to rymeDB are recorded here. Format follows
   retries from removing a staged generation needed for crash recovery.
 - Full WAL rewrites now reject segment-ID overflow instead of wrapping the
   staged segment sequence.
+- Storage recovery and compaction now reject corrupt latest-segment pointers
+  instead of silently treating them as missing snapshot metadata.
 - SQL `CREATE USER` now defaults to `LOGIN`, and unsupported role options are
   rejected instead of being reported as successful while silently ignored.
 - Raft range-coordination recovery now propagates poisoned state-lock errors
