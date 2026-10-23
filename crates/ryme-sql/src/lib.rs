@@ -7947,7 +7947,7 @@ pub struct Executor<B = TxnManager> {
     schema_persist_lock: Arc<Mutex<()>>,
     schema_dirty: Arc<AtomicBool>,
     schema_hook: Option<SchemaHook>,
-    sequence_next: Arc<Mutex<BTreeMap<String, u64>>>,
+    sequence_next: Arc<Mutex<BTreeMap<String, Option<u64>>>>,
 }
 
 impl<B: std::fmt::Debug> std::fmt::Debug for Executor<B> {
@@ -9881,7 +9881,9 @@ where
             .lock()
             .map_err(|_| RymeError::Internal(String::from("sequence lock")))?;
         let next = if let Some(next) = sequences.get(&key).copied() {
-            next
+            next.ok_or_else(|| {
+                RymeError::Conflict(String::from("auto-increment sequence exhausted"))
+            })?
         } else {
             let mut highest = 0u64;
             let composite_primary = self
@@ -9912,9 +9914,11 @@ where
                     highest = highest.max(candidate);
                 }
             }
-            highest.saturating_add(1)
+            highest.checked_add(1).ok_or_else(|| {
+                RymeError::Conflict(String::from("auto-increment sequence exhausted"))
+            })?
         };
-        sequences.insert(key, next.saturating_add(1));
+        sequences.insert(key, next.checked_add(1));
         Ok(next.to_string().into_bytes())
     }
 

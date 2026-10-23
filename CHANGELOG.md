@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- SQL auto-increment IDs now report exhaustion instead of reusing the maximum
+  integer and producing duplicate identifiers.
 - Range split, merge, and leader changes now reject exhausted epochs before
   mutating topology, preserving monotonic routing fences.
 - Branch promotion now rejects exhausted schema versions before changing
