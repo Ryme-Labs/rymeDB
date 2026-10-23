@@ -8,8 +8,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
-- SQL grants reject missing roles, and dropping a role clears its direct and
-  default privileges so recreating the role cannot restore stale access.
+- SQL grants validate roles atomically, and dropping a role clears its direct
+  and default privileges so recreating the role cannot restore stale access.
 
 ## [2.0.3] — 2026-10-23
 
