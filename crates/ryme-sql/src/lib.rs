@@ -8648,8 +8648,8 @@ where
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("privilege lock")))?;
             privileges.retain(|grant| {
-                !grant.grantee.eq_ignore_ascii_case(name)
-                    && !(grant.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
+                !(grant.grantee.eq_ignore_ascii_case(name)
+                    || grant.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
                         && grant.object.eq_ignore_ascii_case(name))
             });
             drop(privileges);
