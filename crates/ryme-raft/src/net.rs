@@ -1265,6 +1265,13 @@ impl Node {
         for record in Wal::read_all(&range_dir)? {
             let range_record: RangeLogRecord = serde_json::from_slice(&record.payload)
                 .map_err(|error| RymeError::Corrupt(format!("range log: {error}")))?;
+            if range_record.group_id.is_empty()
+                || range_record.index == 0
+                || range_record.term == 0
+                || range_record.commit_ts != record.commit_ts
+            {
+                return Err(RymeError::Corrupt(String::from("range log metadata")));
+            }
             range_records.push(range_record);
         }
         let range_meta_path = dir.join("range-meta.json");
@@ -1361,14 +1368,33 @@ impl Node {
         let mut range_recovery_coordinations = BTreeMap::new();
         for range_record in range_records {
             let group_id = range_record.group_id.clone();
-            range_entries
-                .entry(group_id.clone())
-                .or_default()
-                .insert(range_record.index, range_record.clone());
+            let group_entries = range_entries.entry(group_id.clone()).or_default();
+            if group_entries.insert(range_record.index, range_record.clone()).is_some() {
+                return Err(RymeError::Corrupt(String::from("duplicate range log index")));
+            }
             let last = range_logs.entry(group_id.clone()).or_insert(0);
             *last = (*last).max(range_record.index);
             let state = range_groups.entry(group_id).or_default();
             state.term = state.term.max(range_record.term).max(1);
+        }
+        for (group_id, state) in &range_groups {
+            let entries = range_entries.get(group_id);
+            let last_index =
+                entries.and_then(|entries| entries.keys().next_back().copied()).unwrap_or(0);
+            if state.applied_index > state.commit_index || state.commit_index > last_index {
+                return Err(RymeError::Corrupt(String::from("range commit index")));
+            }
+            if let Some(entries) = entries {
+                let mut expected_index = 1u64;
+                for index in entries.keys() {
+                    if *index != expected_index {
+                        return Err(RymeError::Corrupt(String::from("range log gap")));
+                    }
+                    expected_index = expected_index.checked_add(1).ok_or_else(|| {
+                        RymeError::Corrupt(String::from("range log index overflow"))
+                    })?;
+                }
+            }
         }
         for (group_id, entries) in &range_entries {
             let state = range_groups.entry(group_id.clone()).or_default();

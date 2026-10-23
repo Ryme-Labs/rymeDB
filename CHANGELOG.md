@@ -35,6 +35,8 @@ All notable changes to rymeDB are recorded here. Format follows
   persisted, preserving the durable election-state boundary.
 - Raft range metadata snapshots now serialize their atomic file replacements,
   preventing concurrent writers from racing on the shared temporary file.
+- Raft startup now rejects duplicate, gapped, or inconsistent range WAL records
+  and metadata whose applied or committed indexes exceed the recovered log.
 
 ### Performance
 
