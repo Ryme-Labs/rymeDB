@@ -30,9 +30,12 @@ impl KeyRing {
     }
 
     pub fn rotate(&mut self, tenant: &str, now_unix: u64) -> Dek {
-        self.counter += 1;
+        // Imported rings can have a stale counter, so include a random suffix
+        // to keep IDs unique across restored state and counter saturation.
+        self.counter = self.counter.saturating_add(1);
+        let id_suffix = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(16));
         let dek = Dek {
-            id: format!("dek-{}-{}", now_unix, self.counter),
+            id: format!("dek-{now_unix}-{}-{id_suffix}", self.counter),
             key: ryme_auth::random_bytes(32),
             created_unix: now_unix,
             retired: false,

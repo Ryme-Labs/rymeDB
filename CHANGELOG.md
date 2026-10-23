@@ -26,6 +26,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- DEK rotation IDs now remain unique when restoring stale counters or reaching
+  counter saturation.
 - Local archive listings validate prefixes, cap result count and bytes, and use
   bounded, iterative directory traversal.
 - Config file loading now rejects non-regular files and caps reads at 4 MiB.
