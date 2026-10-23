@@ -28,6 +28,8 @@ All notable changes to rymeDB are recorded here. Format follows
   restrictive Unix permissions before atomic replacement.
 - Shard range and table placement snapshots now use exclusive temporary files
   and clean them up if writing or replacement fails.
+- Raft node and range metadata publication now uses unique temporary files
+  created exclusively, with cleanup on failed writes or replacement.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.

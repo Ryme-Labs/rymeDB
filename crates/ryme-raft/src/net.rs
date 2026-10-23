@@ -34,6 +34,7 @@ const RPC_READ_FRAME_BUDGET_PERMITS: usize =
     RPC_READ_FRAME_BUDGET_BYTES / RPC_FRAME_BUDGET_UNIT_BYTES;
 const RPC_WRITE_FRAME_BUDGET_PERMITS: usize =
     RPC_WRITE_FRAME_BUDGET_BYTES / RPC_FRAME_BUDGET_UNIT_BYTES;
+static NEXT_METADATA_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static RPC_READ_FRAME_BUDGET: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(RPC_READ_FRAME_BUDGET_PERMITS));
 static RPC_WRITE_FRAME_BUDGET: LazyLock<Semaphore> =
@@ -50,6 +51,31 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+fn persist_metadata_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let (temporary, mut file) = loop {
+        let id = NEXT_METADATA_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("tmp-{}-{id}", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = file.write_all(bytes).and_then(|()| file.sync_data());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_parent_directory(path)
 }
 
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
@@ -1063,16 +1089,7 @@ impl Inner {
         if raw.len() > MAX_RAFT_METADATA_BYTES {
             return Err(RymeError::Overload(String::from("raft metadata")));
         }
-        let tmp = self.meta_path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&raw)?;
-            file.sync_data()?;
-        }
-        std::fs::rename(&tmp, &self.meta_path)?;
-        sync_parent_directory(&self.meta_path)?;
-        Ok(())
+        persist_metadata_file(&self.meta_path, &raw)
     }
 
     fn persist_entries(&mut self, entries: &[LogEntry]) -> Result<()> {
@@ -4449,16 +4466,7 @@ impl Node {
         if raw.len() > MAX_RAFT_METADATA_BYTES {
             return Err(RymeError::Overload(String::from("range metadata")));
         }
-        let temporary = self.range_meta_path.with_extension("json.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&raw)?;
-            file.sync_data()?;
-        }
-        std::fs::rename(temporary, &self.range_meta_path)?;
-        sync_parent_directory(&self.range_meta_path)?;
-        Ok(())
+        persist_metadata_file(&self.range_meta_path, &raw)
     }
 
     #[allow(clippy::too_many_arguments)]
