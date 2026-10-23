@@ -51,6 +51,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and scan the keyspace in bounded pages.
 - RESP `MGET` reads values incrementally and rejects combined results above
   16 MiB before retaining the oversized result.
+- RESP `MULTI` queues now cap command count and estimated memory per connection,
+  with an additional shared process-wide queue budget.
 - Config file loading now rejects non-regular files and caps reads at 4 MiB.
 - Routing-key capacity calculations now check overflow and report allocation
   failure instead of relying on infallible vector allocation.

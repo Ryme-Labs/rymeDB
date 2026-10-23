@@ -25,6 +25,9 @@ const RESP_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RESP_READ_CHUNK_BYTES: usize = 16 * 1024;
 const RESP_INPUT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RESP_INPUT_BUDGET_UNIT_BYTES: usize = 16 * 1024;
+const RESP_MULTI_MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const RESP_MULTI_MAX_QUEUE_COMMANDS: usize = 10_000;
+const RESP_MULTI_QUEUE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RESP_MAX_COMMAND_ARGS: usize = 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
 const RESP_SCAN_PAGE_ITEMS: usize = 4;
@@ -46,6 +49,9 @@ const MAX_COMMAND_CONFLICT_RETRIES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 static RESP_INPUT_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     Arc::new(Semaphore::new(RESP_INPUT_BUDGET_BYTES / RESP_INPUT_BUDGET_UNIT_BYTES))
+});
+static RESP_MULTI_QUEUE_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(RESP_MULTI_QUEUE_BUDGET_BYTES / RESP_INPUT_BUDGET_UNIT_BYTES))
 });
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
@@ -1530,6 +1536,53 @@ where
                         state.dirty = true;
                         return encode_error(String::from("unknown command"));
                     }
+                    if state.queue.len() >= RESP_MULTI_MAX_QUEUE_COMMANDS {
+                        state.dirty = true;
+                        return encode_error(String::from("MULTI command limit exceeded"));
+                    }
+                    let Some(command_bytes) = Self::multi_command_memory_bytes(&command) else {
+                        state.dirty = true;
+                        return encode_error(String::from("MULTI queue memory limit exceeded"));
+                    };
+                    let Some(next_bytes) = state
+                        .queue_bytes
+                        .checked_add(command_bytes)
+                        .filter(|bytes| *bytes <= RESP_MULTI_MAX_QUEUE_BYTES)
+                    else {
+                        state.dirty = true;
+                        return encode_error(String::from("MULTI queue memory limit exceeded"));
+                    };
+                    let required_units = next_bytes.div_ceil(RESP_INPUT_BUDGET_UNIT_BYTES);
+                    let additional_units = required_units.saturating_sub(state.reserved_units);
+                    if additional_units > 0 && state.queue_permits.try_reserve(1).is_err() {
+                        state.dirty = true;
+                        return encode_error(String::from("MULTI queue memory limit exceeded"));
+                    }
+                    if state.queue.try_reserve(1).is_err() {
+                        state.dirty = true;
+                        return encode_error(String::from("MULTI queue memory limit exceeded"));
+                    }
+                    let permit = if additional_units > 0 {
+                        match RESP_MULTI_QUEUE_BUDGET
+                            .clone()
+                            .try_acquire_many_owned(additional_units as u32)
+                        {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                state.dirty = true;
+                                return encode_error(String::from(
+                                    "MULTI queue memory limit exceeded",
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(permit) = permit {
+                        state.queue_permits.push(permit);
+                    }
+                    state.queue_bytes = next_bytes;
+                    state.reserved_units = required_units;
                     state.queue.push(command);
                     return encode_simple("QUEUED");
                 }
@@ -3446,6 +3499,16 @@ where
 
     fn command_bytes(command: &RespCommand) -> u64 {
         command.args.iter().map(|arg| arg.len() as u64).sum()
+    }
+
+    fn multi_command_memory_bytes(command: &RespCommand) -> Option<usize> {
+        let command_and_args = command
+            .args
+            .len()
+            .checked_mul(std::mem::size_of::<Vec<u8>>())?
+            .checked_add(std::mem::size_of::<RespCommand>() * 2)?
+            .checked_add(command.name.len())?;
+        command.args.iter().try_fold(command_and_args, |total, arg| total.checked_add(arg.len()))
     }
 
     fn stream_last(entries: &[(String, Vec<(String, String)>)]) -> (u64, u64) {
@@ -5693,6 +5756,9 @@ fn script_cache_has_capacity(
 #[derive(Debug, Default)]
 struct Multi {
     queue: Vec<RespCommand>,
+    queue_bytes: usize,
+    reserved_units: usize,
+    queue_permits: Vec<OwnedSemaphorePermit>,
     dirty: bool,
 }
 

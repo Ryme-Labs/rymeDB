@@ -51,8 +51,11 @@ more. Scan pages read four records at a time to bound temporary memory.
 
 ## Transaction notes
 
-Commands inside `MULTI` execute against one transaction. Blocking list and
-stream reads wake on commits and take a fresh transaction for each check.
+Commands inside `MULTI` execute against one transaction. A queue is limited to
+10,000 commands and 16 MiB per connection; active queues also share a 256 MiB
+process-wide memory budget. A command rejected by these limits marks the queue
+dirty, so `EXEC` aborts. Blocking list and stream reads wake on commits and take
+a fresh transaction for each check.
 Sorted sets use score ordering with lexicographic member tie-breaks. Stream
 consumer groups and pending entries are persisted with the stream document.
 
