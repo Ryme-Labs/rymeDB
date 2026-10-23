@@ -2719,7 +2719,7 @@ impl Node {
                 if term > inner.term {
                     inner.term = term;
                     inner.voted_for = None;
-                    let _ = inner.persist_meta();
+                    inner.persist_meta()?;
                 }
                 inner.role = Role::Follower;
                 inner.leader_id = None;
@@ -3003,9 +3003,11 @@ impl Node {
                             false,
                         )
                     } else {
-                        if term > inner.term {
+                        let term_changed = term > inner.term;
+                        if term_changed {
                             inner.term = term;
                             inner.voted_for = None;
+                            inner.leader_id = None;
                         }
                         inner.role = Role::Follower;
                         inner.leader_id = Some(leader);
@@ -3018,18 +3020,18 @@ impl Node {
                             entries,
                             leader_commit,
                         );
+                        if term_changed || outcome.is_ok() {
+                            inner.persist_meta()?;
+                        }
                         match outcome {
-                            Ok(matched) => {
-                                let _ = inner.persist_meta();
-                                (
-                                    Rpc::AppendResponse {
-                                        term: inner.term,
-                                        ok: true,
-                                        match_index: matched,
-                                    },
-                                    true,
-                                )
-                            }
+                            Ok(matched) => (
+                                Rpc::AppendResponse {
+                                    term: inner.term,
+                                    ok: true,
+                                    match_index: matched,
+                                },
+                                true,
+                            ),
                             Err(_) => {
                                 let term = inner.term;
                                 (
