@@ -1750,7 +1750,16 @@ impl Node {
                         }
                     }
                     let _ = self.persist_range_meta();
-                    let _ = self.range_heartbeat(&range.id).await;
+                    match self.range_heartbeat(&range.id).await {
+                        Ok(()) => {
+                            if let Ok(mut leaders) = self.range_leaders.write() {
+                                leaders.insert(range.id.clone(), self.id);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(group_id = %range.id, %error, "range heartbeat quorum unavailable");
+                        }
+                    }
                 }
                 continue;
             }
@@ -1772,16 +1781,29 @@ impl Node {
     }
 
     async fn range_heartbeat(self: &Arc<Self>, group_id: &str) -> Result<()> {
-        let range = self
-            .try_range_owner_by_id(group_id)?
+        let mut range = self
+            .try_range_owners()?
+            .into_iter()
+            .find(|range| range.id == group_id)
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
-        if range.owner != self.id {
+        let state = self.try_ensure_range_group(group_id, self.id)?;
+        if state.leader != Some(self.id) {
             return Err(RymeError::Unavailable(String::from("not range leader")));
         }
-        let state = self.try_ensure_range_group(group_id, self.id)?;
+        range.owner = self.id;
+        let mut replicas = range.replicas;
+        if replicas.is_empty() {
+            replicas.push(self.id);
+        }
+        if !replicas.contains(&self.id) {
+            return Err(RymeError::Unavailable(String::from("range replica")));
+        }
+        replicas.sort_unstable();
+        replicas.dedup();
         let (last_index, last_term) = self.try_range_last_position(group_id)?;
-        for replica in range.replicas.iter().copied().filter(|replica| *replica != self.id) {
-            let _ = self
+        let mut acknowledgements = 1usize;
+        for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
+            if self
                 .sync_range_replica(
                     group_id,
                     replica,
@@ -1790,7 +1812,24 @@ impl Node {
                     last_term,
                     state.commit_index,
                 )
-                .await;
+                .await
+                .is_ok()
+            {
+                acknowledgements += 1;
+            }
+        }
+        if acknowledgements < majority(replicas.len()) {
+            return Err(RymeError::Unavailable(String::from("range quorum")));
+        }
+        let current = self
+            .range_groups
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| RymeError::Unavailable(String::from("range metadata unavailable")))?;
+        if current.term != state.term || current.leader != Some(self.id) {
+            return Err(RymeError::Unavailable(String::from("stale range leader")));
         }
         Ok(())
     }
@@ -2049,11 +2088,11 @@ impl Node {
             }
             return Err(error);
         }
+        self.range_heartbeat(&range.id).await?;
         self.range_leaders
             .write()
             .map_err(|_| RymeError::Internal(String::from("range leader metadata lock")))?
             .insert(range.id.clone(), self.id);
-        let _ = self.range_heartbeat(&range.id).await;
         self.recover_range_coordinations_for_group(&range.id).await?;
         Ok(())
     }
