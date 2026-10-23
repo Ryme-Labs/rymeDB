@@ -2235,6 +2235,9 @@ impl Node {
         last_term: u64,
         last_index: u64,
     ) -> Result<(u64, bool)> {
+        if term == 0 {
+            return Ok((self.try_range_term(group_id)?, false));
+        }
         let Some(range) = self.try_range_owners()?.into_iter().find(|range| range.id == group_id)
         else {
             return Ok((self.try_range_term(group_id)?, false));

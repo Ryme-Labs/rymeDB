@@ -55,6 +55,7 @@ All notable changes to rymeDB are recorded here. Format follows
   counting quorum votes or advancing its replication position.
 - Range append requests now require a configured group and replica membership
   before changing its leader metadata or durable log.
+- Range voters now reject term-zero requests without persisting a vote.
 
 ### Performance
 
