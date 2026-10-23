@@ -472,14 +472,21 @@ fn decode_frame(input: &[u8]) -> Result<Option<(WalRecord, usize)>> {
     let mut cursor = &input[..HEADER];
     let magic = cursor.get_u32();
     let version = cursor.get_u16();
-    let _reserved = cursor.get_u16();
+    let reserved = cursor.get_u16();
     let lsn = cursor.get_u64();
     let commit_ts = cursor.get_u64();
     let len = cursor.get_u32() as usize;
-    if magic != WAL_MAGIC || version != WAL_VERSION {
+    if magic != WAL_MAGIC || version != WAL_VERSION || reserved != 0 {
         return Err(RymeError::Corrupt(String::from("wal header")));
     }
-    if input.len() < HEADER + len + TRAILER {
+    if len > MAX_WAL_PAYLOAD_BYTES {
+        return Err(RymeError::Corrupt(String::from("wal payload length")));
+    }
+    let frame_len = HEADER
+        .checked_add(len)
+        .and_then(|length| length.checked_add(TRAILER))
+        .ok_or_else(|| RymeError::Corrupt(String::from("wal frame length")))?;
+    if input.len() < frame_len {
         return Ok(None);
     }
     let payload = input[HEADER..HEADER + len].to_vec();
@@ -492,7 +499,7 @@ fn decode_frame(input: &[u8]) -> Result<Option<(WalRecord, usize)>> {
     if stored != computed {
         return Err(RymeError::Corrupt(String::from("wal checksum")));
     }
-    Ok(Some((WalRecord { lsn, commit_ts, payload }, HEADER + len + TRAILER)))
+    Ok(Some((WalRecord { lsn, commit_ts, payload }, frame_len)))
 }
 
 #[cfg(test)]
