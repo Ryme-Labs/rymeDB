@@ -51,7 +51,10 @@ impl S3Store {
             return Err(RymeError::InvalidArgument(String::from("s3 credentials")));
         }
         validate_endpoint(&config.endpoint, config.allow_insecure_http)?;
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| RymeError::Unavailable(String::from("s3 client")))?;
         Ok(Self { config, client })
     }
 
