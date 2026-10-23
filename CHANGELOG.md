@@ -1,5 +1,13 @@
 # Changelog
 
+All notable changes to rymeDB are recorded here. Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
+[SemVer](https://semver.org/).
+
+## [2.0.0] — 2026-10-23
+
+### Added
+
 - PostgreSQL wire sessions now preserve startup user and database parameters
   for `current_user`, `session_user`, `session_authorization`, and
   `current_database()` compatibility probes.
@@ -227,14 +235,6 @@
   `NOTIFY` delivery with standard asynchronous `NotificationResponse` frames,
   scoped by tenant and database; notification delivery and listener changes
   follow transaction commit and rollback semantics.
-
-All notable changes to rymeDB are recorded here. Format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
-[SemVer](https://semver.org/) once 1.0.0 ships.
-
-## [0.1.0] — In development
-
-### Added
 
 - Supabase Realtime channels now support presence configuration, connection
   keys, `presence_state`, `presence_diff`, `track`, and `untrack` frames in

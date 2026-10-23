@@ -1,7 +1,7 @@
 {
   "name": "rymedb-workspace",
   "private": true,
-  "version": "0.1.0",
+  "version": "2.0.0",
   "packageManager": "pnpm@9.0.0",
   "scripts": {
     "check": "turbo run check",
