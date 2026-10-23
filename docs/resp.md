@@ -44,6 +44,9 @@ another gateway with a suitable request limit.
 RESP connections use 16 KiB read buffers and share a 256 MiB process-wide
 budget for read buffers and pending framed input. A connection is closed if it
 cannot reserve input memory from that budget.
+`SCAN` returns at most 10,000 matching keys and 16 MiB of key bytes per call;
+`KEYS` uses the same result limits and returns an error if the keyspace matches
+more. Scan pages read 32 records at a time to bound temporary memory.
 
 ## Transaction notes
 

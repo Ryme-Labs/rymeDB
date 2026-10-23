@@ -47,6 +47,8 @@ All notable changes to rymeDB are recorded here. Format follows
   copying any objects.
 - Archive restores propagate destination inspection errors and recheck the
   destination before publishing the staged restore.
+- RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
+  and scan the keyspace in bounded pages.
 - Config file loading now rejects non-regular files and caps reads at 4 MiB.
 - Routing-key capacity calculations now check overflow and report allocation
   failure instead of relying on infallible vector allocation.

@@ -27,6 +27,9 @@ const RESP_INPUT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RESP_INPUT_BUDGET_UNIT_BYTES: usize = 16 * 1024;
 const RESP_MAX_COMMAND_ARGS: usize = 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
+const RESP_SCAN_PAGE_ITEMS: usize = 32;
+const RESP_MAX_SCAN_RESULT_ITEMS: usize = 10_000;
+const RESP_MAX_SCAN_RESULT_KEY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
 const RESP_LUA_MAX_NESTING: usize = 64;
 const RESP_LUA_MAX_ARRAY_ITEMS: usize = 65_536;
 const RESP_LUA_MAX_REPLY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
@@ -54,6 +57,20 @@ fn check_collection_bytes(bytes: &[u8]) -> std::result::Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn next_scan_result_key_bytes(
+    item_count: usize,
+    current_bytes: usize,
+    key_bytes: usize,
+) -> std::result::Result<usize, String> {
+    if item_count >= RESP_MAX_SCAN_RESULT_ITEMS {
+        return Err(String::from("scan result exceeds the 10,000 key limit"));
+    }
+    current_bytes
+        .checked_add(key_bytes)
+        .filter(|bytes| *bytes <= RESP_MAX_SCAN_RESULT_KEY_BYTES)
+        .ok_or_else(|| String::from("scan result exceeds the 16 MiB key limit"))
 }
 
 pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
@@ -2635,6 +2652,7 @@ where
                 let pattern = &command.args[0];
                 let mut after = Vec::new();
                 let mut keys = Vec::new();
+                let mut key_bytes = 0usize;
                 loop {
                     let rows = match self.manager.scan_after(
                         txn,
@@ -2642,7 +2660,7 @@ where
                         &self.database,
                         KV_TABLE,
                         &after,
-                        512,
+                        RESP_SCAN_PAGE_ITEMS,
                     ) {
                         Ok(rows) => rows,
                         Err(e) => return encode_error(e.to_string()),
@@ -2650,10 +2668,21 @@ where
                     if rows.is_empty() {
                         break;
                     }
-                    let short_page = rows.len() < 512;
+                    let short_page = rows.len() < RESP_SCAN_PAGE_ITEMS;
                     for (key, _) in rows {
                         after = key.clone();
                         if glob_match(pattern, &key) {
+                            key_bytes = match next_scan_result_key_bytes(
+                                keys.len(),
+                                key_bytes,
+                                key.len(),
+                            ) {
+                                Ok(bytes) => bytes,
+                                Err(error) => return encode_error(error),
+                            };
+                            if keys.try_reserve(1).is_err() {
+                                return encode_error(String::from("scan result allocation failed"));
+                            }
                             keys.push(Some(key));
                         }
                     }
@@ -3831,16 +3860,24 @@ where
                 _ => return Err(String::from("syntax")),
             }
         }
-        let want = count.clamp(1, 10_000) as usize;
+        let want = count.clamp(1, RESP_MAX_SCAN_RESULT_ITEMS as i64) as usize;
         let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut key_bytes = 0usize;
         let mut exhausted = false;
         let mut drained = true;
         while keys.len() < want && !exhausted {
             let rows = self
                 .manager
-                .scan_after(txn, &self.tenant, &self.database, KV_TABLE, &after, 512)
+                .scan_after(
+                    txn,
+                    &self.tenant,
+                    &self.database,
+                    KV_TABLE,
+                    &after,
+                    RESP_SCAN_PAGE_ITEMS,
+                )
                 .map_err(|e| e.to_string())?;
-            if rows.len() < 512 {
+            if rows.len() < RESP_SCAN_PAGE_ITEMS {
                 exhausted = true;
             }
             if rows.is_empty() {
@@ -3852,6 +3889,9 @@ where
                     glob_match(pat.as_bytes(), String::from_utf8_lossy(&key).as_bytes())
                 });
                 if matched {
+                    key_bytes = next_scan_result_key_bytes(keys.len(), key_bytes, key.len())?;
+                    keys.try_reserve(1)
+                        .map_err(|_| String::from("scan result allocation failed"))?;
                     keys.push(key);
                     if keys.len() >= want {
                         drained = false;
