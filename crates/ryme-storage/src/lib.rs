@@ -1031,8 +1031,8 @@ impl Engine {
         let mut cursor = body;
         let magic = take_u32(&mut cursor)?;
         let version = take_u16(&mut cursor)?;
-        let _reserved = take_u16(&mut cursor)?;
-        if magic != 0x52594D53 || (version != 1 && version != 2) {
+        let reserved = take_u16(&mut cursor)?;
+        if magic != 0x52594D53 || (version != 1 && version != 2) || reserved != 0 {
             return Err(RymeError::Corrupt(String::from("snapshot magic")));
         }
         let declared_max = take_u64(&mut cursor)?;
