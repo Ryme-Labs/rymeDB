@@ -19,7 +19,8 @@ retention must keep the relevant snapshot and WAL segments available.
 WAL recovery visits records in LSN order one segment at a time, so replay does
 not keep every historical record payload in memory at once.
 WAL segment paths must be regular files; symlinks and other file types are
-rejected during discovery and recovery.
+rejected during discovery and recovery. Segment discovery accepts only the
+canonical `seg-` plus 20-digit ID plus `.wal` filename format.
 Local archive objects and restored files are written through unique temporary
 files created exclusively in their destination directories.
 On Unix, local archive writes sync the published object's containing directory

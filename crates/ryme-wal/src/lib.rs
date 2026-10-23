@@ -549,6 +549,9 @@ fn latest_segment_id(dir: &Path) -> Result<u64> {
 
 fn parse_segment_name(name: &str) -> Option<u64> {
     let rest = name.strip_prefix("seg-")?.strip_suffix(".wal")?;
+    if rest.len() != 20 || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
     rest.parse::<u64>().ok()
 }
 
