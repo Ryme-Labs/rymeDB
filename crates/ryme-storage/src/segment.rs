@@ -407,7 +407,7 @@ impl ImmutableSegment {
         let declared_max =
             if version == SEGMENT_VERSION { Some(take_u64(&mut cursor)?) } else { None };
         let payload_len = take_u32(&mut cursor)? as usize;
-        if cursor.len() < payload_len + 4 {
+        if payload_len.checked_add(4).is_none_or(|required| cursor.len() < required) {
             return Err(RymeError::Corrupt(String::from("segment length")));
         }
         let payload = &cursor[..payload_len];
@@ -1676,6 +1676,21 @@ mod tests {
         std::fs::write(dir.join(segment_name(42)), encode_v1_segment(&segment)).unwrap();
         assert_eq!(SegmentStore::open(&dir).unwrap().max_commit_ts().unwrap(), 42);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_decode_rejects_overflowing_payload_length() {
+        let segment = ImmutableSegment::from_engine(7, &Engine::new());
+        let mut encoded = segment.encode().unwrap();
+        encoded[24..28].copy_from_slice(&u32::MAX.to_be_bytes());
+        let checksum_offset = encoded.len() - 4;
+        let checksum = crc32fast::hash(&encoded[..checksum_offset]);
+        encoded[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(matches!(
+            ImmutableSegment::decode(&encoded),
+            Err(RymeError::Corrupt(message)) if message == "segment length"
+        ));
     }
 
     #[test]
