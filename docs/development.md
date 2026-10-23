@@ -51,8 +51,9 @@ pnpm docs:dev
 pnpm docs:build
 ```
 
-The CI workflows run on `ubuntu-24.04`, install `protoc` and `psql`, test the
-protocols, and build the documentation site.
+The CI workflows run on `ubuntu-24.04`, install `protoc` and `psql`, audit the
+full pnpm dependency graph (including build tooling), test the protocols, and
+build the documentation site.
 
 ## Adding a feature
 

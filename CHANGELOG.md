@@ -16,6 +16,11 @@ All notable changes to rymeDB are recorded here. Format follows
 - SQL supports changing an existing role's inheritance behavior with
   `ALTER ROLE ... INHERIT` and `ALTER ROLE ... NOINHERIT`.
 
+### Security
+
+- CI and the scheduled dependency workflow now audit all pnpm dependencies,
+  including documentation and build tooling, instead of production packages only.
+
 ### Performance
 
 - RESP benchmark percentiles now use whole pipeline-batch samples when pipelining,

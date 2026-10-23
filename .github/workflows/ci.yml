@@ -138,8 +138,8 @@ jobs:
       - name: Install site dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Audit production npm dependencies
-        run: pnpm audit --prod
+      - name: Audit all pnpm dependencies
+        run: pnpm audit
 
       - name: Set up Helm
         uses: azure/setup-helm@59b1c81c6280f5abebb1fb1bc585696daa7dfb42 # v5

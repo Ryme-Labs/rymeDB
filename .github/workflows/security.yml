@@ -49,5 +49,5 @@ jobs:
         with:
           node-version: 22
 
-      - name: Audit production dependencies
-        run: pnpm audit --prod
+      - name: Audit all pnpm dependencies
+        run: pnpm audit
