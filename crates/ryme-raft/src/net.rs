@@ -6628,7 +6628,6 @@ fn append_to_log(
             return Err(RymeError::Unavailable(String::from("conflict")));
         }
     }
-    let needs_rewrite = inner.last_index() > prev_index;
     let mut expected = prev_index.saturating_add(1);
     for entry in &entries {
         if entry.index != expected {
@@ -6637,14 +6636,30 @@ fn append_to_log(
         expected = expected.saturating_add(1);
     }
 
-    if needs_rewrite {
-        inner.replace_log_suffix(prev_index, &entries)?;
-        inner.log.retain(|entry| entry.index <= prev_index);
-    } else if !entries.is_empty() {
-        inner.persist_entries(&entries)?;
+    let conflict = entries.iter().find_map(|incoming| {
+        inner
+            .log
+            .iter()
+            .find(|existing| existing.index == incoming.index)
+            .filter(|existing| existing.term != incoming.term)
+            .map(|_| incoming.index)
+    });
+    if let Some(conflict) = conflict {
+        let keep_through = conflict - 1;
+        let replacement: Vec<LogEntry> =
+            entries.into_iter().filter(|entry| entry.index >= conflict).collect();
+        inner.replace_log_suffix(keep_through, &replacement)?;
+        inner.log.retain(|entry| entry.index <= keep_through);
+        inner.log.extend(replacement);
+    } else {
+        let last = inner.last_index();
+        let new_entries: Vec<LogEntry> =
+            entries.into_iter().filter(|entry| entry.index > last).collect();
+        if !new_entries.is_empty() {
+            inner.persist_entries(&new_entries)?;
+            inner.log.extend(new_entries);
+        }
     }
-    inner.log.extend(entries);
-    inner.log.sort_by_key(|e| e.index);
     let last = inner.last_index();
     if leader_commit > inner.commit_index {
         inner.commit_index = leader_commit.min(last);
