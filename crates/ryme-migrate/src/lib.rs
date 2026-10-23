@@ -497,6 +497,12 @@ impl Ledger {
         self.entries.last().map(|e| e.result_schema_version).unwrap_or(0)
     }
 
+    fn next_schema_version(&self) -> Result<u64> {
+        self.schema_version()
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Conflict(String::from("migration schema version exhausted")))
+    }
+
     pub fn validate_next(&self, migration_id: &str, sql: &str, author: &str) -> Result<()> {
         if migration_id.is_empty()
             || migration_id.len() > MAX_MIGRATION_ID_BYTES
@@ -514,6 +520,7 @@ impl Ledger {
         if self.entries.len() >= MAX_LEDGER_ENTRIES {
             return Err(RymeError::Overload(String::from("migrations")));
         }
+        self.next_schema_version()?;
         Ok(())
     }
 
@@ -532,7 +539,7 @@ impl Ledger {
             checksum,
             parent_checksum: parent,
             applied_unix,
-            result_schema_version: self.schema_version() + 1,
+            result_schema_version: self.next_schema_version()?,
             author,
         };
         self.entries.push(entry.clone());

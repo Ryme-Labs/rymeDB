@@ -19,6 +19,7 @@ All notable changes to rymeDB are recorded here. Format follows
   mutating topology, preserving monotonic routing fences.
 - Branch promotion now rejects exhausted schema versions before changing
   parent manifests or references.
+- Migration validation now rejects exhausted schema versions before running SQL.
 - SQL grants validate roles atomically, and dropping a role clears its direct
   and default privileges so recreating the role cannot restore stale access.
 - SQL role inheritance now stops at intermediate `NOINHERIT` roles, preventing
