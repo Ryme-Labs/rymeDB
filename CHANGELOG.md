@@ -72,6 +72,9 @@ All notable changes to rymeDB are recorded here. Format follows
   protocol C strings reject invalid UTF-8 instead of silently replacing bytes.
 - PostgreSQL text-format Bind parameters now reject invalid UTF-8 and embedded
   NUL bytes instead of silently rewriting client values.
+- PostgreSQL Bind messages now require the parameter count to match the
+  prepared statement instead of leaving placeholders unresolved or ignoring
+  extra values.
 - RESP array commands split at TCP read boundaries now remain buffered instead
   of being rejected as malformed.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment

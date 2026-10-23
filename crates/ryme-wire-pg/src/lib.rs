@@ -1717,6 +1717,25 @@ where
                             .map_err(|e| RymeError::Io(e.to_string()))?;
                         continue;
                     }
+                    let expected_params =
+                        statements.get(&statement).map_or(0, |query| parameter_count(query));
+                    if params.len() != expected_params {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
+                        socket
+                            .write_all(&encode_error_code(
+                                "08P01",
+                                format!(
+                                    "bind parameter count mismatch: expected {expected_params}, got {}",
+                                    params.len()
+                                ),
+                            ))
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        continue;
+                    }
                     if !portal.is_empty() && portals.contains_key(&portal) {
                         ignore_until_sync = true;
                         if let Some(transaction) = active_transaction.as_mut() {
