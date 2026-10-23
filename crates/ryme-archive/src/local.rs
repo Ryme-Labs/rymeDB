@@ -181,6 +181,16 @@ impl crate::ObjectStore for LocalStore {
 
         let max_bytes = max_bytes.min(super::MAX_ARCHIVE_OBJECT_BYTES);
         let path = self.path(key)?;
+        let path_metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RymeError::NotFound(String::from("key")));
+            }
+            Err(error) => return Err(RymeError::from(error)),
+        };
+        if !path_metadata.file_type().is_file() {
+            return Err(RymeError::Corrupt(String::from("archive object file type")));
+        }
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -188,7 +198,18 @@ impl crate::ObjectStore for LocalStore {
             }
             Err(e) => return Err(RymeError::from(e)),
         };
-        if file.metadata()?.len() > max_bytes as u64 {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(RymeError::Corrupt(String::from("archive object file type")));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+                return Err(RymeError::Corrupt(String::from("archive object file identity")));
+            }
+        }
+        if metadata.len() > max_bytes as u64 {
             return Err(RymeError::Overload(String::from("archive object")));
         }
         let mut bytes = Vec::new();
