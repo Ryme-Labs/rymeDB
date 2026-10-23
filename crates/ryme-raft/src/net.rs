@@ -23,6 +23,8 @@ const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_RAFT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const APPEND_RPC_BASE_ESTIMATE_BYTES: usize = 256;
+const APPEND_RPC_ENTRY_OVERHEAD_ESTIMATE_BYTES: usize = 96;
 const RPC_READ_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RPC_WRITE_FRAME_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RPC_FRAME_BUDGET_UNIT_BYTES: usize = 16 * 1024;
@@ -916,6 +918,53 @@ fn decode_log_frame(input: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
         return Err(RymeError::Corrupt(String::from("log frame")));
     }
     Ok((index, term, input[24..].to_vec()))
+}
+
+fn append_entry_frame_estimate(entry: &LogEntry) -> Result<usize> {
+    let mut payload_bytes = 2usize;
+    for (index, byte) in entry.payload.iter().enumerate() {
+        let digits = if *byte < 10 {
+            1
+        } else if *byte < 100 {
+            2
+        } else {
+            3
+        };
+        payload_bytes = payload_bytes
+            .checked_add(digits + usize::from(index > 0))
+            .ok_or_else(|| RymeError::Overload(String::from("raft append entry")))?;
+    }
+    APPEND_RPC_ENTRY_OVERHEAD_ESTIMATE_BYTES
+        .checked_add(payload_bytes)
+        .ok_or_else(|| RymeError::Overload(String::from("raft append entry")))
+}
+
+fn append_batch_count(entries: &[LogEntry], next_index: u64) -> Result<usize> {
+    let mut estimated_bytes = APPEND_RPC_BASE_ESTIMATE_BYTES;
+    let mut count = 0usize;
+    for entry in entries.iter().filter(|entry| entry.index >= next_index) {
+        let Some(required_bytes) = estimated_bytes.checked_add(append_entry_frame_estimate(entry)?)
+        else {
+            return Err(RymeError::Overload(String::from("raft append batch")));
+        };
+        if required_bytes > MAX_RPC_FRAME_BYTES {
+            if count == 0 {
+                return Err(RymeError::Overload(String::from("raft append entry")));
+            }
+            break;
+        }
+        estimated_bytes = required_bytes;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn validate_append_batch(entries: &[LogEntry]) -> Result<()> {
+    if append_batch_count(entries, 0)? == entries.len() {
+        Ok(())
+    } else {
+        Err(RymeError::Overload(String::from("raft append batch")))
+    }
 }
 
 fn validate_apply_payload(input: &[u8]) -> Result<()> {
@@ -2582,7 +2631,9 @@ impl Node {
         };
         let prev = snapshot.iter().rev().find(|e| e.index < next);
         let (prev_index, prev_term) = prev.map(|e| (e.index, e.term)).unwrap_or((0, 0));
-        let entries: Vec<LogEntry> = snapshot.iter().filter(|e| e.index >= next).cloned().collect();
+        let batch_count = append_batch_count(&snapshot, next)?;
+        let entries: Vec<LogEntry> =
+            snapshot.iter().filter(|e| e.index >= next).take(batch_count).cloned().collect();
         let sent_last = entries.last().map(|entry| entry.index).unwrap_or(prev_index);
         let request = Rpc::AppendRequest {
             term,
@@ -5598,6 +5649,7 @@ impl Node {
                 .checked_add(1)
                 .ok_or_else(|| RymeError::Corrupt(String::from("raft log index overflow")))?;
             let entry = LogEntry { index, term: inner.term, payload };
+            validate_append_batch(std::slice::from_ref(&entry))?;
             if let Err(error) = inner.persist_entries(std::slice::from_ref(&entry)) {
                 let isolate = is_wal_storage_failure(&error);
                 drop(inner);
@@ -5763,12 +5815,14 @@ impl Node {
             };
             let prev = snapshot.iter().rev().find(|e| e.index < next);
             let (prev_index, prev_term) = prev.map(|e| (e.index, e.term)).unwrap_or((0, 0));
-            let entries: Vec<LogEntry> =
-                snapshot.iter().filter(|e| e.index >= next).cloned().collect();
             let last = snapshot.last().map(|e| e.index).unwrap_or(0);
             if next > last {
                 return Ok(());
             }
+            let batch_count = append_batch_count(&snapshot, next)?;
+            let entries: Vec<LogEntry> =
+                snapshot.iter().filter(|e| e.index >= next).take(batch_count).cloned().collect();
+            let sent_last = entries.last().map(|entry| entry.index).unwrap_or(prev_index);
             let request = Rpc::AppendRequest {
                 term,
                 leader: self.id,
@@ -5793,10 +5847,26 @@ impl Node {
                             return Err(RymeError::Unavailable(String::from("not leader")));
                         }
                     }
-                    if ok && match_index >= last {
-                        return Ok(());
+                    if ok {
+                        if match_index < sent_last {
+                            return Err(RymeError::Unavailable(String::from(
+                                "catch-up acknowledgement index",
+                            )));
+                        }
+                        if sent_last >= last {
+                            return Ok(());
+                        }
+                        next = sent_last.checked_add(1).ok_or_else(|| {
+                            RymeError::Corrupt(String::from("raft log index overflow"))
+                        })?;
+                    } else {
+                        let suggested = match_index.min(last).saturating_add(1).max(1);
+                        next = if suggested < next {
+                            suggested
+                        } else {
+                            next.saturating_sub(1).max(1)
+                        };
                     }
-                    next = match_index.saturating_add(1).max(1);
                 }
                 Ok(_) => return Err(RymeError::Corrupt(String::from("rpc"))),
                 Err(_) => {
@@ -6876,6 +6946,7 @@ fn append_to_log(
     if leader_term == 0 {
         return Err(RymeError::InvalidArgument(String::from("raft append term")));
     }
+    validate_append_batch(&entries)?;
     if prev_index == 0 && prev_term != 0 {
         return Err(RymeError::Unavailable(String::from("invalid log prefix")));
     }
