@@ -33,6 +33,8 @@ All notable changes to rymeDB are recorded here. Format follows
   or transaction-commit errors instead of reporting a clean abort.
 - Raft range heartbeats now stop when leader/contact metadata cannot be
   persisted, preserving the durable election-state boundary.
+- Raft range metadata snapshots now serialize their atomic file replacements,
+  preventing concurrent writers from racing on the shared temporary file.
 
 ### Performance
 

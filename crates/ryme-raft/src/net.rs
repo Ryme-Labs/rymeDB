@@ -1122,6 +1122,7 @@ pub struct Node {
     range_logs: std::sync::Mutex<BTreeMap<String, u64>>,
     range_entries: std::sync::Mutex<BTreeMap<String, BTreeMap<u64, RangeLogRecord>>>,
     range_groups: std::sync::Mutex<BTreeMap<String, RangeGroupState>>,
+    range_meta_persist_lock: std::sync::Mutex<()>,
     range_meta_path: PathBuf,
     range_wal_path: PathBuf,
     range_wal: std::sync::Mutex<Wal>,
@@ -1509,6 +1510,7 @@ impl Node {
             range_logs: std::sync::Mutex::new(range_logs),
             range_entries: std::sync::Mutex::new(range_entries),
             range_groups: std::sync::Mutex::new(range_groups),
+            range_meta_persist_lock: std::sync::Mutex::new(()),
             range_meta_path,
             range_wal_path: range_dir,
             range_wal: std::sync::Mutex::new(range_wal),
@@ -4236,6 +4238,10 @@ impl Node {
     }
 
     fn persist_range_meta(&self) -> Result<()> {
+        let _persist = self
+            .range_meta_persist_lock
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range metadata persist lock")))?;
         let states = self
             .range_groups
             .lock()
