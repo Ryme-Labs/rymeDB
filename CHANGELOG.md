@@ -4,6 +4,22 @@ All notable changes to rymeDB are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [2.0.1] — 2026-10-23
+
+### Fixed
+
+- WAL, Raft, range metadata, shard placement, and transaction persistence now
+  fail closed when durable writes or synchronization fail, preventing the
+  process from serving state that may disagree with recovery.
+- PostgreSQL extended-protocol parsing, prepared-object lifecycle, cancellation,
+  transaction status, COPY synchronization, and schema rollback now handle
+  malformed input and failures without leaving sessions or schema state
+  inconsistent.
+- Realtime scans, catalog snapshots, filtered commits, range routing, and
+  snapshot retention now propagate errors instead of silently using incomplete
+  state.
+- Patched Rust dependencies with published security advisories.
+
 ## [2.0.0] — 2026-10-23
 
 ### Added

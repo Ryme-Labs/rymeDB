@@ -83,7 +83,7 @@ Install the chart, setting the image tag and your cluster's storage class:
 helm upgrade --install rymedb deploy/k8s/helm/rymeDB \
   --namespace rymedb \
   --set image.repository=ghcr.io/ryme-labs/rymedb \
-  --set image.tag=2.0.0 \
+  --set image.tag=2.0.1 \
   --set raftTls.secretName=rymedb-raft-tls \
   --set persistence.storageClass=YOUR_STORAGE_CLASS
 ```
