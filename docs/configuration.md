@@ -36,7 +36,7 @@ ryme-server --config /etc/rymedb/node.json
 | `storage_mode` | `hot` | `hot` keeps the working set materialized; `standard` reads immutable segments through a bounded cache. |
 | `cache_bytes` | `67108864` | Segment cache size. Minimum 1 MiB. |
 | `max_connections` | `10000` | Node-wide connection limit for protocol gateways. |
-| `http_max_body_bytes` | `2097152` | HTTP request limit; maximum 64 MiB. |
+| `http_max_body_bytes` | `2097152` | HTTP per-request limit; maximum 64 MiB. HTTP and HTTPS share a 256 MiB configured active-body budget. |
 | `region` | `local-1` | Region label returned by placement APIs. |
 | `read_only` | `false` | Reject mutations while serving reads. |
 | `sweep_interval_secs` | `30` | TTL, MVCC, and retention sweep period; `0` disables it. |

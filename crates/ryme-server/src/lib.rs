@@ -1164,6 +1164,7 @@ pub struct SharedState {
     dek_ring: Arc<Mutex<KeyRing>>,
     indexes: Arc<RwLock<PartitionedIndex>>,
     http_max_body_bytes: u64,
+    http_request_slots: Arc<tokio::sync::Semaphore>,
     credentials: Arc<Mutex<CredentialStore>>,
     auth_attempts: Arc<Mutex<AuthAttemptLimiter>>,
     auth_hash_slots: Arc<tokio::sync::Semaphore>,
@@ -2627,6 +2628,9 @@ impl SharedState {
             dek_ring,
             indexes: Arc::new(RwLock::new(PartitionedIndex::new(config.index_partitions))),
             http_max_body_bytes: config.http_max_body_bytes,
+            http_request_slots: Arc::new(tokio::sync::Semaphore::new(
+                (256 * 1024 * 1024 / config.http_max_body_bytes.max(1) as usize).clamp(1, 256),
+            )),
             credentials: Arc::new(Mutex::new(credentials)),
             auth_attempts: Arc::new(Mutex::new(AuthAttemptLimiter::default())),
             auth_hash_slots: Arc::new(tokio::sync::Semaphore::new(AUTH_HASH_CONCURRENCY)),
@@ -3267,6 +3271,7 @@ pub fn router(state: SharedState) -> axum::Router {
         .route("/v1/stream", get(stream))
         .route("/v1/query-stream", get(query_stream))
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), http_request_limit))
         .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_guard))
         .layer(axum::middleware::from_fn(cors_headers))
         .layer(axum::middleware::from_fn_with_state(state.clone(), record_http_status))
@@ -3502,6 +3507,15 @@ async fn read_only_guard(
     if state.read_only && is_mutating(request.method(), request.uri().path()) {
         return error_response(ryme_error::RymeError::ReadOnly(String::from("read-only follower")));
     }
+    next.run(request).await
+}
+
+async fn http_request_limit(
+    State(state): State<SharedState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let _permit = state.http_request_slots.clone().acquire_owned().await;
     next.run(request).await
 }
 

@@ -15,6 +15,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- HTTP and HTTPS share a request concurrency limit derived from the configured
+  body limit, keeping the aggregate configured active-body allowance at or below
+  256 MiB.
 - gRPC TCP/TLS servers now cap active requests per listener and connection and
   enforce an explicit protobuf request-size limit.
 - RESP TCP/TLS input now shares a process-wide memory budget for read buffers
