@@ -26,6 +26,8 @@ All notable changes to rymeDB are recorded here. Format follows
   removes them when writes or replacement fail.
 - SQL schema snapshots now use exclusively created temporary files with
   restrictive Unix permissions before atomic replacement.
+- Shard range and table placement snapshots now use exclusive temporary files
+  and clean them up if writing or replacement fails.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.

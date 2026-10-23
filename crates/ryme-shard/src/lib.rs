@@ -7,6 +7,7 @@ use ryme_txn::{
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
@@ -124,6 +125,7 @@ const COORDINATOR_PLACEMENT_VERSION: u8 = 2;
 const MAX_PENDING_GROUP_COMMITS: usize = 128;
 const MAX_PENDING_GROUP_COMMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SHARD_METADATA_BYTES: usize = 64 * 1024 * 1024;
+static NEXT_METADATA_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<()> {
@@ -136,6 +138,31 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+fn persist_metadata_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let (temporary, mut file) = loop {
+        let id = NEXT_METADATA_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("json.tmp-{}-{id}", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_parent_directory(path)
 }
 
 fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
@@ -262,14 +289,7 @@ fn persist_range_assignments(
     if bytes.len() > MAX_SHARD_METADATA_BYTES {
         return Err(RymeError::Overload(String::from("range placements")));
     }
-    let temporary = path.with_extension("json.tmp");
-    let mut file = std::fs::File::create(&temporary)?;
-    use std::io::Write;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::rename(temporary, path)?;
-    sync_parent_directory(path)?;
-    Ok(())
+    persist_metadata_file(path, &bytes)
 }
 
 fn route_range(ranges: &[RangePlacement], key: &[u8]) -> Option<usize> {
@@ -452,14 +472,7 @@ impl ShardSet {
         if bytes.len() > MAX_SHARD_METADATA_BYTES {
             return Err(RymeError::Overload(String::from("placements")));
         }
-        let temporary = path.with_extension("json.tmp");
-        let mut file = std::fs::File::create(&temporary)?;
-        use std::io::Write;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(temporary, &path)?;
-        sync_parent_directory(&path)?;
-        Ok(())
+        persist_metadata_file(&path, &bytes)
     }
 
     pub fn shard_count(&self) -> usize {
