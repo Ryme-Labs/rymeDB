@@ -1464,7 +1464,10 @@ where
                         .map_err(|e| RymeError::Io(e.to_string()))?;
                 }
                 Err(e) => {
-                    let response = encode_error(e.to_string());
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
+                    let response = encode_error_code("08P01", e.to_string());
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
                 }
             },
@@ -1497,7 +1500,10 @@ where
                         .map_err(|e| RymeError::Io(e.to_string()))?;
                 }
                 Err(e) => {
-                    let response = encode_error(e.to_string());
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
+                    let response = encode_error_code("08P01", e.to_string());
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
                 }
             },
@@ -4571,25 +4577,18 @@ fn parse_close(payload: &[u8]) -> Option<(u8, String)> {
 }
 
 fn read_i16(payload: &[u8], offset: &mut usize) -> Option<i16> {
-    if payload.len() < *offset + 2 {
-        return None;
-    }
-    let value = i16::from_be_bytes([payload[*offset], payload[*offset + 1]]);
-    *offset += 2;
+    let end = (*offset).checked_add(2)?;
+    let bytes = payload.get(*offset..end)?;
+    let value = i16::from_be_bytes([bytes[0], bytes[1]]);
+    *offset = end;
     Some(value)
 }
 
 fn read_i32(payload: &[u8], offset: &mut usize) -> Option<i32> {
-    if payload.len() < *offset + 4 {
-        return None;
-    }
-    let value = i32::from_be_bytes([
-        payload[*offset],
-        payload[*offset + 1],
-        payload[*offset + 2],
-        payload[*offset + 3],
-    ]);
-    *offset += 4;
+    let end = (*offset).checked_add(4)?;
+    let bytes = payload.get(*offset..end)?;
+    let value = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    *offset = end;
     Some(value)
 }
 
@@ -4599,6 +4598,19 @@ fn parse_prepare(payload: &[u8]) -> std::result::Result<(String, String), RymeEr
         .ok_or_else(|| RymeError::InvalidArgument(String::from("parse name")))?;
     let query = read_cstring(payload, &mut offset)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("parse query")))?;
+    let type_count = read_i16(payload, &mut offset)
+        .filter(|count| *count >= 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("parse parameter types")))?;
+    for _ in 0..type_count {
+        read_i32(payload, &mut offset)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("parse parameter type")))?;
+    }
+    if type_count > 0 && type_count as usize != parameter_count(&query) {
+        return Err(RymeError::InvalidArgument(String::from("parse parameter type count")));
+    }
+    if offset != payload.len() {
+        return Err(RymeError::InvalidArgument(String::from("parse trailing bytes")));
+    }
     Ok((name, query))
 }
 
@@ -4609,27 +4621,63 @@ fn parse_bind(payload: &[u8]) -> std::result::Result<(String, String, Vec<String
     let statement = read_cstring(payload, &mut offset)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("bind statement")))?;
     let formats = read_i16(payload, &mut offset)
+        .filter(|count| *count >= 0)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("bind formats")))?;
-    for _ in 0..formats.max(0) {
-        read_i16(payload, &mut offset)
+    let mut parameter_formats = Vec::with_capacity(formats as usize);
+    for _ in 0..formats {
+        let format = read_i16(payload, &mut offset)
             .ok_or_else(|| RymeError::InvalidArgument(String::from("bind format")))?;
+        if format != 0 {
+            return Err(RymeError::InvalidArgument(String::from(
+                "binary parameter format is unsupported",
+            )));
+        }
+        parameter_formats.push(format);
     }
     let count = read_i16(payload, &mut offset)
+        .filter(|count| *count >= 0)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("bind count")))?;
+    if !parameter_formats.is_empty()
+        && parameter_formats.len() != 1
+        && parameter_formats.len() != count as usize
+    {
+        return Err(RymeError::InvalidArgument(String::from("bind format count")));
+    }
     let mut params = Vec::new();
-    for _ in 0..count.max(0) {
+    for _ in 0..count {
         let length = read_i32(payload, &mut offset)
             .ok_or_else(|| RymeError::InvalidArgument(String::from("bind length")))?;
-        if length < 0 {
+        if length == -1 {
             params.push(String::from("\0"));
             continue;
         }
-        let length = length as usize;
-        if payload.len() < offset + length {
-            return Err(RymeError::InvalidArgument(String::from("bind value")));
+        if length < 0 {
+            return Err(RymeError::InvalidArgument(String::from("bind length")));
         }
-        params.push(String::from_utf8_lossy(&payload[offset..offset + length]).into_owned());
-        offset += length;
+        let length = length as usize;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("bind value")))?;
+        let value = payload
+            .get(offset..end)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("bind value")))?;
+        params.push(String::from_utf8_lossy(value).into_owned());
+        offset = end;
+    }
+    let result_formats = read_i16(payload, &mut offset)
+        .filter(|count| *count >= 0)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("bind result formats")))?;
+    for _ in 0..result_formats {
+        let format = read_i16(payload, &mut offset)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("bind result format")))?;
+        if format != 0 {
+            return Err(RymeError::InvalidArgument(String::from(
+                "binary result format is unsupported",
+            )));
+        }
+    }
+    if offset != payload.len() {
+        return Err(RymeError::InvalidArgument(String::from("bind trailing bytes")));
     }
     Ok((portal, statement, params))
 }
