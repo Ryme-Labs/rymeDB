@@ -13356,6 +13356,7 @@ async fn range_transfer(
     let mut source_rows_purged = 0u64;
     for peer in cleanup_peers {
         let mut purged = None;
+        let mut last_error = None;
         for _ in 0..20 {
             let result = if peer == node.node_id() {
                 node.purge_range_after_transfer(&moved.id, moved.epoch, &snapshot).await
@@ -13373,16 +13374,27 @@ async fn range_transfer(
                     purged = Some(rows);
                     break;
                 }
-                Err(ryme_error::RymeError::Unavailable(_)) => {
+                Err(
+                    error @ (ryme_error::RymeError::Unavailable(_)
+                    | ryme_error::RymeError::Timeout
+                    | ryme_error::RymeError::Io(_)),
+                ) => {
+                    last_error = Some(error);
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
-                Err(_) => break,
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
             }
         }
         if let Some(rows) = purged {
             source_rows_purged = source_rows_purged.saturating_add(rows);
         } else {
             source_cleanup = false;
+            if let Some(error) = last_error {
+                tracing::warn!(peer, %error, range_id = %moved.id, "range transfer source cleanup deferred");
+            }
         }
     }
     let bytes: u64 =
