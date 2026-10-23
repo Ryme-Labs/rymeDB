@@ -5952,12 +5952,20 @@ impl Node {
         }
     }
 
-    pub fn set_range_owners(&self, mut owners: Vec<RangeOwner>) {
+    pub fn set_range_owners(&self, owners: Vec<RangeOwner>) {
+        if let Err(error) = self.try_set_range_owners(owners) {
+            tracing::error!(%error, "failed to install range ownership metadata");
+        }
+    }
+
+    /// Installs range ownership metadata and reports validation, persistence,
+    /// or synchronization failures to the caller.
+    pub fn try_set_range_owners(&self, mut owners: Vec<RangeOwner>) -> Result<()> {
         if let Some(first) = owners.first() {
             if ryme_storage::validate_routing_version(first.routing_version).is_err()
                 || owners.iter().any(|range| range.routing_version != first.routing_version)
             {
-                return;
+                return Err(RymeError::InvalidArgument(String::from("range routing version")));
             }
         }
         for range in &mut owners {
@@ -5972,28 +5980,28 @@ impl Node {
             }
             range.replicas.sort_unstable();
             range.replicas.dedup();
-            if let Err(error) = self.try_ensure_range_group(&range.id, range.owner) {
-                tracing::error!(group_id = %range.id, %error, "range metadata unavailable");
-                return;
-            }
+            self.try_ensure_range_group(&range.id, range.owner)?;
         }
-        let _ = self.persist_range_meta();
+        self.persist_range_meta()?;
         owners.sort_by(|left, right| left.start.cmp(&right.start));
-        if let Ok(mut current) = self.range_owners.write() {
-            if *current == owners {
-                return;
-            }
-            *current = owners;
-            self.range_generation.fetch_add(1, Ordering::SeqCst);
+        let mut current = self
+            .range_owners
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("range ownership metadata poisoned")))?;
+        let mut leaders = self
+            .range_leaders
+            .write()
+            .map_err(|_| RymeError::Internal(String::from("range leader metadata lock")))?;
+        if *current == owners {
+            return Ok(());
         }
-        if let Ok(owners) = self.range_owners.read() {
-            if let Ok(mut leaders) = self.range_leaders.write() {
-                leaders.clear();
-                for range in owners.iter() {
-                    leaders.insert(range.id.clone(), range.owner);
-                }
-            }
+        *current = owners.clone();
+        leaders.clear();
+        for range in owners {
+            leaders.insert(range.id, range.owner);
         }
+        self.range_generation.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn range_generation(&self) -> u64 {

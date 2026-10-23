@@ -12382,7 +12382,7 @@ fn install_cluster_range_replication(
         .lock()
         .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?
         .ranges();
-    node.set_range_owners(range_owners(&ranges));
+    node.try_set_range_owners(range_owners(&ranges))?;
     let state = state.clone();
     let hook: ryme_raft::net::MetadataHook =
         Arc::new(move |payload| apply_cluster_metadata(&state, payload));
@@ -12772,7 +12772,19 @@ fn apply_replicated_ranges(state: &SharedState, payload: &[u8]) -> ryme_error::R
         return Err(error);
     }
     if let Some(node) = state.raft_node() {
-        node.set_range_owners(range_owners(&ranges));
+        if let Err(error) = node.try_set_range_owners(range_owners(&ranges)) {
+            let rollback = (|| -> ryme_error::Result<()> {
+                control.restore_ranges(previous.clone())?;
+                sync_range_topology(state, &previous)?;
+                state.persist_control_locked(&control)
+            })();
+            if let Err(rollback_error) = rollback {
+                return Err(ryme_error::RymeError::Internal(format!(
+                    "range metadata update failed: {error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
