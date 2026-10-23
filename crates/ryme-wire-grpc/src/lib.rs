@@ -24,6 +24,9 @@ pub mod proto {
 
 pub const VERSION: &str = "ryme-grpc/1";
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+const MAX_GRPC_REQUEST_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
+const MAX_GRPC_CONCURRENT_REQUESTS: usize = 64;
+const MAX_GRPC_STREAMS_PER_CONNECTION: u32 = 32;
 
 struct LimitedTcpStream {
     stream: TcpStream,
@@ -204,8 +207,13 @@ where
     ) -> Result<()> {
         let incoming = limited_incoming(listener, max_connections);
         tonic::transport::Server::builder()
-            .concurrency_limit_per_connection(1024)
-            .add_service(proto::ryme_server::RymeServer::new(self))
+            .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_GRPC_CONCURRENT_REQUESTS))
+            .max_concurrent_streams(MAX_GRPC_STREAMS_PER_CONNECTION)
+            .concurrency_limit_per_connection(MAX_GRPC_STREAMS_PER_CONNECTION as usize)
+            .add_service(
+                proto::ryme_server::RymeServer::new(self)
+                    .max_decoding_message_size(MAX_GRPC_REQUEST_BYTES),
+            )
             .serve_with_incoming(incoming)
             .await
             .map_err(|e| RymeError::Io(e.to_string()))
@@ -229,10 +237,15 @@ where
         let identity = tonic::transport::Identity::from_pem(cert, key);
         let incoming = limited_incoming(listener, max_connections);
         tonic::transport::Server::builder()
-            .concurrency_limit_per_connection(1024)
+            .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_GRPC_CONCURRENT_REQUESTS))
+            .max_concurrent_streams(MAX_GRPC_STREAMS_PER_CONNECTION)
+            .concurrency_limit_per_connection(MAX_GRPC_STREAMS_PER_CONNECTION as usize)
             .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
             .map_err(|e| RymeError::Io(e.to_string()))?
-            .add_service(proto::ryme_server::RymeServer::new(self))
+            .add_service(
+                proto::ryme_server::RymeServer::new(self)
+                    .max_decoding_message_size(MAX_GRPC_REQUEST_BYTES),
+            )
             .serve_with_incoming(incoming)
             .await
             .map_err(|e| RymeError::Io(e.to_string()))

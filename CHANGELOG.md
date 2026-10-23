@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- gRPC TCP/TLS servers now cap active requests per listener and connection and
+  enforce an explicit protobuf request-size limit.
 - RESP TCP/TLS input now shares a process-wide memory budget for read buffers
   and pending frames, bounding aggregate ingress memory under many connections.
 - Native TCP/TLS input now shares a process-wide memory budget for read buffers

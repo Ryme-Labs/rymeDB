@@ -64,6 +64,10 @@ buffers and pending framed input.
 Connections are closed when the process-wide input budget is exhausted; this
 budget is not currently configurable.
 
+The gRPC TCP/TLS gateway accepts protobuf requests up to 4 MiB plus 64 KiB,
+allows up to 32 concurrent streams per connection, and caps active requests at
+64 per listener. Additional streams wait for capacity.
+
 ## Listener flags
 
 The equivalent CLI flags are `--pg-listen`, `--resp-listen`,
