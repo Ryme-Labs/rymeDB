@@ -62,7 +62,16 @@ impl RaftGroup {
         if self.role != Role::Leader {
             return Err(RymeError::Unavailable(String::from("not leader")));
         }
-        let index = self.log.last().map(|e| e.index + 1).unwrap_or(1);
+        let index = self
+            .log
+            .last()
+            .map(|entry| {
+                entry
+                    .index
+                    .checked_add(1)
+                    .ok_or_else(|| RymeError::Corrupt(String::from("raft log index overflow")))
+            })
+            .unwrap_or(Ok(1))?;
         self.log.push(LogEntry { index, term: self.term, payload });
         Ok(index)
     }
@@ -428,7 +437,11 @@ impl Cluster {
             if peer == leader {
                 continue;
             }
-            let next = self.nodes[peer].group.last_index() + 1;
+            let next = self.nodes[peer]
+                .group
+                .last_index()
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("raft log index overflow")))?;
             let prev = log.iter().rev().find(|e| e.index < next);
             let (prev_index, prev_term) = prev.map(|e| (e.index, e.term)).unwrap_or((0, 0));
             let entries: Vec<LogEntry> = log.iter().filter(|e| e.index >= next).cloned().collect();

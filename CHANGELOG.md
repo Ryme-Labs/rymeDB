@@ -70,6 +70,8 @@ All notable changes to rymeDB are recorded here. Format follows
   well.
 - Global Raft leader initialization now rejects a saturated log index instead
   of overflowing when initializing follower replication positions.
+- The in-process Raft model now rejects saturated log indexes during proposal
+  and follower replication.
 - Range followers now acknowledge exact duplicate appends idempotently while
   retaining conflict handling for entries with different contents.
 - Raft replication now sends bounded append batches so large backlogs can catch
