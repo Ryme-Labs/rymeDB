@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- TLS certificate, key, and CA inputs are capped at 4 MiB each, including
+  file-based and byte-based constructors.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique

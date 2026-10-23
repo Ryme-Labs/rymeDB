@@ -78,6 +78,7 @@ The equivalent CLI flags are `--pg-listen`, `--resp-listen`,
 Optional TLS listeners require `tls_cert_pem` and `tls_key_pem`. Add
 `tls_client_ca_pem` to require client certificates. `raft_tls` additionally
 requires a Raft listener, server certificate/key, and client CA.
+Each certificate, key, or CA PEM input is limited to 4 MiB.
 Non-loopback Raft listeners always require `raft_tls: true`; loopback-only
 development Raft listeners may remain plaintext.
 

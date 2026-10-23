@@ -1,5 +1,27 @@
 use ryme_error::{Result, RymeError};
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
+
+const MAX_TLS_PEM_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_pem_file(path: &Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_TLS_PEM_BYTES as u64 {
+        return Err(RymeError::InvalidArgument(String::from("tls pem exceeds 4 MiB")));
+    }
+    let mut raw = Vec::new();
+    file.take((MAX_TLS_PEM_BYTES + 1) as u64).read_to_end(&mut raw)?;
+    validate_pem_size(&raw)?;
+    Ok(raw)
+}
+
+fn validate_pem_size(pem: &[u8]) -> Result<()> {
+    if pem.len() > MAX_TLS_PEM_BYTES {
+        return Err(RymeError::InvalidArgument(String::from("tls pem exceeds 4 MiB")));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct TlsAcceptor {
@@ -10,8 +32,8 @@ pub struct TlsAcceptor {
 
 impl TlsAcceptor {
     pub fn from_pem_files(cert_path: &std::path::Path, key_path: &std::path::Path) -> Result<Self> {
-        let cert_raw = std::fs::read(cert_path)?;
-        let key_raw = std::fs::read(key_path)?;
+        let cert_raw = read_pem_file(cert_path)?;
+        let key_raw = read_pem_file(key_path)?;
         Self::from_pem_bytes(&cert_raw, &key_raw)
     }
 
@@ -20,13 +42,15 @@ impl TlsAcceptor {
         key_path: &std::path::Path,
         ca_path: &std::path::Path,
     ) -> Result<Self> {
-        let cert_raw = std::fs::read(cert_path)?;
-        let key_raw = std::fs::read(key_path)?;
-        let ca_raw = std::fs::read(ca_path)?;
+        let cert_raw = read_pem_file(cert_path)?;
+        let key_raw = read_pem_file(key_path)?;
+        let ca_raw = read_pem_file(ca_path)?;
         Self::from_pem_bytes_mutual(&cert_raw, &key_raw, &ca_raw)
     }
 
     pub fn from_pem_bytes(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
+        validate_pem_size(cert_pem)?;
+        validate_pem_size(key_pem)?;
         let certs = read_certs(cert_pem, "tls cert")?;
         let key = tls_private_key(key_pem)?;
         let config = rustls::ServerConfig::builder()
@@ -41,6 +65,9 @@ impl TlsAcceptor {
     }
 
     pub fn from_pem_bytes_mutual(cert_pem: &[u8], key_pem: &[u8], ca_pem: &[u8]) -> Result<Self> {
+        validate_pem_size(cert_pem)?;
+        validate_pem_size(key_pem)?;
+        validate_pem_size(ca_pem)?;
         let certs = read_certs(cert_pem, "tls cert")?;
         let key = tls_private_key(key_pem)?;
         let cas = read_certs(ca_pem, "tls client ca")?;
@@ -102,6 +129,13 @@ impl MeshConnector {
         client_cert_pem: Option<&[u8]>,
         client_key_pem: Option<&[u8]>,
     ) -> Result<Self> {
+        validate_pem_size(ca_pem)?;
+        if let Some(pem) = client_cert_pem {
+            validate_pem_size(pem)?;
+        }
+        if let Some(pem) = client_key_pem {
+            validate_pem_size(pem)?;
+        }
         use rustls_pki_types::pem::PemObject;
         let cas: Vec<rustls::pki_types::CertificateDer<'static>> =
             rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem)
@@ -144,13 +178,13 @@ impl MeshConnector {
         client_cert_path: Option<&std::path::Path>,
         client_key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let ca_raw = std::fs::read(ca_path)?;
+        let ca_raw = read_pem_file(ca_path)?;
         let cert_raw = match client_cert_path {
-            Some(path) => Some(std::fs::read(path)?),
+            Some(path) => Some(read_pem_file(path)?),
             None => None,
         };
         let key_raw = match client_key_path {
-            Some(path) => Some(std::fs::read(path)?),
+            Some(path) => Some(read_pem_file(path)?),
             None => None,
         };
         Self::from_pem_bytes(&ca_raw, cert_raw.as_deref(), key_raw.as_deref())
