@@ -2107,14 +2107,16 @@ impl Node {
         let commit_index = self
             .range_groups
             .lock()
-            .ok()
-            .and_then(|groups| groups.get(group_id).map(|state| state.commit_index))
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?
+            .get(group_id)
+            .map(|state| state.commit_index)
             .unwrap_or(0);
         let entries = self
             .range_entries
             .lock()
-            .ok()
-            .and_then(|groups| groups.get(group_id).cloned())
+            .map_err(|_| RymeError::Internal(String::from("range entries lock")))?
+            .get(group_id)
+            .cloned()
             .unwrap_or_default();
         let mut pending = BTreeMap::new();
         for record in entries.values().filter(|record| record.index <= commit_index) {

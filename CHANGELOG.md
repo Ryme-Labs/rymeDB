@@ -23,6 +23,8 @@ All notable changes to rymeDB are recorded here. Format follows
   retries from removing a staged generation needed for crash recovery.
 - SQL `CREATE USER` now defaults to `LOGIN`, and unsupported role options are
   rejected instead of being reported as successful while silently ignored.
+- Raft range-coordination recovery now propagates poisoned state-lock errors
+  instead of treating potentially committed work as an empty range.
 
 ### Performance
 
