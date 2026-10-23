@@ -100,7 +100,9 @@ Without explicit bounds, ascending sequences start at `1`; descending
 sequences start at `-1` and use the type's minimum and `-1` as their bounds.
 `nextval` reports exhaustion unless the sequence has `CYCLE`. For
 `setval(sequence, value, false)`, the next `nextval` returns `value` itself,
-including after schema state is restored.
+including after schema state is restored. `currval` is tracked per PostgreSQL
+connection and errors until that connection has set or generated a value for
+the sequence.
 
 ## PostgreSQL driver setup
 

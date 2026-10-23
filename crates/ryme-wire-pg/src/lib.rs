@@ -771,6 +771,7 @@ where
     )
     .await
     .map_err(|_| startup_timeout_error())??;
+    let executor = Arc::new(executor.fork_session());
     let (pid, secret, cancellation) = register_backend()?;
     let notification_tenant = limits.tenant.clone();
     let notification_database = limits.database.clone();

@@ -7999,6 +7999,7 @@ pub struct Executor<B = TxnManager> {
     schema_dirty: Arc<AtomicBool>,
     schema_hook: Option<SchemaHook>,
     sequence_next: Arc<Mutex<BTreeMap<String, Option<u64>>>>,
+    session_currvals: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl<B: std::fmt::Debug> std::fmt::Debug for Executor<B> {
@@ -8113,6 +8114,7 @@ impl Executor<TxnManager> {
             schema_dirty: Arc::new(AtomicBool::new(false)),
             schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
+            session_currvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -8153,6 +8155,7 @@ impl Executor<TxnManager> {
             schema_dirty: Arc::new(AtomicBool::new(false)),
             schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
+            session_currvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -8198,12 +8201,21 @@ where
             schema_dirty: Arc::new(AtomicBool::new(false)),
             schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
+            session_currvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn with_realtime(mut self, realtime: Realtime) -> Self {
         self.realtime = Some(realtime);
         self
+    }
+
+    /// Clones the executor's shared database state with fresh per-session
+    /// sequence values, as required by PostgreSQL `currval` semantics.
+    pub fn fork_session(&self) -> Self {
+        let mut executor = self.clone();
+        executor.session_currvals = Arc::new(Mutex::new(HashMap::new()));
+        executor
     }
 
     pub fn with_schema_hook(mut self, hook: SchemaHook) -> Self {
@@ -8683,15 +8695,25 @@ where
                 };
                 sequence.last_value = Some(next);
                 sequence.is_called = true;
+                self.session_currvals
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("sequence session lock")))?
+                    .insert(key, next);
                 self.schema_dirty.store(true, Ordering::SeqCst);
                 Ok(next)
             }
-            SequenceOperation::Currval => sequence.last_value.ok_or_else(|| {
-                RymeError::InvalidArgument(format!(
-                    "currval of sequence {} is not yet defined",
-                    sequence.name
-                ))
-            }),
+            SequenceOperation::Currval => self
+                .session_currvals
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("sequence session lock")))?
+                .get(&key)
+                .copied()
+                .ok_or_else(|| {
+                    RymeError::InvalidArgument(format!(
+                        "currval of sequence {} is not yet defined",
+                        sequence.name
+                    ))
+                }),
             SequenceOperation::Setval => {
                 let value = value
                     .ok_or_else(|| RymeError::InvalidArgument(String::from("setval value")))?;
@@ -8700,6 +8722,10 @@ where
                 }
                 sequence.last_value = Some(value);
                 sequence.is_called = is_called;
+                self.session_currvals
+                    .lock()
+                    .map_err(|_| RymeError::Internal(String::from("sequence session lock")))?
+                    .insert(key, value);
                 self.schema_dirty.store(true, Ordering::SeqCst);
                 Ok(value)
             }
@@ -9276,6 +9302,7 @@ where
             schema_dirty: self.schema_dirty,
             schema_hook: self.schema_hook,
             sequence_next: self.sequence_next,
+            session_currvals: self.session_currvals,
         }
     }
 
@@ -9714,6 +9741,7 @@ where
             schema_dirty: Arc::new(AtomicBool::new(false)),
             schema_hook: None,
             sequence_next: Arc::new(Mutex::new(BTreeMap::new())),
+            session_currvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
