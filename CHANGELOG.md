@@ -58,6 +58,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Range voters now reject term-zero requests without persisting a vote.
 - Range leader heartbeats now serialize with local range commits, so a
   concurrent heartbeat cannot truncate a newly replicated suffix.
+- Range replicas now isolate after range apply or commit-metadata persistence
+  errors, preventing further work on partially applied state.
 - Range followers now acknowledge exact duplicate appends idempotently while
   retaining conflict handling for entries with different contents.
 - Raft replication now sends bounded append batches so large backlogs can catch

@@ -4581,6 +4581,14 @@ impl Node {
     }
 
     fn apply_range_committed(&self, group_id: &str, commit_index: u64) -> Result<()> {
+        let result = self.apply_range_committed_inner(group_id, commit_index);
+        if result.is_err() {
+            self.set_isolated(true);
+        }
+        result
+    }
+
+    fn apply_range_committed_inner(&self, group_id: &str, commit_index: u64) -> Result<()> {
         let (start, end) = {
             let mut groups = self
                 .range_groups
@@ -4986,7 +4994,6 @@ impl Node {
             state.commit_index = state.commit_index.max(index);
         }
         self.apply_range_committed(group_id, index)?;
-        self.persist_range_meta()?;
         for replica in acknowledged.iter().copied().filter(|replica| *replica != self.id) {
             let _ = self.sync_range_replica(group_id, replica, term, index, term, index).await;
         }
