@@ -1,6 +1,6 @@
 {
   "name": "@rymelabs/rymedb-cli",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "type": "module",
   "description": "Command-line operator client for rymeDB",
   "license": "Apache-2.0",

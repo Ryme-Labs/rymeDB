@@ -34,40 +34,40 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/rymelabs/rymeDB"
 rust-version = "1.89"
 
 [workspace.dependencies]
-ryme-error = { path = "crates/ryme-error", version = "2.0.2" }
-ryme-config = { path = "crates/ryme-config", version = "2.0.2" }
-ryme-wal = { path = "crates/ryme-wal", version = "2.0.2" }
-ryme-storage = { path = "crates/ryme-storage", version = "2.0.2" }
-ryme-txn = { path = "crates/ryme-txn", version = "2.0.2" }
-ryme-sql = { path = "crates/ryme-sql", version = "2.0.2" }
-ryme-wire-pg = { path = "crates/ryme-wire-pg", version = "2.0.2" }
-ryme-wire-resp = { path = "crates/ryme-wire-resp", version = "2.0.2" }
-ryme-realtime = { path = "crates/ryme-realtime", version = "2.0.2" }
-ryme-auth = { path = "crates/ryme-auth", version = "2.0.2" }
-ryme-branch = { path = "crates/ryme-branch", version = "2.0.2" }
-ryme-backup = { path = "crates/ryme-backup", version = "2.0.2" }
-ryme-metering = { path = "crates/ryme-metering", version = "2.0.2" }
-ryme-observe = { path = "crates/ryme-observe", version = "2.0.2" }
-ryme-router = { path = "crates/ryme-router", version = "2.0.2" }
-ryme-raft = { path = "crates/ryme-raft", version = "2.0.2" }
-ryme-gateway = { path = "crates/ryme-gateway", version = "2.0.2" }
-ryme-control = { path = "crates/ryme-control", version = "2.0.2" }
-ryme-shard = { path = "crates/ryme-shard", version = "2.0.2" }
-ryme-archive = { path = "crates/ryme-archive", version = "2.0.2" }
-ryme-migrate = { path = "crates/ryme-migrate", version = "2.0.2" }
-ryme-qos = { path = "crates/ryme-qos", version = "2.0.2" }
-ryme-wire-native = { path = "crates/ryme-wire-native", version = "2.0.2" }
-ryme-wire-grpc = { path = "crates/ryme-wire-grpc", version = "2.0.2" }
-ryme-crypto = { path = "crates/ryme-crypto", version = "2.0.2" }
-ryme-index = { path = "crates/ryme-index", version = "2.0.2" }
-ryme-tls = { path = "crates/ryme-tls", version = "2.0.2" }
+ryme-error = { path = "crates/ryme-error", version = "2.0.3" }
+ryme-config = { path = "crates/ryme-config", version = "2.0.3" }
+ryme-wal = { path = "crates/ryme-wal", version = "2.0.3" }
+ryme-storage = { path = "crates/ryme-storage", version = "2.0.3" }
+ryme-txn = { path = "crates/ryme-txn", version = "2.0.3" }
+ryme-sql = { path = "crates/ryme-sql", version = "2.0.3" }
+ryme-wire-pg = { path = "crates/ryme-wire-pg", version = "2.0.3" }
+ryme-wire-resp = { path = "crates/ryme-wire-resp", version = "2.0.3" }
+ryme-realtime = { path = "crates/ryme-realtime", version = "2.0.3" }
+ryme-auth = { path = "crates/ryme-auth", version = "2.0.3" }
+ryme-branch = { path = "crates/ryme-branch", version = "2.0.3" }
+ryme-backup = { path = "crates/ryme-backup", version = "2.0.3" }
+ryme-metering = { path = "crates/ryme-metering", version = "2.0.3" }
+ryme-observe = { path = "crates/ryme-observe", version = "2.0.3" }
+ryme-router = { path = "crates/ryme-router", version = "2.0.3" }
+ryme-raft = { path = "crates/ryme-raft", version = "2.0.3" }
+ryme-gateway = { path = "crates/ryme-gateway", version = "2.0.3" }
+ryme-control = { path = "crates/ryme-control", version = "2.0.3" }
+ryme-shard = { path = "crates/ryme-shard", version = "2.0.3" }
+ryme-archive = { path = "crates/ryme-archive", version = "2.0.3" }
+ryme-migrate = { path = "crates/ryme-migrate", version = "2.0.3" }
+ryme-qos = { path = "crates/ryme-qos", version = "2.0.3" }
+ryme-wire-native = { path = "crates/ryme-wire-native", version = "2.0.3" }
+ryme-wire-grpc = { path = "crates/ryme-wire-grpc", version = "2.0.3" }
+ryme-crypto = { path = "crates/ryme-crypto", version = "2.0.3" }
+ryme-index = { path = "crates/ryme-index", version = "2.0.3" }
+ryme-tls = { path = "crates/ryme-tls", version = "2.0.3" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

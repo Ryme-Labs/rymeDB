@@ -1776,7 +1776,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ryme-archive"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "hmac 0.12.1",
  "reqwest",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-auth"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-backup"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "serde",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-bench"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "clap",
  "futures-util",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-branch"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "ryme-storage",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-config"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "ryme-storage",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-control"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-backup",
  "ryme-branch",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-crypto"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "hmac 0.12.1",
  "ring",
@@ -1878,14 +1878,14 @@ dependencies = [
 
 [[package]]
 name = "ryme-error"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ryme-gateway"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "futures-util",
  "ryme-auth",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-index"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "rustc-hash",
  "ryme-error",
@@ -1909,14 +1909,14 @@ dependencies = [
 
 [[package]]
 name = "ryme-metering"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ryme-migrate"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "serde",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-observe"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-qos"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "serde",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-raft"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "ryme-sql",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-realtime"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "serde",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-router"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "ryme-storage",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-server"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "axum",
  "clap",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-shard"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "ryme-raft",
@@ -2043,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-sql"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "getrandom 0.4.3",
  "ryme-error",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-storage"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-tls"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "rustls",
  "rustls-pki-types",
@@ -2078,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-txn"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "ryme-error",
  "ryme-storage",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-wal"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-wire-grpc"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "prost",
  "ryme-auth",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-wire-native"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "rustls",
  "rustls-pki-types",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-wire-pg"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "ryme-wire-resp"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "bytes",
  "mlua",
@@ -3102,7 +3102,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "2.0.2"
+version = "2.0.3"
 
 [[package]]
 name = "yoke"
