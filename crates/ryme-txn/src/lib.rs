@@ -26,6 +26,7 @@ const TRANSACTION_ENTRY_OVERHEAD: usize = 64;
 const MVCC_GC_KEYS_PER_LOCK: usize = 1_024;
 const MVCC_GC_VERSIONS_PER_LOCK: usize = 4_096;
 const MIN_ORDERED_BATCH_READ_KEYS: usize = 16;
+const MAX_SNAPSHOT_POINTER_BYTES: usize = 64;
 static NEXT_SNAPSHOT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 fn transaction_key_bytes(key: &RecordKey) -> usize {
@@ -141,6 +142,44 @@ fn read_snapshot_file(path: &Path) -> Result<Vec<u8>> {
         return Err(RymeError::Overload(String::from("snapshot")));
     }
     Ok(raw)
+}
+
+fn read_snapshot_pointer(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !path_metadata.file_type().is_file() {
+        return Err(RymeError::Corrupt(String::from("snapshot pointer file type")));
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RymeError::Corrupt(String::from("snapshot pointer file type")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err(RymeError::Corrupt(String::from("snapshot pointer file identity")));
+        }
+    }
+    if metadata.len() > MAX_SNAPSHOT_POINTER_BYTES as u64 {
+        return Err(RymeError::Corrupt(String::from("snapshot pointer")));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SNAPSHOT_POINTER_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SNAPSHOT_POINTER_BYTES {
+        return Err(RymeError::Corrupt(String::from("snapshot pointer")));
+    }
+    Ok(Some(bytes))
 }
 
 #[derive(Debug, Default)]
@@ -3109,11 +3148,7 @@ impl DurableManager {
     pub fn load_latest_snapshot(&self) -> Result<Option<u64>> {
         self.ensure_persistence_healthy()?;
         let latest = self.snapshot_dir().join("latest");
-        let name = match std::fs::read(&latest) {
-            Ok(name) => name,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(RymeError::from(e)),
-        };
+        let Some(name) = read_snapshot_pointer(&latest)? else { return Ok(None) };
         let name = String::from_utf8(name)
             .map_err(|_| RymeError::Corrupt(String::from("snapshot pointer")))?;
         let name = name.trim();
