@@ -9566,15 +9566,13 @@ where
             || self
                 .rls_enabled
                 .read()
-                .ok()
-                .is_some_and(|tables| relation_set_contains(&tables, table))
+                .map_or(true, |tables| relation_set_contains(&tables, table))
     }
 
     fn platform_rls_applies(&self, table: &str) -> bool {
         self.platform_rls_tables
             .read()
-            .ok()
-            .is_some_and(|tables| relation_set_contains(&tables, table))
+            .map_or(true, |tables| relation_set_contains(&tables, table))
     }
 
     fn rls_applies_to_role(&self, table: &str) -> bool {
@@ -9584,8 +9582,7 @@ where
                 || self
                     .rls_forced
                     .read()
-                    .ok()
-                    .is_some_and(|tables| relation_set_contains(&tables, table)))
+                    .map_or(true, |tables| relation_set_contains(&tables, table)))
     }
 
     fn rls_policy_allows(&self, table: &str, value: &[u8]) -> bool {
