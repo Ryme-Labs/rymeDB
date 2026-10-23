@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Transaction and shard recovery now visit WAL records in LSN order as they
+  replay, instead of retaining the complete WAL history in memory.
 - PostgreSQL `COPY FROM STDIN` now shares a process-wide buffer budget, so
   concurrent COPY sessions cannot each consume their full per-connection cap.
 - RESP inline requests now enforce the same 1,024-argument limit as array

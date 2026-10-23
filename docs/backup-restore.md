@@ -16,6 +16,8 @@ before declaring a recovery plan.
 
 Checkpoints are metadata. They do not create a durable copy by themselves;
 retention must keep the relevant snapshot and WAL segments available.
+WAL recovery visits records in LSN order one segment at a time, so replay does
+not keep every historical record payload in memory at once.
 
 ## Configure retention
 

@@ -116,31 +116,19 @@ impl Wal {
     }
 
     pub fn read_all(dir: &Path) -> Result<Vec<WalRecord>> {
-        let mut ids = segment_ids(dir)?;
-        ids.sort_unstable();
-        let latest_id = ids.last().copied();
         let mut out = Vec::new();
-        let mut previous_lsn = None;
-        for id in ids {
-            let path = dir.join(segment_name(id));
-            let raw = read_segment_file(&path)?;
-            let mut cursor = raw.as_slice();
-            while !cursor.is_empty() {
-                match decode_frame(cursor)? {
-                    Some((record, consumed)) => {
-                        cursor = &cursor[consumed..];
-                        if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
-                            return Err(RymeError::Corrupt(String::from("wal lsn order")));
-                        }
-                        previous_lsn = Some(record.lsn);
-                        out.push(record);
-                    }
-                    None if Some(id) == latest_id => break,
-                    None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
-                }
-            }
-        }
+        scan_records(dir, |record| {
+            out.push(record);
+            Ok(())
+        })?;
         Ok(out)
+    }
+
+    /// Validate the full WAL, then visit records in LSN order while retaining
+    /// only the current segment and record rather than collecting its history.
+    pub fn for_each(dir: &Path, mut visit: impl FnMut(WalRecord) -> Result<()>) -> Result<()> {
+        scan_records(dir, |_| Ok(()))?;
+        scan_records(dir, &mut visit)
     }
 
     pub fn truncate_below(&mut self, floor_commit_ts: u64) -> Result<usize> {
@@ -461,6 +449,32 @@ where
 
 fn segment_name(id: u64) -> String {
     format!("seg-{id:020}.wal")
+}
+
+fn scan_records(dir: &Path, mut visit: impl FnMut(WalRecord) -> Result<()>) -> Result<()> {
+    let mut ids = segment_ids(dir)?;
+    ids.sort_unstable();
+    let latest_id = ids.last().copied();
+    let mut previous_lsn = None;
+    for id in ids {
+        let raw = read_segment_file(&dir.join(segment_name(id)))?;
+        let mut cursor = raw.as_slice();
+        while !cursor.is_empty() {
+            match decode_frame(cursor)? {
+                Some((record, consumed)) => {
+                    cursor = &cursor[consumed..];
+                    if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                        return Err(RymeError::Corrupt(String::from("wal lsn order")));
+                    }
+                    previous_lsn = Some(record.lsn);
+                    visit(record)?;
+                }
+                None if Some(id) == latest_id => break,
+                None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn segment_ids(dir: &Path) -> Result<Vec<u64>> {

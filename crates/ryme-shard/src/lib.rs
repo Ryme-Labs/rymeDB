@@ -403,8 +403,7 @@ impl ShardSet {
             .map_err(|_| RymeError::Internal(String::from("shard lock")))?
             .base_dir
             .join("coordinator");
-        let records = Wal::read_all(&dir)?;
-        for record in records {
+        Wal::for_each(&dir, |record| {
             match record.payload.first() {
                 Some(&COORDINATOR_DECISION_VERSION) => {
                     let (commit_ts, parts) = decode_decision(&record.payload)?;
@@ -429,7 +428,8 @@ impl ShardSet {
                 }
                 _ => return Err(RymeError::Corrupt(String::from("coordinator record"))),
             }
-        }
+            Ok(())
+        })?;
         self.persist_placement_snapshot()?;
         Ok(())
     }

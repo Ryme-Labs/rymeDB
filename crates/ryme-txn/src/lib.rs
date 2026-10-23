@@ -3278,15 +3278,15 @@ impl DurableManager {
         let raw = read_snapshot_file(&path)?;
         let snapshot = Engine::decode_snapshot(&raw)?;
         let base = snapshot.max_commit_ts();
-        let records = Wal::read_all(&self.dir)?;
         let mut replay = Vec::new();
-        for record in records {
+        Wal::for_each(&self.dir, |record| {
             if record.commit_ts <= base || record.commit_ts > target {
-                continue;
+                return Ok(());
             }
             let writes = decode_writes(&record.payload)?;
             replay.push((record.commit_ts, writes));
-        }
+            Ok(())
+        })?;
         let replayed = replay.len() as u64;
         self.inner.restore_with_replay(snapshot, &replay)?;
         let restored_raw = self.inner.encode_snapshot()?;
@@ -3362,11 +3362,10 @@ impl DurableManager {
 
     pub fn recover_from(&self, floor: u64) -> Result<u64> {
         self.ensure_persistence_healthy()?;
-        let records = Wal::read_all(&self.dir)?;
         let mut applied = 0u64;
-        for record in records {
+        Wal::for_each(&self.dir, |record| {
             if record.commit_ts <= floor {
-                continue;
+                return Ok(());
             }
             let writes = decode_writes(&record.payload)?;
             if self.mode == StorageMode::Standard {
@@ -3378,7 +3377,8 @@ impl DurableManager {
             }
             self.inner.apply_at(record.commit_ts, &writes)?;
             applied += 1;
-        }
+            Ok(())
+        })?;
         Ok(applied)
     }
 
