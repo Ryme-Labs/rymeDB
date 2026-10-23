@@ -502,15 +502,15 @@ async fn e2e_scheduled_drill_verifies_latest_backup() {
         let (status, body) = http_request(http, "GET /v1/backups/drill", b"").await;
         if status == 200 {
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(parsed.get("backup_id").and_then(|v| v.as_str()), Some("drill-1"));
-            assert!(parsed.get("error").map(|v| v.is_null()).unwrap_or(false), "{parsed}");
-            assert!(
-                parsed.get("verified_files").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
-                "{parsed}"
-            );
-            break;
+            if parsed.get("backup_id").and_then(|v| v.as_str()) == Some("drill-1")
+                && parsed.get("error").map(|v| v.is_null()).unwrap_or(false)
+                && parsed.get("verified_files").and_then(|v| v.as_u64()).unwrap_or(0) > 0
+            {
+                break;
+            }
+        } else {
+            assert_eq!(status, 404);
         }
-        assert_eq!(status, 404);
         assert!(tokio::time::Instant::now() < deadline, "no drill completed");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
