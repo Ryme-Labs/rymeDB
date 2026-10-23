@@ -10,6 +10,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - SQL role memberships with transitive privilege and RLS policy inheritance;
   `NOINHERIT` disables inherited grants for the effective role.
+- SQL supports changing an existing role's inheritance behavior with
+  `ALTER ROLE ... INHERIT` and `ALTER ROLE ... NOINHERIT`.
 
 ### Fixed
 

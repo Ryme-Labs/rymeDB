@@ -528,6 +528,10 @@ pub enum Statement {
         #[serde(default = "default_role_inherit")]
         inherit: bool,
     },
+    AlterRoleInheritance {
+        name: String,
+        inherit: bool,
+    },
     DropRole {
         name: String,
         #[serde(default)]
@@ -1360,6 +1364,7 @@ impl Statement {
     pub fn requires_admin(&self) -> bool {
         match self {
             Self::CreateRole { .. }
+            | Self::AlterRoleInheritance { .. }
             | Self::DropRole { .. }
             | Self::RoleMembershipChange { .. }
             | Self::PrivilegeChange { .. }
@@ -1394,6 +1399,7 @@ impl Statement {
                 | Statement::DropSequence { .. }
                 | Statement::AlterSequence { .. }
                 | Statement::CreateRole { .. }
+                | Statement::AlterRoleInheritance { .. }
                 | Statement::DropRole { .. }
                 | Statement::RoleMembershipChange { .. }
                 | Statement::PrivilegeChange { .. }
@@ -1453,6 +1459,7 @@ impl Statement {
                 | Statement::DropSequence { .. }
                 | Statement::AlterSequence { .. }
                 | Statement::CreateRole { .. }
+                | Statement::AlterRoleInheritance { .. }
                 | Statement::DropRole { .. }
                 | Statement::RoleMembershipChange { .. }
                 | Statement::PrivilegeChange { .. }
@@ -2304,6 +2311,7 @@ impl Statement {
             | Self::RefreshMaterializedView { name, .. } => name,
             Self::DropSequence { name, .. } | Self::AlterSequence { name, .. } => name,
             Self::CreateRole { .. }
+            | Self::AlterRoleInheritance { .. }
             | Self::RoleMembershipChange { .. }
             | Self::PrivilegeChange { .. }
             | Self::DefaultPrivilegeChange { .. } => "",
@@ -2607,6 +2615,11 @@ fn parse_truncate(tokens: &[String]) -> Result<Statement> {
 }
 
 fn parse_alter(tokens: &[String], raw: &str) -> Result<Statement> {
+    if tokens.get(1).is_some_and(|token| {
+        token.eq_ignore_ascii_case("ROLE") || token.eq_ignore_ascii_case("USER")
+    }) {
+        return parse_alter_role(tokens);
+    }
     if tokens.get(1).is_some_and(|token| token.eq_ignore_ascii_case("SEQUENCE")) {
         return parse_alter_sequence(tokens);
     }
@@ -3645,6 +3658,26 @@ fn parse_sequence_number(value: Option<&String>, message: &str) -> Result<i64> {
     value
         .and_then(|value| value.trim_end_matches(';').parse::<i64>().ok())
         .ok_or_else(|| RymeError::InvalidArgument(message.to_string()))
+}
+
+fn parse_alter_role(tokens: &[String]) -> Result<Statement> {
+    let name = tokens
+        .get(2)
+        .map(|value| unquote(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("alter role name")))?;
+    let option_index =
+        if tokens.get(3).is_some_and(|token| token.eq_ignore_ascii_case("WITH")) { 4 } else { 3 };
+    if option_index + 1 != tokens.len() {
+        return Err(RymeError::InvalidArgument(String::from("alter role option")));
+    }
+    let inherit = match tokens.get(option_index).map(|token| token.to_ascii_uppercase()).as_deref()
+    {
+        Some("INHERIT") => true,
+        Some("NOINHERIT") => false,
+        _ => return Err(RymeError::InvalidArgument(String::from("alter role option"))),
+    };
+    Ok(Statement::AlterRoleInheritance { name, inherit })
 }
 
 fn parse_alter_sequence(tokens: &[String]) -> Result<Statement> {
@@ -7227,6 +7260,9 @@ pub fn describe_plan(statement: &Statement) -> String {
             format!("ddl alter_sequence({name}) restart {restart:?} increment {increment:?}")
         }
         Statement::CreateRole { name, .. } => format!("ddl create_role({name})"),
+        Statement::AlterRoleInheritance { name, inherit } => {
+            format!("ddl alter_role({name}) {}", if *inherit { "inherit" } else { "noinherit" })
+        }
         Statement::DropRole { name, .. } => format!("ddl drop_role({name})"),
         Statement::RoleMembershipChange { grant, roles, members } => format!(
             "ddl {} roles {} to {}",
@@ -8623,6 +8659,25 @@ where
         }
         roles.insert(definition.name.clone(), definition);
         self.schema_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn alter_role_inheritance(&self, name: &str, inherit: bool) -> Result<()> {
+        if is_builtin_sql_role(name) {
+            return Err(reserved_role_error(name));
+        }
+        let mut roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        let role = roles
+            .values_mut()
+            .find(|role| role.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| RymeError::NotFound(format!("role {name}")))?;
+        if role.inherit != inherit {
+            role.inherit = inherit;
+            self.schema_dirty.store(true, Ordering::SeqCst);
+            drop(roles);
+            self.invalidate_rls_role_maps();
+        }
         Ok(())
     }
 
@@ -13701,6 +13756,7 @@ where
             | Statement::DropSequence { .. }
             | Statement::AlterSequence { .. }
             | Statement::CreateRole { .. }
+            | Statement::AlterRoleInheritance { .. }
             | Statement::DropRole { .. }
             | Statement::RoleMembershipChange { .. }
             | Statement::PrivilegeChange { .. }
@@ -13827,6 +13883,10 @@ where
                     createrole,
                     inherit,
                 })?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::AlterRoleInheritance { name, inherit } => {
+                self.alter_role_inheritance(&name, inherit)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::DropRole { name, if_exists } => {
@@ -15694,6 +15754,7 @@ where
             | Statement::DropSequence { .. }
             | Statement::AlterSequence { .. }
             | Statement::CreateRole { .. }
+            | Statement::AlterRoleInheritance { .. }
             | Statement::DropRole { .. }
             | Statement::RoleMembershipChange { .. }
             | Statement::PrivilegeChange { .. }
@@ -16183,6 +16244,10 @@ where
                     createrole,
                     inherit,
                 })?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::AlterRoleInheritance { name, inherit } => {
+                self.alter_role_inheritance(&name, inherit)?;
                 Ok(QueryResult::Ok)
             }
             Statement::DropRole { name, if_exists } => {

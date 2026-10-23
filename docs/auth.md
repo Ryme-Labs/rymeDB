@@ -273,7 +273,9 @@ inherited privileges from passing through that role to members further down the
 chain. Role membership changes use `GRANT role TO member` and
 `REVOKE role FROM member`; cycles are rejected. Inspect membership rows through
 `pg_catalog.pg_auth_members`. `WITH ADMIN OPTION` and `SET ROLE` are not
-supported.
+supported. Change a role's inheritance setting with
+`ALTER ROLE role_name [WITH] INHERIT` or `ALTER ROLE role_name [WITH] NOINHERIT`;
+these are the only `ALTER ROLE` options currently supported.
 
 For SQL policies, `auth.uid()` is the authenticated JWT `sub` identity. It is
 distinct from the tenant claim. Configure `rls_tables` when rows should be

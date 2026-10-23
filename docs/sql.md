@@ -79,6 +79,8 @@ Role membership grants use `GRANT role TO member` and `REVOKE role FROM member`.
 Inherited object privileges and role-scoped RLS policies follow membership
 chains until a `NOINHERIT` role blocks inheritance through that point; see
 [authentication and authorization](auth.md) for limits and policy behavior.
+Change a role's inheritance behavior with `ALTER ROLE name INHERIT` or
+`ALTER ROLE name NOINHERIT`.
 
 ```bash
 rymedb-cli migrate apply 2026-01-create-messages \
