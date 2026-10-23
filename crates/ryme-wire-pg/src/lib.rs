@@ -1294,6 +1294,12 @@ where
                     copy_in = Some(CopyInState::Failed { message });
                     continue;
                 }
+                (Some(_), b'X') => return Ok(()),
+                (state @ Some(CopyInState::Receiving { .. }), b'H' | b'S')
+                | (state @ Some(CopyInState::Failed { .. }), b'H' | b'S') => {
+                    copy_in = state;
+                    continue;
+                }
                 (Some(CopyInState::Failed { message }), b'c' | b'f') => {
                     let cancelled = finish_backend_query(&cancellation);
                     if let Some(transaction) = active_transaction.as_mut() {
