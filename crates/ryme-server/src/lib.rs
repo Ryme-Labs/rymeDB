@@ -13957,8 +13957,11 @@ async fn query_stream(
     if !rls_executor.can_select_table(&table) {
         return error_response(ryme_error::RymeError::Forbidden);
     }
-    let dependencies =
-        rls_executor.view_dependencies(&table).unwrap_or_else(|| vec![table.clone()]);
+    let dependencies = match rls_executor.view_dependencies(&table) {
+        Ok(Some(dependencies)) => dependencies,
+        Ok(None) => vec![table.clone()],
+        Err(error) => return error_response(error),
+    };
     let query_spec = ReactiveQuerySpec::from_query(&query);
     bounded_realtime_upgrade(upgrade).on_upgrade(move |socket| async move {
         let _connection = connection;
@@ -14489,20 +14492,16 @@ async fn scan_realtime_rows_for_query<B: TxnBackend>(
     read_ts: Option<u64>,
     filters: &[(String, String)],
     order: Option<&str>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    if rls_executor.view_dependencies(table).is_some() {
-        let rows = rls_executor
-            .realtime_view_rows(table, read_ts)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let mut rows = filter_rows_by_params(rows, filters);
-        rows = order_rows(rows, order);
-        rows.truncate(limit);
-        return rows;
+) -> ryme_error::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if rls_executor.view_dependencies(table)?.is_some() {
+        if let Some(rows) = rls_executor.realtime_view_rows(table, read_ts).await? {
+            let mut rows = filter_rows_by_params(rows, filters);
+            rows = order_rows(rows, order);
+            rows.truncate(limit);
+            return Ok(rows);
+        }
     }
-    scan_realtime_rows_with_executor(
+    Ok(scan_realtime_rows_with_executor(
         backend,
         rls_executor,
         tenant,
@@ -14512,7 +14511,7 @@ async fn scan_realtime_rows_for_query<B: TxnBackend>(
         read_ts,
         filters,
         order,
-    )
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14532,7 +14531,7 @@ async fn send_query_snapshot<B: TxnBackend>(
     if !rls_executor.can_select_table(table) {
         return (commit, false);
     }
-    let rows = scan_realtime_rows_for_query(
+    let rows = match scan_realtime_rows_for_query(
         backend,
         rls_executor,
         tenant,
@@ -14543,7 +14542,14 @@ async fn send_query_snapshot<B: TxnBackend>(
         &[],
         None,
     )
-    .await;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, table, "could not build realtime snapshot");
+            return (commit, false);
+        }
+    };
     let snapshot = serde_json::json!({
         "type": "snapshot",
         "commit": commit,
@@ -14582,7 +14588,7 @@ async fn send_reactive_query_snapshot<B: TxnBackend>(
     if !rls_executor.can_select_table(table) {
         return (commit, false);
     }
-    let rows = scan_realtime_rows_for_query(
+    let rows = match scan_realtime_rows_for_query(
         backend,
         rls_executor,
         tenant,
@@ -14593,7 +14599,14 @@ async fn send_reactive_query_snapshot<B: TxnBackend>(
         &spec.filters,
         spec.order.as_deref(),
     )
-    .await;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, table, "could not build realtime snapshot");
+            return (commit, false);
+        }
+    };
     let payload_rows = rows
         .into_iter()
         .map(|(pk, value)| {
