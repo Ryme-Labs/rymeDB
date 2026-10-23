@@ -310,7 +310,9 @@ async fn grpc_read_only_rejects_sql_writes() {
         .await
         .unwrap();
     executor
-        .execute(ryme_sql::parse("GRANT SELECT ON TABLE docs TO authenticated").unwrap())
+        .execute(
+            ryme_sql::parse("GRANT SELECT, INSERT, UPDATE ON TABLE docs TO authenticated").unwrap(),
+        )
         .await
         .unwrap();
     let grpc = GrpcGateway::with_gateway(inner, keys).with_sql_executor(executor);
