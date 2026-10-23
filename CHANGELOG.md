@@ -49,6 +49,8 @@ All notable changes to rymeDB are recorded here. Format follows
   destination before publishing the staged restore.
 - RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
   and scan the keyspace in bounded pages.
+- RESP `MGET` reads values incrementally and rejects combined results above
+  16 MiB before retaining the oversized result.
 - Config file loading now rejects non-regular files and caps reads at 4 MiB.
 - Routing-key capacity calculations now check overflow and report allocation
   failure instead of relying on infallible vector allocation.

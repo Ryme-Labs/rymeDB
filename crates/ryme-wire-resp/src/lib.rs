@@ -27,9 +27,10 @@ const RESP_INPUT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RESP_INPUT_BUDGET_UNIT_BYTES: usize = 16 * 1024;
 const RESP_MAX_COMMAND_ARGS: usize = 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
-const RESP_SCAN_PAGE_ITEMS: usize = 32;
+const RESP_SCAN_PAGE_ITEMS: usize = 4;
 const RESP_MAX_SCAN_RESULT_ITEMS: usize = 10_000;
 const RESP_MAX_SCAN_RESULT_KEY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
+const RESP_MGET_BATCH_ITEMS: usize = 4;
 const RESP_LUA_MAX_NESTING: usize = 64;
 const RESP_LUA_MAX_ARRAY_ITEMS: usize = 65_536;
 const RESP_LUA_MAX_REPLY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
@@ -71,6 +72,16 @@ fn next_scan_result_key_bytes(
         .checked_add(key_bytes)
         .filter(|bytes| *bytes <= RESP_MAX_SCAN_RESULT_KEY_BYTES)
         .ok_or_else(|| String::from("scan result exceeds the 16 MiB key limit"))
+}
+
+fn next_resp_collection_bytes(
+    current_bytes: usize,
+    item_bytes: usize,
+) -> std::result::Result<usize, String> {
+    current_bytes
+        .checked_add(item_bytes)
+        .filter(|bytes| *bytes <= RESP_MAX_COLLECTION_BYTES)
+        .ok_or_else(|| String::from("response exceeds the 16 MiB limit"))
 }
 
 pub type RespAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
@@ -2270,10 +2281,29 @@ where
                     .iter()
                     .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
                     .collect::<Vec<_>>();
-                match self.manager.get_many(txn, &records) {
-                    Ok(items) => encode_array(items),
-                    Err(error) => encode_error(error.to_string()),
+                let mut items = Vec::with_capacity(records.len());
+                let mut response_bytes = 0usize;
+                for batch in records.chunks(RESP_MGET_BATCH_ITEMS) {
+                    let values = match self.manager.get_many(txn, batch) {
+                        Ok(values) if values.len() == batch.len() => values,
+                        Ok(_) => return encode_error(String::from("MGET result size mismatch")),
+                        Err(error) => return encode_error(error.to_string()),
+                    };
+                    for value in values {
+                        match value {
+                            Some(value) => {
+                                response_bytes =
+                                    match next_resp_collection_bytes(response_bytes, value.len()) {
+                                        Ok(bytes) => bytes,
+                                        Err(error) => return encode_error(error),
+                                    };
+                                items.push(Some(value));
+                            }
+                            None => items.push(None),
+                        }
+                    }
                 }
+                encode_array(items)
             }
             "MSET" => {
                 if command.args.is_empty() || !command.args.len().is_multiple_of(2) {
