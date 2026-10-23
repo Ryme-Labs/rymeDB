@@ -5,6 +5,7 @@ use ryme_txn::{decode_writes, encode_writes, now_unix, TxnManager};
 use ryme_wal::{Wal, WalRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -40,6 +41,16 @@ static RPC_READ_FRAME_BUDGET: LazyLock<Semaphore> =
 static RPC_WRITE_FRAME_BUDGET: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(RPC_WRITE_FRAME_BUDGET_PERMITS));
 
+fn configure_private_file(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<()> {
     let parent =
@@ -59,7 +70,10 @@ fn persist_metadata_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let (temporary, mut file) = loop {
         let id = NEXT_METADATA_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temporary = path.with_extension(format!("tmp-{}-{id}", std::process::id()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_private_file(&mut options);
+        match options.open(&temporary) {
             Ok(file) => break (temporary, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -622,8 +636,12 @@ fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<V
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
             return Err(RymeError::Corrupt(format!("{label} file identity")));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
     let file_len = metadata.len();
