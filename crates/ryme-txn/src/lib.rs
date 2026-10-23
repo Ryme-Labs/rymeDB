@@ -7,7 +7,7 @@ use std::future::Future;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 pub const MAX_TRANSACTION_WRITE_ENTRIES: usize = 100_000;
@@ -2773,6 +2773,7 @@ pub struct DurableManager {
     wal: Arc<Mutex<Wal>>,
     segments: Arc<SegmentStore>,
     gate: Arc<Mutex<()>>,
+    persistence_failed: Arc<AtomicBool>,
     policy: SyncPolicy,
     mode: StorageMode,
     dir: std::path::PathBuf,
@@ -2782,6 +2783,23 @@ const SEGMENT_COMPACTION_THRESHOLD: usize = 64;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl DurableManager {
+    fn ensure_persistence_healthy(&self) -> Result<()> {
+        if self.persistence_failed.load(Ordering::Acquire) {
+            Err(RymeError::Unavailable(String::from(
+                "durable storage requires reopen after a persistence failure",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_persistence_result<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.persistence_failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
     pub fn open(dir: &Path, segment_bytes: u64, policy: SyncPolicy) -> Result<Self> {
         Self::open_with_cache(dir, segment_bytes, policy, DEFAULT_SEGMENT_CACHE_BYTES)
     }
@@ -2827,6 +2845,7 @@ impl DurableManager {
             wal: Arc::new(Mutex::new(wal)),
             segments,
             gate: Arc::new(Mutex::new(())),
+            persistence_failed: Arc::new(AtomicBool::new(false)),
             policy,
             mode,
             dir: dir.to_path_buf(),
@@ -2846,6 +2865,9 @@ impl DurableManager {
         Ok(manager)
     }
 
+    /// Returns the volatile transaction index for low-level coordination.
+    /// Data writes must go through `DurableManager` so they reach the WAL and
+    /// segment store and honor persistence health checks.
     pub fn inner(&self) -> &TxnManager {
         &self.inner
     }
@@ -2867,6 +2889,7 @@ impl DurableManager {
     }
 
     pub fn resident_bytes(&self) -> Result<u64> {
+        self.ensure_persistence_healthy()?;
         self.inner.memory_bytes()
     }
 
@@ -2874,11 +2897,17 @@ impl DurableManager {
         self.inner.latest_commit()
     }
 
+    pub fn validate_at(&self, txn: &Transaction, commit_ts: u64) -> Result<()> {
+        self.ensure_persistence_healthy()?;
+        self.inner.validate_at(txn, commit_ts)
+    }
+
     fn materialized_segments(&self) -> Result<Engine> {
         Ok(self.segments.load_all()?.map(|(engine, _)| engine).unwrap_or_default())
     }
 
     pub fn table_bytes(&self, tenant: &str, database: &str, table: &str) -> Result<u64> {
+        self.ensure_persistence_healthy()?;
         match self.mode {
             StorageMode::Hot => self.inner.table_bytes(tenant, database, table),
             StorageMode::Standard => {
@@ -2894,6 +2923,7 @@ impl DurableManager {
         database: &str,
         table: &str,
     ) -> Result<ryme_storage::TableRows> {
+        self.ensure_persistence_healthy()?;
         match self.mode {
             StorageMode::Hot => self.inner.export_table(tenant, database, table),
             StorageMode::Standard => {
@@ -2909,6 +2939,7 @@ impl DurableManager {
         table: &str,
         rows: ryme_storage::TableRows,
     ) -> Result<u64> {
+        self.ensure_persistence_healthy()?;
         if self.mode == StorageMode::Hot {
             return self.inner.import_table(tenant, database, table, rows);
         }
@@ -2946,6 +2977,7 @@ impl DurableManager {
     }
 
     pub fn purge_keys(&self, keys: &[RecordKey]) -> Result<usize> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         if self.mode == StorageMode::Hot {
@@ -2960,7 +2992,30 @@ impl DurableManager {
         Ok(removed)
     }
 
+    /// Removes a transferred table and publishes the removal before shard
+    /// ownership is released, so recovery cannot restore the source rows.
+    pub fn drop_table_for_transfer(
+        &self,
+        tenant: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<usize> {
+        self.ensure_persistence_healthy()?;
+        let rows = self.export_table(tenant, database, table)?;
+        let keys: Vec<RecordKey> =
+            rows.into_iter().map(|(pk, _)| RecordKey::new(tenant, database, table, &pk)).collect();
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        self.record_persistence_result((|| {
+            let removed = self.purge_keys(&keys)?;
+            self.write_snapshot()?;
+            Ok(removed)
+        })())
+    }
+
     pub fn spaces(&self) -> Result<Vec<(String, String, String)>> {
+        self.ensure_persistence_healthy()?;
         match self.mode {
             StorageMode::Hot => self.inner.spaces(),
             StorageMode::Standard => Ok(self.materialized_segments()?.spaces()),
@@ -2974,6 +3029,7 @@ impl DurableManager {
         table: &str,
         limit: usize,
     ) -> Result<Vec<Vec<u8>>> {
+        self.ensure_persistence_healthy()?;
         match self.mode {
             StorageMode::Hot => self.inner.expired_keys(tenant, database, table, limit),
             StorageMode::Standard => Ok(self.materialized_segments()?.expired(
@@ -2992,6 +3048,7 @@ impl DurableManager {
     }
 
     pub fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
+        self.ensure_persistence_healthy()?;
         match self.mode {
             StorageMode::Hot => self.inner.expires_at_at(key, read_ts),
             StorageMode::Standard => Ok(self
@@ -3002,6 +3059,7 @@ impl DurableManager {
     }
 
     pub fn write_snapshot(&self) -> Result<(u64, std::path::PathBuf)> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let snapshot = match self.mode {
@@ -3025,6 +3083,7 @@ impl DurableManager {
     }
 
     pub fn load_latest_snapshot(&self) -> Result<Option<u64>> {
+        self.ensure_persistence_healthy()?;
         let latest = self.snapshot_dir().join("latest");
         let name = match std::fs::read(&latest) {
             Ok(name) => name,
@@ -3046,6 +3105,7 @@ impl DurableManager {
     }
 
     pub fn load_all_segments(&self) -> Result<Option<u64>> {
+        self.ensure_persistence_healthy()?;
         let Some((engine, max)) = self.segments.load_all()? else {
             return Ok(None);
         };
@@ -3054,10 +3114,12 @@ impl DurableManager {
     }
 
     pub fn gc_oldest(&self) -> Result<u64> {
+        self.ensure_persistence_healthy()?;
         self.inner.gc_oldest()
     }
 
     pub fn prune_snapshots(&self, keep: usize) -> Result<usize> {
+        self.ensure_persistence_healthy()?;
         let dir = self.snapshot_dir();
         let mut snaps: Vec<(u64, std::path::PathBuf)> = Vec::new();
         let entries = match std::fs::read_dir(&dir) {
@@ -3142,6 +3204,7 @@ impl DurableManager {
     }
 
     pub fn retention_sweep(&self, snapshot_keep: usize) -> Result<(usize, usize)> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         // WAL retention is justified by the oldest durable snapshot and does
@@ -3170,6 +3233,7 @@ impl DurableManager {
     /// Compacts one bounded delta run in Standard mode, or snapshots resident
     /// state in Hot mode.
     pub fn compact_segments(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         self.compact_segments_locked()
@@ -3202,6 +3266,7 @@ impl DurableManager {
     }
 
     pub fn restore_to(&self, target: u64) -> Result<u64> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let path = self
@@ -3293,6 +3358,7 @@ impl DurableManager {
     }
 
     pub fn recover_from(&self, floor: u64) -> Result<u64> {
+        self.ensure_persistence_healthy()?;
         let records = Wal::read_all(&self.dir)?;
         let mut applied = 0u64;
         for record in records {
@@ -3314,27 +3380,35 @@ impl DurableManager {
     }
 
     pub fn replay_at(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
-        if self.mode == StorageMode::Standard {
-            self.segments.write_delta_owned_with_sync(
-                commit_ts,
-                segment_entries(commit_ts, writes),
-                self.policy == SyncPolicy::Always,
-            )?;
-        }
-        self.inner.replay_at(commit_ts, writes)?;
-        if self.mode == StorageMode::Standard {
-            self.inner.clear_engine()?;
-        }
-        Ok(())
+        self.record_persistence_result((|| {
+            if self.mode == StorageMode::Standard {
+                self.segments.write_delta_owned_with_sync(
+                    commit_ts,
+                    segment_entries(commit_ts, writes),
+                    self.policy == SyncPolicy::Always,
+                )?;
+            }
+            self.inner.replay_at(commit_ts, writes)?;
+            if self.mode == StorageMode::Standard {
+                self.inner.clear_engine()?;
+            }
+            Ok(())
+        })())
     }
 
     pub fn begin(&self) -> Transaction {
-        self.inner.begin()
+        let mut txn = self.inner.begin();
+        if let Err(error) = self.ensure_persistence_healthy() {
+            txn.mark_failed(error);
+        }
+        txn
     }
 
     pub fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
+        self.ensure_persistence_healthy()?;
         let read_ts = txn.read_ts;
         match self.mode {
             StorageMode::Hot => self.inner.get(txn, key),
@@ -3349,6 +3423,7 @@ impl DurableManager {
         txn: &mut Transaction,
         keys: &[RecordKey],
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.ensure_persistence_healthy()?;
         match self.mode {
             StorageMode::Hot => self.inner.get_many(txn, keys),
             StorageMode::Standard => {
@@ -3397,11 +3472,15 @@ impl DurableManager {
     }
 
     pub fn try_put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) -> Result<()> {
+        if let Err(error) = self.ensure_persistence_healthy() {
+            txn.mark_failed(error.clone());
+            return Err(error);
+        }
         self.inner.try_put(txn, key, value)
     }
 
     pub fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
-        self.inner.put(txn, key, value);
+        let _ = self.try_put(txn, key, value);
     }
 
     pub fn try_put_with_ttl(
@@ -3411,6 +3490,10 @@ impl DurableManager {
         value: Vec<u8>,
         expires_at: u64,
     ) -> Result<()> {
+        if let Err(error) = self.ensure_persistence_healthy() {
+            txn.mark_failed(error.clone());
+            return Err(error);
+        }
         self.inner.try_put_with_ttl(txn, key, value, expires_at)
     }
 
@@ -3421,15 +3504,19 @@ impl DurableManager {
         value: Vec<u8>,
         expires_at: u64,
     ) {
-        self.inner.put_with_ttl(txn, key, value, expires_at);
+        let _ = self.try_put_with_ttl(txn, key, value, expires_at);
     }
 
     pub fn try_delete(&self, txn: &mut Transaction, key: RecordKey) -> Result<()> {
+        if let Err(error) = self.ensure_persistence_healthy() {
+            txn.mark_failed(error.clone());
+            return Err(error);
+        }
         self.inner.try_delete(txn, key)
     }
 
     pub fn delete(&self, txn: &mut Transaction, key: RecordKey) {
-        self.inner.delete(txn, key);
+        let _ = self.try_delete(txn, key);
     }
 
     pub fn scan(
@@ -3440,6 +3527,7 @@ impl DurableManager {
         table: &str,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_persistence_healthy()?;
         let read_ts = txn.read_ts;
         match self.mode {
             StorageMode::Hot => self.inner.scan(txn, tenant, database, table, limit),
@@ -3460,6 +3548,7 @@ impl DurableManager {
         start_after: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_persistence_healthy()?;
         let read_ts = txn.read_ts;
         match self.mode {
             StorageMode::Hot => {
@@ -3488,6 +3577,7 @@ impl DurableManager {
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<u64> {
+        self.ensure_persistence_healthy()?;
         txn.ensure_healthy()?;
         if txn.writes.is_empty() {
             return Ok(txn.read_ts);
@@ -3498,38 +3588,42 @@ impl DurableManager {
         match self.mode {
             StorageMode::Hot => {
                 self.inner.commit_durable_with(txn, |commit_ts, payload, writes| {
-                    let mut wal = self
-                        .wal
-                        .lock()
-                        .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-                    wal.append_lsn(commit_ts, payload)?;
-                    if policy == SyncPolicy::Always {
-                        wal.sync()?;
-                    }
-                    self.segments.write_delta_owned_with_sync(
-                        commit_ts,
-                        segment_entries(commit_ts, writes),
-                        policy == SyncPolicy::Always,
-                    )?;
-                    Ok(())
+                    self.record_persistence_result((|| {
+                        let mut wal = self
+                            .wal
+                            .lock()
+                            .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                        wal.append_lsn(commit_ts, payload)?;
+                        if policy == SyncPolicy::Always {
+                            wal.sync()?;
+                        }
+                        self.segments.write_delta_owned_with_sync(
+                            commit_ts,
+                            segment_entries(commit_ts, writes),
+                            policy == SyncPolicy::Always,
+                        )?;
+                        Ok(())
+                    })())
                 })
             }
             StorageMode::Standard => {
                 self.inner.commit_durable_consuming_with(txn, |commit_ts, payload, writes| {
-                    let mut wal = self
-                        .wal
-                        .lock()
-                        .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-                    wal.append_lsn(commit_ts, payload)?;
-                    if policy == SyncPolicy::Always {
-                        wal.sync()?;
-                    }
-                    self.segments.write_delta_owned_with_sync(
-                        commit_ts,
-                        segment_entries_owned(commit_ts, writes),
-                        policy == SyncPolicy::Always,
-                    )?;
-                    Ok(())
+                    self.record_persistence_result((|| {
+                        let mut wal = self
+                            .wal
+                            .lock()
+                            .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                        wal.append_lsn(commit_ts, payload)?;
+                        if policy == SyncPolicy::Always {
+                            wal.sync()?;
+                        }
+                        self.segments.write_delta_owned_with_sync(
+                            commit_ts,
+                            segment_entries_owned(commit_ts, writes),
+                            policy == SyncPolicy::Always,
+                        )?;
+                        Ok(())
+                    })())
                 })
             }
         }
@@ -3541,6 +3635,7 @@ impl DurableManager {
         commit_ts: u64,
         keep: impl Fn(&RecordKey) -> bool,
     ) -> Result<()> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let policy = self.policy;
@@ -3549,19 +3644,23 @@ impl DurableManager {
             commit_ts,
             keep,
             |commit_ts, payload, writes| {
-                let mut wal =
-                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-                wal.append_lsn(commit_ts, payload)?;
-                if policy == SyncPolicy::Always {
-                    wal.sync()?;
-                }
-                drop(wal);
-                self.segments.write_delta_owned_with_sync(
-                    commit_ts,
-                    segment_entries(commit_ts, writes),
-                    policy == SyncPolicy::Always,
-                )?;
-                Ok(())
+                self.record_persistence_result((|| {
+                    let mut wal = self
+                        .wal
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                    wal.append_lsn(commit_ts, payload)?;
+                    if policy == SyncPolicy::Always {
+                        wal.sync()?;
+                    }
+                    drop(wal);
+                    self.segments.write_delta_owned_with_sync(
+                        commit_ts,
+                        segment_entries(commit_ts, writes),
+                        policy == SyncPolicy::Always,
+                    )?;
+                    Ok(())
+                })())
             },
         );
         if result.is_ok() && self.mode == StorageMode::Standard {
@@ -3574,6 +3673,9 @@ impl DurableManager {
     /// segment. Transactions keep separate commit timestamps and conflict
     /// outcomes.
     pub fn commit_at_batch_owned(&self, commits: Vec<(Transaction, u64)>) -> Vec<Result<u64>> {
+        if let Err(error) = self.ensure_persistence_healthy() {
+            return commits.into_iter().map(|_| Err(error.clone())).collect();
+        }
         if commits.windows(2).any(|pair| pair[0].1 >= pair[1].1) {
             return commits
                 .iter()
@@ -3601,42 +3703,46 @@ impl DurableManager {
         };
         let policy = self.policy;
         let results = self.inner.commit_durable_batch_at_owned(commits, |prepared| {
-            {
-                let mut wal =
-                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-                for (commit_ts, payload, _) in prepared {
-                    wal.append_lsn(*commit_ts, payload)?;
+            self.record_persistence_result((|| {
+                {
+                    let mut wal = self
+                        .wal
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                    for (commit_ts, payload, _) in prepared {
+                        wal.append_lsn(*commit_ts, payload)?;
+                    }
+                    if policy == SyncPolicy::Always {
+                        wal.sync()?;
+                    }
                 }
-                if policy == SyncPolicy::Always {
-                    wal.sync()?;
-                }
-            }
-            let Some((last_commit_ts, _, _)) = prepared.last() else {
-                return Ok(());
-            };
-            let group_bytes = prepared
-                .iter()
-                .fold(0usize, |total, (_, payload, _)| total.saturating_add(payload.len()));
-            if group_bytes <= MAX_GROUP_COMMIT_BYTES {
-                let entries = prepared
+                let Some((last_commit_ts, _, _)) = prepared.last() else {
+                    return Ok(());
+                };
+                let group_bytes = prepared
                     .iter()
-                    .flat_map(|(commit_ts, _, writes)| segment_entries(*commit_ts, writes))
-                    .collect();
-                self.segments.write_delta_owned_with_sync(
-                    *last_commit_ts,
-                    entries,
-                    policy == SyncPolicy::Always,
-                )?;
-            } else {
-                for (commit_ts, _, writes) in prepared {
+                    .fold(0usize, |total, (_, payload, _)| total.saturating_add(payload.len()));
+                if group_bytes <= MAX_GROUP_COMMIT_BYTES {
+                    let entries = prepared
+                        .iter()
+                        .flat_map(|(commit_ts, _, writes)| segment_entries(*commit_ts, writes))
+                        .collect();
                     self.segments.write_delta_owned_with_sync(
-                        *commit_ts,
-                        segment_entries(*commit_ts, writes),
+                        *last_commit_ts,
+                        entries,
                         policy == SyncPolicy::Always,
                     )?;
+                } else {
+                    for (commit_ts, _, writes) in prepared {
+                        self.segments.write_delta_owned_with_sync(
+                            *commit_ts,
+                            segment_entries(*commit_ts, writes),
+                            policy == SyncPolicy::Always,
+                        )?;
+                    }
                 }
-            }
-            Ok(())
+                Ok(())
+            })())
         });
         if self.mode == StorageMode::Standard && results.iter().any(Result::is_ok) {
             if let Err(error) = self.inner.clear_engine() {
@@ -3652,6 +3758,7 @@ impl DurableManager {
     /// Commits an owned single-shard transaction, avoiding filtered write-map
     /// copies on the durable path.
     pub fn commit_at_owned(&self, txn: Transaction, commit_ts: u64) -> Result<()> {
+        self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
         let policy = self.policy;
@@ -3660,18 +3767,22 @@ impl DurableManager {
             commit_ts,
             |_| true,
             |commit_ts, payload, writes| {
-                let mut wal =
-                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-                wal.append_lsn(commit_ts, payload)?;
-                if policy == SyncPolicy::Always {
-                    wal.sync()?;
-                }
-                self.segments.write_delta_owned_with_sync(
-                    commit_ts,
-                    segment_entries(commit_ts, writes),
-                    policy == SyncPolicy::Always,
-                )?;
-                Ok(())
+                self.record_persistence_result((|| {
+                    let mut wal = self
+                        .wal
+                        .lock()
+                        .map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                    wal.append_lsn(commit_ts, payload)?;
+                    if policy == SyncPolicy::Always {
+                        wal.sync()?;
+                    }
+                    self.segments.write_delta_owned_with_sync(
+                        commit_ts,
+                        segment_entries(commit_ts, writes),
+                        policy == SyncPolicy::Always,
+                    )?;
+                    Ok(())
+                })())
             },
         );
         if result.is_ok() && self.mode == StorageMode::Standard {

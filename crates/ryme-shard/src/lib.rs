@@ -476,9 +476,7 @@ impl ShardSet {
     pub fn latest_commit(&self) -> u64 {
         self.inner
             .lock()
-            .map(|inner| {
-                inner.shards.iter().map(|shard| shard.inner().latest_commit()).max().unwrap_or(0)
-            })
+            .map(|inner| inner.shards.iter().map(DurableManager::latest_commit).max().unwrap_or(0))
             .unwrap_or(0)
     }
 
@@ -1034,7 +1032,7 @@ impl ShardSet {
             write_placements.values().copied().collect();
         let commit_ts = self.reserve_commit_ts(0, txn.read_ts)?;
         for (_, manager) in managers.iter() {
-            manager.inner().validate_at(&txn, commit_ts)?;
+            manager.validate_at(&txn, commit_ts)?;
         }
         let mut parts: DecisionParts = Vec::with_capacity(writers.len());
         for shard in writers.iter() {
@@ -1124,7 +1122,7 @@ impl ShardSet {
                 let commit_ts = inner
                     .shards
                     .iter()
-                    .map(|shard| shard.inner().latest_commit())
+                    .map(DurableManager::latest_commit)
                     .max()
                     .unwrap_or(0)
                     .saturating_add(1);
@@ -1148,12 +1146,11 @@ impl ShardSet {
                     }
                     Err(error)
                 } else {
-                    source.inner().drop_table(
+                    source.drop_table_for_transfer(
                         &table_ref.tenant,
                         &table_ref.database,
                         &table_ref.table,
                     )?;
-                    source.write_snapshot()?;
                     Ok(report)
                 }
             })(),

@@ -308,7 +308,7 @@ impl Backend {
 
     pub fn latest_commit(&self) -> u64 {
         match self {
-            Self::Single(manager) => manager.inner().latest_commit(),
+            Self::Single(manager) => manager.latest_commit(),
             Self::Cluster(backend) => backend.node().manager().latest_commit(),
             Self::Sharded(shards) => shards.latest_commit(),
             Self::Hybrid(hybrid) => {
