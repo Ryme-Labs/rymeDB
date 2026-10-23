@@ -35,6 +35,8 @@ All notable changes to rymeDB are recorded here. Format follows
   broader permissions on existing snapshots are repaired when opened.
 - Raft metadata files are created with Unix mode 0600; existing metadata with
   broader permissions is tightened through the verified open handle.
+- Local archive objects and restored files use Unix mode 0600; broader
+  permissions on existing objects are repaired when opened.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique

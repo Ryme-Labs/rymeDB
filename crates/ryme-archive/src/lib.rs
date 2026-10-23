@@ -18,7 +18,14 @@ pub(crate) fn create_archive_temp_file(path: &Path) -> Result<(PathBuf, File)> {
     for _ in 0..128 {
         let id = NEXT_ARCHIVE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temp = parent.join(format!(".rymedb-archive-{}-{id}.tmp", std::process::id()));
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
             Ok(file) => return Ok((temp, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
