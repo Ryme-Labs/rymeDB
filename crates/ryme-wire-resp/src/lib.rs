@@ -6212,7 +6212,10 @@ fn decode_array(input: &[u8]) -> Result<Option<(RespCommand, usize)>> {
     }
     let mut parts: Vec<Vec<u8>> = Vec::new();
     for _ in 0..count {
-        if offset >= input.len() || input[offset] != b'$' {
+        if offset >= input.len() {
+            return Ok(None);
+        }
+        if input[offset] != b'$' {
             return Err(RymeError::InvalidArgument(String::from("resp")));
         }
         let Some(len_end) = find_crlf(&input[offset..]).map(|v| v + offset) else {
