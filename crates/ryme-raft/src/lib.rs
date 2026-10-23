@@ -349,7 +349,9 @@ impl Cluster {
         if !self.nodes.get(candidate).map(|n| n.alive).unwrap_or(false) {
             return false;
         }
-        let term = self.nodes[candidate].group.term + 1;
+        let Some(term) = self.nodes[candidate].group.term.checked_add(1) else {
+            return false;
+        };
         let (candidate_term, candidate_index) = self.nodes[candidate].group.last_position();
         let peers = self.reachable(candidate);
         if peers.is_empty() {

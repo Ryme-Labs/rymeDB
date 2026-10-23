@@ -2077,7 +2077,11 @@ impl Node {
             if state.leader == Some(self.id) {
                 return Ok(());
             }
-            state.term = state.term.max(1).saturating_add(1);
+            state.term = state
+                .term
+                .max(1)
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("range term overflow")))?;
             state.voted_for = Some(self.id);
             state.leader = None;
             state.last_contact_ms = now_ms();
@@ -2322,7 +2326,10 @@ impl Node {
             if inner.role == Role::Leader {
                 return Ok(());
             }
-            inner.term += 1;
+            inner.term = inner
+                .term
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("raft term overflow")))?;
             inner.role = Role::Candidate;
             inner.voted_for = Some(self.id);
             inner.leader_id = None;
@@ -2393,7 +2400,14 @@ impl Node {
                 return Ok(false);
             }
             let (last_term, last_index) = inner.last_position();
-            (inner.term + 1, last_term, last_index)
+            (
+                inner
+                    .term
+                    .checked_add(1)
+                    .ok_or_else(|| RymeError::Corrupt(String::from("raft term overflow")))?,
+                last_term,
+                last_index,
+            )
         };
         let mut votes = vec![self.id];
         let mut tasks = Vec::new();

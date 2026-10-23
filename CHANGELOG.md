@@ -43,6 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
   same-term index conflicts and overflowing append indexes.
 - Raft voting, append, and leadership-transfer requests now require the claimed
   candidate or leader to belong to the active or joint membership.
+- Raft elections now fail cleanly if the term counter cannot advance, avoiding
+  overflow panics or repeated elections in a saturated term.
 
 ### Performance
 
