@@ -3,6 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const KEY: &str = "ryme-tenants-key-5f2c8a1d9e40";
 const JWT_SECRET: &str = "ryme-tenants-jwt-secret-9d4c";
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn bind_listener() -> tokio::net::TcpListener {
     tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
@@ -128,6 +129,7 @@ fn now_ms() -> u128 {
 
 #[tokio::test]
 async fn tenants_share_no_presence_or_partitions() {
+    let _env = ENV_LOCK.lock().await;
     std::env::set_var("RYME_API_KEY", KEY);
     std::env::set_var("RYME_JWT_SECRET", JWT_SECRET);
     let root =
@@ -322,6 +324,7 @@ async fn tenants_share_no_presence_or_partitions() {
 
 #[tokio::test]
 async fn presence_counts_drop_expired_members_on_join() {
+    let _env = ENV_LOCK.lock().await;
     std::env::set_var("RYME_API_KEY", KEY);
     std::env::set_var("RYME_JWT_SECRET", JWT_SECRET);
     let root =
