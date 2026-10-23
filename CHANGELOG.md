@@ -37,6 +37,8 @@ All notable changes to rymeDB are recorded here. Format follows
   range snapshots reject empty or oversized IDs.
 - The documentation toolchain now resolves patched `body-parser` 1.20.9 to
   address a denial-of-service advisory in earlier 1.x versions.
+- The documentation toolchain now resolves patched `fast-uri` 3.1.9 and
+  `serialize-javascript` 7.1.3 for current dependency advisories.
 - Durable-topic snapshot restoration now enforces global and per-tenant topic
   limits before admitting each restored topic.
 - DEK rotation IDs now remain unique when restoring stale counters or reaching
