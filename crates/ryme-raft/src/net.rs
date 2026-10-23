@@ -663,6 +663,7 @@ pub struct PeerPool {
     conn: Mutex<Option<MeshStream>>,
     dials: std::sync::atomic::AtomicU64,
     isolated: std::sync::atomic::AtomicBool,
+    tls_required: std::sync::atomic::AtomicBool,
     tls: std::sync::Mutex<Option<ryme_tls::MeshConnector>>,
 }
 
@@ -687,15 +688,33 @@ impl PeerPool {
             conn: Mutex::new(None),
             dials: std::sync::atomic::AtomicU64::new(0),
             isolated: std::sync::atomic::AtomicBool::new(false),
+            tls_required: std::sync::atomic::AtomicBool::new(false),
             tls: std::sync::Mutex::new(None),
         })
     }
 
     pub fn set_connector(&self, connector: Option<ryme_tls::MeshConnector>) {
-        if let Ok(mut guard) = self.tls.lock() {
-            *guard = connector;
+        if let Err(error) = self.try_set_connector(connector) {
+            tracing::error!(%error, "failed to install raft peer TLS connector");
         }
+    }
+
+    pub fn try_set_connector(&self, connector: Option<ryme_tls::MeshConnector>) -> Result<()> {
+        if connector.is_some() {
+            self.tls_required.store(true, Ordering::SeqCst);
+        }
+        let mut guard = self
+            .tls
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("raft peer TLS config lock")))?;
+        *guard = connector;
+        drop(guard);
         self.purge();
+        Ok(())
+    }
+
+    fn require_tls(&self) {
+        self.tls_required.store(true, Ordering::SeqCst);
     }
 
     pub fn set_isolated(&self, isolated: bool) {
@@ -713,7 +732,11 @@ impl PeerPool {
     }
 
     async fn dial(&self) -> Result<MeshStream> {
-        let connector = self.tls.lock().ok().and_then(|guard| guard.clone());
+        let connector = self
+            .tls
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("raft peer TLS config lock")))?
+            .clone();
         if let Some(connector) = connector {
             let name = ryme_tls::server_name_for(&self.addr);
             let stream = tokio::time::timeout(
@@ -723,6 +746,11 @@ impl PeerPool {
             .await
             .map_err(|_| RymeError::Timeout)??;
             return Ok(MeshStream::Tls(Box::new(stream)));
+        }
+        if self.tls_required.load(Ordering::SeqCst) {
+            return Err(RymeError::Unavailable(String::from(
+                "raft peer TLS connector unavailable",
+            )));
         }
         let socket = tokio::time::timeout(
             Duration::from_millis(800),
@@ -740,6 +768,11 @@ impl PeerPool {
             return Err(RymeError::Unavailable(String::from("isolated")));
         }
         let mut guard = self.conn.lock().await;
+        if self.tls_required.load(Ordering::SeqCst)
+            && matches!(guard.as_ref(), Some(MeshStream::Plain(_)))
+        {
+            *guard = None;
+        }
         if guard.is_none() {
             let stream = self.dial().await?;
             self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1508,9 +1541,17 @@ impl Node {
                 let node = accept.clone();
                 let task = tokio::spawn(async move {
                     let _permit = permit;
-                    if let Some(transport) =
-                        node.mesh_tls.lock().ok().and_then(|guard| guard.clone())
-                    {
+                    let transport = match node.mesh_tls.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => {
+                            tracing::error!(
+                                node_id = node.id,
+                                "raft mesh TLS config lock is poisoned"
+                            );
+                            return;
+                        }
+                    };
+                    if let Some(transport) = transport {
                         let Ok(tls) = transport.acceptor.acceptor().accept(socket).await else {
                             return;
                         };
@@ -1591,24 +1632,61 @@ impl Node {
     }
 
     fn adopt_pool(&self, pool: &Arc<PeerPool>) {
-        let transport = self.mesh_tls.lock().ok().and_then(|guard| guard.clone());
+        let transport = match self.mesh_tls.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                pool.require_tls();
+                tracing::error!(node_id = self.id, "raft mesh TLS config lock is poisoned");
+                return;
+            }
+        };
         if let Some(transport) = transport {
-            pool.set_connector(Some(transport.connector.clone()));
+            if let Err(error) = pool.try_set_connector(Some(transport.connector.clone())) {
+                tracing::error!(node_id = self.id, %error, "failed to install raft peer TLS connector");
+            }
         }
     }
 
     pub fn set_mesh_tls(&self, transport: MeshTransport) {
-        let transport = Arc::new(transport);
-        if let Ok(mut guard) = self.mesh_tls.lock() {
-            *guard = Some(transport.clone());
-        }
-        for (_, pool) in self.pools_snapshot() {
-            pool.set_connector(Some(transport.connector.clone()));
+        if let Err(error) = self.try_set_mesh_tls(transport) {
+            tracing::error!(node_id = self.id, %error, "failed to install raft mesh TLS transport");
         }
     }
 
+    pub fn try_set_mesh_tls(&self, transport: MeshTransport) -> Result<()> {
+        let transport = Arc::new(transport);
+        let pools = self.pools_snapshot();
+        for (_, pool) in &pools {
+            pool.require_tls();
+        }
+        {
+            let mut guard = self
+                .mesh_tls
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("raft mesh TLS config lock")))?;
+            *guard = Some(transport.clone());
+        }
+        for (_, pool) in pools {
+            pool.try_set_connector(Some(transport.connector.clone()))?;
+        }
+        Ok(())
+    }
+
     pub fn mesh_enabled(&self) -> bool {
-        self.mesh_tls.lock().ok().and_then(|guard| guard.clone()).is_some()
+        match self.try_mesh_enabled() {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                tracing::error!(node_id = self.id, %error, "failed to read raft mesh TLS state");
+                true
+            }
+        }
+    }
+
+    pub fn try_mesh_enabled(&self) -> Result<bool> {
+        self.mesh_tls
+            .lock()
+            .map(|guard| guard.is_some())
+            .map_err(|_| RymeError::Internal(String::from("raft mesh TLS config lock")))
     }
 
     fn range_timeout_ms(&self, group_id: &str) -> u64 {

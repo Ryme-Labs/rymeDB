@@ -2866,7 +2866,7 @@ impl SharedState {
                 return Err(ryme_error::RymeError::InvalidArgument(String::from("tls client ca")));
             }
         };
-        node.set_mesh_tls(ryme_raft::net::MeshTransport { acceptor, connector });
+        node.try_set_mesh_tls(ryme_raft::net::MeshTransport { acceptor, connector })?;
         Ok(())
     }
 
