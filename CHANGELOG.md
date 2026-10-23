@@ -29,6 +29,8 @@ All notable changes to rymeDB are recorded here. Format follows
   queues rather than silently treating them as empty.
 - Raft transaction routing now propagates invalid scanned-table bounds instead
   of omitting affected ranges from distributed coordination.
+- Raft range writes now surface local suffix-truncation failures after quorum
+  or transaction-commit errors instead of reporting a clean abort.
 
 ### Performance
 

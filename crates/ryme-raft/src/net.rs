@@ -4689,7 +4689,7 @@ impl Node {
             }
         }
         if acknowledgements < replicas.len() / 2 + 1 {
-            let _ = self.abort_range_entry(group_id, index, &replicas).await;
+            self.abort_range_entry(group_id, index, &replicas).await?;
             return Err(RymeError::Unavailable(String::from("range quorum")));
         }
         Ok((index, term, acknowledged))
@@ -4848,7 +4848,7 @@ impl Node {
                 Err(error) => return Err(error),
             };
         if let Err(error) = self.manager.commit_filtered_at(&txn, commit_ts, |_| true) {
-            let _ = self.abort_range_entry(group_id, index, &range.replicas).await;
+            self.abort_range_entry(group_id, index, &range.replicas).await?;
             return Err(error);
         }
         self.commit_range_entry(group_id, index, term, &acknowledged).await?;
