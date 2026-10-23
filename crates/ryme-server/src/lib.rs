@@ -2319,7 +2319,7 @@ impl SharedState {
             let reader = RemoteReader::new_with_read_ts(move |key, read_ts| {
                 let node = single_node.clone();
                 async move {
-                    let Some(owner) = node.range_owner_key(&key) else {
+                    let Some(owner) = node.try_range_owner_key(&key)? else {
                         return Ok(RemoteRead::Local);
                     };
                     if owner == node.node_id() {
@@ -2336,7 +2336,7 @@ impl SharedState {
                     let mut grouped: BTreeMap<usize, Vec<(usize, ryme_storage::RecordKey)>> =
                         BTreeMap::new();
                     for (index, key) in keys.into_iter().enumerate() {
-                        let Some(owner) = node.range_owner_key(&key) else {
+                        let Some(owner) = node.try_range_owner_key(&key)? else {
                             continue;
                         };
                         if owner != node.node_id() {
@@ -12469,7 +12469,7 @@ async fn remote_scan_range_page(
     if limit == 0 {
         return Ok(RemoteScan::Page(RemoteScanPage { rows: Vec::new(), next: None }));
     }
-    let owners = node.range_owners();
+    let owners = node.try_range_owners()?;
     if owners.is_empty() {
         return Ok(RemoteScan::Local);
     }
@@ -15434,7 +15434,7 @@ async fn snapshot_backend_files(
         Backend::Single(manager) => Ok(vec![manager.write_snapshot()?]),
         Backend::Cluster(backend) => {
             let node = backend.node();
-            let owners = node.range_owners();
+            let owners = node.try_range_owners()?;
             if owners.is_empty() {
                 Ok(vec![snapshot_manager(node.manager(), &state.data_dir.join("snapshots"))?])
             } else {

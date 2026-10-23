@@ -1622,7 +1622,11 @@ impl Node {
 
     async fn range_tick(self: &Arc<Self>) {
         let now = now_ms();
-        for configured in self.range_owners() {
+        let Ok(configured_ranges) = self.try_range_owners() else {
+            tracing::error!(node_id = self.id, "range ownership metadata unavailable");
+            return;
+        };
+        for configured in configured_ranges {
             let range = self.with_current_range_leader(configured);
             if !range.replicas.contains(&self.id) {
                 continue;
@@ -1974,7 +1978,11 @@ impl Node {
         last_term: u64,
         last_index: u64,
     ) -> (u64, bool) {
-        let Some(range) = self.range_owners().into_iter().find(|range| range.id == group_id) else {
+        let Some(range) = self
+            .try_range_owners()
+            .ok()
+            .and_then(|ranges| ranges.into_iter().find(|range| range.id == group_id))
+        else {
             return (self.range_term(group_id), false);
         };
         if !range.replicas.contains(&self.id) || !range.replicas.contains(&candidate) {
@@ -2331,11 +2339,14 @@ impl Node {
                 ApplyPayload::Data { commit_ts, writes } => {
                     let encoded_writes = writes.clone();
                     let writes = decode_writes(&writes)?;
-                    if self.range_owners().is_empty() {
+                    let range_owners = self.try_range_owners()?;
+                    if range_owners.is_empty() {
                         self.manager.replay_at(commit_ts, &writes)?;
                     } else {
                         self.manager.replay_at_filtered(commit_ts, &writes, |key| {
-                            self.owns_range_key(key)
+                            self.range_owner_key_in(&range_owners, key)
+                                .map(|owner| owner == self.id)
+                                .unwrap_or(true)
                         })?;
                     }
                     if self.inner.lock().await.role != Role::Leader {
@@ -3053,7 +3064,7 @@ impl Node {
         if writes.is_empty() {
             return Err(RymeError::InvalidArgument(String::from("writes")));
         }
-        if let Some((group_id, range_owner)) = self.range_group_for_writes(&writes) {
+        if let Some((group_id, range_owner)) = self.range_group_for_writes(&writes)? {
             return self
                 .propose_range_write(range_owner, &group_id, writes, route_generation)
                 .await;
@@ -3086,17 +3097,23 @@ impl Node {
     fn range_group_for_writes(
         &self,
         writes: &BTreeMap<RecordKey, ryme_txn::WriteOp>,
-    ) -> Option<(String, usize)> {
+    ) -> Result<Option<(String, usize)>> {
+        let owners = self.try_range_owners()?;
+        if owners.is_empty() {
+            return Ok(None);
+        }
         let mut group = None;
         for key in writes.keys() {
-            let range = self.range_for_record(key)?;
+            let Some(range) = self.range_for_record_in(&owners, key) else {
+                return Ok(None);
+            };
             match &group {
                 None => group = Some((range.id, range.owner)),
                 Some((group_id, owner)) if *group_id == range.id && *owner == range.owner => {}
-                Some(_) => return None,
+                Some(_) => return Ok(None),
             }
         }
-        group
+        Ok(group)
     }
 
     async fn propose_range_write(
@@ -3146,8 +3163,9 @@ impl Node {
     }
 
     async fn restore_to(self: &Arc<Self>, target: u64) -> Result<u64> {
-        if !self.range_owners().is_empty() {
-            return self.restore_active_ranges_to(target).await;
+        let range_owners = self.try_range_owners()?;
+        if !range_owners.is_empty() {
+            return self.restore_active_ranges_to(target, range_owners).await;
         }
         let entries = {
             let inner = self.inner.lock().await;
@@ -3165,8 +3183,11 @@ impl Node {
         self.manager.restore_with_replay(Engine::default(), &replay)
     }
 
-    async fn restore_active_ranges_to(self: &Arc<Self>, target: u64) -> Result<u64> {
-        let ranges = self.range_owners();
+    async fn restore_active_ranges_to(
+        self: &Arc<Self>,
+        target: u64,
+        ranges: Vec<RangeOwner>,
+    ) -> Result<u64> {
         let mut restored = 0u64;
         for range in ranges {
             if !range.replicas.contains(&self.id) && range.owner != self.id {
@@ -3550,8 +3571,11 @@ impl Node {
         self.manager.validate_at(&txn, commit_ts)?;
         self.range_prepare_conflict(group_id, transaction_id, commit_ts, &txn, &state)?;
         let mut local_state = state.clone();
+        let range_owners = self.try_range_owners()?;
         local_state.writes.retain(|(key, _)| {
-            self.range_for_record(key).map(|range| range.id == group_id).unwrap_or(true)
+            self.range_for_record_in(&range_owners, key)
+                .map(|range| range.id == group_id)
+                .unwrap_or(true)
         });
         let encoded = serde_json::to_vec(&local_state)
             .map_err(|error| RymeError::Internal(format!("range transaction prepare: {error}")))?;
@@ -3813,17 +3837,29 @@ impl Node {
         Ok(())
     }
 
-    fn range_for_record(&self, key: &RecordKey) -> Option<RangeOwner> {
-        let owners = self.range_owners();
+    /// Returns the configured key ranges or an error if range metadata is unavailable.
+    pub fn try_range_owners(&self) -> Result<Vec<RangeOwner>> {
+        self.range_owners
+            .read()
+            .map(|owners| owners.clone())
+            .map_err(|_| RymeError::Internal(String::from("range ownership metadata poisoned")))
+    }
+
+    fn range_for_record_in(&self, owners: &[RangeOwner], key: &RecordKey) -> Option<RangeOwner> {
         let version = owners.first()?.routing_version;
         let routing = ryme_storage::record_routing_key(version, key).ok()?;
         owners
-            .into_iter()
+            .iter()
             .find(|range| {
                 routing.as_slice() >= range.start.as_slice()
                     && (range.end.is_empty() || routing.as_slice() < range.end.as_slice())
             })
+            .cloned()
             .map(|range| self.with_current_range_leader(range))
+    }
+
+    fn range_owner_key_in(&self, owners: &[RangeOwner], key: &RecordKey) -> Option<usize> {
+        self.range_for_record_in(owners, key).map(|range| range.owner)
     }
 
     fn with_current_range_leader(&self, mut range: RangeOwner) -> RangeOwner {
@@ -4300,7 +4336,8 @@ impl Node {
     }
 
     fn range_owner_by_id(&self, group_id: &str) -> Option<RangeOwner> {
-        self.range_owners()
+        self.try_range_owners()
+            .ok()?
             .into_iter()
             .find(|range| range.id == group_id)
             .map(|range| self.with_current_range_leader(range))
@@ -4547,13 +4584,14 @@ impl Node {
         commit_ts: u64,
         writes: &BTreeMap<RecordKey, ryme_txn::WriteOp>,
     ) -> Result<()> {
-        if self.range_owners().is_empty() {
+        let range_owners = self.try_range_owners()?;
+        if range_owners.is_empty() {
             return Ok(());
         }
         let mut groups: BTreeMap<String, (usize, BTreeMap<RecordKey, ryme_txn::WriteOp>)> =
             BTreeMap::new();
         for (key, op) in writes {
-            let Some(range) = self.range_for_record(key) else { continue };
+            let Some(range) = self.range_for_record_in(&range_owners, key) else { continue };
             groups
                 .entry(range.id)
                 .or_insert_with(|| (range.owner, BTreeMap::new()))
@@ -4567,13 +4605,13 @@ impl Node {
         Ok(())
     }
 
-    fn transaction_participant_ranges(
+    fn try_transaction_participant_ranges(
         &self,
         txn: &ryme_txn::Transaction,
-    ) -> BTreeMap<String, RangeOwner> {
-        let ranges = self.range_owners();
+    ) -> Result<BTreeMap<String, RangeOwner>> {
+        let ranges = self.try_range_owners()?;
         if ranges.is_empty() {
-            return BTreeMap::new();
+            return Ok(BTreeMap::new());
         }
         let mut participants = BTreeMap::new();
         let routing_version = ranges
@@ -4581,7 +4619,7 @@ impl Node {
             .map(|range| range.routing_version)
             .unwrap_or(ryme_storage::LEGACY_ROUTING_VERSION);
         for key in txn.writes().keys().chain(txn.read_keys().iter()) {
-            if let Some(range) = self.range_for_record(key) {
+            if let Some(range) = self.range_for_record_in(&ranges, key) {
                 participants.insert(range.id.clone(), range);
             }
         }
@@ -4603,7 +4641,14 @@ impl Node {
                 }
             }
         }
-        participants
+        Ok(participants)
+    }
+
+    fn transaction_participant_ranges(
+        &self,
+        txn: &ryme_txn::Transaction,
+    ) -> BTreeMap<String, RangeOwner> {
+        self.try_transaction_participant_ranges(txn).unwrap_or_default()
     }
 
     pub fn transaction_participants(&self, txn: &ryme_txn::Transaction) -> BTreeSet<usize> {
@@ -4884,7 +4929,7 @@ impl Node {
         if txn.writes().is_empty() {
             return Ok(txn.read_ts);
         }
-        let participants = self.transaction_participant_ranges(&txn);
+        let participants = self.try_transaction_participant_ranges(&txn)?;
         if participants.len() < 2 {
             return self.commit_global_txn(txn).await;
         }
@@ -4991,7 +5036,7 @@ impl Node {
         }
         let _commit = self.txn_commit_lock.lock().await;
         self.reject_prepared_conflict(&txn)?;
-        if self.transaction_participant_ranges(&txn).len() > 1 {
+        if self.try_transaction_participant_ranges(&txn)?.len() > 1 {
             return self.commit_distributed_txn(txn).await;
         }
         self.commit_global_txn(txn).await
@@ -5486,7 +5531,7 @@ impl Node {
         if limit == 0 {
             return Ok(Some(Vec::new()));
         }
-        let ranges = self.range_owners();
+        let ranges = self.try_range_owners()?;
         let routing_version = ranges
             .first()
             .map(|range| range.routing_version)
@@ -5866,13 +5911,19 @@ impl Node {
     }
 
     pub fn range_owner_key(&self, key: &RecordKey) -> Option<usize> {
-        let version = self.range_owners().first()?.routing_version;
-        let routing = ryme_storage::record_routing_key(version, key).ok()?;
-        self.range_owner(&routing).map(|(owner, _)| owner)
+        self.try_range_owner_key(key).ok().flatten()
+    }
+
+    /// Resolves a record key to its range owner, propagating range metadata errors.
+    pub fn try_range_owner_key(&self, key: &RecordKey) -> Result<Option<usize>> {
+        let owners = self.try_range_owners()?;
+        Ok(self.range_owner_key_in(&owners, key))
     }
 
     pub fn owns_range_key(&self, key: &RecordKey) -> bool {
-        self.range_owner_key(key).map(|owner| owner == self.id).unwrap_or(true)
+        self.try_range_owner_key(key)
+            .map(|owner| owner.map(|owner| owner == self.id).unwrap_or(true))
+            .unwrap_or(false)
     }
 
     pub fn read_range_value(
@@ -6057,7 +6108,7 @@ impl ryme_txn::TxnBackend for ClusterBackend {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>>> + Send + 'a>> {
         let node = self.node.clone();
         Box::pin(async move {
-            let Some(owner) = node.range_owner_key(key) else {
+            let Some(owner) = node.try_range_owner_key(key)? else {
                 return node.manager().get(txn, key);
             };
             if owner == node.node_id() {
@@ -6160,39 +6211,39 @@ impl ryme_txn::TxnBackend for ClusterBackend {
     ) -> impl std::future::Future<Output = Result<u64>> + Send {
         let node = self.node.clone();
         let route_generation = txn.route_generation();
-        let distributed = node.transaction_participant_ranges(&txn).len() > 1;
-        let routed = if !distributed
-            && txn.read_keys().is_empty()
-            && txn.scanned_tables().is_empty()
-            && txn.constraint_scanned_tables().is_empty()
-            && !txn.writes().is_empty()
-        {
-            let owners = node.range_owners();
-            if owners.is_empty() {
-                None
-            } else {
-                let owner = txn
-                    .writes()
-                    .keys()
-                    .map(|key| node.range_owner_key(key))
-                    .try_fold(None, |current, next| match (current, next) {
-                        (None, Some(owner)) => Ok(Some(owner)),
-                        (Some(existing), Some(owner)) if existing == owner => Ok(current),
-                        _ => Err(()),
-                    })
-                    .ok()
-                    .flatten()
-                    .map_or_else(
-                        || Some((None, txn.writes().clone())),
-                        |owner| Some((Some(owner), txn.writes().clone())),
-                    );
-                owner
-            }
-        } else {
-            None
-        };
         async move {
             txn.ensure_healthy()?;
+            let distributed = node.try_transaction_participant_ranges(&txn)?.len() > 1;
+            let routed = if !distributed
+                && txn.read_keys().is_empty()
+                && txn.scanned_tables().is_empty()
+                && txn.constraint_scanned_tables().is_empty()
+                && !txn.writes().is_empty()
+            {
+                let owners = node.try_range_owners()?;
+                if owners.is_empty() {
+                    None
+                } else {
+                    let owner = txn
+                        .writes()
+                        .keys()
+                        .map(|key| node.range_owner_key_in(&owners, key))
+                        .try_fold(None, |current, next| match (current, next) {
+                            (None, Some(owner)) => Ok(Some(owner)),
+                            (Some(existing), Some(owner)) if existing == owner => Ok(current),
+                            _ => Err(()),
+                        })
+                        .ok()
+                        .flatten()
+                        .map_or_else(
+                            || Some((None, txn.writes().clone())),
+                            |owner| Some((Some(owner), txn.writes().clone())),
+                        );
+                    owner
+                }
+            } else {
+                None
+            };
             let result = match routed {
                 Some((Some(owner), writes)) => {
                     node.propose_write_on(owner, writes, route_generation).await
