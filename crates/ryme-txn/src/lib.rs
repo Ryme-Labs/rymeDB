@@ -131,8 +131,23 @@ fn write_snapshot_file(dir: &Path, commit_ts: u64, raw: &[u8]) -> Result<std::pa
 fn read_snapshot_file(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
 
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(RymeError::Corrupt(String::from("snapshot file type")));
+    }
     let file = std::fs::File::open(path)?;
-    let length = file.metadata()?.len();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RymeError::Corrupt(String::from("snapshot file type")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err(RymeError::Corrupt(String::from("snapshot file identity")));
+        }
+    }
+    let length = metadata.len();
     if length > ryme_storage::MAX_SNAPSHOT_BYTES as u64 {
         return Err(RymeError::Overload(String::from("snapshot")));
     }
