@@ -187,17 +187,108 @@ impl Wal {
     }
 
     pub fn truncate_above(&mut self, ceiling_commit_ts: u64) -> Result<usize> {
-        let records = Self::read_all(&self.dir)?;
-        let kept: Vec<WalRecord> = records
-            .iter()
-            .filter(|record| record.commit_ts <= ceiling_commit_ts)
-            .cloned()
-            .collect();
-        let removed = records.len().saturating_sub(kept.len());
+        let mut ids = segment_ids(&self.dir)?;
+        ids.sort_unstable();
+        let latest_id = ids.last().copied();
+
+        // Avoid staging and rewriting the full WAL when this cutoff removes
+        // nothing. On the rewrite path, processing one source segment at a
+        // time keeps memory use independent of total WAL history.
+        let mut previous_lsn = None;
+        let mut removed = 0usize;
+        for source_id in ids.iter().copied() {
+            let raw = read_segment_file(&self.dir.join(segment_name(source_id)))?;
+            let mut cursor = raw.as_slice();
+            while !cursor.is_empty() {
+                let (record, consumed) = match decode_frame(cursor)? {
+                    Some(frame) => frame,
+                    None if Some(source_id) == latest_id => break,
+                    None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
+                };
+                cursor = &cursor[consumed..];
+                if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                    return Err(RymeError::Corrupt(String::from("wal lsn order")));
+                }
+                previous_lsn = Some(record.lsn);
+                if record.commit_ts > ceiling_commit_ts {
+                    removed = removed.saturating_add(1);
+                }
+            }
+        }
         if removed == 0 {
             return Ok(0);
         }
-        self.rewrite(&kept)?;
+
+        let temporary = self.dir.join(REWRITE_DIR);
+        if temporary.exists() {
+            std::fs::remove_dir_all(&temporary)?;
+        }
+        std::fs::create_dir_all(&temporary)?;
+
+        let mut id = 0u64;
+        let mut path = temporary.join(segment_name(id));
+        let mut file = File::create(&path)?;
+        let mut segment_len = 0u64;
+        let mut previous_lsn = None;
+        let mut last_kept_lsn = None;
+
+        for source_id in ids {
+            let raw = read_segment_file(&self.dir.join(segment_name(source_id)))?;
+            let mut cursor = raw.as_slice();
+            while !cursor.is_empty() {
+                let (record, consumed) = match decode_frame(cursor)? {
+                    Some(frame) => frame,
+                    None if Some(source_id) == latest_id => break,
+                    None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
+                };
+                cursor = &cursor[consumed..];
+                if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                    return Err(RymeError::Corrupt(String::from("wal lsn order")));
+                }
+                previous_lsn = Some(record.lsn);
+
+                if record.commit_ts > ceiling_commit_ts {
+                    continue;
+                }
+
+                let frame = encode_frame(record.lsn, record.commit_ts, &record.payload)?;
+                if segment_len > 0
+                    && segment_len.saturating_add(frame.len() as u64) > self.segment_size_bytes
+                {
+                    file.sync_data()?;
+                    id = id.checked_add(1).ok_or_else(|| {
+                        RymeError::Corrupt(String::from("wal segment id overflow"))
+                    })?;
+                    path = temporary.join(segment_name(id));
+                    file = File::create(&path)?;
+                    segment_len = 0;
+                }
+                file.write_all(&frame)?;
+                segment_len = segment_len.saturating_add(frame.len() as u64);
+                last_kept_lsn = Some(record.lsn);
+            }
+        }
+
+        file.sync_data()?;
+        drop(file);
+        sync_directory(&temporary)?;
+        let next_lsn = last_kept_lsn
+            .map(|lsn| {
+                lsn.checked_add(1)
+                    .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
+            })
+            .unwrap_or(Ok(0))?;
+        // The staged generation is authoritative after the marker is durable;
+        // stop appends through the old handle if installation fails.
+        self.poisoned = true;
+        create_rewrite_marker(&self.dir)?;
+        install_rewrite(&self.dir)?;
+        self.active_id = latest_segment_id(&self.dir)?;
+        let active_path = self.dir.join(segment_name(self.active_id));
+        self.active = OpenOptions::new().create(true).read(true).append(true).open(active_path)?;
+        self.active_len = self.active.metadata()?.len();
+        self.next_lsn = next_lsn;
+        self.poisoned = false;
         Ok(removed)
     }
 

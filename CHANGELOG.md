@@ -16,6 +16,11 @@ All notable changes to rymeDB are recorded here. Format follows
 - SQL grants validate roles atomically, and dropping a role clears its direct
   and default privileges so recreating the role cannot restore stale access.
 
+### Performance
+
+- WAL point-in-time truncation now stages retained records one segment at a
+  time instead of buffering the full WAL history in memory.
+
 ## [2.0.3] — 2026-10-23
 
 ### Fixed
