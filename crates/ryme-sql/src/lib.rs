@@ -8546,13 +8546,18 @@ where
             })
             .ok_or_else(|| RymeError::NotFound(format!("sequence {name}")))?;
         let sequence = sequences.get_mut(&key).expect("sequence key selected above");
+        if increment == Some(0) {
+            return Err(RymeError::InvalidArgument(String::from("sequence increment")));
+        }
+        if restart
+            .is_some_and(|restart| restart < sequence.min_value || restart > sequence.max_value)
+        {
+            return Err(RymeError::InvalidArgument(String::from("sequence restart")));
+        }
         if let Some(increment) = increment {
             sequence.increment = increment;
         }
         if let Some(restart) = restart {
-            if restart < sequence.min_value || restart > sequence.max_value {
-                return Err(RymeError::InvalidArgument(String::from("sequence restart")));
-            }
             sequence.start = restart;
             sequence.last_value = None;
         }
@@ -8587,15 +8592,20 @@ where
         let sequence = sequences.get_mut(&key).expect("sequence key selected above");
         match operation {
             SequenceOperation::Nextval => {
-                let next = sequence.last_value.map_or(sequence.start, |last| {
-                    last.checked_add(sequence.increment).unwrap_or({
-                        if sequence.increment < 0 {
-                            sequence.min_value
-                        } else {
-                            sequence.max_value
+                let next = match sequence.last_value {
+                    None => sequence.start,
+                    Some(last) => match last.checked_add(sequence.increment) {
+                        Some(next) => next,
+                        None if sequence.cycle && sequence.increment < 0 => sequence.max_value,
+                        None if sequence.cycle => sequence.min_value,
+                        None => {
+                            return Err(RymeError::Conflict(format!(
+                                "sequence {} exhausted",
+                                sequence.name
+                            )));
                         }
-                    })
-                });
+                    },
+                };
                 let next = if next < sequence.min_value || next > sequence.max_value {
                     if sequence.cycle {
                         if sequence.increment < 0 {
