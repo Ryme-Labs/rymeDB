@@ -3328,8 +3328,11 @@ where
         }
         TransactionControl::Rollback => {
             if let Some(state) = active.take() {
-                let _ = executor.rollback_schema_transaction(state.schema_before);
+                let rollback = executor.rollback_schema_transaction(state.schema_before);
                 restore_local_settings(session, &state.local_settings);
+                if let Err(error) = rollback {
+                    return encode_error_code(error_code(&error), error.to_string());
+                }
             }
             command_complete("ROLLBACK")
         }
