@@ -982,18 +982,22 @@ impl Inner {
         if target <= self.commit_index {
             return Ok(());
         }
-        let mut candidate = target;
-        while candidate > self.commit_index {
-            if self.log.iter().any(|e| e.index == candidate && e.term == self.term) {
-                let previous_commit = self.commit_index;
-                self.commit_index = candidate;
-                if let Err(error) = self.persist_meta() {
-                    self.commit_index = previous_commit;
-                    return Err(error);
-                }
-                return Ok(());
-            }
-            candidate -= 1;
+        let Some(candidate) = self
+            .log
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.index > self.commit_index && entry.index <= target && entry.term == self.term
+            })
+            .map(|entry| entry.index)
+        else {
+            return Ok(());
+        };
+        let previous_commit = self.commit_index;
+        self.commit_index = candidate;
+        if let Err(error) = self.persist_meta() {
+            self.commit_index = previous_commit;
+            return Err(error);
         }
         Ok(())
     }
@@ -2561,6 +2565,7 @@ impl Node {
         let prev = snapshot.iter().rev().find(|e| e.index < next);
         let (prev_index, prev_term) = prev.map(|e| (e.index, e.term)).unwrap_or((0, 0));
         let entries: Vec<LogEntry> = snapshot.iter().filter(|e| e.index >= next).cloned().collect();
+        let sent_last = entries.last().map(|entry| entry.index).unwrap_or(prev_index);
         let request = Rpc::AppendRequest {
             term,
             leader: self.id,
@@ -2584,14 +2589,21 @@ impl Node {
                     return Ok(());
                 }
                 if ok {
+                    if match_index < prev_index {
+                        return Ok(());
+                    }
+                    let matched = match_index.min(sent_last);
                     let next = inner.next_index.entry(peer).or_insert(1);
-                    *next = match_index + 1;
+                    *next = matched.saturating_add(1).max(1);
                     let ack = inner.acks.entry(peer).or_insert(0);
-                    *ack = match_index.max(*ack);
+                    *ack = matched.max(*ack);
                     inner.advance_commit()?;
                 } else {
                     let next = inner.next_index.entry(peer).or_insert(1);
-                    *next = match_index.saturating_add(1).max(1);
+                    *next = match_index
+                        .min(snapshot.last().map(|entry| entry.index).unwrap_or(0))
+                        .saturating_add(1)
+                        .max(1);
                 }
             }
             Ok(_) => {}

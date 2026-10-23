@@ -47,6 +47,8 @@ All notable changes to rymeDB are recorded here. Format follows
   overflow panics or repeated elections in a saturated term.
 - Raft nodes now isolate themselves after durable WAL write or rewrite failures
   across core, range, intent, and resolution logs.
+- Raft leaders now cap follower acknowledgments at entries actually sent and
+  advance commits by scanning stored entries instead of untrusted index ranges.
 
 ### Performance
 
