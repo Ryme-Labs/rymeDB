@@ -389,15 +389,20 @@ fn publish_notifications(tenant: &str, database: &str, notifications: &mut Vec<P
     }
 }
 
-fn register_backend() -> (u32, u32, Arc<AtomicBool>) {
+fn register_backend() -> Result<(u32, u32, Arc<AtomicBool>)> {
     let pid = NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed).max(1);
-    let secret = pid.rotate_left(13) ^ 0x9e37_79b9;
+    let mut secret_bytes = [0u8; 4];
+    getrandom::fill(&mut secret_bytes).map_err(|error| {
+        RymeError::Internal(format!("secure random source unavailable: {error}"))
+    })?;
+    let secret = u32::from_be_bytes(secret_bytes);
     let cancellation = Arc::new(AtomicBool::new(false));
-    if let Ok(mut backends) = BACKEND_CANCELLATIONS.lock() {
-        backends.retain(|_, signal| signal.strong_count() > 0);
-        backends.insert((pid, secret), Arc::downgrade(&cancellation));
-    }
-    (pid, secret, cancellation)
+    let mut backends = BACKEND_CANCELLATIONS
+        .lock()
+        .map_err(|_| RymeError::Internal(String::from("backend cancellation registry poisoned")))?;
+    backends.retain(|_, signal| signal.strong_count() > 0);
+    backends.insert((pid, secret), Arc::downgrade(&cancellation));
+    Ok((pid, secret, cancellation))
 }
 
 fn unregister_backend(pid: u32, secret: u32) {
@@ -743,7 +748,7 @@ where
     )
     .await
     .map_err(|_| startup_timeout_error())??;
-    let (pid, secret, cancellation) = register_backend();
+    let (pid, secret, cancellation) = register_backend()?;
     let notification_tenant = limits.tenant.clone();
     let notification_database = limits.database.clone();
     let result = async {

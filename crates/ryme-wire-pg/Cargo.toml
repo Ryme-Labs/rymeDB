@@ -18,3 +18,4 @@ ryme-observe = { workspace = true }
 ryme-wire-native = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+getrandom = { workspace = true }
