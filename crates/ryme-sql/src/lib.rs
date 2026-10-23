@@ -6,11 +6,14 @@ use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+static NEXT_SCHEMA_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 type TableDefinitionParts =
     (Vec<ColumnDefinition>, Vec<Vec<String>>, Vec<String>, Vec<ForeignKeyConstraint>);
@@ -1370,23 +1373,38 @@ fn sync_schema_directory(_path: &Path) -> Result<()> {
 }
 
 pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = schema_snapshot_bytes(snapshot)?;
-    let temporary = path.with_extension("tmp");
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_data()?;
+    let (temporary, mut file) = loop {
+        let id = NEXT_SCHEMA_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("tmp-{}-{id}", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = file.write_all(&bytes).and_then(|()| file.sync_data());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
-    std::fs::rename(temporary, path)?;
     if let Some(parent) = path.parent() {
         sync_schema_directory(parent)?;
     }
