@@ -68,12 +68,31 @@ impl BranchManager {
     pub fn load(path: &Path) -> Result<Self> {
         use std::io::Read;
 
+        let path_metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(error) => return Err(error.into()),
+        };
+        if !path_metadata.file_type().is_file() {
+            return Err(RymeError::Corrupt(String::from("branch metadata file type")));
+        }
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
             Err(error) => return Err(error.into()),
         };
-        let file_len = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(RymeError::Corrupt(String::from("branch metadata file type")));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+                return Err(RymeError::Corrupt(String::from("branch metadata file identity")));
+            }
+        }
+        let file_len = metadata.len();
         if file_len > MAX_BRANCH_METADATA_BYTES as u64 {
             return Err(RymeError::Overload(String::from("branch metadata")));
         }

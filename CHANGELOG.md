@@ -36,6 +36,8 @@ All notable changes to rymeDB are recorded here. Format follows
   permissions through the opened file handle.
 - Server state-file loading now rejects symlinks and non-regular files, and on
   Unix verifies the opened file still matches the checked path.
+- Branch catalog loading now rejects symlinks and non-regular files, and on
+  Unix verifies the opened file identity before deserializing it.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.
