@@ -7942,16 +7942,20 @@ where
         Some(self.schema_snapshot())
     }
 
+    pub fn try_schema_transaction_snapshot(&self) -> Result<Option<SchemaSnapshot>> {
+        Ok(Some(self.try_schema_snapshot()?))
+    }
+
     pub fn rollback_schema_transaction(&self, snapshot: Option<SchemaSnapshot>) -> Result<()> {
         let Some(snapshot) = snapshot else { return Ok(()) };
-        if self.schema_snapshot() != snapshot {
+        if self.try_schema_snapshot()? != snapshot {
             self.restore_schema_snapshot(snapshot)?;
         }
         Ok(())
     }
 
     fn validate_schema_mutation(&self, previous: &SchemaSnapshot, was_dirty: bool) -> Result<()> {
-        if let Err(error) = validate_schema_snapshot(&self.schema_snapshot()) {
+        if let Err(error) = validate_schema_snapshot(&self.try_schema_snapshot()?) {
             self.restore_schema_snapshot(previous.clone()).map_err(|rollback_error| {
                 RymeError::Internal(format!(
                     "schema limit exceeded: {error}; rollback failed: {rollback_error}"
@@ -8899,115 +8903,121 @@ where
         }
     }
 
-    pub fn schema_snapshot(&self) -> SchemaSnapshot {
+    /// Fallible schema snapshot used by persistence and transaction paths.
+    ///
+    /// Any poisoned schema lock is an error: serializing a defaulted snapshot
+    /// could replace durable schema state with an incomplete catalog.
+    pub fn try_schema_snapshot(&self) -> Result<SchemaSnapshot> {
         let tables = self
             .catalog
             .lock()
-            .map(|catalog| {
-                catalog.iter().map(|(table, columns)| (table.clone(), columns.clone())).collect()
-            })
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("catalog lock")))?
+            .iter()
+            .map(|(table, columns)| (table.clone(), columns.clone()))
+            .collect();
         let mut indexes = self
             .indexes
             .read()
-            .map(|catalog| {
-                catalog
-                    .values()
-                    .flat_map(|states| states.iter().map(|state| state.definition.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("index lock")))?
+            .values()
+            .flat_map(|states| states.iter().map(|state| state.definition.clone()))
+            .collect::<Vec<_>>();
         indexes.sort_by(|left, right| {
             left.table.cmp(&right.table).then_with(|| left.name.cmp(&right.name))
         });
         let checks = self
             .checks
             .lock()
-            .map(|checks| {
-                checks
-                    .iter()
-                    .map(|(table, expressions)| (table.clone(), expressions.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("check constraint lock")))?
+            .iter()
+            .map(|(table, expressions)| (table.clone(), expressions.clone()))
+            .collect();
         let foreign_keys = self
             .foreign_keys
             .lock()
-            .map(|foreign_keys| {
-                foreign_keys
-                    .iter()
-                    .map(|(table, constraints)| (table.clone(), constraints.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("foreign key lock")))?
+            .iter()
+            .map(|(table, constraints)| (table.clone(), constraints.clone()))
+            .collect();
         let constraints = self
             .constraints
             .lock()
-            .map(|constraints| {
-                constraints
-                    .iter()
-                    .map(|(table, entries)| (table.clone(), entries.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let rls_maps = self.rls_maps.read().map(|maps| maps.clone()).unwrap_or_default();
-        let rls_tables: BTreeMap<_, _> = rls_maps.tenant_read.into_iter().collect();
-        let rls_write_tables: BTreeMap<_, _> = rls_maps.tenant_write.into_iter().collect();
+            .map_err(|_| RymeError::Internal(String::from("constraint lock")))?
+            .iter()
+            .map(|(table, entries)| (table.clone(), entries.clone()))
+            .collect();
+        let rls_maps = self
+            .rls_maps
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("RLS map lock")))?
+            .clone();
+        let rls_tables = rls_maps.tenant_read.into_iter().collect();
+        let rls_write_tables = rls_maps.tenant_write.into_iter().collect();
         let rls_enabled = self
             .rls_enabled
             .read()
-            .map(|tables| tables.iter().cloned().collect())
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("RLS enabled lock")))?
+            .iter()
+            .cloned()
+            .collect();
         let rls_forced = self
             .rls_forced
             .read()
-            .map(|tables| tables.iter().cloned().collect())
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("RLS forced lock")))?
+            .iter()
+            .cloned()
+            .collect();
         let rls_policies = self
             .rls_policies
             .read()
-            .map(|policies| {
-                policies.iter().map(|(key, policy)| (key.clone(), policy.clone())).collect()
-            })
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("RLS policy lock")))?
+            .iter()
+            .map(|(key, policy)| (key.clone(), policy.clone()))
+            .collect();
         let functions = self
             .functions
             .lock()
-            .map(|functions| {
-                functions
-                    .iter()
-                    .map(|(name, definition)| (name.clone(), definition.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("function lock")))?
+            .iter()
+            .map(|(name, definition)| (name.clone(), definition.clone()))
+            .collect();
         let triggers = self
             .triggers
             .lock()
-            .map(|triggers| triggers.iter().map(|key| (key.0.clone(), key.1.clone())).collect())
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("trigger lock")))?
+            .iter()
+            .map(|key| (key.0.clone(), key.1.clone()))
+            .collect();
         let views = self
             .views
             .lock()
-            .map(|views| {
-                views.iter().map(|(name, definition)| (name.clone(), definition.clone())).collect()
-            })
-            .unwrap_or_default();
+            .map_err(|_| RymeError::Internal(String::from("view lock")))?
+            .iter()
+            .map(|(name, definition)| (name.clone(), definition.clone()))
+            .collect();
         let sequences = self
             .sequences
             .lock()
-            .map(|sequences| {
-                sequences
-                    .iter()
-                    .map(|(name, definition)| (name.clone(), definition.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let roles = self.roles.lock().map(|roles| roles.clone()).unwrap_or_default();
-        let privileges =
-            self.privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
-        let default_privileges =
-            self.default_privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default();
-        SchemaSnapshot {
+            .map_err(|_| RymeError::Internal(String::from("sequence lock")))?
+            .iter()
+            .map(|(name, definition)| (name.clone(), definition.clone()))
+            .collect();
+        let roles = self
+            .roles
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("role lock")))?
+            .clone();
+        let privileges = self
+            .privileges
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("privilege lock")))?
+            .clone();
+        let default_privileges = self
+            .default_privileges
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("default privilege lock")))?
+            .clone();
+        Ok(SchemaSnapshot {
             tables,
             indexes,
             checks,
@@ -9025,11 +9035,16 @@ where
             rls_enabled,
             rls_forced,
             rls_policies,
-        }
+        })
+    }
+
+    /// Legacy infallible accessor. Durable paths must use `try_schema_snapshot`.
+    pub fn schema_snapshot(&self) -> SchemaSnapshot {
+        self.try_schema_snapshot().unwrap_or_default()
     }
 
     pub fn restore_schema_snapshot(&self, snapshot: SchemaSnapshot) -> Result<()> {
-        let previous = self.schema_snapshot();
+        let previous = self.try_schema_snapshot()?;
         let was_dirty = self.schema_dirty.load(Ordering::SeqCst);
         match self.restore_schema_snapshot_inner(snapshot) {
             Ok(()) => Ok(()),
@@ -13248,7 +13263,7 @@ where
 
     fn ensure_table(&self, table: &str) -> Result<()> {
         let was_dirty = self.schema_dirty.load(Ordering::SeqCst);
-        let previous = self.schema_snapshot();
+        let previous = self.try_schema_snapshot()?;
         if previous.tables.contains_key(table) {
             return Ok(());
         }
@@ -13273,7 +13288,7 @@ where
         if !self.schema_dirty.load(Ordering::SeqCst) {
             return Ok(());
         }
-        persist_schema_snapshot(&path, &self.schema_snapshot())?;
+        persist_schema_snapshot(&path, &self.try_schema_snapshot()?)?;
         self.schema_dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -13351,7 +13366,11 @@ where
     ) -> Result<(QueryResult, Vec<TransactionChange>)> {
         self.enforce_statement_privileges(&statement)?;
         let schema_statement = statement.is_schema_change();
-        let previous_schema = schema_statement.then(|| self.schema_snapshot());
+        let previous_schema = if schema_statement {
+            Some(self.try_schema_snapshot()?)
+        } else {
+            None
+        };
         let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         match &statement {
             Statement::CreateSchema { .. }
@@ -14975,7 +14994,11 @@ where
         self.check_transaction_uniqueness(&changes)?;
         let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         let previous_schema = schema_before.clone();
-        let schema_after = schema_before.as_ref().map(|_| self.schema_snapshot());
+        let schema_after = if schema_before.is_some() {
+            Some(self.try_schema_snapshot()?)
+        } else {
+            None
+        };
         let schema_changed = schema_after
             .as_ref()
             .is_some_and(|after| schema_before.as_ref().is_some_and(|before| before != after));
@@ -15337,7 +15360,11 @@ where
     ) -> Result<QueryResult> {
         self.enforce_statement_privileges(&statement)?;
         let schema_statement = statement.is_schema_change();
-        let previous_schema = schema_statement.then(|| self.schema_snapshot());
+        let previous_schema = if schema_statement {
+            Some(self.try_schema_snapshot()?)
+        } else {
+            None
+        };
         let previous_schema_dirty = self.schema_dirty.load(Ordering::SeqCst);
         match &statement {
             Statement::CreateSchema { .. }
@@ -15425,7 +15452,7 @@ where
             if let (Some(hook), Some(previous)) =
                 (self.schema_hook.clone(), previous_schema.clone())
             {
-                let next = self.schema_snapshot();
+                let next = self.try_schema_snapshot()?;
                 if next != previous {
                     if let Err(error) = hook(previous.clone(), next).await {
                         self.restore_schema_snapshot(previous)?;

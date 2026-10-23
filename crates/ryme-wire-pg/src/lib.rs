@@ -3348,7 +3348,13 @@ where
                     ),
                 );
             }
-            let schema_snapshot = executor.schema_transaction_snapshot();
+            let schema_snapshot = match executor.try_schema_transaction_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    state.failed = true;
+                    return encode_error_code(error_code(&error), error.to_string());
+                }
+            };
             let schema_snapshot_bytes = match schema_snapshot.as_ref() {
                 Some(snapshot) => match schema_snapshot_serialized_size(snapshot) {
                     Ok(bytes) => bytes,
@@ -3547,7 +3553,13 @@ where
     if statement.is_schema_change() {
         if let Some(transaction) = active.as_mut() {
             if transaction.schema_before.is_none() {
-                transaction.schema_before = executor.schema_transaction_snapshot();
+                transaction.schema_before = match executor.try_schema_transaction_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        transaction.failed = true;
+                        return encode_error_code(error_code(&error), error.to_string());
+                    }
+                };
             }
         }
     }

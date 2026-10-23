@@ -11290,7 +11290,10 @@ async fn branch_create(
         }
     }
     let parent_schema = if request.parent == "main" {
-        state.executor.schema_snapshot()
+        match state.executor.try_schema_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_response(error),
+        }
     } else {
         let parent_path = state.branch_schema_path(&principal.tenant, &request.parent);
         match load_existing_schema_snapshot(&parent_path) {
@@ -11557,7 +11560,10 @@ async fn branch_promote(
             Ok(snapshot) => snapshot,
             Err(e) => return error_response(e),
         };
-    let previous_schema = state.executor.schema_snapshot();
+    let previous_schema = match state.executor.try_schema_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error_response(error),
+    };
     let (child, write_txn) = match prepare_branch_promotion(&state, &principal.tenant, &id).await {
         Ok(prepared) => prepared,
         Err(e) => return error_response(e),
@@ -12728,7 +12734,7 @@ fn apply_cluster_metadata(state: &SharedState, payload: &[u8]) -> ryme_error::Re
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("cluster metadata: {error}")))?;
     match event {
         ClusterMetadata::Schema(snapshot) => {
-            let previous = state.executor.schema_snapshot();
+            let previous = state.executor.try_schema_snapshot()?;
             state.executor.restore_schema_snapshot(snapshot.clone())?;
             let path = state.data_dir.join("schema.json");
             if let Err(error) = ryme_sql::persist_schema_snapshot(&path, &snapshot) {
