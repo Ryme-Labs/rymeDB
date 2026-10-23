@@ -75,9 +75,16 @@ pub fn routing_key(
     if has_invalid_component {
         return Err(RymeError::InvalidArgument(String::from("routing component")));
     }
-    let mut out = Vec::with_capacity(
-        tenant.len() + database.len() + table.len() + pk.len() + if version == 0 { 1 } else { 3 },
-    );
+    let capacity = tenant
+        .len()
+        .checked_add(database.len())
+        .and_then(|capacity| capacity.checked_add(table.len()))
+        .and_then(|capacity| capacity.checked_add(pk.len()))
+        .and_then(|capacity| capacity.checked_add(if version == 0 { 1 } else { 3 }))
+        .ok_or_else(|| RymeError::Overload(String::from("routing key")))?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| RymeError::Overload(String::from("routing key")))?;
     if version == SCOPED_ROUTING_VERSION {
         out.extend_from_slice(tenant.as_bytes());
         out.push(0);

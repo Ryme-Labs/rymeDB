@@ -26,6 +26,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Routing-key capacity calculations now check overflow and report allocation
+  failure instead of relying on infallible vector allocation.
 - Storage segment encoding now enforces the 256 MiB persisted-segment limit
   while constructing the encoded buffer.
 - GitHub Actions dependencies now use verified full commit SHAs, with weekly
