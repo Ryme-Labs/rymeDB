@@ -83,6 +83,9 @@ async fn roundtrip(socket: &mut tokio::net::TcpStream, message: Vec<u8>) -> Vec<
         loop {
             let (tag, body) = read_frame(socket).await;
             out.push((tag, body));
+            if tag == b'E' {
+                socket.write_all(&sync_msg()).await.unwrap();
+            }
             if tag == b'1' || tag == b'2' || tag == b'Z' {
                 break;
             }
