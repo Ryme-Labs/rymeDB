@@ -540,6 +540,7 @@ impl Engine {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn export_table_routing_range(
         &self,
         version: u8,

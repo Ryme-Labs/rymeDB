@@ -3941,10 +3941,7 @@ fn policy_column_name(side: &str) -> Option<String> {
 
 fn policy_auth_uid_side(side: &str) -> bool {
     let mut candidate = side.trim();
-    loop {
-        let Some(inner) = candidate.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
-            break;
-        };
+    while let Some(inner) = candidate.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         candidate = inner.trim();
     }
     if candidate.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("select ")) {

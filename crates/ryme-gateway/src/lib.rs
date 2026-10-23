@@ -573,9 +573,11 @@ where
             changes.push((pk, before, value, op));
         }
         let commit_ts = self.manager.commit(txn).await?;
-        let written = include_written_rows
-            .then(|| changes.iter().map(|(pk, _, after, _)| (pk.clone(), after.clone())).collect())
-            .unwrap_or_default();
+        let written = if include_written_rows {
+            changes.iter().map(|(pk, _, after, _)| (pk.clone(), after.clone())).collect()
+        } else {
+            Vec::new()
+        };
         for (pk, before, after, op) in changes {
             self.publish_change(NewChange {
                 tenant: principal.tenant.clone(),

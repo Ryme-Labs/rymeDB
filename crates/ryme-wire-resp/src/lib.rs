@@ -150,6 +150,9 @@ impl PubSubBus {
         self.sender.subscribe()
     }
 
+    // `try_update` is newer than the workspace MSRV (1.89), so keep using the
+    // compatible alias while allowing its deprecation on newer stable toolchains.
+    #[allow(deprecated)]
     fn reserve_subscription(&self) -> bool {
         self.total_subscriptions
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

@@ -434,6 +434,9 @@ impl Realtime {
         self.presence_sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    // `try_update` is newer than the workspace MSRV (1.89), so keep using the
+    // compatible alias while allowing its deprecation on newer stable toolchains.
+    #[allow(deprecated)]
     fn reserve_presence_capacity(&self, members: usize, state_bytes: usize) -> bool {
         let members_reserved = self.presence_member_count.fetch_update(
             Ordering::AcqRel,
@@ -587,6 +590,9 @@ impl Realtime {
         Ok(sequence)
     }
 
+    // `try_update` is newer than the workspace MSRV (1.89), so keep using the
+    // compatible alias while allowing its deprecation on newer stable toolchains.
+    #[allow(deprecated)]
     fn retain_history(
         &self,
         topics: &mut TableTopicShard,
@@ -626,6 +632,9 @@ impl Realtime {
         }
     }
 
+    // `try_update` is newer than the workspace MSRV (1.89), so keep using the
+    // compatible alias while allowing its deprecation on newer stable toolchains.
+    #[allow(deprecated)]
     fn release_history_bytes(&self, bytes: usize) {
         let _ = self.history_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             Some(current.saturating_sub(bytes))
