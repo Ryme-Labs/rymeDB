@@ -1814,6 +1814,9 @@ impl Node {
     }
 
     async fn range_tick(self: &Arc<Self>) {
+        if self.isolated.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let now = now_ms();
         let Ok(configured_ranges) = self.try_range_owners() else {
             tracing::error!(node_id = self.id, "range ownership metadata unavailable");
@@ -1892,6 +1895,7 @@ impl Node {
 
     async fn range_heartbeat(self: &Arc<Self>, group_id: &str) -> Result<()> {
         let _commit = self.txn_commit_lock.lock().await;
+        self.ensure_not_isolated()?;
         let mut range = self
             .try_range_owners()?
             .into_iter()
@@ -1929,6 +1933,7 @@ impl Node {
                 acknowledgements += 1;
             }
         }
+        self.ensure_not_isolated()?;
         if acknowledgements < majority(replicas.len()) {
             return Err(RymeError::Unavailable(String::from("range quorum")));
         }
@@ -2136,6 +2141,7 @@ impl Node {
     }
 
     async fn campaign_range(self: &Arc<Self>, range: &RangeOwner) -> Result<()> {
+        self.ensure_not_isolated()?;
         let (last_index, last_term) = self.try_range_last_position(&range.id)?;
         let (term, last_term, last_index) = {
             let mut groups = self
@@ -2187,6 +2193,7 @@ impl Node {
         if votes.len() < majority(range.replicas.len()) {
             return Ok(());
         }
+        self.ensure_not_isolated()?;
         let won = {
             let mut groups = self
                 .range_groups
