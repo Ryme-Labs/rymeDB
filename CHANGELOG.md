@@ -17,6 +17,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and default privileges so recreating the role cannot restore stale access.
 - SQL role inheritance now stops at intermediate `NOINHERIT` roles, preventing
   privileges from passing through those roles to downstream members.
+- WAL maintenance and rewrite operations now reject a poisoned handle, keeping
+  retries from removing a staged generation needed for crash recovery.
 
 ### Performance
 

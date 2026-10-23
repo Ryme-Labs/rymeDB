@@ -64,6 +64,15 @@ impl Wal {
         self.next_lsn
     }
 
+    fn ensure_usable(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(RymeError::Unavailable(String::from(
+                "wal is in a failed state; reopen it before further operations",
+            )));
+        }
+        Ok(())
+    }
+
     pub fn append(&mut self, commit_ts: u64, payload: &[u8]) -> Result<WalRecord> {
         let lsn = self.append_lsn(commit_ts, payload)?;
         Ok(WalRecord { lsn, commit_ts, payload: payload.to_vec() })
@@ -72,11 +81,7 @@ impl Wal {
     /// Append a record and return its log sequence number without copying the
     /// payload into a `WalRecord` that the caller may not need.
     pub fn append_lsn(&mut self, commit_ts: u64, payload: &[u8]) -> Result<u64> {
-        if self.poisoned {
-            return Err(RymeError::Unavailable(String::from(
-                "wal append failed; reopen the wal before writing again",
-            )));
-        }
+        self.ensure_usable()?;
         let lsn = self.next_lsn;
         let next_lsn = lsn
             .checked_add(1)
@@ -102,11 +107,7 @@ impl Wal {
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        if self.poisoned {
-            return Err(RymeError::Unavailable(String::from(
-                "wal append failed; reopen the wal before writing again",
-            )));
-        }
+        self.ensure_usable()?;
         if let Err(error) = self.active.sync_data() {
             self.poisoned = true;
             return Err(error.into());
@@ -143,6 +144,7 @@ impl Wal {
     }
 
     pub fn truncate_below(&mut self, floor_commit_ts: u64) -> Result<usize> {
+        self.ensure_usable()?;
         let mut ids = segment_ids(&self.dir)?;
         ids.sort_unstable();
         let mut obsolete = Vec::new();
@@ -187,6 +189,7 @@ impl Wal {
     }
 
     pub fn truncate_above(&mut self, ceiling_commit_ts: u64) -> Result<usize> {
+        self.ensure_usable()?;
         let mut ids = segment_ids(&self.dir)?;
         ids.sort_unstable();
         let latest_id = ids.last().copied();
@@ -297,6 +300,7 @@ impl Wal {
     }
 
     fn rewrite(&mut self, records: &[WalRecord]) -> Result<()> {
+        self.ensure_usable()?;
         if records.windows(2).any(|pair| pair[0].lsn >= pair[1].lsn) {
             return Err(RymeError::InvalidArgument(String::from("wal lsn order")));
         }
