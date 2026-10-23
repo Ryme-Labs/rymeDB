@@ -43,6 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
   bounded, iterative directory traversal.
 - Local archive operations reject a symlink or non-directory root, including
   before and after creating destination directories for writes.
+- Archive copies verify the source manifest matches the selected backup before
+  copying any objects.
 - Config file loading now rejects non-regular files and caps reads at 4 MiB.
 - Routing-key capacity calculations now check overflow and report allocation
   failure instead of relying on infallible vector allocation.

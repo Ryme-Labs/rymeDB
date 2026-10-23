@@ -437,6 +437,15 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
     manifest: &BackupManifest,
 ) -> Result<u64> {
     validate_manifest(&manifest.manifest_key(), manifest)?;
+    let key = manifest.manifest_key();
+    let raw = source.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await?;
+    let source_manifest: BackupManifest =
+        serde_json::from_slice(&raw).map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
+    validate_manifest(&key, &source_manifest)?;
+    if &source_manifest != manifest {
+        return Err(RymeError::Corrupt(String::from("copy manifest")));
+    }
+
     let mut copied = 0u64;
     for file in &manifest.files {
         let bytes = source.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
@@ -451,11 +460,6 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
         }
         copied += 1;
     }
-    let key = manifest.manifest_key();
-    let raw = source.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await?;
-    let copied_manifest: BackupManifest =
-        serde_json::from_slice(&raw).map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
-    validate_manifest(&key, &copied_manifest)?;
     dest.put(&key, raw).await?;
     Ok(copied)
 }
