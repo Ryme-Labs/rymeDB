@@ -276,6 +276,11 @@ chain. Role membership changes use `GRANT role TO member` and
 supported. Change a role's inheritance setting with
 `ALTER ROLE role_name [WITH] INHERIT` or `ALTER ROLE role_name [WITH] NOINHERIT`;
 these are the only `ALTER ROLE` options currently supported.
+`CREATE USER` defaults to `LOGIN`, while `CREATE ROLE` defaults to `NOLOGIN`.
+Role creation supports `LOGIN`/`NOLOGIN`, `SUPERUSER`/`NOSUPERUSER`,
+`CREATEDB`/`NOCREATEDB`, `CREATEROLE`/`NOCREATEROLE`, and
+`INHERIT`/`NOINHERIT`. Unsupported options such as SQL `PASSWORD` are rejected
+instead of ignored.
 
 For SQL policies, `auth.uid()` is the authenticated JWT `sub` identity. It is
 distinct from the tenant claim. Configure `rls_tables` when rows should be

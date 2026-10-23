@@ -3335,12 +3335,18 @@ fn parse_create_role(tokens: &[String], kind_index: usize) -> Result<Statement> 
         .map(|value| unquote(value))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| RymeError::InvalidArgument(String::from("create role")))?;
-    let mut login = false;
+    let mut login = tokens[kind_index].eq_ignore_ascii_case("USER");
     let mut superuser = false;
     let mut createdb = false;
     let mut createrole = false;
     let mut inherit = true;
-    for token in tokens.iter().skip(kind_index + 2) {
+    let options_start =
+        if tokens.get(kind_index + 2).is_some_and(|token| token.eq_ignore_ascii_case("WITH")) {
+            kind_index + 3
+        } else {
+            kind_index + 2
+        };
+    for token in tokens.iter().skip(options_start) {
         match token.to_ascii_uppercase().as_str() {
             "LOGIN" => login = true,
             "NOLOGIN" => login = false,
@@ -3352,7 +3358,11 @@ fn parse_create_role(tokens: &[String], kind_index: usize) -> Result<Statement> 
             "NOCREATEROLE" => createrole = false,
             "INHERIT" => inherit = true,
             "NOINHERIT" => inherit = false,
-            _ => {}
+            _ => {
+                return Err(RymeError::InvalidArgument(String::from(
+                    "unsupported create role option",
+                )));
+            }
         }
     }
     Ok(Statement::CreateRole { name, login, superuser, createdb, createrole, inherit })
