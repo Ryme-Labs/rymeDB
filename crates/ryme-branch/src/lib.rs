@@ -94,7 +94,9 @@ impl BranchManager {
             } else {
                 scoped_key(&tenant, &branch.id)
             };
-            normalized.insert(key, branch);
+            if normalized.insert(key, branch).is_some() {
+                return Err(RymeError::Corrupt(String::from("duplicate branch identity")));
+            }
         }
         manager.branches = normalized;
         if let Some(highest_epoch) = manager.branches.values().map(|b| b.storage_epoch).max() {
