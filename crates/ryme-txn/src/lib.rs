@@ -1615,16 +1615,29 @@ impl TxnManager {
         writes: &BTreeMap<RecordKey, WriteOp>,
         keep: impl Fn(&RecordKey) -> bool,
     ) -> Result<()> {
+        self.replay_at_filtered_fallible(commit_ts, writes, |key| Ok(keep(key)))
+    }
+
+    /// Fallible ownership-aware replay. The predicate is evaluated for every
+    /// key before any transaction state is applied, so a routing error cannot
+    /// leave a partially replayed transaction.
+    pub fn replay_at_filtered_fallible(
+        &self,
+        commit_ts: u64,
+        writes: &BTreeMap<RecordKey, WriteOp>,
+        keep: impl Fn(&RecordKey) -> Result<bool>,
+    ) -> Result<()> {
         let mut guard = self
             .inner
             .commit
             .lock()
             .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
-        let local_writes: BTreeMap<RecordKey, WriteOp> = writes
-            .iter()
-            .filter(|(key, _)| keep(key))
-            .map(|(key, op)| (key.clone(), op.clone()))
-            .collect();
+        let mut local_writes = BTreeMap::new();
+        for (key, op) in writes {
+            if keep(key)? {
+                local_writes.insert(key.clone(), op.clone());
+            }
+        }
         let committed_keys: Vec<RecordKey> = writes.keys().cloned().collect();
         self.replay_locked(commit_ts, &local_writes, Some(&committed_keys), &mut guard)
     }

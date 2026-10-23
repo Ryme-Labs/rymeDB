@@ -1627,7 +1627,13 @@ impl Node {
             return;
         };
         for configured in configured_ranges {
-            let range = self.with_current_range_leader(configured);
+            let range = match self.try_with_current_range_leader(configured) {
+                Ok(range) => range,
+                Err(error) => {
+                    tracing::error!(node_id = self.id, %error, "range leader metadata unavailable");
+                    return;
+                }
+            };
             if !range.replicas.contains(&self.id) {
                 continue;
             }
@@ -1670,7 +1676,7 @@ impl Node {
 
     async fn range_heartbeat(self: &Arc<Self>, group_id: &str) -> Result<()> {
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
@@ -1931,16 +1937,16 @@ impl Node {
         }
         let _ = self.persist_range_meta();
         let _ = self.range_heartbeat(&range.id).await;
-        self.recover_range_coordinations_for_group(&range.id).await;
+        self.recover_range_coordinations_for_group(&range.id).await?;
         Ok(())
     }
 
-    async fn recover_range_coordinations_for_group(self: &Arc<Self>, group_id: &str) {
-        let Some(range) = self.range_owner_by_id(group_id) else {
-            return;
+    async fn recover_range_coordinations_for_group(self: &Arc<Self>, group_id: &str) -> Result<()> {
+        let Some(range) = self.try_range_owner_by_id(group_id)? else {
+            return Ok(());
         };
         if range.owner != self.id {
-            return;
+            return Ok(());
         }
         let commit_index = self
             .range_groups
@@ -1980,6 +1986,7 @@ impl Node {
                 );
             }
         }
+        Ok(())
     }
 
     fn handle_range_vote(
@@ -2354,10 +2361,11 @@ impl Node {
                     if range_owners.is_empty() {
                         self.manager.replay_at(commit_ts, &writes)?;
                     } else {
-                        self.manager.replay_at_filtered(commit_ts, &writes, |key| {
-                            self.range_owner_key_in(&range_owners, key)
+                        self.manager.replay_at_filtered_fallible(commit_ts, &writes, |key| {
+                            Ok(self
+                                .try_range_owner_key_in(&range_owners, key)?
                                 .map(|owner| owner == self.id)
-                                .unwrap_or(true)
+                                .unwrap_or(true))
                         })?;
                     }
                     if self.inner.lock().await.role != Role::Leader {
@@ -3115,7 +3123,7 @@ impl Node {
         }
         let mut group = None;
         for key in writes.keys() {
-            let Some(range) = self.range_for_record_in(&owners, key) else {
+            let Some(range) = self.try_range_for_record_in(&owners, key)? else {
                 return Ok(None);
             };
             match &group {
@@ -3284,7 +3292,9 @@ impl Node {
             }
             self.truncate_range_suffix(&range.id, keep_through)?;
             if !prepared.is_empty()
-                && self.range_owner_by_id(&range.id).is_some_and(|current| current.owner == self.id)
+                && self
+                    .try_range_owner_by_id(&range.id)?
+                    .is_some_and(|current| current.owner == self.id)
             {
                 for (transaction_id, (commit_ts, _)) in prepared {
                     self.commit_range_record(
@@ -3565,7 +3575,7 @@ impl Node {
         state: ryme_txn::TransactionState,
     ) -> Result<()> {
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
@@ -3583,11 +3593,17 @@ impl Node {
         self.range_prepare_conflict(group_id, transaction_id, commit_ts, &txn, &state)?;
         let mut local_state = state.clone();
         let range_owners = self.try_range_owners()?;
-        local_state.writes.retain(|(key, _)| {
-            self.range_for_record_in(&range_owners, key)
+        let mut retained_writes = Vec::with_capacity(local_state.writes.len());
+        for (key, write) in std::mem::take(&mut local_state.writes) {
+            if self
+                .try_range_for_record_in(&range_owners, &key)?
                 .map(|range| range.id == group_id)
                 .unwrap_or(true)
-        });
+            {
+                retained_writes.push((key, write));
+            }
+        }
+        local_state.writes = retained_writes;
         let encoded = serde_json::to_vec(&local_state)
             .map_err(|error| RymeError::Internal(format!("range transaction prepare: {error}")))?;
         self.commit_range_record(
@@ -3606,7 +3622,7 @@ impl Node {
         committed: bool,
     ) -> Result<()> {
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
@@ -3668,7 +3684,7 @@ impl Node {
             return Err(RymeError::Conflict(String::from("transaction decision changed")));
         }
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
@@ -3689,7 +3705,7 @@ impl Node {
         participants: Vec<ResolutionParticipant>,
     ) -> Result<()> {
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
@@ -3712,7 +3728,7 @@ impl Node {
         participants: Vec<ResolutionParticipant>,
     ) -> Result<()> {
         for attempt in 0..3 {
-            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let owner = self.try_range_owner_by_id(group_id)?.map_or(owner, |range| range.owner);
             let result = if owner == self.id {
                 self.record_range_decision(
                     group_id,
@@ -3769,7 +3785,7 @@ impl Node {
         participants: Vec<ResolutionParticipant>,
     ) -> Result<()> {
         for attempt in 0..3 {
-            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let owner = self.try_range_owner_by_id(group_id)?.map_or(owner, |range| range.owner);
             let result = if owner == self.id {
                 self.record_range_coordination(
                     group_id,
@@ -3856,9 +3872,15 @@ impl Node {
             .map_err(|_| RymeError::Internal(String::from("range ownership metadata poisoned")))
     }
 
-    fn range_for_record_in(&self, owners: &[RangeOwner], key: &RecordKey) -> Option<RangeOwner> {
-        let version = owners.first()?.routing_version;
-        let routing = ryme_storage::record_routing_key(version, key).ok()?;
+    fn try_range_for_record_in(
+        &self,
+        owners: &[RangeOwner],
+        key: &RecordKey,
+    ) -> Result<Option<RangeOwner>> {
+        let Some(version) = owners.first().map(|range| range.routing_version) else {
+            return Ok(None);
+        };
+        let routing = ryme_storage::record_routing_key(version, key)?;
         owners
             .iter()
             .find(|range| {
@@ -3866,20 +3888,27 @@ impl Node {
                     && (range.end.is_empty() || routing.as_slice() < range.end.as_slice())
             })
             .cloned()
-            .map(|range| self.with_current_range_leader(range))
+            .map(|range| self.try_with_current_range_leader(range))
+            .transpose()
     }
 
-    fn range_owner_key_in(&self, owners: &[RangeOwner], key: &RecordKey) -> Option<usize> {
-        self.range_for_record_in(owners, key).map(|range| range.owner)
+    fn try_range_owner_key_in(
+        &self,
+        owners: &[RangeOwner],
+        key: &RecordKey,
+    ) -> Result<Option<usize>> {
+        Ok(self.try_range_for_record_in(owners, key)?.map(|range| range.owner))
     }
 
-    fn with_current_range_leader(&self, mut range: RangeOwner) -> RangeOwner {
-        if let Some(leader) =
-            self.range_leaders.read().ok().and_then(|leaders| leaders.get(&range.id).copied())
-        {
+    fn try_with_current_range_leader(&self, mut range: RangeOwner) -> Result<RangeOwner> {
+        let leaders = self
+            .range_leaders
+            .read()
+            .map_err(|_| RymeError::Internal(String::from("range leader metadata lock")))?;
+        if let Some(leader) = leaders.get(&range.id).copied() {
             range.owner = leader;
         }
-        range
+        Ok(range)
     }
 
     fn try_range_last_index(&self, group_id: &str) -> Result<u64> {
@@ -4193,9 +4222,8 @@ impl Node {
                                 self.manager.replay_at(record.commit_ts, &writes)?;
                                 let encoded_writes = encode_writes(&writes)?;
                                 let is_owner = self
-                                    .range_owner_by_id(group_id)
-                                    .map(|range| range.owner == self.id)
-                                    .unwrap_or(false);
+                                    .try_range_owner_by_id(group_id)?
+                                    .is_some_and(|range| range.owner == self.id);
                                 if is_owner {
                                     self.apply_data_hook(crate::encode_applied(
                                         record.commit_ts,
@@ -4405,12 +4433,12 @@ impl Node {
         Ok(last)
     }
 
-    fn range_owner_by_id(&self, group_id: &str) -> Option<RangeOwner> {
-        self.try_range_owners()
-            .ok()?
-            .into_iter()
-            .find(|range| range.id == group_id)
-            .map(|range| self.with_current_range_leader(range))
+    fn try_range_owner_by_id(&self, group_id: &str) -> Result<Option<RangeOwner>> {
+        let Some(range) = self.try_range_owners()?.into_iter().find(|range| range.id == group_id)
+        else {
+            return Ok(None);
+        };
+        self.try_with_current_range_leader(range).map(Some)
     }
 
     async fn replicate_range_record(
@@ -4422,7 +4450,7 @@ impl Node {
         kind: RangeEntryKind,
     ) -> Result<(u64, u64, Vec<usize>)> {
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
@@ -4582,7 +4610,7 @@ impl Node {
             }
         }
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
@@ -4593,7 +4621,7 @@ impl Node {
         }
         let _commit = self.txn_commit_lock.lock().await;
         let current = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if current.owner != self.id || current.epoch != range.epoch {
             return Err(RymeError::Conflict(String::from("range topology changed")));
@@ -4664,7 +4692,7 @@ impl Node {
         let mut groups: BTreeMap<String, (usize, BTreeMap<RecordKey, ryme_txn::WriteOp>)> =
             BTreeMap::new();
         for (key, op) in writes {
-            let Some(range) = self.range_for_record_in(&range_owners, key) else { continue };
+            let Some(range) = self.try_range_for_record_in(&range_owners, key)? else { continue };
             groups
                 .entry(range.id)
                 .or_insert_with(|| (range.owner, BTreeMap::new()))
@@ -4692,7 +4720,7 @@ impl Node {
             .map(|range| range.routing_version)
             .unwrap_or(ryme_storage::LEGACY_ROUTING_VERSION);
         for key in txn.writes().keys().chain(txn.read_keys().iter()) {
-            if let Some(range) = self.range_for_record_in(&ranges, key) {
+            if let Some(range) = self.try_range_for_record_in(&ranges, key)? {
                 participants.insert(range.id.clone(), range);
             }
         }
@@ -4709,7 +4737,7 @@ impl Node {
                 let ends_after_start =
                     range.end.is_empty() || range.end.as_slice() > prefix.as_slice();
                 if starts_before_end && ends_after_start {
-                    let range = self.with_current_range_leader(range.clone());
+                    let range = self.try_with_current_range_leader(range.clone())?;
                     participants.insert(range.id.clone(), range);
                 }
             }
@@ -4739,7 +4767,7 @@ impl Node {
         let payload = serde_json::to_vec(&state)
             .map_err(|error| RymeError::Internal(format!("transaction prepare: {error}")))?;
         for attempt in 0..3 {
-            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let owner = self.try_range_owner_by_id(group_id)?.map_or(owner, |range| range.owner);
             let result = if owner == self.id {
                 self.prepare_range_group(group_id, transaction_id, commit_ts, state.clone()).await
             } else {
@@ -4788,7 +4816,7 @@ impl Node {
         committed: bool,
     ) -> Result<()> {
         for attempt in 0..3 {
-            let owner = self.range_owner_by_id(group_id).map(|range| range.owner).unwrap_or(owner);
+            let owner = self.try_range_owner_by_id(group_id)?.map_or(owner, |range| range.owner);
             let result = if owner == self.id {
                 if group_id.is_empty() {
                     self.resolve_intent(transaction_id, commit_ts, committed)
@@ -4883,8 +4911,13 @@ impl Node {
 
     async fn recover_pending_range_coordinations(self: &Arc<Self>) {
         for coordination in self.pending_range_coordinations_snapshot() {
-            let Some(range) = self.range_owner_by_id(&coordination.group_id) else {
-                continue;
+            let range = match self.try_range_owner_by_id(&coordination.group_id) {
+                Ok(Some(range)) => range,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::error!(group_id = %coordination.group_id, %error, "range owner lookup failed");
+                    continue;
+                }
             };
             if range.owner != self.id {
                 continue;
@@ -4918,8 +4951,13 @@ impl Node {
 
     async fn retry_pending_range_decisions(self: &Arc<Self>) {
         for decision in self.pending_range_decisions_snapshot() {
-            let Some(range) = self.range_owner_by_id(&decision.group_id) else {
-                continue;
+            let range = match self.try_range_owner_by_id(&decision.group_id) {
+                Ok(Some(range)) => range,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::error!(group_id = %decision.group_id, %error, "range owner lookup failed");
+                    continue;
+                }
             };
             if range.owner != self.id {
                 continue;
@@ -4967,10 +5005,8 @@ impl Node {
         committed: bool,
     ) -> Result<()> {
         for (group_id, range) in participants {
-            let participant = self
-                .range_owner_by_id(group_id)
-                .map(|current| current.owner)
-                .unwrap_or(range.owner);
+            let participant =
+                self.try_range_owner_by_id(group_id)?.map_or(range.owner, |current| current.owner);
             self.queue_resolution_for_group(
                 group_id,
                 transaction_id,
@@ -5012,14 +5048,15 @@ impl Node {
         let participant_ids = participants.clone();
         let decision_participants = participants
             .iter()
-            .map(|(group_id, range)| ResolutionParticipant {
-                participant: self
-                    .range_owner_by_id(group_id)
-                    .map(|current| current.owner)
-                    .unwrap_or(range.owner),
-                group_id: group_id.clone(),
+            .map(|(group_id, range)| {
+                Ok(ResolutionParticipant {
+                    participant: self
+                        .try_range_owner_by_id(group_id)?
+                        .map_or(range.owner, |current| current.owner),
+                    group_id: group_id.clone(),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let (coordinator_group, coordinator_owner) = decision_participants
             .first()
             .map(|participant| (participant.group_id.clone(), participant.participant))
@@ -5613,7 +5650,7 @@ impl Node {
             ryme_storage::table_routing_bounds(routing_version, tenant, database, table)?;
         let mut spans = Vec::new();
         for range in ranges {
-            let range = self.with_current_range_leader(range);
+            let range = self.try_with_current_range_leader(range)?;
             let lower = if range.start.as_slice() > table_start.as_slice() {
                 range.start
             } else {
@@ -5860,7 +5897,7 @@ impl Node {
         }
         let _commit = self.txn_commit_lock.lock().await;
         let range = self
-            .range_owner_by_id(group_id)
+            .try_range_owner_by_id(group_id)?
             .ok_or_else(|| RymeError::NotFound(String::from("range group")))?;
         if range.epoch != expected_epoch || range.owner == self.id {
             return Err(RymeError::Unavailable(String::from("range ownership update pending")));
@@ -5993,7 +6030,7 @@ impl Node {
     /// Resolves a record key to its range owner, propagating range metadata errors.
     pub fn try_range_owner_key(&self, key: &RecordKey) -> Result<Option<usize>> {
         let owners = self.try_range_owners()?;
-        Ok(self.range_owner_key_in(&owners, key))
+        self.try_range_owner_key_in(&owners, key)
     }
 
     pub fn owns_range_key(&self, key: &RecordKey) -> bool {
@@ -6300,22 +6337,23 @@ impl ryme_txn::TxnBackend for ClusterBackend {
                 if owners.is_empty() {
                     None
                 } else {
-                    let owner = txn
-                        .writes()
-                        .keys()
-                        .map(|key| node.range_owner_key_in(&owners, key))
-                        .try_fold(None, |current, next| match (current, next) {
-                            (None, Some(owner)) => Ok(Some(owner)),
-                            (Some(existing), Some(owner)) if existing == owner => Ok(current),
-                            _ => Err(()),
-                        })
-                        .ok()
-                        .flatten()
-                        .map_or_else(
-                            || Some((None, txn.writes().clone())),
-                            |owner| Some((Some(owner), txn.writes().clone())),
-                        );
-                    owner
+                    let mut owner = None;
+                    let mut same_owner = true;
+                    for key in txn.writes().keys() {
+                        let Some(next_owner) = node.try_range_owner_key_in(&owners, key)? else {
+                            same_owner = false;
+                            break;
+                        };
+                        match owner {
+                            None => owner = Some(next_owner),
+                            Some(current) if current == next_owner => {}
+                            Some(_) => {
+                                same_owner = false;
+                                break;
+                            }
+                        }
+                    }
+                    Some((same_owner.then_some(owner).flatten(), txn.writes().clone()))
                 }
             } else {
                 None
@@ -6839,7 +6877,7 @@ mod tests {
         let participants =
             vec![ResolutionParticipant { participant: 0, group_id: String::from("range-a") }];
         node.record_range_coordination("range-a", 414, 8, participants.clone()).await.unwrap();
-        node.recover_range_coordinations_for_group("range-a").await;
+        node.recover_range_coordinations_for_group("range-a").await.unwrap();
         node.retry_pending_range_decisions().await;
         assert!(node.range_decisions.lock().unwrap().is_empty());
         assert!(node.range_recovery_coordinations.lock().unwrap().is_empty());
