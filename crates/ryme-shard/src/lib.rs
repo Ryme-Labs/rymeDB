@@ -272,10 +272,6 @@ fn persist_range_assignments(
     Ok(())
 }
 
-fn range_key(version: u8, key: &RecordKey) -> Option<Vec<u8>> {
-    ryme_storage::record_routing_key(version, key).ok()
-}
-
 fn route_range(ranges: &[RangePlacement], key: &[u8]) -> Option<usize> {
     ranges.iter().rev().find(|range| range.start.as_slice() <= key).and_then(|range| {
         if range.end.is_empty() || key < range.end.as_slice() {
@@ -286,9 +282,14 @@ fn route_range(ranges: &[RangePlacement], key: &[u8]) -> Option<usize> {
     })
 }
 
-fn route_record(ranges: &[RangePlacement], key: &RecordKey) -> Option<usize> {
-    let version = ranges.first()?.routing_version;
-    route_range(ranges, range_key(version, key)?.as_slice())
+fn route_record(ranges: &[RangePlacement], key: &RecordKey) -> Result<Option<usize>> {
+    let Some(first) = ranges.first() else {
+        return Ok(None);
+    };
+    let encoded = ryme_storage::record_routing_key(first.routing_version, key)?;
+    route_range(ranges, &encoded)
+        .map(Some)
+        .ok_or_else(|| RymeError::InvalidArgument(String::from("range key")))
 }
 
 fn decode_decision(raw: &[u8]) -> Result<(u64, DecisionParts)> {
@@ -587,16 +588,16 @@ impl ShardSet {
         hash_table(table, inner.shards.len())
     }
 
-    fn route_record(&self, key: &RecordKey) -> usize {
+    fn route_record(&self, key: &RecordKey) -> Result<usize> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let table = TableRef::of(key);
-        route_record(&inner.ranges, key).unwrap_or_else(|| {
+        Ok(route_record(&inner.ranges, key)?.unwrap_or_else(|| {
             inner
                 .place
                 .get(&table)
                 .copied()
                 .unwrap_or_else(|| hash_table(&table, inner.shards.len()))
-        })
+        }))
     }
 
     pub fn range_placements(&self) -> Vec<RangePlacement> {
@@ -708,7 +709,7 @@ impl ShardSet {
                 let rows = source.export_table(&tenant, &database, &table)?;
                 for (pk, versions) in rows {
                     let key = RecordKey::new(&tenant, &database, &table, &pk);
-                    let target = route_record(ranges, &key)
+                    let target = route_record(ranges, &key)?
                         .unwrap_or_else(|| hash_table(&TableRef::of(&key), inner.shards.len()));
                     if target != source_index {
                         moves
@@ -785,13 +786,13 @@ impl ShardSet {
         out
     }
 
-    fn touch(&self, txn: &Transaction, key: &RecordKey) -> usize {
+    fn touch(&self, txn: &Transaction, key: &RecordKey) -> Result<usize> {
         let table = TableRef::of(key);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.side.len() > 4096 {
             inner.side.retain(|_, ctx| ctx.touched.elapsed().as_secs() < 120);
         }
-        let shard = route_record(&inner.ranges, key).unwrap_or_else(|| {
+        let shard = route_record(&inner.ranges, key)?.unwrap_or_else(|| {
             inner
                 .place
                 .get(&table)
@@ -810,7 +811,7 @@ impl ShardSet {
         if entry.shard.is_none() {
             entry.shard = Some(shard);
         }
-        entry.shard.unwrap_or(shard)
+        Ok(entry.shard.unwrap_or(shard))
     }
 
     fn manager_for(&self, shard: usize) -> Option<DurableManager> {
@@ -982,7 +983,7 @@ impl ShardSet {
             if inner.paused.contains(&table) {
                 return Err(RymeError::Unavailable(String::from("rescheduling")));
             }
-            let shard = route_record(&inner.ranges, key).unwrap_or_else(|| {
+            let shard = route_record(&inner.ranges, key)?.unwrap_or_else(|| {
                 inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
             });
             cohort.insert(shard);
@@ -1018,16 +1019,19 @@ impl ShardSet {
                     .ok_or_else(|| RymeError::Unavailable(String::from("shard")))
             })
             .collect::<Result<Vec<_>>>()?;
-        let writers: std::collections::BTreeSet<usize> = txn
+        let write_placements: BTreeMap<RecordKey, usize> = txn
             .writes()
             .keys()
             .map(|key| {
                 let table = TableRef::of(key);
-                route_record(&inner.ranges, key).unwrap_or_else(|| {
+                let shard = route_record(&inner.ranges, key)?.unwrap_or_else(|| {
                     inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
-                })
+                });
+                Ok((key.clone(), shard))
             })
-            .collect();
+            .collect::<Result<_>>()?;
+        let writers: std::collections::BTreeSet<usize> =
+            write_placements.values().copied().collect();
         let commit_ts = self.reserve_commit_ts(0, txn.read_ts)?;
         for (_, manager) in managers.iter() {
             manager.inner().validate_at(&txn, commit_ts)?;
@@ -1037,16 +1041,7 @@ impl ShardSet {
             let subset: std::collections::BTreeMap<RecordKey, ryme_txn::WriteOp> = txn
                 .writes()
                 .iter()
-                .filter(|(key, _)| {
-                    let table = TableRef::of(key);
-                    route_record(&inner.ranges, key).unwrap_or_else(|| {
-                        inner
-                            .place
-                            .get(&table)
-                            .copied()
-                            .unwrap_or_else(|| hash_table(&table, shards))
-                    }) == *shard
-                })
+                .filter(|(key, _)| write_placements.get(*key) == Some(shard))
                 .map(|(key, op)| (key.clone(), op.clone()))
                 .collect();
             parts.push((*shard as u32, encode_writes(&subset)?));
@@ -1062,10 +1057,7 @@ impl ShardSet {
         for (shard, manager) in managers.iter() {
             let index = *shard;
             manager.commit_at(&txn, commit_ts, |key| {
-                let table = TableRef::of(key);
-                route_record(&inner.ranges, key).unwrap_or_else(|| {
-                    inner.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
-                }) == index
+                write_placements.get(key).copied() == Some(index)
             })?;
         }
         Ok(commit_ts)
@@ -1212,28 +1204,46 @@ impl TxnBackend for ShardSet {
     fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
-        let shard = self.route_record(key);
+        let shard = self.route_record(key)?;
         let manager =
             self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
         manager.get(txn, key)
     }
 
     fn put(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>) {
-        let shard = self.touch(txn, &key);
+        let shard = match self.touch(txn, &key) {
+            Ok(shard) => shard,
+            Err(error) => {
+                txn.mark_failed(error);
+                return;
+            }
+        };
         if let Some(manager) = self.manager_for(shard) {
             manager.put(txn, key, value);
         }
     }
 
     fn put_with_ttl(&self, txn: &mut Transaction, key: RecordKey, value: Vec<u8>, expires_at: u64) {
-        let shard = self.touch(txn, &key);
+        let shard = match self.touch(txn, &key) {
+            Ok(shard) => shard,
+            Err(error) => {
+                txn.mark_failed(error);
+                return;
+            }
+        };
         if let Some(manager) = self.manager_for(shard) {
             manager.put_with_ttl(txn, key, value, expires_at);
         }
     }
 
     fn delete(&self, txn: &mut Transaction, key: RecordKey) {
-        let shard = self.touch(txn, &key);
+        let shard = match self.touch(txn, &key) {
+            Ok(shard) => shard,
+            Err(error) => {
+                txn.mark_failed(error);
+                return;
+            }
+        };
         if let Some(manager) = self.manager_for(shard) {
             manager.delete(txn, key);
         }
@@ -1242,7 +1252,7 @@ impl TxnBackend for ShardSet {
     fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
-        let shard = self.route_record(key);
+        let shard = self.route_record(key)?;
         let manager =
             self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
         manager.expires_at(key)
@@ -1251,7 +1261,7 @@ impl TxnBackend for ShardSet {
     fn expires_at_at(&self, key: &RecordKey, read_ts: u64) -> Result<Option<u64>> {
         let _read =
             self.commit.read().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
-        let shard = self.route_record(key);
+        let shard = self.route_record(key)?;
         let manager =
             self.manager_for(shard).ok_or_else(|| RymeError::Unavailable(String::from("shard")))?;
         manager.expires_at_at(key, read_ts)
@@ -1286,7 +1296,7 @@ impl TxnBackend for ShardSet {
             let mut cohort: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             for key in txn.writes().keys().chain(txn.read_keys().iter()) {
                 let table = TableRef::of(key);
-                let shard = route_record(&guard.ranges, key).unwrap_or_else(|| {
+                let shard = route_record(&guard.ranges, key)?.unwrap_or_else(|| {
                     guard.place.get(&table).copied().unwrap_or_else(|| hash_table(&table, shards))
                 });
                 cohort.insert(shard);

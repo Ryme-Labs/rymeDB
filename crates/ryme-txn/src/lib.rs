@@ -731,6 +731,14 @@ impl Transaction {
         self.resource_error.clone().map_or(Ok(()), Err)
     }
 
+    /// Marks this transaction as failed so that later writes and commit fail.
+    /// Backends use this when an infallible staging method cannot complete.
+    pub fn mark_failed(&mut self, error: RymeError) {
+        if self.resource_error.is_none() {
+            self.resource_error = Some(error);
+        }
+    }
+
     fn stage_write(&mut self, key: RecordKey, op: WriteOp) -> Result<()> {
         if self.read_only {
             let error = RymeError::InvalidArgument(String::from("read-only transaction"));
