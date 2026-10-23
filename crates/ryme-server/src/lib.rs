@@ -15282,7 +15282,7 @@ fn read_keyring(path: &std::path::Path) -> ryme_error::Result<Option<Vec<u8>>> {
         if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
             return Err(ryme_error::RymeError::Corrupt(String::from("keyring file")));
         }
-        if metadata.permissions().mode() & 0o077 != 0 {
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }

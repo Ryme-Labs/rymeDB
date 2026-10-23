@@ -205,7 +205,7 @@ fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<V
         if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
             return Err(RymeError::Corrupt(format!("{label} file identity")));
         }
-        if metadata.permissions().mode() & 0o077 != 0 {
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }

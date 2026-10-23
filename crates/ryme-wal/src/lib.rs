@@ -588,7 +588,7 @@ fn verify_opened_segment(
         {
             return Err(RymeError::Corrupt(String::from("wal segment file identity")));
         }
-        if opened_metadata.permissions().mode() & 0o077 != 0 {
+        if opened_metadata.permissions().mode() & 0o7777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }

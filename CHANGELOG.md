@@ -30,15 +30,15 @@ All notable changes to rymeDB are recorded here. Format follows
 - Newly created storage segment, pointer, and compaction-marker files use mode
   0600 on Unix.
 - Existing WAL segment and storage data/metadata files with broader Unix
-  permissions are tightened to mode 0600 through the verified open handle.
+  permissions are normalized to mode 0600 through the verified open handle.
 - Snapshot data and latest-pointer files are created with Unix mode 0600, and
-  broader permissions on existing snapshots are repaired when opened.
-- Raft metadata files are created with Unix mode 0600; existing metadata with
-  broader permissions is tightened through the verified open handle.
-- Local archive objects and restored files use Unix mode 0600; broader
-  permissions on existing objects are repaired when opened.
+  existing snapshots are normalized to that mode through the verified handle.
+- Raft metadata files are created with Unix mode 0600; existing metadata is
+  normalized to that mode through the verified open handle.
+- Local archive objects and restored files use Unix mode 0600; existing objects
+  are normalized to that mode when opened.
 - Branch and shard catalog files use Unix mode 0600, and existing catalogs
-  with broader permissions are tightened when opened.
+  are normalized to that mode when opened.
 - Server startup rejects root or symlinked data directories and restricts the
   Unix mode to 0700 through a verified directory handle.
 - Transaction snapshot and pointer publication now use unique temporary files
