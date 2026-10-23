@@ -1138,6 +1138,16 @@ where
         }
 
         if copy_in.is_some() {
+            if tag == b'c' && !payload.is_empty() {
+                socket
+                    .write_all(&encode_error_code(
+                        "08P01",
+                        String::from("malformed CopyDone message"),
+                    ))
+                    .await
+                    .map_err(|e| RymeError::Io(e.to_string()))?;
+                return Ok(());
+            }
             match (copy_in.take(), tag) {
                 (
                     Some(CopyInState::Receiving {
@@ -1395,7 +1405,17 @@ where
                     copy_in = state;
                     continue;
                 }
-                (Some(CopyInState::Failed { message }), b'c' | b'f') => {
+                (Some(CopyInState::Failed { message }), tag @ (b'c' | b'f')) => {
+                    if tag == b'f' && copy_fail_message(&payload).is_none() {
+                        socket
+                            .write_all(&encode_error_code(
+                                "08P01",
+                                String::from("malformed CopyFail message"),
+                            ))
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        return Ok(());
+                    }
                     let cancelled = finish_backend_query(&cancellation);
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;

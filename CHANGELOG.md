@@ -77,6 +77,8 @@ All notable changes to rymeDB are recorded here. Format follows
   extra values.
 - PostgreSQL `CopyFail` messages now require a valid NUL-terminated UTF-8
   string and reject embedded NULs or trailing bytes.
+- PostgreSQL `CopyDone` messages now reject unexpected payload bytes, and COPY
+  completion framing is validated even after COPY input has failed.
 - PostgreSQL Execute messages with a positive `max_rows` now return
   `0A000` instead of silently returning more rows than the client requested.
 - RESP command names and inline commands now reject malformed UTF-8 instead of
