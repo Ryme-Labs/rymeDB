@@ -41,6 +41,7 @@ fn bind_msg(portal: &str, statement: &str, params: &[&str]) -> Vec<u8> {
         payload.extend_from_slice(&(param.len() as i32).to_be_bytes());
         payload.extend_from_slice(param.as_bytes());
     }
+    payload.extend_from_slice(&0i16.to_be_bytes());
     frame(b'B', &payload)
 }
 
