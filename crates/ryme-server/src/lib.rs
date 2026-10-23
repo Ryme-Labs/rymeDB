@@ -2966,6 +2966,16 @@ impl SharedState {
                     .to_string();
                 sources.push((format!("{prefix}sst-{name}"), path));
             }
+            for path in segment_metadata_files(&log_dir)? {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        ryme_error::RymeError::Internal(String::from("segment metadata name"))
+                    })?
+                    .to_string();
+                sources.push((format!("{prefix}segment-meta-{name}"), path));
+            }
         }
         if sources.len() > ryme_archive::MAX_ARCHIVE_FILES {
             return Err(ryme_error::RymeError::Overload(String::from("archive manifest files")));
@@ -15448,7 +15458,7 @@ fn immutable_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std:
         let entry = entry?;
         let path = entry.path();
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        if name.starts_with("segment-") && name.ends_with(".sst") {
+        if name.starts_with("segment-") && (name.ends_with(".sst") || name.ends_with(".cmp")) {
             if !entry.file_type()?.is_file() {
                 return Err(ryme_error::RymeError::Corrupt(String::from("segment file")));
             }
@@ -15457,6 +15467,27 @@ fn immutable_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std:
     }
     out.sort();
     Ok(out)
+}
+
+fn segment_metadata_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std::path::PathBuf>> {
+    let segments = dir.join("segments");
+    match std::fs::symlink_metadata(&segments) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(ryme_error::RymeError::Corrupt(String::from("segment directory"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut files = Vec::new();
+    for name in ["latest", "delta-compaction"] {
+        let path = segments.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => files.push(path),
+            Ok(_) => return Err(ryme_error::RymeError::Corrupt(String::from("segment metadata"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(files)
 }
 
 fn archive_metadata_paths(

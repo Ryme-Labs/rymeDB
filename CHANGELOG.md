@@ -59,6 +59,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and caps visited directories and nesting depth.
 - Immutable-segment archive discovery rejects symlinked segment directories
   and symlink or non-file entries using segment filenames.
+- Segment archives now include compacted delta outputs and the latest/compaction
+  markers required to recover a segment chain during delta compaction.
 - RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
   and scan the keyspace in bounded pages.
 - RESP `MGET` reads values incrementally and rejects combined results above

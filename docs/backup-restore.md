@@ -27,6 +27,8 @@ Branch-schema archive discovery rejects symlinked roots and non-regular entries;
 it caps traversal at 100,000 directories and 256 levels of nesting.
 Immutable-segment archive discovery rejects a symlinked `segments` directory
 and non-regular entries that use a segment filename.
+Segment archives include active `.cmp` delta-compaction files plus the `latest`
+and `delta-compaction` metadata needed to recover that chain.
 Local archive objects and restored files are written through unique temporary
 files created exclusively in their destination directories.
 On Unix, local archive writes sync the published object's containing directory
