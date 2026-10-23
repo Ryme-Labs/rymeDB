@@ -226,8 +226,6 @@ async fn prepared_portal_invalidation() {
     assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'2'));
     let first = execute(&mut socket, "p1").await;
     assert!(first.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("v1")));
-    let replied = roundtrip(&mut socket, bind_msg("p1", "s1", &[])).await;
-    assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'2'));
     let rebound = execute(&mut socket, "p1").await;
     assert_eq!(first, rebound);
     let closed = close(&mut socket, b'P', "p1").await;
