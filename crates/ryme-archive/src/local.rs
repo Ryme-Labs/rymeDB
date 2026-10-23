@@ -11,10 +11,20 @@ impl LocalStore {
         Self { root }
     }
 
+    fn validate_root(&self) -> Result<()> {
+        match std::fs::symlink_metadata(&self.root) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+            Ok(_) => Err(RymeError::InvalidArgument(String::from("archive root"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RymeError::from(error)),
+        }
+    }
+
     fn path(&self, key: &str) -> Result<PathBuf> {
         if !super::safe_relative_name(key) {
             return Err(RymeError::InvalidArgument(String::from("key")));
         }
+        self.validate_root()?;
         if Self::has_symlink_component(&self.root, &self.root.join(key))? {
             return Err(RymeError::InvalidArgument(String::from("symlink key")));
         }
@@ -181,6 +191,7 @@ impl crate::ObjectStore for LocalStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let path = self.path(key)?;
         let (tmp, mut file) = super::create_archive_temp_file(&path)?;
         let write_result = (|| -> Result<()> {
             std::io::Write::write_all(&mut file, &bytes)?;
@@ -252,6 +263,7 @@ impl crate::ObjectStore for LocalStore {
         if !prefix.is_empty() && !super::safe_relative_name(prefix) {
             return Err(RymeError::InvalidArgument(String::from("prefix")));
         }
+        self.validate_root()?;
         let mut out = Vec::new();
         Self::collect(&self.root.join(prefix), &self.root, &mut out)?;
         out.retain(|key| key.starts_with(prefix));
