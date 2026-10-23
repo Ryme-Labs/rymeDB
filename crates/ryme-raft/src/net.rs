@@ -2339,6 +2339,10 @@ impl Node {
 
     async fn main_loop(self: Arc<Self>) {
         loop {
+            if self.isolated.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
             self.range_tick().await;
             self.retry_pending_resolutions().await;
             if self.take_campaign().await {
@@ -2394,12 +2398,14 @@ impl Node {
     }
 
     async fn campaign(self: &Arc<Self>, skip_prevote: bool) -> Result<()> {
+        self.ensure_not_isolated()?;
         if self.inner.lock().await.learner {
             return Ok(());
         }
         if !skip_prevote && !self.prevote().await? {
             return Ok(());
         }
+        self.ensure_not_isolated()?;
         let (term, last_term, last_index) = {
             let mut inner = self.inner.lock().await;
             if inner.role == Role::Leader {
@@ -2444,6 +2450,7 @@ impl Node {
         if inner.term != term || inner.role != Role::Candidate {
             return Ok(());
         }
+        self.ensure_not_isolated()?;
         let win_current = votes_win(&votes, &inner.current);
         let win_joint = inner.joint.as_ref().map(|joint| votes_win(&votes, joint)).unwrap_or(true);
         if win_current && win_joint {
@@ -2603,6 +2610,7 @@ impl Node {
     }
 
     async fn replicate_once(self: &Arc<Self>) -> Result<()> {
+        self.ensure_not_isolated()?;
         let peers: Vec<(usize, Arc<PeerPool>)> = self.member_pools().await;
         let (term, leader_commit, snapshot) = {
             let inner = self.inner.lock().await;

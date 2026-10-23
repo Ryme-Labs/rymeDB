@@ -62,6 +62,8 @@ All notable changes to rymeDB are recorded here. Format follows
   errors, preventing further work on partially applied state.
 - Isolated Raft nodes no longer campaign for range leadership or send range
   heartbeats.
+- Isolated Raft nodes now stop global elections and replication attempts as
+  well.
 - Global Raft leader initialization now rejects a saturated log index instead
   of overflowing when initializing follower replication positions.
 - Range followers now acknowledge exact duplicate appends idempotently while
