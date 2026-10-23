@@ -23,13 +23,26 @@ const MAX_SEGMENT_POINTER_BYTES: usize = 64;
 const DELTA_COMPACTION_MARKER_BYTES: usize = 4 + 2 + 8 + 8 + 8 + 4;
 static NEXT_SEGMENT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+fn configure_private_file(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
 fn write_temp_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<PathBuf> {
     use std::io::Write;
 
     let (temporary, mut file) = loop {
         let id = NEXT_SEGMENT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
         let path = dir.join(format!("{name}.{}.{}.tmp", std::process::id(), id));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_private_file(&mut options);
+        match options.open(&path) {
             Ok(file) => break (path, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),

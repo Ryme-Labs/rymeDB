@@ -27,6 +27,8 @@ All notable changes to rymeDB are recorded here. Format follows
   installing staged segments.
 - On Unix, newly created WAL segment, rewrite, and marker files use mode 0600;
   rewrite staging directories use mode 0700.
+- Newly created storage segment, pointer, and compaction-marker files use mode
+  0600 on Unix.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique
