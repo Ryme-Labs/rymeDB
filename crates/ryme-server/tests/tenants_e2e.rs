@@ -168,6 +168,23 @@ async fn tenants_share_no_presence_or_partitions() {
     assert_eq!(status, 200);
     assert_eq!(body.as_array().map(Vec::len), Some(0));
 
+    let (status, body) = bearer_request(
+        http,
+        KEY,
+        "POST /v1/sql",
+        br#"{"sql":"CREATE TABLE sql_docs (id TEXT PRIMARY KEY)"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = bearer_request(
+        http,
+        KEY,
+        "POST /v1/sql",
+        br#"{"sql":"GRANT SELECT, INSERT, UPDATE ON TABLE sql_docs TO authenticated"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
     let copy = serde_json::json!({
         "table": "sql_docs",
         "rows": [{"key": "shared", "value": "alpha-row"}]
