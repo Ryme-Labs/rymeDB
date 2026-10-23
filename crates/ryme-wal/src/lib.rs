@@ -558,8 +558,7 @@ fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
         return Err(RymeError::Corrupt(String::from("wal segment file")));
     }
     let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    verify_opened_segment(&path_metadata, &metadata)?;
+    let metadata = verify_opened_segment(&path_metadata, &file)?;
     let length = metadata.len();
     if length > MAX_WAL_SEGMENT_BYTES {
         return Err(RymeError::Overload(String::from("wal segment")));
@@ -574,23 +573,28 @@ fn read_segment_file(path: &Path) -> Result<Vec<u8>> {
 
 fn verify_opened_segment(
     path_metadata: &std::fs::Metadata,
-    opened_metadata: &std::fs::Metadata,
-) -> Result<()> {
+    file: &File,
+) -> Result<std::fs::Metadata> {
+    let opened_metadata = file.metadata()?;
     if !opened_metadata.is_file() {
         return Err(RymeError::Corrupt(String::from("wal segment file")));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         if path_metadata.dev() != opened_metadata.dev()
             || path_metadata.ino() != opened_metadata.ino()
         {
             return Err(RymeError::Corrupt(String::from("wal segment file identity")));
         }
+        if opened_metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
     }
     #[cfg(not(unix))]
     let _ = path_metadata;
-    Ok(())
+    Ok(opened_metadata)
 }
 
 fn ensure_regular_or_missing(path: &Path) -> Result<()> {
@@ -606,7 +610,7 @@ fn open_segment_append(path: &Path, create: bool) -> Result<File> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             let file = OpenOptions::new().read(true).append(true).open(path)?;
-            verify_opened_segment(&metadata, &file.metadata()?)?;
+            verify_opened_segment(&metadata, &file)?;
             Ok(file)
         }
         Ok(_) => Err(RymeError::Corrupt(String::from("wal segment file"))),
