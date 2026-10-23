@@ -1218,6 +1218,37 @@ const AUTH_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const KEYRING_MAX_BYTES: usize = 64 * 1024 * 1024;
 const BRANCH_PROMOTION_JOURNAL_MAX_BYTES: usize = 768 * 1024 * 1024;
 
+fn prepare_data_directory(path: &std::path::Path) -> ryme_error::Result<()> {
+    std::fs::create_dir_all(path)?;
+    let canonical = std::fs::canonicalize(path)?;
+    if canonical.parent().is_none() {
+        return Err(ryme_error::RymeError::InvalidArgument(String::from(
+            "data directory must not be a filesystem root",
+        )));
+    }
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_dir() {
+        return Err(ryme_error::RymeError::Corrupt(String::from("data directory type")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::fs::File::open(path)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir()
+            || path_metadata.dev() != metadata.dev()
+            || path_metadata.ino() != metadata.ino()
+        {
+            return Err(ryme_error::RymeError::Corrupt(String::from("data directory identity")));
+        }
+        if metadata.permissions().mode() & 0o7777 != 0o700 {
+            directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
 fn read_bounded_state_file(
     path: &std::path::Path,
     max_bytes: usize,
@@ -2230,7 +2261,7 @@ impl SharedState {
             configured_pg_password.as_deref(),
             configured_resp_password.as_deref(),
         )?;
-        std::fs::create_dir_all(&config.data_dir)?;
+        prepare_data_directory(&config.data_dir)?;
         let wal_dir = config.data_dir.join("wal");
         let policy = match config.durability.is_durable() {
             true => SyncPolicy::Always,

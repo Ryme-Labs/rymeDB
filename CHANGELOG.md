@@ -39,6 +39,8 @@ All notable changes to rymeDB are recorded here. Format follows
   permissions on existing objects are repaired when opened.
 - Branch and shard catalog files use Unix mode 0600, and existing catalogs
   with broader permissions are tightened when opened.
+- Server startup rejects root or symlinked data directories and restricts the
+  Unix mode to 0700 through a verified directory handle.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique
