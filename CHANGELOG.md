@@ -75,6 +75,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - PostgreSQL Bind messages now require the parameter count to match the
   prepared statement instead of leaving placeholders unresolved or ignoring
   extra values.
+- PostgreSQL `CopyFail` messages now require a valid NUL-terminated UTF-8
+  string and reject embedded NULs or trailing bytes.
 - RESP array commands split at TCP read boundaries now remain buffered instead
   of being rejected as malformed.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment

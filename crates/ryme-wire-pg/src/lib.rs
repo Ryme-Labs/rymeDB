@@ -1356,6 +1356,16 @@ where
                     continue;
                 }
                 (Some(CopyInState::Receiving { .. }), b'f') => {
+                    let Some(message) = copy_fail_message(&payload) else {
+                        socket
+                            .write_all(&encode_error_code(
+                                "08P01",
+                                String::from("malformed CopyFail message"),
+                            ))
+                            .await
+                            .map_err(|e| RymeError::Io(e.to_string()))?;
+                        return Ok(());
+                    };
                     let cancelled = finish_backend_query(&cancellation);
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
@@ -1366,7 +1376,7 @@ where
                             String::from("canceling statement due to user request"),
                         )
                     } else {
-                        encode_error_code("57014", copy_fail_message(&payload))
+                        encode_error_code("57014", message)
                     };
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     if active_transaction.is_none() {
@@ -5173,13 +5183,16 @@ fn copy_complete(rows: usize) -> Vec<u8> {
     command_complete(&format!("COPY {rows}"))
 }
 
-fn copy_fail_message(payload: &[u8]) -> String {
-    let message = payload.split(|byte| *byte == 0).next().unwrap_or(payload);
-    let message = String::from_utf8_lossy(message).trim().to_string();
+fn copy_fail_message(payload: &[u8]) -> Option<String> {
+    let message = payload.strip_suffix(&[0])?;
+    if message.contains(&0) {
+        return None;
+    }
+    let message = std::str::from_utf8(message).ok()?.trim();
     if message.is_empty() {
-        String::from("COPY failed")
+        Some(String::from("COPY failed"))
     } else {
-        message
+        Some(message.to_owned())
     }
 }
 
