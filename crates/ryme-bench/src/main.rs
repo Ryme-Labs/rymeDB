@@ -204,8 +204,10 @@ enum Command {
     Realtime {
         #[arg(long, default_value = "127.0.0.1:3000")]
         addr: String,
-        #[arg(long)]
+        #[arg(long, help = "Anonymous API key used by WebSocket subscribers")]
         api_key: Option<String>,
+        #[arg(long, help = "Bearer API key used by HTTP publishers (defaults to --api-key)")]
+        publish_api_key: Option<String>,
         #[arg(long, default_value = "bench")]
         channel: String,
         #[arg(long, default_value_t = 1)]
@@ -366,6 +368,7 @@ async fn main() {
         Some(Command::Realtime {
             addr,
             api_key,
+            publish_api_key,
             channel,
             channel_count,
             connections,
@@ -376,9 +379,16 @@ async fn main() {
             warmup_ms,
             json,
         }) => {
+            let api_key = api_key
+                .or_else(|| std::env::var("RYME_PUBLIC_API_KEY").ok())
+                .or_else(|| std::env::var("RYME_API_KEY").ok())
+                .unwrap_or_default();
             realtime_bench(RealtimeBench {
                 addr,
-                api_key: api_key.or_else(|| std::env::var("RYME_API_KEY").ok()).unwrap_or_default(),
+                publish_api_key: publish_api_key
+                    .or_else(|| std::env::var("RYME_BENCH_PUBLISH_API_KEY").ok())
+                    .unwrap_or_else(|| api_key.clone()),
+                api_key,
                 channel,
                 channel_count,
                 connections,
@@ -400,6 +410,7 @@ async fn main() {
 struct RealtimeBench {
     addr: String,
     api_key: String,
+    publish_api_key: String,
     channel: String,
     channel_count: usize,
     connections: usize,
@@ -438,7 +449,11 @@ async fn realtime_bench(config: RealtimeBench) {
         return;
     }
     if config.api_key.is_empty() {
-        eprintln!("realtime benchmark requires --api-key or RYME_API_KEY");
+        eprintln!("realtime benchmark requires --api-key or RYME_PUBLIC_API_KEY");
+        return;
+    }
+    if config.publish_api_key.is_empty() {
+        eprintln!("realtime benchmark requires --publish-api-key or RYME_BENCH_PUBLISH_API_KEY");
         return;
     }
     let benchmark_start = Instant::now();
@@ -557,13 +572,13 @@ async fn realtime_bench(config: RealtimeBench) {
             let topic = index % config.channel_count;
             let client = client.clone();
             let publish_url = publish_url.clone();
-            let api_key = config.api_key.clone();
+            let publish_api_key = config.publish_api_key.clone();
             let channel = realtime_channel(&config.channel, config.channel_count, topic);
             let payload = payload.clone();
             async move {
                 client
                     .post(publish_url)
-                    .bearer_auth(api_key)
+                    .bearer_auth(publish_api_key)
                     .json(&serde_json::json!({
                         "channel": channel,
                         "payload": {

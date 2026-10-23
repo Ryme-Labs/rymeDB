@@ -8,6 +8,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Added
 
+- Realtime benchmarks accept a separate publisher API key so WebSocket
+  subscribers can use a public `anon` key while HTTP publishes use a
+  write-capable key.
 - SQL role memberships with transitive privilege and RLS policy inheritance;
   `NOINHERIT` disables inherited grants for the effective role.
 - SQL supports changing an existing role's inheritance behavior with

@@ -489,10 +489,24 @@ treated as a direct replacement for the 100-connection burst result.
 Run it yourself:
 
 ```bash
-ryme-bench realtime --addr 127.0.0.1:8080 --api-key local-dev-key \
+ryme-bench realtime --addr 127.0.0.1:8080 \
+  --api-key local-dev-anon --publish-api-key local-dev-writer \
   --connections 100 --connection-concurrency 256 --messages 10000 \
   --payload-bytes 128 --json
 ```
+
+WebSocket subscribers authenticate with `--api-key`, which must be an `anon`
+key when passed in the WebSocket query string. It defaults to
+`RYME_PUBLIC_API_KEY` (then `RYME_API_KEY` for compatibility). HTTP publishers
+authenticate with `--publish-api-key`, which needs permission to publish. The
+publisher key defaults to `--api-key` for servers that allow that key to
+publish. To keep a publisher secret out of command-line arguments, set
+`RYME_BENCH_PUBLISH_API_KEY`; it takes precedence over the default.
+
+Realtime quotas count fanout deliveries as well as publishes. Set the
+benchmark tenant's QoS tier high enough for the selected connection count and
+publish rate; for a local server using the `default` tenant, an operator can
+run `rymedb-cli qos tier default dedicated_cluster` before this workload.
 
 By default, all subscribers and publishes use the single `bench` channel (a
 hot-topic test). Set `--channel-count 10` to spread both connections and
@@ -505,7 +519,8 @@ The cached-envelope run used 20 connections, 64 connection concurrency, 1,000
 messages, and 32 concurrent publishers:
 
 ```bash
-ryme-bench realtime --addr 127.0.0.1:8080 --api-key local-dev-key \
+ryme-bench realtime --addr 127.0.0.1:8080 \
+  --api-key local-dev-anon --publish-api-key local-dev-writer \
   --connections 20 --connection-concurrency 64 --messages 1000 \
   --payload-bytes 128 --publish-concurrency 32 --json
 ```
