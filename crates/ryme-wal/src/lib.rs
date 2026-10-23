@@ -3,6 +3,7 @@ use ryme_error::{Result, RymeError};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const WAL_MAGIC: u32 = 0x52594D45;
 pub const WAL_VERSION: u16 = 1;
@@ -13,6 +14,7 @@ const WAL_FRAME_OVERHEAD_BYTES: usize = WAL_FRAME_HEADER_BYTES + WAL_FRAME_TRAIL
 const MAX_WAL_PAYLOAD_BYTES: usize = MAX_WAL_SEGMENT_BYTES as usize - WAL_FRAME_OVERHEAD_BYTES;
 const REWRITE_DIR: &str = ".rewrite";
 const REWRITE_MARKER: &str = ".rewrite-in-progress";
+static NEXT_REWRITE_INSTALL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
@@ -405,9 +407,7 @@ fn install_rewrite(dir: &Path) -> Result<()> {
             previous_lsn = Some(record.lsn);
             cursor = &cursor[consumed..];
         }
-        ensure_regular_or_missing(&dir.join(name))?;
-        std::fs::copy(path, dir.join(name))?;
-        File::open(dir.join(name))?.sync_all()?;
+        install_rewrite_segment(dir, name, &raw)?;
     }
     sync_directory(dir)?;
 
@@ -564,6 +564,39 @@ fn create_segment_append(path: &Path) -> Result<File> {
 
 fn create_rewrite_segment(path: &Path) -> Result<File> {
     Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
+}
+
+fn install_rewrite_segment(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let destination = dir.join(name);
+    ensure_regular_or_missing(&destination)?;
+    let (temporary, mut file) = loop {
+        let id = NEXT_REWRITE_INSTALL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), id));
+        match OpenOptions::new().write(true).create_new(true).open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    match std::fs::remove_file(&destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
+    if let Err(error) = std::fs::rename(&temporary, &destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64> {
