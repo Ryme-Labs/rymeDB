@@ -1282,16 +1282,34 @@ impl Node {
                 None => BTreeMap::new(),
             };
         let manager = TxnManager::new();
-        let mut log: Vec<LogEntry> = Vec::new();
+        let mut log_by_index = BTreeMap::<u64, LogEntry>::new();
         for record in records {
             let (index, term, apply) = decode_log_frame(&record.payload)?;
-            if log.iter().any(|e: &LogEntry| e.index == index) {
-                continue;
+            if index == 0 || term == 0 {
+                return Err(RymeError::Corrupt(String::from("raft log metadata")));
             }
             validate_apply_payload(&apply)?;
-            log.push(LogEntry { index, term, payload: apply });
+            if let Some(existing) = log_by_index.get(&index) {
+                if existing.term != term || existing.payload != apply {
+                    return Err(RymeError::Corrupt(String::from("conflicting raft log index")));
+                }
+                continue;
+            }
+            log_by_index.insert(index, LogEntry { index, term, payload: apply });
         }
-        log.sort_by_key(|e| e.index);
+        let mut expected_index = 1u64;
+        for index in log_by_index.keys() {
+            if *index != expected_index {
+                return Err(RymeError::Corrupt(String::from("raft log gap")));
+            }
+            expected_index = expected_index
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("raft log index overflow")))?;
+        }
+        if meta.commit_index > log_by_index.keys().next_back().copied().unwrap_or(0) {
+            return Err(RymeError::Corrupt(String::from("raft commit index")));
+        }
+        let log: Vec<LogEntry> = log_by_index.into_values().collect();
         let mut applied = 0u64;
         let mut replayed_commit_ts = BTreeSet::new();
         let mut replayed_data = Vec::new();

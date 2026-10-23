@@ -37,6 +37,8 @@ All notable changes to rymeDB are recorded here. Format follows
   preventing concurrent writers from racing on the shared temporary file.
 - Raft startup now rejects duplicate, gapped, or inconsistent range WAL records
   and metadata whose applied or committed indexes exceed the recovered log.
+- Core Raft recovery now rejects conflicting duplicate entries, log gaps, and
+  commit indexes beyond the recovered WAL while retaining exact duplicate frames.
 
 ### Performance
 
