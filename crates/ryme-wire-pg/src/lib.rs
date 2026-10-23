@@ -6035,6 +6035,7 @@ mod tests {
         payload.extend_from_slice(&0i16.to_be_bytes());
         payload.extend_from_slice(&1i16.to_be_bytes());
         payload.extend_from_slice(&(-1i32).to_be_bytes());
+        payload.extend_from_slice(&0i16.to_be_bytes());
         let (_, _, params) = parse_bind(&payload).unwrap();
         assert_eq!(params, vec![String::from("\0")]);
         assert_eq!(execute_parameter("NULL"), "\0");
