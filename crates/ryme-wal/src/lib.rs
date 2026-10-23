@@ -212,11 +212,7 @@ impl Wal {
             return Ok(0);
         }
 
-        let temporary = self.dir.join(REWRITE_DIR);
-        if temporary.exists() {
-            std::fs::remove_dir_all(&temporary)?;
-        }
-        std::fs::create_dir_all(&temporary)?;
+        let temporary = prepare_rewrite_directory(&self.dir)?;
 
         let mut id = 0u64;
         let mut path = temporary.join(segment_name(id));
@@ -303,14 +299,10 @@ impl Wal {
                     .ok_or_else(|| RymeError::Corrupt(String::from("wal lsn overflow")))
             })
             .unwrap_or(Ok(0))?;
-        let temporary = self.dir.join(REWRITE_DIR);
         for record in records {
             validate_payload_len(record.payload.len())?;
         }
-        if temporary.exists() {
-            std::fs::remove_dir_all(&temporary)?;
-        }
-        std::fs::create_dir_all(&temporary)?;
+        let temporary = prepare_rewrite_directory(&self.dir)?;
         let mut id = 0u64;
         let mut path = temporary.join(segment_name(id));
         let mut file = create_rewrite_segment(&path)?;
@@ -370,16 +362,36 @@ fn create_rewrite_marker(dir: &Path) -> Result<()> {
 }
 
 fn recover_rewrite(dir: &Path) -> Result<()> {
-    if dir.join(REWRITE_MARKER).exists() {
-        install_rewrite(dir)?;
+    let marker = dir.join(REWRITE_MARKER);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() => install_rewrite(dir)?,
+        Ok(_) => return Err(RymeError::Corrupt(String::from("wal rewrite marker"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn prepare_rewrite_directory(dir: &Path) -> Result<PathBuf> {
+    let temporary = dir.join(REWRITE_DIR);
+    match std::fs::symlink_metadata(&temporary) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(&temporary)?,
+        Ok(_) => return Err(RymeError::Corrupt(String::from("wal rewrite directory"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::create_dir(&temporary)?;
+    Ok(temporary)
 }
 
 // Once the marker is durable, the staged generation is authoritative. Copying
 // (rather than moving) makes installation idempotent if the process crashes.
 fn install_rewrite(dir: &Path) -> Result<()> {
     let temporary = dir.join(REWRITE_DIR);
+    let metadata = std::fs::symlink_metadata(&temporary)?;
+    if !metadata.file_type().is_dir() {
+        return Err(RymeError::Corrupt(String::from("wal rewrite directory")));
+    }
     let mut staged = Vec::new();
     for entry in std::fs::read_dir(&temporary)? {
         let entry = entry?;

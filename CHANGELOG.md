@@ -23,6 +23,8 @@ All notable changes to rymeDB are recorded here. Format follows
   incomplete handshakes cannot hold connection slots indefinitely.
 - WAL segment readers and append handles verify opened file identity to detect
   symlink swaps during recovery or writes.
+- WAL recovery rejects symlinked rewrite markers and staging directories before
+  installing staged segments.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique
