@@ -75,6 +75,10 @@ startup. Use the migration ledger rather than relying on an application-side
 `GRANT` and `ALTER DEFAULT PRIVILEGES` require each named grantee to exist.
 Dropping a role removes its direct and default privilege grants; recreating a
 role with the same name does not restore its previous access.
+Role membership grants use `GRANT role TO member` and `REVOKE role FROM member`.
+Inherited object privileges and role-scoped RLS policies follow membership
+chains unless the effective role has `NOINHERIT`; see [authentication and
+authorization](auth.md) for limits and policy behavior.
 
 ```bash
 rymedb-cli migrate apply 2026-01-create-messages \

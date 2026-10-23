@@ -266,8 +266,13 @@ CREATE POLICY messages_owner ON messages
 
 Omitting `TO` or using `TO PUBLIC` applies the policy to every role. A policy
 targeted with `TO role[, role...]` applies only when the request uses one of
-those roles; the role names must already exist. Role membership inheritance is
-not implemented, so target the effective request role directly.
+those roles; the role names must already exist. Role membership inheritance
+applies to SQL grants and policy targets when the effective request role has
+`INHERIT`. `NOINHERIT` roles use only their direct grants and policies. Role
+membership changes use `GRANT role TO member` and `REVOKE role FROM member`;
+cycles are rejected. Inspect membership rows through
+`pg_catalog.pg_auth_members`. `WITH ADMIN OPTION` and `SET ROLE` are not
+supported.
 
 For SQL policies, `auth.uid()` is the authenticated JWT `sub` identity. It is
 distinct from the tenant claim. Configure `rls_tables` when rows should be

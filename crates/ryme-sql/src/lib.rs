@@ -136,6 +136,9 @@ pub struct RoleDefinition {
 /// one would make authorization and catalog introspection disagree.
 pub const BUILTIN_SQL_ROLES: &[&str] =
     &["postgres", "anon", "authenticated", "service_role", "realtime_subscriber"];
+const SQL_ROLE_MEMBERSHIP_OBJECT: &str = "ROLE_MEMBERSHIP";
+const SQL_ROLE_MEMBERSHIP_PRIVILEGE: &str = "MEMBER";
+const MAX_ROLE_MEMBERSHIP_CHANGE_EDGES: usize = 10_000;
 
 fn is_builtin_sql_role(name: &str) -> bool {
     BUILTIN_SQL_ROLES.iter().any(|builtin| builtin.eq_ignore_ascii_case(name))
@@ -160,6 +163,120 @@ fn validate_role_catalog(roles: &BTreeMap<String, RoleDefinition>) -> Result<()>
                 role.name
             )));
         }
+    }
+    Ok(())
+}
+
+fn role_membership_has_cycle(privileges: &[PrivilegeGrant]) -> bool {
+    let mut parents = HashMap::<String, Vec<String>>::new();
+    for grant in privileges.iter().filter(|grant| {
+        grant.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
+            && grant.privilege.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_PRIVILEGE)
+    }) {
+        parents
+            .entry(grant.grantee.to_ascii_lowercase())
+            .or_default()
+            .push(grant.object.to_ascii_lowercase());
+    }
+    let mut state = HashMap::<String, u8>::new();
+    for start in parents.keys() {
+        if state.get(start) == Some(&2) {
+            continue;
+        }
+        let mut pending = vec![(start.clone(), false)];
+        while let Some((role, expanded)) = pending.pop() {
+            if expanded {
+                state.insert(role, 2);
+                continue;
+            }
+            match state.get(&role).copied().unwrap_or(0) {
+                1 => return true,
+                2 => continue,
+                _ => {}
+            }
+            state.insert(role.clone(), 1);
+            pending.push((role.clone(), true));
+            if let Some(role_parents) = parents.get(&role) {
+                for parent in role_parents {
+                    match state.get(parent).copied().unwrap_or(0) {
+                        1 => return true,
+                        2 => {}
+                        _ => pending.push((parent.clone(), false)),
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn effective_sql_roles(
+    current_role: &str,
+    roles: &HashMap<String, RoleDefinition>,
+    privileges: &[PrivilegeGrant],
+) -> Vec<String> {
+    let current_role = current_role.to_ascii_lowercase();
+    let inherits = roles
+        .values()
+        .find(|role| role.name.eq_ignore_ascii_case(&current_role))
+        .is_none_or(|role| role.inherit);
+    let mut effective = vec![current_role.clone()];
+    if !inherits {
+        return effective;
+    }
+    let mut parents = HashMap::<String, Vec<String>>::new();
+    for membership in privileges.iter().filter(|grant| {
+        grant.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
+            && grant.privilege.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_PRIVILEGE)
+    }) {
+        parents
+            .entry(membership.grantee.to_ascii_lowercase())
+            .or_default()
+            .push(membership.object.to_ascii_lowercase());
+    }
+    let mut pending = vec![current_role.clone()];
+    let mut visited = HashSet::from([current_role]);
+    while let Some(member) = pending.pop() {
+        if let Some(role_parents) = parents.get(&member) {
+            for role in role_parents {
+                if visited.insert(role.clone()) {
+                    effective.push(role.clone());
+                    pending.push(role.clone());
+                }
+            }
+        }
+    }
+    effective
+}
+
+fn validate_role_memberships(snapshot: &SchemaSnapshot) -> Result<()> {
+    let mut known_roles =
+        BUILTIN_SQL_ROLES.iter().map(|role| role.to_ascii_lowercase()).collect::<HashSet<_>>();
+    known_roles.extend(snapshot.roles.values().map(|role| role.name.to_ascii_lowercase()));
+    let mut unique = HashSet::new();
+    for grant in &snapshot.privileges {
+        if !grant.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT) {
+            continue;
+        }
+        if !grant.privilege.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_PRIVILEGE)
+            || grant.grant_option
+            || grant.object.is_empty()
+            || grant.grantee.is_empty()
+            || grant.grantee.eq_ignore_ascii_case("PUBLIC")
+            || grant.object.eq_ignore_ascii_case(&grant.grantee)
+            || !known_roles.contains(&grant.object.to_ascii_lowercase())
+            || !known_roles.contains(&grant.grantee.to_ascii_lowercase())
+        {
+            return Err(RymeError::Corrupt(String::from("invalid role membership")));
+        }
+        let member = grant.grantee.to_ascii_lowercase();
+        let role = grant.object.to_ascii_lowercase();
+        if !unique.insert((member.clone(), role.clone())) {
+            return Err(RymeError::Corrupt(String::from("duplicate role membership")));
+        }
+    }
+    if role_membership_has_cycle(&snapshot.privileges) {
+        return Err(RymeError::Corrupt(String::from("role membership cycle")));
     }
     Ok(())
 }
@@ -411,6 +528,11 @@ pub enum Statement {
         name: String,
         #[serde(default)]
         if_exists: bool,
+    },
+    RoleMembershipChange {
+        grant: bool,
+        roles: Vec<String>,
+        members: Vec<String>,
     },
     PrivilegeChange {
         #[serde(default)]
@@ -1070,6 +1192,7 @@ pub fn schema_snapshot_serialized_size(snapshot: &SchemaSnapshot) -> Result<usiz
 
     schema_snapshot_object_count(snapshot)?;
     validate_role_catalog(&snapshot.roles)?;
+    validate_role_memberships(snapshot)?;
     validate_rls_policy_catalog(snapshot)?;
     let mut counter = SizeCounter(0);
     serde_json::to_writer(&mut counter, snapshot)
@@ -1174,6 +1297,7 @@ fn schema_snapshot_object_count(snapshot: &SchemaSnapshot) -> Result<usize> {
 fn schema_snapshot_bytes(snapshot: &SchemaSnapshot) -> Result<Vec<u8>> {
     schema_snapshot_object_count(snapshot)?;
     validate_role_catalog(&snapshot.roles)?;
+    validate_role_memberships(snapshot)?;
     validate_rls_policy_catalog(snapshot)?;
     let bytes = serde_json::to_vec(snapshot)
         .map_err(|error| RymeError::Internal(format!("schema snapshot: {error}")))?;
@@ -1233,6 +1357,7 @@ impl Statement {
         match self {
             Self::CreateRole { .. }
             | Self::DropRole { .. }
+            | Self::RoleMembershipChange { .. }
             | Self::PrivilegeChange { .. }
             | Self::DefaultPrivilegeChange { .. } => true,
             Self::Returning { statement, .. }
@@ -1266,6 +1391,7 @@ impl Statement {
                 | Statement::AlterSequence { .. }
                 | Statement::CreateRole { .. }
                 | Statement::DropRole { .. }
+                | Statement::RoleMembershipChange { .. }
                 | Statement::PrivilegeChange { .. }
                 | Statement::DefaultPrivilegeChange { .. }
                 | Statement::AlterTableRls { .. }
@@ -1324,6 +1450,7 @@ impl Statement {
                 | Statement::AlterSequence { .. }
                 | Statement::CreateRole { .. }
                 | Statement::DropRole { .. }
+                | Statement::RoleMembershipChange { .. }
                 | Statement::PrivilegeChange { .. }
                 | Statement::DefaultPrivilegeChange { .. }
                 | Statement::TruncateTable { .. }
@@ -1398,13 +1525,16 @@ fn merge_uid_rls_policy_column(map: &mut HashMap<String, Vec<String>>, table: &s
 
 fn rls_policy_maps_for_role<'a>(
     policies: impl Iterator<Item = &'a RlsPolicy>,
-    role: Option<&str>,
+    roles: Option<&[String]>,
 ) -> RlsPolicyMaps {
     let mut maps = RlsPolicyMaps::default();
     for policy in policies {
-        if role.is_some_and(|role| {
+        if roles.is_some_and(|roles| {
             !policy.roles.is_empty()
-                && !policy.roles.iter().any(|target| target.eq_ignore_ascii_case(role))
+                && !policy
+                    .roles
+                    .iter()
+                    .any(|target| roles.iter().any(|role| target.eq_ignore_ascii_case(role)))
         }) {
             continue;
         }
@@ -2170,6 +2300,7 @@ impl Statement {
             | Self::RefreshMaterializedView { name, .. } => name,
             Self::DropSequence { name, .. } | Self::AlterSequence { name, .. } => name,
             Self::CreateRole { .. }
+            | Self::RoleMembershipChange { .. }
             | Self::PrivilegeChange { .. }
             | Self::DefaultPrivilegeChange { .. } => "",
             Self::DropRole { name, .. } => name,
@@ -3212,8 +3343,9 @@ fn parse_create_role(tokens: &[String], kind_index: usize) -> Result<Statement> 
 
 fn parse_privilege_change(tokens: &[String], raw: &str, grant: bool) -> Result<Statement> {
     let command = if grant { "GRANT" } else { "REVOKE" };
-    let on_pos = find_sql_keyword(raw, "ON", command.len())
-        .ok_or_else(|| RymeError::InvalidArgument(format!("{command} object")))?;
+    let Some(on_pos) = find_sql_keyword(raw, "ON", command.len()) else {
+        return parse_role_membership_change(raw, grant);
+    };
     let recipient_keyword = if grant { "TO" } else { "FROM" };
     let recipient_pos = find_sql_keyword(raw, recipient_keyword, on_pos + 2)
         .ok_or_else(|| RymeError::InvalidArgument(format!("{command} grantee")))?;
@@ -3281,6 +3413,40 @@ fn parse_privilege_change(tokens: &[String], raw: &str, grant: bool) -> Result<S
         grantees,
         grant_option,
     })
+}
+
+fn parse_role_membership_change(raw: &str, grant: bool) -> Result<Statement> {
+    let command = if grant { "GRANT" } else { "REVOKE" };
+    let recipient_keyword = if grant { "TO" } else { "FROM" };
+    let recipient_pos = find_sql_keyword(raw, recipient_keyword, command.len())
+        .ok_or_else(|| RymeError::InvalidArgument(format!("{command} role member")))?;
+    let roles = split_sql_items(raw[command.len()..recipient_pos].trim())
+        .into_iter()
+        .map(|role| unquote(role.trim()))
+        .filter(|role| !role.is_empty())
+        .collect::<Vec<_>>();
+    let member_text =
+        raw[recipient_pos + recipient_keyword.len()..].trim().trim_end_matches(';').trim();
+    if member_text.to_ascii_uppercase().ends_with("WITH ADMIN OPTION") {
+        return Err(RymeError::InvalidArgument(String::from(
+            "role membership admin option is unsupported",
+        )));
+    }
+    if member_text.is_empty() {
+        return Err(RymeError::InvalidArgument(format!("{command} role member")));
+    }
+    let members = split_sql_items(member_text)
+        .into_iter()
+        .map(|member| unquote(member.trim()))
+        .filter(|member| !member.is_empty())
+        .collect::<Vec<_>>();
+    if roles.is_empty()
+        || members.is_empty()
+        || members.iter().any(|m| m.eq_ignore_ascii_case("PUBLIC"))
+    {
+        return Err(RymeError::InvalidArgument(format!("{command} role member")));
+    }
+    Ok(Statement::RoleMembershipChange { grant, roles, members })
 }
 
 fn parse_default_privilege_change(tokens: &[String], raw: &str) -> Result<Statement> {
@@ -7058,6 +7224,12 @@ pub fn describe_plan(statement: &Statement) -> String {
         }
         Statement::CreateRole { name, .. } => format!("ddl create_role({name})"),
         Statement::DropRole { name, .. } => format!("ddl drop_role({name})"),
+        Statement::RoleMembershipChange { grant, roles, members } => format!(
+            "ddl {} roles {} to {}",
+            if *grant { "grant" } else { "revoke" },
+            roles.join(","),
+            members.join(",")
+        ),
         Statement::PrivilegeChange {
             grant, object_type, objects, privileges, grantees, ..
         } => {
@@ -8475,7 +8647,11 @@ where
                 .privileges
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("privilege lock")))?;
-            privileges.retain(|grant| !grant.grantee.eq_ignore_ascii_case(name));
+            privileges.retain(|grant| {
+                !grant.grantee.eq_ignore_ascii_case(name)
+                    && !(grant.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
+                        && grant.object.eq_ignore_ascii_case(name))
+            });
             drop(privileges);
             let mut defaults = self
                 .default_privileges
@@ -8488,6 +8664,103 @@ where
             self.schema_dirty.store(true, Ordering::SeqCst);
         }
         drop(roles);
+        if removed {
+            self.invalidate_rls_role_maps();
+        }
+        Ok(())
+    }
+
+    fn apply_role_membership_change(
+        &self,
+        grant: bool,
+        granted_roles: Vec<String>,
+        members: Vec<String>,
+    ) -> Result<()> {
+        let roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        let mut stored = self
+            .privileges
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("privilege lock")))?;
+        let edge_count = granted_roles
+            .len()
+            .checked_mul(members.len())
+            .ok_or_else(|| RymeError::Overload(String::from("role membership change")))?;
+        if edge_count > MAX_ROLE_MEMBERSHIP_CHANGE_EDGES {
+            return Err(RymeError::Overload(String::from("role membership change")));
+        }
+        let mut known_roles =
+            BUILTIN_SQL_ROLES.iter().map(|role| role.to_ascii_lowercase()).collect::<HashSet<_>>();
+        known_roles.extend(roles.keys().map(|role| role.to_ascii_lowercase()));
+        for role in &granted_roles {
+            if !known_roles.contains(&role.to_ascii_lowercase()) {
+                return Err(RymeError::NotFound(format!("role {role}")));
+            }
+        }
+        for member in &members {
+            if member.eq_ignore_ascii_case("PUBLIC")
+                || !known_roles.contains(&member.to_ascii_lowercase())
+            {
+                return Err(RymeError::NotFound(format!("role {member}")));
+            }
+        }
+
+        let memberships = stored
+            .iter()
+            .filter(|entry| {
+                entry.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
+                    && entry.privilege.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_PRIVILEGE)
+            })
+            .collect::<Vec<_>>();
+        let mut edges = memberships
+            .iter()
+            .map(|entry| (entry.grantee.to_ascii_lowercase(), entry.object.to_ascii_lowercase()))
+            .collect::<HashSet<_>>();
+        let mut additions = Vec::new();
+        for role in &granted_roles {
+            for member in &members {
+                if grant {
+                    let edge = (member.to_ascii_lowercase(), role.to_ascii_lowercase());
+                    if !edges.insert(edge) {
+                        continue;
+                    }
+                    additions.push(PrivilegeGrant {
+                        object_type: String::from(SQL_ROLE_MEMBERSHIP_OBJECT),
+                        object: role.clone(),
+                        privilege: String::from(SQL_ROLE_MEMBERSHIP_PRIVILEGE),
+                        grantee: member.clone(),
+                        grant_option: false,
+                    });
+                }
+            }
+        }
+        if grant {
+            if memberships.len().saturating_add(additions.len()) > MAX_SCHEMA_OBJECTS {
+                return Err(RymeError::Overload(String::from("role memberships")));
+            }
+            let mut candidate =
+                memberships.iter().map(|entry| (*entry).clone()).collect::<Vec<_>>();
+            candidate.extend(additions.iter().cloned());
+            if role_membership_has_cycle(&candidate) {
+                return Err(RymeError::InvalidArgument(String::from("role membership cycle")));
+            }
+            stored.extend(additions);
+        } else {
+            let granted_roles =
+                granted_roles.iter().map(|role| role.to_ascii_lowercase()).collect::<HashSet<_>>();
+            let members =
+                members.iter().map(|member| member.to_ascii_lowercase()).collect::<HashSet<_>>();
+            stored.retain(|entry| {
+                !entry.object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT)
+                    || !entry.privilege.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_PRIVILEGE)
+                    || !granted_roles.contains(&entry.object.to_ascii_lowercase())
+                    || !members.contains(&entry.grantee.to_ascii_lowercase())
+            });
+        }
+        self.schema_dirty.store(true, Ordering::SeqCst);
+        drop(stored);
+        drop(roles);
+        self.invalidate_rls_role_maps();
         Ok(())
     }
 
@@ -8515,6 +8788,9 @@ where
         grantees: Vec<String>,
         grant_option: bool,
     ) -> Result<()> {
+        if object_type.eq_ignore_ascii_case(SQL_ROLE_MEMBERSHIP_OBJECT) {
+            return Err(RymeError::InvalidArgument(String::from("privilege object type")));
+        }
         let roles =
             self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
         Self::validate_grantees(&roles, &grantees)?;
@@ -8704,8 +8980,10 @@ where
                 }
             }
 
+            let effective_roles = self.effective_role_names().ok()?;
             let policies = self.rls_policies.read().ok()?;
-            let maps = Arc::new(rls_policy_maps_for_role(policies.values(), Some(&self.role)));
+            let maps =
+                Arc::new(rls_policy_maps_for_role(policies.values(), Some(&effective_roles)));
             drop(policies);
             if self.rls_policy_version.load(Ordering::SeqCst) != version {
                 continue;
@@ -9379,6 +9657,16 @@ where
         self.default_privileges.lock().map(|privileges| privileges.clone()).unwrap_or_default()
     }
 
+    fn effective_role_names(&self) -> Result<Vec<String>> {
+        let roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        let privileges = self
+            .privileges
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("privilege lock")))?;
+        Ok(effective_sql_roles(&self.role, &roles, &privileges))
+    }
+
     fn role_is_superuser(&self) -> bool {
         self.role.eq_ignore_ascii_case("postgres")
             || self
@@ -9400,23 +9688,24 @@ where
             _ => object.to_string(),
         };
         let canonical_schema = canonical.rsplit_once('.').map(|(schema, _)| schema);
-        self.privileges.lock().ok().is_some_and(|privileges| {
-            privileges.iter().any(|grant| {
-                if !grant.object_type.eq_ignore_ascii_case(object_type)
-                    || !(grant.grantee.eq_ignore_ascii_case(&self.role)
-                        || grant.grantee.eq_ignore_ascii_case("PUBLIC"))
-                {
-                    return false;
-                }
-                let object_matches = if let Some(schema) = grant.object.strip_suffix(".*") {
-                    canonical_schema.is_some_and(|actual| schema.eq_ignore_ascii_case(actual))
-                } else {
-                    same_relation(&grant.object, &canonical)
-                };
-                object_matches
-                    && (grant.privilege.eq_ignore_ascii_case("ALL")
-                        || grant.privilege.eq_ignore_ascii_case(privilege))
-            })
+        let Ok(roles) = self.roles.lock() else { return false };
+        let Ok(privileges) = self.privileges.lock() else { return false };
+        let effective_roles = effective_sql_roles(&self.role, &roles, &privileges);
+        privileges.iter().any(|grant| {
+            if !grant.object_type.eq_ignore_ascii_case(object_type)
+                || !(effective_roles.iter().any(|role| grant.grantee.eq_ignore_ascii_case(role))
+                    || grant.grantee.eq_ignore_ascii_case("PUBLIC"))
+            {
+                return false;
+            }
+            let object_matches = if let Some(schema) = grant.object.strip_suffix(".*") {
+                canonical_schema.is_some_and(|actual| schema.eq_ignore_ascii_case(actual))
+            } else {
+                same_relation(&grant.object, &canonical)
+            };
+            object_matches
+                && (grant.privilege.eq_ignore_ascii_case("ALL")
+                    || grant.privilege.eq_ignore_ascii_case(privilege))
         })
     }
 
@@ -13409,6 +13698,7 @@ where
             | Statement::AlterSequence { .. }
             | Statement::CreateRole { .. }
             | Statement::DropRole { .. }
+            | Statement::RoleMembershipChange { .. }
             | Statement::PrivilegeChange { .. }
             | Statement::DefaultPrivilegeChange { .. }
             | Statement::SequenceValue { .. }
@@ -13537,6 +13827,10 @@ where
             }
             Statement::DropRole { name, if_exists } => {
                 self.drop_role(&name, if_exists)?;
+                Ok((QueryResult::Ok, Vec::new()))
+            }
+            Statement::RoleMembershipChange { grant, roles, members } => {
+                self.apply_role_membership_change(grant, roles, members)?;
                 Ok((QueryResult::Ok, Vec::new()))
             }
             Statement::PrivilegeChange {
@@ -15397,6 +15691,7 @@ where
             | Statement::AlterSequence { .. }
             | Statement::CreateRole { .. }
             | Statement::DropRole { .. }
+            | Statement::RoleMembershipChange { .. }
             | Statement::PrivilegeChange { .. }
             | Statement::DefaultPrivilegeChange { .. }
             | Statement::SequenceValue { .. }
@@ -15888,6 +16183,10 @@ where
             }
             Statement::DropRole { name, if_exists } => {
                 self.drop_role(&name, if_exists)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::RoleMembershipChange { grant, roles, members } => {
+                self.apply_role_membership_change(grant, roles, members)?;
                 Ok(QueryResult::Ok)
             }
             Statement::PrivilegeChange {

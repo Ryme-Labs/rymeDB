@@ -2036,6 +2036,8 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
         || upper.contains("INFORMATION_SCHEMA.ROLE_TABLE_GRANTS")
     {
         "privileges"
+    } else if upper.contains("PG_CATALOG.PG_AUTH_MEMBERS") || upper.contains("PG_AUTH_MEMBERS") {
+        "auth_members"
     } else if upper.contains("PG_CATALOG.PG_ROLES") || upper.contains("PG_ROLES") {
         "roles"
     } else if upper.contains("INFORMATION_SCHEMA.TABLES") || upper.contains("PG_CATALOG.PG_TABLES")
@@ -2075,6 +2077,7 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
     let defaults = match kind {
         "tables" => vec![String::from("table_name")],
         "privileges" => vec![String::from("table_name")],
+        "auth_members" => vec![String::from("roleid")],
         "roles" => vec![String::from("rolname")],
         "indexes" => vec![String::from("indexname")],
         "policies" => vec![String::from("policyname")],
@@ -2114,6 +2117,14 @@ fn catalog_query_columns(query: &str) -> Option<Vec<String>> {
                 String::from("rolconnlimit"),
                 String::from("rolpassword"),
                 String::from("rolvaliduntil"),
+            ],
+            "auth_members" => vec![
+                String::from("roleid"),
+                String::from("member"),
+                String::from("grantor"),
+                String::from("admin_option"),
+                String::from("inherit_option"),
+                String::from("set_option"),
             ],
             "tables" => vec![
                 String::from("table_schema"),
@@ -2434,6 +2445,53 @@ where
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        return Some(encode_catalog_rows(&columns, rows));
+    }
+    if upper.contains("PG_CATALOG.PG_AUTH_MEMBERS") || upper.contains("PG_AUTH_MEMBERS") {
+        let mut memberships = executor
+            .catalog_privileges()
+            .into_iter()
+            .filter(|grant| {
+                grant.object_type.eq_ignore_ascii_case("ROLE_MEMBERSHIP")
+                    && grant.privilege.eq_ignore_ascii_case("MEMBER")
+            })
+            .collect::<Vec<_>>();
+        memberships.sort_by(|left, right| {
+            left.object.to_ascii_lowercase().cmp(&right.object.to_ascii_lowercase()).then_with(
+                || left.grantee.to_ascii_lowercase().cmp(&right.grantee.to_ascii_lowercase()),
+            )
+        });
+        let roles = executor.catalog_roles();
+        let rows = memberships
+            .into_iter()
+            .map(|membership| {
+                let member_inherits = roles
+                    .iter()
+                    .find(|role| role.name.eq_ignore_ascii_case(&membership.grantee))
+                    .is_none_or(|role| role.inherit);
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "roleid" => catalog_oid(&format!("role:{}", membership.object))
+                            .to_string()
+                            .into_bytes(),
+                        "member" => catalog_oid(&format!("role:{}", membership.grantee))
+                            .to_string()
+                            .into_bytes(),
+                        "grantor" => catalog_oid("role:postgres").to_string().into_bytes(),
+                        "admin_option" | "set_option" => b"f".to_vec(),
+                        "inherit_option" => {
+                            if member_inherits {
+                                b"t".to_vec()
+                            } else {
+                                b"f".to_vec()
+                            }
+                        }
+                        _ => Vec::new(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         return Some(encode_catalog_rows(&columns, rows));
     }
     if upper.contains("PG_CATALOG.PG_ROLES") || upper.contains("PG_ROLES") {
