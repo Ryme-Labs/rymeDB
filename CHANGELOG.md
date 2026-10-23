@@ -34,6 +34,8 @@ All notable changes to rymeDB are recorded here. Format follows
   privileges from passing through those roles to downstream members.
 - WAL maintenance and rewrite operations now reject a poisoned handle, keeping
   retries from removing a staged generation needed for crash recovery.
+- Full WAL rewrites now reject segment-ID overflow instead of wrapping the
+  staged segment sequence.
 - SQL `CREATE USER` now defaults to `LOGIN`, and unsupported role options are
   rejected instead of being reported as successful while silently ignored.
 - Raft range-coordination recovery now propagates poisoned state-lock errors

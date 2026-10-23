@@ -329,7 +329,9 @@ impl Wal {
             let current_len = file.metadata()?.len();
             if current_len > 0 && current_len + frame.len() as u64 > self.segment_size_bytes {
                 file.sync_data()?;
-                id += 1;
+                id = id
+                    .checked_add(1)
+                    .ok_or_else(|| RymeError::Corrupt(String::from("wal segment id overflow")))?;
                 path = temporary.join(segment_name(id));
                 file = File::create(&path)?;
             }
