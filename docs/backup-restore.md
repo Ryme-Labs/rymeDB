@@ -22,6 +22,10 @@ WAL segment paths must be regular files; symlinks and other file types are
 rejected during discovery and recovery.
 Local archive objects and restored files are written through unique temporary
 files created exclusively in their destination directories.
+Local and S3 object listings are capped at 100,000 keys and 64 MiB of key
+names. Local listing prefixes must be relative paths; traversal also caps
+visited directories and nesting depth so a large or deeply nested archive
+directory cannot grow the listing stack without bound.
 
 ## Configure retention
 

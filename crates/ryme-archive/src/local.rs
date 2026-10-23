@@ -43,25 +43,49 @@ impl LocalStore {
         root: &std::path::Path,
         out: &mut Vec<String>,
     ) -> Result<()> {
-        if Self::has_symlink_component(root, prefix)? {
-            return Ok(());
-        }
-        let entries = match std::fs::read_dir(prefix) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(RymeError::from(e)),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
+        let mut pending = vec![(prefix.to_path_buf(), 0usize)];
+        let mut visited_directories = 0usize;
+        let mut total_key_bytes = 0usize;
+        while let Some((directory, depth)) = pending.pop() {
+            if Self::has_symlink_component(root, &directory)? {
                 continue;
-            } else if file_type.is_dir() {
-                Self::collect(&path, root, out)?;
-            } else if file_type.is_file() {
-                if let Ok(relative) = path.strip_prefix(root) {
-                    out.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+            visited_directories = visited_directories.saturating_add(1);
+            if visited_directories > super::MAX_ARCHIVE_LIST_DIRECTORIES {
+                return Err(RymeError::Overload(String::from("archive list directories")));
+            }
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(RymeError::from(e)),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                } else if file_type.is_dir() {
+                    if depth >= super::MAX_ARCHIVE_LIST_DEPTH
+                        || pending.len() >= super::MAX_ARCHIVE_LIST_DIRECTORIES
+                    {
+                        return Err(RymeError::Overload(String::from("archive list directories")));
+                    }
+                    pending.push((path, depth + 1));
+                } else if file_type.is_file() {
+                    if out.len() >= super::MAX_ARCHIVE_LIST_KEYS {
+                        return Err(RymeError::Overload(String::from("archive list results")));
+                    }
+                    if let Ok(relative) = path.strip_prefix(root) {
+                        let key = relative.to_string_lossy().replace('\\', "/");
+                        total_key_bytes = total_key_bytes
+                            .checked_add(key.len())
+                            .filter(|bytes| *bytes <= super::MAX_ARCHIVE_LIST_KEY_BYTES)
+                            .ok_or_else(|| {
+                                RymeError::Overload(String::from("archive list results"))
+                            })?;
+                        out.push(key);
+                    }
                 }
             }
         }
@@ -225,6 +249,9 @@ impl crate::ObjectStore for LocalStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        if !prefix.is_empty() && !super::safe_relative_name(prefix) {
+            return Err(RymeError::InvalidArgument(String::from("prefix")));
+        }
         let mut out = Vec::new();
         Self::collect(&self.root.join(prefix), &self.root, &mut out)?;
         out.retain(|key| key.starts_with(prefix));

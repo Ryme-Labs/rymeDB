@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const MAX_ARCHIVE_OBJECT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_ARCHIVE_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ARCHIVE_FILES: usize = 262_144;
+pub(crate) const MAX_ARCHIVE_LIST_KEYS: usize = 100_000;
+pub(crate) const MAX_ARCHIVE_LIST_KEY_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_LIST_DIRECTORIES: usize = 100_000;
+const MAX_ARCHIVE_LIST_DEPTH: usize = 256;
 static NEXT_ARCHIVE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn create_archive_temp_file(path: &Path) -> Result<(PathBuf, File)> {

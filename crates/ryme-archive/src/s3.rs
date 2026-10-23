@@ -2,8 +2,6 @@ use ryme_error::{Result, RymeError};
 
 const MAX_S3_LIST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_S3_LIST_PAGES: usize = 100;
-const MAX_S3_LIST_KEYS: usize = 100_000;
-const MAX_S3_LIST_KEY_BYTES: usize = 64 * 1024 * 1024;
 
 async fn response_bytes_bounded(
     mut response: reqwest::Response,
@@ -232,7 +230,9 @@ impl crate::ObjectStore for S3Store {
                 total_key_bytes = total_key_bytes
                     .checked_add(key.len())
                     .ok_or_else(|| RymeError::Overload(String::from("s3 list results")))?;
-                if out.len() == MAX_S3_LIST_KEYS || total_key_bytes > MAX_S3_LIST_KEY_BYTES {
+                if out.len() == crate::MAX_ARCHIVE_LIST_KEYS
+                    || total_key_bytes > crate::MAX_ARCHIVE_LIST_KEY_BYTES
+                {
                     return Err(RymeError::Overload(String::from("s3 list results")));
                 }
                 out.push(key);
@@ -375,7 +375,7 @@ fn extract_keys(xml: &str) -> Result<Vec<String>> {
         let end = rest
             .find("</Key>")
             .ok_or_else(|| RymeError::Corrupt(String::from("s3 list XML key")))?;
-        if out.len() >= MAX_S3_LIST_KEYS {
+        if out.len() >= crate::MAX_ARCHIVE_LIST_KEYS {
             return Err(RymeError::Overload(String::from("s3 list keys")));
         }
         let key = decode_xml_text(&rest[..end])
