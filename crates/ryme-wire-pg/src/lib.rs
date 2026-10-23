@@ -25,7 +25,7 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 
 pub type PgAuthenticator = Arc<dyn Fn(&str, &str) -> Result<Principal> + Send + Sync>;
 pub type PgAuditHook =
@@ -59,8 +59,16 @@ struct Portal {
 }
 
 enum CopyInState {
-    Receiving { table: String, columns: Vec<String>, data: Vec<u8> },
-    Failed { message: String },
+    Receiving {
+        table: String,
+        columns: Vec<String>,
+        data: Vec<u8>,
+        reserved_units: usize,
+        _budget_permits: Vec<OwnedSemaphorePermit>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 enum DecodedCopy {
@@ -88,6 +96,11 @@ const MAX_SESSION_SETTING_VALUE_BYTES: usize = 64 * 1024;
 const MAX_LISTENING_CHANNELS: usize = 4_096;
 const MAX_NOTIFICATION_CHANNEL_BYTES: usize = 63;
 const MAX_NOTIFICATION_PAYLOAD_BYTES: usize = 8_000;
+const MAX_COPY_BYTES_PER_CONNECTION: usize = 64 * 1024 * 1024;
+const COPY_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const COPY_MEMORY_UNIT_BYTES: usize = 64 * 1024;
+static COPY_MEMORY_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(COPY_MEMORY_BUDGET_BYTES / COPY_MEMORY_UNIT_BYTES)));
 
 fn prepared_state_exceeds_limit(
     statements: &HashMap<String, String>,
@@ -1103,19 +1116,67 @@ where
 
         if copy_in.is_some() {
             match (copy_in.take(), tag) {
-                (Some(CopyInState::Receiving { table, columns, mut data }), b'd') => {
-                    const MAX_COPY_BYTES: usize = 64 * 1024 * 1024;
-                    if data.len().saturating_add(payload.len()) > MAX_COPY_BYTES {
+                (
+                    Some(CopyInState::Receiving {
+                        table,
+                        columns,
+                        mut data,
+                        mut reserved_units,
+                        mut _budget_permits,
+                    }),
+                    b'd',
+                ) => {
+                    let Some(next_len) = data.len().checked_add(payload.len()) else {
                         copy_in = Some(CopyInState::Failed {
-                            message: String::from("COPY data exceeds the 64 MiB limit"),
+                            message: String::from("COPY data size overflow"),
+                        });
+                        continue;
+                    };
+                    if next_len > MAX_COPY_BYTES_PER_CONNECTION {
+                        copy_in = Some(CopyInState::Failed {
+                            message: String::from(
+                                "COPY data exceeds the 64 MiB per-connection limit",
+                            ),
                         });
                     } else {
+                        let required_units = next_len.div_ceil(COPY_MEMORY_UNIT_BYTES);
+                        let additional_units = required_units.saturating_sub(reserved_units);
+                        if additional_units > 0 {
+                            match COPY_MEMORY_BUDGET
+                                .clone()
+                                .try_acquire_many_owned(additional_units as u32)
+                            {
+                                Ok(permit) => _budget_permits.push(permit),
+                                Err(_) => {
+                                    copy_in = Some(CopyInState::Failed {
+                                        message: String::from("COPY memory budget exceeded"),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        if data.try_reserve_exact(payload.len()).is_err() {
+                            copy_in = Some(CopyInState::Failed {
+                                message: String::from("COPY memory allocation failed"),
+                            });
+                            continue;
+                        }
                         data.extend_from_slice(&payload);
-                        copy_in = Some(CopyInState::Receiving { table, columns, data });
+                        reserved_units = required_units;
+                        copy_in = Some(CopyInState::Receiving {
+                            table,
+                            columns,
+                            data,
+                            reserved_units,
+                            _budget_permits,
+                        });
                     }
                     continue;
                 }
-                (Some(CopyInState::Receiving { table, columns, data }), b'c') => {
+                (
+                    Some(CopyInState::Receiving { table, columns, data, _budget_permits, .. }),
+                    b'c',
+                ) => {
                     let response = match decode_copy_rows(
                         &data,
                         &columns,
@@ -1436,6 +1497,8 @@ where
                                     table,
                                     columns,
                                     data: Vec::new(),
+                                    reserved_units: 0,
+                                    _budget_permits: Vec::new(),
                                 });
                                 awaiting_copy = true;
                                 break;

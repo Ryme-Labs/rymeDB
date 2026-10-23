@@ -24,6 +24,8 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
 - Explicit transactions, `SAVEPOINT`, `ROLLBACK TO`, `RELEASE`, and aborted
   transaction state.
 - `COPY FROM STDIN` and `COPY TO STDOUT`, including nulls and escaping.
+- `COPY FROM STDIN` buffers at most 64 MiB per connection and shares a 256 MiB
+  process-wide buffer budget across active COPY sessions.
 - `LISTEN`, `UNLISTEN`, and post-commit `NOTIFY` notifications.
 - Common driver probes such as `version()`, `current_setting`, `SHOW ALL`,
   `SET NAMES`, `SET TIME ZONE`, and `application_name`.

@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- PostgreSQL `COPY FROM STDIN` now shares a process-wide buffer budget, so
+  concurrent COPY sessions cannot each consume their full per-connection cap.
 - RESP inline requests now enforce the same 1,024-argument limit as array
   requests, bounding per-argument allocations for oversized token lists.
 - SQL auto-increment IDs now report exhaustion instead of reusing the maximum
