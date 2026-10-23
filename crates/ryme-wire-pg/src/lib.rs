@@ -1502,9 +1502,19 @@ where
                 }
             },
             b'D' => {
-                let kind = payload.first().copied().unwrap_or(0);
-                let mut offset = 1;
-                let name = read_cstring(&payload, &mut offset).unwrap_or_default();
+                let Some((kind, name)) = parse_describe(&payload) else {
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
+                    socket
+                        .write_all(&encode_error_code(
+                            "08P01",
+                            String::from("malformed Describe message"),
+                        ))
+                        .await
+                        .map_err(|e| RymeError::Io(e.to_string()))?;
+                    continue;
+                };
                 let query = if kind == b'P' {
                     portals.get(&name).and_then(|portal| statements.get(&portal.statement)).cloned()
                 } else {
@@ -1524,7 +1534,19 @@ where
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             b'E' => {
-                let portal = read_cstring(&payload, &mut 0).unwrap_or_default();
+                let Some(portal) = parse_execute(&payload) else {
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
+                    socket
+                        .write_all(&encode_error_code(
+                            "08P01",
+                            String::from("malformed Execute message"),
+                        ))
+                        .await
+                        .map_err(|e| RymeError::Io(e.to_string()))?;
+                    continue;
+                };
                 let was_listening_empty = listening.is_empty();
                 let mut committed_notifications = Vec::new();
                 let response = match portals.get_mut(&portal) {
@@ -1629,12 +1651,23 @@ where
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             b'C' => {
-                if payload.first() == Some(&b'S') {
-                    if let Some(name) = read_cstring(&payload, &mut 1) {
-                        statements.remove(&name);
-                        prepared_cache.remove(&name);
+                let Some((kind, name)) = parse_close(&payload) else {
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
                     }
-                } else if let Some(name) = read_cstring(&payload, &mut 1) {
+                    socket
+                        .write_all(&encode_error_code(
+                            "08P01",
+                            String::from("malformed Close message"),
+                        ))
+                        .await
+                        .map_err(|e| RymeError::Io(e.to_string()))?;
+                    continue;
+                };
+                if kind == b'S' {
+                    statements.remove(&name);
+                    prepared_cache.remove(&name);
+                } else {
                     portals.remove(&name);
                 }
                 socket
@@ -4503,10 +4536,38 @@ fn session_data_row(values: &[String]) -> Vec<u8> {
 }
 
 fn read_cstring(payload: &[u8], offset: &mut usize) -> Option<String> {
-    let end = payload[*offset..].iter().position(|b| *b == 0)?;
-    let value = String::from_utf8_lossy(&payload[*offset..*offset + end]).into_owned();
-    *offset = *offset + end + 1;
+    let remainder = payload.get(*offset..)?;
+    let end = remainder.iter().position(|b| *b == 0)?;
+    let value = String::from_utf8_lossy(&remainder[..end]).into_owned();
+    *offset = (*offset).checked_add(end)?.checked_add(1)?;
     Some(value)
+}
+
+fn parse_describe(payload: &[u8]) -> Option<(u8, String)> {
+    let kind = *payload.first()?;
+    if kind != b'S' && kind != b'P' {
+        return None;
+    }
+    let mut offset = 1;
+    let name = read_cstring(payload, &mut offset)?;
+    (offset == payload.len()).then_some((kind, name))
+}
+
+fn parse_execute(payload: &[u8]) -> Option<String> {
+    let mut offset = 0;
+    let portal = read_cstring(payload, &mut offset)?;
+    let max_rows = read_i32(payload, &mut offset)?;
+    (max_rows >= 0 && offset == payload.len()).then_some(portal)
+}
+
+fn parse_close(payload: &[u8]) -> Option<(u8, String)> {
+    let kind = *payload.first()?;
+    if kind != b'S' && kind != b'P' {
+        return None;
+    }
+    let mut offset = 1;
+    let name = read_cstring(payload, &mut offset)?;
+    (offset == payload.len()).then_some((kind, name))
 }
 
 fn read_i16(payload: &[u8], offset: &mut usize) -> Option<i16> {
