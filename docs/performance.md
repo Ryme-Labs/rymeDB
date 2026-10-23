@@ -546,6 +546,14 @@ still needs work. This is a repeated current-build validation, not a controlled
 before/after experiment. Raw captures are in
 [`bench/results/realtime-writer-batch-100x10000.json`](../bench/results/realtime-writer-batch-100x10000.json).
 
+A separate Windows 11 release run on the AMD Ryzen 5 4500 with the same
+100-connection, 10,000-publish workload delivered all 1,000,000 expected
+messages. It measured 491k–495k fanout deliveries/s, p50 6.756–6.859 ms,
+p95 159.9–176.8 ms, and p99 322.1–332.7 ms. The long tail remains poor, and
+these Windows results are not directly comparable to the Linux capture. Raw
+results are in
+[`bench/results/realtime-shared-bytes-100x10000-windows.json`](../bench/results/realtime-shared-bytes-100x10000-windows.json).
+
 ## How to read the numbers
 
 - Compare the same protocol and acknowledgement semantics.
