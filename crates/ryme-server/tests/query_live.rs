@@ -7,6 +7,23 @@ async fn bind_listener() -> tokio::net::TcpListener {
     tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
 }
 
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_ws(
+    url: String,
+) -> (WsStream, tokio_tungstenite::tungstenite::handshake::client::Response) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = url.into_client_request().unwrap();
+    let authorization = format!("Bearer {KEY}");
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+        authorization.parse().unwrap(),
+    );
+    tokio_tungstenite::connect_async(request).await.unwrap()
+}
+
 fn test_config(dir: &std::path::Path) -> ryme_config::Config {
     let mut base = ryme_config::Config::default();
     base.archive.interval_secs = 0;
@@ -146,8 +163,8 @@ async fn live_query_snapshot_update_reconnect() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (status, _) = http_request(http, "PUT /v1/kv/docs/k1", b"one").await;
     assert_eq!(status, 200);
-    let url = format!("ws://{http}/v1/query-stream?table=docs&limit=100&api_key={KEY}");
-    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/query-stream?table=docs&limit=100");
+    let (mut stream, _) = connect_ws(url).await;
     let snapshot = next_text(&mut stream).await;
     assert_eq!(snapshot["type"], "snapshot");
     assert!(row_pks(&snapshot).contains(&String::from("k1")));
@@ -161,8 +178,8 @@ async fn live_query_snapshot_update_reconnect() {
     assert!(pks.contains(&String::from("k1")));
     assert!(pks.contains(&String::from("k2")));
     stream.close(None).await.unwrap();
-    let url = format!("ws://{http}/v1/query-stream?table=docs&limit=100&api_key={KEY}");
-    let (mut second, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/query-stream?table=docs&limit=100");
+    let (mut second, _) = connect_ws(url).await;
     let snapshot = next_text(&mut second).await;
     assert_eq!(snapshot["type"], "snapshot");
     let pks = row_pks(&snapshot);
@@ -184,9 +201,9 @@ async fn live_query_snapshot_update_reconnect() {
         http_request(http, "PUT /v1/kv/messages/b", br#"{"room":"other","body":"x"}"#).await;
     assert_eq!(status, 200);
     let filtered_url = format!(
-        "ws://{http}/v1/query-stream?table=messages&room=eq.lobby&select=key,body&order=body.asc&api_key={KEY}"
+        "ws://{http}/v1/query-stream?table=messages&room=eq.lobby&select=key,body&order=body.asc"
     );
-    let (mut filtered, _) = tokio_tungstenite::connect_async(filtered_url).await.unwrap();
+    let (mut filtered, _) = connect_ws(filtered_url).await;
     let snapshot = next_text(&mut filtered).await;
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(row_pks(&snapshot), vec![String::from("a")], "{snapshot}");
@@ -237,8 +254,8 @@ async fn live_view_query_updates_from_base_relation() {
         assert_eq!(status, 200, "{sql}: {}", String::from_utf8_lossy(&response));
     }
 
-    let url = format!("ws://{http}/v1/query-stream?table=lobby_messages&limit=100&api_key={KEY}");
-    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/query-stream?table=lobby_messages&limit=100");
+    let (mut stream, _) = connect_ws(url).await;
     let snapshot = next_text(&mut stream).await;
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(row_pks(&snapshot), vec![String::from("a")], "{snapshot}");
@@ -298,8 +315,8 @@ async fn branch_realtime_streams_are_isolated_and_read_branch_snapshots() {
     let (status, _) = http_request(http, "POST /v1/branches", branch_body).await;
     assert_eq!(status, 200);
 
-    let stream_url = format!("ws://{http}/v1/stream?table=docs&branch=preview&api_key={KEY}");
-    let (mut stream, _) = tokio_tungstenite::connect_async(stream_url).await.unwrap();
+    let stream_url = format!("ws://{http}/v1/stream?table=docs&branch=preview");
+    let (mut stream, _) = connect_ws(stream_url).await;
     let (status, _) =
         http_request_branch(http, "preview", "PUT /v1/kv/docs/branch", b"branch-value").await;
     assert_eq!(status, 200);
@@ -312,8 +329,8 @@ async fn branch_realtime_streams_are_isolated_and_read_branch_snapshots() {
     assert!(tokio::time::timeout(Duration::from_millis(500), stream.next()).await.is_err());
     stream.close(None).await.unwrap();
 
-    let query_url = format!("ws://{http}/v1/query-stream?table=docs&branch=preview&api_key={KEY}");
-    let (mut query, _) = tokio_tungstenite::connect_async(query_url).await.unwrap();
+    let query_url = format!("ws://{http}/v1/query-stream?table=docs&branch=preview");
+    let (mut query, _) = connect_ws(query_url).await;
     let snapshot = next_text(&mut query).await;
     assert_eq!(snapshot["type"], "snapshot");
     let pks = row_pks(&snapshot);
@@ -366,8 +383,8 @@ async fn live_broadcast_stream_receives_posts() {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let url = format!("ws://{http}/v1/broadcast/lobby?api_key={KEY}");
-    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/broadcast/lobby");
+    let (mut stream, response) = connect_ws(url).await;
     assert_eq!(response.status(), 101);
     let (status, _) = http_request(
         http,
@@ -411,8 +428,8 @@ async fn broadcast_quota_rejects_before_fanout_without_dropping_subscribers() {
 
     let mut streams = Vec::new();
     for _ in 0..20 {
-        let url = format!("ws://{http}/v1/broadcast/quota-lobby?api_key={KEY}");
-        let (stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let url = format!("ws://{http}/v1/broadcast/quota-lobby");
+        let (stream, response) = connect_ws(url).await;
         assert_eq!(response.status(), 101);
         streams.push(stream);
     }
@@ -489,8 +506,8 @@ async fn supabase_realtime_protocol_joins_heartbeats_and_broadcasts() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let url = format!("ws://{http}/realtime/v1/websocket?apikey={KEY}&vsn=1.0.0");
-    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/realtime/v1/websocket?vsn=1.0.0");
+    let (mut stream, response) = connect_ws(url).await;
     assert_eq!(response.status(), 101);
     stream
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -651,8 +668,8 @@ async fn supabase_realtime_protocol_joins_heartbeats_and_broadcasts() {
     assert!(leave_diff["payload"]["leaves"]["ada"].is_object());
 
     stream.close(None).await.unwrap();
-    let v2_url = format!("ws://{http}/realtime/v1/websocket?apikey={KEY}&vsn=2.0.0");
-    let (mut v2, response) = tokio_tungstenite::connect_async(v2_url).await.unwrap();
+    let v2_url = format!("ws://{http}/realtime/v1/websocket?vsn=2.0.0");
+    let (mut v2, response) = connect_ws(v2_url).await;
     assert_eq!(response.status(), 101);
     v2.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::json!([
@@ -705,8 +722,8 @@ async fn live_presence_stream_snapshots_and_follows_members() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let url = format!("ws://{http}/v1/presence/room/stream?api_key={KEY}");
-    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/presence/room/stream");
+    let (mut stream, response) = connect_ws(url).await;
     assert_eq!(response.status(), 101);
     let snapshot = next_text(&mut stream).await;
     assert_eq!(snapshot["type"], "presence_state");
@@ -763,8 +780,8 @@ async fn live_durable_topic_stream_replays_and_follows() {
         let (status, _) = http_request(http, "POST /v1/topics/append", body.as_bytes()).await;
         assert_eq!(status, 200);
     }
-    let url = format!("ws://{http}/v1/topics/chat/stream?from=0&api_key={KEY}");
-    let (mut stream, response) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/topics/chat/stream?from=0");
+    let (mut stream, response) = connect_ws(url).await;
     assert_eq!(response.status(), 101);
     let first = next_text(&mut stream).await;
     let second = next_text(&mut stream).await;
@@ -803,8 +820,8 @@ async fn live_cdc_stream_resumes_from_commit() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     let _ = put_commit(http, "docs", "r1", "one").await;
-    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}");
-    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/stream?table=docs");
+    let (mut stream, _) = connect_ws(url).await;
     let _ = put_commit(http, "docs", "r2", "two").await;
     let second = next_text(&mut stream).await;
     let commit2 = second.get("commit_ts").and_then(|v| v.as_u64()).unwrap();
@@ -812,8 +829,8 @@ async fn live_cdc_stream_resumes_from_commit() {
     stream.close(None).await.unwrap();
     let commit3 = put_commit(http, "docs", "r3", "three").await;
     assert!(commit3 > commit2);
-    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}&from={commit2}");
-    let (mut resumed, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/stream?table=docs&from={commit2}");
+    let (mut resumed, _) = connect_ws(url).await;
     let replayed = next_text(&mut resumed).await;
     assert_eq!(change_pk(&replayed), "r3", "{replayed}");
     assert_eq!(replayed.get("commit_ts").and_then(|v| v.as_u64()), Some(commit3));
@@ -823,8 +840,8 @@ async fn live_cdc_stream_resumes_from_commit() {
     let sequence4 = live.get("sequence").and_then(|v| v.as_u64()).unwrap();
     resumed.close(None).await.unwrap();
     let _ = put_commit(http, "docs", "r5", "five").await;
-    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}&from_sequence={sequence4}");
-    let (mut exact, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/stream?table=docs&from_sequence={sequence4}");
+    let (mut exact, _) = connect_ws(url).await;
     let replayed = next_text(&mut exact).await;
     assert_eq!(change_pk(&replayed), "r5", "{replayed}");
     exact.close(None).await.unwrap();
@@ -861,8 +878,8 @@ async fn live_query_snapshot_limit_capped() {
     rows.push_str("]}");
     let (status, _) = http_request(http, "POST /v1/sql/copy", rows.as_bytes()).await;
     assert_eq!(status, 200);
-    let url = format!("ws://{http}/v1/query-stream?table=big&limit=999999&api_key={KEY}");
-    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/query-stream?table=big&limit=999999");
+    let (mut stream, _) = connect_ws(url).await;
     let snapshot = next_text(&mut stream).await;
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(row_pks(&snapshot).len(), 1000, "snapshot capped at 1000");
@@ -890,8 +907,8 @@ async fn live_stream_sheds_on_egress_quota() {
         let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let url = format!("ws://{http}/v1/stream?table=docs&api_key={KEY}");
-    let (mut stream, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let url = format!("ws://{http}/v1/stream?table=docs");
+    let (mut stream, _) = connect_ws(url).await;
     let big = "v".repeat(512 * 1024);
     let mut received = 0usize;
     let start = tokio::time::Instant::now();
