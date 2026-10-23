@@ -46,6 +46,8 @@ All notable changes to rymeDB are recorded here. Format follows
   rejected instead of being reported as successful while silently ignored.
 - Raft range-coordination recovery now propagates poisoned state-lock errors
   instead of treating potentially committed work as an empty range.
+- Transaction range replacement now propagates invalid routing-key errors
+  instead of reporting a successful zero-row replacement.
 - Raft transaction-retry workers now log and skip poisoned pending-resolution
   queues rather than silently treating them as empty.
 - Raft transaction routing now propagates invalid scanned-table bounds instead

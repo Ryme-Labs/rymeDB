@@ -1,5 +1,8 @@
 use ryme_error::{Result, RymeError};
-use ryme_storage::{Engine, RecordKey, SegmentCacheStats, SegmentEntry, SegmentStore, StorageMode};
+use ryme_storage::{
+    Engine, RecordKey, SegmentCacheStats, SegmentEntry, SegmentStore, StorageMode,
+    LEGACY_ROUTING_VERSION,
+};
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2320,7 +2323,7 @@ impl TxnManager {
             .engine
             .write()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        Ok(engine.replace_routing_range(start, end, &replacement))
+        engine.replace_routing_range_for_version(LEGACY_ROUTING_VERSION, start, end, &replacement)
     }
 
     pub fn replace_routing_range_for_version(
