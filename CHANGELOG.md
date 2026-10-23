@@ -57,6 +57,8 @@ All notable changes to rymeDB are recorded here. Format follows
   with an additional shared process-wide queue budget.
 - RESP `EXEC` aborts before commit when the combined command replies exceed
   16 MiB.
+- RESP pub/sub shares message buffers and bounds retained-message and concurrent
+  egress memory with separate process-wide budgets.
 - Config file loading now rejects non-regular files and caps reads at 4 MiB.
 - Routing-key capacity calculations now check overflow and report allocation
   failure instead of relying on infallible vector allocation.

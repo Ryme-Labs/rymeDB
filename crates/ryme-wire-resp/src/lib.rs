@@ -28,6 +28,8 @@ const RESP_INPUT_BUDGET_UNIT_BYTES: usize = 16 * 1024;
 const RESP_MULTI_MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const RESP_MULTI_MAX_QUEUE_COMMANDS: usize = 10_000;
 const RESP_MULTI_QUEUE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RESP_PUBSUB_QUEUE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const RESP_PUBSUB_EGRESS_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const RESP_MAX_COMMAND_ARGS: usize = 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
 const RESP_MAX_EXEC_REPLY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
@@ -53,6 +55,12 @@ static RESP_INPUT_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
 });
 static RESP_MULTI_QUEUE_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     Arc::new(Semaphore::new(RESP_MULTI_QUEUE_BUDGET_BYTES / RESP_INPUT_BUDGET_UNIT_BYTES))
+});
+static RESP_PUBSUB_QUEUE_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(RESP_PUBSUB_QUEUE_BUDGET_BYTES / RESP_INPUT_BUDGET_UNIT_BYTES))
+});
+static RESP_PUBSUB_EGRESS_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(RESP_PUBSUB_EGRESS_BUDGET_BYTES / RESP_INPUT_BUDGET_UNIT_BYTES))
 });
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
@@ -145,11 +153,12 @@ struct ClientState {
     pubsub: Option<PubSubBus>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PubSubMessage {
     tenant: String,
     channel: Vec<u8>,
     payload: Vec<u8>,
+    _queue_permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -170,7 +179,7 @@ struct ClusterPubSubBroadcast {
 
 #[derive(Debug, Clone)]
 struct PubSubBus {
-    sender: broadcast::Sender<PubSubMessage>,
+    sender: broadcast::Sender<Arc<PubSubMessage>>,
     counts: PubSubCounts,
     pattern_counts: PubSubCounts,
     total_subscriptions: Arc<AtomicUsize>,
@@ -187,8 +196,43 @@ fn new_pubsub() -> PubSubBus {
     }
 }
 
+fn reserve_pubsub_message(
+    tenant: String,
+    channel: Vec<u8>,
+    payload: Vec<u8>,
+) -> Option<Arc<PubSubMessage>> {
+    let bytes = std::mem::size_of::<PubSubMessage>()
+        .checked_add(tenant.len())?
+        .checked_add(channel.len())?
+        .checked_add(payload.len())?;
+    if bytes > RESP_PUBSUB_QUEUE_BUDGET_BYTES {
+        return None;
+    }
+    let units = bytes.div_ceil(RESP_INPUT_BUDGET_UNIT_BYTES).max(1);
+    let permit =
+        RESP_PUBSUB_QUEUE_BUDGET.clone().try_acquire_many_owned(u32::try_from(units).ok()?).ok()?;
+    Some(Arc::new(PubSubMessage { tenant, channel, payload, _queue_permit: permit }))
+}
+
+fn reserve_pubsub_egress(
+    message: &PubSubMessage,
+    extra_bytes: usize,
+) -> Option<OwnedSemaphorePermit> {
+    let bytes = message
+        .channel
+        .len()
+        .checked_add(message.payload.len())?
+        .checked_add(extra_bytes)?
+        .checked_add(128)?;
+    if bytes > RESP_PUBSUB_EGRESS_BUDGET_BYTES {
+        return None;
+    }
+    let units = bytes.div_ceil(RESP_INPUT_BUDGET_UNIT_BYTES).max(1);
+    RESP_PUBSUB_EGRESS_BUDGET.clone().try_acquire_many_owned(u32::try_from(units).ok()?).ok()
+}
+
 impl PubSubBus {
-    fn subscribe(&self) -> broadcast::Receiver<PubSubMessage> {
+    fn subscribe(&self) -> broadcast::Receiver<Arc<PubSubMessage>> {
         self.sender.subscribe()
     }
 
@@ -269,10 +313,11 @@ impl PubSubBus {
         }
     }
 
-    fn publish(&self, tenant: &str, channel: Vec<u8>, payload: Vec<u8>) -> usize {
+    fn publish(&self, tenant: &str, channel: Vec<u8>, payload: Vec<u8>) -> Option<usize> {
         let delivered = self.delivered_count(tenant, &channel);
-        let _ = self.sender.send(PubSubMessage { tenant: tenant.to_string(), channel, payload });
-        delivered
+        let message = reserve_pubsub_message(tenant.to_string(), channel, payload)?;
+        let _ = self.sender.send(message);
+        Some(delivered)
     }
 
     fn delivered_count(&self, tenant: &str, channel: &[u8]) -> usize {
@@ -315,11 +360,14 @@ impl PubSubBus {
                         else {
                             continue;
                         };
-                        let _ = sender.send(PubSubMessage {
-                            tenant: tenant.clone(),
-                            channel: message.channel,
-                            payload: message.payload,
-                        });
+                        let Some(message) = reserve_pubsub_message(
+                            tenant.clone(),
+                            message.channel,
+                            message.payload,
+                        ) else {
+                            continue;
+                        };
+                        let _ = sender.send(message);
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -1276,25 +1324,9 @@ where
                         if message.tenant == client.tenant
                             && client.subscriptions.contains(&message.channel)
                         {
-                            let reply = encode_raw_array(vec![
-                                encode_bulk(b"message"),
-                                encode_bulk(&message.channel),
-                                encode_bulk(&message.payload),
-                            ]);
-                            let reply = if client.resp3 {
-                                resp3_push(&reply).unwrap_or(reply)
-                            } else {
-                                reply
-                            };
-                            writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                        }
-                        for pattern in &client.patterns {
-                            if message.tenant == client.tenant
-                                && glob_match(pattern, &message.channel)
-                            {
+                            if let Some(_permit) = reserve_pubsub_egress(&message, 0) {
                                 let reply = encode_raw_array(vec![
-                                    encode_bulk(b"pmessage"),
-                                    encode_bulk(pattern),
+                                    encode_bulk(b"message"),
                                     encode_bulk(&message.channel),
                                     encode_bulk(&message.payload),
                                 ]);
@@ -1304,6 +1336,26 @@ where
                                     reply
                                 };
                                 writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                            }
+                        }
+                        for pattern in &client.patterns {
+                            if message.tenant == client.tenant
+                                && glob_match(pattern, &message.channel)
+                            {
+                                if let Some(_permit) = reserve_pubsub_egress(&message, pattern.len()) {
+                                    let reply = encode_raw_array(vec![
+                                        encode_bulk(b"pmessage"),
+                                        encode_bulk(pattern),
+                                        encode_bulk(&message.channel),
+                                        encode_bulk(&message.payload),
+                                    ]);
+                                    let reply = if client.resp3 {
+                                        resp3_push(&reply).unwrap_or(reply)
+                                    } else {
+                                        reply
+                                    };
+                                    writer.write_all(&reply).await.map_err(|e| RymeError::Io(e.to_string()))?;
+                                }
                             }
                         }
                     }
@@ -2024,10 +2076,13 @@ where
     }
 
     fn publish_pubsub(&self, channel: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
-        let delivered = self.pubsub.delivered_count(&self.tenant, &channel);
         let Some(realtime) = self.realtime.clone() else {
-            return encode_integer(self.pubsub.publish(&self.tenant, channel, payload) as i64);
+            return match self.pubsub.publish(&self.tenant, channel, payload) {
+                Some(delivered) => encode_integer(delivered as i64),
+                None => encode_error(String::from("pubsub memory budget exceeded")),
+            };
         };
+        let delivered = self.pubsub.delivered_count(&self.tenant, &channel);
         self.start_realtime_pubsub();
         let message = match serde_json::to_value(ClusterPubSubMessage { channel, payload }) {
             Ok(message) => message,

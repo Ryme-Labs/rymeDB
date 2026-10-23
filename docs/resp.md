@@ -48,6 +48,11 @@ cannot reserve input memory from that budget.
 `KEYS` uses the same result limits and returns an error if the keyspace matches
 more. Scan pages read four records at a time to bound temporary memory.
 `MGET` returns an error when the combined value bytes exceed 16 MiB.
+Pub/sub shares a 64 MiB budget for retained messages and another 64 MiB budget
+for concurrent socket writes. Delivery is best effort: local `PUBLISH` returns
+an error when the retained-message budget is full, and cluster or subscriber
+delivery may drop messages under memory pressure or when a receiver falls
+behind.
 
 ## Transaction notes
 
