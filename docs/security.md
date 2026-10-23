@@ -18,6 +18,12 @@ Encrypt sensitive attachments and remove credentials, customer data, JWTs,
 private URLs, and production archive details. We may ask for a sanitized
 reproduction or a temporary test key.
 
+## CI supply chain
+
+External GitHub Actions are pinned to full commit SHAs, with inline release
+references so weekly Dependabot updates can propose newer versions. Review
+those updates as executable supply-chain changes.
+
 ## Deployment baseline
 
 - Use a non-root container or service account; the published image runs as

@@ -24,6 +24,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- GitHub Actions dependencies now use verified full commit SHAs, with weekly
+  Dependabot updates keeping their release tags current.
 - TLS certificate, key, and CA inputs are capped at 4 MiB each, including
   file-based and byte-based constructors.
 - Local archive object reads verify the opened file identity to detect symlink
