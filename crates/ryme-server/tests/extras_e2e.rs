@@ -290,6 +290,7 @@ async fn extras_auth_presence_topics_mask() {
         resp_listen: resp,
         http_listen: http,
         native_listen: Some(native),
+        passkey_rp_id: String::from("localhost"),
         ..Config::default()
     };
     let server = tokio::spawn(async move {
