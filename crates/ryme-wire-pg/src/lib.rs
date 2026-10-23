@@ -1057,10 +1057,13 @@ where
         };
 
         if cancellation.swap(false, Ordering::Acquire) && copy_in.is_none() {
+            if let Some(transaction) = active_transaction.as_mut() {
+                transaction.failed = true;
+            }
             let response =
                 encode_error_code("57014", String::from("canceling statement due to user request"));
             socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-            send_ready(&mut socket).await?;
+            send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
             continue;
         }
 
@@ -1211,14 +1214,22 @@ where
                         Some(denied) => denied,
                         None => response,
                     };
+                    if response.first() == Some(&b'E') {
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
+                    }
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                    send_ready(&mut socket).await?;
+                    send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
                 (Some(CopyInState::Receiving { .. }), b'f') => {
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
                     let response = encode_error_code("57014", copy_fail_message(&payload));
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                    send_ready(&mut socket).await?;
+                    send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
                 (Some(CopyInState::Failed { message }), b'd') => {
@@ -1226,17 +1237,23 @@ where
                     continue;
                 }
                 (Some(CopyInState::Failed { message }), b'c' | b'f') => {
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
                     let response = encode_error_code("22P04", message);
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                    send_ready(&mut socket).await?;
+                    send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
                 (Some(CopyInState::Receiving { .. }), _)
                 | (Some(CopyInState::Failed { .. }), _) => {
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
                     let response =
                         encode_error_code("08P01", String::from("unexpected message during COPY"));
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                    send_ready(&mut socket).await?;
+                    send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                     continue;
                 }
                 (None, _) => unreachable!(),
@@ -1437,7 +1454,7 @@ where
                 };
                 socket.write_all(&out).await.map_err(|e| RymeError::Io(e.to_string()))?;
                 if !awaiting_copy {
-                    send_ready(&mut socket).await?;
+                    send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
                 }
             }
             b'P' => match parse_prepare(&payload) {
@@ -1681,13 +1698,17 @@ where
                     .await
                     .map_err(|e| RymeError::Io(e.to_string()))?;
             }
-            b'S' | b'H' => {
-                send_ready(&mut socket).await?;
+            b'S' => {
+                send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
             }
+            b'H' => socket.flush().await.map_err(|e| RymeError::Io(e.to_string()))?,
             _ => {
+                if let Some(transaction) = active_transaction.as_mut() {
+                    transaction.failed = true;
+                }
                 let response = encode_error(String::from("unsupported"));
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                send_ready(&mut socket).await?;
+                send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
             }
         }
     }
@@ -5050,6 +5071,22 @@ where
 {
     let packet = frame(b'Z', b"I");
     socket.write_all(&packet).await.map_err(|e| RymeError::Io(e.to_string()))?;
+    Ok(())
+}
+
+async fn send_ready_for_transaction<S>(
+    socket: &mut S,
+    transaction: Option<&SessionTransaction>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let status = match transaction {
+        Some(transaction) if transaction.failed => b'E',
+        Some(_) => b'T',
+        None => b'I',
+    };
+    socket.write_all(&frame(b'Z', &[status])).await.map_err(|e| RymeError::Io(e.to_string()))?;
     Ok(())
 }
 
