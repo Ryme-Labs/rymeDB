@@ -2,7 +2,10 @@ openapi: 3.0.3
 info:
   title: rymeDB REST API
   version: 2.0.3
-  description: Operator and data-plane HTTP API for a rymeDB node.
+  description: >-
+    Operator and data-plane HTTP API for a rymeDB node. Requests may receive
+    429 Too Many Requests when the node's bounded HTTP request concurrency
+    budget is full.
 servers:
   - url: http://127.0.0.1:8080
 security:

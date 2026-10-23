@@ -3533,7 +3533,14 @@ async fn http_request_limit(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let _permit = state.http_request_slots.clone().acquire_owned().await;
+    let _permit = match state.http_request_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(ryme_error::RymeError::Overload(String::from(
+                "HTTP request capacity",
+            )))
+        }
+    };
     next.run(request).await
 }
 

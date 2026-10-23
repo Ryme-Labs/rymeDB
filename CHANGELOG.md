@@ -24,6 +24,9 @@ All notable changes to rymeDB are recorded here. Format follows
 - PostgreSQL protocol messages must finish within 15 seconds after their first
   byte, preventing partial frames from holding connection slots indefinitely;
   idle pooled connections remain open.
+- HTTP request admission now rejects requests with `429 Too Many Requests`
+  when the configured request-concurrency budget is full instead of queueing
+  additional handlers without a bound.
 - WAL segment readers and append handles verify opened file identity to detect
   symlink swaps during recovery or writes.
 - WAL recovery rejects symlinked rewrite markers and staging directories before
