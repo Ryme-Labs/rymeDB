@@ -127,6 +127,16 @@ const MAX_PENDING_GROUP_COMMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SHARD_METADATA_BYTES: usize = 64 * 1024 * 1024;
 static NEXT_METADATA_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+fn configure_private_file(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<()> {
     let parent =
@@ -146,7 +156,10 @@ fn persist_metadata_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let (temporary, mut file) = loop {
         let id = NEXT_METADATA_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temporary = path.with_extension(format!("json.tmp-{}-{id}", std::process::id()));
-        match OpenOptions::new().write(true).create_new(true).open(&temporary) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_private_file(&mut options);
+        match options.open(&temporary) {
             Ok(file) => break (temporary, file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -188,8 +201,12 @@ fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<V
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
             return Err(RymeError::Corrupt(format!("{label} file identity")));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
     let file_len = metadata.len();
