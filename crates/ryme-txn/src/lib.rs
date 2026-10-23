@@ -29,6 +29,37 @@ const MIN_ORDERED_BATCH_READ_KEYS: usize = 16;
 const MAX_SNAPSHOT_POINTER_BYTES: usize = 64;
 static NEXT_SNAPSHOT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+fn configure_private_file(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+fn verify_snapshot_file(path_metadata: &std::fs::Metadata, file: &File, label: &str) -> Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RymeError::Corrupt(label.to_string()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err(RymeError::Corrupt(format!("{label} identity")));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path_metadata;
+    Ok(())
+}
+
 fn transaction_key_bytes(key: &RecordKey) -> usize {
     TRANSACTION_ENTRY_OVERHEAD
         .saturating_add(key.tenant.len())
@@ -80,7 +111,10 @@ fn create_snapshot_temp(dir: &Path, name: &str) -> Result<(std::path::PathBuf, F
     loop {
         let id = NEXT_SNAPSHOT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), id));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_private_file(&mut options);
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -136,17 +170,8 @@ fn read_snapshot_file(path: &Path) -> Result<Vec<u8>> {
         return Err(RymeError::Corrupt(String::from("snapshot file type")));
     }
     let file = std::fs::File::open(path)?;
+    verify_snapshot_file(&path_metadata, &file, "snapshot file")?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(RymeError::Corrupt(String::from("snapshot file type")));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
-            return Err(RymeError::Corrupt(String::from("snapshot file identity")));
-        }
-    }
     let length = metadata.len();
     if length > ryme_storage::MAX_SNAPSHOT_BYTES as u64 {
         return Err(RymeError::Overload(String::from("snapshot")));
@@ -175,17 +200,8 @@ fn read_snapshot_pointer(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    verify_snapshot_file(&path_metadata, &file, "snapshot pointer file")?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(RymeError::Corrupt(String::from("snapshot pointer file type")));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
-            return Err(RymeError::Corrupt(String::from("snapshot pointer file identity")));
-        }
-    }
     if metadata.len() > MAX_SNAPSHOT_POINTER_BYTES as u64 {
         return Err(RymeError::Corrupt(String::from("snapshot pointer")));
     }

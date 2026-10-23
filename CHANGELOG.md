@@ -31,6 +31,8 @@ All notable changes to rymeDB are recorded here. Format follows
   0600 on Unix.
 - Existing WAL segment and storage data/metadata files with broader Unix
   permissions are tightened to mode 0600 through the verified open handle.
+- Snapshot data and latest-pointer files are created with Unix mode 0600, and
+  broader permissions on existing snapshots are repaired when opened.
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
 - Storage segment, pointer, and compaction-marker publication now uses unique
