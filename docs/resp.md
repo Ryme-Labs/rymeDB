@@ -55,7 +55,8 @@ Commands inside `MULTI` execute against one transaction. A queue is limited to
 10,000 commands and 16 MiB per connection; active queues also share a 256 MiB
 process-wide memory budget. A command rejected by these limits marks the queue
 dirty, so `EXEC` aborts. Blocking list and stream reads wake on commits and take
-a fresh transaction for each check.
+a fresh transaction for each check. The aggregate `EXEC` reply is limited to
+16 MiB; exceeding it aborts the transaction before commit.
 Sorted sets use score ordering with lexicographic member tie-breaks. Stream
 consumer groups and pending entries are persisted with the stream document.
 

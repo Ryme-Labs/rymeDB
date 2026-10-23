@@ -30,6 +30,7 @@ const RESP_MULTI_MAX_QUEUE_COMMANDS: usize = 10_000;
 const RESP_MULTI_QUEUE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const RESP_MAX_COMMAND_ARGS: usize = 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
+const RESP_MAX_EXEC_REPLY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
 const RESP_SCAN_PAGE_ITEMS: usize = 4;
 const RESP_MAX_SCAN_RESULT_ITEMS: usize = 10_000;
 const RESP_MAX_SCAN_RESULT_KEY_BYTES: usize = RESP_MAX_COLLECTION_BYTES;
@@ -1472,8 +1473,20 @@ where
                         }
                     }
                     let mut replies = Vec::with_capacity(state.queue.len());
+                    let mut reply_bytes = 0usize;
                     for queued in &state.queue {
-                        replies.push(self.dispatch_in(&mut txn, queued.clone()));
+                        let reply = self.dispatch_in(&mut txn, queued.clone());
+                        let Some(next_reply_bytes) = reply_bytes
+                            .checked_add(reply.len())
+                            .filter(|bytes| *bytes <= RESP_MAX_EXEC_REPLY_BYTES)
+                        else {
+                            self.record_timing("EXEC", start.elapsed().as_micros() as u64);
+                            return encode_error(String::from(
+                                "EXEC reply exceeds the 16 MiB limit; transaction aborted",
+                            ));
+                        };
+                        reply_bytes = next_reply_bytes;
+                        replies.push(reply);
                     }
                     if let Err(error) = txn.ensure_healthy() {
                         self.record_timing("EXEC", start.elapsed().as_micros() as u64);
