@@ -31,6 +31,8 @@ All notable changes to rymeDB are recorded here. Format follows
   of omitting affected ranges from distributed coordination.
 - Raft range writes now surface local suffix-truncation failures after quorum
   or transaction-commit errors instead of reporting a clean abort.
+- Raft range heartbeats now stop when leader/contact metadata cannot be
+  persisted, preserving the durable election-state boundary.
 
 ### Performance
 

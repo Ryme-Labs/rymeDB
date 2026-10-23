@@ -1749,7 +1749,14 @@ impl Node {
                             current.last_contact_ms = now;
                         }
                     }
-                    let _ = self.persist_range_meta();
+                    if let Err(error) = self.persist_range_meta() {
+                        tracing::error!(
+                            group_id = %range.id,
+                            %error,
+                            "range heartbeat metadata persistence failed"
+                        );
+                        continue;
+                    }
                     match self.range_heartbeat(&range.id).await {
                         Ok(()) => {
                             if let Ok(mut leaders) = self.range_leaders.write() {
@@ -1769,7 +1776,14 @@ impl Node {
                         current.last_contact_ms = now;
                     }
                 }
-                let _ = self.persist_range_meta();
+                if let Err(error) = self.persist_range_meta() {
+                    tracing::error!(
+                        group_id = %range.id,
+                        %error,
+                        "range contact metadata persistence failed"
+                    );
+                    continue;
+                }
                 continue;
             }
             if now.saturating_sub(state.last_contact_ms) >= self.range_timeout_ms(&range.id) {
