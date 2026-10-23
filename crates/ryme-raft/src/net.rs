@@ -4929,11 +4929,8 @@ impl Node {
         for (tenant, database, table) in
             txn.scanned_tables().iter().chain(txn.constraint_scanned_tables().iter())
         {
-            let Ok((prefix, end)) =
-                ryme_storage::table_routing_bounds(routing_version, tenant, database, table)
-            else {
-                continue;
-            };
+            let (prefix, end) =
+                ryme_storage::table_routing_bounds(routing_version, tenant, database, table)?;
             for range in &ranges {
                 let starts_before_end = end.is_empty() || range.start.as_slice() < end.as_slice();
                 let ends_after_start =

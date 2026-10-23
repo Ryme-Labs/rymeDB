@@ -27,6 +27,8 @@ All notable changes to rymeDB are recorded here. Format follows
   instead of treating potentially committed work as an empty range.
 - Raft transaction-retry workers now log and skip poisoned pending-resolution
   queues rather than silently treating them as empty.
+- Raft transaction routing now propagates invalid scanned-table bounds instead
+  of omitting affected ranges from distributed coordination.
 
 ### Performance
 
