@@ -1655,7 +1655,9 @@ impl Node {
                 continue;
             }
             if now.saturating_sub(state.last_contact_ms) >= self.range_timeout_ms(&range.id) {
-                self.campaign_range(&range).await;
+                if let Err(error) = self.campaign_range(&range).await {
+                    tracing::warn!(group_id = %range.id, %error, "range election failed");
+                }
             }
         }
     }
@@ -1668,8 +1670,7 @@ impl Node {
             return Err(RymeError::Unavailable(String::from("not range leader")));
         }
         let state = self.ensure_range_group(group_id, self.id);
-        let last_index = self.range_last_index(group_id);
-        let last_term = if last_index == 0 { 0 } else { self.range_last_term(group_id) };
+        let (last_index, last_term) = self.try_range_last_position(group_id)?;
         for replica in range.replicas.iter().copied().filter(|replica| *replica != self.id) {
             let _ = self
                 .sync_range_replica(
@@ -1737,13 +1738,13 @@ impl Node {
         while next_index <= leader_last {
             let index = next_index;
             let record = self
-                .range_entry(group_id, index)
+                .try_range_entry(group_id, index)?
                 .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
             let prev_index = index - 1;
             let prev_term = if prev_index == 0 {
                 0
             } else {
-                self.range_entry(group_id, prev_index)
+                self.try_range_entry(group_id, prev_index)?
                     .map(|entry| entry.term)
                     .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?
             };
@@ -1855,18 +1856,22 @@ impl Node {
         }
     }
 
-    async fn campaign_range(self: &Arc<Self>, range: &RangeOwner) {
+    async fn campaign_range(self: &Arc<Self>, range: &RangeOwner) -> Result<()> {
+        let (last_index, last_term) = self.try_range_last_position(&range.id)?;
         let (term, last_term, last_index) = {
-            let mut groups = self.range_groups.lock().unwrap_or_else(|error| error.into_inner());
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
             let state = groups.entry(range.id.clone()).or_default();
             if state.leader == Some(self.id) {
-                return;
+                return Ok(());
             }
             state.term = state.term.max(1).saturating_add(1);
             state.voted_for = Some(self.id);
             state.leader = None;
             state.last_contact_ms = now_ms();
-            (state.term, self.range_last_term(&range.id), self.range_last_index(&range.id))
+            (state.term, last_term, last_index)
         };
         let _ = self.persist_range_meta();
         let mut votes = vec![self.id];
@@ -1889,7 +1894,7 @@ impl Node {
             if let Rpc::RangeVoteResponse { term: peer_term, granted } = response {
                 if peer_term > term {
                     self.observe_range_term(&range.id, peer_term);
-                    return;
+                    return Ok(());
                 }
                 if granted && !votes.contains(&replica) {
                     votes.push(replica);
@@ -1897,7 +1902,7 @@ impl Node {
             }
         }
         if votes.len() < majority(range.replicas.len()) {
-            return;
+            return Ok(());
         }
         let won = if let Ok(mut groups) = self.range_groups.lock() {
             let state = groups.entry(range.id.clone()).or_default();
@@ -1913,7 +1918,7 @@ impl Node {
             false
         };
         if !won {
-            return;
+            return Ok(());
         }
         if let Ok(mut leaders) = self.range_leaders.write() {
             leaders.insert(range.id.clone(), self.id);
@@ -1921,6 +1926,7 @@ impl Node {
         let _ = self.persist_range_meta();
         let _ = self.range_heartbeat(&range.id).await;
         self.recover_range_coordinations_for_group(&range.id).await;
+        Ok(())
     }
 
     async fn recover_range_coordinations_for_group(self: &Arc<Self>, group_id: &str) {
@@ -1977,29 +1983,28 @@ impl Node {
         candidate: usize,
         last_term: u64,
         last_index: u64,
-    ) -> (u64, bool) {
-        let Some(range) = self
-            .try_range_owners()
-            .ok()
-            .and_then(|ranges| ranges.into_iter().find(|range| range.id == group_id))
+    ) -> Result<(u64, bool)> {
+        let Some(range) = self.try_range_owners()?.into_iter().find(|range| range.id == group_id)
         else {
-            return (self.range_term(group_id), false);
+            return Ok((self.range_term(group_id), false));
         };
         if !range.replicas.contains(&self.id) || !range.replicas.contains(&candidate) {
-            return (self.range_term(group_id), false);
+            return Ok((self.range_term(group_id), false));
         }
-        let mut groups = self.range_groups.lock().unwrap_or_else(|error| error.into_inner());
+        let (local_last_index, local_last_term) = self.try_range_last_position(group_id)?;
+        let mut groups = self
+            .range_groups
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
         let state = groups.entry(group_id.to_string()).or_default();
         if term < state.term {
-            return (state.term.max(1), false);
+            return Ok((state.term.max(1), false));
         }
         if term > state.term {
             state.term = term;
             state.voted_for = None;
             state.leader = None;
         }
-        let local_last_term = self.range_last_term(group_id);
-        let local_last_index = self.range_last_index(group_id);
         let current_vote = state.voted_for;
         let up_to_date = last_term > local_last_term
             || (last_term == local_last_term && last_index >= local_last_index);
@@ -2014,7 +2019,7 @@ impl Node {
         if granted {
             let _ = self.persist_range_meta();
         }
-        (response_term, granted)
+        Ok((response_term, granted))
     }
 
     async fn main_loop(self: Arc<Self>) {
@@ -2743,7 +2748,7 @@ impl Node {
             }
             Rpc::RangeVoteRequest { group_id, term, candidate, last_term, last_index } => {
                 let (term, granted) =
-                    self.handle_range_vote(&group_id, term, candidate, last_term, last_index);
+                    self.handle_range_vote(&group_id, term, candidate, last_term, last_index)?;
                 Ok(Rpc::RangeVoteResponse { term, granted })
             }
             Rpc::RangeCommit { group_id, commit_ts, writes } => {
@@ -2804,7 +2809,7 @@ impl Node {
                     Err(error) => Ok(Rpc::RangeAppendResponse {
                         term: self.range_term(&group_id),
                         appended: false,
-                        last_index: self.range_last_index(&group_id),
+                        last_index: self.try_range_last_index(&group_id)?,
                         conflict_index: self.range_conflict_index(
                             &group_id,
                             prev_index,
@@ -2815,7 +2820,7 @@ impl Node {
                             &writes,
                             publish_data,
                             &kind,
-                        ),
+                        )?,
                         error: Some(error.into()),
                     }),
                 }
@@ -3559,7 +3564,7 @@ impl Node {
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
         }
-        if self.range_resolution(group_id, transaction_id, commit_ts) == Some(false) {
+        if self.try_range_resolution(group_id, transaction_id, commit_ts)? == Some(false) {
             return Err(RymeError::Conflict(String::from("transaction already aborted")));
         }
         let txn = self.manager.from_state(state.clone())?;
@@ -3600,7 +3605,7 @@ impl Node {
         if range.owner != self.id {
             return Err(RymeError::Unavailable(String::from("not range leader")));
         }
-        if let Some(previous) = self.range_resolution(group_id, transaction_id, commit_ts) {
+        if let Some(previous) = self.try_range_resolution(group_id, transaction_id, commit_ts)? {
             if previous == committed {
                 return Ok(());
             }
@@ -3871,30 +3876,58 @@ impl Node {
         range
     }
 
-    fn range_last_index(&self, group_id: &str) -> u64 {
-        self.range_logs.lock().ok().and_then(|logs| logs.get(group_id).copied()).unwrap_or(0)
-    }
-
-    fn range_last_term(&self, group_id: &str) -> u64 {
-        let last = self.range_last_index(group_id);
-        self.range_entries
+    fn try_range_last_index(&self, group_id: &str) -> Result<u64> {
+        let logs = self
+            .range_logs
             .lock()
-            .ok()
-            .and_then(|groups| groups.get(group_id)?.get(&last).map(|record| record.term))
-            .unwrap_or(0)
+            .map_err(|_| RymeError::Internal(String::from("range log lock")))?;
+        Ok(logs.get(group_id).copied().unwrap_or(0))
     }
 
-    fn range_entry(&self, group_id: &str, index: u64) -> Option<RangeLogRecord> {
-        self.range_entries.lock().ok().and_then(|groups| groups.get(group_id)?.get(&index).cloned())
+    fn try_range_last_term(&self, group_id: &str) -> Result<u64> {
+        self.try_range_last_position(group_id).map(|(_, term)| term)
     }
 
-    fn range_resolution(
+    fn try_range_last_position(&self, group_id: &str) -> Result<(u64, u64)> {
+        let logs = self
+            .range_logs
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range log lock")))?;
+        let last = logs.get(group_id).copied().unwrap_or(0);
+        if last == 0 {
+            return Ok((0, 0));
+        }
+        let entries = self
+            .range_entries
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range entries lock")))?;
+        let term = entries
+            .get(group_id)
+            .and_then(|group| group.get(&last))
+            .map(|record| record.term)
+            .ok_or_else(|| RymeError::Corrupt(String::from("range log gap")))?;
+        Ok((last, term))
+    }
+
+    fn try_range_entry(&self, group_id: &str, index: u64) -> Result<Option<RangeLogRecord>> {
+        let entries = self
+            .range_entries
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range entries lock")))?;
+        Ok(entries.get(group_id).and_then(|group| group.get(&index).cloned()))
+    }
+
+    fn try_range_resolution(
         &self,
         group_id: &str,
         transaction_id: u128,
         commit_ts: u64,
-    ) -> Option<bool> {
-        self.range_entries.lock().ok()?.get(group_id)?.values().find_map(|record| {
+    ) -> Result<Option<bool>> {
+        let entries = self
+            .range_entries
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range entries lock")))?;
+        Ok(entries.get(group_id).into_iter().flat_map(|group| group.values()).find_map(|record| {
             if record.commit_ts != commit_ts {
                 return None;
             }
@@ -3906,7 +3939,32 @@ impl Node {
                 }
                 _ => None,
             }
-        })
+        }))
+    }
+
+    #[cfg(test)]
+    fn range_last_index(&self, group_id: &str) -> u64 {
+        self.try_range_last_index(group_id).unwrap()
+    }
+
+    #[cfg(test)]
+    fn range_last_term(&self, group_id: &str) -> u64 {
+        self.try_range_last_term(group_id).unwrap()
+    }
+
+    #[cfg(test)]
+    fn range_entry(&self, group_id: &str, index: u64) -> Option<RangeLogRecord> {
+        self.try_range_entry(group_id, index).unwrap()
+    }
+
+    #[cfg(test)]
+    fn range_resolution(
+        &self,
+        group_id: &str,
+        transaction_id: u128,
+        commit_ts: u64,
+    ) -> Option<bool> {
+        self.try_range_resolution(group_id, transaction_id, commit_ts).unwrap()
     }
 
     fn ensure_range_group(&self, group_id: &str, leader: usize) -> RangeGroupState {
@@ -3990,25 +4048,24 @@ impl Node {
         .map_err(|error| RymeError::Internal(format!("range log: {error}")))?;
         let mut wal =
             self.range_wal.lock().map_err(|_| RymeError::Internal(String::from("range wal")))?;
+        let mut entries = self
+            .range_entries
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range entries")))?;
         wal.append(commit_ts, &record)?;
         wal.sync()?;
-        self.range_entries
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("range entries")))?
-            .entry(group_id.to_string())
-            .or_default()
-            .insert(
+        entries.entry(group_id.to_string()).or_default().insert(
+            index,
+            RangeLogRecord {
+                group_id: group_id.to_string(),
                 index,
-                RangeLogRecord {
-                    group_id: group_id.to_string(),
-                    index,
-                    term,
-                    commit_ts,
-                    writes: encoded_writes.to_vec(),
-                    publish_data,
-                    kind,
-                },
-            );
+                term,
+                commit_ts,
+                writes: encoded_writes.to_vec(),
+                publish_data,
+                kind,
+            },
+        );
         logs.insert(group_id.to_string(), index);
         Ok(index)
     }
@@ -4025,6 +4082,14 @@ impl Node {
             return Err(RymeError::Conflict(String::from("committed range suffix")));
         }
 
+        let mut logs =
+            self.range_logs.lock().map_err(|_| RymeError::Internal(String::from("range log")))?;
+        let mut wal =
+            self.range_wal.lock().map_err(|_| RymeError::Internal(String::from("range wal")))?;
+        let mut entries = self
+            .range_entries
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("range entries")))?;
         let records = Wal::read_all(&self.range_wal_path)?;
         let mut kept = Vec::with_capacity(records.len());
         for record in &records {
@@ -4035,25 +4100,18 @@ impl Node {
             }
         }
         if kept.len() != records.len() {
-            self.range_wal
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("range wal")))?
-                .replace_records(&kept)?;
+            wal.replace_records(&kept)?;
         }
-        if let Ok(mut entries) = self.range_entries.lock() {
-            if let Some(group) = entries.get_mut(group_id) {
-                group.retain(|index, _| *index <= keep_through);
-                if group.is_empty() {
-                    entries.remove(group_id);
-                }
+        if let Some(group) = entries.get_mut(group_id) {
+            group.retain(|index, _| *index <= keep_through);
+            if group.is_empty() {
+                entries.remove(group_id);
             }
         }
-        if let Ok(mut logs) = self.range_logs.lock() {
-            if keep_through == 0 {
-                logs.remove(group_id);
-            } else {
-                logs.insert(group_id.to_string(), keep_through);
-            }
+        if keep_through == 0 {
+            logs.remove(group_id);
+        } else {
+            logs.insert(group_id.to_string(), keep_through);
         }
         Ok(())
     }
@@ -4186,32 +4244,36 @@ impl Node {
         encoded_writes: &[u8],
         publish_data: bool,
         kind: &RangeEntryKind,
-    ) -> Option<u64> {
-        let last = self.range_last_index(group_id);
+    ) -> Result<Option<u64>> {
+        let last = self.try_range_last_index(group_id)?;
         if prev_index > last {
-            return Some(last + 1);
+            return Ok(Some(last.saturating_add(1)));
         }
-        if prev_index > 0
-            && self.range_entry(group_id, prev_index).map(|entry| entry.term) != Some(prev_term)
-        {
-            return Some(prev_index);
-        }
-        if index > 0 && index <= last {
-            if let Some(existing) = self.range_entry(group_id, index) {
-                if existing.term != term
-                    || existing.commit_ts != commit_ts
-                    || existing.writes != encoded_writes
-                    || existing.publish_data != publish_data
-                    || existing.kind != *kind
-                {
-                    return Some(index);
-                }
+        if prev_index > 0 {
+            let previous = self
+                .try_range_entry(group_id, prev_index)?
+                .ok_or_else(|| RymeError::Corrupt(String::from("range log gap")))?;
+            if previous.term != prev_term {
+                return Ok(Some(prev_index));
             }
         }
-        if index > last + 1 {
-            Some(last + 1)
+        if index > 0 && index <= last {
+            let existing = self
+                .try_range_entry(group_id, index)?
+                .ok_or_else(|| RymeError::Corrupt(String::from("range log gap")))?;
+            if existing.term != term
+                || existing.commit_ts != commit_ts
+                || existing.writes != encoded_writes
+                || existing.publish_data != publish_data
+                || existing.kind != *kind
+            {
+                return Ok(Some(index));
+            }
+        }
+        if index > last.saturating_add(1) {
+            Ok(Some(last.saturating_add(1)))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -4284,13 +4346,13 @@ impl Node {
         if let Ok(mut leaders) = self.range_leaders.write() {
             leaders.insert(group_id.to_string(), leader);
         }
-        let mut last = self.range_last_index(group_id);
+        let mut last = self.try_range_last_index(group_id)?;
         if prev_index > last {
             return Err(RymeError::Unavailable(String::from("range log gap")));
         }
         if prev_index != 0 {
             let previous = self
-                .range_entry(group_id, prev_index)
+                .try_range_entry(group_id, prev_index)?
                 .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
             if previous.term != prev_term {
                 return Err(RymeError::Unavailable(String::from("range log conflict")));
@@ -4304,7 +4366,7 @@ impl Node {
         } else {
             if index <= last {
                 let existing = self
-                    .range_entry(group_id, index)
+                    .try_range_entry(group_id, index)?
                     .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
                 if existing.term != term
                     || existing.commit_ts != commit_ts
@@ -4366,7 +4428,10 @@ impl Node {
         }
         replicas.sort_unstable();
         replicas.dedup();
-        let index = self.range_last_index(group_id) + 1;
+        let index = self
+            .try_range_last_index(group_id)?
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Corrupt(String::from("range log index overflow")))?;
         let term = self.ensure_range_group(group_id, self.id).term.max(1);
         self.append_range_entry(
             group_id,
@@ -4442,7 +4507,7 @@ impl Node {
     ) -> Result<()> {
         let keep_through = index.saturating_sub(1);
         self.truncate_range_suffix(group_id, keep_through)?;
-        let last_term = if keep_through == 0 { 0 } else { self.range_last_term(group_id) };
+        let last_term = if keep_through == 0 { 0 } else { self.try_range_last_term(group_id)? };
         let commit_index = self
             .range_groups
             .lock()
