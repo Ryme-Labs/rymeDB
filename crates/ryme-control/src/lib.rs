@@ -143,8 +143,8 @@ impl ControlPlane {
         let routing_version = ranges[0].routing_version;
         ryme_storage::validate_routing_version(routing_version)?;
         for (index, range) in ranges.iter().enumerate() {
-            if !ids.insert(range.id.clone()) {
-                return Err(RymeError::Corrupt(String::from("duplicate range id")));
+            if range.id.is_empty() || !ids.insert(range.id.clone()) {
+                return Err(RymeError::Corrupt(String::from("invalid or duplicate range id")));
             }
             if !range.end.is_empty() && range.start >= range.end {
                 return Err(RymeError::Corrupt(String::from("invalid range bounds")));
