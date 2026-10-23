@@ -27,7 +27,25 @@ async fn serve() -> (std::net::SocketAddr, GrpcGateway) {
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
     )
     .unwrap();
-    let grpc = GrpcGateway::with_gateway(gateway, keys);
+    let executor = ryme_sql::Executor::with_backend(
+        String::from("t"),
+        String::from("d"),
+        gateway.manager_clone(),
+    );
+    executor
+        .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
+        .await
+        .unwrap();
+    executor
+        .execute(
+            ryme_sql::parse(
+                "GRANT SELECT, INSERT, UPDATE ON TABLE docs TO authenticated",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let grpc = GrpcGateway::with_gateway(gateway, keys).with_sql_executor(executor);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let service = grpc.clone();
@@ -152,6 +170,10 @@ async fn grpc_sql_uses_configured_rls_executor() {
     )]));
     executor
         .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
+        .await
+        .unwrap();
+    executor
+        .execute(ryme_sql::parse("GRANT SELECT ON TABLE docs TO authenticated").unwrap())
         .await
         .unwrap();
     let mut txn = manager.begin();
@@ -281,7 +303,20 @@ async fn grpc_read_only_rejects_sql_writes() {
         Principal { id: String::from("u"), tenant: String::from("t"), roles },
     )
     .unwrap();
-    let grpc = GrpcGateway::with_gateway(inner, keys);
+    let executor = ryme_sql::Executor::with_backend(
+        String::from("t"),
+        String::from("d"),
+        inner.manager_clone(),
+    );
+    executor
+        .execute(ryme_sql::parse("CREATE TABLE docs (id TEXT PRIMARY KEY)").unwrap())
+        .await
+        .unwrap();
+    executor
+        .execute(ryme_sql::parse("GRANT SELECT ON TABLE docs TO authenticated").unwrap())
+        .await
+        .unwrap();
+    let grpc = GrpcGateway::with_gateway(inner, keys).with_sql_executor(executor);
     let reply = grpc
         .sql(authed(
             proto::SqlRequest { sql: String::from("INSERT INTO docs KEY 'a' VALUE 'b'") },
