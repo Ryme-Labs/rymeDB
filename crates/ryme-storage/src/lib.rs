@@ -612,6 +612,9 @@ impl Engine {
         // visible to readers.
         let mut histories: ImportHistory<'_> = BTreeMap::new();
         for (pk, versions) in &rows {
+            if versions.iter().any(|version| version.commit_ts == 0) {
+                return Err(RymeError::Corrupt(String::from("import commit timestamp")));
+            }
             let key = RecordKey {
                 tenant: tenant.to_string(),
                 database: database.to_string(),

@@ -23,6 +23,8 @@ All notable changes to rymeDB are recorded here. Format follows
   verification, and restored credentials are validated before use.
 - Password verification now bounds candidate passwords and encoded hash fields
   before expensive hashing or base64 decoding.
+- Storage table imports now reject reserved zero commit timestamps during
+  preflight, before they can create snapshot-invalid versions.
 - SQL sequence arithmetic now reports integer overflow as exhaustion, and
   invalid `ALTER SEQUENCE` options leave the sequence unchanged.
 - SQL sequences now validate `smallint`, `integer`, and `bigint` ranges and use
