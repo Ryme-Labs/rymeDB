@@ -11,6 +11,7 @@ use ryme_realtime::{NewChange, Operation, Realtime};
 use ryme_router::RangeLoadHook;
 use ryme_storage::RecordKey;
 use ryme_txn::{Transaction, TxnBackend, TxnManager};
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -1100,13 +1101,13 @@ where
         Ok(())
     }
 
-    fn cdc_pending(&self, txn: &Transaction) -> CdcPending {
-        let Some(_realtime) = self.realtime.as_ref() else { return Vec::new() };
+    fn cdc_pending(&self, txn: &Transaction) -> Result<CdcPending> {
+        let Some(_realtime) = self.realtime.as_ref() else { return Ok(Vec::new()) };
         let mut out = Vec::new();
         for (key, staged) in txn.writes() {
             let mut before_txn = self.manager.begin();
             before_txn.restamp(txn.read_ts);
-            let before = self.manager.get(&mut before_txn, key).ok().flatten();
+            let before = self.manager.get(&mut before_txn, key)?;
             let op = match &staged.value {
                 None => Operation::Delete,
                 Some(_) => match txn.observed_existed(key) {
@@ -1118,7 +1119,7 @@ where
             };
             out.push((key.clone(), op, before, staged.value.clone()));
         }
-        out
+        Ok(out)
     }
 
     fn cdc_emit(&self, pending: CdcPending, commit_ts: u64) {
@@ -1416,7 +1417,10 @@ where
                         }
                         admitted = true;
                     }
-                    let pending = self.cdc_pending(&txn);
+                    let pending = match self.cdc_pending(&txn) {
+                        Ok(pending) => pending,
+                        Err(error) => return encode_error(error.to_string()),
+                    };
                     let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
                         txn.writes().keys().cloned().collect()
                     } else {
@@ -1560,7 +1564,10 @@ where
                 if let Some(denied) = self.admit(true, bytes) {
                     return denied;
                 }
-                let pending = self.cdc_pending(&txn);
+                let pending = match self.cdc_pending(&txn) {
+                    Ok(pending) => pending,
+                    Err(error) => return encode_error(error.to_string()),
+                };
                 match self.manager.commit(txn).await {
                     Ok(commit_ts) => {
                         self.note_range_key(&self.tenant, KV_TABLE, &key);
@@ -1616,8 +1623,10 @@ where
                     } else {
                         source.pop().unwrap_or_default()
                     };
-                    let mut target =
-                        self.read_list(&mut txn, &args[1]).unwrap_or(None).unwrap_or_default();
+                    let mut target = match self.read_list(&mut txn, &args[1]) {
+                        Ok(target) => target.unwrap_or_default(),
+                        Err(error) => return encode_error(error),
+                    };
                     if to_front {
                         target.insert(0, value.clone());
                     } else {
@@ -1636,7 +1645,10 @@ where
                             if let Some(denied) = self.admit(true, bytes) {
                                 return denied;
                             }
-                            let pending = self.cdc_pending(&txn);
+                            let pending = match self.cdc_pending(&txn) {
+                                Ok(pending) => pending,
+                                Err(error) => return encode_error(error.to_string()),
+                            };
                             match self.manager.commit(txn).await {
                                 Ok(commit_ts) => {
                                     self.note_range_key(&self.tenant, KV_TABLE, &args[0]);
@@ -1703,7 +1715,10 @@ where
                 }
                 admitted = true;
             }
-            let pending = self.cdc_pending(&txn);
+            let pending = match self.cdc_pending(&txn) {
+                Ok(pending) => pending,
+                Err(error) => return encode_error(error.to_string()),
+            };
             let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
                 txn.writes().keys().cloned().collect()
             } else {
@@ -2046,11 +2061,17 @@ where
                 }
             }
             "TTL" => match command.args.first() {
-                Some(key) => encode_integer(self.ttl_secs(key)),
+                Some(key) => match self.ttl_secs(key) {
+                    Ok(ttl) => encode_integer(ttl),
+                    Err(error) => encode_error(error.to_string()),
+                },
                 None => encode_error(String::from("wrong args")),
             },
             "PTTL" => match command.args.first() {
-                Some(key) => encode_integer(self.ttl_millis(key)),
+                Some(key) => match self.ttl_millis(key) {
+                    Ok(ttl) => encode_integer(ttl),
+                    Err(error) => encode_error(error.to_string()),
+                },
                 None => encode_error(String::from("wrong args")),
             },
             "PERSIST" => match command.args.first() {
@@ -2062,9 +2083,11 @@ where
                                 self.manager.put(txn, record, value);
                                 encode_integer(1)
                             }
-                            _ => encode_integer(0),
+                            Ok(None) => encode_integer(0),
+                            Err(error) => encode_error(error.to_string()),
                         },
-                        _ => encode_integer(0),
+                        Ok(_) => encode_integer(0),
+                        Err(error) => encode_error(error.to_string()),
                     }
                 }
                 None => encode_error(String::from("wrong args")),
@@ -2073,15 +2096,27 @@ where
                 if command.args.is_empty() {
                     return encode_error(String::from("wrong args"));
                 }
-                let mut removed = 0;
-                for key in command.args {
-                    let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &key);
-                    if self.manager.get(txn, &record).unwrap_or(None).is_some() {
-                        self.manager.delete(txn, record);
-                        removed += 1;
+                let mut seen = HashSet::with_capacity(command.args.len());
+                let keys: Vec<_> =
+                    command.args.into_iter().filter(|key| seen.insert(key.clone())).collect();
+                let records: Vec<_> = keys
+                    .iter()
+                    .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
+                    .collect();
+                match self.manager.get_many(txn, &records) {
+                    Ok(values) if values.len() == records.len() => {
+                        let mut removed = 0;
+                        for (record, value) in records.into_iter().zip(values) {
+                            if value.is_some() {
+                                self.manager.delete(txn, record);
+                                removed += 1;
+                            }
+                        }
+                        encode_integer(removed)
                     }
+                    Ok(_) => encode_error(String::from("read count")),
+                    Err(error) => encode_error(error.to_string()),
                 }
-                encode_integer(removed)
             }
             "EXISTS" => {
                 if command.args.is_empty() {
@@ -2103,9 +2138,10 @@ where
             "TYPE" => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-                    match self.manager.get(txn, &record).unwrap_or(None) {
-                        Some(_) => encode_simple("string"),
-                        None => encode_simple("none"),
+                    match self.manager.get(txn, &record) {
+                        Ok(Some(_)) => encode_simple("string"),
+                        Ok(None) => encode_simple("none"),
+                        Err(error) => encode_error(error.to_string()),
                     }
                 }
                 None => encode_error(String::from("wrong args")),
@@ -2116,8 +2152,10 @@ where
                 }
                 let record =
                     RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
-                let mut current =
-                    self.manager.get(txn, &record).unwrap_or(None).unwrap_or_default();
+                let mut current = match self.manager.get(txn, &record) {
+                    Ok(value) => value.unwrap_or_default(),
+                    Err(error) => return encode_error(error.to_string()),
+                };
                 current.extend_from_slice(&command.args[1]);
                 let length = current.len();
                 self.manager.put(txn, record, current);
@@ -2126,9 +2164,10 @@ where
             "STRLEN" => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-                    match self.manager.get(txn, &record).unwrap_or(None) {
-                        Some(value) => encode_integer(value.len() as i64),
-                        None => encode_integer(0),
+                    match self.manager.get(txn, &record) {
+                        Ok(Some(value)) => encode_integer(value.len() as i64),
+                        Ok(None) => encode_integer(0),
+                        Err(error) => encode_error(error.to_string()),
                     }
                 }
                 None => encode_error(String::from("wrong args")),
@@ -2183,12 +2222,25 @@ where
                 if command.args.is_empty() || !command.args.len().is_multiple_of(2) {
                     return encode_error(String::from("wrong args"));
                 }
-                for pair in command.args.as_chunks::<2>().0 {
-                    let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &pair[0]);
-                    let _ = self.manager.get(txn, &record);
-                    self.manager.put(txn, record, pair[1].clone());
+                let writes: Vec<_> = command
+                    .args
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| RecordKey::new(&self.tenant, &self.database, KV_TABLE, &pair[0]))
+                    .collect();
+                match self.manager.get_many(txn, &writes) {
+                    Ok(values) if values.len() == writes.len() => {
+                        for (record, pair) in
+                            writes.into_iter().zip(command.args.as_chunks::<2>().0)
+                        {
+                            self.manager.put(txn, record, pair[1].clone());
+                        }
+                        encode_simple("OK")
+                    }
+                    Ok(_) => encode_error(String::from("read count")),
+                    Err(error) => encode_error(error.to_string()),
                 }
-                encode_simple("OK")
             }
             "MSETNX" => {
                 if command.args.is_empty() || !command.args.len().is_multiple_of(2) {
@@ -2722,7 +2774,10 @@ where
             return encode_error(String::from("wrong args"));
         }
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &args[0]);
-        let current = self.manager.get(txn, &record).unwrap_or(None).unwrap_or_default();
+        let current = match self.manager.get(txn, &record) {
+            Ok(value) => value.unwrap_or_default(),
+            Err(error) => return encode_error(error.to_string()),
+        };
         let base: i64 = if current.is_empty() {
             0
         } else {
@@ -2740,7 +2795,10 @@ where
 
     fn incr_float(&self, txn: &mut Transaction, key: &[u8], delta: f64) -> Vec<u8> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        let current = self.manager.get(txn, &record).unwrap_or(None).unwrap_or_default();
+        let current = match self.manager.get(txn, &record) {
+            Ok(value) => value.unwrap_or_default(),
+            Err(error) => return encode_error(error.to_string()),
+        };
         let base: f64 = if current.is_empty() {
             0.0
         } else {
@@ -2760,7 +2818,7 @@ where
         key: &[u8],
     ) -> std::result::Result<Option<std::collections::HashMap<String, String>>, String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.get(txn, &record).unwrap_or(None) {
+        match self.manager.get(txn, &record).map_err(|error| error.to_string())? {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashMap::new())),
             Some(value) => {
                 check_collection_bytes(&value)?;
@@ -2789,7 +2847,7 @@ where
         key: &[u8],
     ) -> std::result::Result<Option<Vec<String>>, String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.get(txn, &record).unwrap_or(None) {
+        match self.manager.get(txn, &record).map_err(|error| error.to_string())? {
             Some(value) if value.is_empty() => Ok(Some(Vec::new())),
             Some(value) => {
                 check_collection_bytes(&value)?;
@@ -2862,7 +2920,7 @@ where
         key: &[u8],
     ) -> std::result::Result<Option<std::collections::HashSet<String>>, String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.get(txn, &record).unwrap_or(None) {
+        match self.manager.get(txn, &record).map_err(|error| error.to_string())? {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashSet::new())),
             Some(value) => {
                 check_collection_bytes(&value)?;
@@ -2895,7 +2953,7 @@ where
         key: &[u8],
     ) -> std::result::Result<Option<std::collections::HashMap<String, f64>>, String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.get(txn, &record).unwrap_or(None) {
+        match self.manager.get(txn, &record).map_err(|error| error.to_string())? {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashMap::new())),
             Some(value) => {
                 check_collection_bytes(&value)?;
@@ -3112,7 +3170,7 @@ where
         key: &[u8],
     ) -> std::result::Result<Option<StreamData>, String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.get(txn, &record).unwrap_or(None) {
+        match self.manager.get(txn, &record).map_err(|error| error.to_string())? {
             Some(value) if value.is_empty() => Ok(Some(StreamData::default())),
             Some(value) => {
                 check_collection_bytes(&value)?;
@@ -3774,7 +3832,7 @@ where
         key: &[u8],
     ) -> std::result::Result<Option<Vec<u8>>, String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.get(txn, &record).unwrap_or(None) {
+        match self.manager.get(txn, &record).map_err(|error| error.to_string())? {
             Some(value) if value.is_empty() => Ok(Some(vec![0; HLL_REGISTERS])),
             Some(value) => {
                 check_collection_bytes(&value)?;
@@ -3851,7 +3909,7 @@ where
         key: &[u8],
     ) -> std::result::Result<Option<std::collections::HashMap<String, GeoPoint>>, String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.get(txn, &record).unwrap_or(None) {
+        match self.manager.get(txn, &record).map_err(|error| error.to_string())? {
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashMap::new())),
             Some(value) => {
                 check_collection_bytes(&value)?;
@@ -4436,7 +4494,10 @@ where
                     if let Some(denied) = self.admit(true, bytes) {
                         return denied;
                     }
-                    let pending = self.cdc_pending(&txn);
+                    let pending = match self.cdc_pending(&txn) {
+                        Ok(pending) => pending,
+                        Err(error) => return encode_error(error.to_string()),
+                    };
                     match self.manager.commit(txn).await {
                         Ok(commit_ts) => {
                             self.cdc_emit(pending, commit_ts);
@@ -4987,28 +5048,28 @@ where
         Ok(out)
     }
 
-    fn ttl_secs(&self, key: &[u8]) -> i64 {
+    fn ttl_secs(&self, key: &[u8]) -> Result<i64> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.expires_at(&record) {
-            Ok(Some(0)) => -1,
-            Ok(Some(ts)) => {
+        match self.manager.expires_at(&record)? {
+            Some(0) => Ok(-1),
+            Some(ts) => {
                 let now = ryme_txn::now_unix();
                 if ts <= now {
-                    -2
+                    Ok(-2)
                 } else {
-                    (ts - now) as i64
+                    Ok((ts - now) as i64)
                 }
             }
-            _ => -2,
+            None => Ok(-2),
         }
     }
 
-    fn ttl_millis(&self, key: &[u8]) -> i64 {
-        let secs = self.ttl_secs(key);
+    fn ttl_millis(&self, key: &[u8]) -> Result<i64> {
+        let secs = self.ttl_secs(key)?;
         if secs < 0 {
-            secs
+            Ok(secs)
         } else {
-            secs.saturating_mul(1000)
+            Ok(secs.saturating_mul(1000))
         }
     }
 
