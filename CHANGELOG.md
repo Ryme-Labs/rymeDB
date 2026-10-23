@@ -18,8 +18,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
-- Realtime WebSocket fanout shares the cached serialized broadcast bytes across
-  subscribers instead of copying the payload for each delivery.
+- Realtime and Supabase-compatible WebSocket broadcast fanout share cached
+  serialized bytes across subscribers instead of copying each frame per
+  delivery.
 
 ### Fixed
 

@@ -9323,16 +9323,19 @@ async fn forward_supabase_realtime(
                         }
                         let event_pre_admitted = record.fanout_quota_pre_admitted();
                         let pre_admitted_bytes = record.json_len();
-                        let text = record
-                            .cached_text_frame(&topic, u8::from(array_protocol), || {
+                        let bytes = record
+                            .cached_text_bytes_frame(&topic, u8::from(array_protocol), || {
                                 encode_supabase_broadcast_frame(
                                     &topic,
                                     &record.payload,
                                     array_protocol,
                                 )
                             })
-                            .await
-                            .to_string();
+                            .await;
+                        let text = match axum::extract::ws::Utf8Bytes::try_from(bytes) {
+                            Ok(text) => text,
+                            Err(_) => continue,
+                        };
                         (text, event_pre_admitted, pre_admitted_bytes)
                     }
                     SupabaseRealtimeEvent::Change(topic, subscription, record) => {
@@ -9351,7 +9354,7 @@ async fn forward_supabase_realtime(
                             },
                             array_protocol,
                         );
-                        (text, false, 0)
+                        (axum::extract::ws::Utf8Bytes::from(text), false, 0)
                     }
                     SupabaseRealtimeEvent::Presence(topic, event) => {
                         let Some(channel) = channels.get_mut(&topic) else { continue };
@@ -9371,7 +9374,7 @@ async fn forward_supabase_realtime(
                             },
                             array_protocol,
                         );
-                        (text, false, 0)
+                        (axum::extract::ws::Utf8Bytes::from(text), false, 0)
                     }
                 };
                 let admitted = if event_pre_admitted {
@@ -9381,7 +9384,7 @@ async fn forward_supabase_realtime(
                     stream_realtime_event(&qos, &tenant, text.len() as u64)
                 };
                 if !admitted
-                    || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text.into())) {
+                    || !queue_realtime_message(&outgoing, axum::extract::ws::Message::Text(text)) {
                     break;
                 }
             }

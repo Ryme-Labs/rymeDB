@@ -478,9 +478,10 @@ publish-to-client latency was about 5.3 s p50 and 8.6 s p99 under that burst.
 That historical result predates the current cached-envelope and batched-writer
 path; it is not directly comparable to the newer captures below.
 
-The current release build also includes a cached broadcast envelope so one
-JSON payload is encoded once and its immutable bytes are shared across
-subscribers rather than copied for every delivery. A smaller
+The current release build also includes cached broadcast envelopes so JSON
+payloads and Supabase-compatible protocol frames are encoded once and their
+immutable bytes are shared across subscribers rather than copied for every
+delivery. A smaller
 20-connection loopback run on the same 12-vCPU machine delivered all 20,000
 messages with zero publish or receive errors at 13,089 publish requests/s and
 2.81 million fanout deliveries/s. Publish-to-client latency was 38.9 ms p50,

@@ -7,7 +7,21 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
 
-type EncodedFrameSlot = tokio::sync::OnceCell<(String, Arc<str>)>;
+#[derive(Debug)]
+struct CachedEncodedFrame {
+    bytes: Bytes,
+    text: OnceLock<Arc<str>>,
+}
+
+impl CachedEncodedFrame {
+    fn text(&self) -> Arc<str> {
+        Arc::clone(self.text.get_or_init(|| {
+            Arc::from(String::from_utf8(self.bytes.to_vec()).unwrap_or_else(|_| String::from("{}")))
+        }))
+    }
+}
+
+type EncodedFrameSlot = tokio::sync::OnceCell<(String, CachedEncodedFrame)>;
 type EncodedFrameCache = Arc<[EncodedFrameSlot; 2]>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,21 +294,59 @@ impl BroadcastMsg {
             return Arc::from(encode());
         };
         if let Some((cached_topic, frame)) = cache.get() {
-            return if cached_topic == topic { Arc::clone(frame) } else { Arc::from(encode()) };
+            return if cached_topic == topic { frame.text() } else { Arc::from(encode()) };
         }
 
         let mut encode = Some(encode);
         let (cached_topic, frame) = cache
             .get_or_init(|| async {
-                let frame: Arc<str> =
-                    Arc::from(encode.take().expect("frame cache initializer runs once")());
-                (topic.to_owned(), frame)
+                let bytes = Bytes::from(
+                    encode.take().expect("frame cache initializer runs once")().into_bytes(),
+                );
+                (topic.to_owned(), CachedEncodedFrame { bytes, text: OnceLock::new() })
             })
             .await;
         if cached_topic == topic {
-            Arc::clone(frame)
+            frame.text()
         } else {
             Arc::from(encode.take().expect("frame cache initialized for another topic")())
+        }
+    }
+
+    /// Reuse an encoded protocol frame as reference-counted bytes across
+    /// subscribers. The cache is capped at two protocol variants.
+    pub async fn cached_text_bytes_frame(
+        &self,
+        topic: &str,
+        protocol: u8,
+        encode: impl FnOnce() -> String,
+    ) -> Bytes {
+        let Some(cache) = self.encoded_frames.get(usize::from(protocol)) else {
+            return Bytes::from(encode().into_bytes());
+        };
+        if let Some((cached_topic, frame)) = cache.get() {
+            return if cached_topic == topic {
+                frame.bytes.clone()
+            } else {
+                Bytes::from(encode().into_bytes())
+            };
+        }
+
+        let mut encode = Some(encode);
+        let (cached_topic, frame) = cache
+            .get_or_init(|| async {
+                let bytes = Bytes::from(
+                    encode.take().expect("frame cache initializer runs once")().into_bytes(),
+                );
+                (topic.to_owned(), CachedEncodedFrame { bytes, text: OnceLock::new() })
+            })
+            .await;
+        if cached_topic == topic {
+            frame.bytes.clone()
+        } else {
+            Bytes::from(
+                encode.take().expect("frame cache initialized for another topic")().into_bytes(),
+            )
         }
     }
 }
