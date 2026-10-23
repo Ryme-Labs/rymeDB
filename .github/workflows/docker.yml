@@ -33,6 +33,11 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             node scripts/validate-release-version.mjs "$GITHUB_REF_NAME"
             version="${GITHUB_REF_NAME#rymedb-v}"
+            release_major="${version%%.*}"
+            release_minor="${version#*.}"
+            release_minor="${release_minor%%.*}"
+            echo "major=$release_major" >> "$GITHUB_OUTPUT"
+            echo "major_minor=$release_major.$release_minor" >> "$GITHUB_OUTPUT"
           else
             version="$GITHUB_REF_NAME"
           fi
@@ -63,10 +68,10 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}},prefix=rymedb-v
-            type=semver,pattern={{major}}.{{minor}},prefix=rymedb-v
-            type=semver,pattern={{major}},prefix=rymedb-v
-            type=sha,prefix={{branch}}-,format=short
+            type=raw,value=rymedb-v${{ steps.version.outputs.version }},enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=rymedb-v${{ steps.version.outputs.major_minor }},enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=rymedb-v${{ steps.version.outputs.major }},enable=${{ github.ref_type == 'tag' }}
+            type=sha,prefix=sha-,format=short
           labels: |
             org.opencontainers.image.title=ryme-server
             org.opencontainers.image.description=rymeDB server (Postgres wire + RESP + REST operator API)
