@@ -1935,11 +1935,16 @@ impl Node {
                     return Err(RymeError::Unavailable(String::from("stale range leader")));
                 }
                 if appended {
+                    if last_index < leader_last {
+                        return Err(RymeError::Unavailable(String::from(
+                            "range heartbeat acknowledgement index",
+                        )));
+                    }
                     return Ok(());
                 }
                 conflict_index
                     .unwrap_or_else(|| last_index.min(leader_last).saturating_add(1))
-                    .max(1)
+                    .clamp(1, leader_last.saturating_add(1).max(1))
             }
             _ => return Err(RymeError::Corrupt(String::from("range append rpc"))),
         };
@@ -1984,8 +1989,18 @@ impl Node {
                         self.observe_range_term(group_id, peer_term)?;
                         return Err(RymeError::Unavailable(String::from("stale range leader")));
                     }
-                    next_index = last_index + 1;
+                    if last_index < index {
+                        return Err(RymeError::Unavailable(String::from(
+                            "range append acknowledgement index",
+                        )));
+                    }
                     same_index_retries = 0;
+                    if index == leader_last {
+                        break;
+                    }
+                    next_index = index.checked_add(1).ok_or_else(|| {
+                        RymeError::Corrupt(String::from("range log index overflow"))
+                    })?;
                 }
                 Rpc::RangeAppendResponse {
                     term: peer_term,
@@ -2000,7 +2015,7 @@ impl Node {
                     }
                     let retry_index = conflict_index
                         .unwrap_or_else(|| last_index.min(leader_last).saturating_add(1))
-                        .max(1);
+                        .clamp(1, leader_last.saturating_add(1).max(1));
                     if retry_index == next_index {
                         same_index_retries = same_index_retries.saturating_add(1);
                         if same_index_retries > 1 {
@@ -2032,8 +2047,8 @@ impl Node {
             })
             .await?;
         match committed {
-            Rpc::RangeAppendResponse { term: peer_term, appended: true, .. }
-                if peer_term <= term =>
+            Rpc::RangeAppendResponse { term: peer_term, appended: true, last_index, .. }
+                if peer_term <= term && last_index >= leader_last =>
             {
                 Ok(())
             }
@@ -4397,7 +4412,10 @@ impl Node {
         if index <= last {
             return Ok(last);
         }
-        if index != last + 1 {
+        let next_index = last
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Corrupt(String::from("range log index overflow")))?;
+        if index != next_index {
             return Err(RymeError::Unavailable(String::from("range log gap")));
         }
         let record = serde_json::to_vec(&RangeLogRecord {
@@ -4773,7 +4791,10 @@ impl Node {
                     last = index - 1;
                 }
             }
-            if index != last + 1 {
+            let next_index = last
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("range log index overflow")))?;
+            if index != next_index {
                 return Err(RymeError::Unavailable(String::from("range log gap")));
             }
             last = self.append_range_entry(

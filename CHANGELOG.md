@@ -51,6 +51,8 @@ All notable changes to rymeDB are recorded here. Format follows
   advance commits by scanning stored entries instead of untrusted index ranges.
 - Raft leaders now backtrack the replication prefix when a follower rejects an
   append without offering a lower retry point, allowing conflicting suffixes to heal.
+- Range replication now validates follower acknowledgment indexes before
+  counting quorum votes or advancing its replication position.
 
 ### Performance
 
