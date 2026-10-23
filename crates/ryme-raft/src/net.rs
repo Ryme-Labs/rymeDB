@@ -3658,11 +3658,16 @@ impl Node {
         Ok(())
     }
 
-    fn pending_resolutions_snapshot(&self) -> Vec<PendingResolution> {
+    fn try_pending_resolutions_snapshot(&self) -> Result<Vec<PendingResolution>> {
         self.pending_resolutions
             .lock()
             .map(|pending| pending.values().cloned().collect())
-            .unwrap_or_default()
+            .map_err(|_| RymeError::Internal(String::from("transaction resolutions lock")))
+    }
+
+    #[cfg(test)]
+    fn pending_resolutions_snapshot(&self) -> Vec<PendingResolution> {
+        self.try_pending_resolutions_snapshot().expect("transaction resolutions lock")
     }
 
     fn prepare_intent(
@@ -5072,42 +5077,56 @@ impl Node {
     }
 
     async fn retry_pending_resolutions(self: &Arc<Self>) {
-        for resolution in self.pending_resolutions_snapshot() {
-            if self
-                .resolve_on(
-                    &resolution.group_id,
-                    resolution.participant,
-                    resolution.transaction_id,
-                    resolution.commit_ts,
-                    resolution.committed,
-                )
-                .await
-                .is_ok()
-            {
-                if let Err(error) = self.complete_resolution(&resolution) {
-                    tracing::error!(
-                        transaction_id = resolution.transaction_id,
-                        commit_ts = resolution.commit_ts,
-                        participant = resolution.participant,
-                        %error,
-                        "transaction resolution checkpoint failed"
-                    );
+        match self.try_pending_resolutions_snapshot() {
+            Ok(resolutions) => {
+                for resolution in resolutions {
+                    if self
+                        .resolve_on(
+                            &resolution.group_id,
+                            resolution.participant,
+                            resolution.transaction_id,
+                            resolution.commit_ts,
+                            resolution.committed,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        if let Err(error) = self.complete_resolution(&resolution) {
+                            tracing::error!(
+                                transaction_id = resolution.transaction_id,
+                                commit_ts = resolution.commit_ts,
+                                participant = resolution.participant,
+                                %error,
+                                "transaction resolution checkpoint failed"
+                            );
+                        }
+                    }
                 }
+            }
+            Err(error) => {
+                tracing::error!(%error, "pending transaction resolution state unavailable")
             }
         }
         self.recover_pending_range_coordinations().await;
         self.retry_pending_range_decisions().await;
     }
 
-    fn pending_range_coordinations_snapshot(&self) -> Vec<PendingRangeCoordination> {
+    fn try_pending_range_coordinations_snapshot(&self) -> Result<Vec<PendingRangeCoordination>> {
         self.range_recovery_coordinations
             .lock()
             .map(|coordinations| coordinations.values().cloned().collect())
-            .unwrap_or_default()
+            .map_err(|_| RymeError::Internal(String::from("range recovery coordination lock")))
     }
 
     async fn recover_pending_range_coordinations(self: &Arc<Self>) {
-        for coordination in self.pending_range_coordinations_snapshot() {
+        let coordinations = match self.try_pending_range_coordinations_snapshot() {
+            Ok(coordinations) => coordinations,
+            Err(error) => {
+                tracing::error!(%error, "pending range coordination state unavailable");
+                return;
+            }
+        };
+        for coordination in coordinations {
             let range = match self.try_range_owner_by_id(&coordination.group_id) {
                 Ok(Some(range)) => range,
                 Ok(None) => continue,
@@ -5139,15 +5158,22 @@ impl Node {
         }
     }
 
-    fn pending_range_decisions_snapshot(&self) -> Vec<PendingRangeDecision> {
+    fn try_pending_range_decisions_snapshot(&self) -> Result<Vec<PendingRangeDecision>> {
         self.range_decisions
             .lock()
             .map(|decisions| decisions.values().cloned().collect())
-            .unwrap_or_default()
+            .map_err(|_| RymeError::Internal(String::from("range decisions lock")))
     }
 
     async fn retry_pending_range_decisions(self: &Arc<Self>) {
-        for decision in self.pending_range_decisions_snapshot() {
+        let decisions = match self.try_pending_range_decisions_snapshot() {
+            Ok(decisions) => decisions,
+            Err(error) => {
+                tracing::error!(%error, "pending range decision state unavailable");
+                return;
+            }
+        };
+        for decision in decisions {
             let range = match self.try_range_owner_by_id(&decision.group_id) {
                 Ok(Some(range)) => range,
                 Ok(None) => continue,
@@ -5183,12 +5209,22 @@ impl Node {
                 }
             }
             if complete {
-                if let Ok(mut decisions) = self.range_decisions.lock() {
-                    decisions.remove(&(
-                        decision.group_id.clone(),
-                        decision.transaction_id,
-                        decision.commit_ts,
-                    ));
+                match self.range_decisions.lock() {
+                    Ok(mut decisions) => {
+                        decisions.remove(&(
+                            decision.group_id.clone(),
+                            decision.transaction_id,
+                            decision.commit_ts,
+                        ));
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            group_id = %decision.group_id,
+                            transaction_id = decision.transaction_id,
+                            commit_ts = decision.commit_ts,
+                            "range decision completion lock poisoned"
+                        );
+                    }
                 }
             }
         }
