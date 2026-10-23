@@ -3302,7 +3302,11 @@ where
                 return command_complete("COMMIT");
             };
             if state.failed {
+                let rollback = executor.rollback_schema_transaction(state.schema_before);
                 restore_local_settings(session, &state.local_settings);
+                if let Err(error) = rollback {
+                    return encode_error_code(error_code(&error), error.to_string());
+                }
                 return encode_error_code(
                     "25P02",
                     String::from("current transaction is aborted, commands ignored until end of transaction block"),
