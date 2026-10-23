@@ -20,7 +20,7 @@ use ryme_txn::{
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -336,8 +336,15 @@ enum TransactionControl {
     RollbackToSavepoint(String),
 }
 
-type BackendCancellationMap = HashMap<(u32, u32), Weak<AtomicBool>>;
+type BackendCancellation = Mutex<BackendCancellationState>;
+type BackendCancellationMap = HashMap<(u32, u32), Weak<BackendCancellation>>;
 type NotificationMap = HashMap<(String, String), broadcast::Sender<PgNotification>>;
+
+#[derive(Default)]
+struct BackendCancellationState {
+    query_in_progress: bool,
+    requested: bool,
+}
 
 static NEXT_BACKEND_PID: AtomicU32 = AtomicU32::new(1);
 static BACKEND_CANCELLATIONS: LazyLock<Mutex<BackendCancellationMap>> =
@@ -389,14 +396,14 @@ fn publish_notifications(tenant: &str, database: &str, notifications: &mut Vec<P
     }
 }
 
-fn register_backend() -> Result<(u32, u32, Arc<AtomicBool>)> {
+fn register_backend() -> Result<(u32, u32, Arc<BackendCancellation>)> {
     let pid = NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed).max(1);
     let mut secret_bytes = [0u8; 4];
     getrandom::fill(&mut secret_bytes).map_err(|error| {
         RymeError::Internal(format!("secure random source unavailable: {error}"))
     })?;
     let secret = u32::from_be_bytes(secret_bytes);
-    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation = Arc::new(Mutex::new(BackendCancellationState::default()));
     let mut backends = BACKEND_CANCELLATIONS
         .lock()
         .map_err(|_| RymeError::Internal(String::from("backend cancellation registry poisoned")))?;
@@ -417,8 +424,24 @@ fn cancel_backend(pid: u32, secret: u32) {
         .ok()
         .and_then(|backends| backends.get(&(pid, secret)).and_then(Weak::upgrade));
     if let Some(signal) = signal {
-        signal.store(true, Ordering::Release);
+        if let Ok(mut state) = signal.lock() {
+            if state.query_in_progress {
+                state.requested = true;
+            }
+        }
     }
+}
+
+fn begin_backend_query(cancellation: &BackendCancellation) {
+    let mut state = cancellation.lock().unwrap_or_else(|error| error.into_inner());
+    state.query_in_progress = true;
+    state.requested = false;
+}
+
+fn finish_backend_query(cancellation: &BackendCancellation) -> bool {
+    let mut state = cancellation.lock().unwrap_or_else(|error| error.into_inner());
+    state.query_in_progress = false;
+    std::mem::take(&mut state.requested)
 }
 
 #[derive(Clone)]
@@ -1006,7 +1029,7 @@ async fn serve_loop<B, S>(
     mut socket: S,
     executor: Arc<Executor<B>>,
     limits: ConnLimits,
-    cancellation: Arc<AtomicBool>,
+    cancellation: Arc<BackendCancellation>,
     pid: u32,
     mut notifications: broadcast::Receiver<PgNotification>,
     user: String,
@@ -1074,17 +1097,6 @@ where
                 b'X' => return Ok(()),
                 _ => {}
             }
-            continue;
-        }
-
-        if cancellation.swap(false, Ordering::Acquire) && copy_in.is_none() {
-            if let Some(transaction) = active_transaction.as_mut() {
-                transaction.failed = true;
-            }
-            let response =
-                encode_error_code("57014", String::from("canceling statement due to user request"));
-            socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-            send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
             continue;
         }
 
@@ -1235,6 +1247,17 @@ where
                         Some(denied) => denied,
                         None => response,
                     };
+                    let response = if finish_backend_query(&cancellation) {
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
+                        encode_error_code(
+                            "57014",
+                            String::from("canceling statement due to user request"),
+                        )
+                    } else {
+                        response
+                    };
                     if response.first() == Some(&b'E') {
                         if let Some(transaction) = active_transaction.as_mut() {
                             transaction.failed = true;
@@ -1248,10 +1271,18 @@ where
                     continue;
                 }
                 (Some(CopyInState::Receiving { .. }), b'f') => {
+                    let cancelled = finish_backend_query(&cancellation);
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
-                    let response = encode_error_code("57014", copy_fail_message(&payload));
+                    let response = if cancelled {
+                        encode_error_code(
+                            "57014",
+                            String::from("canceling statement due to user request"),
+                        )
+                    } else {
+                        encode_error_code("57014", copy_fail_message(&payload))
+                    };
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     if active_transaction.is_none() {
                         portals.clear();
@@ -1264,10 +1295,18 @@ where
                     continue;
                 }
                 (Some(CopyInState::Failed { message }), b'c' | b'f') => {
+                    let cancelled = finish_backend_query(&cancellation);
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
-                    let response = encode_error_code("22P04", message);
+                    let response = if cancelled {
+                        encode_error_code(
+                            "57014",
+                            String::from("canceling statement due to user request"),
+                        )
+                    } else {
+                        encode_error_code("22P04", message)
+                    };
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     if active_transaction.is_none() {
                         portals.clear();
@@ -1277,11 +1316,18 @@ where
                 }
                 (Some(CopyInState::Receiving { .. }), _)
                 | (Some(CopyInState::Failed { .. }), _) => {
+                    let cancelled = finish_backend_query(&cancellation);
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
-                    let response =
-                        encode_error_code("08P01", String::from("unexpected message during COPY"));
+                    let response = if cancelled {
+                        encode_error_code(
+                            "57014",
+                            String::from("canceling statement due to user request"),
+                        )
+                    } else {
+                        encode_error_code("08P01", String::from("unexpected message during COPY"))
+                    };
                     socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
                     if active_transaction.is_none() {
                         portals.clear();
@@ -1296,6 +1342,7 @@ where
         match tag {
             b'X' => return Ok(()),
             b'Q' => {
+                begin_backend_query(&cancellation);
                 statements.remove("");
                 prepared_cache.remove("");
                 portals.remove("");
@@ -1478,7 +1525,10 @@ where
                 if out.is_empty() {
                     out.extend_from_slice(&frame(b'I', b""));
                 }
-                if cancellation.swap(false, Ordering::Acquire) {
+                if !awaiting_copy && finish_backend_query(&cancellation) {
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
                     out = encode_error_code(
                         "57014",
                         String::from("canceling statement due to user request"),
@@ -1683,6 +1733,7 @@ where
                         .map_err(|e| RymeError::Io(e.to_string()))?;
                     continue;
                 };
+                begin_backend_query(&cancellation);
                 let was_listening_empty = listening.is_empty();
                 let mut committed_notifications = Vec::new();
                 let response = match portals.get_mut(&portal) {
@@ -1768,7 +1819,7 @@ where
                     Some(denied) => denied,
                     None => response,
                 };
-                let response = if cancellation.swap(false, Ordering::Acquire) {
+                let response = if finish_backend_query(&cancellation) {
                     ignore_until_sync = true;
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
