@@ -232,14 +232,26 @@ pub fn open_with(dek: &Dek, envelope: &Envelope) -> Result<Vec<u8>> {
         ryme_auth::base64_url_decode(&envelope.blob_b64).map_err(|_| RymeError::Unauthorized)?;
     let tag =
         ryme_auth::base64_url_decode(&envelope.tag_b64).map_err(|_| RymeError::Unauthorized)?;
+    open_with_parts(dek, &nonce, &blob, &tag)
+}
+
+/// Decrypt raw ciphertext using the encoded nonce and tag from an envelope.
+/// This avoids base64-copying large binary objects through `Envelope::blob_b64`.
+pub fn open_with_blob(dek: &Dek, nonce_b64: &str, blob: &[u8], tag_b64: &str) -> Result<Vec<u8>> {
+    let nonce = ryme_auth::base64_url_decode(nonce_b64).map_err(|_| RymeError::Unauthorized)?;
+    let tag = ryme_auth::base64_url_decode(tag_b64).map_err(|_| RymeError::Unauthorized)?;
+    open_with_parts(dek, &nonce, blob, &tag)
+}
+
+fn open_with_parts(dek: &Dek, nonce: &[u8], blob: &[u8], tag: &[u8]) -> Result<Vec<u8>> {
     if tag.len() == AEAD_TAG_LEN {
-        return aead_open(&dek.key, dek.id.as_bytes(), &nonce, &blob, &tag);
+        return aead_open(&dek.key, dek.id.as_bytes(), nonce, blob, tag);
     }
-    let expected = auth_tag(&dek.key, &nonce, &blob);
-    if !equal(&expected, &tag) {
+    let expected = auth_tag(&dek.key, nonce, blob);
+    if !equal(&expected, tag) {
         return Err(RymeError::Unauthorized);
     }
-    let stream = keystream(&dek.key, &nonce, blob.len());
+    let stream = keystream(&dek.key, nonce, blob.len());
     Ok(blob.iter().zip(stream.iter()).map(|(b, s)| b ^ s).collect())
 }
 
@@ -277,13 +289,22 @@ fn aead_open(key: &[u8], aad: &[u8], nonce: &[u8], blob: &[u8], tag: &[u8]) -> R
     let key =
         LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).map_err(|_| RymeError::Unauthorized)?);
     let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| RymeError::Unauthorized)?;
-    let mut ciphertext = Vec::with_capacity(blob.len() + tag.len());
+    let capacity = blob
+        .len()
+        .checked_add(tag.len())
+        .ok_or_else(|| RymeError::Overload(String::from("encrypted object")))?;
+    let mut ciphertext = Vec::new();
+    ciphertext
+        .try_reserve_exact(capacity)
+        .map_err(|_| RymeError::Overload(String::from("encrypted object")))?;
     ciphertext.extend_from_slice(blob);
     ciphertext.extend_from_slice(tag);
-    let plaintext = key
+    let plaintext_len = key
         .open_in_place(nonce, Aad::from(aad), &mut ciphertext)
-        .map_err(|_| RymeError::Unauthorized)?;
-    Ok(plaintext.to_vec())
+        .map_err(|_| RymeError::Unauthorized)?
+        .len();
+    ciphertext.truncate(plaintext_len);
+    Ok(ciphertext)
 }
 
 fn keystream(key: &[u8], nonce: &[u8], len: usize) -> Vec<u8> {

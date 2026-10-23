@@ -12044,18 +12044,18 @@ fn open_archive_bytes(
     let Some(envelope) = encryption else {
         return Ok(bytes.to_vec());
     };
-    let guard =
-        state.dek_ring.lock().map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
-    let dek =
-        guard.get(&state.tenant, &envelope.dek_id).ok_or(ryme_error::RymeError::Unauthorized)?;
-    ryme_crypto::open_with(
+    let dek = {
+        let guard = state
+            .dek_ring
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("lock")))?;
+        guard.get(&state.tenant, &envelope.dek_id).ok_or(ryme_error::RymeError::Unauthorized)?
+    };
+    ryme_crypto::open_with_blob(
         &dek,
-        &ryme_crypto::Envelope {
-            dek_id: envelope.dek_id.clone(),
-            nonce_b64: envelope.nonce_b64.clone(),
-            blob_b64: ryme_auth::base64_url_encode(bytes),
-            tag_b64: envelope.tag_b64.clone(),
-        },
+        &envelope.nonce_b64,
+        bytes,
+        &envelope.tag_b64,
     )
 }
 
