@@ -204,6 +204,10 @@ impl Router {
         if self.ranges.values().any(|range| range.id == left_id || range.id == right_id) {
             return Err(RymeError::Conflict(String::from("range id exists")));
         }
+        let epoch = original
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Conflict(String::from("range epoch exhausted")))?;
         self.ranges.remove(&original.start);
         self.ranges.insert(
             original.start.clone(),
@@ -214,7 +218,7 @@ impl Router {
                 routing_version: original.routing_version,
                 leader: original.leader.clone(),
                 replicas: original.replicas.clone(),
-                epoch: original.epoch + 1,
+                epoch,
                 load: fresh_load(),
             },
         );
@@ -227,7 +231,7 @@ impl Router {
                 routing_version: original.routing_version,
                 leader: original.leader,
                 replicas: original.replicas,
-                epoch: original.epoch + 1,
+                epoch,
                 load: fresh_load(),
             },
         );
@@ -252,9 +256,13 @@ impl Router {
         if self.ranges.values().any(|range| range.id == merged_id) {
             return Err(RymeError::Conflict(String::from("range id exists")));
         }
+        let epoch = left
+            .epoch
+            .max(right.epoch)
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Conflict(String::from("range epoch exhausted")))?;
         self.ranges.remove(&left.start);
         self.ranges.remove(&right.start);
-        let epoch = left.epoch.max(right.epoch) + 1;
         let mut replicas = left.replicas.clone();
         replicas.extend(right.replicas);
         replicas.sort();
@@ -276,18 +284,22 @@ impl Router {
     }
 
     pub fn move_leader(&mut self, id: &str, leader: String) -> Result<Range> {
-        let mut range = self.remove(id)?;
-        if range.leader == leader {
-            self.insert(range.clone());
+        let existing = self.get(id)?;
+        if existing.leader == leader {
             return Err(RymeError::InvalidArgument(String::from("leader")));
         }
+        let epoch = existing
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Conflict(String::from("range epoch exhausted")))?;
+        let mut range = self.remove(id)?;
         let previous_leader = range.leader.clone();
         range.leader = leader;
         range.replicas.retain(|replica| replica != &previous_leader);
         range.replicas.push(range.leader.clone());
         range.replicas.sort();
         range.replicas.dedup();
-        range.epoch = range.epoch.saturating_add(1);
+        range.epoch = epoch;
         self.insert(range.clone());
         Ok(range)
     }

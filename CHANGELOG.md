@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Range split, merge, and leader changes now reject exhausted epochs before
+  mutating topology, preserving monotonic routing fences.
 - SQL grants validate roles atomically, and dropping a role clears its direct
   and default privileges so recreating the role cannot restore stale access.
 - SQL role inheritance now stops at intermediate `NOINHERIT` roles, preventing
