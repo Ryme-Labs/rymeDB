@@ -53,16 +53,17 @@ async fn wait_value(nodes: &[std::sync::Arc<Node>], name: &str, value: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let key = RecordKey::new("t", "d", "s", name.as_bytes());
     loop {
-        let mut done = true;
-        for node in nodes {
-            if node.read_latest(&key).await.unwrap() != Some(value.as_bytes().to_vec()) {
-                done = false;
+        let mut lagging = Vec::new();
+        for (id, node) in nodes.iter().enumerate() {
+            let observed = node.read_latest(&key).await.unwrap();
+            if observed != Some(value.as_bytes().to_vec()) {
+                lagging.push((id, node.is_leader().await, observed));
             }
         }
-        if done {
+        if lagging.is_empty() {
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "replication lag for {name}");
+        assert!(tokio::time::Instant::now() < deadline, "replication lag for {name}: {lagging:?}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
