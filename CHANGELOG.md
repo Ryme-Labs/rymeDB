@@ -38,6 +38,8 @@ All notable changes to rymeDB are recorded here. Format follows
   staged segment sequence.
 - Storage recovery and compaction now reject corrupt latest-segment pointers
   instead of silently treating them as missing snapshot metadata.
+- Storage metadata and segment readers now reject symlink files instead of
+  following them outside the data directory.
 - SQL `CREATE USER` now defaults to `LOGIN`, and unsupported role options are
   rejected instead of being reported as successful while silently ignored.
 - Raft range-coordination recovery now propagates poisoned state-lock errors

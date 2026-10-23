@@ -948,7 +948,9 @@ impl SegmentStore {
             let name = name.trim();
             if !name.is_empty() && parse_segment_name(name).is_some() && !name.contains('/') {
                 let path = self.dir.join(name);
-                if path.is_file() {
+                if std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+                {
                     Some(path)
                 } else {
                     return Err(RymeError::Corrupt(String::from("segment pointer")));
@@ -1198,6 +1200,14 @@ fn read_bounded_metadata_file(
     max_bytes: usize,
     label: &str,
 ) -> Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(RymeError::Corrupt(label.to_string()));
+    }
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1219,6 +1229,10 @@ fn read_bounded_metadata_file(
 fn read_segment_identity(path: &Path) -> Result<(u64, SegmentKind)> {
     const V1_HEADER: u64 = 4 + 2 + 2 + 8 + 4;
     const V2_HEADER: u64 = V1_HEADER + 8;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(RymeError::Corrupt(String::from("segment file")));
+    }
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut prefix = [0; 16];
