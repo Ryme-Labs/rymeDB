@@ -6,7 +6,7 @@ use ryme_wal::{Wal, WalRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -37,6 +37,19 @@ static RPC_READ_FRAME_BUDGET: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(RPC_READ_FRAME_BUDGET_PERMITS));
 static RPC_WRITE_FRAME_BUDGET: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(RPC_WRITE_FRAME_BUDGET_PERMITS));
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent =
+        path.parent().ok_or_else(|| RymeError::InvalidArgument(String::from("metadata path")))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 type RangeReadValues = Vec<(Option<Vec<u8>>, Option<u64>)>;
 
@@ -1007,6 +1020,7 @@ impl Inner {
             file.sync_data()?;
         }
         std::fs::rename(&tmp, &self.meta_path)?;
+        sync_parent_directory(&self.meta_path)?;
         Ok(())
     }
 
@@ -4180,6 +4194,7 @@ impl Node {
             file.sync_data()?;
         }
         std::fs::rename(temporary, &self.range_meta_path)?;
+        sync_parent_directory(&self.range_meta_path)?;
         Ok(())
     }
 
