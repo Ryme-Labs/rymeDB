@@ -89,7 +89,13 @@ async fn roundtrip(socket: &mut tokio::net::TcpStream, message: Vec<u8>) -> Vec<
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for response to PostgreSQL frame {:?} with payload {:?}",
+            message.first(),
+            message.get(5..).unwrap_or_default()
+        )
+    });
     out
 }
 
