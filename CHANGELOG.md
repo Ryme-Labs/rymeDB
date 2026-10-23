@@ -28,6 +28,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - Range splits now reject empty or duplicate child IDs, merges reject empty IDs,
   and persisted range snapshots reject empty IDs.
+- The documentation toolchain now resolves patched `body-parser` 1.20.9 to
+  address a denial-of-service advisory in earlier 1.x versions.
 - Durable-topic snapshot restoration now enforces global and per-tenant topic
   limits before admitting each restored topic.
 - DEK rotation IDs now remain unique when restoring stale counters or reaching
