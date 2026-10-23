@@ -17,6 +17,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - Transaction snapshot and pointer publication now use unique temporary files
   created exclusively, preventing symlink following and temp-name collisions.
+- Storage segment, pointer, and compaction-marker publication now uses unique
+  temporary files created exclusively, preventing symlink following and
+  collisions.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.

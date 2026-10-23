@@ -2,6 +2,7 @@ use super::{Engine, RecordKey};
 use ryme_error::{Result, RymeError};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -21,6 +22,41 @@ const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SEGMENT_POINTER_BYTES: usize = 64;
 const DELTA_COMPACTION_MARKER_BYTES: usize = 4 + 2 + 8 + 8 + 8 + 4;
 static NEXT_SEGMENT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn write_temp_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<PathBuf> {
+    use std::io::Write;
+
+    let (temporary, mut file) = loop {
+        let id = NEXT_SEGMENT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = dir.join(format!("{name}.{}.{}.tmp", std::process::id(), id));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = file.write_all(bytes).and_then(|()| {
+        if sync {
+            file.sync_data()
+        } else {
+            Ok(())
+        }
+    });
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(temporary)
+}
+
+fn install_temp_file(temporary: &Path, destination: &Path) -> Result<()> {
+    if let Err(error) = std::fs::rename(temporary, destination) {
+        let _ = std::fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
@@ -526,51 +562,34 @@ impl SegmentStore {
     ) -> Result<(SegmentMeta, PathBuf)> {
         let id = segment.meta.id;
         let path = self.dir.join(segment_file_name(id, segment.kind));
-        let temporary = self.dir.join(format!(
-            "{segment_name}.{}.{}.tmp",
-            std::process::id(),
-            NEXT_SEGMENT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed),
-            segment_name = segment_name(id)
-        ));
+        let name = segment_file_name(id, segment.kind);
         let encoded = segment.encode()?;
         if encoded.len() > MAX_SEGMENT_BYTES {
             return Err(RymeError::Overload(String::from("segment")));
         }
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&encoded)?;
-            if sync {
-                file.sync_data()?;
+        let temporary = write_temp_file(&self.dir, &name, &encoded, sync)?;
+        let _segment_io = match self.segment_io.write() {
+            Ok(lock) => lock,
+            Err(_) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(RymeError::Internal(String::from("segment update lock")));
             }
-        }
-        let _segment_io = self
-            .segment_io
-            .write()
-            .map_err(|_| RymeError::Internal(String::from("segment update lock")))?;
+        };
         if let Ok(mut cache) = self.cache.lock() {
             cache.remove(id);
         }
-        std::fs::rename(&temporary, &path)?;
+        install_temp_file(&temporary, &path)?;
         if segment.kind != SegmentKind::CompactedDelta {
             self.remember_segment(path.clone());
         }
         if update_latest_pointer {
             let latest = self.dir.join("latest");
-            let latest_tmp = self.dir.join("latest.tmp");
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| RymeError::Internal(String::from("segment name")))?;
-            {
-                use std::io::Write;
-                let mut file = std::fs::File::create(&latest_tmp)?;
-                file.write_all(name.as_bytes())?;
-                if sync {
-                    file.sync_data()?;
-                }
-            }
-            std::fs::rename(latest_tmp, latest)?;
+            let latest_tmp = write_temp_file(&self.dir, "latest", name.as_bytes(), sync)?;
+            install_temp_file(&latest_tmp, &latest)?;
             self.refresh_paths()?;
         }
         if sync {
@@ -1371,14 +1390,8 @@ fn publish_delta_compaction_marker(dir: &Path, marker: DeltaCompactionMarker) ->
     bytes.extend_from_slice(&checksum.to_be_bytes());
 
     let path = dir.join("delta-compaction");
-    let temporary = dir.join("delta-compaction.tmp");
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_data()?;
-    }
-    std::fs::rename(temporary, path)?;
+    let temporary = write_temp_file(dir, "delta-compaction", &bytes, true)?;
+    install_temp_file(&temporary, &path)?;
     sync_directory(dir)
 }
 
