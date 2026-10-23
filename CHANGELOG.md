@@ -49,6 +49,8 @@ All notable changes to rymeDB are recorded here. Format follows
   copying any objects.
 - Archive restores propagate destination inspection errors and recheck the
   destination before publishing the staged restore.
+- Local archive writes now sync the containing directory after publishing an
+  object, and sync newly created directory entries before reporting success.
 - RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
   and scan the keyspace in bounded pages.
 - RESP `MGET` reads values incrementally and rejects combined results above

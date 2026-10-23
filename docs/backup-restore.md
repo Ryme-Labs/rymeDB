@@ -22,6 +22,8 @@ WAL segment paths must be regular files; symlinks and other file types are
 rejected during discovery and recovery.
 Local archive objects and restored files are written through unique temporary
 files created exclusively in their destination directories.
+On Unix, local archive writes sync the published object's containing directory
+and any newly created directory entries before reporting success.
 The configured local archive root must be a directory, not a symlink; missing
 roots are created when objects are written.
 Local and S3 object listings are capped at 100,000 keys and 64 MiB of key

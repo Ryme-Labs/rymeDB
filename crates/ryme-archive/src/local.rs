@@ -20,6 +20,30 @@ impl LocalStore {
         }
     }
 
+    fn create_parent_directories(&self, parent: &std::path::Path) -> Result<Vec<PathBuf>> {
+        let mut missing = Vec::new();
+        let mut current = Some(parent);
+        while let Some(directory) = current {
+            let under_root = directory.starts_with(&self.root);
+            let metadata = if under_root {
+                std::fs::symlink_metadata(directory)
+            } else {
+                std::fs::metadata(directory)
+            };
+            match metadata {
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => return Err(RymeError::InvalidArgument(String::from("archive directory"))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(directory.to_path_buf());
+                }
+                Err(error) => return Err(RymeError::from(error)),
+            }
+            current = directory.parent();
+        }
+        std::fs::create_dir_all(parent)?;
+        Ok(missing)
+    }
+
     fn path(&self, key: &str) -> Result<PathBuf> {
         if !super::safe_relative_name(key) {
             return Err(RymeError::InvalidArgument(String::from("key")));
@@ -188,9 +212,10 @@ impl crate::ObjectStore for LocalStore {
             return Err(RymeError::Overload(String::from("archive object")));
         }
         let path = self.path(key)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("archive path")))?;
+        let missing_directories = self.create_parent_directories(parent)?;
         let path = self.path(key)?;
         let (tmp, mut file) = super::create_archive_temp_file(&path)?;
         let write_result = (|| -> Result<()> {
@@ -198,6 +223,12 @@ impl crate::ObjectStore for LocalStore {
             file.sync_all()?;
             drop(file);
             std::fs::rename(&tmp, &path)?;
+            sync_archive_directory(parent)?;
+            for directory in &missing_directories {
+                if let Some(parent) = directory.parent() {
+                    sync_archive_directory(parent)?;
+                }
+            }
             Ok(())
         })();
         if write_result.is_err() {
@@ -279,4 +310,15 @@ impl crate::ObjectStore for LocalStore {
             Err(e) => Err(RymeError::from(e)),
         }
     }
+}
+
+#[cfg(unix)]
+fn sync_archive_directory(path: &std::path::Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_archive_directory(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
