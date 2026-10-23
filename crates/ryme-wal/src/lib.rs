@@ -243,11 +243,12 @@ impl Wal {
         file.sync_data()?;
         drop(file);
         sync_directory(&temporary)?;
+        // From marker publication onward, recovery may choose the staged
+        // generation over this handle's current WAL files. Do not let the
+        // live writer append through the old handle if any rewrite step fails.
+        self.poisoned = true;
         create_rewrite_marker(&self.dir)?;
-        if let Err(error) = install_rewrite(&self.dir) {
-            self.poisoned = true;
-            return Err(error);
-        }
+        install_rewrite(&self.dir)?;
 
         self.active_id = latest_segment_id(&self.dir)?;
         let active_path = self.dir.join(segment_name(self.active_id));
