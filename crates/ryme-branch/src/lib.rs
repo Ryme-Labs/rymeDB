@@ -476,13 +476,22 @@ impl BranchManager {
             .parent_id
             .clone()
             .ok_or_else(|| RymeError::InvalidArgument(String::from("root")))?;
+        let parent_key = scoped_key(tenant, &parent_id);
+        let schema_version = self
+            .branches
+            .get(&parent_key)
+            .ok_or_else(|| RymeError::NotFound(String::from("parent")))?
+            .schema_version
+            .max(child.schema_version)
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Conflict(String::from("branch schema version exhausted")))?;
         let parent = self
             .branches
-            .get_mut(&scoped_key(tenant, &parent_id))
+            .get_mut(&parent_key)
             .ok_or_else(|| RymeError::NotFound(String::from("parent")))?;
         let old_manifest = parent.manifest_id.clone();
         parent.manifest_id.clone_from(&child.manifest_id);
-        parent.schema_version = parent.schema_version.max(child.schema_version) + 1;
+        parent.schema_version = schema_version;
         parent.base_commit_ts = child.base_commit_ts;
         *self.refs.entry(child.manifest_id.clone()).or_insert(0) += 1;
         let count = self.refs.entry(old_manifest.clone()).or_insert(1);
@@ -1027,11 +1036,7 @@ where
         expires_at: u64,
     ) {
         if self.overlay {
-            self.base.put(
-                txn,
-                self.local_key(&key),
-                Self::encode_with_expiry(&value, expires_at),
-            );
+            self.base.put(txn, self.local_key(&key), Self::encode_with_expiry(&value, expires_at));
         } else {
             self.base.put_with_ttl(txn, key, value, expires_at);
         }
@@ -1514,7 +1519,12 @@ mod tests {
         let now = ryme_txn::now_unix();
         let parent_expiry = now + 10_000;
         let mut parent_write = base.begin();
-        base.put_with_ttl(&mut parent_write, parent_key.clone(), b"from-parent".to_vec(), parent_expiry);
+        base.put_with_ttl(
+            &mut parent_write,
+            parent_key.clone(),
+            b"from-parent".to_vec(),
+            parent_expiry,
+        );
         let parent_commit = base.commit(parent_write).unwrap();
         let branch = BranchBackend::new(
             base.clone(),
@@ -1526,7 +1536,12 @@ mod tests {
 
         let updated_expiry = now + 20_000;
         let mut parent_update = base.begin();
-        base.put_with_ttl(&mut parent_update, parent_key.clone(), b"updated".to_vec(), updated_expiry);
+        base.put_with_ttl(
+            &mut parent_update,
+            parent_key.clone(),
+            b"updated".to_vec(),
+            updated_expiry,
+        );
         base.commit(parent_update).unwrap();
         assert_eq!(branch.expires_at(&parent_key).unwrap(), Some(parent_expiry));
 
@@ -1540,12 +1555,20 @@ mod tests {
         base.commit(expired_override).unwrap();
         let mut expired_read = branch.begin();
         assert_eq!(branch.get(&mut expired_read, &parent_key).unwrap(), None);
-        assert!(branch.scan(&mut expired_read, "tenant", "default", "docs", 10).unwrap().is_empty());
+        assert!(branch
+            .scan(&mut expired_read, "tenant", "default", "docs", 10)
+            .unwrap()
+            .is_empty());
 
         let local_key = ryme_storage::RecordKey::new("tenant", "default", "docs", b"local");
         let local_expiry = now + 30_000;
         let mut branch_write = branch.begin();
-        branch.put_with_ttl(&mut branch_write, local_key.clone(), b"from-branch".to_vec(), local_expiry);
+        branch.put_with_ttl(
+            &mut branch_write,
+            local_key.clone(),
+            b"from-branch".to_vec(),
+            local_expiry,
+        );
         base.commit(branch_write).unwrap();
         assert_eq!(branch.expires_at(&local_key).unwrap(), Some(local_expiry));
     }
