@@ -1125,6 +1125,10 @@ pub struct SequenceDefinition {
     pub cycle: bool,
     #[serde(default)]
     pub last_value: Option<i64>,
+    /// Whether `last_value` has already been consumed by `nextval`.
+    /// A false value makes the next call return `last_value` as-is.
+    #[serde(default = "default_sequence_called")]
+    pub is_called: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8610,6 +8614,7 @@ where
         if let Some(restart) = restart {
             sequence.start = restart;
             sequence.last_value = None;
+            sequence.is_called = false;
         }
         self.schema_dirty.store(true, Ordering::SeqCst);
         Ok(())
@@ -8642,19 +8647,23 @@ where
         let sequence = sequences.get_mut(&key).expect("sequence key selected above");
         match operation {
             SequenceOperation::Nextval => {
-                let next = match sequence.last_value {
-                    None => sequence.start,
-                    Some(last) => match last.checked_add(sequence.increment) {
-                        Some(next) => next,
-                        None if sequence.cycle && sequence.increment < 0 => sequence.max_value,
-                        None if sequence.cycle => sequence.min_value,
-                        None => {
-                            return Err(RymeError::Conflict(format!(
-                                "sequence {} exhausted",
-                                sequence.name
-                            )));
-                        }
-                    },
+                let next = if !sequence.is_called {
+                    sequence.last_value.unwrap_or(sequence.start)
+                } else {
+                    match sequence.last_value {
+                        None => sequence.start,
+                        Some(last) => match last.checked_add(sequence.increment) {
+                            Some(next) => next,
+                            None if sequence.cycle && sequence.increment < 0 => sequence.max_value,
+                            None if sequence.cycle => sequence.min_value,
+                            None => {
+                                return Err(RymeError::Conflict(format!(
+                                    "sequence {} exhausted",
+                                    sequence.name
+                                )));
+                            }
+                        },
+                    }
                 };
                 let next = if next < sequence.min_value || next > sequence.max_value {
                     if sequence.cycle {
@@ -8673,6 +8682,7 @@ where
                     next
                 };
                 sequence.last_value = Some(next);
+                sequence.is_called = true;
                 self.schema_dirty.store(true, Ordering::SeqCst);
                 Ok(next)
             }
@@ -8688,11 +8698,8 @@ where
                 if value < sequence.min_value || value > sequence.max_value {
                     return Err(RymeError::InvalidArgument(String::from("setval value")));
                 }
-                sequence.last_value = if is_called {
-                    Some(value)
-                } else {
-                    Some(value.checked_sub(sequence.increment).unwrap_or(value))
-                };
+                sequence.last_value = Some(value);
+                sequence.is_called = is_called;
                 self.schema_dirty.store(true, Ordering::SeqCst);
                 Ok(value)
             }
@@ -13943,6 +13950,7 @@ where
                         cache,
                         cycle,
                         last_value: None,
+                        is_called: false,
                     },
                     if_not_exists,
                 )?;
@@ -16304,6 +16312,7 @@ where
                         cache,
                         cycle,
                         last_value: None,
+                        is_called: false,
                     },
                     if_not_exists,
                 )?;

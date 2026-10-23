@@ -21,6 +21,8 @@ All notable changes to rymeDB are recorded here. Format follows
   invalid `ALTER SEQUENCE` options leave the sequence unchanged.
 - SQL sequences now validate `smallint`, `integer`, and `bigint` ranges and use
   direction-aware defaults for descending sequences.
+- `setval(..., false)` now persists its value directly, so the next `nextval`
+  returns that value without storing an out-of-range synthetic predecessor.
 - Range split, merge, and leader changes now reject exhausted epochs before
   mutating topology, preserving monotonic routing fences.
 - Branch promotion now rejects exhausted schema versions before changing
