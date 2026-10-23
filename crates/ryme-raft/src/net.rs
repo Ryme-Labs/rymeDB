@@ -3186,7 +3186,7 @@ impl Node {
                             inner.persist_meta()?;
                         }
                         let log_storage_failed =
-                            outcome.as_ref().is_err_and(is_raft_log_storage_failure);
+                            outcome.as_ref().is_err_and(is_wal_storage_failure);
                         match outcome {
                             Ok(matched) => (
                                 Rpc::AppendResponse {
@@ -3657,8 +3657,15 @@ impl Node {
             .intent_wal
             .lock()
             .map_err(|_| RymeError::Internal(String::from("transaction intent wal")))?;
-        wal.append(commit_ts, &payload)?;
-        wal.sync()
+        if let Err(error) = wal.append(commit_ts, &payload).and_then(|_| wal.sync()) {
+            let isolate = is_wal_storage_failure(&error);
+            drop(wal);
+            if isolate {
+                self.set_isolated(true);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3701,8 +3708,15 @@ impl Node {
             .resolution_wal
             .lock()
             .map_err(|_| RymeError::Internal(String::from("transaction resolution wal")))?;
-        wal.append(commit_ts, &payload)?;
-        wal.sync()?;
+        if let Err(error) = wal.append(commit_ts, &payload).and_then(|_| wal.sync()) {
+            let isolate = is_wal_storage_failure(&error);
+            drop(wal);
+            drop(pending);
+            if isolate {
+                self.set_isolated(true);
+            }
+            return Err(error);
+        }
         pending.insert(
             key,
             PendingResolution {
@@ -3742,8 +3756,15 @@ impl Node {
             .resolution_wal
             .lock()
             .map_err(|_| RymeError::Internal(String::from("transaction resolution wal")))?;
-        wal.append(resolution.commit_ts, &payload)?;
-        wal.sync()?;
+        if let Err(error) = wal.append(resolution.commit_ts, &payload).and_then(|_| wal.sync()) {
+            let isolate = is_wal_storage_failure(&error);
+            drop(wal);
+            drop(pending);
+            if isolate {
+                self.set_isolated(true);
+            }
+            return Err(error);
+        }
         pending.remove(&key);
         Ok(())
     }
@@ -4381,8 +4402,16 @@ impl Node {
             .range_entries
             .lock()
             .map_err(|_| RymeError::Internal(String::from("range entries")))?;
-        wal.append(commit_ts, &record)?;
-        wal.sync()?;
+        if let Err(error) = wal.append(commit_ts, &record).and_then(|_| wal.sync()) {
+            let isolate = is_wal_storage_failure(&error);
+            drop(entries);
+            drop(wal);
+            drop(logs);
+            if isolate {
+                self.set_isolated(true);
+            }
+            return Err(error);
+        }
         entries.entry(group_id.to_string()).or_default().insert(
             index,
             RangeLogRecord {
@@ -4419,17 +4448,36 @@ impl Node {
             .range_entries
             .lock()
             .map_err(|_| RymeError::Internal(String::from("range entries")))?;
-        let records = Wal::read_all(&self.range_wal_path)?;
-        let mut kept = Vec::with_capacity(records.len());
-        for record in &records {
-            let range_record: RangeLogRecord = serde_json::from_slice(&record.payload)
-                .map_err(|error| RymeError::Corrupt(format!("range log: {error}")))?;
-            if range_record.group_id != group_id || range_record.index <= keep_through {
-                kept.push(record.clone());
+        let replacement = (|| -> Result<(usize, Vec<WalRecord>)> {
+            let records = Wal::read_all(&self.range_wal_path)?;
+            let mut kept = Vec::with_capacity(records.len());
+            for record in &records {
+                let range_record: RangeLogRecord = serde_json::from_slice(&record.payload)
+                    .map_err(|error| RymeError::Corrupt(format!("range log: {error}")))?;
+                if range_record.group_id != group_id || range_record.index <= keep_through {
+                    kept.push(record.clone());
+                }
             }
-        }
-        if kept.len() != records.len() {
-            wal.replace_records(&kept)?;
+            Ok((records.len(), kept))
+        })();
+        let (record_count, kept) = match replacement {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                drop(entries);
+                drop(wal);
+                drop(logs);
+                self.set_isolated(true);
+                return Err(error);
+            }
+        };
+        if kept.len() != record_count {
+            if let Err(error) = wal.replace_records(&kept) {
+                drop(entries);
+                drop(wal);
+                drop(logs);
+                self.set_isolated(true);
+                return Err(error);
+            }
         }
         if let Some(group) = entries.get_mut(group_id) {
             group.retain(|index, _| *index <= keep_through);
@@ -5501,7 +5549,7 @@ impl Node {
                 .ok_or_else(|| RymeError::Corrupt(String::from("raft log index overflow")))?;
             let entry = LogEntry { index, term: inner.term, payload };
             if let Err(error) = inner.persist_entries(std::slice::from_ref(&entry)) {
-                let isolate = is_raft_log_storage_failure(&error);
+                let isolate = is_wal_storage_failure(&error);
                 drop(inner);
                 if isolate {
                     self.set_isolated(true);
@@ -6759,7 +6807,7 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-fn is_raft_log_storage_failure(error: &RymeError) -> bool {
+fn is_wal_storage_failure(error: &RymeError) -> bool {
     match error {
         RymeError::Io(_) | RymeError::Corrupt(_) => true,
         RymeError::Unavailable(message) => message.starts_with("wal is in a failed state"),
