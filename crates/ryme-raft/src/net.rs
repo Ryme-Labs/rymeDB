@@ -2600,10 +2600,12 @@ impl Node {
                     inner.advance_commit()?;
                 } else {
                     let next = inner.next_index.entry(peer).or_insert(1);
-                    *next = match_index
+                    let suggested = match_index
                         .min(snapshot.last().map(|entry| entry.index).unwrap_or(0))
                         .saturating_add(1)
                         .max(1);
+                    *next =
+                        if suggested < *next { suggested } else { next.saturating_sub(1).max(1) };
                 }
             }
             Ok(_) => {}

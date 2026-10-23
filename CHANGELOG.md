@@ -49,6 +49,8 @@ All notable changes to rymeDB are recorded here. Format follows
   across core, range, intent, and resolution logs.
 - Raft leaders now cap follower acknowledgments at entries actually sent and
   advance commits by scanning stored entries instead of untrusted index ranges.
+- Raft leaders now backtrack the replication prefix when a follower rejects an
+  append without offering a lower retry point, allowing conflicting suffixes to heal.
 
 ### Performance
 
