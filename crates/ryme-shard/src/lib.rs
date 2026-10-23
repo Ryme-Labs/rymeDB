@@ -7,6 +7,7 @@ use ryme_txn::{
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -123,6 +124,19 @@ const COORDINATOR_PLACEMENT_VERSION: u8 = 2;
 const MAX_PENDING_GROUP_COMMITS: usize = 128;
 const MAX_PENDING_GROUP_COMMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SHARD_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent =
+        path.parent().ok_or_else(|| RymeError::InvalidArgument(String::from("metadata path")))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
@@ -254,6 +268,7 @@ fn persist_range_assignments(
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
+    sync_parent_directory(path)?;
     Ok(())
 }
 
@@ -441,7 +456,8 @@ impl ShardSet {
         use std::io::Write;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        std::fs::rename(temporary, path)?;
+        std::fs::rename(temporary, &path)?;
+        sync_parent_directory(&path)?;
         Ok(())
     }
 
