@@ -48,6 +48,7 @@ fn bind_msg(portal: &str, statement: &str, params: &[&str]) -> Vec<u8> {
 fn execute_msg(portal: &str) -> Vec<u8> {
     let mut payload = portal.as_bytes().to_vec();
     payload.push(0);
+    payload.extend_from_slice(&0i32.to_be_bytes());
     frame(b'E', &payload)
 }
 
@@ -257,6 +258,8 @@ async fn prepared_statements_and_portals_have_session_limits() {
     socket.write_all(&parse_msg("statement-over-limit", "SELECT 1")).await.unwrap();
     let (_, body) = read_frame(&mut socket).await;
     assert!(String::from_utf8_lossy(&body).contains("prepared statement limit exceeded"));
+    socket.write_all(&sync_msg()).await.unwrap();
+    assert_eq!(read_frame(&mut socket).await.0, b'Z');
 
     for index in 0..256 {
         let response =
