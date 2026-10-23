@@ -2224,20 +2224,23 @@ where
                     .iter()
                     .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
                     .collect();
-                match self.manager.get_many(txn, &records) {
-                    Ok(values) if values.len() == records.len() => {
-                        let mut removed = 0;
-                        for (record, value) in records.into_iter().zip(values) {
-                            if value.is_some() {
-                                self.manager.delete(txn, record);
-                                removed += 1;
-                            }
-                        }
-                        encode_integer(removed)
-                    }
-                    Ok(_) => encode_error(String::from("read count")),
-                    Err(error) => encode_error(error.to_string()),
+                let mut exists = Vec::with_capacity(records.len());
+                for batch in records.chunks(RESP_MGET_BATCH_ITEMS) {
+                    let values = match self.manager.get_many(txn, batch) {
+                        Ok(values) if values.len() == batch.len() => values,
+                        Ok(_) => return encode_error(String::from("read count")),
+                        Err(error) => return encode_error(error.to_string()),
+                    };
+                    exists.extend(values.into_iter().map(|value| value.is_some()));
                 }
+                let mut removed = 0;
+                for (record, exists) in records.into_iter().zip(exists) {
+                    if exists {
+                        self.manager.delete(txn, record);
+                        removed += 1;
+                    }
+                }
+                encode_integer(removed)
             }
             "EXISTS" => {
                 if command.args.is_empty() {
@@ -2248,13 +2251,17 @@ where
                     .iter()
                     .map(|key| RecordKey::new(&self.tenant, &self.database, KV_TABLE, key))
                     .collect::<Vec<_>>();
-                match self.manager.get_many(txn, &records) {
-                    Ok(values) => {
-                        let found = values.iter().filter(|value| value.is_some()).count();
-                        encode_integer(found as i64)
+                let mut found = 0usize;
+                for batch in records.chunks(RESP_MGET_BATCH_ITEMS) {
+                    match self.manager.get_many(txn, batch) {
+                        Ok(values) if values.len() == batch.len() => {
+                            found += values.iter().filter(|value| value.is_some()).count();
+                        }
+                        Ok(_) => return encode_error(String::from("read count")),
+                        Err(error) => return encode_error(error.to_string()),
                     }
-                    Err(error) => encode_error(error.to_string()),
                 }
+                encode_integer(found as i64)
             }
             "TYPE" => match command.args.first() {
                 Some(key) => {
@@ -2369,18 +2376,10 @@ where
                     .iter()
                     .map(|pair| RecordKey::new(&self.tenant, &self.database, KV_TABLE, &pair[0]))
                     .collect();
-                match self.manager.get_many(txn, &writes) {
-                    Ok(values) if values.len() == writes.len() => {
-                        for (record, pair) in
-                            writes.into_iter().zip(command.args.as_chunks::<2>().0)
-                        {
-                            self.manager.put(txn, record, pair[1].clone());
-                        }
-                        encode_simple("OK")
-                    }
-                    Ok(_) => encode_error(String::from("read count")),
-                    Err(error) => encode_error(error.to_string()),
+                for (record, pair) in writes.into_iter().zip(command.args.as_chunks::<2>().0) {
+                    self.manager.put(txn, record, pair[1].clone());
                 }
+                encode_simple("OK")
             }
             "MSETNX" => {
                 if command.args.is_empty() || !command.args.len().is_multiple_of(2) {

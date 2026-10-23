@@ -24,6 +24,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Realtime and Supabase-compatible WebSocket broadcast fanout share cached
   serialized bytes across subscribers instead of copying each frame per
   delivery.
+- RESP `MSET` no longer reads and clones the previous values before writing;
+  `DEL` and `EXISTS` inspect existing values in small batches.
 
 ### Fixed
 
