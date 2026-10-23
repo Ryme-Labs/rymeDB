@@ -2447,9 +2447,12 @@ impl Node {
         let win_current = votes_win(&votes, &inner.current);
         let win_joint = inner.joint.as_ref().map(|joint| votes_win(&votes, joint)).unwrap_or(true);
         if win_current && win_joint {
+            let last = inner.last_index();
+            let next_index = last
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("raft log index overflow")))?;
             inner.role = Role::Leader;
             inner.leader_id = Some(self.id);
-            let last = inner.last_index();
             inner.next_index.clear();
             inner.acks.clear();
             let mut ids: Vec<usize> = inner.current.iter().map(|member| member.id).collect();
@@ -2459,7 +2462,7 @@ impl Node {
             ids.sort_unstable();
             ids.dedup();
             for id in ids {
-                inner.next_index.insert(id, last + 1);
+                inner.next_index.insert(id, next_index);
                 inner.acks.insert(id, 0);
             }
             if let Some(slot) = inner.acks.get_mut(&self.id) {
