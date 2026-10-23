@@ -1255,6 +1255,10 @@ pub struct PasskeyCredential {
 
 pub const PASSKEY_CHALLENGE_TTL_SECS: u64 = 300;
 const MAX_PASSKEY_CREDENTIALS: usize = 100_000;
+const MAX_PASSKEY_CLIENT_DATA_BYTES: usize = 16 * 1024;
+const MAX_PASSKEY_AUTHENTICATOR_DATA_BYTES: usize = 4 * 1024;
+const MAX_PASSKEY_SIGNATURE_BYTES: usize = 128;
+const MAX_PASSKEY_CREDENTIAL_ID_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PasskeyAssertion<'a> {
@@ -1320,7 +1324,7 @@ impl PasskeyRegistry {
         if user.is_empty() || user.len() > MAX_USER_LEN {
             return Err(RymeError::InvalidArgument(String::from("user")));
         }
-        if credential_id.is_empty() || credential_id.len() > 256 {
+        if credential_id.is_empty() || credential_id.len() > MAX_PASSKEY_CREDENTIAL_ID_BYTES {
             return Err(RymeError::InvalidArgument(String::from("credential")));
         }
         if public_key.len() > 128 {
@@ -1354,8 +1358,20 @@ impl PasskeyRegistry {
     }
 
     pub fn from_snapshot(credentials: HashMap<String, PasskeyCredential>) -> Result<Self> {
+        use p256::elliptic_curve::sec1::FromSec1Point;
         if credentials.len() > MAX_PASSKEY_CREDENTIALS {
             return Err(RymeError::Corrupt(String::from("passkey snapshot")));
+        }
+        if credentials.iter().any(|(credential_id, credential)| {
+            credential_id.is_empty()
+                || credential_id.len() > MAX_PASSKEY_CREDENTIAL_ID_BYTES
+                || credential.user.is_empty()
+                || credential.user.len() > MAX_USER_LEN
+                || credential.public_key.is_empty()
+                || credential.public_key.len() > 128
+                || p256::AffinePoint::from_sec1_bytes(&credential.public_key).is_err()
+        }) {
+            return Err(RymeError::Corrupt(String::from("passkey snapshot credential")));
         }
         Ok(Self { challenges: HashMap::new(), next_challenge_expiry: None, credentials })
     }
@@ -1377,6 +1393,20 @@ impl PasskeyRegistry {
         let credential_id: &str = credential_id;
         let rp_id: &str = rp_id;
         let now_secs: u64 = *now_secs;
+        if user.is_empty()
+            || user.len() > MAX_USER_LEN
+            || credential_id.is_empty()
+            || credential_id.len() > MAX_PASSKEY_CREDENTIAL_ID_BYTES
+            || rp_id.is_empty()
+            || rp_id.len() > 253
+            || client_data_json.is_empty()
+            || client_data_json.len() > MAX_PASSKEY_CLIENT_DATA_BYTES
+            || authenticator_data.len() > MAX_PASSKEY_AUTHENTICATOR_DATA_BYTES
+            || signature_der.is_empty()
+            || signature_der.len() > MAX_PASSKEY_SIGNATURE_BYTES
+        {
+            return Err(RymeError::InvalidArgument(String::from("passkey assertion size")));
+        }
         let client_data: serde_json::Value =
             serde_json::from_slice(client_data_json).map_err(|_| RymeError::Unauthorized)?;
         if client_data.get("type").and_then(|v| v.as_str()) != Some("webauthn.get") {

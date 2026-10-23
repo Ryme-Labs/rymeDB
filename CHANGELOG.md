@@ -19,6 +19,8 @@ All notable changes to rymeDB are recorded here. Format follows
   integer and producing duplicate identifiers.
 - API key storage and authentication now reject empty or oversized bearer keys
   before hashing or retaining them.
+- Passkey assertion fields are size-bounded before JSON parsing and signature
+  verification, and restored credentials are validated before use.
 - SQL sequence arithmetic now reports integer overflow as exhaustion, and
   invalid `ALTER SEQUENCE` options leave the sequence unchanged.
 - SQL sequences now validate `smallint`, `integer`, and `bigint` ranges and use
