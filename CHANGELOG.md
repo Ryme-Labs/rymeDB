@@ -56,7 +56,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - WAL archive enumeration now propagates directory errors and rejects symlink
   or non-file segment entries instead of following or silently skipping them.
 - Branch-schema archive discovery rejects symlinked roots and special files,
-  and caps visited directories and nesting depth.
+  and caps visited directories, nesting depth, queued path bytes, and archived
+  path-name bytes.
 - Immutable-segment archive discovery rejects symlinked segment directories
   and symlink or non-file entries using segment filenames.
 - Segment archives now include compacted delta outputs and the latest/compaction

@@ -1219,6 +1219,7 @@ const AUTH_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const KEYRING_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ARCHIVE_METADATA_DIRECTORIES: usize = 100_000;
 const MAX_ARCHIVE_METADATA_DEPTH: usize = 256;
+const MAX_ARCHIVE_METADATA_PATH_BYTES: usize = 64 * 1024 * 1024;
 const BRANCH_PROMOTION_JOURNAL_MAX_BYTES: usize = 768 * 1024 * 1024;
 
 fn prepare_data_directory(path: &std::path::Path) -> ryme_error::Result<()> {
@@ -15518,10 +15519,13 @@ fn archive_metadata_paths(
         }
     }
 
+    let mut archive_name_bytes = files.iter().map(|(name, _)| name.len()).sum::<usize>();
     let root = data_dir.join("branch-schemas");
+    let mut pending_path_bytes = root.to_string_lossy().len();
     let mut pending = vec![(root.clone(), 0usize)];
     let mut visited_directories = 0usize;
     while let Some((directory, depth)) = pending.pop() {
+        pending_path_bytes = pending_path_bytes.saturating_sub(directory.to_string_lossy().len());
         match std::fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.file_type().is_dir() => {}
             Ok(_) => {
@@ -15555,6 +15559,12 @@ fn archive_metadata_paths(
                         "archive metadata directories",
                     )));
                 }
+                pending_path_bytes = pending_path_bytes
+                    .checked_add(path.to_string_lossy().len())
+                    .filter(|bytes| *bytes <= MAX_ARCHIVE_METADATA_PATH_BYTES)
+                    .ok_or_else(|| {
+                        ryme_error::RymeError::Overload(String::from("archive metadata paths"))
+                    })?;
                 pending.push((path, depth + 1));
                 continue;
             }
@@ -15567,6 +15577,12 @@ fn archive_metadata_paths(
                 .strip_prefix(data_dir)
                 .map_err(|_| ryme_error::RymeError::Internal(String::from("archive path")))?;
             let name = relative.to_string_lossy().replace('\\', "/");
+            archive_name_bytes = archive_name_bytes
+                .checked_add(name.len())
+                .filter(|bytes| *bytes <= MAX_ARCHIVE_METADATA_PATH_BYTES)
+                .ok_or_else(|| {
+                    ryme_error::RymeError::Overload(String::from("archive metadata paths"))
+                })?;
             if files.len() == ryme_archive::MAX_ARCHIVE_FILES {
                 return Err(ryme_error::RymeError::Overload(String::from(
                     "archive manifest files",

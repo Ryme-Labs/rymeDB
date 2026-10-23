@@ -24,7 +24,8 @@ canonical `seg-` plus 20-digit ID plus `.wal` filename format.
 WAL archive enumeration also fails on directory read errors and rejects
 symlink or non-file entries that use a segment filename.
 Branch-schema archive discovery rejects symlinked roots and non-regular entries;
-it caps traversal at 100,000 directories and 256 levels of nesting.
+it caps traversal at 100,000 directories, 256 levels of nesting, and 64 MiB of
+queued paths and archived path names.
 Immutable-segment archive discovery rejects a symlinked `segments` directory
 and non-regular entries that use a segment filename.
 Segment archives include active `.cmp` delta-compaction files plus the `latest`
