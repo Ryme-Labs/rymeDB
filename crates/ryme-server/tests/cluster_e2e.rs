@@ -2,6 +2,8 @@ use futures_util::StreamExt;
 use ryme_config::{Config, RaftPeer};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 const KEY: &str = "ryme-cluster-e2e-key-9d4c2b7a1f60";
 
@@ -105,6 +107,13 @@ async fn http_request(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> (u
         .map(|index| raw[index + 4..].to_vec())
         .unwrap_or_default();
     (status, body)
+}
+
+fn websocket_request(url: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    let mut request = url.into_client_request().unwrap();
+    let authorization = format!("Bearer {KEY}");
+    request.headers_mut().insert("authorization", HeaderValue::from_str(&authorization).unwrap());
+    request
 }
 
 async fn is_leader(http: std::net::SocketAddr) -> bool {
@@ -524,8 +533,8 @@ async fn cluster_broadcast_reaches_every_gateway() {
     let leader = wait_leader(&http, None).await;
     let mut sockets = Vec::new();
     for address in &http {
-        let url = format!("ws://{address}/v1/broadcast/cluster-chat?api_key={KEY}");
-        let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let url = format!("ws://{address}/v1/broadcast/cluster-chat");
+        let (socket, _) = tokio_tungstenite::connect_async(websocket_request(&url)).await.unwrap();
         sockets.push(socket);
     }
     let body = br#"{"channel":"cluster-chat","from":"cluster-test","payload":{"message":"hello"}}"#;
@@ -729,8 +738,8 @@ async fn cluster_cdc_reaches_every_gateway() {
     let leader = wait_leader(&http, None).await;
     let mut sockets = Vec::new();
     for address in &http {
-        let url = format!("ws://{address}/v1/stream?table=docs&api_key={KEY}");
-        let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let url = format!("ws://{address}/v1/stream?table=docs");
+        let (socket, _) = tokio_tungstenite::connect_async(websocket_request(&url)).await.unwrap();
         sockets.push(socket);
     }
     let (status, _) =
