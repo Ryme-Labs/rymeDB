@@ -963,23 +963,28 @@ impl Inner {
                 .unwrap_or(false)
     }
 
-    fn advance_commit(&mut self) {
+    fn advance_commit(&mut self) -> Result<()> {
         let mut target = committed_in(&self.acks, &self.current);
         if let Some(joint) = self.joint.as_ref() {
             target = target.min(committed_in(&self.acks, joint));
         }
         if target <= self.commit_index {
-            return;
+            return Ok(());
         }
         let mut candidate = target;
         while candidate > self.commit_index {
             if self.log.iter().any(|e| e.index == candidate && e.term == self.term) {
+                let previous_commit = self.commit_index;
                 self.commit_index = candidate;
-                let _ = self.persist_meta();
-                return;
+                if let Err(error) = self.persist_meta() {
+                    self.commit_index = previous_commit;
+                    return Err(error);
+                }
+                return Ok(());
             }
             candidate -= 1;
         }
+        Ok(())
     }
 
     fn persist_meta(&self) -> Result<()> {
@@ -2344,7 +2349,7 @@ impl Node {
             if tokio::time::Instant::now() >= deadline {
                 return Err(RymeError::Timeout);
             }
-            self.replicate_once().await;
+            self.replicate_once().await?;
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
@@ -2366,14 +2371,18 @@ impl Node {
     }
 
     async fn replicate_all(self: &Arc<Self>) {
-        self.replicate_once().await;
+        if let Err(error) = self.replicate_once().await {
+            tracing::error!(node = self.id, %error, "raft replication metadata update failed");
+            self.set_isolated(true);
+            return;
+        }
         if let Err(error) = self.apply_ready().await {
             tracing::error!(node = self.id, %error, "raft state machine apply failed");
             self.set_isolated(true);
         }
     }
 
-    async fn replicate_once(self: &Arc<Self>) {
+    async fn replicate_once(self: &Arc<Self>) -> Result<()> {
         let peers: Vec<(usize, Arc<PeerPool>)> = self.member_pools().await;
         let (term, leader_commit, snapshot) = {
             let inner = self.inner.lock().await;
@@ -2388,8 +2397,15 @@ impl Node {
             }));
         }
         for task in tasks {
-            let _ = task.await;
+            let result = task
+                .await
+                .map_err(|error| RymeError::Internal(format!("raft replication task: {error}")))?;
+            if let Err(error) = result {
+                self.set_isolated(true);
+                return Err(error);
+            }
         }
+        Ok(())
     }
 
     async fn replicate_to(
@@ -2399,7 +2415,7 @@ impl Node {
         term: u64,
         leader_commit: u64,
         snapshot: Arc<Vec<LogEntry>>,
-    ) {
+    ) -> Result<()> {
         let next = {
             let inner = self.inner.lock().await;
             inner.next_index.get(&peer).copied().unwrap_or(1)
@@ -2422,18 +2438,19 @@ impl Node {
                     inner.term = peer_term;
                     inner.role = Role::Follower;
                     inner.voted_for = None;
-                    let _ = inner.persist_meta();
-                    return;
+                    inner.leader_id = None;
+                    inner.persist_meta()?;
+                    return Ok(());
                 }
                 if inner.term != term || inner.role != Role::Leader {
-                    return;
+                    return Ok(());
                 }
                 if ok {
                     let next = inner.next_index.entry(peer).or_insert(1);
                     *next = match_index + 1;
                     let ack = inner.acks.entry(peer).or_insert(0);
                     *ack = match_index.max(*ack);
-                    inner.advance_commit();
+                    inner.advance_commit()?;
                 } else {
                     let next = inner.next_index.entry(peer).or_insert(1);
                     *next = match_index.saturating_add(1).max(1);
@@ -2442,6 +2459,7 @@ impl Node {
             Ok(_) => {}
             Err(_) => {}
         }
+        Ok(())
     }
 
     async fn apply_ready(self: &Arc<Self>) -> Result<()> {
@@ -5293,10 +5311,14 @@ impl Node {
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            self.replicate_once().await;
+            self.replicate_once().await?;
             let (role, committed, last) = {
                 let mut inner = self.inner.lock().await;
-                inner.advance_commit();
+                if let Err(error) = inner.advance_commit() {
+                    drop(inner);
+                    self.set_isolated(true);
+                    return Err(error);
+                }
                 (inner.role, inner.commit_index, inner.last_index())
             };
             if committed >= last {
