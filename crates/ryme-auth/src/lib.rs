@@ -1102,8 +1102,10 @@ const ARGON2ID_MEMORY_KIB: u32 = 19 * 1024;
 const ARGON2ID_TIME_COST: u32 = 2;
 const ARGON2ID_PARALLELISM: u32 = 1;
 const PASSWORD_HASH_LEN: usize = 32;
+const PASSWORD_HASH_B64_LEN: usize = 43;
 const MAX_LEGACY_PASSWORD_ROUNDS: u32 = 1_000_000;
 const MAX_PASSWORD_SALT_BYTES: usize = 1024;
+const MAX_PASSWORD_SALT_B64_LEN: usize = 1366;
 const MAX_OTP_SECRET_BYTES: usize = 1024;
 pub const MAX_PASSWORD_LEN: usize = 256;
 pub const MAX_USER_LEN: usize = 256;
@@ -1152,7 +1154,7 @@ pub fn hash_password_with_salt(password: &str, salt: &[u8], rounds: u32) -> Pass
 }
 
 pub fn verify_password(password: &str, stored: &PasswordHash) -> bool {
-    if !valid_password_hash(stored) {
+    if password.len() > MAX_PASSWORD_LEN || !valid_password_hash(stored) {
         return false;
     }
     let Ok(salt) = base64_url_decode(&stored.salt_b64) else {
@@ -1174,6 +1176,12 @@ pub fn verify_password(password: &str, stored: &PasswordHash) -> bool {
 }
 
 fn valid_password_hash(stored: &PasswordHash) -> bool {
+    if stored.hash_b64.len() != PASSWORD_HASH_B64_LEN
+        || stored.salt_b64.is_empty()
+        || stored.salt_b64.len() > MAX_PASSWORD_SALT_B64_LEN
+    {
+        return false;
+    }
     let Ok(salt) = base64_url_decode(&stored.salt_b64) else { return false };
     let Ok(hash) = base64_url_decode(&stored.hash_b64) else { return false };
     if hash.len() != PASSWORD_HASH_LEN

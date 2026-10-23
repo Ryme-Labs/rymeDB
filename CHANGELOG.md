@@ -21,6 +21,8 @@ All notable changes to rymeDB are recorded here. Format follows
   before hashing or retaining them.
 - Passkey assertion fields are size-bounded before JSON parsing and signature
   verification, and restored credentials are validated before use.
+- Password verification now bounds candidate passwords and encoded hash fields
+  before expensive hashing or base64 decoding.
 - SQL sequence arithmetic now reports integer overflow as exhaustion, and
   invalid `ALTER SEQUENCE` options leave the sequence unchanged.
 - SQL sequences now validate `smallint`, `integer`, and `bigint` ranges and use
