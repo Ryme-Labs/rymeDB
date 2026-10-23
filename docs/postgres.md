@@ -21,6 +21,9 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
   reject bytes following it.
 - Password authentication accepts one non-empty, NUL-terminated password string
   and rejects embedded NULs or trailing bytes.
+- Simple Query messages require one terminal NUL and valid UTF-8; malformed
+  query strings receive a protocol error and close the connection instead of
+  being rewritten.
 - Startup, TLS negotiation, and authentication must complete within 15 seconds;
   the deadline ends before the authenticated session begins.
 - Simple and extended query flows (`Parse`, `Bind`, `Describe`, `Execute`,

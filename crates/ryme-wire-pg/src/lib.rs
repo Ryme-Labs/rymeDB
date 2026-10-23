@@ -1433,16 +1433,25 @@ where
         match tag {
             b'X' => return Ok(()),
             b'Q' => {
+                let Some(query) = parse_query_message(&payload) else {
+                    socket
+                        .write_all(&encode_error_code(
+                            "08P01",
+                            String::from("malformed Query message"),
+                        ))
+                        .await
+                        .map_err(|e| RymeError::Io(e.to_string()))?;
+                    return Ok(());
+                };
                 begin_backend_query(&cancellation);
                 statements.remove("");
                 prepared_cache.remove("");
                 portals.remove("");
-                let query = String::from_utf8_lossy(&payload);
                 let mut out = Vec::new();
                 let mut committed_notifications = Vec::new();
                 let mut failed = false;
                 let mut awaiting_copy = false;
-                for statement in split_statements(&query) {
+                for statement in split_statements(query) {
                     let trimmed = statement.trim_matches(|c| c == '\0' || c == ';' || c == ' ');
                     if trimmed.is_empty() {
                         continue;
@@ -4895,9 +4904,17 @@ fn session_data_row(values: &[String]) -> Vec<u8> {
 fn read_cstring(payload: &[u8], offset: &mut usize) -> Option<String> {
     let remainder = payload.get(*offset..)?;
     let end = remainder.iter().position(|b| *b == 0)?;
-    let value = String::from_utf8_lossy(&remainder[..end]).into_owned();
+    let value = std::str::from_utf8(&remainder[..end]).ok()?.to_owned();
     *offset = (*offset).checked_add(end)?.checked_add(1)?;
     Some(value)
+}
+
+fn parse_query_message(payload: &[u8]) -> Option<&str> {
+    let query = payload.strip_suffix(&[0])?;
+    if query.contains(&0) {
+        return None;
+    }
+    std::str::from_utf8(query).ok()
 }
 
 fn parse_describe(payload: &[u8]) -> Option<(u8, String)> {

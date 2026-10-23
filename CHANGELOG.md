@@ -68,6 +68,8 @@ All notable changes to rymeDB are recorded here. Format follows
   terminator and reject trailing bytes.
 - PostgreSQL password messages now reject missing terminators, embedded NULs,
   and trailing bytes instead of authenticating a password prefix.
+- PostgreSQL simple Query messages now require a terminal NUL and valid UTF-8;
+  protocol C strings reject invalid UTF-8 instead of silently replacing bytes.
 - RESP array commands split at TCP read boundaries now remain buffered instead
   of being rejected as malformed.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment
