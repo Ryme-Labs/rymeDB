@@ -30,6 +30,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and clean them up if writing or replacement fails.
 - Raft node and range metadata publication now uses unique temporary files
   created exclusively, with cleanup on failed writes or replacement.
+- WAL rewrite staging now creates segment files exclusively, rejecting any
+  pre-existing staged path instead of following it.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.

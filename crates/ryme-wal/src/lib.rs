@@ -218,7 +218,7 @@ impl Wal {
 
         let mut id = 0u64;
         let mut path = temporary.join(segment_name(id));
-        let mut file = File::create(&path)?;
+        let mut file = create_rewrite_segment(&path)?;
         let mut segment_len = 0u64;
         let mut previous_lsn = None;
         let mut last_kept_lsn = None;
@@ -251,7 +251,7 @@ impl Wal {
                         RymeError::Corrupt(String::from("wal segment id overflow"))
                     })?;
                     path = temporary.join(segment_name(id));
-                    file = File::create(&path)?;
+                    file = create_rewrite_segment(&path)?;
                     segment_len = 0;
                 }
                 file.write_all(&frame)?;
@@ -311,7 +311,7 @@ impl Wal {
         std::fs::create_dir_all(&temporary)?;
         let mut id = 0u64;
         let mut path = temporary.join(segment_name(id));
-        let mut file = File::create(&path)?;
+        let mut file = create_rewrite_segment(&path)?;
         for record in records {
             let frame = encode_frame(record.lsn, record.commit_ts, &record.payload)?;
             let current_len = file.metadata()?.len();
@@ -321,7 +321,7 @@ impl Wal {
                     .checked_add(1)
                     .ok_or_else(|| RymeError::Corrupt(String::from("wal segment id overflow")))?;
                 path = temporary.join(segment_name(id));
-                file = File::create(&path)?;
+                file = create_rewrite_segment(&path)?;
             }
             file.write_all(&frame)?;
         }
@@ -560,6 +560,10 @@ fn open_segment_append(path: &Path, create: bool) -> Result<File> {
 
 fn create_segment_append(path: &Path) -> Result<File> {
     Ok(OpenOptions::new().create_new(true).read(true).append(true).open(path)?)
+}
+
+fn create_rewrite_segment(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
 }
 
 fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64> {
