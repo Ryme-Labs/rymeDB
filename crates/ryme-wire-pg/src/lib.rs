@@ -82,6 +82,7 @@ const MAX_PREPARED_STATE_BYTES: usize = 256 * 1024;
 const MAX_PORTAL_STATE_BYTES: usize = 256 * 1024;
 const MAX_CACHED_QUERY_BYTES: usize = 256;
 const PG_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const PG_MESSAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SAVEPOINTS: usize = 256;
 const MAX_SAVEPOINT_NAME_BYTES: usize = 256;
 const MAX_TRANSACTION_CHANGES: usize = 100_000;
@@ -1029,13 +1030,24 @@ where
     S: AsyncRead + Unpin,
 {
     let tag = socket.read_u8().await.map_err(|e| RymeError::Io(e.to_string()))?;
-    let length = socket.read_u32().await.map_err(|e| RymeError::Io(e.to_string()))? as usize;
+    let deadline = tokio::time::Instant::now() + PG_MESSAGE_TIMEOUT;
+    let length = tokio::time::timeout_at(deadline, socket.read_u32())
+        .await
+        .map_err(|_| pg_message_timeout_error())?
+        .map_err(|e| RymeError::Io(e.to_string()))? as usize;
     if !(4..=64 * 1024).contains(&length) {
         return Err(RymeError::InvalidArgument(String::from("message")));
     }
     let mut payload = vec![0u8; length - 4];
-    socket.read_exact(&mut payload).await.map_err(|e| RymeError::Io(e.to_string()))?;
+    tokio::time::timeout_at(deadline, socket.read_exact(&mut payload))
+        .await
+        .map_err(|_| pg_message_timeout_error())?
+        .map_err(|e| RymeError::Io(e.to_string()))?;
     Ok((tag, payload))
+}
+
+fn pg_message_timeout_error() -> RymeError {
+    RymeError::Unavailable(String::from("postgres message timeout"))
 }
 
 #[allow(clippy::too_many_arguments)]

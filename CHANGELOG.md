@@ -21,6 +21,9 @@ All notable changes to rymeDB are recorded here. Format follows
   swaps between path validation and file access.
 - Raft, RESP, native, and HTTPS TLS handshakes now time out after 10 seconds so
   incomplete handshakes cannot hold connection slots indefinitely.
+- PostgreSQL protocol messages must finish within 15 seconds after their first
+  byte, preventing partial frames from holding connection slots indefinitely;
+  idle pooled connections remain open.
 - WAL segment readers and append handles verify opened file identity to detect
   symlink swaps during recovery or writes.
 - WAL recovery rejects symlinked rewrite markers and staging directories before

@@ -81,6 +81,8 @@ requires a Raft listener, server certificate/key, and client CA.
 Each certificate, key, or CA PEM input is limited to 4 MiB.
 Raft, RESP, native, and HTTPS TLS handshakes must complete within 10 seconds.
 PostgreSQL TLS startup, including its handshake, has a 15-second deadline.
+After a PostgreSQL client starts a protocol message, it has 15 seconds to send
+the complete message; idle pooled connections remain open.
 Non-loopback Raft listeners always require `raft_tls: true`; loopback-only
 development Raft listeners may remain plaintext.
 
