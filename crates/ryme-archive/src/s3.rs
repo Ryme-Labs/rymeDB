@@ -162,8 +162,9 @@ impl S3Store {
             return Err(RymeError::Unavailable(format!("list {}", response.status())));
         }
         let body = response_bytes_bounded(response, MAX_S3_LIST_RESPONSE_BYTES, "s3 list").await?;
-        let text = String::from_utf8_lossy(&body).into_owned();
-        Ok((extract_keys(&text), extract_token(&text)))
+        let text = String::from_utf8(body)
+            .map_err(|_| RymeError::Corrupt(String::from("s3 list XML encoding")))?;
+        Ok((extract_keys(&text)?, extract_token(&text)?))
     }
 }
 
@@ -359,29 +360,91 @@ fn encode_query_component(value: &str) -> String {
     out
 }
 
-fn extract_keys(xml: &str) -> Vec<String> {
+fn extract_keys(xml: &str) -> Result<Vec<String>> {
+    if !xml.contains("<ListBucketResult") || !xml.contains("</ListBucketResult>") {
+        return Err(RymeError::Corrupt(String::from("s3 list XML")));
+    }
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(start) = rest.find("<Key>") {
         rest = &rest[start + 5..];
-        if let Some(end) = rest.find("</Key>") {
-            out.push(rest[..end].to_string());
-            rest = &rest[end + 6..];
-        } else {
-            break;
+        let end = rest
+            .find("</Key>")
+            .ok_or_else(|| RymeError::Corrupt(String::from("s3 list XML key")))?;
+        if out.len() >= MAX_S3_LIST_KEYS {
+            return Err(RymeError::Overload(String::from("s3 list keys")));
         }
+        let key = decode_xml_text(&rest[..end])
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| RymeError::Corrupt(String::from("s3 list XML key")))?;
+        out.push(key);
+        rest = &rest[end + 6..];
     }
-    out
+    Ok(out)
 }
 
-fn extract_token(xml: &str) -> Option<String> {
-    if !xml.contains("<IsTruncated>true</IsTruncated>") {
-        return None;
+fn extract_token(xml: &str) -> Result<Option<String>> {
+    let truncated = xml
+        .split_once("<IsTruncated>")
+        .and_then(|(_, rest)| rest.split_once("</IsTruncated>").map(|(value, _)| value.trim()))
+        .ok_or_else(|| RymeError::Corrupt(String::from("s3 list XML truncation")))?;
+    match truncated {
+        "false" => Ok(None),
+        "true" => {
+            let token = xml
+                .split_once("<NextContinuationToken>")
+                .and_then(|(_, rest)| {
+                    rest.split_once("</NextContinuationToken>").map(|(token, _)| token)
+                })
+                .and_then(decode_xml_text)
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| RymeError::Corrupt(String::from("s3 list continuation token")))?;
+            Ok(Some(token))
+        }
+        _ => Err(RymeError::Corrupt(String::from("s3 list truncation value"))),
     }
-    let start = xml.find("<NextContinuationToken>")? + 24;
-    let rest = &xml[start..];
-    let end = rest.find("</NextContinuationToken>")?;
-    Some(rest[..end].to_string())
+}
+
+fn decode_xml_text(input: &str) -> Option<String> {
+    fn push_text(output: &mut String, text: &str) -> Option<()> {
+        if text.chars().any(|character| !is_xml_character(character as u32)) {
+            return None;
+        }
+        output.push_str(text);
+        Some(())
+    }
+
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('&') {
+        push_text(&mut output, &rest[..start])?;
+        let entity = &rest[start + 1..];
+        let end = entity.find(';')?;
+        let reference = &entity[..end];
+        let character = match reference {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            value if value.starts_with("#x") || value.starts_with("#X") => {
+                char::from_u32(u32::from_str_radix(&value[2..], 16).ok()?)?
+            }
+            value if value.starts_with('#') => char::from_u32(value[1..].parse::<u32>().ok()?)?,
+            _ => return None,
+        };
+        if !is_xml_character(character as u32) {
+            return None;
+        }
+        output.push(character);
+        rest = &entity[end + 1..];
+    }
+    push_text(&mut output, rest)?;
+    Some(output)
+}
+
+fn is_xml_character(value: u32) -> bool {
+    matches!(value, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
 }
 
 #[cfg(test)]
@@ -436,8 +499,8 @@ mod tests {
     #[test]
     fn list_xml_parsing() {
         let xml = "<?xml version=\"1.0\"?><ListBucketResult><Key>a</Key><Key>b/c</Key><IsTruncated>false</IsTruncated></ListBucketResult>";
-        assert_eq!(extract_keys(xml), vec![String::from("a"), String::from("b/c")]);
-        assert_eq!(extract_token(xml), None);
+        assert_eq!(extract_keys(xml).unwrap(), vec![String::from("a"), String::from("b/c")]);
+        assert_eq!(extract_token(xml).unwrap(), None);
     }
 
     #[test]
