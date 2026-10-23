@@ -2103,32 +2103,36 @@ impl Node {
             return Ok((self.try_range_term(group_id)?, false));
         }
         let (local_last_index, local_last_term) = self.try_range_last_position(group_id)?;
-        let mut groups = self
-            .range_groups
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
-        let state = groups.entry(group_id.to_string()).or_default();
-        if term < state.term {
-            return Ok((state.term.max(1), false));
-        }
-        if term > state.term {
-            state.term = term;
-            state.voted_for = None;
-            state.leader = None;
-        }
-        let current_vote = state.voted_for;
-        let up_to_date = last_term > local_last_term
-            || (last_term == local_last_term && last_index >= local_last_index);
-        let granted = up_to_date && (current_vote.is_none() || current_vote == Some(candidate));
-        if granted {
-            state.voted_for = Some(candidate);
-            state.leader = None;
-            state.last_contact_ms = now_ms();
-        }
-        let response_term = state.term.max(1);
-        drop(groups);
-        if granted {
-            let _ = self.persist_range_meta();
+        let (response_term, granted, changed) = {
+            let mut groups = self
+                .range_groups
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("range metadata lock")))?;
+            let state = groups.entry(group_id.to_string()).or_default();
+            if term < state.term {
+                return Ok((state.term.max(1), false));
+            }
+            let mut changed = false;
+            if term > state.term {
+                state.term = term;
+                state.voted_for = None;
+                state.leader = None;
+                changed = true;
+            }
+            let current_vote = state.voted_for;
+            let up_to_date = last_term > local_last_term
+                || (last_term == local_last_term && last_index >= local_last_index);
+            let granted = up_to_date && (current_vote.is_none() || current_vote == Some(candidate));
+            if granted {
+                changed |= state.voted_for != Some(candidate) || state.leader.is_some();
+                state.voted_for = Some(candidate);
+                state.leader = None;
+                state.last_contact_ms = now_ms();
+            }
+            (state.term.max(1), granted, changed)
+        };
+        if changed || granted {
+            self.persist_range_meta()?;
         }
         Ok((response_term, granted))
     }
@@ -2665,24 +2669,32 @@ impl Node {
                 if !inner.is_member(candidate) && recent_leader(inner.leader_contact_ms) {
                     return Ok(Rpc::VoteResponse { term: inner.term, granted: false });
                 }
-                if term > inner.term {
+                let term_changed = term > inner.term;
+                if term_changed {
                     inner.term = term;
                     inner.role = Role::Follower;
                     inner.voted_for = None;
+                    inner.leader_id = None;
                 }
                 let already = inner.voted_for.is_some() && inner.voted_for != Some(candidate);
                 if already {
+                    if term_changed {
+                        inner.persist_meta()?;
+                    }
                     let term = inner.term;
                     return Ok(Rpc::VoteResponse { term, granted: false });
                 }
                 let (last_t, last_i) = inner.last_position();
                 if last_term < last_t || (last_term == last_t && last_index < last_i) {
+                    if term_changed {
+                        inner.persist_meta()?;
+                    }
                     let term = inner.term;
                     return Ok(Rpc::VoteResponse { term, granted: false });
                 }
                 inner.voted_for = Some(candidate);
                 inner.bump_reset();
-                let _ = inner.persist_meta();
+                inner.persist_meta()?;
                 Ok(Rpc::VoteResponse { term: inner.term, granted: true })
             }
             Rpc::PreVoteRequest { term, candidate, last_term, last_index } => {
