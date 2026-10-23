@@ -55,6 +55,8 @@ All notable changes to rymeDB are recorded here. Format follows
   avoiding duplicate or unreachable segment IDs from alternate spellings.
 - WAL archive enumeration now propagates directory errors and rejects symlink
   or non-file segment entries instead of following or silently skipping them.
+- Branch-schema archive discovery rejects symlinked roots and special files,
+  and caps visited directories and nesting depth.
 - RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
   and scan the keyspace in bounded pages.
 - RESP `MGET` reads values incrementally and rejects combined results above

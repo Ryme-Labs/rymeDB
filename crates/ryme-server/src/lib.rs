@@ -1217,6 +1217,8 @@ struct NamedApiKey {
 
 const AUTH_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const KEYRING_MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ARCHIVE_METADATA_DIRECTORIES: usize = 100_000;
+const MAX_ARCHIVE_METADATA_DEPTH: usize = 256;
 const BRANCH_PROMOTION_JOURNAL_MAX_BYTES: usize = 768 * 1024 * 1024;
 
 fn prepare_data_directory(path: &std::path::Path) -> ryme_error::Result<()> {
@@ -15480,8 +15482,25 @@ fn archive_metadata_paths(
     }
 
     let root = data_dir.join("branch-schemas");
-    let mut pending = vec![root.clone()];
-    while let Some(directory) = pending.pop() {
+    let mut pending = vec![(root.clone(), 0usize)];
+    let mut visited_directories = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                    "archive metadata directory",
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        visited_directories = visited_directories.saturating_add(1);
+        if visited_directories > MAX_ARCHIVE_METADATA_DIRECTORIES {
+            return Err(ryme_error::RymeError::Overload(String::from(
+                "archive metadata directories",
+            )));
+        }
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -15492,11 +15511,20 @@ fn archive_metadata_paths(
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
-                pending.push(path);
+                if depth >= MAX_ARCHIVE_METADATA_DEPTH
+                    || pending.len() >= MAX_ARCHIVE_METADATA_DIRECTORIES
+                {
+                    return Err(ryme_error::RymeError::Overload(String::from(
+                        "archive metadata directories",
+                    )));
+                }
+                pending.push((path, depth + 1));
                 continue;
             }
             if !file_type.is_file() {
-                continue;
+                return Err(ryme_error::RymeError::InvalidArgument(String::from(
+                    "archive metadata file",
+                )));
             }
             let relative = path
                 .strip_prefix(data_dir)
