@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 
 fn startup_packet(user: &str, database: &str) -> Vec<u8> {
     let mut body = Vec::new();
@@ -63,7 +65,21 @@ async fn cancel_request_is_consumed_without_a_startup_greeting() {
 
 #[tokio::test]
 async fn cancel_request_signals_advertised_backend() {
-    let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"));
+    let query_entered = Arc::new(Notify::new());
+    let query_release = Arc::new(Notify::new());
+    let reader_entered = query_entered.clone();
+    let reader_release = query_release.clone();
+    let remote_reader = ryme_wire_pg::RemoteReader::new(move |_| {
+        let entered = reader_entered.clone();
+        let release = reader_release.clone();
+        async move {
+            entered.notify_one();
+            release.notified().await;
+            Ok(ryme_wire_pg::RemoteRead::Local)
+        }
+    });
+    let gateway = ryme_wire_pg::PgGateway::new(String::from("t"), String::from("d"))
+        .with_remote_reader(remote_reader);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -87,6 +103,9 @@ async fn cancel_request_signals_advertised_backend() {
     };
     while read_frame(&mut session).await.0 != b'Z' {}
 
+    session.write_all(&frame(b'Q', b"SELECT * FROM docs KEY 'cancel-target'\0")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), query_entered.notified()).await.unwrap();
+
     let mut cancel = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut packet = Vec::with_capacity(16);
     packet.extend_from_slice(&16u32.to_be_bytes());
@@ -97,8 +116,8 @@ async fn cancel_request_signals_advertised_backend() {
     cancel.shutdown().await.unwrap();
     let mut eof = [0u8; 1];
     assert_eq!(cancel.read(&mut eof).await.unwrap(), 0);
+    query_release.notify_one();
 
-    session.write_all(&frame(b'Q', b"SELECT 1\0")).await.unwrap();
     let mut saw_cancel = false;
     loop {
         let (tag, body) = read_frame(&mut session).await;
