@@ -1,7 +1,12 @@
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_METADATA_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 type BranchChange = (Vec<u8>, Option<Vec<u8>>);
 
@@ -141,14 +146,25 @@ impl BranchManager {
         if bytes.len() > MAX_BRANCH_METADATA_BYTES {
             return Err(RymeError::Overload(String::from("branch metadata")));
         }
-        let temporary = path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_data()?;
+        let (temporary, mut file) = loop {
+            let id = NEXT_METADATA_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let temporary = path.with_extension(format!("tmp-{}-{id}", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).open(&temporary) {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let result = file.write_all(&bytes).and_then(|()| file.sync_data());
+        drop(file);
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
         }
-        std::fs::rename(temporary, path)?;
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
         if let Some(parent) = path.parent() {
             sync_branch_directory(parent)?;
         }

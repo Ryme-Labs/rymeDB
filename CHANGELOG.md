@@ -22,6 +22,8 @@ All notable changes to rymeDB are recorded here. Format follows
   collisions.
 - Server audit, control, branch, durable-topic, and database snapshot files now
   use exclusive temporary-file creation before atomic replacement.
+- Branch catalog persistence now creates unique temporary files exclusively and
+  removes them when writes or replacement fail.
 - HTTP and HTTPS share a request concurrency limit derived from the configured
   body limit, keeping the aggregate configured active-body allowance at or below
   256 MiB.
