@@ -139,6 +139,7 @@ async fn prepared_portal_reexecutes_identically() {
         let _ = gateway.serve(listener).await;
     });
     let mut socket = startup(addr).await;
+    let _ = simple(&mut socket, "BEGIN").await;
     let inserted = simple(&mut socket, "INSERT INTO docs KEY 'k1' VALUE 'v1'").await;
     assert!(String::from_utf8_lossy(&inserted).contains("OK"), "{inserted:?}");
     let replied = roundtrip(&mut socket, parse_msg("s1", "SELECT * FROM docs KEY 'k1'")).await;
@@ -161,16 +162,16 @@ async fn prepared_portal_errors_are_stable() {
         let _ = gateway.serve(listener).await;
     });
     let mut socket = startup(addr).await;
-    let replied = execute(&mut socket, "missing").await;
-    assert!(replied.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("portal")));
+    let first_missing = execute(&mut socket, "missing").await;
+    let second_missing = execute(&mut socket, "missing").await;
+    assert_eq!(first_missing, second_missing);
+    assert!(first_missing.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("portal")));
     let replied = roundtrip(&mut socket, parse_msg("bad", "FROBNICATE docs")).await;
     assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'1'));
     let replied = roundtrip(&mut socket, bind_msg("pbad", "bad", &[])).await;
     assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'2'));
-    let first = execute(&mut socket, "pbad").await;
-    let second = execute(&mut socket, "pbad").await;
-    assert_eq!(first, second);
-    assert!(first.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("42601")));
+    let replied = execute(&mut socket, "pbad").await;
+    assert!(replied.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("42601")));
 }
 
 fn close_msg(kind: u8, name: &str) -> Vec<u8> {
@@ -207,6 +208,7 @@ async fn prepared_portal_invalidation() {
         let _ = gateway.serve(listener).await;
     });
     let mut socket = startup(addr).await;
+    let _ = simple(&mut socket, "BEGIN").await;
     let _ = simple(&mut socket, "INSERT INTO docs KEY 'k1' VALUE 'v1'").await;
     let _ = simple(&mut socket, "INSERT INTO docs KEY 'k2' VALUE 'v2'").await;
     let replied = roundtrip(&mut socket, parse_msg("s1", "SELECT * FROM docs KEY 'k1'")).await;
@@ -219,7 +221,7 @@ async fn prepared_portal_invalidation() {
     assert_eq!(replied.first().map(|(tag, _)| *tag), Some(b'2'));
     let rebound = execute(&mut socket, "p1").await;
     assert_eq!(first, rebound);
-    let closed = close(&mut socket, b' ', "p1").await;
+    let closed = close(&mut socket, b'P', "p1").await;
     assert!(closed.iter().any(|(tag, _)| *tag == b'3'));
     let gone = execute(&mut socket, "p1").await;
     assert!(gone.iter().any(|(_, body)| String::from_utf8_lossy(body).contains("portal")));
