@@ -143,9 +143,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           previous_release="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '[.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0] // empty')"
+            --jq '[.[] | .tag_name | select(test("^sdk-v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0] // empty')"
           if [[ -n "$previous_release" ]]; then
-            current="${previous_release#v}"
+            current="${previous_release#sdk-v}"
           else
             current="$(tr -d '\r\n' < sdks/RELEASE_BASE_VERSION)"
           fi
@@ -447,12 +447,12 @@ jobs:
             git commit -m "Release SDKs v$RELEASE_VERSION"
             git push origin HEAD:main
           fi
-          tag="v$RELEASE_VERSION"
+          tag="sdk-v$RELEASE_VERSION"
           git fetch --tags origin
           if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
             test "$(git rev-parse "$tag^{}")" = "$(git rev-parse HEAD)"
           else
-            git tag -a "$tag" -m "SDK release $tag"
+            git tag -a "$tag" -m "rymeDB SDK release $tag"
             git push origin "$tag"
           fi
           (cd release && find . -type f \( -name '*.tgz' -o -name '*.crate' \) -print0 | sort -z | xargs -0 sha256sum) > release/SHA256SUMS
@@ -460,6 +460,6 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "${artifacts[@]}" --clobber
           else
-            gh release create "$tag" "${artifacts[@]}" --verify-tag --title "SDK release $tag" \
+            gh release create "$tag" "${artifacts[@]}" --verify-tag --title "rymeDB SDK release $tag" \
               --notes "SDK release run: $GITHUB_RUN_ID"
           fi

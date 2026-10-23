@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Args {
     #[arg(long)]
     pg_listen: Option<SocketAddr>,

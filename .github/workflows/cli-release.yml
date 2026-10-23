@@ -3,21 +3,27 @@ name: cli-release
 on:
   push:
     branches: [main]
+    tags:
+      - "rymedb-v*.*.*"
     paths:
       - "apps/cli/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "scripts/validate-release-version.mjs"
       - "docs/cli.md"
       - ".github/workflows/cli-release.yml"
+      - ".github/workflows/server-release.yml"
   pull_request:
     paths:
       - "apps/cli/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "scripts/validate-release-version.mjs"
       - "docs/cli.md"
       - ".github/workflows/cli-release.yml"
+      - ".github/workflows/server-release.yml"
   workflow_dispatch:
 
 concurrency:
@@ -34,6 +40,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Validate CLI and database release versions
+        run: |
+          version="$(node -p 'JSON.parse(require("fs").readFileSync("apps/cli/package.json", "utf8")).version')"
+          node scripts/validate-release-version.mjs "$version"
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
@@ -80,7 +91,7 @@ jobs:
 
   publish:
     name: Publish CLI to npm
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rymedb-v')) }}
     needs: package
     runs-on: ubuntu-24.04
     permissions:

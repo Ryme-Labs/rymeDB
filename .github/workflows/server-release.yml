@@ -1,0 +1,61 @@
+name: server-release
+
+on:
+  push:
+    tags:
+      - "rymedb-v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate synchronized database release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Validate release tag and package metadata
+        run: node scripts/validate-release-version.mjs "$GITHUB_REF_NAME"
+
+  docker:
+    name: Publish versioned server image
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/docker.yml
+
+  release:
+    name: Publish database GitHub Release
+    needs: docker
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "rymeDB ${GITHUB_REF_NAME#rymedb-v}" \
+              --generate-notes
+          fi
