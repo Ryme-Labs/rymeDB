@@ -1593,6 +1593,36 @@ impl TxnManager {
         Ok(())
     }
 
+    fn commit_filtered_durable_at_ref(
+        &self,
+        txn: &Transaction,
+        commit_ts: u64,
+        keep: impl Fn(&RecordKey) -> bool,
+        persist: impl FnOnce(u64, &[u8], &BTreeMap<RecordKey, WriteOp>) -> Result<()>,
+    ) -> Result<()> {
+        txn.ensure_healthy()?;
+        let mut guard = self
+            .inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        self.check_locked(txn, commit_ts, &mut guard)?;
+        let writes: BTreeMap<RecordKey, WriteOp> = txn
+            .writes
+            .iter()
+            .filter(|(key, _)| keep(key))
+            .map(|(key, op)| (key.clone(), op.clone()))
+            .collect();
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let payload = encode_writes(&writes)?;
+        persist(commit_ts, &payload, &writes)?;
+        self.apply_owned_locked(commit_ts, writes, &mut guard, Some(txn.id))?;
+        self.inner.clock.fetch_max(commit_ts.saturating_add(1), Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn replay_at(&self, commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
         let mut guard = self
             .inner
@@ -3505,30 +3535,27 @@ impl DurableManager {
     ) -> Result<()> {
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
-        let writes: BTreeMap<RecordKey, WriteOp> = txn
-            .writes
-            .iter()
-            .filter(|(key, _)| keep(key))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if writes.is_empty() {
-            return Ok(());
-        }
-        let payload = encode_writes(&writes)?;
-        {
-            let mut wal =
-                self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-            wal.append_lsn(commit_ts, &payload)?;
-            if self.policy == SyncPolicy::Always {
-                wal.sync()?;
-            }
-        }
-        self.segments.write_delta_owned_with_sync(
+        let policy = self.policy;
+        let result = self.inner.commit_filtered_durable_at_ref(
+            txn,
             commit_ts,
-            segment_entries(commit_ts, &writes),
-            self.policy == SyncPolicy::Always,
-        )?;
-        let result = self.inner.commit_filtered_at(txn, commit_ts, keep);
+            keep,
+            |commit_ts, payload, writes| {
+                let mut wal =
+                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                wal.append_lsn(commit_ts, payload)?;
+                if policy == SyncPolicy::Always {
+                    wal.sync()?;
+                }
+                drop(wal);
+                self.segments.write_delta_owned_with_sync(
+                    commit_ts,
+                    segment_entries(commit_ts, writes),
+                    policy == SyncPolicy::Always,
+                )?;
+                Ok(())
+            },
+        );
         if result.is_ok() && self.mode == StorageMode::Standard {
             self.inner.clear_engine()?;
         }
