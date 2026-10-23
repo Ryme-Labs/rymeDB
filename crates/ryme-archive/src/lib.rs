@@ -173,6 +173,14 @@ fn restore_stage_path(dest_dir: &Path) -> PathBuf {
     parent.join(format!(".{name}.restore-{}-{nanos}", std::process::id()))
 }
 
+fn ensure_restore_destination_absent(dest_dir: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dest_dir) {
+        Ok(_) => Err(RymeError::Conflict(String::from("restore destination exists"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub struct Archiver<S> {
     store: S,
 }
@@ -344,12 +352,11 @@ impl<S: ObjectStore> Archiver<S> {
         let manifest: BackupManifest = serde_json::from_slice(&raw)
             .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
         validate_manifest(manifest_key, &manifest)?;
-        if std::fs::symlink_metadata(dest_dir).is_ok() {
-            return Err(RymeError::Conflict(String::from("restore destination exists")));
-        }
+        ensure_restore_destination_absent(dest_dir)?;
         if let Some(parent) = dest_dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        ensure_restore_destination_absent(dest_dir)?;
         let staging = restore_stage_path(dest_dir);
         std::fs::create_dir(&staging)?;
         let restore_result: Result<()> = async {
@@ -382,6 +389,10 @@ impl<S: ObjectStore> Archiver<S> {
         }
         .await;
         if let Err(error) = restore_result {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        if let Err(error) = ensure_restore_destination_absent(dest_dir) {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(error);
         }
