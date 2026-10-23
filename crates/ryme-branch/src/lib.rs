@@ -81,18 +81,42 @@ impl BranchManager {
         }
         let mut manager: Self = serde_json::from_slice(&bytes)
             .map_err(|error| RymeError::Corrupt(format!("branch metadata: {error}")))?;
+        if manager.branches.len() > MAX_BRANCHES || manager.manifests.len() > MAX_MANIFESTS {
+            return Err(RymeError::Corrupt(String::from("branch metadata capacity")));
+        }
         let mut normalized = HashMap::with_capacity(manager.branches.len());
         for (stored_key, mut branch) in manager.branches.drain() {
-            let tenant = if branch.tenant.is_empty() {
-                String::from("default")
-            } else {
-                branch.tenant.clone()
-            };
-            branch.tenant = tenant.clone();
+            if branch.tenant.is_empty() {
+                branch.tenant = String::from("default");
+            }
+            Self::validate_new_identity(&branch.tenant, &branch.id)
+                .map_err(|_| RymeError::Corrupt(String::from("branch identity")))?;
+            if branch.manifest_id.is_empty()
+                || branch.manifest_id.len() > MAX_MANIFEST_ID_BYTES
+                || branch.manifest_id.contains('\0')
+            {
+                return Err(RymeError::Corrupt(String::from("branch manifest")));
+            }
+            if branch.parent_id.as_ref().is_some_and(|parent| {
+                parent.is_empty()
+                    || parent.len() > MAX_BRANCH_ID_BYTES
+                    || parent.contains('/')
+                    || parent.contains("..")
+                    || parent.contains('\0')
+            }) {
+                return Err(RymeError::Corrupt(String::from("branch parent")));
+            }
+            let scoped = scoped_key(&branch.tenant, &branch.id);
             let key = if stored_key.contains('\0') {
+                if stored_key != scoped {
+                    return Err(RymeError::Corrupt(String::from("branch identity key")));
+                }
                 stored_key
             } else {
-                scoped_key(&tenant, &branch.id)
+                if stored_key != branch.id {
+                    return Err(RymeError::Corrupt(String::from("branch identity key")));
+                }
+                scoped
             };
             if normalized.insert(key, branch).is_some() {
                 return Err(RymeError::Corrupt(String::from("duplicate branch identity")));
@@ -195,6 +219,14 @@ impl BranchManager {
                 return Err(RymeError::Corrupt(String::from("branch manifest")));
             }
             if let Some(parent) = &branch.parent_id {
+                if parent.is_empty()
+                    || parent.len() > MAX_BRANCH_ID_BYTES
+                    || parent.contains('/')
+                    || parent.contains("..")
+                    || parent.contains('\0')
+                {
+                    return Err(RymeError::Corrupt(String::from("branch parent")));
+                }
                 if !self.branches.contains_key(&scoped_key(&branch.tenant, parent)) {
                     return Err(RymeError::Corrupt(String::from("branch parent")));
                 }
@@ -297,6 +329,7 @@ impl BranchManager {
         base_commit_ts: u64,
     ) -> Result<()> {
         Self::validate_new_identity(tenant, &id)?;
+        Self::validate_new_identity(tenant, parent)?;
         let key = scoped_key(tenant, &id);
         if self.branches.contains_key(&key) {
             return Err(RymeError::Conflict(String::from("branch")));
