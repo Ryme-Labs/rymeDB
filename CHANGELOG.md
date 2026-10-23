@@ -46,7 +46,7 @@ All notable changes to rymeDB are recorded here. Format follows
 - Raft elections now fail cleanly if the term counter cannot advance, avoiding
   overflow panics or repeated elections in a saturated term.
 - Raft nodes now isolate themselves after durable log write failures instead
-  of continuing to vote or serve from state that diverges from their WAL.
+  of continuing to vote or accept global or range writes through direct APIs.
 
 ### Performance
 

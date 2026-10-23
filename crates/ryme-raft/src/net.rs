@@ -2497,6 +2497,13 @@ impl Node {
         }
     }
 
+    fn ensure_not_isolated(&self) -> Result<()> {
+        if self.isolated.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RymeError::Unavailable(String::from("isolated")));
+        }
+        Ok(())
+    }
+
     pub fn pool(&self, target: usize) -> Option<Arc<PeerPool>> {
         self.pool_for(target)
     }
@@ -4342,6 +4349,7 @@ impl Node {
         publish_data: bool,
         kind: RangeEntryKind,
     ) -> Result<u64> {
+        self.ensure_not_isolated()?;
         decode_writes(encoded_writes)?;
         if let RangeEntryKind::Prepare { state, .. } = &kind {
             let _: ryme_txn::TransactionState = serde_json::from_slice(state).map_err(|error| {
@@ -5455,6 +5463,7 @@ impl Node {
     }
 
     pub async fn commit_txn(self: &Arc<Self>, txn: ryme_txn::Transaction) -> Result<u64> {
+        self.ensure_not_isolated()?;
         if let Some(expected) = txn.route_generation() {
             let current = self.range_generation();
             if current != expected {
@@ -5475,7 +5484,9 @@ impl Node {
     }
 
     async fn propose_frame(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
+        self.ensure_not_isolated()?;
         let _write = self.write_lock.lock().await;
+        self.ensure_not_isolated()?;
         {
             let inner = self.inner.lock().await;
             if inner.role != Role::Leader {
