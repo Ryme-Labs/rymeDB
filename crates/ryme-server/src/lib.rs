@@ -595,19 +595,8 @@ impl AuditLog {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary = self.path.with_extension("json.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(temporary, &self.path)?;
+        let temporary = write_metadata_temp(&self.path, &bytes, true)?;
+        publish_metadata_temp(&temporary, &self.path)?;
         if let Some(parent) = self.path.parent() {
             sync_metadata_directory(parent)?;
         }
@@ -1841,20 +1830,65 @@ impl Drop for RemoveFileOnDrop {
     }
 }
 
+fn create_metadata_temp(
+    destination: &std::path::Path,
+) -> ryme_error::Result<(std::path::PathBuf, std::fs::File)> {
+    loop {
+        let suffix = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(16));
+        let temporary = destination.with_extension(format!("tmp-{suffix}"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn write_metadata_temp(
+    destination: &std::path::Path,
+    bytes: &[u8],
+    sync_all: bool,
+) -> ryme_error::Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    let (temporary, mut file) = create_metadata_temp(destination)?;
+    let result = file.write_all(bytes).and_then(|()| {
+        if sync_all {
+            file.sync_all()
+        } else {
+            file.sync_data()
+        }
+    });
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(temporary)
+}
+
+fn publish_metadata_temp(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> ryme_error::Result<()> {
+    if let Err(error) = std::fs::rename(temporary, destination) {
+        let _ = std::fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn create_auth_snapshot_temp(
     auth_path: &std::path::Path,
 ) -> ryme_error::Result<(std::path::PathBuf, std::fs::File)> {
-    let suffix = ryme_auth::base64_url_encode(&ryme_auth::random_bytes(16));
-    let temporary = auth_path.with_extension(format!("tmp-{suffix}"));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(&temporary)?;
-    Ok((temporary, file))
+    create_metadata_temp(auth_path)
 }
 
 impl SharedState {
@@ -1901,9 +1935,8 @@ impl SharedState {
         if let Some(parent) = self.auth_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let (temporary, file) = create_auth_snapshot_temp(&self.auth_path)?;
+        let (temporary, mut file) = create_auth_snapshot_temp(&self.auth_path)?;
         let _temporary_cleanup = RemoveFileOnDrop(temporary.clone());
-        let mut file = file;
         {
             use std::io::Write;
             file.write_all(&bytes)?;
@@ -1915,7 +1948,7 @@ impl SharedState {
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
         drop(file);
-        std::fs::rename(temporary, &self.auth_path)?;
+        publish_metadata_temp(&temporary, &self.auth_path)?;
         on_replace();
         if let Some(parent) = self.auth_path.parent() {
             sync_metadata_directory(parent)?;
@@ -1947,19 +1980,8 @@ impl SharedState {
         if let Some(parent) = self.control_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary = self.control_path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_data()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(temporary, &self.control_path)?;
+        let temporary = write_metadata_temp(&self.control_path, &bytes, false)?;
+        publish_metadata_temp(&temporary, &self.control_path)?;
         if let Some(parent) = self.control_path.parent() {
             sync_metadata_directory(parent)?;
         }
@@ -1979,19 +2001,8 @@ impl SharedState {
         if let Some(parent) = self.promotion_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary = self.promotion_path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_data()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(temporary, &self.promotion_path)?;
+        let temporary = write_metadata_temp(&self.promotion_path, &bytes, false)?;
+        publish_metadata_temp(&temporary, &self.promotion_path)?;
         if let Some(parent) = self.promotion_path.parent() {
             sync_metadata_directory(parent)?;
         }
@@ -2011,19 +2022,8 @@ impl SharedState {
         if let Some(parent) = self.branch_metadata_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary = self.branch_metadata_path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_data()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(temporary, &self.branch_metadata_path)?;
+        let temporary = write_metadata_temp(&self.branch_metadata_path, &bytes, false)?;
+        publish_metadata_temp(&temporary, &self.branch_metadata_path)?;
         if let Some(parent) = self.branch_metadata_path.parent() {
             sync_metadata_directory(parent)?;
         }
@@ -2191,19 +2191,8 @@ impl SharedState {
         if let Some(parent) = self.durable_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temporary = self.durable_path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_data()?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(temporary, &self.durable_path)?;
+        let temporary = write_metadata_temp(&self.durable_path, &bytes, false)?;
+        publish_metadata_temp(&temporary, &self.durable_path)?;
         if let Some(parent) = self.durable_path.parent() {
             sync_metadata_directory(parent)?;
         }
@@ -15514,8 +15503,6 @@ fn sync_snapshot_directory(_path: &std::path::Path) -> ryme_error::Result<()> {
     Ok(())
 }
 
-static NEXT_SNAPSHOT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
-
 fn write_server_snapshot(
     dir: &std::path::Path,
     commit: u64,
@@ -15523,33 +15510,16 @@ fn write_server_snapshot(
 ) -> ryme_error::Result<std::path::PathBuf> {
     let name = format!("snap-{commit:020}.rsnap");
     let path = dir.join(&name);
-    let temporary = dir.join(format!(
-        ".{name}.{}.tmp",
-        NEXT_SNAPSHOT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
-    ));
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(raw)?;
-        file.sync_data()?;
-    }
-    std::fs::rename(temporary, &path)?;
+    let temporary = write_metadata_temp(&path, raw, false)?;
+    publish_metadata_temp(&temporary, &path)?;
     sync_snapshot_directory(dir)?;
     Ok(path)
 }
 
 fn publish_server_snapshot_pointer(dir: &std::path::Path, name: &str) -> ryme_error::Result<()> {
-    let temporary = dir.join(format!(
-        ".latest.{}.tmp",
-        NEXT_SNAPSHOT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed)
-    ));
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(name.as_bytes())?;
-        file.sync_data()?;
-    }
-    std::fs::rename(temporary, dir.join("latest"))?;
+    let destination = dir.join("latest");
+    let temporary = write_metadata_temp(&destination, name.as_bytes(), false)?;
+    publish_metadata_temp(&temporary, &destination)?;
     sync_snapshot_directory(dir)
 }
 
