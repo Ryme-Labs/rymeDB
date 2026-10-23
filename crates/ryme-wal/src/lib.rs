@@ -102,7 +102,15 @@ impl Wal {
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.active.sync_data()?;
+        if self.poisoned {
+            return Err(RymeError::Unavailable(String::from(
+                "wal append failed; reopen the wal before writing again",
+            )));
+        }
+        if let Err(error) = self.active.sync_data() {
+            self.poisoned = true;
+            return Err(error.into());
+        }
         Ok(())
     }
 
