@@ -2835,7 +2835,7 @@ struct TaskConfig {
     start_gate: Arc<tokio::sync::Barrier>,
 }
 
-async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
+async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64, u64) {
     let socket = match tokio::net::TcpStream::connect(&task.addr).await {
         Ok(socket) if socket.set_nodelay(true).is_ok() => Some(socket),
         _ => None,
@@ -2844,10 +2844,11 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
     task.start_gate.wait().await;
     let mut socket = match socket {
         Some(socket) => socket,
-        None => return (Vec::new(), task.ops as u64),
+        None => return (Vec::new(), 0, task.ops as u64),
     };
     let mut scratch = Vec::new();
     let mut latencies: Vec<u64> = Vec::with_capacity(task.ops);
+    let mut successful_ops = 0u64;
     let mut errors = 0u64;
     let mut index = 0usize;
     while index < task.ops {
@@ -2892,6 +2893,7 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
             let micros = start.elapsed().as_micros() as u64;
             if !failed && replies == 5 {
                 latencies.push(micros);
+                successful_ops = successful_ops.saturating_add(1);
             } else if connection_lost {
                 errors += (task.ops - index) as u64;
                 break;
@@ -2953,9 +2955,10 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
         let mut ok = true;
         let mut connection_lost = false;
         let mut batch_errors = 0u64;
+        let mut successful_replies = 0usize;
         for _ in 0..batch {
             match read_reply(&mut socket, &mut scratch).await {
-                Some(false) => {}
+                Some(false) => successful_replies += 1,
                 Some(true) => batch_errors += 1,
                 None => {
                     ok = false;
@@ -2967,18 +2970,27 @@ async fn run_worker(task: TaskConfig) -> (Vec<u64>, u64) {
         let micros = start.elapsed().as_micros() as u64;
         if ok {
             errors += batch_errors;
-            for _ in 0..batch.saturating_sub(batch_errors as usize) {
-                latencies.push(micros / batch as u64);
+            successful_ops = successful_ops.saturating_add(successful_replies as u64);
+            if batch == 1 {
+                if successful_replies == 1 {
+                    latencies.push(micros);
+                }
+            } else if batch_errors == 0 {
+                // Pipelining exposes one completion time for the batch. Keep
+                // that sample intact instead of reporting its amortized share
+                // as an individual command latency.
+                latencies.push(micros);
             }
         } else if connection_lost {
-            errors += (task.ops - index) as u64;
+            successful_ops = successful_ops.saturating_add(successful_replies as u64);
+            errors += (task.ops - index - successful_replies) as u64;
             break;
         } else {
             errors += batch as u64;
         }
         index += batch;
     }
-    (latencies, errors)
+    (latencies, successful_ops, errors)
 }
 
 async fn resp_bench(config: RespBench) {
@@ -3011,9 +3023,11 @@ async fn resp_bench(config: RespBench) {
     let start = Instant::now();
     start_gate.wait().await;
     let mut all: Vec<u64> = Vec::new();
+    let mut successful_ops = 0u64;
     let mut errors = 0u64;
     for handle in handles {
-        let (mut latencies, task_errors) = handle.await.unwrap();
+        let (mut latencies, task_successful_ops, task_errors) = handle.await.unwrap();
+        successful_ops = successful_ops.saturating_add(task_successful_ops);
         errors += task_errors;
         all.append(&mut latencies);
     }
@@ -3027,19 +3041,26 @@ async fn resp_bench(config: RespBench) {
         all[((p / 100.0) * count as f64).floor() as usize % count]
     };
     let mean = if count == 0 { 0 } else { all.iter().sum::<u64>() / count as u64 };
+    let latency_sample_unit = match config.workload.as_str() {
+        "tx" => "transaction",
+        _ if config.pipeline.max(1) == 1 => "command",
+        _ => "pipeline_batch",
+    };
     let result = serde_json::json!({
         "target": config.addr,
         "machine": machine_metadata(),
         "workload": config.workload,
         "mget_keys_per_command": if config.workload == "mget" { config.mget_keys } else { 1 },
         "pipeline": config.pipeline,
-        "ops": count,
+        "latency_sample_unit": latency_sample_unit,
+        "latency_samples": count,
+        "ops": successful_ops,
         "requested_ops": config.ops,
-        "successful_ops": count,
+        "successful_ops": successful_ops,
         "failed_ops": errors,
         "errors": errors,
         "seconds": (elapsed * 1000.0).round() / 1000.0,
-        "qps": (count as f64 / elapsed).round() as u64,
+        "qps": (successful_ops as f64 / elapsed).round() as u64,
         "attempted_qps": (config.ops as f64 / elapsed).round() as u64,
         "p50_us": percentile(50.0),
         "p90_us": percentile(90.0),
@@ -3054,13 +3075,16 @@ async fn resp_bench(config: RespBench) {
         println!("{result}");
     } else {
         println!(
-            "target={} workload={} keys_per_command={} pipeline={} requested_ops={} successful_ops={count} failed_ops={errors} qps={:.0} attempted_qps={:.0} p50={}us p90={}us p95={}us p99={}us p999={}us max={}us",
+            "target={} workload={} keys_per_command={} pipeline={} latency_unit={} latency_samples={} requested_ops={} successful_ops={} failed_ops={errors} qps={:.0} attempted_qps={:.0} p50={}us p90={}us p95={}us p99={}us p999={}us max={}us",
             config.addr,
             config.workload,
             if config.workload == "mget" { config.mget_keys } else { 1 },
             config.pipeline,
+            latency_sample_unit,
+            count,
             config.ops,
-            count as f64 / elapsed,
+            successful_ops,
+            successful_ops as f64 / elapsed,
             config.ops as f64 / elapsed,
             percentile(50.0),
             percentile(90.0),

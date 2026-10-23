@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- RESP benchmark percentiles now use whole pipeline-batch samples when pipelining,
+  with an explicit latency sample unit; throughput remains command-based.
 - SQL `LIMIT 0` queries now return before index lookup, row reads, or view scans.
 - WAL frame encoding now freezes its `BytesMut` buffer directly instead of
   copying the encoded frame into a second allocation.

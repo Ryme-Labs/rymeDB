@@ -26,6 +26,13 @@ and reported latency covers writing the request and reading its full reply.
 Prepopulate those keys on the target server to measure hits. In cluster mode,
 this includes owner routing and local/remote value handling.
 
+With `--pipeline 1`, latency percentiles sample individual command round trips.
+With a larger pipeline, each latency sample is the time to write and receive a
+whole pipeline batch; it is labeled `pipeline_batch` and is not divided into
+synthetic per-command latency. `qps` and `successful_ops` still count successful
+commands, while `latency_samples` counts the samples used for the percentiles.
+Transaction workload percentiles are labeled `transaction`.
+
 A localhost smoke benchmark on an AMD Ryzen 5 4500 used Standard storage,
 memory durability, 16 seeded 16-byte values, and one client issuing 2,000
 16-key MGET commands per capture. Three captures measured p50 at 37–49 µs,
