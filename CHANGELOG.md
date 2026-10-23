@@ -26,8 +26,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
-- Range splits now reject empty or duplicate child IDs, merges reject empty IDs,
-  and persisted range snapshots reject empty IDs.
+- Range splits and merges reject empty or oversized new IDs, and persisted
+  range snapshots reject empty or oversized IDs.
 - The documentation toolchain now resolves patched `body-parser` 1.20.9 to
   address a denial-of-service advisory in earlier 1.x versions.
 - Durable-topic snapshot restoration now enforces global and per-tenant topic

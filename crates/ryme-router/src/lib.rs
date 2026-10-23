@@ -52,6 +52,8 @@ pub struct Range {
     pub load: Arc<AtomicU64>,
 }
 
+pub const MAX_RANGE_ID_BYTES: usize = 256;
+
 fn fresh_load() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(0))
 }
@@ -192,7 +194,12 @@ impl Router {
         left_id: String,
         right_id: String,
     ) -> Result<()> {
-        if left_id.is_empty() || right_id.is_empty() || left_id == right_id {
+        if left_id.is_empty()
+            || right_id.is_empty()
+            || left_id.len() > MAX_RANGE_ID_BYTES
+            || right_id.len() > MAX_RANGE_ID_BYTES
+            || left_id == right_id
+        {
             return Err(RymeError::InvalidArgument(String::from("range id")));
         }
         let original = self
@@ -242,7 +249,7 @@ impl Router {
     }
 
     pub fn merge(&mut self, left_id: &str, right_id: &str, merged_id: String) -> Result<()> {
-        if merged_id.is_empty() {
+        if merged_id.is_empty() || merged_id.len() > MAX_RANGE_ID_BYTES {
             return Err(RymeError::InvalidArgument(String::from("range id")));
         }
         let left = self.get(left_id)?;

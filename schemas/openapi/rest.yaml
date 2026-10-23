@@ -2828,35 +2828,41 @@ components:
     SplitRangeRequest:
       type: object
       required: [id, mid, left_id, right_id, expected_epoch]
-      description: Child range IDs must be non-empty and distinct from each other and existing range IDs.
+      description: Child range IDs must contain 1 to 256 UTF-8 bytes and be distinct from each other and existing range IDs.
       properties:
         id:
           type: string
           minLength: 1
+          maxLength: 256
         mid:
           type: string
         left_id:
           type: string
           minLength: 1
+          maxLength: 256
         right_id:
           type: string
           minLength: 1
+          maxLength: 256
         expected_epoch:
           type: integer
     MergeRangesRequest:
       type: object
       required: [left_id, right_id, merged_id, expected_left_epoch, expected_right_epoch]
-      description: The merged range ID must be non-empty and unused.
+      description: The merged range ID must contain 1 to 256 UTF-8 bytes and be unused.
       properties:
         left_id:
           type: string
           minLength: 1
+          maxLength: 256
         right_id:
           type: string
           minLength: 1
+          maxLength: 256
         merged_id:
           type: string
           minLength: 1
+          maxLength: 256
         expected_left_epoch:
           type: integer
         expected_right_epoch:
@@ -2867,6 +2873,8 @@ components:
       properties:
         id:
           type: string
+          minLength: 1
+          maxLength: 256
         target:
           type: integer
           description: Raft member id to compare against
@@ -2882,6 +2890,8 @@ components:
       properties:
         id:
           type: string
+          minLength: 1
+          maxLength: 256
         target:
           type: integer
           description: Raft member id that will receive the range snapshot
@@ -2898,6 +2908,7 @@ components:
         id:
           type: string
           minLength: 1
+          maxLength: 256
         start:
           type: array
           items:
@@ -2920,6 +2931,8 @@ components:
       properties:
         id:
           type: string
+          minLength: 1
+          maxLength: 256
         epoch:
           type: integer
         writes:
