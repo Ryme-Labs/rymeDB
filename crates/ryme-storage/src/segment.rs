@@ -396,31 +396,33 @@ impl ImmutableSegment {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let payload = self.engine.encode_snapshot()?;
-        let mut out = Vec::with_capacity(4 + 2 + 2 + 8 + 4 + payload.len() + 4);
-        out.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
-        out.extend_from_slice(&SEGMENT_VERSION.to_be_bytes());
-        out.extend_from_slice(&(self.kind as u16).to_be_bytes());
-        out.extend_from_slice(&self.meta.id.to_be_bytes());
-        out.extend_from_slice(&self.meta.max_commit_ts.to_be_bytes());
-        out.extend_from_slice(
+        let mut out = Vec::new();
+        push_segment_bytes(&mut out, &SEGMENT_MAGIC.to_be_bytes())?;
+        push_segment_bytes(&mut out, &SEGMENT_VERSION.to_be_bytes())?;
+        push_segment_bytes(&mut out, &(self.kind as u16).to_be_bytes())?;
+        push_segment_bytes(&mut out, &self.meta.id.to_be_bytes())?;
+        push_segment_bytes(&mut out, &self.meta.max_commit_ts.to_be_bytes())?;
+        push_segment_bytes(
+            &mut out,
             &(u32::try_from(payload.len())
                 .map_err(|_| RymeError::InvalidArgument(String::from("segment size")))?)
             .to_be_bytes(),
-        );
-        out.extend_from_slice(&payload);
-        out.extend_from_slice(&(self.bloom.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.bloom);
-        out.extend_from_slice(&(self.sparse_index.len() as u32).to_be_bytes());
+        )?;
+        push_segment_bytes(&mut out, &payload)?;
+        push_segment_bytes(&mut out, &(self.bloom.len() as u32).to_be_bytes())?;
+        push_segment_bytes(&mut out, &self.bloom)?;
+        push_segment_bytes(&mut out, &(self.sparse_index.len() as u32).to_be_bytes())?;
         for (key, ordinal) in &self.sparse_index {
             push_key(&mut out, key)?;
-            out.extend_from_slice(
+            push_segment_bytes(
+                &mut out,
                 &u32::try_from(*ordinal)
                     .map_err(|_| RymeError::InvalidArgument(String::from("segment index")))?
                     .to_be_bytes(),
-            );
+            )?;
         }
         let checksum = crc32fast::hash(&out);
-        out.extend_from_slice(&checksum.to_be_bytes());
+        push_segment_bytes(&mut out, &checksum.to_be_bytes())?;
         Ok(out)
     }
 
@@ -1627,19 +1629,31 @@ fn take_u64(cursor: &mut &[u8]) -> Result<u64> {
     Ok(value)
 }
 
+fn push_segment_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let new_len = out
+        .len()
+        .checked_add(bytes.len())
+        .filter(|length| *length <= MAX_SEGMENT_BYTES)
+        .ok_or_else(|| RymeError::Overload(String::from("segment")))?;
+    out.try_reserve(new_len - out.len())
+        .map_err(|_| RymeError::Overload(String::from("segment")))?;
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 fn push_key(out: &mut Vec<u8>, key: &RecordKey) -> Result<()> {
     for field in [key.tenant.as_bytes(), key.database.as_bytes(), key.table.as_bytes()] {
         if field.len() > u16::MAX as usize {
             return Err(RymeError::InvalidArgument(String::from("segment key")));
         }
-        out.extend_from_slice(&(field.len() as u16).to_be_bytes());
-        out.extend_from_slice(field);
+        push_segment_bytes(out, &(field.len() as u16).to_be_bytes())?;
+        push_segment_bytes(out, field)?;
     }
     if key.pk.len() > u32::MAX as usize {
         return Err(RymeError::InvalidArgument(String::from("segment key")));
     }
-    out.extend_from_slice(&(key.pk.len() as u32).to_be_bytes());
-    out.extend_from_slice(&key.pk);
+    push_segment_bytes(out, &(key.pk.len() as u32).to_be_bytes())?;
+    push_segment_bytes(out, &key.pk)?;
     Ok(())
 }
 

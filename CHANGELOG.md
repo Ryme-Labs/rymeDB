@@ -24,6 +24,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Storage segment encoding now enforces the 256 MiB persisted-segment limit
+  while constructing the encoded buffer.
 - GitHub Actions dependencies now use verified full commit SHAs, with weekly
   Dependabot updates keeping their release tags current.
 - TLS certificate, key, and CA inputs are capped at 4 MiB each, including
