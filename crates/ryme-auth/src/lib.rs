@@ -315,7 +315,13 @@ impl ApiKeyState {
     }
 }
 
+/// Largest API key accepted by [`ApiKeyStore`] insertion and authentication APIs.
+pub const MAX_API_KEY_BYTES: usize = 16 * 1024;
 const MAX_API_KEYS: usize = 100_000;
+
+fn valid_api_key(api_key: &str) -> bool {
+    !api_key.is_empty() && api_key.len() <= MAX_API_KEY_BYTES
+}
 
 impl ApiKeyStore {
     pub fn new() -> Self {
@@ -343,6 +349,9 @@ impl ApiKeyStore {
         expires_at: Option<u64>,
         now_secs: u64,
     ) -> Result<()> {
+        if !valid_api_key(&api_key) {
+            return Err(RymeError::InvalidArgument(String::from("api key")));
+        }
         principal.validate()?;
         if expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
             return Err(RymeError::InvalidArgument(String::from("api key expiration")));
@@ -363,6 +372,9 @@ impl ApiKeyStore {
     }
 
     pub fn remove_with_expiry(&self, api_key: &str) -> Option<(Principal, Option<u64>)> {
+        if !valid_api_key(api_key) {
+            return None;
+        }
         self.inner
             .write()
             .ok()?
@@ -405,6 +417,9 @@ impl ApiKeyStore {
         principal: Principal,
         expires_at: Option<u64>,
     ) -> Result<()> {
+        if !valid_api_key(api_key) {
+            return Err(RymeError::InvalidArgument(String::from("api key")));
+        }
         principal.validate()?;
         let digest = Self::digest(api_key);
         let mut state =
@@ -421,6 +436,9 @@ impl ApiKeyStore {
     }
 
     pub fn owner_of_at(&self, presented: &str, now_secs: u64) -> Option<Principal> {
+        if !valid_api_key(presented) {
+            return None;
+        }
         let guard = self.inner.read().ok()?;
         let record = guard.records.get(&Self::digest(presented))?;
         if record.expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
@@ -434,6 +452,9 @@ impl ApiKeyStore {
     }
 
     pub fn authenticate_at(&self, presented: &str, now_secs: u64) -> Result<Principal> {
+        if !valid_api_key(presented) {
+            return Err(RymeError::Unauthorized);
+        }
         let guard =
             self.inner.read().map_err(|_| RymeError::Internal(String::from("auth lock")))?;
         let record = guard.records.get(&Self::digest(presented)).ok_or(RymeError::Unauthorized)?;

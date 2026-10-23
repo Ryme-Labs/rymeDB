@@ -17,6 +17,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - SQL auto-increment IDs now report exhaustion instead of reusing the maximum
   integer and producing duplicate identifiers.
+- API key storage and authentication now reject empty or oversized bearer keys
+  before hashing or retaining them.
 - SQL sequence arithmetic now reports integer overflow as exhaustion, and
   invalid `ALTER SEQUENCE` options leave the sequence unchanged.
 - SQL sequences now validate `smallint`, `integer`, and `bigint` ranges and use

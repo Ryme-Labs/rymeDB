@@ -17,6 +17,9 @@ model supplies a tenant, roles, and capabilities across all gateways.
 | OIDC | `RYME_OIDC_*` | OIDC login/token helpers and issuer/audience validation; configure `RYME_OIDC_REDIRECT_URIS` as a comma-separated exact allowlist |
 | OTP/passkey | REST auth endpoints | Application sign-in and WebAuthn assertions |
 
+Stored API keys must be nonempty and no larger than 16 KiB. The key store
+rejects oversized presented values before hashing them.
+
 For HTTP:
 
 ```bash
