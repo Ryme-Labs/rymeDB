@@ -1023,6 +1023,7 @@ where
     let mut listening = HashSet::new();
     let mut copy_in: Option<CopyInState> = None;
     let mut active_transaction: Option<SessionTransaction> = None;
+    let mut ignore_until_sync = false;
     loop {
         let (tag, payload) = if listening.is_empty() {
             match read_client_message(&mut socket).await {
@@ -1055,6 +1056,18 @@ where
                 }
             }
         };
+
+        if ignore_until_sync {
+            match tag {
+                b'S' => {
+                    ignore_until_sync = false;
+                    send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
+                }
+                b'X' => return Ok(()),
+                _ => {}
+            }
+            continue;
+        }
 
         if cancellation.swap(false, Ordering::Acquire) && copy_in.is_none() {
             if let Some(transaction) = active_transaction.as_mut() {
@@ -1463,6 +1476,10 @@ where
                         && !statements.contains_key(&name))
                         || prepared_state_exceeds_limit(&statements, &name, &query)
                     {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
                         let response = encode_error_code(
                             "54000",
                             String::from("prepared statement limit exceeded"),
@@ -1481,6 +1498,7 @@ where
                         .map_err(|e| RymeError::Io(e.to_string()))?;
                 }
                 Err(e) => {
+                    ignore_until_sync = true;
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
@@ -1491,6 +1509,10 @@ where
             b'B' => match parse_bind(&payload) {
                 Ok((portal, statement, params)) => {
                     if portals.len() >= MAX_PORTALS && !portals.contains_key(&portal) {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
                         let response =
                             encode_error_code("54000", String::from("portal limit exceeded"));
                         socket
@@ -1500,6 +1522,10 @@ where
                         continue;
                     }
                     if portal_state_exceeds_limit(&portals, &portal, &statement, &params) {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
                         let response = encode_error_code(
                             "54000",
                             String::from("portal memory limit exceeded"),
@@ -1517,6 +1543,7 @@ where
                         .map_err(|e| RymeError::Io(e.to_string()))?;
                 }
                 Err(e) => {
+                    ignore_until_sync = true;
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
@@ -1526,6 +1553,7 @@ where
             },
             b'D' => {
                 let Some((kind, name)) = parse_describe(&payload) else {
+                    ignore_until_sync = true;
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
@@ -1552,12 +1580,26 @@ where
                         response.extend(describe_query(&query));
                         response
                     }
-                    None => row_description(),
+                    None => {
+                        ignore_until_sync = true;
+                        if let Some(transaction) = active_transaction.as_mut() {
+                            transaction.failed = true;
+                        }
+                        if kind == b'P' {
+                            encode_error_code("34000", format!("portal \"{name}\" does not exist"))
+                        } else {
+                            encode_error_code(
+                                "26000",
+                                format!("prepared statement \"{name}\" does not exist"),
+                            )
+                        }
+                    }
                 };
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             b'E' => {
                 let Some(portal) = parse_execute(&payload) else {
+                    ignore_until_sync = true;
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
@@ -1656,6 +1698,10 @@ where
                     None => response,
                 };
                 let response = if cancellation.swap(false, Ordering::Acquire) {
+                    ignore_until_sync = true;
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
                     encode_error_code(
                         "57014",
                         String::from("canceling statement due to user request"),
@@ -1663,6 +1709,12 @@ where
                 } else {
                     response
                 };
+                if response.first() == Some(&b'E') {
+                    ignore_until_sync = true;
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
+                }
                 if was_listening_empty && !listening.is_empty() {
                     notifications = notification_receiver(&limits.tenant, &limits.database);
                 }
@@ -1675,6 +1727,7 @@ where
             }
             b'C' => {
                 let Some((kind, name)) = parse_close(&payload) else {
+                    ignore_until_sync = true;
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
                     }
@@ -1703,12 +1756,12 @@ where
             }
             b'H' => socket.flush().await.map_err(|e| RymeError::Io(e.to_string()))?,
             _ => {
+                ignore_until_sync = true;
                 if let Some(transaction) = active_transaction.as_mut() {
                     transaction.failed = true;
                 }
                 let response = encode_error(String::from("unsupported"));
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
-                send_ready_for_transaction(&mut socket, active_transaction.as_ref()).await?;
             }
         }
     }
