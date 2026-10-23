@@ -56,6 +56,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Range append requests now require a configured group and replica membership
   before changing its leader metadata or durable log.
 - Range voters now reject term-zero requests without persisting a vote.
+- Range leader heartbeats now serialize with local range commits, so a
+  concurrent heartbeat cannot truncate a newly replicated suffix.
 - Raft replication now sends bounded append batches so large backlogs can catch
   up within the RPC frame limit, and rejects entries too large to replicate.
 

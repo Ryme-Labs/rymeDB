@@ -1891,6 +1891,7 @@ impl Node {
     }
 
     async fn range_heartbeat(self: &Arc<Self>, group_id: &str) -> Result<()> {
+        let _commit = self.txn_commit_lock.lock().await;
         let mut range = self
             .try_range_owners()?
             .into_iter()
