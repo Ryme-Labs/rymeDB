@@ -18,6 +18,7 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- SQL `LIMIT 0` queries now return before index lookup, row reads, or view scans.
 - WAL frame encoding now freezes its `BytesMut` buffer directly instead of
   copying the encoded frame into a second allocation.
 - Realtime and Supabase-compatible WebSocket broadcast fanout share cached

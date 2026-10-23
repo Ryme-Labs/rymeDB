@@ -180,6 +180,8 @@ enum Command {
         rows: usize,
         #[arg(long, default_value_t = 1000)]
         ops: usize,
+        #[arg(long, default_value_t = 4000, help = "SQL LIMIT value to benchmark (0..=4000)")]
+        limit: usize,
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
         #[arg(long)]
@@ -345,8 +347,8 @@ async fn main() {
             })
             .await;
         }
-        Some(Command::SqlLocal { rows, ops, concurrency, json }) => {
-            sql_local_bench(rows, ops, concurrency, json).await
+        Some(Command::SqlLocal { rows, ops, limit, concurrency, json }) => {
+            sql_local_bench(rows, ops, limit, concurrency, json).await
         }
         Some(Command::TxnReadBatch {
             records,
@@ -2673,16 +2675,19 @@ async fn sql_bench(config: SqlBench) {
     }
 }
 
-async fn sql_local_bench(rows: usize, ops: usize, concurrency: usize, json: bool) {
+async fn sql_local_bench(rows: usize, ops: usize, limit: usize, concurrency: usize, json: bool) {
     if rows == 0
         || rows > 50_000
         || ops == 0
         || ops > 1_000_000
+        || limit > 4_000
         || concurrency == 0
         || concurrency > 64
         || concurrency > ops
     {
-        eprintln!("rows must be 1..=50000, ops 1..=1000000, and concurrency 1..=64");
+        eprintln!(
+            "rows must be 1..=50000, ops 1..=1000000, limit 0..=4000, and concurrency 1..=64"
+        );
         return;
     }
 
@@ -2721,16 +2726,16 @@ async fn sql_local_bench(rows: usize, ops: usize, concurrency: usize, json: bool
         return;
     }
 
-    let statement = match parse(
-        "SELECT id, state FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT 4000",
-    ) {
+    let statement = match parse(&format!(
+        "SELECT id, state FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT {limit}"
+    )) {
         Ok(statement) => statement,
         Err(error) => {
             eprintln!("could not parse in-process SQL benchmark query: {error}");
             return;
         }
     };
-    let expected_rows = rows.div_ceil(24).min(4_000);
+    let expected_rows = rows.div_ceil(24).min(limit);
     let warmup_ops = ops.min(100);
     for _ in 0..warmup_ops {
         if !matches!(executor.execute(statement.clone()).await, Ok(QueryResult::Table { ref rows, .. }) if rows.len() == expected_rows)
@@ -2789,6 +2794,7 @@ async fn sql_local_bench(rows: usize, ops: usize, concurrency: usize, json: bool
         "protocol": "ryme-sql-executor",
         "workload": "indexed-filtered-projection-three-predicates",
         "rows": rows,
+        "limit": limit,
         "result_rows": expected_rows,
         "warmup_ops": warmup_ops,
         "ops": ops,

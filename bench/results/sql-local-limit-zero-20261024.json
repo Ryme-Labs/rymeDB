@@ -1,0 +1,41 @@
+{
+  "benchmark": "in-process-sql-limit-zero",
+  "date": "2026-10-24",
+  "machine": {
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "arch": "x86_64",
+    "os": "Windows 11 Pro",
+    "logical_cpus": 12,
+    "host_memory_bytes": 17042579456
+  },
+  "method": "Sequential release captures before and after returning zero scan capacity for SQL LIMIT 0. Each capture seeds 1,000 rows, builds tenant and state indexes, warms 100 queries, then times 10,000 single-worker in-process executor calls. The fixed query filters tenant, state, and seq and projects id and state. The control captures use the same query with LIMIT 4000.",
+  "limit_zero": {
+    "before_revision": "14a2f60",
+    "before": [
+      { "seconds": 0.762, "qps": 13128, "p50_ns": 73800, "p95_ns": 84000, "p99_ns": 114800, "max_ns": 511300 },
+      { "seconds": 0.733, "qps": 13641, "p50_ns": 71800, "p95_ns": 76300, "p99_ns": 107200, "max_ns": 340300 },
+      { "seconds": 0.754, "qps": 13268, "p50_ns": 73600, "p95_ns": 79700, "p99_ns": 113800, "max_ns": 246800 }
+    ],
+    "after": [
+      { "seconds": 0.018, "qps": 553836, "p50_ns": 1700, "p95_ns": 1800, "p99_ns": 2200, "max_ns": 37500 },
+      { "seconds": 0.018, "qps": 542788, "p50_ns": 1700, "p95_ns": 1900, "p99_ns": 2300, "max_ns": 85400 },
+      { "seconds": 0.019, "qps": 527830, "p50_ns": 1700, "p95_ns": 2400, "p99_ns": 2700, "max_ns": 35800 }
+    ],
+    "median_capture_p50_ns_before": 73600,
+    "median_capture_p50_ns_after": 1700,
+    "median_capture_p95_ns_before": 79700,
+    "median_capture_p95_ns_after": 1900,
+    "median_capture_p99_ns_before": 113800,
+    "median_capture_p99_ns_after": 2300,
+    "median_capture_qps_before": 13268,
+    "median_capture_qps_after": 542788
+  },
+  "limit_4000_control": {
+    "result_rows": 42,
+    "before_p50_ns": [106400, 106700, 106200],
+    "after_p50_ns": [109600, 108300, 108200],
+    "before_p99_ns": [155700, 177100, 154600],
+    "after_p99_ns": [177300, 162900, 186000]
+  },
+  "caveat": "The LIMIT 0 result measures one in-process executor workload on one Windows host. It does not measure network, parsing, durability, concurrent sessions, or cross-database performance. The LIMIT 4000 control captures vary enough that their small p50 difference should not be attributed to this change."
+}

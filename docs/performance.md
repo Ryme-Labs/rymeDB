@@ -68,7 +68,7 @@ overhead:
 
 ```bash
 cargo run --locked --release -j 1 -p ryme-bench -- sql-local \
-  --rows 1000 --ops 1000 --json
+  --rows 1000 --ops 1000 --limit 4000 --json
 ```
 
 The command seeds a bounded in-memory table outside the timed interval, warms
@@ -77,6 +77,16 @@ the result row count on every operation and reports p50/p95/p99 latency and
 throughput. This isolates executor/storage work for one fixed query shape; it
 does not measure SQL parsing, concurrent clients, WAL durability, network
 overhead, or establish a cross-database performance claim.
+
+The `--limit` option accepts values from 0 through 4,000. A sequential
+before/after capture for the same 1,000-row indexed query with `LIMIT 0` on an
+AMD Ryzen 5 4500 (12 logical CPUs, Windows 11) measured median p50 falling from
+73.6 µs to 1.7 µs and median throughput rising from 13.3k to 542.8k queries/s.
+The executor now returns before index lookup or row reads when the limit is
+zero. A `LIMIT 4000` control query returned 42 rows and had median p50 of
+106.4 µs before and 108.3 µs after; this difference is within run-to-run noise
+and is not a measured regression or gain. The zero-limit result is an
+in-process microbenchmark, not an end-to-end result; see the [raw captures](../bench/results/sql-local-limit-zero-20261024.json).
 
 Before selective JSON projection, three sequential release captures on an AMD
 Ryzen 5 4500 with 1,000 rows,

@@ -8546,6 +8546,9 @@ where
         offset: usize,
         filter_is_empty: bool,
     ) -> Result<(usize, bool)> {
+        if limit == 0 {
+            return Ok((0, false));
+        }
         let primary_key_order = order == &Order::default();
         if primary_key_order {
             let views =
@@ -11432,7 +11435,8 @@ where
         order: Order,
         filter: Vec<Predicate>,
     ) -> Result<QueryResult> {
-        let exact_key = filter.len() == 1
+        let exact_key = limit > 0
+            && filter.len() == 1
             && filter[0].column.is_none()
             && filter[0].field == Field::Key
             && filter[0].op == Cmp::Eq;
@@ -11888,6 +11892,9 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let rls_applies = self.rls_applies_to_role(table);
         if let Some(view) = self.view_definition(table)? {
             if view.materialized && view.rows.len() > MAX_QUERY_MATERIALIZED_ROWS {
@@ -12058,6 +12065,9 @@ where
         filter: &[Predicate],
         limit: usize,
     ) -> Result<Vec<Row>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let rls_applies = self.rls_applies_to_role(table);
         if let Some(view) = self.view_definition(table)? {
             if view.materialized && view.rows.len() > MAX_QUERY_MATERIALIZED_ROWS {
@@ -15631,7 +15641,8 @@ where
                 }
             }
             Statement::SelectColumns { table, columns, aliases, limit, offset, order, filter }
-                if filter.len() == 1
+                if limit > 0
+                    && filter.len() == 1
                     && filter[0].column.is_none()
                     && filter[0].field == Field::Key
                     && filter[0].op == Cmp::Eq
