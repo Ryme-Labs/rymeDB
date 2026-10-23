@@ -21,6 +21,8 @@ not keep every historical record payload in memory at once.
 WAL segment paths must be regular files; symlinks and other file types are
 rejected during discovery and recovery. Segment discovery accepts only the
 canonical `seg-` plus 20-digit ID plus `.wal` filename format.
+WAL archive enumeration also fails on directory read errors and rejects
+symlink or non-file entries that use a segment filename.
 Local archive objects and restored files are written through unique temporary
 files created exclusively in their destination directories.
 On Unix, local archive writes sync the published object's containing directory

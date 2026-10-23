@@ -53,6 +53,8 @@ All notable changes to rymeDB are recorded here. Format follows
   object, and sync newly created directory entries before reporting success.
 - WAL recovery now recognizes only canonical, fixed-width segment filenames,
   avoiding duplicate or unreachable segment IDs from alternate spellings.
+- WAL archive enumeration now propagates directory errors and rejects symlink
+  or non-file segment entries instead of following or silently skipping them.
 - RESP `KEYS` and `SCAN` cap each result at 10,000 keys and 16 MiB of key bytes,
   and scan the keyspace in bounded pages.
 - RESP `MGET` reads values incrementally and rejects combined results above

@@ -15413,13 +15413,14 @@ fn wal_segment_files(dir: &std::path::Path) -> ryme_error::Result<Vec<std::path:
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(ryme_error::RymeError::from(e)),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with("seg-") && name.ends_with(".wal") {
+            if !entry.file_type()?.is_file() {
+                return Err(ryme_error::RymeError::Corrupt(String::from("wal segment file")));
+            }
             out.push(path);
         }
     }
