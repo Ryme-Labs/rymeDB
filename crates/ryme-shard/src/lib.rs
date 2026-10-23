@@ -168,12 +168,31 @@ fn persist_metadata_file(path: &Path, bytes: &[u8]) -> Result<()> {
 fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
 
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !path_metadata.file_type().is_file() {
+        return Err(RymeError::Corrupt(format!("{label} file type")));
+    }
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let file_len = file.metadata()?.len();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(RymeError::Corrupt(format!("{label} file type")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+            return Err(RymeError::Corrupt(format!("{label} file identity")));
+        }
+    }
+    let file_len = metadata.len();
     if file_len > MAX_SHARD_METADATA_BYTES as u64 {
         return Err(RymeError::Overload(label.to_string()));
     }
