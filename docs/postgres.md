@@ -31,6 +31,9 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
   `SET NAMES`, `SET TIME ZONE`, and `application_name`.
 - `statement_timeout`, SQLSTATE errors, RLS/catalog introspection, views,
   sequences, roles, grants, and persisted migration metadata.
+- Ordered SQL scans sort the full result up to the query materialization bound
+  of 100,000 rows and 64 MiB; larger ordered results fail with an overload error
+  instead of returning a partial, incorrectly ordered result.
 
 ## Compatibility boundary
 

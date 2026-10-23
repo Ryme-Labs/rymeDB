@@ -8560,16 +8560,16 @@ where
                         .next()
                         .is_some_and(|short| short.eq_ignore_ascii_case(table))
                 });
-            let cap = if filter_is_empty && offset == 0 {
+            let cap = if is_view {
+                MAX_QUERY_MATERIALIZED_ROWS.saturating_add(1)
+            } else if filter_is_empty && offset == 0 {
                 limit.clamp(1, 10_000)
-            } else if !is_view {
-                limit.saturating_add(offset).clamp(1, 10_000)
             } else {
-                10_000
+                limit.saturating_add(offset).clamp(1, 10_000)
             };
             return Ok((cap, is_view));
         }
-        Ok((10_000, true))
+        Ok((MAX_QUERY_MATERIALIZED_ROWS.saturating_add(1), true))
     }
 
     fn install_sequence(&self, definition: SequenceDefinition, if_not_exists: bool) -> Result<()> {

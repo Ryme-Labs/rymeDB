@@ -27,6 +27,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Ordered SQL scans now sort the full bounded result set or return an overload
+  error instead of silently sorting only the first 10,000 rows.
 - Range splits and merges reject empty or oversized new IDs, and persisted
   range snapshots reject empty or oversized IDs.
 - The documentation toolchain now resolves patched `body-parser` 1.20.9 to
