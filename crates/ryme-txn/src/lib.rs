@@ -6,6 +6,7 @@ use ryme_storage::{
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::Path;
@@ -25,6 +26,7 @@ const TRANSACTION_ENTRY_OVERHEAD: usize = 64;
 const MVCC_GC_KEYS_PER_LOCK: usize = 1_024;
 const MVCC_GC_VERSIONS_PER_LOCK: usize = 4_096;
 const MIN_ORDERED_BATCH_READ_KEYS: usize = 16;
+static NEXT_SNAPSHOT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 fn transaction_key_bytes(key: &RecordKey) -> usize {
     TRANSACTION_ENTRY_OVERHEAD
@@ -73,18 +75,40 @@ fn snapshot_commit(name: &str) -> Option<u64> {
         .flatten()
 }
 
+fn create_snapshot_temp(dir: &Path, name: &str) -> Result<(std::path::PathBuf, File)> {
+    loop {
+        let id = NEXT_SNAPSHOT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), id));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn write_snapshot_temp(dir: &Path, name: &str, contents: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    let (temporary, mut file) = create_snapshot_temp(dir, name)?;
+    let result = file.write_all(contents).and_then(|()| file.sync_data());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(temporary)
+}
+
 fn publish_snapshot_pointer(dir: &Path, name: &str) -> Result<()> {
     if snapshot_commit(name).is_none() {
         return Err(RymeError::Internal(String::from("snapshot name")));
     }
-    let temporary = dir.join("latest.tmp");
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(name.as_bytes())?;
-        file.sync_data()?;
+    let temporary = write_snapshot_temp(dir, "latest", name.as_bytes())?;
+    if let Err(error) = std::fs::rename(&temporary, dir.join("latest")) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
-    std::fs::rename(temporary, dir.join("latest"))?;
     sync_directory(dir)
 }
 
@@ -94,14 +118,11 @@ fn write_snapshot_file(dir: &Path, commit_ts: u64, raw: &[u8]) -> Result<std::pa
     }
     let name = snapshot_file_name(commit_ts);
     let path = dir.join(&name);
-    let temporary = dir.join(format!(".{name}.tmp"));
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(raw)?;
-        file.sync_data()?;
+    let temporary = write_snapshot_temp(dir, &name, raw)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
-    std::fs::rename(temporary, &path)?;
     sync_directory(dir)?;
     Ok(path)
 }
