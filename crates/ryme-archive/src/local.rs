@@ -154,9 +154,18 @@ impl crate::ObjectStore for LocalStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        let (tmp, mut file) = super::create_archive_temp_file(&path)?;
+        let write_result = (|| -> Result<()> {
+            std::io::Write::write_all(&mut file, &bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        write_result?;
         Ok(())
     }
 

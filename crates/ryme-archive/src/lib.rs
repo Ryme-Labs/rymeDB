@@ -2,12 +2,34 @@ use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_ARCHIVE_OBJECT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_ARCHIVE_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ARCHIVE_FILES: usize = 262_144;
+static NEXT_ARCHIVE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn create_archive_temp_file(path: &Path) -> Result<(PathBuf, File)> {
+    let parent =
+        path.parent().ok_or_else(|| RymeError::InvalidArgument(String::from("archive path")))?;
+    for _ in 0..128 {
+        let id = NEXT_ARCHIVE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".rymedb-archive-{}-{id}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate unique archive temporary file",
+    )
+    .into())
+}
 
 pub mod local;
 pub mod s3;
@@ -329,12 +351,18 @@ impl<S: ObjectStore> Archiver<S> {
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let tmp = dest.with_extension("tmp");
-                let mut output = std::fs::File::create(&tmp)?;
-                output.write_all(&plain)?;
-                output.sync_all()?;
-                drop(output);
-                std::fs::rename(&tmp, &dest)?;
+                let (tmp, mut output) = create_archive_temp_file(&dest)?;
+                let write_result = (|| -> Result<()> {
+                    output.write_all(&plain)?;
+                    output.sync_all()?;
+                    drop(output);
+                    std::fs::rename(&tmp, &dest)?;
+                    Ok(())
+                })();
+                if write_result.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                write_result?;
             }
             Ok(())
         }

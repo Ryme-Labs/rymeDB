@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Local archive writes and restores now create unique temporary files with
+  exclusive creation, preventing symlink following and temp-name collisions.
 - WAL segment discovery and reads now reject symlinked or non-regular segment
   paths before recovery or append operations.
 - Transaction and shard recovery now visit WAL records in LSN order as they
