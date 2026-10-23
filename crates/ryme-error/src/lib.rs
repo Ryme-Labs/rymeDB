@@ -35,11 +35,27 @@ pub type Result<T> = std::result::Result<T, RymeError>;
 pub fn open_read_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    open_no_follow(path, options)
+}
+
+/// Open an existing file for reading and appending without following a
+/// Windows reparse point at the final path component.
+pub fn open_append_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true);
+    open_no_follow(path, options)
+}
+
+fn open_no_follow(
+    path: &std::path::Path,
+    options: std::fs::OpenOptions,
+) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let mut options = options;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         let file = options.open(path)?;
         if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {

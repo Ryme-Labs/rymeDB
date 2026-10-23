@@ -612,7 +612,7 @@ fn ensure_regular_or_missing(path: &Path) -> Result<()> {
 fn open_segment_append(path: &Path, create: bool) -> Result<File> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            let file = OpenOptions::new().read(true).append(true).open(path)?;
+            let file = ryme_error::open_append_no_follow(path)?;
             verify_opened_segment(&metadata, &file)?;
             Ok(file)
         }
