@@ -1970,8 +1970,8 @@ impl Realtime {
                 .saturating_add(
                     pending_topics_by_tenant.get(&snapshot.tenant).copied().unwrap_or(0),
                 );
-            if inner.durable.len().saturating_add(pending.len()) > MAX_DURABLE_TOPICS
-                || tenant_topics > MAX_DURABLE_TOPICS_PER_TENANT
+            if inner.durable.len().saturating_add(pending.len()) >= MAX_DURABLE_TOPICS
+                || tenant_topics >= MAX_DURABLE_TOPICS_PER_TENANT
             {
                 return Err(RymeError::Corrupt(String::from("durable topic limit")));
             }

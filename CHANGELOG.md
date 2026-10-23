@@ -26,6 +26,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Durable-topic snapshot restoration now enforces global and per-tenant topic
+  limits before admitting each restored topic.
 - DEK rotation IDs now remain unique when restoring stale counters or reaching
   counter saturation.
 - Local archive listings validate prefixes, cap result count and bytes, and use
