@@ -1275,9 +1275,12 @@ fn read_bounded_state_file(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
             return Err(ryme_error::RymeError::Corrupt(format!("{label} file identity")));
+        }
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
     let file_len = metadata.len();
@@ -1299,14 +1302,6 @@ fn load_auth_snapshot(path: &std::path::Path) -> ryme_error::Result<AuthSnapshot
     else {
         return Ok(AuthSnapshot::default());
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
     serde_json::from_slice(&bytes)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("auth snapshot: {error}")))
 }
@@ -1387,14 +1382,6 @@ fn load_durable_snapshot(
     else {
         return Ok(Vec::new());
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
     let snapshot: DurableSnapshot = serde_json::from_slice(&bytes)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("durable snapshot: {error}")))?;
     Ok(snapshot.topics)
@@ -1406,14 +1393,6 @@ fn load_schema_snapshot(path: &std::path::Path) -> ryme_error::Result<ryme_sql::
     else {
         return Ok(ryme_sql::SchemaSnapshot::default());
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
     let snapshot = serde_json::from_slice(&bytes)
         .map_err(|error| ryme_error::RymeError::Corrupt(format!("schema snapshot: {error}")))?;
     ryme_sql::validate_schema_snapshot(&snapshot)?;

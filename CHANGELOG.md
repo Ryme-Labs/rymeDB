@@ -61,7 +61,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - Keyring loading now rejects symlink and non-regular paths before repairing
   permissions through the opened file handle.
 - Server state-file loading now rejects symlinks and non-regular files, and on
-  Unix verifies the opened file still matches the checked path.
+  Unix verifies the opened file still matches the checked path and tightens
+  existing files to mode 0600 through that verified handle.
 - Branch catalog loading now rejects symlinks and non-regular files, and on
   Unix verifies the opened file identity before deserializing it.
 - Shard placement catalog loading now rejects symlinks and non-regular files,
