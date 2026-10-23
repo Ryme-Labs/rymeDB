@@ -41,6 +41,9 @@ bytes, and may contain at most 1,024 arguments. Larger commands are rejected
 before bulk arguments are copied into command storage. This is a deliberate
 resource bound; clients sending large values should split the data or use
 another gateway with a suitable request limit.
+RESP connections use 16 KiB read buffers and share a 256 MiB process-wide
+budget for read buffers and pending framed input. A connection is closed if it
+cannot reserve input memory from that budget.
 
 ## Transaction notes
 

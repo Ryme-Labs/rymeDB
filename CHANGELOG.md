@@ -15,6 +15,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP TCP/TLS input now shares a process-wide memory budget for read buffers
+  and pending frames, bounding aggregate ingress memory under many connections.
 - Native TCP/TLS input now shares a process-wide memory budget for read buffers
   and pending frames, and dispatches complete frames without cloning them.
 - Local archive writes and restores now create unique temporary files with

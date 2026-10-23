@@ -14,14 +14,17 @@ use ryme_txn::{Transaction, TxnBackend, TxnManager};
 use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, LazyLock, Mutex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 
 const KV_TABLE: &str = "_kv";
 const RESP_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const RESP_READ_CHUNK_BYTES: usize = 16 * 1024;
+const RESP_INPUT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RESP_INPUT_BUDGET_UNIT_BYTES: usize = 16 * 1024;
 const RESP_MAX_COMMAND_ARGS: usize = 1024;
 const RESP_MAX_COLLECTION_BYTES: usize = 16 * 1024 * 1024;
 const RESP_LUA_MAX_NESTING: usize = 64;
@@ -37,6 +40,9 @@ const RESP_MAX_GLOBAL_PUBSUB_PATTERNS: usize = 1024;
 const RESP_MAX_CLUSTER_BRIDGES: usize = 10_000;
 const MAX_COMMAND_CONFLICT_RETRIES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+static RESP_INPUT_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(RESP_INPUT_BUDGET_BYTES / RESP_INPUT_BUDGET_UNIT_BYTES))
+});
 type CdcPending = Vec<(RecordKey, Operation, Option<Vec<u8>>, Option<Vec<u8>>)>;
 type PubSubKey = (String, Vec<u8>);
 type PubSubCounts = Arc<Mutex<std::collections::HashMap<PubSubKey, usize>>>;
@@ -1206,10 +1212,15 @@ where
         // turns a single read into a syscall storm, while an unbounded reply
         // buffer would let a client consume arbitrary memory.
         const WRITE_BATCH_BYTES: usize = 64 * 1024;
+        let mut input_permits: Vec<OwnedSemaphorePermit> = vec![RESP_INPUT_BUDGET
+            .clone()
+            .try_acquire_many_owned(1)
+            .map_err(|_| RymeError::Overload(String::from("input memory budget")))?];
         let (mut reader, mut writer) = tokio::io::split(socket);
         let mut service = self.clone();
-        let mut buffer = vec![0u8; 65536];
+        let mut buffer = vec![0u8; RESP_READ_CHUNK_BYTES];
         let mut pending: Vec<u8> = Vec::new();
+        let mut pending_reserved_units = 0usize;
         let mut multi: Option<Multi> = None;
         let mut client = service.fresh_client();
         let mut pubsub = service.pubsub.subscribe();
@@ -1263,6 +1274,26 @@ where
             if read == 0 {
                 return Ok(());
             }
+            let next_len = pending
+                .len()
+                .checked_add(read)
+                .ok_or_else(|| RymeError::Overload(String::from("request")))?;
+            if next_len > RESP_MAX_FRAME_BYTES + RESP_READ_CHUNK_BYTES {
+                return Err(RymeError::Overload(String::from("request")));
+            }
+            let required_units = next_len.div_ceil(RESP_INPUT_BUDGET_UNIT_BYTES);
+            let additional_units = required_units.saturating_sub(pending_reserved_units);
+            if additional_units > 0 {
+                let permit = RESP_INPUT_BUDGET
+                    .clone()
+                    .try_acquire_many_owned(additional_units as u32)
+                    .map_err(|_| RymeError::Overload(String::from("input memory budget")))?;
+                input_permits.push(permit);
+            }
+            pending
+                .try_reserve_exact(read)
+                .map_err(|_| RymeError::Overload(String::from("request memory")))?;
+            pending_reserved_units = required_units;
             pending.extend_from_slice(&buffer[..read]);
             let mut consumed = 0usize;
             let mut replies = Vec::with_capacity(WRITE_BATCH_BYTES);

@@ -17,9 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub const MAX_FRAME: usize = 4 * 1024 * 1024 + 1024;
 pub const VERSION: &str = "ryme-native/1";
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
-const NATIVE_READ_CHUNK_BYTES: usize = 64 * 1024;
+const NATIVE_READ_CHUNK_BYTES: usize = 16 * 1024;
 const NATIVE_INPUT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-const NATIVE_INPUT_BUDGET_UNIT_BYTES: usize = 64 * 1024;
+const NATIVE_INPUT_BUDGET_UNIT_BYTES: usize = 16 * 1024;
 static NATIVE_INPUT_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     Arc::new(Semaphore::new(NATIVE_INPUT_BUDGET_BYTES / NATIVE_INPUT_BUDGET_UNIT_BYTES))
 });
