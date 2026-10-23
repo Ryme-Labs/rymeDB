@@ -66,6 +66,8 @@ All notable changes to rymeDB are recorded here. Format follows
   retaining unused parameter names and values.
 - PostgreSQL startup packets now require the final zero-byte parameter
   terminator and reject trailing bytes.
+- PostgreSQL password messages now reject missing terminators, embedded NULs,
+  and trailing bytes instead of authenticating a password prefix.
 - RESP array commands split at TCP read boundaries now remain buffered instead
   of being rejected as malformed.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment

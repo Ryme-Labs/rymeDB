@@ -996,9 +996,8 @@ where
         return Err(error);
     }
     let password = payload
-        .split(|byte| *byte == 0)
-        .next()
-        .filter(|value| !value.is_empty())
+        .strip_suffix(&[0])
+        .filter(|value| !value.is_empty() && !value.contains(&0))
         .ok_or(RymeError::Unauthorized)
         .and_then(|value| String::from_utf8(value.to_vec()).map_err(|_| RymeError::Unauthorized));
     let password = match password {
