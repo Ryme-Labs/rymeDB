@@ -3144,7 +3144,7 @@ impl Node {
                 Ok(Rpc::RangeReadBatchResponse { values })
             }
             Rpc::AppendRequest { term, leader, prev_index, prev_term, entries, leader_commit } => {
-                let (result, applied_now) = {
+                let (result, applied_now, log_storage_failed) = {
                     let mut inner = self.inner.lock().await;
                     if term < inner.term || term == 0 || !inner.is_member(leader) {
                         let term = inner.term;
@@ -3154,6 +3154,7 @@ impl Node {
                                 ok: false,
                                 match_index: inner.last_index(),
                             },
+                            false,
                             false,
                         )
                     } else {
@@ -3177,6 +3178,8 @@ impl Node {
                         if term_changed || outcome.is_ok() {
                             inner.persist_meta()?;
                         }
+                        let log_storage_failed =
+                            outcome.as_ref().is_err_and(is_raft_log_storage_failure);
                         match outcome {
                             Ok(matched) => (
                                 Rpc::AppendResponse {
@@ -3185,6 +3188,7 @@ impl Node {
                                     match_index: matched,
                                 },
                                 true,
+                                false,
                             ),
                             Err(_) => {
                                 let term = inner.term;
@@ -3195,11 +3199,15 @@ impl Node {
                                         match_index: inner.last_index(),
                                     },
                                     false,
+                                    log_storage_failed,
                                 )
                             }
                         }
                     }
                 };
+                if log_storage_failed {
+                    self.set_isolated(true);
+                }
                 if applied_now {
                     self.apply_ready().await?;
                 }
@@ -5476,9 +5484,19 @@ impl Node {
         }
         let index = {
             let mut inner = self.inner.lock().await;
-            let index = inner.last_index() + 1;
+            let index = inner
+                .last_index()
+                .checked_add(1)
+                .ok_or_else(|| RymeError::Corrupt(String::from("raft log index overflow")))?;
             let entry = LogEntry { index, term: inner.term, payload };
-            inner.persist_entries(std::slice::from_ref(&entry))?;
+            if let Err(error) = inner.persist_entries(std::slice::from_ref(&entry)) {
+                let isolate = is_raft_log_storage_failure(&error);
+                drop(inner);
+                if isolate {
+                    self.set_isolated(true);
+                }
+                return Err(error);
+            }
             inner.log.push(entry);
             inner.acks.insert(self.id, index);
             index
@@ -6728,6 +6746,14 @@ impl ryme_txn::TxnBackend for ClusterBackend {
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn is_raft_log_storage_failure(error: &RymeError) -> bool {
+    match error {
+        RymeError::Io(_) | RymeError::Corrupt(_) => true,
+        RymeError::Unavailable(message) => message.starts_with("wal is in a failed state"),
+        _ => false,
+    }
 }
 
 fn append_to_log(
