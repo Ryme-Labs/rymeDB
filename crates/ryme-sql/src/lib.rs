@@ -8897,10 +8897,13 @@ where
         self.read_only = read_only;
     }
 
-    pub fn set_schema_path(&mut self, path: PathBuf) {
-        if let Ok(mut stored) = self.schema_path.lock() {
-            *stored = Some(path);
-        }
+    /// Sets the durable schema snapshot path.
+    pub fn set_schema_path(&mut self, path: PathBuf) -> Result<()> {
+        *self
+            .schema_path
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("schema path lock")))? = Some(path);
+        Ok(())
     }
 
     /// Fallible schema snapshot used by persistence and transaction paths.
@@ -19276,7 +19279,7 @@ mod tests {
         let manager = TxnManager::new();
         let mut executor =
             Executor::with_manager(String::from("t"), String::from("d"), manager.clone());
-        executor.set_schema_path(path.clone());
+        executor.set_schema_path(path.clone()).unwrap();
         executor
             .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT)").unwrap())
             .await
@@ -19366,7 +19369,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut executor = Executor::new(String::from("t"), String::from("d"));
-        executor.set_schema_path(dir.clone());
+        executor.set_schema_path(dir.clone()).unwrap();
         assert!(executor
             .execute(parse("CREATE TABLE should_rollback (id TEXT PRIMARY KEY)").unwrap())
             .await
@@ -19388,7 +19391,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut executor = Executor::new(String::from("t"), String::from("d"));
-        executor.set_schema_path(dir.clone());
+        executor.set_schema_path(dir.clone()).unwrap();
         let mut txn = executor.begin_transaction(Isolation::Serializable);
         let before = executor.schema_transaction_snapshot();
         let (_, changes) = executor
@@ -19457,7 +19460,7 @@ mod tests {
         let manager = TxnManager::new();
         let mut executor =
             Executor::with_manager(String::from("tenant-a"), String::from("d"), manager.clone());
-        executor.set_schema_path(path.clone());
+        executor.set_schema_path(path.clone()).unwrap();
         executor
             .execute(parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT)").unwrap())
             .await
@@ -19505,7 +19508,7 @@ mod tests {
 
         let mut restarted =
             Executor::with_manager(String::from("tenant-a"), String::from("d"), manager);
-        restarted.set_schema_path(path.clone());
+        restarted.set_schema_path(path.clone()).unwrap();
         restarted.restore_schema_snapshot(snapshot).unwrap();
         let user = restarted.clone().with_role(String::from("authenticated"));
         let visible = user.execute(parse("SELECT * FROM messages").unwrap()).await.unwrap();
@@ -21699,7 +21702,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let mut executor = Executor::new(String::from("t"), String::from("d"));
-        executor.set_schema_path(path.clone());
+        executor.set_schema_path(path.clone()).unwrap();
 
         executor
             .bulk_upsert(String::from("events"), vec![(b"e1".to_vec(), b"ok".to_vec())])

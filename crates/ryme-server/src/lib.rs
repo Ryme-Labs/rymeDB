@@ -2418,7 +2418,7 @@ impl SharedState {
             executor = executor.with_schema_hook(hook);
         }
         executor.restore_schema_snapshot(schema_snapshot)?;
-        executor.set_schema_path(schema_path);
+        executor.set_schema_path(schema_path)?;
         executor.set_rls_tables(config.rls_tables.clone());
         executor.set_read_only(config.read_only);
         let branch_path = config.data_dir.join("branches.json");
@@ -4849,7 +4849,7 @@ fn branch_executor_from_snapshot(
         executor.with_isolated_schema(manager).with_branch(branch.to_string());
     let snapshot = load_existing_schema_snapshot(&schema_path)?;
     branch_executor.restore_schema_snapshot(snapshot)?;
-    branch_executor.set_schema_path(schema_path);
+    branch_executor.set_schema_path(schema_path)?;
     Ok(branch_executor)
 }
 
