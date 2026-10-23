@@ -8477,7 +8477,32 @@ where
                 .lock()
                 .map_err(|_| RymeError::Internal(String::from("privilege lock")))?;
             privileges.retain(|grant| !grant.grantee.eq_ignore_ascii_case(name));
+            drop(privileges);
+            let mut defaults = self
+                .default_privileges
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("default privilege lock")))?;
+            defaults.retain(|grant| {
+                !grant.grantee.eq_ignore_ascii_case(name)
+                    && !grant.owner.as_deref().is_some_and(|owner| owner.eq_ignore_ascii_case(name))
+            });
             self.schema_dirty.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn validate_grantees(&self, grantees: &[String]) -> Result<()> {
+        let roles = self
+            .roles
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        for grantee in grantees {
+            if grantee.eq_ignore_ascii_case("PUBLIC") || is_builtin_sql_role(grantee) {
+                continue;
+            }
+            if !roles.keys().any(|role| role.eq_ignore_ascii_case(grantee)) {
+                return Err(RymeError::NotFound(format!("role {grantee}")));
+            }
         }
         Ok(())
     }
@@ -8491,6 +8516,7 @@ where
         grantees: Vec<String>,
         grant_option: bool,
     ) -> Result<()> {
+        self.validate_grantees(&grantees)?;
         let mut stored = self
             .privileges
             .lock()
@@ -8541,6 +8567,7 @@ where
         grantees: Vec<String>,
         grant_option: bool,
     ) -> Result<()> {
+        self.validate_grantees(&grantees)?;
         let mut stored = self
             .default_privileges
             .lock()

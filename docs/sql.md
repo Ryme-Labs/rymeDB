@@ -72,6 +72,10 @@ Schema metadata is persisted under `data_dir/schema.json` and rebuilt on
 startup. Use the migration ledger rather than relying on an application-side
 “already ran” flag:
 
+`GRANT` and `ALTER DEFAULT PRIVILEGES` require each named grantee to exist.
+Dropping a role removes its direct and default privilege grants; recreating a
+role with the same name does not restore its previous access.
+
 ```bash
 rymedb-cli migrate apply 2026-01-create-messages \
   'CREATE TABLE messages (id TEXT PRIMARY KEY, body TEXT NOT NULL)' \

@@ -4,6 +4,13 @@ All notable changes to rymeDB are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- SQL grants reject missing roles, and dropping a role clears its direct and
+  default privileges so recreating the role cannot restore stale access.
+
 ## [2.0.3] — 2026-10-23
 
 ### Fixed
