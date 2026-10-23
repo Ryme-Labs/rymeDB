@@ -3154,6 +3154,7 @@ impl Node {
                         inner.leader_contact_ms = now_ms();
                         let outcome = append_to_log(
                             &mut inner,
+                            term,
                             prev_index,
                             prev_term,
                             entries,
@@ -6721,35 +6722,56 @@ fn recent_leader(contact_ms: u64) -> bool {
 
 fn append_to_log(
     inner: &mut tokio::sync::MutexGuard<'_, Inner>,
+    leader_term: u64,
     prev_index: u64,
     prev_term: u64,
     entries: Vec<LogEntry>,
     leader_commit: u64,
 ) -> Result<u64> {
+    if leader_term == 0 {
+        return Err(RymeError::InvalidArgument(String::from("raft append term")));
+    }
+    if prev_index == 0 && prev_term != 0 {
+        return Err(RymeError::Unavailable(String::from("invalid log prefix")));
+    }
     if prev_index > 0 {
-        let Some(existing) = inner.log.iter().find(|e| e.index == prev_index) else {
+        let Ok(position) = inner.log.binary_search_by_key(&prev_index, |entry| entry.index) else {
             return Err(RymeError::Unavailable(String::from("missing prefix")));
         };
+        let existing = &inner.log[position];
         if existing.term != prev_term {
             return Err(RymeError::Unavailable(String::from("conflict")));
         }
     }
-    let mut expected = prev_index.saturating_add(1);
+    let mut expected = prev_index;
+    let mut conflict = None;
     for entry in &entries {
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Unavailable(String::from("log index overflow")))?;
         if entry.index != expected {
             return Err(RymeError::Unavailable(String::from("log gap")));
         }
-        expected = expected.saturating_add(1);
+        if entry.term == 0 || entry.term > leader_term {
+            return Err(RymeError::InvalidArgument(String::from("raft append term")));
+        }
+        validate_apply_payload(&entry.payload)
+            .map_err(|_| RymeError::InvalidArgument(String::from("raft append payload")))?;
+        if let Ok(position) =
+            inner.log.binary_search_by_key(&entry.index, |existing| existing.index)
+        {
+            let existing = &inner.log[position];
+            if existing.term == entry.term {
+                if existing.payload != entry.payload {
+                    return Err(RymeError::InvalidArgument(String::from(
+                        "conflicting raft entry for term and index",
+                    )));
+                }
+            } else if conflict.is_none() {
+                conflict = Some(entry.index);
+            }
+        }
     }
-
-    let conflict = entries.iter().find_map(|incoming| {
-        inner
-            .log
-            .iter()
-            .find(|existing| existing.index == incoming.index)
-            .filter(|existing| existing.term != incoming.term)
-            .map(|_| incoming.index)
-    });
     if let Some(conflict) = conflict {
         let keep_through = conflict - 1;
         let replacement: Vec<LogEntry> =
@@ -6988,7 +7010,7 @@ mod tests {
             inner.commit_index = 1;
             inner.term = 2;
             inner.persist_meta().unwrap();
-            append_to_log(&mut inner, 1, 1, vec![replacement.clone()], 1).unwrap();
+            append_to_log(&mut inner, 2, 1, 1, vec![replacement.clone()], 1).unwrap();
             assert_eq!(inner.log[1].payload, replacement.payload);
         }
         let records = ryme_wal::Wal::read_all(&dir).unwrap();

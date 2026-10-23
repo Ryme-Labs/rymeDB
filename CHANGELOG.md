@@ -39,6 +39,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and metadata whose applied or committed indexes exceed the recovered log.
 - Core Raft recovery now rejects conflicting duplicate entries, log gaps, and
   commit indexes beyond the recovered WAL while retaining exact duplicate frames.
+- Raft followers now validate replicated entries before WAL writes and reject
+  same-term index conflicts and overflowing append indexes.
 
 ### Performance
 
