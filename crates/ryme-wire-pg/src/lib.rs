@@ -1850,7 +1850,7 @@ where
                 socket.write_all(&response).await.map_err(|e| RymeError::Io(e.to_string()))?;
             }
             b'E' => {
-                let Some(portal) = parse_execute(&payload) else {
+                let Some((portal, max_rows)) = parse_execute(&payload) else {
                     ignore_until_sync = true;
                     if let Some(transaction) = active_transaction.as_mut() {
                         transaction.failed = true;
@@ -1864,6 +1864,20 @@ where
                         .map_err(|e| RymeError::Io(e.to_string()))?;
                     continue;
                 };
+                if max_rows > 0 {
+                    ignore_until_sync = true;
+                    if let Some(transaction) = active_transaction.as_mut() {
+                        transaction.failed = true;
+                    }
+                    socket
+                        .write_all(&encode_error_code(
+                            "0A000",
+                            String::from("bounded portal execution is unsupported"),
+                        ))
+                        .await
+                        .map_err(|e| RymeError::Io(e.to_string()))?;
+                    continue;
+                }
                 begin_backend_query(&cancellation);
                 let was_listening_empty = listening.is_empty();
                 let mut committed_notifications = Vec::new();
@@ -4956,11 +4970,11 @@ fn parse_describe(payload: &[u8]) -> Option<(u8, String)> {
     (offset == payload.len()).then_some((kind, name))
 }
 
-fn parse_execute(payload: &[u8]) -> Option<String> {
+fn parse_execute(payload: &[u8]) -> Option<(String, i32)> {
     let mut offset = 0;
     let portal = read_cstring(payload, &mut offset)?;
     let max_rows = read_i32(payload, &mut offset)?;
-    (max_rows >= 0 && offset == payload.len()).then_some(portal)
+    (max_rows >= 0 && offset == payload.len()).then_some((portal, max_rows))
 }
 
 fn parse_close(payload: &[u8]) -> Option<(u8, String)> {
