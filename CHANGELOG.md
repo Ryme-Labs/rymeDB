@@ -16,6 +16,11 @@ All notable changes to rymeDB are recorded here. Format follows
 - SQL supports changing an existing role's inheritance behavior with
   `ALTER ROLE ... INHERIT` and `ALTER ROLE ... NOINHERIT`.
 
+### Performance
+
+- Realtime WebSocket fanout shares the cached serialized broadcast bytes across
+  subscribers instead of copying the payload for each delivery.
+
 ### Fixed
 
 - TLS certificate, key, and CA inputs are capped at 4 MiB each, including

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use ryme_error::{Result, RymeError};
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
@@ -225,7 +226,7 @@ pub struct BroadcastMsg {
     pub commit_ts: u64,
     pub sequence: u64,
     #[serde(skip)]
-    json_cache: Arc<OnceLock<String>>,
+    json_cache: Arc<OnceLock<Bytes>>,
     #[serde(skip)]
     encoded_frames: EncodedFrameCache,
     #[serde(skip)]
@@ -233,20 +234,24 @@ pub struct BroadcastMsg {
 }
 
 impl BroadcastMsg {
-    /// Serialize the stable broadcast envelope once and reuse it for every
-    /// websocket subscriber. Each websocket still receives its own owned
-    /// frame, but subscriber fanout no longer repeats JSON traversal and
-    /// encoding for the same payload.
-    pub fn json_text(&self) -> String {
+    /// Serialize the stable broadcast envelope once and share its immutable
+    /// bytes across websocket subscribers without copying the payload per
+    /// delivery.
+    pub fn json_bytes_shared(&self) -> Bytes {
         self.json_cache
-            .get_or_init(|| serde_json::to_string(self).unwrap_or_else(|_| String::from("{}")))
+            .get_or_init(|| {
+                Bytes::from(serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec()))
+            })
             .clone()
     }
 
+    /// Return an owned copy for callers that need a `String`.
+    pub fn json_text(&self) -> String {
+        String::from_utf8(self.json_bytes_shared().to_vec()).unwrap_or_else(|_| String::from("{}"))
+    }
+
     pub fn json_len(&self) -> usize {
-        self.json_cache
-            .get_or_init(|| serde_json::to_string(self).unwrap_or_else(|_| String::from("{}")))
-            .len()
+        self.json_bytes_shared().len()
     }
 
     fn checked_json_len(&self) -> Result<usize> {

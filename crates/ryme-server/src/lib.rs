@@ -9803,15 +9803,19 @@ async fn forward_broadcast(
             message = receiver.recv() => {
                 match message {
                     Ok(record) => {
-                        let text = record.json_text();
+                        let bytes = record.json_bytes_shared();
                         if !record.fanout_quota_pre_admitted()
-                            && !stream_realtime_event(&qos, tenant, text.len() as u64)
+                            && !stream_realtime_event(&qos, tenant, bytes.len() as u64)
                         {
                             break;
                         }
+                        let text = match axum::extract::ws::Utf8Bytes::try_from(bytes) {
+                            Ok(text) => text,
+                            Err(_) => break,
+                        };
                         if !queue_realtime_message_wait(
                             &outgoing,
-                            axum::extract::ws::Message::Text(text.into()),
+                            axum::extract::ws::Message::Text(text),
                         ).await {
                             break;
                         }
