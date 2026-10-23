@@ -8492,10 +8492,8 @@ where
     }
 
     fn validate_grantees(&self, grantees: &[String]) -> Result<()> {
-        let roles = self
-            .roles
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("role lock")))?;
+        let roles =
+            self.roles.lock().map_err(|_| RymeError::Internal(String::from("role lock")))?;
         for grantee in grantees {
             if grantee.eq_ignore_ascii_case("PUBLIC") || is_builtin_sql_role(grantee) {
                 continue;
