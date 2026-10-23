@@ -4848,6 +4848,17 @@ impl Node {
                 let existing = self
                     .try_range_entry(group_id, index)?
                     .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
+                if existing.term == term
+                    && existing.commit_ts == commit_ts
+                    && existing.writes == encoded_writes
+                    && existing.publish_data == publish_data
+                    && existing.kind == kind
+                {
+                    if leader_commit > 0 {
+                        self.apply_range_committed(group_id, leader_commit.min(last))?;
+                    }
+                    return Ok(last);
+                }
                 if existing.term != term
                     || existing.commit_ts != commit_ts
                     || existing.writes != encoded_writes
