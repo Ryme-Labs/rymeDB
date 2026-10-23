@@ -26,6 +26,7 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Config file loading now rejects non-regular files and caps reads at 4 MiB.
 - Routing-key capacity calculations now check overflow and report allocation
   failure instead of relying on infallible vector allocation.
 - Storage segment encoding now enforces the 256 MiB persisted-segment limit

@@ -2,8 +2,12 @@ use ryme_error::{Result, RymeError};
 pub use ryme_storage::StorageMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+
+const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
@@ -346,7 +350,21 @@ impl Config {
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(RymeError::InvalidArgument(String::from("config file")));
+        }
+        if metadata.len() > MAX_CONFIG_FILE_BYTES {
+            return Err(RymeError::Overload(String::from("config file")));
+        }
+        let mut raw = String::new();
+        raw.try_reserve_exact(metadata.len() as usize)
+            .map_err(|_| RymeError::Overload(String::from("config file")))?;
+        file.take(MAX_CONFIG_FILE_BYTES + 1).read_to_string(&mut raw)?;
+        if raw.len() as u64 > MAX_CONFIG_FILE_BYTES {
+            return Err(RymeError::Overload(String::from("config file")));
+        }
         serde_json::from_str(&raw).map_err(|e| RymeError::InvalidArgument(e.to_string()))
     }
 }

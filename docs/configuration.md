@@ -2,7 +2,8 @@
 
 `ryme-server` starts with `Config::default()` or reads a JSON file passed with
 `--config`. CLI flags override the file. Unknown JSON fields are rejected so a
-misspelled production setting cannot silently do nothing.
+misspelled production setting cannot silently do nothing. Config files are
+limited to 4 MiB while being read.
 
 ## Minimal file
 
