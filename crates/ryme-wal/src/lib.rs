@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ryme_error::{Result, RymeError};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -725,7 +725,7 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
         .unwrap_or(Ok(0))
 }
 
-fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Result<Vec<u8>> {
+fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Result<Bytes> {
     validate_payload_len(payload.len())?;
     let mut buf = BytesMut::with_capacity(WAL_FRAME_OVERHEAD_BYTES + payload.len());
     buf.put_u32(WAL_MAGIC);
@@ -737,7 +737,7 @@ fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Result<Vec<u8>> {
     buf.put_slice(payload);
     let crc = crc32fast::hash(&buf);
     buf.put_u32(crc);
-    Ok(buf.freeze().to_vec())
+    Ok(buf.freeze())
 }
 
 fn validate_payload_len(payload_len: usize) -> Result<()> {

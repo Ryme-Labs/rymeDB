@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- WAL frame encoding now freezes its `BytesMut` buffer directly instead of
+  copying the encoded frame into a second allocation.
 - Realtime and Supabase-compatible WebSocket broadcast fanout share cached
   serialized bytes across subscribers instead of copying each frame per
   delivery.
