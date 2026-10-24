@@ -1,0 +1,60 @@
+{
+  "experiment": "sql-index-assisted-read-batch-size",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_sql_executor",
+  "storage_mode": "hot",
+  "durability": "in_memory_only",
+  "baseline_revision": "f0c813b",
+  "candidate": "INDEX_READ_BATCH_SIZE=512 (baseline is 256)",
+  "common_parameters": {
+    "concurrency": 1,
+    "value_bytes": 128,
+    "topology": "single in-process executor",
+    "query": "tenant = tenant-0001 AND state = active AND seq >= 0; tenant and state indexes",
+    "seed_pattern": "tenant matches 1/8 rows; state matches 1/3 rows"
+  },
+  "rows_20000": {
+    "ops_per_capture": 300,
+    "result_rows": 834,
+    "baseline_256": [
+      { "p50_ns": 2838800, "p95_ns": 3061000, "p99_ns": 3192900, "qps": 350 },
+      { "p50_ns": 2848700, "p95_ns": 3265600, "p99_ns": 4652000, "qps": 340 },
+      { "p50_ns": 2830600, "p95_ns": 3120300, "p99_ns": 3453400, "qps": 348 },
+      { "p50_ns": 2850400, "p95_ns": 3075600, "p99_ns": 3264400, "qps": 347 },
+      { "p50_ns": 2856900, "p95_ns": 3179500, "p99_ns": 3594800, "qps": 343 }
+    ],
+    "candidate_512": [
+      { "p50_ns": 2834600, "p95_ns": 3112200, "p99_ns": 3423000, "qps": 349 },
+      { "p50_ns": 2827200, "p95_ns": 3175500, "p99_ns": 3542000, "qps": 348 },
+      { "p50_ns": 2835000, "p95_ns": 3348700, "p99_ns": 3863900, "qps": 344 },
+      { "p50_ns": 2829600, "p95_ns": 3156600, "p99_ns": 4196100, "qps": 347 },
+      { "p50_ns": 2800500, "p95_ns": 3081600, "p99_ns": 4374400, "qps": 351 }
+    ],
+    "median_p50_change_percent": -0.7,
+    "median_qps_change_percent": 0.3
+  },
+  "rows_50000": {
+    "ops_per_capture": 200,
+    "result_rows": 2084,
+    "baseline_256": [
+      { "p50_ns": 7552600, "p95_ns": 9284100, "p99_ns": 13193600, "qps": 127 },
+      { "p50_ns": 7523500, "p95_ns": 7914600, "p99_ns": 8147300, "qps": 132 },
+      { "p50_ns": 7556000, "p95_ns": 8013500, "p99_ns": 8217700, "qps": 131 }
+    ],
+    "candidate_512": [
+      { "p50_ns": 7502800, "p95_ns": 7897500, "p99_ns": 8119800, "qps": 133 },
+      { "p50_ns": 7537500, "p95_ns": 7962000, "p99_ns": 8236200, "qps": 132 },
+      { "p50_ns": 7622800, "p95_ns": 8160000, "p99_ns": 8765200, "qps": 130 }
+    ],
+    "median_p50_change_percent": -0.2,
+    "median_qps_change_percent": 0.8
+  },
+  "decision": "Discarded. Doubling the indexed-row fetch chunk to 512 produced no consistent latency or throughput improvement in either result-set size. Keep 256.",
+  "notes": "Five alternating pairs at 20,000 seeded rows and three at 50,000 rows. Percentiles are local in-process measurements, not PostgreSQL-wire/network latency. Tail variation was substantial and no tail improvement is claimed."
+}

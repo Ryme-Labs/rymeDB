@@ -113,6 +113,13 @@ throughput. This isolates executor/storage work for one fixed query shape; it
 does not measure SQL parsing, concurrent clients, WAL durability, network
 overhead, or establish a cross-database performance claim.
 
+The SQL indexed-row fetch chunk remains 256. A 512-row candidate halved fetch
+calls for the measured indexed query, but alternating release runs with 20,000
+rows/834 results showed median p50 only 0.7% lower and median throughput 0.3%
+higher. With 50,000 rows/2,084 results, median p50 was 0.2% lower and
+throughput 0.8% higher. These differences do not establish a reliable gain, so
+the 256-row chunk remains. See the [raw captures](../bench/results/sql-indexed-read-batch-size-20261024.json).
+
 Use `--composite-key-projection` to benchmark a composite-primary-key table
 while projecting only a non-key column. SQL projection decodes the composite
 key only when a selected column needs one of its components. Five alternating
