@@ -44,6 +44,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Snapshot, segment, and WAL rewrites now replace existing files on Windows;
+  WAL publication closes the active segment before installing the staged
+  generation. This allows repeated snapshots and PITR restore publication.
 - Archive creation now rejects an existing `(commit_ts, backup_id)` instead of
   overwriting data referenced by a published manifest, and removes partial
   objects when an archive fails before manifest publication. Automatic

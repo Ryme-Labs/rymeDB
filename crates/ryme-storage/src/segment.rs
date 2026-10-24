@@ -48,13 +48,7 @@ fn write_temp_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<P
             Err(error) => return Err(error.into()),
         }
     };
-    let result = file.write_all(bytes).and_then(|()| {
-        if sync {
-            file.sync_data()
-        } else {
-            Ok(())
-        }
-    });
+    let result = file.write_all(bytes).and_then(|()| if sync { file.sync_data() } else { Ok(()) });
     drop(file);
     if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
@@ -64,7 +58,7 @@ fn write_temp_file(dir: &Path, name: &str, bytes: &[u8], sync: bool) -> Result<P
 }
 
 fn install_temp_file(temporary: &Path, destination: &Path) -> Result<()> {
-    if let Err(error) = std::fs::rename(temporary, destination) {
+    if let Err(error) = ryme_error::replace_file_atomically(temporary, destination) {
         let _ = std::fs::remove_file(temporary);
         return Err(error.into());
     }

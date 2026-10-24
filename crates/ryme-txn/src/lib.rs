@@ -135,12 +135,16 @@ fn write_snapshot_temp(dir: &Path, name: &str, contents: &[u8]) -> Result<std::p
     Ok(temporary)
 }
 
+fn replace_snapshot_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    ryme_error::replace_file_atomically(source, destination)
+}
+
 fn publish_snapshot_pointer(dir: &Path, name: &str) -> Result<()> {
     if snapshot_commit(name).is_none() {
         return Err(RymeError::Internal(String::from("snapshot name")));
     }
     let temporary = write_snapshot_temp(dir, "latest", name.as_bytes())?;
-    if let Err(error) = std::fs::rename(&temporary, dir.join("latest")) {
+    if let Err(error) = replace_snapshot_file(&temporary, &dir.join("latest")) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
@@ -154,7 +158,7 @@ fn write_snapshot_file(dir: &Path, commit_ts: u64, raw: &[u8]) -> Result<std::pa
     let name = snapshot_file_name(commit_ts);
     let path = dir.join(&name);
     let temporary = write_snapshot_temp(dir, &name, raw)?;
-    if let Err(error) = std::fs::rename(&temporary, &path) {
+    if let Err(error) = replace_snapshot_file(&temporary, &path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
@@ -5440,6 +5444,28 @@ mod tests {
         assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"1".to_vec()));
         assert_eq!(reopened.get(&mut probe, &after).unwrap(), Some(b"2".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_publication_replaces_existing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-snapshot-replace-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = write_snapshot_file(&dir, 7, b"first").unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        publish_snapshot_pointer(&dir, name).unwrap();
+        let rewritten = write_snapshot_file(&dir, 7, b"second").unwrap();
+        let rewritten_name = rewritten.file_name().unwrap().to_str().unwrap();
+        publish_snapshot_pointer(&dir, rewritten_name).unwrap();
+
+        assert_eq!(std::fs::read(&rewritten).unwrap(), b"second");
+        assert_eq!(std::fs::read(dir.join("latest")).unwrap(), rewritten_name.as_bytes());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

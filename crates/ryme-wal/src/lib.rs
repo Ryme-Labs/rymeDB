@@ -13,6 +13,11 @@ fn configure_private_file(options: &mut OpenOptions) {
     }
     #[cfg(not(unix))]
     let _ = options;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+    }
 }
 
 #[cfg(unix)]
@@ -296,6 +301,11 @@ impl Wal {
         // stop appends through the old handle if installation fails.
         self.poisoned = true;
         create_rewrite_marker(&self.dir)?;
+        // Close the active segment before replacement; Windows does not allow
+        // renaming a file while a handle opened without delete sharing remains.
+        let replacement_handle = open_null_device()?;
+        let previous_handle = std::mem::replace(&mut self.active, replacement_handle);
+        drop(previous_handle);
         install_rewrite(&self.dir)?;
         self.active_id = latest_segment_id(&self.dir)?;
         let active_path = self.dir.join(segment_name(self.active_id));
@@ -352,6 +362,9 @@ impl Wal {
         // live writer append through the old handle if any rewrite step fails.
         self.poisoned = true;
         create_rewrite_marker(&self.dir)?;
+        let replacement_handle = open_null_device()?;
+        let previous_handle = std::mem::replace(&mut self.active, replacement_handle);
+        drop(previous_handle);
         install_rewrite(&self.dir)?;
 
         self.active_id = latest_segment_id(&self.dir)?;
@@ -463,9 +476,23 @@ fn install_rewrite(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn open_null_device() -> Result<File> {
+    #[cfg(windows)]
+    let path = "NUL";
+    #[cfg(not(windows))]
+    let path = "/dev/null";
+    Ok(File::open(path)?)
 }
 
 fn write_frame_with_rollback<F>(
@@ -619,7 +646,7 @@ fn open_segment_append(path: &Path, create: bool) -> Result<File> {
         Ok(_) => Err(RymeError::Corrupt(String::from("wal segment file"))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
             let mut options = OpenOptions::new();
-            options.create_new(true).read(true).append(true);
+            options.create_new(true).read(true).write(true).append(true);
             configure_private_file(&mut options);
             Ok(options.open(path)?)
         }
@@ -629,7 +656,7 @@ fn open_segment_append(path: &Path, create: bool) -> Result<File> {
 
 fn create_segment_append(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
-    options.create_new(true).read(true).append(true);
+    options.create_new(true).read(true).write(true).append(true);
     configure_private_file(&mut options);
     Ok(options.open(path)?)
 }
@@ -662,15 +689,7 @@ fn install_rewrite_segment(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
-    match std::fs::remove_file(&destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-    }
-    if let Err(error) = std::fs::rename(&temporary, &destination) {
+    if let Err(error) = ryme_error::replace_file_atomically(&temporary, &destination) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
@@ -711,8 +730,12 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
                 }
                 None if id == active_id && Some(id) == latest_id => {
                     let valid_len = raw.len() - cursor.len();
-                    active.set_len(valid_len as u64)?;
-                    active.sync_data()?;
+                    let path = dir.join(segment_name(id));
+                    let path_metadata = std::fs::symlink_metadata(&path)?;
+                    let truncation_file = ryme_error::open_write_no_follow(&path)?;
+                    verify_opened_segment(&path_metadata, &truncation_file)?;
+                    truncation_file.set_len(valid_len as u64)?;
+                    truncation_file.sync_data()?;
                     break;
                 }
                 None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
@@ -896,7 +919,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut raw = encode_frame(2, 2, b"later").unwrap();
+        let mut raw = encode_frame(2, 2, b"later").unwrap().to_vec();
         raw.extend_from_slice(&encode_frame(1, 1, b"earlier").unwrap());
         std::fs::write(dir.join(segment_name(0)), raw).unwrap();
 
