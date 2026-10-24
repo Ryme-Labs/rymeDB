@@ -713,10 +713,14 @@ impl ShardSet {
             range.shard = assignments[&range.id];
         }
 
+        let topology_recovered_from_assignments = !ranges.is_empty()
+            && inner.ranges.is_empty()
+            && !old_assignments.is_empty()
+            && ranges.iter().all(|range| old_assignments.contains_key(&range.id));
         // Keep source histories after ownership moves. A purge writes a newer
         // tombstone, which could hide the imported value if a later topology
         // moves the range back to this shard.
-        Self::rebalance_ranges_locked(&inner, &ranges)?;
+        Self::rebalance_ranges_locked(&inner, &ranges, topology_recovered_from_assignments)?;
         let previous_ranges = inner.ranges.clone();
         let previous_assignments = inner.range_assignments.clone();
         inner.ranges = ranges;
@@ -733,11 +737,16 @@ impl ShardSet {
         Ok(())
     }
 
-    fn rebalance_ranges_locked(inner: &ShardInner, ranges: &[RangePlacement]) -> Result<()> {
+    fn rebalance_ranges_locked(
+        inner: &ShardInner,
+        ranges: &[RangePlacement],
+        topology_recovered_from_assignments: bool,
+    ) -> Result<()> {
         let mut tables = std::collections::BTreeSet::new();
         for shard in &inner.shards {
             tables.extend(shard.spaces()?);
         }
+        let old_ranges = if topology_recovered_from_assignments { ranges } else { &inner.ranges };
         let mut moves: BTreeMap<(usize, usize, TableRef), ryme_storage::TableRows> =
             BTreeMap::new();
         for (tenant, database, table) in tables {
@@ -746,7 +755,7 @@ impl ShardSet {
                 for (pk, versions) in rows {
                     let key = RecordKey::new(&tenant, &database, &table, &pk);
                     let table_ref = TableRef::of(&key);
-                    let old_owner = route_record(&inner.ranges, &key)?.unwrap_or_else(|| {
+                    let old_owner = route_record(old_ranges, &key)?.unwrap_or_else(|| {
                         inner
                             .place
                             .get(&table_ref)
@@ -1813,13 +1822,17 @@ mod tests {
             backend.scan(&mut scan_txn, "t", "d", "users", 2).unwrap(),
             vec![(b"b".to_vec(), b"middle".to_vec()), (b"z".to_vec(), b"last".to_vec())]
         );
+        let mut update_txn = backend.begin();
+        backend.put(&mut update_txn, RecordKey::new("t", "d", "users", b"a"), b"updated".to_vec());
+        futures_executor_block_on(backend.commit(update_txn)).unwrap();
         let left = backend.shard_manager(0).unwrap();
         let right = backend.shard_manager(1).unwrap();
+        assert_eq!(right.purge_keys(&[RecordKey::new("t", "d", "users", b"a")]).unwrap(), 1);
         let mut left_txn = left.begin();
         let mut right_txn = right.begin();
         assert_eq!(
             left.get(&mut left_txn, &RecordKey::new("t", "d", "users", b"a")).unwrap(),
-            Some(b"one".to_vec())
+            Some(b"updated".to_vec())
         );
         assert_eq!(
             right.get(&mut right_txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
@@ -1846,6 +1859,15 @@ mod tests {
                 },
             ])
             .unwrap();
+        let mut restarted_txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut restarted_txn, &RecordKey::new("t", "d", "users", b"a")).unwrap(),
+            Some(b"updated".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut restarted_txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
+            Some(b"last".to_vec())
+        );
         let placements = backend.range_placements();
         assert_eq!(placements[0].shard, 0);
         assert_eq!(placements[1].shard, 1);
