@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- Authentication now rejects NUL bytes in user, principal, and tenant IDs,
+  keeping identities representable consistently across PostgreSQL and storage.
 - SQL row-level security now denies rows when an explicitly configured tenant
   column name is empty, matching configuration validation and failing closed.
 - CI and the scheduled dependency workflow now audit all pnpm dependencies,

@@ -26,7 +26,7 @@ pub struct Principal {
 
 impl Principal {
     pub fn validate(&self) -> Result<()> {
-        if self.id.is_empty() || self.id.len() > MAX_PRINCIPAL_ID_LEN {
+        if self.id.is_empty() || self.id.len() > MAX_PRINCIPAL_ID_LEN || self.id.contains('\0') {
             return Err(RymeError::InvalidArgument(String::from("principal id")));
         }
         validate_tenant(&self.tenant)
@@ -580,7 +580,7 @@ const MAX_TENANT_LEN: usize = 256;
 pub const MIN_HMAC_JWT_SECRET_BYTES: usize = 16;
 
 fn validate_tenant(tenant: &str) -> Result<()> {
-    if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN {
+    if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN || tenant.contains('\0') {
         return Err(RymeError::InvalidArgument(String::from("tenant")));
     }
     Ok(())
@@ -805,6 +805,7 @@ impl JwtVerifier {
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
             .filter(|value| value.len() <= MAX_PRINCIPAL_ID_LEN)
+            .filter(|value| !value.contains('\0'))
             .ok_or(RymeError::Unauthorized)?
             .to_string();
         let tenant = claims
@@ -814,7 +815,7 @@ impl JwtVerifier {
             .map(|value| value.as_str().ok_or(RymeError::Unauthorized))
             .transpose()?
             .unwrap_or("default");
-        if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN {
+        if tenant.is_empty() || tenant.len() > MAX_TENANT_LEN || tenant.contains('\0') {
             return Err(RymeError::Unauthorized);
         }
         let mut roles = claim_roles(&claims);
@@ -1112,6 +1113,10 @@ pub const MAX_USER_LEN: usize = 256;
 pub const MAX_CHALLENGES: usize = 4096;
 const MAX_USERS: usize = 100_000;
 
+fn valid_user_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_USER_LEN && !id.contains('\0')
+}
+
 fn dummy_password_hash() -> PasswordHash {
     PasswordHash {
         salt_b64: base64_url_encode(&[0u8; 16]),
@@ -1297,7 +1302,7 @@ impl PasskeyRegistry {
     }
 
     pub fn challenge_at(&mut self, user: &str, now_secs: u64) -> Result<String> {
-        if user.is_empty() || user.len() > MAX_USER_LEN {
+        if !valid_user_id(user) {
             return Err(RymeError::InvalidArgument(String::from("user")));
         }
         self.prune_expired_challenges(now_secs);
@@ -1329,7 +1334,7 @@ impl PasskeyRegistry {
 
     pub fn register(&mut self, user: &str, credential_id: String, public_key: &[u8]) -> Result<()> {
         use p256::elliptic_curve::sec1::FromSec1Point;
-        if user.is_empty() || user.len() > MAX_USER_LEN {
+        if !valid_user_id(user) {
             return Err(RymeError::InvalidArgument(String::from("user")));
         }
         if credential_id.is_empty() || credential_id.len() > MAX_PASSKEY_CREDENTIAL_ID_BYTES {
@@ -1373,8 +1378,7 @@ impl PasskeyRegistry {
         if credentials.iter().any(|(credential_id, credential)| {
             credential_id.is_empty()
                 || credential_id.len() > MAX_PASSKEY_CREDENTIAL_ID_BYTES
-                || credential.user.is_empty()
-                || credential.user.len() > MAX_USER_LEN
+                || !valid_user_id(&credential.user)
                 || credential.public_key.is_empty()
                 || credential.public_key.len() > 128
                 || p256::AffinePoint::from_sec1_bytes(&credential.public_key).is_err()
@@ -1401,8 +1405,7 @@ impl PasskeyRegistry {
         let credential_id: &str = credential_id;
         let rp_id: &str = rp_id;
         let now_secs: u64 = *now_secs;
-        if user.is_empty()
-            || user.len() > MAX_USER_LEN
+        if !valid_user_id(user)
             || credential_id.is_empty()
             || credential_id.len() > MAX_PASSKEY_CREDENTIAL_ID_BYTES
             || rp_id.is_empty()
@@ -1615,11 +1618,7 @@ impl CredentialStore {
         tenant: &str,
         password: &str,
     ) -> Result<()> {
-        if id.is_empty()
-            || id.len() > MAX_USER_LEN
-            || password.len() < 8
-            || password.len() > MAX_PASSWORD_LEN
-        {
+        if !valid_user_id(id) || password.len() < 8 || password.len() > MAX_PASSWORD_LEN {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
         validate_tenant(tenant)?;
@@ -1641,7 +1640,7 @@ impl CredentialStore {
         password_hash: PasswordHash,
         roles: HashSet<Role>,
     ) -> Result<()> {
-        if id.is_empty() || id.len() > MAX_USER_LEN {
+        if !valid_user_id(&id) {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
         validate_tenant(&tenant)?;
@@ -1668,7 +1667,7 @@ impl CredentialStore {
     }
 
     pub fn verify_password(&self, id: &str, password: &str) -> Result<Principal> {
-        if id.is_empty() || id.len() > MAX_USER_LEN || password.len() > MAX_PASSWORD_LEN {
+        if !valid_user_id(id) || password.len() > MAX_PASSWORD_LEN {
             return Err(RymeError::InvalidArgument(String::from("credentials")));
         }
         let snapshot = self.password_hash_snapshot(id);
@@ -1752,7 +1751,7 @@ impl CredentialStore {
         if users.len() > MAX_USERS {
             return Err(RymeError::Corrupt(String::from("user snapshot")));
         }
-        if users.keys().any(|id| id.is_empty() || id.len() > MAX_USER_LEN)
+        if users.keys().any(|id| !valid_user_id(id))
             || users.values().any(|user| {
                 validate_tenant(&user.tenant).is_err()
                     || user.password.as_ref().is_some_and(|hash| !valid_password_hash(hash))
@@ -1886,6 +1885,21 @@ mod tests {
             CredentialStore::from_snapshot(users),
             Err(RymeError::Corrupt(message)) if message == "user snapshot"
         ));
+
+        assert!(Principal {
+            id: String::from("u"),
+            tenant: String::from("tenant\0suffix"),
+            roles: HashSet::new(),
+        }
+        .validate()
+        .is_err());
+        assert!(Principal {
+            id: String::from("user\0suffix"),
+            tenant: String::from("tenant"),
+            roles: HashSet::new(),
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -2253,6 +2267,25 @@ mod tests {
         assert!(verifier
             .principal_from_token(
                 &token(serde_json::json!({ "sub": "u", "tenant": "", "exp": 2000000000u64 })),
+                1000,
+            )
+            .is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({
+                    "sub": "u",
+                    "tenant": "tenant\0suffix",
+                    "exp": 2000000000u64,
+                })),
+                1000,
+            )
+            .is_err());
+        assert!(verifier
+            .principal_from_token(
+                &token(serde_json::json!({
+                    "sub": "user\0suffix",
+                    "exp": 2000000000u64,
+                })),
                 1000,
             )
             .is_err());
@@ -2829,6 +2862,7 @@ mod tests {
     fn challenge_bounds_users_and_map() {
         let mut registry = PasskeyRegistry::new();
         assert!(registry.challenge("").is_err());
+        assert!(registry.challenge("user\0suffix").is_err());
         assert!(registry.challenge(&"u".repeat(MAX_USER_LEN + 1)).is_err());
         assert!(registry.challenge(&"u".repeat(MAX_USER_LEN)).is_ok());
         for index in 0..MAX_CHALLENGES - 1 {
@@ -2855,13 +2889,16 @@ mod tests {
     #[test]
     fn passkey_challenge_expires_at_ttl_boundary() {
         let mut registry = PasskeyRegistry::new();
-        registry.challenge_at("ada", 1000).unwrap();
+        let challenge = registry.challenge_at("ada", 1000).unwrap();
+        let client_data = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"https://auth.test\"}}"
+        );
         let result = registry.verify_assertion(&PasskeyAssertion {
             user: "ada",
             credential_id: "cred-1",
             authenticator_data: &[],
-            client_data_json: &[],
-            signature_der: &[],
+            client_data_json: client_data.as_bytes(),
+            signature_der: b"signature",
             rp_id: "auth.test",
             origins: &[],
             now_secs: 1000 + PASSKEY_CHALLENGE_TTL_SECS,
@@ -3166,6 +3203,22 @@ mod tests {
             .register_password(
                 String::from("ada"),
                 "t".repeat(MAX_TENANT_LEN + 1),
+                "correct-horse",
+                HashSet::new(),
+            )
+            .is_err());
+        assert!(store
+            .register_password(
+                String::from("ada"),
+                String::from("tenant\0suffix"),
+                "correct-horse",
+                HashSet::new(),
+            )
+            .is_err());
+        assert!(store
+            .register_password(
+                String::from("user\0suffix"),
+                String::from("tenant"),
                 "correct-horse",
                 HashSet::new(),
             )
