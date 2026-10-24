@@ -5243,18 +5243,25 @@ fn decode_copy_rows(
             if rows.len() >= MAX_COPY_ROWS {
                 return Err(String::from("COPY exceeds the 10000 row limit"));
             }
-            let fields = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-            if fields.len() != columns.len() {
-                return Err(format!(
-                    "COPY row has {} fields but table expects {}",
-                    fields.len(),
-                    columns.len()
-                ));
-            }
-            let mut values = Vec::with_capacity(fields.len());
-            for field in fields {
+            let mut fields = line.split(|byte| *byte == b'\t');
+            let mut values = Vec::with_capacity(columns.len());
+            for _ in 0..columns.len() {
+                let Some(field) = fields.next() else {
+                    return Err(format!(
+                        "COPY row has {} fields but table expects {}",
+                        values.len(),
+                        columns.len()
+                    ));
+                };
                 let value = decode_copy_field(field)?;
                 values.push(value.map_or(InsertValue::Null, InsertValue::Value));
+            }
+            if fields.next().is_some() {
+                let field_count = columns.len().saturating_add(1).saturating_add(fields.count());
+                return Err(format!(
+                    "COPY row has {field_count} fields but table expects {}",
+                    columns.len()
+                ));
             }
             rows.push(values);
         }
@@ -5517,6 +5524,16 @@ mod tests {
             decode_copy_field(&oversized).unwrap_err(),
             "COPY field exceeds the 4 MiB limit"
         );
+    }
+
+    #[test]
+    fn copy_column_rows_reject_extra_fields_without_collecting_them() {
+        let columns = vec![String::from("value")];
+        let data = vec![b'\t'; 8_192];
+        assert!(matches!(
+            decode_copy_rows(&data, &columns, &columns),
+            Err(error) if error == "COPY row has 8193 fields but table expects 1"
+        ));
     }
 
     #[test]
