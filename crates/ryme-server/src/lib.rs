@@ -3233,6 +3233,12 @@ impl SharedState {
     }
 
     fn principal(&self, headers: &HeaderMap) -> ryme_error::Result<Principal> {
+        if headers.get_all(axum::http::header::AUTHORIZATION).iter().nth(1).is_some()
+            || headers.get_all("x-api-key").iter().nth(1).is_some()
+            || headers.get_all("apikey").iter().nth(1).is_some()
+        {
+            return Err(ryme_error::RymeError::Unauthorized);
+        }
         if headers.contains_key(axum::http::header::AUTHORIZATION) {
             let value = headers
                 .get(axum::http::header::AUTHORIZATION)
@@ -3384,6 +3390,19 @@ mod websocket_credential_precedence_tests {
             HeaderValue::from_static("bEaReR user-key"),
         );
         assert_eq!(state.principal(&bearer_headers).unwrap().id, "app-user");
+        let mut duplicate_bearer_headers = HeaderMap::new();
+        duplicate_bearer_headers.append(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer user-key"),
+        );
+        duplicate_bearer_headers.append(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid-key"),
+        );
+        assert!(matches!(
+            state.principal(&duplicate_bearer_headers),
+            Err(ryme_error::RymeError::Unauthorized)
+        ));
         let websocket_principal =
             state.principal_for_websocket(&project_headers, Some("query-admin-key")).unwrap();
         assert_eq!(websocket_principal.id, "app-user");

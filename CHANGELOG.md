@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- HTTP authentication rejects repeated `Authorization`, `x-api-key`, or
+  `apikey` headers so intermediaries cannot disagree about the selected value.
 - Range snapshot installation and source cleanup reject requests whose declared
   sender is not a current cluster member recognized as the Raft leader.
 - Lua `redis.call` and `redis.pcall` now enforce RESP argument-count and frame-size
