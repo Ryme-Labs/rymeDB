@@ -824,6 +824,36 @@ async fn xreadgroup_history_is_scoped_to_pending_consumer() {
 }
 
 #[tokio::test]
+async fn blocking_xreadgroup_persists_consumer_before_timeout() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["XADD", "blocked-group", "1-1", "f", "a"]).await, "$3\r\n1-1");
+    assert_eq!(
+        command(addr, &["XGROUP", "CREATE", "blocked-group", "workers", "1-1"]).await,
+        "+OK"
+    );
+
+    let reply = command(
+        addr,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "workers",
+            "idle-consumer",
+            "BLOCK",
+            "25",
+            "STREAMS",
+            "blocked-group",
+            ">",
+        ],
+    )
+    .await;
+    assert_eq!(reply, "*-1");
+    let consumers = command(addr, &["XINFO", "CONSUMERS", "blocked-group", "workers"]).await;
+    assert!(consumers.contains("idle-consumer"), "consumers: {consumers}");
+    assert!(consumers.contains("pending\r\n:0"), "consumers: {consumers}");
+}
+
+#[tokio::test]
 async fn blocking_xread_pins_dollar_to_initial_stream_position() {
     let addr = serve().await;
     assert_eq!(

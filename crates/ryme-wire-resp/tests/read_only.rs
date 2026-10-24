@@ -47,4 +47,10 @@ async fn read_only_rejects_writes_allows_reads() {
     assert_eq!(command(addr, &["GET", "k"]).await, "$-1");
     let denied = command(addr, &["INCR", "counter"]).await;
     assert!(denied.contains("READONLY"), "{denied}");
+    let denied = command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "reader", "BLOCK", "50", "STREAMS", "events", ">"],
+    )
+    .await;
+    assert!(denied.contains("READONLY"), "{denied}");
 }

@@ -4974,31 +4974,71 @@ where
             Ok(deadline) => deadline,
             Err(error) => return encode_error(error),
         };
+        if let Some(denied) = self.readonly_deny(true) {
+            return denied;
+        }
+        let bytes: u64 = args.iter().map(|arg| arg.len() as u64).sum();
+        if let Some(denied) = self.admit(true, bytes) {
+            return denied;
+        }
         let mut waiter = ryme_txn::subscribe_commits();
+        let mut consumer_persisted = false;
+        let mut retries = 0;
         loop {
             let mut txn = self.manager.begin();
             let rest = args.get(keys_at..).unwrap_or(&[]);
             match self.xreadgroup_deliver(&mut txn, count, &args[1], &args[2], rest) {
                 Err(e) => return encode_error(e),
                 Ok(groups) if !groups.is_empty() => {
-                    let bytes: u64 = args.iter().map(|arg| arg.len() as u64).sum();
-                    if let Some(denied) = self.readonly_deny(true) {
-                        return denied;
-                    }
-                    if let Some(denied) = self.admit(true, bytes) {
-                        return denied;
-                    }
                     let pending = match self.cdc_pending(&txn) {
                         Ok(pending) => pending,
                         Err(error) => return encode_error(error.to_string()),
                     };
+                    let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
+                        txn.writes().keys().cloned().collect()
+                    } else {
+                        Vec::new()
+                    };
                     match self.manager.commit(txn).await {
                         Ok(commit_ts) => {
+                            for key in &range_keys {
+                                self.note_range_write(key);
+                            }
                             self.cdc_emit(pending, commit_ts);
                             self.observe(true);
                             return Self::encode_xread(groups);
                         }
                         Err(e) => return encode_error(e.to_string()),
+                    }
+                }
+                Ok(_) if !consumer_persisted && !txn.writes().is_empty() => {
+                    let pending = match self.cdc_pending(&txn) {
+                        Ok(pending) => pending,
+                        Err(error) => return encode_error(error.to_string()),
+                    };
+                    let range_keys: Vec<RecordKey> = if self.range_hook.is_armed() {
+                        txn.writes().keys().cloned().collect()
+                    } else {
+                        Vec::new()
+                    };
+                    match self.manager.commit(txn).await {
+                        Ok(commit_ts) => {
+                            for key in &range_keys {
+                                self.note_range_write(key);
+                            }
+                            self.cdc_emit(pending, commit_ts);
+                            self.observe(true);
+                            consumer_persisted = true;
+                            retries = 0;
+                            let _ = waiter.borrow_and_update();
+                            continue;
+                        }
+                        Err(RymeError::Conflict(_)) if retries < MAX_COMMAND_CONFLICT_RETRIES => {
+                            retries += 1;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(error) => return encode_error(error.to_string()),
                     }
                 }
                 Ok(_) => {}
