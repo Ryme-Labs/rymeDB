@@ -63,6 +63,8 @@ All notable changes to rymeDB are recorded here. Format follows
   late timestamp conflict cannot leave an in-memory engine partially merged.
 - Storage range reads now return an empty result for reversed or empty bounds,
   avoiding a panic from invalid caller-supplied ranges.
+- Storage writes and snapshot loading now reject NUL bytes in tenant, database,
+  and table names before they can produce ambiguous routing keys.
 - Raft peer dialing now tries all resolved address families, so DNS names work
   when only an IPv4 or IPv6 listener is available.
 - Range election ticks no longer restore the configured owner after a vote clears

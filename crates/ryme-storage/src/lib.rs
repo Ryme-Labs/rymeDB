@@ -131,6 +131,16 @@ pub fn record_routing_key(version: u8, key: &RecordKey) -> Result<Vec<u8>> {
     routing_key(version, &key.tenant, &key.database, &key.table, &key.pk)
 }
 
+fn validate_record_scope(tenant: &str, database: &str, table: &str) -> Result<()> {
+    if tenant.as_bytes().contains(&0)
+        || database.as_bytes().contains(&0)
+        || table.as_bytes().contains(&0)
+    {
+        return Err(RymeError::InvalidArgument(String::from("record scope")));
+    }
+    Ok(())
+}
+
 pub fn table_routing_bounds(
     version: u8,
     tenant: &str,
@@ -263,6 +273,7 @@ impl Engine {
         if commit_ts == 0 {
             return Err(RymeError::InvalidArgument(String::from("commit_ts")));
         }
+        validate_record_scope(&key.tenant, &key.database, &key.table)?;
         let versions = self.inner.entry(key).or_default();
         if let Some(last) = versions.back() {
             if commit_ts <= last.commit_ts {
@@ -658,6 +669,7 @@ impl Engine {
         table: &str,
         rows: TableRows,
     ) -> Result<u64> {
+        validate_record_scope(tenant, database, table)?;
         // Validate every key's incoming history before changing the engine. A
         // malformed later row must not leave an earlier part of the import
         // visible to readers.
@@ -1132,6 +1144,8 @@ impl Engine {
                 versions.push_back(Version { commit_ts, value, expires_at });
             }
             let key = RecordKey { tenant, database, table, pk };
+            validate_record_scope(&key.tenant, &key.database, &key.table)
+                .map_err(|_| RymeError::Corrupt(String::from("snapshot record scope")))?;
             if engine.inner.contains_key(&key) {
                 return Err(RymeError::Corrupt(String::from("snapshot duplicate key")));
             }
@@ -1824,6 +1838,31 @@ mod tests {
         );
         assert!(routing_key(SCOPED_ROUTING_VERSION, "tenant\0a", "db", "docs", b"k").is_err());
         assert!(routing_key(9, "tenant", "db", "docs", b"k").is_err());
+    }
+
+    #[test]
+    fn record_scopes_reject_nul_before_mutation_and_on_snapshot_load() {
+        let mut engine = Engine::new();
+        let invalid = RecordKey::new("t\0other", "d", "items", b"k");
+        assert!(matches!(
+            engine.apply(invalid, 1, Some(b"value".to_vec())),
+            Err(RymeError::InvalidArgument(message)) if message == "record scope"
+        ));
+        assert!(engine.is_empty());
+        assert!(engine
+            .import_table("t\0other", "d", "items", vec![(b"k".to_vec(), vec![])])
+            .is_err());
+        assert!(engine.is_empty());
+
+        let mut snapshot_engine = Engine::new();
+        snapshot_engine
+            .apply(RecordKey::new("t", "d", "items", b"k"), 1, Some(b"value".to_vec()))
+            .unwrap();
+        let mut raw = snapshot_engine.encode_snapshot().unwrap();
+        // The tenant begins immediately after its 16-bit length at offset 20.
+        raw[22] = 0;
+        refresh_snapshot_checksum(&mut raw);
+        assert!(matches!(Engine::decode_snapshot(&raw), Err(RymeError::Corrupt(_))));
     }
 
     #[test]
