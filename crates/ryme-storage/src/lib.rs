@@ -2073,6 +2073,49 @@ mod tests {
         assert_eq!(engine.read(&tenant_b, 3, 0).unwrap(), Some(b"old-b".to_vec()));
     }
 
+    #[test]
+    fn branch_database_range_export_and_replacement_preserve_namespace() {
+        let database = "app\0branch\0preview";
+        let branch_key = RecordKey::new("tenant", database, "docs", b"branch-key");
+        let regular_key = RecordKey::new("tenant", "app", "docs", b"regular-key");
+        let mut source = Engine::new();
+        source.apply(branch_key.clone(), 1, Some(b"branch".to_vec())).unwrap();
+        source.apply(regular_key.clone(), 2, Some(b"regular".to_vec())).unwrap();
+
+        let (start, end) =
+            table_routing_bounds(SCOPED_ROUTING_VERSION, "tenant", database, "docs").unwrap();
+        let rows = source
+            .export_table_routing_range(
+                SCOPED_ROUTING_VERSION,
+                "tenant",
+                database,
+                "docs",
+                &start,
+                &end,
+                2,
+                10,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, b"branch-key");
+
+        let mut replacement = Engine::new();
+        replacement.apply(branch_key.clone(), 3, Some(b"moved".to_vec())).unwrap();
+        assert_eq!(
+            source
+                .replace_routing_range_for_version(
+                    SCOPED_ROUTING_VERSION,
+                    &start,
+                    &end,
+                    &replacement,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(source.read(&branch_key, 3, 0).unwrap(), Some(b"moved".to_vec()));
+        assert_eq!(source.read(&regular_key, 3, 0).unwrap(), Some(b"regular".to_vec()));
+    }
+
     fn refresh_snapshot_checksum(snapshot: &mut [u8]) {
         let checksum_offset = snapshot.len() - 4;
         let checksum = crc32fast::hash(&snapshot[..checksum_offset]);
