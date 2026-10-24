@@ -1257,7 +1257,7 @@ fn matching_totp_step(secret: &[u8], code: &str, unix_secs: u64) -> Option<u64> 
     (found == 1).then_some(matched_step)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PasskeyRegistry {
     challenges: HashMap<String, (String, u64)>,
     next_challenge_expiry: Option<u64>,

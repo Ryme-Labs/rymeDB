@@ -52,6 +52,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Passkey registration now publishes the credential in memory only after its
+  auth snapshot is atomically replaced, so failed persistence cannot leave a
+  credential active only until restart.
 - Storage segment merges now validate every key history before appending, so a
   late timestamp conflict cannot leave an in-memory engine partially merged.
 - Raft peer dialing now tries all resolved address families, so DNS names work

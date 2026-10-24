@@ -1953,6 +1953,19 @@ impl SharedState {
     }
 
     fn persist_auth_locked(&self, on_replace: impl FnOnce()) -> ryme_error::Result<()> {
+        let passkeys = self
+            .passkeys
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
+            .snapshot();
+        let snapshot = self.auth_snapshot(passkeys)?;
+        self.persist_auth_snapshot_locked(snapshot, on_replace)
+    }
+
+    fn auth_snapshot(
+        &self,
+        passkeys: HashMap<String, ryme_auth::PasskeyCredential>,
+    ) -> ryme_error::Result<AuthSnapshot> {
         let snapshot = AuthSnapshot {
             api_keys: self.keys.snapshot()?,
             api_key_expirations: self.keys.expiration_snapshot()?,
@@ -1967,12 +1980,16 @@ impl SharedState {
                 .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
                 .snapshot(),
             refresh_tokens: self.refresh_tokens.snapshot()?,
-            passkeys: self
-                .passkeys
-                .lock()
-                .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
-                .snapshot(),
+            passkeys,
         };
+        Ok(snapshot)
+    }
+
+    fn persist_auth_snapshot_locked(
+        &self,
+        snapshot: AuthSnapshot,
+        on_replace: impl FnOnce(),
+    ) -> ryme_error::Result<()> {
         let bytes = serde_json::to_vec(&snapshot)
             .map_err(|error| ryme_error::RymeError::Internal(format!("auth snapshot: {error}")))?;
         if bytes.len() > AUTH_SNAPSHOT_MAX_BYTES {
@@ -2000,6 +2017,26 @@ impl SharedState {
             sync_metadata_directory(parent)?;
         }
         Ok(())
+    }
+
+    fn register_passkey(
+        &self,
+        user: &str,
+        credential_id: String,
+        public_key: &[u8],
+    ) -> ryme_error::Result<()> {
+        let _persist_guard = self
+            .auth_persist_lock
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+        let mut passkeys = self
+            .passkeys
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
+        let mut staged = passkeys.clone();
+        staged.register(user, credential_id, public_key)?;
+        let snapshot = self.auth_snapshot(staged.snapshot())?;
+        self.persist_auth_snapshot_locked(snapshot, || *passkeys = staged)
     }
 
     fn persist_control(&self) -> ryme_error::Result<()> {
@@ -7863,17 +7900,8 @@ async fn passkey_register(
             )))
         }
     };
-    let registered = match state.passkeys.lock() {
-        Ok(mut registry) => registry.register(&request.user, request.credential_id, &public_key),
-        Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
-    match registered {
-        Ok(()) => match state.persist_auth() {
-            Ok(()) => {
-                (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
-            }
-            Err(e) => error_response(e),
-        },
+    match state.register_passkey(&request.user, request.credential_id, &public_key) {
+        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -16394,6 +16422,26 @@ mod realtime_policy_tests {
             .filter(|name| name.to_string_lossy().starts_with("auth.tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "auth temp files left behind: {leftovers:?}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_passkey_persistence_does_not_publish_credential_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-passkey-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+        let secret = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let public_key = secret.verifying_key().to_sec1_point(false).as_bytes().to_vec();
+
+        assert!(state.register_passkey("ada", String::from("credential"), &public_key).is_err());
+        assert_eq!(state.passkeys.lock().unwrap().owner_of("credential"), None);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
