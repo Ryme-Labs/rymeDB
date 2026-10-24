@@ -1,0 +1,43 @@
+{
+  "benchmark": "transaction-batch-read-single-version-fast-path",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "parameters": {
+    "records": 10000,
+    "candidates_per_iteration": 1024,
+    "iterations": 100,
+    "batch_size": 256,
+    "value_bytes": 128,
+    "workload": "read-only unique same-table keys, one committed version per key"
+  },
+  "hot_baseline": [
+    { "p50_ns": 120400, "p95_ns": 192600, "p99_ns": 356500 },
+    { "p50_ns": 119900, "p95_ns": 213600, "p99_ns": 366500 },
+    { "p50_ns": 118400, "p95_ns": 229300, "p99_ns": 349400 }
+  ],
+  "hot_candidate": [
+    { "p50_ns": 117500, "p95_ns": 212100, "p99_ns": 297400 },
+    { "p50_ns": 119000, "p95_ns": 221300, "p99_ns": 263900 },
+    { "p50_ns": 120600, "p95_ns": 220500, "p99_ns": 314200 }
+  ],
+  "standard_baseline": [
+    { "p50_ns": 431100, "p95_ns": 680800, "p99_ns": 890700 },
+    { "p50_ns": 449400, "p95_ns": 787700, "p99_ns": 815200 },
+    { "p50_ns": 447200, "p95_ns": 736600, "p99_ns": 820700 }
+  ],
+  "standard_candidate": [
+    { "p50_ns": 468300, "p95_ns": 723500, "p99_ns": 893800 },
+    { "p50_ns": 477000, "p95_ns": 621200, "p99_ns": 852200 },
+    { "p50_ns": 472300, "p95_ns": 953700, "p99_ns": 1341500 }
+  ],
+  "median_p50_change_percent": {
+    "hot": -0.75,
+    "standard": 5.61
+  },
+  "decision": "Discard the len-one version deque fast path. Hot-mode p50 was effectively flat, while Standard-mode p50 regressed 5.61%.",
+  "notes": "Three alternating release-build pairs per mode on one Windows host. Standard mode uses a warmed segment cache with WAL and segment sync disabled. This in-process benchmark does not measure network or durable-write latency."
+}

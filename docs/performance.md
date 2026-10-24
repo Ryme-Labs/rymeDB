@@ -235,6 +235,12 @@ lookup in the individual-read fallback left Hot-mode p50 effectively flat and
 raised Standard-mode median p50 by 3.4% across three alternating pairs. The
 existing lookup path remains in place. See the [raw captures](../bench/results/txn-read-shuffled-lookup-experiments-windows-20261024.json).
 
+A fast path for a key with exactly one MVCC version was also measured on 10,000
+records and 1,024 read keys. Across three alternating pairs, Hot-mode median
+p50 changed by less than 1%, while Standard-mode median p50 regressed 5.6%.
+The branch was discarded; the general snapshot-aware version lookup remains.
+See the [raw captures](../bench/results/txn-read-single-version-fast-path-windows-20261024.json).
+
 On an AMD Ryzen 5 4500, two release captures with 64 records, 1,024 reads per
 iteration, and batches of 256 measured read-only batched p50 at 157–161 µs vs
 184–185 µs for individual reads in Hot mode (1.15–1.17×). Standard mode
