@@ -1084,6 +1084,16 @@ impl SegmentStore {
     }
 
     pub fn compact_delta_run(&self) -> Result<Option<SegmentMeta>> {
+        self.compact_delta_run_inner(None)
+    }
+
+    /// Compacts one bounded delta run, collecting versions older than the
+    /// supplied MVCC retention timestamp before publishing the replacement.
+    pub fn compact_delta_run_with_gc(&self, retain_ts: u64) -> Result<Option<SegmentMeta>> {
+        self.compact_delta_run_inner(Some(retain_ts))
+    }
+
+    fn compact_delta_run_inner(&self, retain_ts: Option<u64>) -> Result<Option<SegmentMeta>> {
         let _maintenance = self
             .compaction_gate
             .lock()
@@ -1123,6 +1133,9 @@ impl SegmentStore {
         }
         if merged.is_empty() {
             return Ok(None);
+        }
+        if let Some(retain_ts) = retain_ts {
+            merged.gc(retain_ts);
         }
         let through_id = parse_segment_name(
             selected

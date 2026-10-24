@@ -2889,7 +2889,6 @@ pub struct DurableManager {
     wal: Arc<Mutex<Wal>>,
     segments: Arc<SegmentStore>,
     gate: Arc<Mutex<()>>,
-    standard_gc_state: Arc<Mutex<Option<(u64, u64, usize)>>>,
     persistence_failed: Arc<AtomicBool>,
     policy: SyncPolicy,
     mode: StorageMode,
@@ -2962,7 +2961,6 @@ impl DurableManager {
             wal: Arc::new(Mutex::new(wal)),
             segments,
             gate: Arc::new(Mutex::new(())),
-            standard_gc_state: Arc::new(Mutex::new(None)),
             persistence_failed: Arc::new(AtomicBool::new(false)),
             policy,
             mode,
@@ -3099,10 +3097,6 @@ impl DurableManager {
             )?;
         }
         self.inner.advance_to(max);
-        *self
-            .standard_gc_state
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("standard gc state")))? = None;
         Ok(max)
     }
 
@@ -3247,12 +3241,15 @@ impl DurableManager {
         self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
-        let snapshot = match self.mode {
+        let mut snapshot = match self.mode {
             StorageMode::Hot => self.inner.clone_engine_snapshot()?,
             StorageMode::Standard => {
                 self.segments.load_all()?.map(|(engine, _)| engine).unwrap_or_default()
             }
         };
+        if self.mode == StorageMode::Standard {
+            snapshot.gc(self.inner.gc_horizon());
+        }
         let raw = snapshot.encode_snapshot()?;
         let max = snapshot.max_commit_ts();
         self.segments.write(max, &snapshot)?;
@@ -3296,47 +3293,7 @@ impl DurableManager {
 
     pub fn gc_oldest(&self) -> Result<u64> {
         self.ensure_persistence_healthy()?;
-        if self.mode == StorageMode::Hot {
-            return self.inner.gc_oldest();
-        }
-
-        let _gate =
-            self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
-        let horizon = self.inner.gc_oldest()?;
-        let latest_commit = self.inner.latest_commit();
-        let segment_count = self.segments.segment_paths()?.len();
-        let gc_state = (horizon, latest_commit, segment_count);
-        if *self
-            .standard_gc_state
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("standard gc state")))?
-            == Some(gc_state)
-        {
-            return Ok(horizon);
-        }
-
-        let mut engine = self.materialized_segments()?;
-        if engine.gc_with_count(horizon) == 0 {
-            *self
-                .standard_gc_state
-                .lock()
-                .map_err(|_| RymeError::Internal(String::from("standard gc state")))? =
-                Some(gc_state);
-            return Ok(horizon);
-        }
-
-        (|| -> Result<()> {
-            let max_commit_ts = engine.max_commit_ts();
-            let (_, newest) = self.segments.write(max_commit_ts, &engine)?;
-            self.segments.remove_except(&newest)?;
-            Ok(())
-        })()?;
-        *self
-            .standard_gc_state
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("standard gc state")))? =
-            Some((horizon, latest_commit, 1));
-        Ok(horizon)
+        self.inner.gc_oldest()
     }
 
     pub fn prune_snapshots(&self, keep: usize) -> Result<usize> {
@@ -3443,7 +3400,7 @@ impl DurableManager {
         let _segments_pruned = self.segments.prune(snapshot_keep)?;
         if self.segments.segment_paths()?.len() >= SEGMENT_COMPACTION_THRESHOLD {
             if self.mode == StorageMode::Standard {
-                self.segments.compact_delta_run()?;
+                self.segments.compact_delta_run_with_gc(self.inner.gc_horizon())?;
             } else {
                 self.compact_segments_locked()?;
             }
@@ -3462,7 +3419,7 @@ impl DurableManager {
 
     fn compact_segments_locked(&self) -> Result<Option<ryme_storage::SegmentMeta>> {
         if self.mode == StorageMode::Standard {
-            return self.segments.compact_delta_run();
+            return self.segments.compact_delta_run_with_gc(self.inner.gc_horizon());
         }
         let _guard = self
             .inner
@@ -3524,10 +3481,6 @@ impl DurableManager {
         if self.mode == StorageMode::Standard {
             self.inner.clear_engine()?;
         }
-        *self
-            .standard_gc_state
-            .lock()
-            .map_err(|_| RymeError::Internal(String::from("standard gc state")))? = None;
         Ok(replayed)
     }
 
@@ -5044,13 +4997,68 @@ mod tests {
         assert_eq!(manager.export_table("t", "d", "gc-standard").unwrap()[0].1.len(), 2);
         assert_eq!(manager.segments.segment_paths().unwrap().len(), 2);
 
+        manager.compact_segments().unwrap().unwrap();
+        assert_eq!(manager.export_table("t", "d", "gc-standard").unwrap()[0].1.len(), 2);
+        assert_eq!(manager.segments.segment_paths().unwrap().len(), 1);
+
         drop(reader);
-        manager.gc_oldest().unwrap();
+        let mut third = manager.begin();
+        manager.put(&mut third, key.clone(), b"latest value".to_vec());
+        manager.commit(third).unwrap();
+        manager.compact_segments().unwrap().unwrap();
         let rows = manager.export_table("t", "d", "gc-standard").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.len(), 1);
-        assert_eq!(rows[0].1[0].value.as_deref(), Some(b"new value".as_slice()));
+        assert_eq!(rows[0].1[0].value.as_deref(), Some(b"latest value".as_slice()));
         assert_eq!(manager.segments.segment_paths().unwrap().len(), 1);
+
+        drop(manager);
+        let reopened = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"latest value".to_vec()));
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn standard_snapshots_apply_the_active_reader_gc_horizon() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-snapshot-gc-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let key = RecordKey::new("t", "d", "snapshot-gc", b"row");
+        let mut first = manager.begin();
+        manager.put(&mut first, key.clone(), b"old value".to_vec());
+        manager.commit(first).unwrap();
+        let reader = manager.begin();
+        let mut second = manager.begin();
+        manager.put(&mut second, key.clone(), b"new value".to_vec());
+        manager.commit(second).unwrap();
+
+        manager.write_snapshot().unwrap();
+        assert_eq!(manager.export_table("t", "d", "snapshot-gc").unwrap()[0].1.len(), 2);
+        drop(reader);
+        manager.write_snapshot().unwrap();
+        let rows = manager.export_table("t", "d", "snapshot-gc").unwrap();
+        assert_eq!(rows[0].1.len(), 1);
+        assert_eq!(rows[0].1[0].value.as_deref(), Some(b"new value".as_slice()));
 
         drop(manager);
         let reopened = DurableManager::open_with_mode(
