@@ -269,52 +269,78 @@ impl<S: ObjectStore> Archiver<S> {
         if file_count_lower_bound > MAX_ARCHIVE_FILES {
             return Err(RymeError::Overload(String::from("archive manifest files")));
         }
+        let manifest_key = format!("backups/{commit_ts:020}-{backup_id}/manifest.json");
+        // A zero-byte bounded read checks existence without buffering a
+        // potentially large manifest; oversized means the key already exists.
+        match self.store.get_bounded(&manifest_key, 0).await {
+            Ok(_) => return Err(RymeError::Conflict(String::from("backup already exists"))),
+            Err(RymeError::NotFound(_)) => {}
+            Err(RymeError::Overload(_)) => {
+                return Err(RymeError::Conflict(String::from("backup already exists")));
+            }
+            Err(error) => return Err(error),
+        }
         let prefix = format!("backups/{commit_ts:020}-{backup_id}/");
         let mut entries = Vec::with_capacity(file_count_lower_bound);
         let mut names = HashSet::with_capacity(file_count_lower_bound);
-        for file in files {
-            if entries.len() == MAX_ARCHIVE_FILES {
-                return Err(RymeError::Overload(String::from("archive manifest files")));
+        let mut written_keys = Vec::new();
+        let mut publishing_manifest = false;
+        let result = async {
+            for file in files {
+                if entries.len() == MAX_ARCHIVE_FILES {
+                    return Err(RymeError::Overload(String::from("archive manifest files")));
+                }
+                let (name, bytes) = file?;
+                if bytes.len() > MAX_ARCHIVE_OBJECT_BYTES {
+                    return Err(RymeError::Overload(String::from("archive object")));
+                }
+                if !safe_relative_name(&name) {
+                    return Err(RymeError::InvalidArgument(String::from("filename")));
+                }
+                if !names.insert(name.clone()) {
+                    return Err(RymeError::InvalidArgument(String::from("duplicate filename")));
+                }
+                let key = format!("{prefix}{name}");
+                let (stored, encryption) = protect(&bytes)?;
+                if stored.len() > MAX_ARCHIVE_OBJECT_BYTES {
+                    return Err(RymeError::Overload(String::from("archive object")));
+                }
+                let digest = sha256_hex(&stored);
+                let length = stored.len() as u64;
+                // Track before put: a backend can report an error after the
+                // object was accepted, so cleanup must include ambiguous writes.
+                written_keys.push(key.clone());
+                self.store.put(&key, stored).await?;
+                let roundtrip = self.store.get_bounded(&key, MAX_ARCHIVE_OBJECT_BYTES).await?;
+                if sha256_hex(&roundtrip) != digest {
+                    return Err(RymeError::Corrupt(String::from("archive verify")));
+                }
+                entries.push(FileEntry { key, bytes: length, sha256: digest, encryption });
             }
-            let (name, bytes) = file?;
-            if bytes.len() > MAX_ARCHIVE_OBJECT_BYTES {
-                return Err(RymeError::Overload(String::from("archive object")));
+            let manifest = BackupManifest {
+                backup_id: backup_id.to_string(),
+                commit_ts,
+                created_unix: now_unix(),
+                files: entries,
+            };
+            let raw =
+                serde_json::to_vec(&manifest).map_err(|e| RymeError::Internal(e.to_string()))?;
+            if raw.len() > MAX_ARCHIVE_MANIFEST_BYTES {
+                return Err(RymeError::Overload(String::from("archive manifest")));
             }
-            if !safe_relative_name(&name) {
-                return Err(RymeError::InvalidArgument(String::from("filename")));
-            }
-            if !names.insert(name.clone()) {
-                return Err(RymeError::InvalidArgument(String::from("duplicate filename")));
-            }
-            let key = format!("{prefix}{name}");
-            let (stored, encryption) = protect(&bytes)?;
-            if stored.len() > MAX_ARCHIVE_OBJECT_BYTES {
-                return Err(RymeError::Overload(String::from("archive object")));
-            }
-            let digest = sha256_hex(&stored);
-            let length = stored.len() as u64;
-            self.store.put(&key, stored).await?;
-            let roundtrip = self.store.get_bounded(&key, MAX_ARCHIVE_OBJECT_BYTES).await?;
-            if sha256_hex(&roundtrip) != digest {
-                return Err(RymeError::Corrupt(String::from("archive verify")));
-            }
-            entries.push(FileEntry { key, bytes: length, sha256: digest, encryption });
+            // A failed manifest PUT may still have reached the backend. Keep
+            // every referenced object in that ambiguous case.
+            publishing_manifest = true;
+            self.store.put(&manifest_key, raw).await?;
+            Ok(manifest)
         }
-        let manifest = BackupManifest {
-            backup_id: backup_id.to_string(),
-            commit_ts,
-            created_unix: now_unix(),
-            files: entries,
-        };
-        let raw = serde_json::to_vec(&manifest).map_err(|e| RymeError::Internal(e.to_string()))?;
-        if raw.len() > MAX_ARCHIVE_MANIFEST_BYTES {
-            for file in &manifest.files {
-                let _ = self.store.delete(&file.key).await;
+        .await;
+        if result.is_err() && !publishing_manifest {
+            for key in written_keys {
+                let _ = self.store.delete(&key).await;
             }
-            return Err(RymeError::Overload(String::from("archive manifest")));
         }
-        self.store.put(&manifest.manifest_key(), raw).await?;
-        Ok(manifest)
+        result
     }
 
     pub async fn list_backups(&self) -> Result<Vec<BackupManifest>> {
@@ -535,6 +561,50 @@ mod tests {
         archiver.restore_backup(&manifest.manifest_key(), &restored).await.unwrap();
         assert_eq!(std::fs::read(restored.join("first")).unwrap(), b"one");
         assert_eq!(std::fs::read(restored.join("second")).unwrap(), b"two");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_rejects_backup_id_reuse_without_replacing_existing_data() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-idempotency-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let archiver = Archiver::new(LocalStore::new(root.clone()));
+        let manifest = archiver
+            .archive_files("stable-id", 23, vec![(String::from("state"), b"original".to_vec())])
+            .await
+            .unwrap();
+
+        let duplicate = archiver
+            .archive_files("stable-id", 23, vec![(String::from("state"), b"replacement".to_vec())])
+            .await;
+        assert!(matches!(duplicate, Err(RymeError::Conflict(_))));
+
+        let dest = root.join("restored");
+        archiver.restore_backup(&manifest.manifest_key(), &dest).await.unwrap();
+        assert_eq!(std::fs::read(dest.join("state")).unwrap(), b"original");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_cleans_objects_when_source_fails_before_manifest_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-partial-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let store = LocalStore::new(root.clone());
+        let archiver = Archiver::new(store.clone());
+        let files = vec![
+            Ok((String::from("first"), b"one".to_vec())),
+            Err(RymeError::Unavailable(String::from("source failed"))),
+        ];
+
+        let result = archiver.archive_files_from("partial", 29, files).await;
+        assert!(matches!(result, Err(RymeError::Unavailable(_))));
+        assert!(store.list("backups/").await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

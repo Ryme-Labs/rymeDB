@@ -86,6 +86,11 @@ read-only inspection also require a platform superuser because archives include 
 branch, control-plane, auth, topic, placement, WAL, and immutable segment
 artifacts as applicable.
 
+Treat each `(commit timestamp, backup ID)` pair as immutable. Reusing a pair
+that already has a manifest returns a conflict so it cannot overwrite objects
+belonging to the existing backup. If an archive fails before its manifest is
+published, the archiver attempts to remove the objects it uploaded.
+
 ## Restore
 
 Always stop application writes or put the service in a controlled maintenance
