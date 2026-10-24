@@ -227,6 +227,43 @@ fn restore_stage_path(dest_dir: &Path) -> PathBuf {
     parent.join(format!(".{name}.restore-{}-{nanos}", std::process::id()))
 }
 
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+fn create_restore_parents(staging: &Path, parent: &Path) -> Result<()> {
+    let relative = parent
+        .strip_prefix(staging)
+        .map_err(|_| RymeError::Corrupt(String::from("restore path")))?;
+    let mut current = staging.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(RymeError::Corrupt(String::from("restore path")));
+        };
+        current.push(name);
+        match create_private_directory(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if !metadata.file_type().is_dir() {
+                    return Err(RymeError::Corrupt(String::from("restore path")));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_restore_destination_absent(dest_dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dest_dir) {
         Ok(_) => Err(RymeError::Conflict(String::from("restore destination exists"))),
@@ -459,7 +496,7 @@ impl<S: ObjectStore> Archiver<S> {
         }
         ensure_restore_destination_absent(dest_dir)?;
         let staging = restore_stage_path(dest_dir);
-        std::fs::create_dir(&staging)?;
+        create_private_directory(&staging)?;
         let restore_result: Result<()> = async {
             for file in &manifest.files {
                 let bytes = self.store.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
@@ -471,7 +508,7 @@ impl<S: ObjectStore> Archiver<S> {
                     file.key.strip_prefix(&manifest.prefix()).expect("validated archive manifest");
                 let dest = staging.join(name);
                 if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    create_restore_parents(&staging, parent)?;
                 }
                 let (tmp, mut output) = create_archive_temp_file(&dest)?;
                 let write_result = (|| -> Result<()> {
@@ -1031,6 +1068,20 @@ mod tests {
             std::fs::read(root.join("out/branch-schemas/tenant/preview.json")).unwrap(),
             b"schema"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for directory in [
+                root.join("out"),
+                root.join("out/branch-schemas"),
+                root.join("out/branch-schemas/tenant"),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
         assert!(!root.join("out/preview.json").exists());
         let _ = std::fs::remove_dir_all(&root);
     }

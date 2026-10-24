@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- Archive restore now creates private staging and nested directories on Unix,
+  protecting restored database files from other local users.
 - Windows atomic file replacement now rejects embedded NUL path characters
   before passing paths to Win32.
 - HTTP authentication rejects repeated `Authorization`, `x-api-key`, or
