@@ -1847,23 +1847,46 @@ fn machine_metadata() -> serde_json::Value {
     if let Ok(host) = std::env::var("RYME_BENCH_HOST") {
         metadata["host"] = serde_json::Value::String(host);
     }
-    if let Ok(model) = std::fs::read_to_string("/proc/cpuinfo") {
-        if let Some(model) = cpu_model_from_proc(&model) {
-            metadata["cpu_model"] = serde_json::Value::String(model);
-        }
+    let cpu_model = std::env::var("RYME_BENCH_CPU_MODEL")
+        .ok()
+        .and_then(non_empty_metadata)
+        .or_else(|| {
+            (std::env::consts::OS == "windows")
+                .then(|| std::env::var("PROCESSOR_IDENTIFIER").ok())
+                .flatten()
+                .and_then(non_empty_metadata)
+        })
+        .or_else(|| {
+            std::fs::read_to_string("/proc/cpuinfo")
+                .ok()
+                .and_then(|cpuinfo| cpu_model_from_proc(&cpuinfo))
+        });
+    if let Some(model) = cpu_model {
+        metadata["cpu_model"] = serde_json::Value::String(model);
     }
-    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(bytes) = host_memory_bytes_from_proc(&meminfo) {
-            metadata["host_memory_bytes"] = serde_json::Value::from(bytes);
-        }
+    let host_memory_bytes = std::env::var("RYME_BENCH_HOST_MEMORY_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|meminfo| host_memory_bytes_from_proc(&meminfo))
+        });
+    if let Some(bytes) = host_memory_bytes {
+        metadata["host_memory_bytes"] = serde_json::Value::from(bytes);
     }
     metadata
+}
+
+fn non_empty_metadata(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn cpu_model_from_proc(cpuinfo: &str) -> Option<String> {
     cpuinfo.lines().find_map(|line| {
         let (name, value) = line.trim().split_once(':')?;
-        (name.trim() == "model name").then(|| value.trim().to_string())
+        (name.trim() == "model name").then(|| value.trim().to_string()).and_then(non_empty_metadata)
     })
 }
 
@@ -2477,6 +2500,11 @@ fn txn_read_batch_bench(
         "batch_size": batch_size,
         "value_bytes": value_bytes,
         "storage_mode": if standard_mode { "standard" } else { "hot" },
+        "durability": if standard_mode {
+            "wal_and_segment_sync_disabled"
+        } else {
+            "in_memory_only"
+        },
         "single_read": single,
         "read_only_single_read": read_only,
         "batched_read": batched,
@@ -3100,7 +3128,7 @@ async fn resp_bench(config: RespBench) {
 mod tests {
     use super::{
         cpu_model_from_proc, encode_mget, expected_fanout, frame_len, host_memory_bytes_from_proc,
-        latency_histogram, realtime_channel, worker_ops,
+        latency_histogram, non_empty_metadata, realtime_channel, worker_ops,
     };
 
     #[test]
@@ -3153,5 +3181,10 @@ mod tests {
         assert_eq!(cpu_model_from_proc(cpuinfo).as_deref(), Some("Test CPU 3.2GHz"));
         assert_eq!(host_memory_bytes_from_proc("MemTotal: 16384 kB\n"), Some(16_777_216));
         assert_eq!(host_memory_bytes_from_proc("MemFree: 1024 kB\n"), None);
+        assert_eq!(
+            non_empty_metadata(String::from("  Windows CPU identifier  ")).as_deref(),
+            Some("Windows CPU identifier")
+        );
+        assert_eq!(non_empty_metadata(String::from("  ")), None);
     }
 }

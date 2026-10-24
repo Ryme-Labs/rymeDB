@@ -4,6 +4,11 @@ These are measured local results, not promises. Each number depends on the
 machine, payload, durability, protocol, concurrency, QoS tier, and data shape.
 Raw JSON artifacts live under `bench/results/`.
 
+Benchmark JSON includes OS, architecture, and logical CPU count. It reads the
+CPU model and host memory from procfs on Linux and the processor identifier on
+Windows. Set `RYME_BENCH_CPU_MODEL` and `RYME_BENCH_HOST_MEMORY_BYTES` to provide
+more precise host metadata or fill fields the current platform does not expose.
+
 ## Reproduce
 
 Build a release server and benchmark binary, then use a dedicated QoS tier:
@@ -126,8 +131,10 @@ Standard mode seeds a temporary segment-backed database, warms its cache, and
 removes the temporary directory after the run. This measures cached point-read
 overhead, not cold disk latency or a full networked deployment. Compare modes
 on the same idle machine; the output includes the storage mode and read
-percentiles. `read_only_batched_read` models the transaction-core access path
-used by RESP `MGET`: one read-only transaction with repeated `get_many` calls.
+percentiles, and labels Hot as in-memory-only and Standard as running with WAL
+and segment sync disabled. `read_only_batched_read` models the transaction-core
+access path used by RESP `MGET`: one read-only transaction with repeated
+`get_many` calls.
 Its speedup is reported against `read_only_single_read`, so neither side pays
 conflict-observation tracking.
 
@@ -142,6 +149,12 @@ iteration, and batches of 256 measured read-only batched p50 at 157–161 µs vs
 measured 323–326 µs vs 536 µs (1.65–1.66×). This is a warmed, repeated-key
 core workload, not end-to-end RESP or cold-disk latency; see the
 [raw captures](../bench/results/txn-read-batch-repeated.json).
+
+A Windows capture on an AMD Ryzen 5 4500 with 12 logical CPUs and 16 GiB RAM,
+using the same 64-record repeated-key workload and 100 iterations, measured
+read-only batch p50/p99 at 190/267 µs in Hot mode and 205/289 µs in Standard
+mode. These are one capture per mode with sync disabled, so compare them only
+with equivalent local runs; see the [raw capture](../bench/results/txn-read-batch-windows-20261024.json).
 
 Hot-mode unsorted batches with duplicate keys now sort once, read each distinct
 key through the ordered MVCC range path, and fan values back to the original

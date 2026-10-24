@@ -1,0 +1,43 @@
+{
+  "benchmark": "transaction-batch-read",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "records": 64,
+  "candidates_per_iteration": 1024,
+  "distinct_keys_per_iteration": 64,
+  "iterations": 100,
+  "batch_size": 256,
+  "value_bytes": 128,
+  "notes": "One sequential release capture per storage mode on an idle Windows host. Standard mode uses warmed segment cache and SyncPolicy::Never. In-process core benchmark only; not cold disk, network, or end-to-end RESP latency.",
+  "captures": [
+    {
+      "storage_mode": "hot",
+      "durability": "in_memory_only",
+      "single_read": { "p50_ns": 463000, "p95_ns": 486400, "p99_ns": 539800, "rows_per_second": 2208348 },
+      "read_only_single_read": { "p50_ns": 268900, "p95_ns": 283300, "p99_ns": 306500, "rows_per_second": 3787823 },
+      "batched_read": { "p50_ns": 380100, "p95_ns": 418200, "p99_ns": 527200, "rows_per_second": 2654927 },
+      "read_only_batched_read": { "p50_ns": 190300, "p95_ns": 237400, "p99_ns": 267200, "rows_per_second": 5245418 },
+      "reversed_read_only_batched_read": { "p50_ns": 190300, "p95_ns": 229400, "p99_ns": 280900, "rows_per_second": 5209102 },
+      "shuffled_read_only_batched_read": { "p50_ns": 213700, "p95_ns": 248100, "p99_ns": 276400, "rows_per_second": 4680651 },
+      "staged_write_single_read": { "p50_ns": 479400, "p95_ns": 506500, "p99_ns": 595800, "rows_per_second": 2117238 },
+      "staged_write_batched_read": { "p50_ns": 416600, "p95_ns": 453700, "p99_ns": 500800, "rows_per_second": 2441362 }
+    },
+    {
+      "storage_mode": "standard",
+      "durability": "wal_and_segment_sync_disabled",
+      "single_read": { "p50_ns": 719500, "p95_ns": 787500, "p99_ns": 847100, "rows_per_second": 1403290 },
+      "read_only_single_read": { "p50_ns": 526800, "p95_ns": 545400, "p99_ns": 682000, "rows_per_second": 1916074 },
+      "batched_read": { "p50_ns": 386600, "p95_ns": 439400, "p99_ns": 494800, "rows_per_second": 2594928 },
+      "read_only_batched_read": { "p50_ns": 205200, "p95_ns": 249600, "p99_ns": 289100, "rows_per_second": 4761285 },
+      "reversed_read_only_batched_read": { "p50_ns": 208300, "p95_ns": 259800, "p99_ns": 338500, "rows_per_second": 4676397 },
+      "shuffled_read_only_batched_read": { "p50_ns": 208300, "p95_ns": 247400, "p99_ns": 330700, "rows_per_second": 4740346 },
+      "staged_write_single_read": { "p50_ns": 738500, "p95_ns": 776900, "p99_ns": 962900, "rows_per_second": 1370833 },
+      "staged_write_batched_read": { "p50_ns": 414500, "p95_ns": 469500, "p99_ns": 620300, "rows_per_second": 2415487 }
+    }
+  ]
+}
