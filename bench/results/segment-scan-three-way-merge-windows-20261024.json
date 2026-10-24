@@ -1,0 +1,643 @@
+{
+  "benchmark": "segment-scan-page-three-way-merge",
+  "date": "2026-10-24",
+  "baseline_revision": "7545a04",
+  "candidate_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "architecture": "x86_64",
+    "os": "Windows"
+  },
+  "parameters": {
+    "snapshot_rows": 10000,
+    "scan_limit": 100,
+    "concurrency": 1,
+    "segment_cache_bytes": 67108864,
+    "durability": "local segment files with warmed in-process cache; no concurrent writers"
+  },
+  "two_delta_workload": {
+    "delta_segments": 2,
+    "iterations_per_capture": 100,
+    "captures": [
+      {
+        "deltas": 2,
+        "pair": 1,
+        "variant": "baseline",
+        "p50_ns": 32800,
+        "p95_ns": 46300,
+        "scans_per_second": 23754.09758183287,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 1,
+        "variant": "candidate",
+        "p50_ns": 31200,
+        "p95_ns": 67300,
+        "scans_per_second": 21669.41145878478,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 2,
+        "variant": "candidate",
+        "p50_ns": 30100,
+        "p95_ns": 33100,
+        "scans_per_second": 27571.75549367228,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 2,
+        "variant": "baseline",
+        "p50_ns": 33700,
+        "p95_ns": 59700,
+        "scans_per_second": 21081.035500463782,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 3,
+        "variant": "baseline",
+        "p50_ns": 32300,
+        "p95_ns": 41800,
+        "scans_per_second": 24457.053414204656,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 3,
+        "variant": "candidate",
+        "p50_ns": 30000,
+        "p95_ns": 32400,
+        "scans_per_second": 27609.818051299044,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 4,
+        "variant": "candidate",
+        "p50_ns": 30000,
+        "p95_ns": 32900,
+        "scans_per_second": 27815.637951656423,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 4,
+        "variant": "baseline",
+        "p50_ns": 33300,
+        "p95_ns": 34600,
+        "scans_per_second": 25145.2136085896,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 5,
+        "variant": "baseline",
+        "p50_ns": 32700,
+        "p95_ns": 41600,
+        "scans_per_second": 23617.21222426905,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 5,
+        "variant": "candidate",
+        "p50_ns": 30200,
+        "p95_ns": 34600,
+        "scans_per_second": 27443.12412525042,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 6,
+        "variant": "candidate",
+        "p50_ns": 30400,
+        "p95_ns": 39100,
+        "scans_per_second": 27443.877270980844,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 6,
+        "variant": "baseline",
+        "p50_ns": 32600,
+        "p95_ns": 34100,
+        "scans_per_second": 25791.143321383435,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 7,
+        "variant": "baseline",
+        "p50_ns": 32900,
+        "p95_ns": 46300,
+        "scans_per_second": 23396.19110008891,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 7,
+        "variant": "candidate",
+        "p50_ns": 30200,
+        "p95_ns": 33100,
+        "scans_per_second": 27968.116347364004,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 8,
+        "variant": "candidate",
+        "p50_ns": 32200,
+        "p95_ns": 46400,
+        "scans_per_second": 24235.37395182008,
+        "cache_hits": 300,
+        "cache_misses": 3
+      },
+      {
+        "deltas": 2,
+        "pair": 8,
+        "variant": "baseline",
+        "p50_ns": 33400,
+        "p95_ns": 34200,
+        "scans_per_second": 25768.546911639653,
+        "cache_hits": 300,
+        "cache_misses": 3
+      }
+    ],
+    "summary": {
+      "p50_ns": {
+        "baseline_median": 32850.0,
+        "candidate_median": 30200.0,
+        "change_percent": -8.07
+      },
+      "p95_ns": {
+        "baseline_median": 41700.0,
+        "candidate_median": 33850.0,
+        "change_percent": -18.82
+      },
+      "candidate_faster_p50_pairs": 8
+    }
+  },
+  "many_delta_controls": [
+    {
+      "delta_segments": 100,
+      "iterations_per_capture": 100,
+      "captures": [
+        {
+          "deltas": 100,
+          "pair": 1,
+          "variant": "baseline",
+          "p50_ns": 59100,
+          "p95_ns": 63200,
+          "scans_per_second": 15330.839516771939,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 1,
+          "variant": "candidate",
+          "p50_ns": 58500,
+          "p95_ns": 85900,
+          "scans_per_second": 14013.060172080379,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 2,
+          "variant": "candidate",
+          "p50_ns": 59400,
+          "p95_ns": 104400,
+          "scans_per_second": 13488.723427214847,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 2,
+          "variant": "baseline",
+          "p50_ns": 59200,
+          "p95_ns": 62700,
+          "scans_per_second": 14908.23978412869,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 3,
+          "variant": "baseline",
+          "p50_ns": 59800,
+          "p95_ns": 103000,
+          "scans_per_second": 13884.068031933357,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 3,
+          "variant": "candidate",
+          "p50_ns": 59200,
+          "p95_ns": 65900,
+          "scans_per_second": 15242.972989451862,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 4,
+          "variant": "candidate",
+          "p50_ns": 61900,
+          "p95_ns": 90400,
+          "scans_per_second": 13815.78038435501,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 4,
+          "variant": "baseline",
+          "p50_ns": 59700,
+          "p95_ns": 92100,
+          "scans_per_second": 14093.43950391093,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 5,
+          "variant": "baseline",
+          "p50_ns": 59400,
+          "p95_ns": 70400,
+          "scans_per_second": 14954.612750302831,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 5,
+          "variant": "candidate",
+          "p50_ns": 59200,
+          "p95_ns": 80800,
+          "scans_per_second": 14407.145944388416,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 6,
+          "variant": "candidate",
+          "p50_ns": 59800,
+          "p95_ns": 97100,
+          "scans_per_second": 13372.738335628987,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 6,
+          "variant": "baseline",
+          "p50_ns": 59100,
+          "p95_ns": 63900,
+          "scans_per_second": 15471.015053297646,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 7,
+          "variant": "baseline",
+          "p50_ns": 59500,
+          "p95_ns": 65900,
+          "scans_per_second": 15311.825322696719,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 7,
+          "variant": "candidate",
+          "p50_ns": 58400,
+          "p95_ns": 84400,
+          "scans_per_second": 14791.367757776563,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 8,
+          "variant": "candidate",
+          "p50_ns": 61400,
+          "p95_ns": 65400,
+          "scans_per_second": 14840.978910968966,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        },
+        {
+          "deltas": 100,
+          "pair": 8,
+          "variant": "baseline",
+          "p50_ns": 64800,
+          "p95_ns": 100500,
+          "scans_per_second": 11872.39549323867,
+          "cache_hits": 10100,
+          "cache_misses": 101
+        }
+      ],
+      "summary": {
+        "p50_ns": {
+          "baseline_median": 59450.0,
+          "candidate_median": 59300.0,
+          "change_percent": -0.25
+        },
+        "p95_ns": {
+          "baseline_median": 68150.0,
+          "candidate_median": 85150.0,
+          "change_percent": 24.94
+        },
+        "candidate_faster_p50_pairs": 5
+      }
+    },
+    {
+      "delta_segments": 100,
+      "iterations_per_capture": 300,
+      "captures": [
+        {
+          "pair": 1,
+          "variant": "baseline",
+          "p50_ns": 59700,
+          "p95_ns": 64000,
+          "scans_per_second": 15594.298724386364
+        },
+        {
+          "pair": 1,
+          "variant": "candidate",
+          "p50_ns": 92200,
+          "p95_ns": 184800,
+          "scans_per_second": 8482.771491101572
+        },
+        {
+          "pair": 2,
+          "variant": "candidate",
+          "p50_ns": 86300,
+          "p95_ns": 109000,
+          "scans_per_second": 10731.993503566599
+        },
+        {
+          "pair": 2,
+          "variant": "baseline",
+          "p50_ns": 59900,
+          "p95_ns": 62900,
+          "scans_per_second": 15792.798483891347
+        },
+        {
+          "pair": 3,
+          "variant": "baseline",
+          "p50_ns": 60300,
+          "p95_ns": 78600,
+          "scans_per_second": 15103.534730578114
+        },
+        {
+          "pair": 3,
+          "variant": "candidate",
+          "p50_ns": 58900,
+          "p95_ns": 62300,
+          "scans_per_second": 15984.399226355075
+        },
+        {
+          "pair": 4,
+          "variant": "candidate",
+          "p50_ns": 58700,
+          "p95_ns": 72100,
+          "scans_per_second": 15853.47164606596
+        },
+        {
+          "pair": 4,
+          "variant": "baseline",
+          "p50_ns": 59400,
+          "p95_ns": 65000,
+          "scans_per_second": 15759.033866163778
+        },
+        {
+          "pair": 5,
+          "variant": "baseline",
+          "p50_ns": 59900,
+          "p95_ns": 66000,
+          "scans_per_second": 15489.707089638934
+        },
+        {
+          "pair": 5,
+          "variant": "candidate",
+          "p50_ns": 59300,
+          "p95_ns": 74700,
+          "scans_per_second": 15427.733923015607
+        },
+        {
+          "pair": 6,
+          "variant": "candidate",
+          "p50_ns": 59700,
+          "p95_ns": 63900,
+          "scans_per_second": 15840.998616552788
+        },
+        {
+          "pair": 6,
+          "variant": "baseline",
+          "p50_ns": 59600,
+          "p95_ns": 66900,
+          "scans_per_second": 15570.907316769348
+        },
+        {
+          "pair": 7,
+          "variant": "baseline",
+          "p50_ns": 59300,
+          "p95_ns": 65200,
+          "scans_per_second": 15750.181127082962
+        },
+        {
+          "pair": 7,
+          "variant": "candidate",
+          "p50_ns": 59000,
+          "p95_ns": 63000,
+          "scans_per_second": 15982.525771822808
+        },
+        {
+          "pair": 8,
+          "variant": "candidate",
+          "p50_ns": 61400,
+          "p95_ns": 65600,
+          "scans_per_second": 15276.349156236314
+        },
+        {
+          "pair": 8,
+          "variant": "baseline",
+          "p50_ns": 59500,
+          "p95_ns": 64000,
+          "scans_per_second": 15790.470977114344
+        }
+      ],
+      "summary": {
+        "p50_ns": {
+          "baseline_median": 59650.0,
+          "candidate_median": 59500.0,
+          "change_percent": -0.25
+        },
+        "p95_ns": {
+          "baseline_median": 65100.0,
+          "candidate_median": 68850.0,
+          "change_percent": 5.76
+        },
+        "candidate_faster_p50_pairs": 4
+      }
+    },
+    {
+      "delta_segments": 100,
+      "iterations_per_capture": 300,
+      "captures": [
+        {
+          "pair": 1,
+          "variant": "baseline",
+          "p50_ns": 60900,
+          "p95_ns": 90800,
+          "scans_per_second": 14674.016718596382
+        },
+        {
+          "pair": 1,
+          "variant": "candidate",
+          "p50_ns": 59200,
+          "p95_ns": 95900,
+          "scans_per_second": 14449.544598519404
+        },
+        {
+          "pair": 2,
+          "variant": "candidate",
+          "p50_ns": 59000,
+          "p95_ns": 63600,
+          "scans_per_second": 15818.112793689628
+        },
+        {
+          "pair": 2,
+          "variant": "baseline",
+          "p50_ns": 59200,
+          "p95_ns": 69500,
+          "scans_per_second": 15685.20832570858
+        },
+        {
+          "pair": 3,
+          "variant": "baseline",
+          "p50_ns": 60400,
+          "p95_ns": 71200,
+          "scans_per_second": 15528.673695979627
+        },
+        {
+          "pair": 3,
+          "variant": "candidate",
+          "p50_ns": 59900,
+          "p95_ns": 90700,
+          "scans_per_second": 14928.566807824558
+        },
+        {
+          "pair": 4,
+          "variant": "candidate",
+          "p50_ns": 58900,
+          "p95_ns": 73900,
+          "scans_per_second": 15686.76664365941
+        },
+        {
+          "pair": 4,
+          "variant": "baseline",
+          "p50_ns": 60800,
+          "p95_ns": 95800,
+          "scans_per_second": 13891.590031394995
+        },
+        {
+          "pair": 5,
+          "variant": "baseline",
+          "p50_ns": 59200,
+          "p95_ns": 94700,
+          "scans_per_second": 15247.77636594663
+        },
+        {
+          "pair": 5,
+          "variant": "candidate",
+          "p50_ns": 59700,
+          "p95_ns": 78200,
+          "scans_per_second": 15318.549231264138
+        },
+        {
+          "pair": 6,
+          "variant": "candidate",
+          "p50_ns": 81400,
+          "p95_ns": 96200,
+          "scans_per_second": 12461.369753763334
+        },
+        {
+          "pair": 6,
+          "variant": "baseline",
+          "p50_ns": 59400,
+          "p95_ns": 71600,
+          "scans_per_second": 15564.525333859068
+        },
+        {
+          "pair": 7,
+          "variant": "baseline",
+          "p50_ns": 59400,
+          "p95_ns": 63300,
+          "scans_per_second": 15845.851556062624
+        },
+        {
+          "pair": 7,
+          "variant": "candidate",
+          "p50_ns": 85800,
+          "p95_ns": 100000,
+          "scans_per_second": 12076.176521497606
+        },
+        {
+          "pair": 8,
+          "variant": "candidate",
+          "p50_ns": 59700,
+          "p95_ns": 64600,
+          "scans_per_second": 15633.631067151658
+        },
+        {
+          "pair": 8,
+          "variant": "baseline",
+          "p50_ns": 59700,
+          "p95_ns": 90400,
+          "scans_per_second": 14354.479075954334
+        }
+      ],
+      "summary": {
+        "p50_ns": {
+          "baseline_median": 59550.0,
+          "candidate_median": 59700.0,
+          "change_percent": 0.25
+        },
+        "p95_ns": {
+          "baseline_median": 81000.0,
+          "candidate_median": 84450.0,
+          "change_percent": 4.26
+        },
+        "candidate_faster_p50_pairs": 4
+      }
+    }
+  ],
+  "correctness": "All 61 ryme-storage tests pass. The three-way scan uses the existing tests for cross-segment updates, tombstones, expiry, snapshot timestamps, table bounds, and pagination.",
+  "caveat": "One Windows host, warm-cache in-process scan benchmark. The 100-delta heap-path control had flat p50 but noisy p95; candidate control medians were 4-25% higher across three small cohorts. Treat this as an unresolved tail-variation risk and rerun on controlled hardware before generalizing."
+}

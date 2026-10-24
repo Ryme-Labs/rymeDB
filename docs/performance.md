@@ -653,6 +653,15 @@ tests cover overlapping keys, tombstones, expiry, read timestamps, and cursor
 pagination in the two-segment path. These are local warm-cache scans, not
 end-to-end SQL latency; see the [paired captures](../bench/results/segment-scan-two-way-merge-windows-20261024.json).
 
+For exactly two delta segments over a snapshot, a direct three-cursor merge
+reduced median p50 from 32.9 to 30.2 µs (8.1%) and p95 from 41.7 to 33.9 µs
+(18.8%) across eight alternating release pairs; all eight candidate p50
+captures were faster. The 100-delta heap-path control had effectively flat
+p50, but its p95 was noisy and candidate medians ranged 4–25% higher across
+three small control cohorts. This local result is specific to three segments
+and leaves a tail-variation risk for larger segment counts; see the [raw
+captures](../bench/results/segment-scan-three-way-merge-windows-20261024.json).
+
 A local three-pair batch comparison on the AMD Ryzen 5 4500 used one shard,
 one worker, 500 transactions × 64 distinct 128-byte writes, and no per-write
 fsync. All runs completed with zero failures. After removing the redundant

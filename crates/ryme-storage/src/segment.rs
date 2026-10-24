@@ -970,6 +970,9 @@ impl SegmentStore {
         if segments.len() == 2 {
             return Ok(Self::scan_two_segments(&segments, read_ts, now, limit));
         }
+        if segments.len() == 3 {
+            return Ok(Self::scan_three_segments(&segments, read_ts, now, limit));
+        }
 
         // Every segment is ordered by RecordKey. Merge the scoped key ranges
         // instead of materializing all visible rows before applying `limit`.
@@ -1083,6 +1086,64 @@ impl SegmentStore {
                         out.push((newer_key.pk.clone(), value));
                     }
                 }
+            }
+        }
+        out
+    }
+
+    fn scan_three_segments(
+        segments: &[(Arc<ImmutableSegment>, usize, usize)],
+        read_ts: u64,
+        now: u64,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut indices = [segments[0].1, segments[1].1, segments[2].1];
+        let ends = [segments[0].2, segments[1].2, segments[2].2];
+        let mut out = Vec::with_capacity(limit.min(1024));
+
+        let visible_value = |segment: &ImmutableSegment, key: &RecordKey| {
+            segment.engine.version_at(key, read_ts).map(|(_, value, expires_at)| {
+                if super::expiry_is_expired(expires_at, now) {
+                    None
+                } else {
+                    value
+                }
+            })
+        };
+
+        while out.len() < limit {
+            let mut minimum_pk: Option<&[u8]> = None;
+            for segment_index in 0..3 {
+                if indices[segment_index] >= ends[segment_index] {
+                    continue;
+                }
+                let pk = segments[segment_index].0.keys[indices[segment_index]].pk.as_slice();
+                if minimum_pk.is_none_or(|current| pk < current) {
+                    minimum_pk = Some(pk);
+                }
+            }
+            let Some(minimum_pk) = minimum_pk else {
+                break;
+            };
+
+            let mut chosen: Option<Option<Vec<u8>>> = None;
+            for segment_index in 0..3 {
+                if indices[segment_index] >= ends[segment_index] {
+                    continue;
+                }
+                let (segment, _, _) = &segments[segment_index];
+                let key = &segment.keys[indices[segment_index]];
+                if key.pk.as_slice() != minimum_pk {
+                    continue;
+                }
+                if chosen.is_none() {
+                    chosen = visible_value(segment, key);
+                }
+                indices[segment_index] += 1;
+            }
+
+            if let Some(Some(value)) = chosen {
+                out.push((minimum_pk.to_vec(), value));
             }
         }
         out
