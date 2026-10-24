@@ -247,6 +247,15 @@ large p95/p99 outlier, so no tail improvement is claimed. This is a warmed
 in-process result for batches of 256; larger batches and concurrent workloads
 need separate measurements. See the [raw captures](../bench/results/segment-readmany-map-reserve-windows-20261024.json).
 
+Because segment batches can be larger than SQL's usual 256-key chunks, the
+dedup map's initial reservation is capped at 256 entries and grows normally for
+larger unique batches. In three alternating 1,024-key Standard-mode pairs, the
+cap measured median shuffled read-only p50 5.7% lower for repeated keys and
+0.6% higher for unique keys (effectively flat); tail percentiles were noisy.
+This bounds speculative initial allocation for duplicate-heavy batches, not
+the final map size, and is not a general speedup claim. See the
+[raw captures](../bench/results/segment-readmany-map-reserve-cap-windows-20261024.json).
+
 Standard segment point reads previously Bloom-checked, binary-searched the
 segment key vector, then searched the same key in the segment engine. Removing
 the redundant vector search reduced read-only batched p50 from 490 µs to

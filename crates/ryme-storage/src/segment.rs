@@ -16,6 +16,7 @@ const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
 const MIN_SEGMENT_DEDUP_BATCH_READ: usize = 16;
+const MAX_SEGMENT_DEDUP_INITIAL_CAPACITY: usize = 256;
 const MAX_DELTA_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
@@ -778,7 +779,7 @@ impl SegmentStore {
                 let mut unique_indices = Vec::with_capacity(key_count);
                 let mut duplicate_indices = Vec::new();
                 let mut first_indices: HashMap<SegmentBatchKey<'a>, usize> =
-                    HashMap::with_capacity(key_count);
+                    HashMap::with_capacity(key_count.min(MAX_SEGMENT_DEDUP_INITIAL_CAPACITY));
                 for index in 0..key_count {
                     let key = key_at(index);
                     let batch_key = if same_scope {

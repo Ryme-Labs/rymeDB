@@ -1,0 +1,54 @@
+{
+  "benchmark": "standard-segment-batch-read-dedup-initial-reserve-cap",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_transaction_core",
+  "storage_mode": "standard",
+  "durability": "memory; WAL and segment sync disabled",
+  "iterations": 100,
+  "batch_size": 1024,
+  "candidates_per_iteration": 1024,
+  "value_bytes": 128,
+  "baseline_revision": "cf63e86",
+  "change": "Cap initial dedup HashMap reservation at 256 entries; the map grows normally if a batch has more unique keys.",
+  "workloads": {
+    "repeated_keys": {
+      "records": 64,
+      "shuffled_read_only_batched_read": {
+        "full_batch_reserve": [
+          { "p50_ns": 173300, "p95_ns": 200000, "p99_ns": 228000 },
+          { "p50_ns": 196500, "p95_ns": 316100, "p99_ns": 770700 },
+          { "p50_ns": 194600, "p95_ns": 408900, "p99_ns": 837200 }
+        ],
+        "reserve_cap_256": [
+          { "p50_ns": 183600, "p95_ns": 244700, "p99_ns": 307900 },
+          { "p50_ns": 196800, "p95_ns": 417600, "p99_ns": 1144200 },
+          { "p50_ns": 181200, "p95_ns": 313000, "p99_ns": 389500 }
+        ],
+        "median_capture_p50_change_percent": -5.7
+      }
+    },
+    "shuffled_unique_keys": {
+      "records": 1024,
+      "shuffled_read_only_batched_read": {
+        "full_batch_reserve": [
+          { "p50_ns": 471700, "p95_ns": 707900, "p99_ns": 994600 },
+          { "p50_ns": 472000, "p95_ns": 521000, "p99_ns": 571900 },
+          { "p50_ns": 463500, "p95_ns": 536100, "p99_ns": 615900 }
+        ],
+        "reserve_cap_256": [
+          { "p50_ns": 477800, "p95_ns": 621200, "p99_ns": 823300 },
+          { "p50_ns": 470300, "p95_ns": 576200, "p99_ns": 983600 },
+          { "p50_ns": 474700, "p95_ns": 620300, "p99_ns": 952600 }
+        ],
+        "median_capture_p50_change_percent": 0.6
+      }
+    }
+  },
+  "notes": "Three alternating release-build pairs per workload on one host. At 1,024 unique keys, the candidate map grows beyond its initial capacity; p50 was effectively unchanged. Run-to-run tail variation was substantial. The cap bounds only the initial reservation and does not limit the eventual map size or prove a total-memory ceiling. The benchmark excludes network latency, durable sync, cold disk, and concurrent writers."
+}
