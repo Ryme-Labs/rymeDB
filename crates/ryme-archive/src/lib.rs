@@ -132,7 +132,8 @@ fn valid_backup_id(backup_id: &str) -> bool {
 }
 
 fn valid_new_backup_id(backup_id: &str) -> bool {
-    valid_backup_id(backup_id) && !backup_id.contains('\\')
+    valid_backup_id(backup_id)
+        && backup_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn valid_sha256(digest: &str) -> bool {
@@ -536,6 +537,10 @@ mod tests {
     #[test]
     fn new_backup_ids_are_portable_and_legacy_ids_remain_valid() {
         assert!(!valid_new_backup_id(r"legacy\id"));
+        assert!(!valid_new_backup_id("legacy:id"));
+        assert!(!valid_new_backup_id("trailing."));
+        assert!(!valid_new_backup_id("unicode-λ"));
+        assert!(valid_new_backup_id("backup_2026-10"));
         assert!(valid_backup_id(r"legacy\id"));
 
         let manifest = BackupManifest {

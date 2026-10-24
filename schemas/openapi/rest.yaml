@@ -2804,6 +2804,11 @@ components:
       properties:
         backup_id:
           type: string
+          maxLength: 128
+          pattern: '^[A-Za-z0-9_-]+$'
+          description: >-
+            Optional archive ID. New IDs may contain only ASCII letters, digits,
+            underscores, and hyphens.
     SnapshotReceipt:
       type: object
       properties:
