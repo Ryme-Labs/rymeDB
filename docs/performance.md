@@ -143,6 +143,13 @@ seeded keys, measuring repeated-key batches. JSON reports the number of
 distinct keys per iteration. For example, use `--records 64 --candidates 1024`
 to measure 16 reads per distinct key while keeping batch size fixed.
 
+The same benchmark also reports a shuffled unique-key control. On the Windows
+Ryzen 5 4500 host above, two runs with 1,024 distinct keys in 256-key batches
+measured shuffled read-only p50 at 415–418 µs in Hot mode and about 565 µs in
+Standard mode. Ordered batches measured 117–119 µs and 373–389 µs respectively.
+This identifies an optimization target, not a before/after claim; see the
+[raw captures](../bench/results/txn-read-batch-unique-windows-20261024.json).
+
 On an AMD Ryzen 5 4500, two release captures with 64 records, 1,024 reads per
 iteration, and batches of 256 measured read-only batched p50 at 157–161 µs vs
 184–185 µs for individual reads in Hot mode (1.15–1.17×). Standard mode

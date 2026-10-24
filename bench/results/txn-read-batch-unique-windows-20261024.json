@@ -1,0 +1,43 @@
+{
+  "benchmark": "transaction-batch-read-shuffled-unique-keys",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "records": 1024,
+  "candidates_per_iteration": 1024,
+  "distinct_keys_per_iteration": 1024,
+  "iterations": 100,
+  "batch_size": 256,
+  "value_bytes": 128,
+  "notes": "Two sequential release captures per storage mode on the same host. Standard mode uses warmed segment cache and SyncPolicy::Never. The shuffled control measures 1,024 unique keys split into 256-key batches. In-process core benchmark only; not cold disk, network, or end-to-end RESP latency.",
+  "captures": [
+    {
+      "storage_mode": "hot",
+      "durability": "in_memory_only",
+      "read_only_batched_read": { "p50_ns": 118500, "p95_ns": 189300, "p99_ns": 266100, "rows_per_second": 7989264 },
+      "shuffled_read_only_batched_read": { "p50_ns": 415400, "p95_ns": 448800, "p99_ns": 598700, "rows_per_second": 2431657 }
+    },
+    {
+      "storage_mode": "hot",
+      "durability": "in_memory_only",
+      "read_only_batched_read": { "p50_ns": 117100, "p95_ns": 162800, "p99_ns": 218800, "rows_per_second": 8194688 },
+      "shuffled_read_only_batched_read": { "p50_ns": 417800, "p95_ns": 502600, "p99_ns": 557700, "rows_per_second": 2392697 }
+    },
+    {
+      "storage_mode": "standard",
+      "durability": "wal_and_segment_sync_disabled",
+      "read_only_batched_read": { "p50_ns": 388900, "p95_ns": 485000, "p99_ns": 702200, "rows_per_second": 2535268 },
+      "shuffled_read_only_batched_read": { "p50_ns": 565300, "p95_ns": 752900, "p99_ns": 1025800, "rows_per_second": 1727052 }
+    },
+    {
+      "storage_mode": "standard",
+      "durability": "wal_and_segment_sync_disabled",
+      "read_only_batched_read": { "p50_ns": 372700, "p95_ns": 427400, "p99_ns": 536900, "rows_per_second": 2674823 },
+      "shuffled_read_only_batched_read": { "p50_ns": 565800, "p95_ns": 637400, "p99_ns": 861800, "rows_per_second": 1767196 }
+    }
+  ]
+}
