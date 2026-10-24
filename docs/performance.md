@@ -228,6 +228,16 @@ about 518 µs, but there is no matching pre-change shuffled capture, so that
 number does not establish a before/after effect. Use the reproduction command
 above with `--records 64` for repeated keys and `--records 1024` for unique keys.
 
+For unsorted Standard segment batches, duplicate detection now hashes only the
+primary-key bytes when all keys share a tenant/database/table scope; mixed-scope
+batches continue to compare full record keys. Three alternating release-build
+pairs on the same Windows Ryzen 5 4500 host measured median read-only p50 18.6%
+lower for 64 keys repeated across 1,024 reads, and 10.3% lower for 1,024 shuffled
+unique keys. Unique-key p99 was noisy and 4.4% higher by median, so this result
+does not establish a tail-latency improvement. This is a warmed in-process
+Standard-mode benchmark with WAL and segment sync disabled, not networked or
+cold-disk latency; see the [raw captures](../bench/results/segment-readmany-primary-key-hash-windows-20261024.json).
+
 Standard segment point reads previously Bloom-checked, binary-searched the
 segment key vector, then searched the same key in the segment engine. Removing
 the redundant vector search reduced read-only batched p50 from 490 µs to

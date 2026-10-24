@@ -23,6 +23,12 @@ const MAX_SEGMENT_POINTER_BYTES: usize = 64;
 const DELTA_COMPACTION_MARKER_BYTES: usize = 4 + 2 + 8 + 8 + 8 + 4;
 static NEXT_SEGMENT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Eq, Hash, PartialEq)]
+enum SegmentBatchKey<'a> {
+    PrimaryKey(&'a [u8]),
+    Full(&'a RecordKey),
+}
+
 fn configure_private_file(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
@@ -762,15 +768,27 @@ impl SegmentStore {
                 }
             }
             if !strictly_ordered && !strictly_reversed {
+                let first = key_at(0);
+                let same_scope = (1..key_count).all(|index| {
+                    let key = key_at(index);
+                    key.tenant == first.tenant
+                        && key.database == first.database
+                        && key.table == first.table
+                });
                 let mut unique_indices = Vec::with_capacity(key_count);
                 let mut duplicate_indices = Vec::new();
-                let mut first_indices = HashMap::new();
+                let mut first_indices: HashMap<SegmentBatchKey<'a>, usize> = HashMap::new();
                 for index in 0..key_count {
                     let key = key_at(index);
-                    if let Some(first) = first_indices.get(key) {
+                    let batch_key = if same_scope {
+                        SegmentBatchKey::PrimaryKey(key.pk.as_slice())
+                    } else {
+                        SegmentBatchKey::Full(key)
+                    };
+                    if let Some(first) = first_indices.get(&batch_key) {
                         duplicate_indices.push((index, *first));
                     } else {
-                        first_indices.insert(key, index);
+                        first_indices.insert(batch_key, index);
                         unique_indices.push(index);
                     }
                 }
@@ -2302,6 +2320,32 @@ mod tests {
         let after_partial_cache_read = store.cache_stats();
         assert_eq!(after_partial_cache_read.hits - before_partial_cache_read.hits, 1);
         assert_eq!(after_partial_cache_read.misses - before_partial_cache_read.misses, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_batch_dedup_keeps_mixed_scopes_distinct() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-mixed-scope-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let item_key = RecordKey::new("tenant", "db", "items", b"same-pk");
+        let audit_key = RecordKey::new("tenant", "db", "audit", b"same-pk");
+        let mut engine = Engine::new();
+        engine.apply(item_key.clone(), 1, Some(b"item".to_vec())).unwrap();
+        engine.apply(audit_key.clone(), 1, Some(b"audit".to_vec())).unwrap();
+        store.write(1, &engine).unwrap();
+
+        let keys = (0..MIN_SEGMENT_DEDUP_BATCH_READ)
+            .map(|index| if index % 2 == 0 { item_key.clone() } else { audit_key.clone() })
+            .collect::<Vec<_>>();
+        let expected = (0..MIN_SEGMENT_DEDUP_BATCH_READ)
+            .map(|index| Some(if index % 2 == 0 { b"item".to_vec() } else { b"audit".to_vec() }))
+            .collect::<Vec<_>>();
+        assert_eq!(store.get_many(&keys, 1, 0).unwrap(), expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

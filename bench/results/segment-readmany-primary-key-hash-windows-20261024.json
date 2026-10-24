@@ -1,0 +1,52 @@
+{
+  "benchmark": "standard-segment-batch-read-scope-aware-primary-key-hash",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_transaction_core",
+  "storage_mode": "standard",
+  "durability": "memory; WAL and segment sync disabled",
+  "iterations": 100,
+  "batch_size": 256,
+  "candidates_per_iteration": 1024,
+  "value_bytes": 128,
+  "workloads": {
+    "repeated_keys": {
+      "records": 64,
+      "baseline": [
+        { "p50_ns": 244900, "p95_ns": 427700, "p99_ns": 636900 },
+        { "p50_ns": 220200, "p95_ns": 323600, "p99_ns": 420300 },
+        { "p50_ns": 216500, "p95_ns": 311500, "p99_ns": 363300 }
+      ],
+      "scope_aware_primary_key_hash": [
+        { "p50_ns": 196000, "p95_ns": 361600, "p99_ns": 386300 },
+        { "p50_ns": 179200, "p95_ns": 261700, "p99_ns": 279500 },
+        { "p50_ns": 177900, "p95_ns": 202800, "p99_ns": 259600 }
+      ],
+      "median_capture_p50_change_percent": -18.6,
+      "median_capture_p95_change_percent": -19.1,
+      "median_capture_p99_change_percent": -33.5
+    },
+    "shuffled_unique_keys": {
+      "records": 1024,
+      "baseline": [
+        { "p50_ns": 562200, "p95_ns": 700000, "p99_ns": 787700 },
+        { "p50_ns": 564600, "p95_ns": 822100, "p99_ns": 1179000 },
+        { "p50_ns": 565800, "p95_ns": 735300, "p99_ns": 832600 }
+      ],
+      "scope_aware_primary_key_hash": [
+        { "p50_ns": 496000, "p95_ns": 570200, "p99_ns": 597600 },
+        { "p50_ns": 521600, "p95_ns": 736000, "p99_ns": 869700 },
+        { "p50_ns": 506300, "p95_ns": 623600, "p99_ns": 986100 }
+      ],
+      "median_capture_p50_change_percent": -10.3,
+      "median_capture_p95_change_percent": -15.2,
+      "median_capture_p99_change_percent": 4.4
+    }
+  },
+  "notes": "Three alternating baseline/candidate release-build pairs per workload on the same host. Each capture uses the txn-read-batch benchmark with Standard storage and in-process reads; it does not include network latency, durable sync, or cold disk access. The candidate hashes primary-key bytes only when every key has the same tenant/database/table scope; mixed-scope batches retain full RecordKey equality. Unique-key p99 varied and its median was 4.4% higher, so no tail-latency improvement is claimed for that workload."
+}
