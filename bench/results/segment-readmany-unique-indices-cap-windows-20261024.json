@@ -1,0 +1,55 @@
+{
+  "experiment": "standard-segment-batch-unique-index-vector-initial-capacity",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_transaction_core",
+  "storage_mode": "standard",
+  "durability": "memory; WAL and segment sync disabled",
+  "iterations": 100,
+  "batch_size": 1024,
+  "candidates_per_iteration": 1024,
+  "value_bytes": 128,
+  "baseline_revision": "73e1046",
+  "candidate_change": "Cap unique_indices initial capacity at 256 entries, allowing the vector to grow for larger unique batches.",
+  "workloads": {
+    "repeated_keys": {
+      "records": 64,
+      "shuffled_read_only_batched_read": {
+        "baseline": [
+          { "p50_ns": 168800, "p95_ns": 227100, "p99_ns": 270500 },
+          { "p50_ns": 163300, "p95_ns": 218500, "p99_ns": 252000 },
+          { "p50_ns": 174800, "p95_ns": 201200, "p99_ns": 222800 }
+        ],
+        "candidate": [
+          { "p50_ns": 165400, "p95_ns": 209400, "p99_ns": 250700 },
+          { "p50_ns": 168900, "p95_ns": 203500, "p99_ns": 258000 },
+          { "p50_ns": 167200, "p95_ns": 223200, "p99_ns": 289200 }
+        ],
+        "median_capture_p50_change_percent": -0.9
+      }
+    },
+    "shuffled_unique_keys": {
+      "records": 1024,
+      "shuffled_read_only_batched_read": {
+        "baseline": [
+          { "p50_ns": 487700, "p95_ns": 660000, "p99_ns": 836800 },
+          { "p50_ns": 480600, "p95_ns": 730300, "p99_ns": 1154900 },
+          { "p50_ns": 484700, "p95_ns": 829300, "p99_ns": 1205400 }
+        ],
+        "candidate": [
+          { "p50_ns": 561400, "p95_ns": 928400, "p99_ns": 1037100 },
+          { "p50_ns": 538800, "p95_ns": 639500, "p99_ns": 780000 },
+          { "p50_ns": 538000, "p95_ns": 662100, "p99_ns": 779100 }
+        ],
+        "median_capture_p50_change_percent": 11.2
+      }
+    }
+  },
+  "decision": "Discarded. The repeated-key p50 was effectively unchanged, while every shuffled unique-key candidate capture regressed p50. Keep full unique_indices capacity for the larger unique-key path.",
+  "notes": "Three alternating release-build pairs per workload on one host. Tail percentiles are noisy. The benchmark measures warmed in-process Standard storage and excludes network latency, durable sync, cold disk, and concurrent writers."
+}

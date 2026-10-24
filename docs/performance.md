@@ -256,6 +256,12 @@ This bounds speculative initial allocation for duplicate-heavy batches, not
 the final map size, and is not a general speedup claim. See the
 [raw captures](../bench/results/segment-readmany-map-reserve-cap-windows-20261024.json).
 
+I also tested capping the `unique_indices` vector's initial capacity for
+1,024-key batches. The repeated-key p50 was effectively unchanged, while all
+three shuffled unique-key captures regressed p50 (median 11.2% higher), so that
+change was discarded and the vector keeps full batch capacity. See the
+[raw experiment](../bench/results/segment-readmany-unique-indices-cap-windows-20261024.json).
+
 Standard segment point reads previously Bloom-checked, binary-searched the
 segment key vector, then searched the same key in the segment engine. Removing
 the redundant vector search reduced read-only batched p50 from 490 µs to
