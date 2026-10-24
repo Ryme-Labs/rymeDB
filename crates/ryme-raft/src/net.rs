@@ -1276,7 +1276,7 @@ impl Node {
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(dir)?;
         let meta_path = dir.join("raft-meta.json");
-        let meta = match read_bounded_metadata(&meta_path, "raft metadata")? {
+        let mut meta = match read_bounded_metadata(&meta_path, "raft metadata")? {
             Some(raw) => serde_json::from_slice::<Meta>(&raw)
                 .map_err(|error| RymeError::Corrupt(format!("raft metadata: {error}")))?,
             None => {
@@ -1416,6 +1416,14 @@ impl Node {
         }
         if meta.commit_index > log_by_index.keys().next_back().copied().unwrap_or(0) {
             return Err(RymeError::Corrupt(String::from("raft commit index")));
+        }
+        let recovered_log_term = log_by_index.values().map(|entry| entry.term).max().unwrap_or(0);
+        if recovered_log_term > meta.term {
+            meta.term = recovered_log_term;
+            meta.voted_for = None;
+            let raw = serde_json::to_vec(&meta)
+                .map_err(|error| RymeError::Internal(error.to_string()))?;
+            persist_metadata_file(&meta_path, &raw)?;
         }
         let log: Vec<LogEntry> = log_by_index.into_values().collect();
         let mut applied = 0u64;
@@ -7408,6 +7416,30 @@ mod tests {
         assert!(
             matches!(result, Err(RymeError::Corrupt(message)) if message == "raft log metadata")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_recovers_term_from_log_when_metadata_was_not_advanced() {
+        let dir = temp_dir("log-term-recovery");
+        let mut wal = ryme_wal::Wal::open(&dir, 1024 * 1024).unwrap();
+        let payload = crate::encode_metadata(b"metadata").unwrap();
+        wal.append(2, &encode_log_frame(1, 2, &payload)).unwrap();
+        wal.sync().unwrap();
+        let meta =
+            Meta { term: 1, voted_for: Some(7), commit_index: 0, members: Vec::new(), joint: None };
+        persist_metadata_file(&dir.join("raft-meta.json"), &serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        let inner = node.inner.try_lock().unwrap();
+        assert_eq!(inner.term, 2);
+        assert_eq!(inner.voted_for, None);
+        drop(inner);
+        let persisted: Meta =
+            serde_json::from_slice(&std::fs::read(dir.join("raft-meta.json")).unwrap()).unwrap();
+        assert_eq!(persisted.term, 2);
+        assert_eq!(persisted.voted_for, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
