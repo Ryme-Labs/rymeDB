@@ -871,6 +871,13 @@ four-way scan is retained; results cover a warmed, single-threaded 100-row page
 over 10,000 snapshot rows with no concurrent writers. This is not evidence of a
 general database-wide speedup. See the [raw captures](../bench/results/segment-scan-four-way-merge-windows-20261024.json).
 
+A similar fixed five-way merge for a snapshot plus four deltas was tested with
+eight alternating release-build pairs. Median p50 improved 1.7%, but median
+p95 regressed 6.2% and was worse in six pairs, so the specialization was
+discarded. The existing generic heap merge remains for five segments. The
+correctness test still covers this five-segment shape with MVCC, expiry,
+tombstones, and cursor pagination. See the [raw captures](../bench/results/segment-scan-five-way-merge-windows-20261024.json).
+
 A candidate that removed `SegmentBatchKey`'s enum discriminant from hashing did
 not show a reliable gain. In Standard mode, repeated-key batch median p50
 improved 1.9% while p95 regressed 2.2%; the 1,024-key unique workload changed

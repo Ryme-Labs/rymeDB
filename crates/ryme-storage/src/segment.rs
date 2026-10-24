@@ -2745,6 +2745,52 @@ mod tests {
                 (b"d".to_vec(), b"D".to_vec()),
             ]
         );
+        store
+            .write_delta_owned_with_sync(
+                4,
+                vec![
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "items", b"a"),
+                        commit_ts: 4,
+                        value: Some(b"expired-newer".to_vec()),
+                        expires_at: 5,
+                    },
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "items", b"d"),
+                        commit_ts: 4,
+                        value: None,
+                        expires_at: 0,
+                    },
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "items", b"f"),
+                        commit_ts: 4,
+                        value: Some(b"F".to_vec()),
+                        expires_at: 0,
+                    },
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.scan("tenant", "db", "items", 4, 10_000, 10).unwrap(),
+            vec![
+                (b"b".to_vec(), b"B3".to_vec()),
+                (b"e".to_vec(), b"E".to_vec()),
+                (b"f".to_vec(), b"F".to_vec()),
+            ]
+        );
+        assert_eq!(
+            store.scan_after("tenant", "db", "items", 4, 10_000, b"b", 2).unwrap(),
+            vec![(b"e".to_vec(), b"E".to_vec()), (b"f".to_vec(), b"F".to_vec())]
+        );
+        assert_eq!(
+            store.scan("tenant", "db", "items", 3, 10_000, 10).unwrap(),
+            vec![
+                (b"b".to_vec(), b"B3".to_vec()),
+                (b"d".to_vec(), b"D".to_vec()),
+                (b"e".to_vec(), b"E".to_vec()),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

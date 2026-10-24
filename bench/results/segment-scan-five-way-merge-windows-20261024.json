@@ -1,0 +1,48 @@
+{
+  "experiment": "segment-scan-five-way-merge",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "909e0f7",
+  "candidate_revision": "working-tree-experiment",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "architecture": "x86_64",
+    "os": "Windows 11"
+  },
+  "workload": {
+    "benchmark": "ryme-bench segment-scan",
+    "snapshot_rows": 10000,
+    "delta_segments": 4,
+    "segments_merged": 5,
+    "limit": 100,
+    "iterations_per_capture": 500,
+    "concurrency": 1,
+    "segment_cache_bytes": 67108864,
+    "durability": "local segment files with warmed in-process cache; no concurrent writers",
+    "timing": "per-scan p50/p95"
+  },
+  "candidate_change": "Add a fixed five-way merge for exactly five sorted segments instead of the generic heap merge.",
+  "summary": {
+    "baseline_median_p50_ns": 34600,
+    "candidate_median_p50_ns": 34000,
+    "p50_change_percent": -1.7,
+    "baseline_median_p95_ns": 40500,
+    "candidate_median_p95_ns": 43000,
+    "p95_change_percent": 6.2,
+    "p50_pairs_candidate_faster": 5,
+    "p50_pairs_candidate_slower": 2,
+    "p50_pairs_tied": 1,
+    "p95_pairs_candidate_faster": 2,
+    "decision": "Discarded. Small median p50 improvement was outweighed by a 6.2% median p95 regression; p95 was worse in six of eight pairs."
+  },
+  "captures": [
+    {"pair":1,"baseline":{"p50_ns":34900,"p95_ns":39400,"scans_per_second":25382.772204849123},"candidate":{"p50_ns":33600,"p95_ns":39500,"scans_per_second":26416.310486746937}},
+    {"pair":2,"baseline":{"p50_ns":33800,"p95_ns":38500,"scans_per_second":26243.137419564784},"candidate":{"p50_ns":35200,"p95_ns":44600,"scans_per_second":24888.49952214081}},
+    {"pair":3,"baseline":{"p50_ns":33400,"p95_ns":38700,"scans_per_second":26506.91830567778},"candidate":{"p50_ns":34100,"p95_ns":42600,"scans_per_second":26166.77656712825}},
+    {"pair":4,"baseline":{"p50_ns":34600,"p95_ns":46200,"scans_per_second":25478.61579776094},"candidate":{"p50_ns":33700,"p95_ns":43400,"scans_per_second":26213.55660293277}},
+    {"pair":5,"baseline":{"p50_ns":34600,"p95_ns":41600,"scans_per_second":25982.259313340848},"candidate":{"p50_ns":33900,"p95_ns":42500,"scans_per_second":26178.421650601842}},
+    {"pair":6,"baseline":{"p50_ns":34400,"p95_ns":38600,"scans_per_second":25383.803102916092},"candidate":{"p50_ns":34400,"p95_ns":50800,"scans_per_second":24245.245507356005}},
+    {"pair":7,"baseline":{"p50_ns":35400,"p95_ns":45100,"scans_per_second":24079.790794777575},"candidate":{"p50_ns":34200,"p95_ns":47700,"scans_per_second":24828.435510621606}},
+    {"pair":8,"baseline":{"p50_ns":34600,"p95_ns":45600,"scans_per_second":25228.316262172662},"candidate":{"p50_ns":33800,"p95_ns":37900,"scans_per_second":26519.712102005422}}
+  ]
+}
