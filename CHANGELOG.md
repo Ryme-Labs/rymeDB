@@ -43,6 +43,10 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- Standard-mode batch reads inspect cached segments in eight-segment windows
+  for large key batches. On an eight-client, 80-segment local MGET workload this
+  raised median throughput 22%, lowered p50 by 19% and p99 by 14%, and showed
+  a 12% p50 regression in a serial deep-chain microbenchmark.
 - Standard-mode batched reads reuse precomputed Bloom hashes across delta segments, reducing the 16-key, 80-segment in-process benchmark median p50 by 48% on an AMD Ryzen 5 4500.
 
 - HNSW graph scoring now uses single-precision accumulation for normalized

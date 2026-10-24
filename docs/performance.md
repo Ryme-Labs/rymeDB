@@ -53,12 +53,23 @@ p99 at 308–328 µs, with zero errors. This remains a localhost, memory-durabil
 smoke benchmark, not a production or cross-database comparison; see the
 [raw captures](../bench/results/resp-mget-standard-8clients.json).
 
-The Standard-mode batch-read path resolves all segment handles under one cache
-lock when the active segments are resident, instead of reacquiring the cache
-lock for each segment. With 80 active segments, eight clients, and 16-key MGETs,
-two local captures measured 41.8k–45.3k commands/s and p99 at 456–501 µs, with
-zero errors. Treat these as a local scaling baseline, not a cross-database
-comparison; see the [raw captures](../bench/results/resp-mget-standard-80segments-8clients.json).
+Large Standard-mode key batches now inspect cached segments in windows of
+eight, updating hit and LRU state only for segments the read visits. On the
+Windows Ryzen 5 4500, two baseline and three candidate release captures of an
+eight-client localhost workload (80 SET commits over 16 keys, then 16-key MGET,
+16,000 commands per capture, one shard, memory durability, dedicated-cluster
+QoS) measured median throughput rising from 34.8k to 42.3k commands/s. Median
+p50 fell from 212 to 172 µs and p99 from 473 to 406 µs, with zero failures.
+The candidate restarted against the same persisted data with an empty process
+cache; a 16,000-command warm-up preceded the three measured captures. These are
+local RESP results, not durable-write or cross-database evidence. A separate
+in-process 80-segment batch-read workload targeting older records measured median p50 rising from 36.1 to 40.5 µs (12%);
+the optimization trades some serial deep-chain batch latency for better
+multi-client MGET throughput and tail latency. Single and small-batch reads
+retain their point-cache lookup path. See the [raw before/after captures](../bench/results/resp-mget-standard-segment-cache-prefetch-windows-20261024.json).
+The earlier eager-cache measurements in
+[this capture](../bench/results/resp-mget-standard-80segments-8clients.json)
+predate lazy segment loading and are historical.
 
 To isolate the in-memory transaction core from networking and WAL durability:
 

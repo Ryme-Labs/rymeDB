@@ -16,6 +16,7 @@ const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
 const MIN_SEGMENT_DEDUP_BATCH_READ: usize = 16;
+const SEGMENT_CACHE_BULK_READ_CHUNK: usize = 8;
 const MAX_DELTA_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
@@ -176,6 +177,17 @@ impl SegmentReadCache {
             segments.push(segment);
         }
         segments
+    }
+
+    fn peek_many_cached(&self, ids: &[u64]) -> Vec<Option<Arc<ImmutableSegment>>> {
+        ids.iter().map(|id| self.entries.get(id).map(|entry| Arc::clone(&entry.segment))).collect()
+    }
+
+    fn record_many_hits(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.hits = self.hits.saturating_add(1);
+            self.touch(*id);
+        }
     }
 
     fn insert(&mut self, id: u64, segment: Arc<ImmutableSegment>, bytes: u64) {
@@ -656,6 +668,17 @@ impl SegmentStore {
         Some(self.cache.lock().ok()?.get_many_cached(&ids))
     }
 
+    fn peek_cached_segments(
+        &self,
+        paths: &[PathBuf],
+    ) -> Option<Vec<Option<Arc<ImmutableSegment>>>> {
+        let ids = paths
+            .iter()
+            .map(|path| parse_segment_name(path.file_name()?.to_str()?))
+            .collect::<Option<Vec<_>>>()?;
+        Some(self.cache.lock().ok()?.peek_many_cached(&ids))
+    }
+
     fn read_scan_segments(
         &self,
         tenant: &str,
@@ -785,7 +808,8 @@ impl SegmentStore {
             .read()
             .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
         let paths = self.newest_paths()?;
-        let key_hashes = if paths.len() > 1 && key_count >= MIN_SEGMENT_DEDUP_BATCH_READ {
+        let use_cached_bulk_lookup = paths.len() > 1 && key_count >= MIN_SEGMENT_DEDUP_BATCH_READ;
+        let key_hashes = if use_cached_bulk_lookup {
             let mut hashes = Vec::new();
             hashes
                 .try_reserve_exact(key_count)
@@ -800,27 +824,67 @@ impl SegmentStore {
             deduplicated.unwrap_or_else(|| ((0..key_count).collect(), Vec::new()));
         let mut next_unresolved = Vec::with_capacity(unresolved.len());
 
-        for path in paths.iter().rev() {
-            let segment = self.read_segment_under_lock(path)?;
-            let is_snapshot = segment.is_snapshot();
-            next_unresolved.clear();
-            for index in unresolved.drain(..) {
-                let key = key_at(index);
-                let version = match key_hashes.as_ref() {
-                    Some(hashes) => segment.version_at_prehashed(key, read_ts, hashes[index]),
-                    None => segment.version_at(key, read_ts),
+        let mut path_end = paths.len();
+        while path_end > 0 {
+            let chunk_size = if use_cached_bulk_lookup { SEGMENT_CACHE_BULK_READ_CHUNK } else { 1 };
+            let path_start = path_end.saturating_sub(chunk_size);
+            let chunk_paths = &paths[path_start..path_end];
+            let mut cached_segments = use_cached_bulk_lookup
+                .then(|| self.peek_cached_segments(chunk_paths))
+                .flatten()
+                .map(|segments| segments.into_iter().rev());
+            let mut cached_hits = Vec::new();
+            let mut stop = false;
+
+            for path in chunk_paths.iter().rev() {
+                let segment = match cached_segments.as_mut().and_then(Iterator::next).flatten() {
+                    Some(segment) => {
+                        cached_hits.push(segment.meta.id);
+                        segment
+                    }
+                    None => match self.read_segment_under_lock(path) {
+                        Ok(segment) => segment,
+                        Err(error) => {
+                            if !cached_hits.is_empty() {
+                                if let Ok(mut cache) = self.cache.lock() {
+                                    cache.record_many_hits(&cached_hits);
+                                }
+                            }
+                            return Err(error);
+                        }
+                    },
                 };
-                if let Some((_, value, expires_at)) = version {
-                    values[index] =
-                        if super::expiry_is_expired(expires_at, now) { None } else { value };
-                } else if !is_snapshot {
-                    next_unresolved.push(index);
+                let is_snapshot = segment.is_snapshot();
+                next_unresolved.clear();
+                for index in unresolved.drain(..) {
+                    let key = key_at(index);
+                    let version = match key_hashes.as_ref() {
+                        Some(hashes) => segment.version_at_prehashed(key, read_ts, hashes[index]),
+                        None => segment.version_at(key, read_ts),
+                    };
+                    if let Some((_, value, expires_at)) = version {
+                        values[index] =
+                            if super::expiry_is_expired(expires_at, now) { None } else { value };
+                    } else if !is_snapshot {
+                        next_unresolved.push(index);
+                    }
+                }
+                std::mem::swap(&mut unresolved, &mut next_unresolved);
+                if unresolved.is_empty() || is_snapshot {
+                    stop = true;
+                    break;
                 }
             }
-            std::mem::swap(&mut unresolved, &mut next_unresolved);
-            if unresolved.is_empty() || is_snapshot {
+
+            if !cached_hits.is_empty() {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.record_many_hits(&cached_hits);
+                }
+            }
+            if stop {
                 break;
             }
+            path_end = path_start;
         }
 
         for (duplicate, first) in duplicate_indices {
@@ -2318,21 +2382,27 @@ mod tests {
         let mut engine = Engine::new();
         engine.apply(key.clone(), 1, Some(b"old".to_vec())).unwrap();
         store.write(1, &engine).unwrap();
-        store
-            .write_delta(
-                2,
-                &[SegmentEntry {
-                    key: key.clone(),
-                    commit_ts: 2,
-                    value: Some(b"new".to_vec()),
-                    expires_at: 0,
-                }],
-            )
-            .unwrap();
+        for commit_ts in 2..=10 {
+            store
+                .write_delta(
+                    commit_ts,
+                    &[SegmentEntry {
+                        key: key.clone(),
+                        commit_ts,
+                        value: Some(commit_ts.to_string().into_bytes()),
+                        expires_at: 0,
+                    }],
+                )
+                .unwrap();
+        }
 
         assert_eq!(store.get(&key, 1, 0).unwrap(), Some(b"old".to_vec()));
         let before = store.cache_stats();
-        assert_eq!(store.get_many(&[key], 2, 0).unwrap(), vec![Some(b"new".to_vec())]);
+        let batch = vec![key; MIN_SEGMENT_DEDUP_BATCH_READ];
+        assert_eq!(
+            store.get_many(&batch, 10, 0).unwrap(),
+            vec![Some(b"10".to_vec()); MIN_SEGMENT_DEDUP_BATCH_READ]
+        );
         let after = store.cache_stats();
         assert_eq!(after.hits - before.hits, 1);
         assert_eq!(after.misses - before.misses, 0);
