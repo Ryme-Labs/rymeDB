@@ -243,13 +243,16 @@ pub fn encode_restore(target: u64) -> Vec<u8> {
 pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
     if input.first() == Some(&1u8) {
         let body = &input[1..];
-        if body.first() == Some(&b'[') {
+        let change = if body.first() == Some(&b'[') {
             let members: Vec<crate::net::Member> = serde_json::from_slice(body)
                 .map_err(|_| RymeError::Corrupt(String::from("conf")))?;
-            return Ok(ApplyPayload::Conf { change: ConfChange::single(members) });
+            ConfChange::single(members)
+        } else {
+            serde_json::from_slice(body).map_err(|_| RymeError::Corrupt(String::from("conf")))?
+        };
+        if change.old.is_empty() || change.new.as_ref().is_some_and(Vec::is_empty) {
+            return Err(RymeError::Corrupt(String::from("conf membership")));
         }
-        let change: ConfChange =
-            serde_json::from_slice(body).map_err(|_| RymeError::Corrupt(String::from("conf")))?;
         return Ok(ApplyPayload::Conf { change });
     }
     if input.first() == Some(&2u8) {
@@ -617,5 +620,18 @@ mod tests {
             ApplyPayload::Restore { target: 42 }
         );
         assert!(matches!(decode_apply(&[5, 0]), Err(RymeError::Corrupt(_))));
+    }
+
+    #[test]
+    fn configuration_payloads_reject_empty_membership_sets() {
+        for payload in [
+            br#"{"old":[],"new":null}"#.as_slice(),
+            br#"{"old":[{"id":1,"addr":"node"}],"new":[]}"#.as_slice(),
+            b"[]".as_slice(),
+        ] {
+            let mut encoded = vec![1];
+            encoded.extend_from_slice(payload);
+            assert!(matches!(decode_apply(&encoded), Err(RymeError::Corrupt(_))));
+        }
     }
 }
