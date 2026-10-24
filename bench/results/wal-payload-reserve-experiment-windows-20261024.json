@@ -1,0 +1,108 @@
+{
+  "experiment": "wal-payload-exact-reserve",
+  "command": "ryme-bench sharded-local --ops 2000 --concurrency 1 --shards 1 --value-bytes 128 --batch-size 8",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "baseline_revision": "3bf7fd2",
+  "baseline_runs": [
+    {
+      "qps": 4970.379180597578,
+      "transaction_qps": 621.2973975746972,
+      "sampled_p50_us": 1602,
+      "sampled_p95_us": 2098,
+      "sampled_p99_us": 2446,
+      "seconds": 3.2190703,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    },
+    {
+      "qps": 6044.249497250659,
+      "transaction_qps": 755.5311871563324,
+      "sampled_p50_us": 1269,
+      "sampled_p95_us": 1719,
+      "sampled_p99_us": 1862,
+      "seconds": 2.6471442,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    },
+    {
+      "qps": 6420.976302223155,
+      "transaction_qps": 802.6220377778943,
+      "sampled_p50_us": 1244,
+      "sampled_p95_us": 1537,
+      "sampled_p99_us": 1590,
+      "seconds": 2.4918329,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    }
+  ],
+  "candidate_change": "Precompute encoded write payload size, validate it against the WAL frame bound, and reserve its exact capacity before encoding. One unrecorded warmup run preceded the measured captures.",
+  "candidate_runs": [
+    {
+      "qps": 4859.146847396155,
+      "transaction_qps": 607.3933559245194,
+      "sampled_p50_us": 1655,
+      "sampled_p95_us": 2312,
+      "sampled_p99_us": 2345,
+      "seconds": 3.2927591,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    },
+    {
+      "qps": 5111.782217119244,
+      "transaction_qps": 638.9727771399055,
+      "sampled_p50_us": 1409,
+      "sampled_p95_us": 2134,
+      "sampled_p99_us": 2395,
+      "seconds": 3.1300238,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    },
+    {
+      "qps": 5476.813618589976,
+      "transaction_qps": 684.601702323747,
+      "sampled_p50_us": 1303,
+      "sampled_p95_us": 1853,
+      "sampled_p99_us": 1969,
+      "seconds": 2.9214067,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    },
+    {
+      "qps": 4572.631304108161,
+      "transaction_qps": 571.5789130135202,
+      "sampled_p50_us": 1517,
+      "sampled_p95_us": 3322,
+      "sampled_p99_us": 4749,
+      "seconds": 3.4990794,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    },
+    {
+      "qps": 5519.900067729173,
+      "transaction_qps": 689.9875084661467,
+      "sampled_p50_us": 1325,
+      "sampled_p95_us": 1929,
+      "sampled_p99_us": 2510,
+      "seconds": 2.8986032,
+      "successful_transactions": 2000,
+      "failed_transactions": 0
+    }
+  ],
+  "median_summary": {
+    "baseline_qps": 6044.249497250659,
+    "candidate_qps": 5111.782217119244,
+    "baseline_sampled_p50_us": 1269,
+    "candidate_sampled_p50_us": 1409,
+    "baseline_sampled_p95_us": 1719,
+    "candidate_sampled_p95_us": 2134,
+    "baseline_sampled_p99_us": 1862,
+    "candidate_sampled_p99_us": 2395
+  },
+  "result": "Candidate not retained. Results are noisy and runs were not interleaved; they show no evidence of a performance improvement.",
+  "caveat": "Hot-mode in-process benchmark, no fsync per write, 2000 transactions of eight 128-byte writes, one worker and one shard. Sampled latency captures 32 transactions at a stride of 64 and is not a stable tail-latency estimate."
+}

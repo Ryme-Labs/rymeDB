@@ -396,6 +396,16 @@ shard-placed tables, so larger batches exercise cross-shard coordination. Use
 `--shards 1` to isolate the single-shard batch path; benchmark table-local
 batches separately when that matches the application workload.
 
+An experiment to precompute and reserve the exact WAL write-payload size did
+not show a benefit. On a Windows Ryzen 5 4500, a single-shard Hot-mode run with
+one worker, 2,000 transactions, eight 128-byte writes per transaction, and no
+per-write fsync measured median throughput of 6,044 writes/s before and 5,112
+writes/s with the candidate. Median sampled p50 was 1,269 microseconds before
+and 1,409 microseconds with the candidate. These captures were sequential,
+not interleaved, and varied substantially; the candidate was discarded rather
+than treated as a performance improvement. The [raw captures](../bench/results/wal-payload-reserve-experiment-windows-20261024.json)
+record the run counts and benchmark limits.
+
 Standard-mode scans merge the sorted key ranges of their delta segments and
 resolve each key from newest to oldest at the requested snapshot. They stop
 after collecting the requested number of visible rows instead of materializing
