@@ -21,7 +21,8 @@
                      "commands_per_capture":  16000,
                      "pipeline":  1,
                      "latency_unit":  "command round trip",
-                     "cache":  "baseline 8-window and candidate 16-window captures used the same 80-segment data; the 16-window candidate was restarted with an empty process cache, then received a 16000-command warm-up before measured captures"
+                     "cache":  "baseline 8-window and candidate 16-window captures used the same 80-segment data; the 16-window candidate was restarted with an empty process cache, then received a 16000-command warm-up before measured captures",
+                 "attribution":  "Exploratory only: RESP MGET storage reads are dispatched in batches of four, below the cache-window optimization threshold of 16; these captures do not measure that optimization."
                  },
     "summary":  {
                     "network_mget":  {
