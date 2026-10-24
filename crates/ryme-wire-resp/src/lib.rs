@@ -5147,16 +5147,27 @@ where
         let start_text = std::str::from_utf8(&args[4]).map_err(|_| String::from("syntax"))?;
         let start = Self::parse_stream_id(start_text)?;
         let mut count = 100usize;
+        let mut just_id = false;
         let mut index = 5;
         while index < args.len() {
             let name = std::str::from_utf8(&args[index]).map_err(|_| String::from("syntax"))?;
+            if name.eq_ignore_ascii_case("JUSTID") {
+                just_id = true;
+                index += 1;
+                continue;
+            }
             if !name.eq_ignore_ascii_case("COUNT") {
                 return Err(String::from("syntax"));
             }
             index += 1;
             let raw = args.get(index).ok_or_else(|| String::from("syntax"))?;
             let text = std::str::from_utf8(raw).map_err(|_| String::from("syntax"))?;
-            count = text.parse::<usize>().map_err(|_| String::from("syntax"))?.min(10_000);
+            count = text
+                .parse::<usize>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| String::from("syntax"))?
+                .min(10_000);
             index += 1;
         }
         let mut data = self.read_stream(txn, &args[0])?.unwrap_or_default();
@@ -5185,7 +5196,9 @@ where
                 continue;
             }
             group.pending[slot].1.clone_from(&consumer);
-            group.pending[slot].2 += 1;
+            if !just_id {
+                group.pending[slot].2 = group.pending[slot].2.saturating_add(1);
+            }
             group.pending[slot].3 = now;
             group.consumers.entry(consumer.clone()).or_default().delivered_ms = Some(now);
             let claimed_id = group.pending[slot].0.clone();
@@ -5203,7 +5216,14 @@ where
         }
         self.write_stream(txn, &args[0], &data)?;
         let mut out = format!("*3\r\n${}\r\n{cursor}\r\n", cursor.len()).into_bytes();
-        out.extend_from_slice(&Self::encode_stream_entries(&claimed));
+        if just_id {
+            out.extend_from_slice(format!("*{}\r\n", claimed.len()).as_bytes());
+            for (id, _) in claimed {
+                out.extend_from_slice(format!("${}\r\n{id}\r\n", id.len()).as_bytes());
+            }
+        } else {
+            out.extend_from_slice(&Self::encode_stream_entries(&claimed));
+        }
         out.extend_from_slice(format!("*{}\r\n", orphans.len()).as_bytes());
         for orphan in orphans {
             out.extend_from_slice(&orphan);

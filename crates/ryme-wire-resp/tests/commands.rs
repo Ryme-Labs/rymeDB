@@ -943,6 +943,33 @@ async fn xautoclaim_removes_deleted_entries_from_pending_list() {
 }
 
 #[tokio::test]
+async fn xautoclaim_justid_returns_only_claimed_ids() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["XADD", "claim-justid", "1-1", "f", "a"]).await, "$3\r\n1-1");
+    assert_eq!(command(addr, &["XGROUP", "CREATE", "claim-justid", "workers", "0-0"]).await, "+OK");
+    assert!(command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "first", "STREAMS", "claim-justid", ">"]
+    )
+    .await
+    .contains("$3\r\n1-1"));
+
+    let claimed = command(
+        addr,
+        &["XAUTOCLAIM", "claim-justid", "workers", "second", "0", "0-0", "JUSTID"],
+    )
+    .await;
+    assert_eq!(claimed, "*3\r\n$3\r\n0-0\r\n*1\r\n$3\r\n1-1\r\n*0");
+    assert!(command(addr, &["XPENDING", "claim-justid", "workers"]).await.contains("*4\r\n:1"));
+    assert!(command(
+        addr,
+        &["XAUTOCLAIM", "claim-justid", "workers", "third", "0", "0-0", "COUNT", "0"]
+    )
+    .await
+    .starts_with("-ERR"));
+}
+
+#[tokio::test]
 async fn blocking_xread_pins_dollar_to_initial_stream_position() {
     let addr = serve().await;
     assert_eq!(
