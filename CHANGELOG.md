@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- The P-256 authentication dependency now resolves `crypto-bigint` 0.7.6,
+  which fixes its reported constant-time side-channel issues.
 - Archive restore now creates private staging and nested directories on Unix,
   protecting restored database files from other local users.
 - Windows atomic file replacement now rejects embedded NUL path characters
