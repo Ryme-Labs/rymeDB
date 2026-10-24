@@ -3238,7 +3238,11 @@ impl SharedState {
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or(ryme_error::RymeError::Unauthorized)?;
-            let token = value.strip_prefix("Bearer ").ok_or(ryme_error::RymeError::Unauthorized)?;
+            let (scheme, token) =
+                value.split_once(' ').ok_or(ryme_error::RymeError::Unauthorized)?;
+            if !scheme.eq_ignore_ascii_case("Bearer") {
+                return Err(ryme_error::RymeError::Unauthorized);
+            }
             if let Ok(principal) = self.keys.authenticate(token) {
                 return Ok(principal);
             }
@@ -3374,6 +3378,12 @@ mod websocket_credential_precedence_tests {
         project_headers.insert("apikey", HeaderValue::from_static("user-key"));
         let project_principal = state.principal(&project_headers).unwrap();
         assert_eq!(project_principal.id, "app-user");
+        let mut bearer_headers = HeaderMap::new();
+        bearer_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("bEaReR user-key"),
+        );
+        assert_eq!(state.principal(&bearer_headers).unwrap().id, "app-user");
         let websocket_principal =
             state.principal_for_websocket(&project_headers, Some("query-admin-key")).unwrap();
         assert_eq!(websocket_principal.id, "app-user");
