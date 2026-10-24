@@ -170,11 +170,10 @@ impl Wal {
         self.ensure_usable()?;
         let mut ids = segment_ids(&self.dir)?;
         ids.sort_unstable();
+        let latest_id = ids.last().copied();
         let mut obsolete = Vec::new();
+        let mut previous_lsn = None;
         for id in ids {
-            if id >= self.active_id {
-                continue;
-            }
             let path = self.dir.join(segment_name(id));
             let raw = read_segment_file(&path)?;
             let mut cursor = raw.as_slice();
@@ -183,15 +182,19 @@ impl Wal {
                 match decode_frame(cursor)? {
                     Some((record, consumed)) => {
                         cursor = &cursor[consumed..];
+                        if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
+                            return Err(RymeError::Corrupt(String::from("wal lsn order")));
+                        }
+                        previous_lsn = Some(record.lsn);
                         if record.commit_ts >= floor_commit_ts {
                             keep = true;
-                            break;
                         }
                     }
+                    None if Some(id) == latest_id => break,
                     None => return Err(RymeError::Corrupt(String::from("truncated wal segment"))),
                 }
             }
-            if !keep {
+            if id < self.active_id && !keep {
                 obsolete.push(path);
             }
         }
@@ -1007,6 +1010,33 @@ mod tests {
         std::fs::write(dir.join(segment_name(1)), encode_frame(1, 1, b"earlier").unwrap()).unwrap();
 
         assert!(matches!(Wal::open(&dir, 1024), Err(RymeError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_rejects_out_of_order_lsns_before_deleting_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-retain-lsn-order-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 64).unwrap();
+        for commit_ts in 1..=3 {
+            wal.append(commit_ts, b"x").unwrap();
+        }
+        wal.sync().unwrap();
+
+        let path = dir.join(segment_name(1));
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[8..16].copy_from_slice(&0u64.to_be_bytes());
+        let checksum_offset = raw.len() - WAL_FRAME_TRAILER_BYTES;
+        let checksum = crc32fast::hash(&raw[..checksum_offset]);
+        raw[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+        std::fs::write(path, raw).unwrap();
+
+        assert!(matches!(wal.truncate_below(10), Err(RymeError::Corrupt(_))));
+        assert_eq!(segment_ids(&dir).unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

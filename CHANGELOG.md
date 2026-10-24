@@ -54,6 +54,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- WAL retention now validates LSN ordering across all segments before deleting
+  any segment.
 - HTTP authentication now accepts the standard `apikey` header, and invalid
   WebSocket header credentials cannot fall back to anonymous query credentials.
 - HTTP Bearer authentication now treats the scheme name as case-insensitive.
