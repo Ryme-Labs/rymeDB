@@ -215,6 +215,13 @@ baseline capture, so treat it as directional, not a general speed claim. The
 optimization is for Hot-mode `Engine::read_many`; Standard segment reads follow
 a separate code path. See the [before/after captures](../bench/results/txn-read-batch-hot-duplicates-20261017.json).
 
+I tested replacing Hot-mode's duplicate-free `HashSet` check and subsequent
+dedup `HashMap` pass with one map pass. Three alternating release-build pairs
+on this host measured median shuffled read-only p50 1.9% higher for repeated
+keys and 4.3% higher for unique keys, so the candidate was discarded. The
+existing set check remains useful for batches without duplicates; see the
+[raw experiment](../bench/results/hot-readmany-single-pass-dedup-windows-20261024.json).
+
 Standard segment batch reads now bypass duplicate detection for strictly
 ascending and descending batches. For other batches of at least 16 keys, they
 resolve each distinct key once and fan its value back to duplicate positions.

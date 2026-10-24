@@ -1,0 +1,55 @@
+{
+  "experiment": "hot-read-many-single-pass-duplicate-detection",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_transaction_core",
+  "storage_mode": "hot",
+  "durability": "in_memory_only",
+  "iterations": 100,
+  "batch_size": 256,
+  "candidates_per_iteration": 1024,
+  "value_bytes": 128,
+  "baseline_revision": "2625103",
+  "candidate_change": "Replace the duplicate-detection HashSet pass plus conditional HashMap pass with one HashMap pass that records first indices.",
+  "workloads": {
+    "repeated_keys": {
+      "records": 64,
+      "shuffled_read_only_batched_read": {
+        "baseline": [
+          { "p50_ns": 175900, "p95_ns": 253400, "p99_ns": 343700 },
+          { "p50_ns": 170500, "p95_ns": 204500, "p99_ns": 229200 },
+          { "p50_ns": 172100, "p95_ns": 228100, "p99_ns": 268400 }
+        ],
+        "candidate": [
+          { "p50_ns": 188600, "p95_ns": 266300, "p99_ns": 305100 },
+          { "p50_ns": 175400, "p95_ns": 248500, "p99_ns": 266500 },
+          { "p50_ns": 173000, "p95_ns": 246400, "p99_ns": 275200 }
+        ],
+        "median_capture_p50_change_percent": 1.9
+      }
+    },
+    "shuffled_unique_keys": {
+      "records": 1024,
+      "shuffled_read_only_batched_read": {
+        "baseline": [
+          { "p50_ns": 395100, "p95_ns": 478300, "p99_ns": 534800 },
+          { "p50_ns": 396700, "p95_ns": 510600, "p99_ns": 561200 },
+          { "p50_ns": 384800, "p95_ns": 560700, "p99_ns": 711700 }
+        ],
+        "candidate": [
+          { "p50_ns": 412200, "p95_ns": 481700, "p99_ns": 635600 },
+          { "p50_ns": 409100, "p95_ns": 503300, "p99_ns": 882700 },
+          { "p50_ns": 412500, "p95_ns": 522100, "p99_ns": 627000 }
+        ],
+        "median_capture_p50_change_percent": 4.3
+      }
+    }
+  },
+  "decision": "Discarded. Median p50 regressed 1.9% for repeated keys and 4.3% for unique keys; retain the existing HashSet fast path for duplicate-free batches.",
+  "notes": "Three alternating release-build pairs per workload on one host. Tail percentiles varied. This is a local in-process Hot-mode benchmark, not networked database latency."
+}
