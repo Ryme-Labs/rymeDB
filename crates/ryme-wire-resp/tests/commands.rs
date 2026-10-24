@@ -717,6 +717,49 @@ async fn stream_ops() {
 }
 
 #[tokio::test]
+async fn stream_reads_treat_zero_count_as_unlimited() {
+    let addr = serve().await;
+    assert_eq!(
+        command(addr, &["XADD", "read-zero", "1-1", "f", "a"]).await,
+        "$3\r\n1-1"
+    );
+    assert_eq!(
+        command(addr, &["XADD", "read-zero", "2-2", "f", "b"]).await,
+        "$3\r\n2-2"
+    );
+
+    let xread = command(addr, &["XREAD", "COUNT", "0", "STREAMS", "read-zero", "0-0"]).await;
+    assert!(
+        xread.contains("$3\r\n1-1") && xread.contains("$3\r\n2-2"),
+        "XREAD: {xread}"
+    );
+
+    assert_eq!(
+        command(addr, &["XGROUP", "CREATE", "read-zero", "group-zero", "0-0"]).await,
+        "+OK"
+    );
+    let xreadgroup = command(
+        addr,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "group-zero",
+            "consumer-zero",
+            "COUNT",
+            "0",
+            "STREAMS",
+            "read-zero",
+            ">",
+        ],
+    )
+    .await;
+    assert!(
+        xreadgroup.contains("$3\r\n1-1") && xreadgroup.contains("$3\r\n2-2"),
+        "XREADGROUP: {xreadgroup}"
+    );
+}
+
+#[tokio::test]
 async fn xinfo_ops() {
     let addr = serve().await;
     assert_eq!(command(addr, &["DEL", "xi"]).await, ":0");

@@ -45,6 +45,7 @@ All notable changes to rymeDB are recorded here. Format follows
   unchanged when the command has invalid arity.
 - RESP `XRANGE` and `XREVRANGE` now match Redis for `COUNT 0` on existing and
   missing streams.
+- RESP `XREAD` and `XREADGROUP` now treat `COUNT 0` as unlimited, matching Redis.
 - RESP `PING` now echoes its optional message and rejects additional arguments.
 - RESP `PING` in Pub/Sub mode now returns the subscription-compatible `pong`
   array reply.

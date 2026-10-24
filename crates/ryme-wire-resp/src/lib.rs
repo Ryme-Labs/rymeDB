@@ -4065,6 +4065,9 @@ where
         if !streams.eq_ignore_ascii_case(b"STREAMS") {
             return Err(String::from("syntax"));
         }
+        if count == Some(0) {
+            count = None;
+        }
         Ok((count, block, index + 1))
     }
 
