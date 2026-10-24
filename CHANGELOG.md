@@ -58,6 +58,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Point-in-time restore now publishes its recovery pointer before pruning newer
+  snapshots, preserving the existing recovery point if publication fails.
 - Raft now broadcasts the committed index for membership changes before
   returning, so followers can apply the new quorum configuration before leader
   loss.

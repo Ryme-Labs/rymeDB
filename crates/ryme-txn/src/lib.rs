@@ -3604,6 +3604,14 @@ impl DurableManager {
         let dir = self.snapshot_dir();
         std::fs::create_dir_all(&dir)?;
         let path = write_snapshot_file(&dir, commit_ts, raw)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| RymeError::Internal(String::from("snapshot name")))?;
+        // Keep the currently published recovery point intact until the new
+        // pointer is durable. Pruning first can leave `latest` pointing at a
+        // deleted snapshot if pointer publication fails.
+        publish_snapshot_pointer(&dir, name)?;
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let candidate = entry.path();
@@ -3619,11 +3627,6 @@ impl DurableManager {
                 std::fs::remove_file(candidate)?;
             }
         }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| RymeError::Internal(String::from("snapshot name")))?;
-        publish_snapshot_pointer(&dir, name)?;
         Ok(())
     }
 
@@ -5961,6 +5964,27 @@ mod tests {
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"one".to_vec()));
         assert_eq!(reopened.get(&mut probe, &after).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_restore_pointer_publish_preserves_newer_snapshots() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-restore-pointer-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let snapshot_dir = manager.snapshot_dir();
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        let future = write_snapshot_file(&snapshot_dir, 20, b"future snapshot").unwrap();
+        std::fs::create_dir(snapshot_dir.join("latest")).unwrap();
+
+        assert!(manager.publish_restored_snapshot(10, 10, b"restored snapshot").is_err());
+        assert!(future.exists());
+
+        drop(manager);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
