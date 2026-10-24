@@ -4880,21 +4880,28 @@ where
                 seen.seen_ms = Some(now);
                 changed = true;
             }
-            let bound = if last == ">" {
-                Some(Self::parse_stream_id(&group.last).map_err(|_| String::from("corrupt"))?)
-            } else if last == "$" {
-                None
+            let new_messages = last == ">";
+            let bound = if new_messages {
+                Self::parse_stream_id(&group.last).map_err(|_| String::from("corrupt"))?
             } else {
-                Some(Self::parse_stream_id(last)?)
+                Self::parse_stream_id(last)?
+            };
+            let pending_ids: HashSet<&str> = if new_messages {
+                HashSet::new()
+            } else {
+                group
+                    .pending
+                    .iter()
+                    .filter(|(_, owner, _, _)| owner == &consumer_text)
+                    .map(|(id, _, _, _)| id.as_str())
+                    .collect()
             };
             let mut picked: Vec<&(String, StreamFields)> = Vec::new();
             for entry in data.entries.iter() {
                 let id = Self::parse_stream_id(&entry.0).map_err(|_| String::from("corrupt"))?;
-                let fresh = match bound {
-                    Some(floor) => id > floor,
-                    None => false,
-                };
-                if fresh {
+                let after_cursor = id > bound;
+                let belongs_to_consumer = new_messages || pending_ids.contains(entry.0.as_str());
+                if after_cursor && belongs_to_consumer {
                     picked.push(entry);
                     if count.is_some_and(|n| picked.len() >= n) {
                         break;
@@ -4909,7 +4916,9 @@ where
             }
             let max_id = picked.last().map(|(id, _)| id.clone()).unwrap_or_default();
             let delivered_at = Self::stream_now_ms();
-            group.read += picked.len() as u64;
+            if new_messages {
+                group.read += picked.len() as u64;
+            }
             group.consumers.entry(consumer_text.clone()).or_default().delivered_ms =
                 Some(delivered_at);
             for (id, _) in picked.iter() {
@@ -4927,7 +4936,7 @@ where
                     }
                 }
             }
-            if last == ">" {
+            if new_messages {
                 group.last = max_id;
             }
             self.write_stream(txn, key, &data)?;

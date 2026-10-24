@@ -52,6 +52,8 @@ All notable changes to rymeDB are recorded here. Format follows
   command-specific Redis semantics.
 - RESP `XREADGROUP` now rejects the `$` and `+` IDs, which are only valid for
   non-group `XREAD` reads.
+- RESP `XREADGROUP` history reads now return only pending entries owned by the
+  requesting consumer and leave the new-entry read counter unchanged.
 - RESP `XREAD` supports Redis's `+` cursor for returning only each stream's
   latest entry, independently of `COUNT`.
 - RESP `PING` now echoes its optional message and rejects additional arguments.

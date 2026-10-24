@@ -794,6 +794,36 @@ async fn stream_reads_treat_zero_count_as_unlimited() {
 }
 
 #[tokio::test]
+async fn xreadgroup_history_is_scoped_to_pending_consumer() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["XADD", "history", "1-1", "f", "a"]).await, "$3\r\n1-1");
+    assert_eq!(command(addr, &["XADD", "history", "2-2", "f", "b"]).await, "$3\r\n2-2");
+    assert_eq!(command(addr, &["XGROUP", "CREATE", "history", "workers", "0-0"]).await, "+OK");
+    assert!(command(addr, &["XREADGROUP", "GROUP", "workers", "alice", "STREAMS", "history", ">"])
+        .await
+        .contains("$3\r\n2-2"));
+
+    assert_eq!(
+        command(addr, &["XREADGROUP", "GROUP", "workers", "bob", "STREAMS", "history", "0-0"])
+            .await,
+        "*-1"
+    );
+    let alice_history = command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "alice", "STREAMS", "history", "1-1"],
+    )
+    .await;
+    assert!(alice_history.contains("$3\r\n2-2"), "reply: {alice_history}");
+    assert!(!alice_history.contains("$3\r\n1-1"), "reply: {alice_history}");
+
+    let pending = command(addr, &["XPENDING", "history", "workers"]).await;
+    assert!(pending.contains("$5\r\nalice"), "pending: {pending}");
+    assert!(!pending.contains("$3\r\nbob"), "pending: {pending}");
+    let groups = command(addr, &["XINFO", "GROUPS", "history"]).await;
+    assert!(groups.contains("$12\r\nentries-read\r\n:2"), "groups: {groups}");
+}
+
+#[tokio::test]
 async fn blocking_xread_pins_dollar_to_initial_stream_position() {
     let addr = serve().await;
     assert_eq!(
