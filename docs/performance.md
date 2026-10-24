@@ -238,6 +238,15 @@ does not establish a tail-latency improvement. This is a warmed in-process
 Standard-mode benchmark with WAL and segment sync disabled, not networked or
 cold-disk latency; see the [raw captures](../bench/results/segment-readmany-primary-key-hash-windows-20261024.json).
 
+The same deduplication map now reserves for the incoming batch size to avoid
+rehashing while registering unique keys. Three alternating release-build pairs
+on this host showed median shuffled read-only p50 8.8% lower for 64 keys
+repeated across 1,024 reads and 8.1% lower for 1,024 unique keys, with every
+paired p50 favoring the reserved map. One unique-key candidate capture had a
+large p95/p99 outlier, so no tail improvement is claimed. This is a warmed
+in-process result for batches of 256; larger batches and concurrent workloads
+need separate measurements. See the [raw captures](../bench/results/segment-readmany-map-reserve-windows-20261024.json).
+
 Standard segment point reads previously Bloom-checked, binary-searched the
 segment key vector, then searched the same key in the segment engine. Removing
 the redundant vector search reduced read-only batched p50 from 490 µs to

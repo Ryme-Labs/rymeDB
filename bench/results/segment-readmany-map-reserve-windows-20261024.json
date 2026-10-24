@@ -1,0 +1,54 @@
+{
+  "benchmark": "standard-segment-batch-read-dedup-map-reserve",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_transaction_core",
+  "storage_mode": "standard",
+  "durability": "memory; WAL and segment sync disabled",
+  "iterations": 100,
+  "batch_size": 256,
+  "candidates_per_iteration": 1024,
+  "value_bytes": 128,
+  "baseline_revision": "5665785",
+  "change": "Reserve the segment batch deduplication HashMap for the incoming batch size.",
+  "workloads": {
+    "repeated_keys": {
+      "records": 64,
+      "shuffled_read_only_batched_read": {
+        "baseline": [
+          { "p50_ns": 184300, "p95_ns": 236700, "p99_ns": 303300 },
+          { "p50_ns": 185000, "p95_ns": 303300, "p99_ns": 324500 },
+          { "p50_ns": 177400, "p95_ns": 212200, "p99_ns": 261100 }
+        ],
+        "reserved": [
+          { "p50_ns": 172100, "p95_ns": 268300, "p99_ns": 301200 },
+          { "p50_ns": 168100, "p95_ns": 215200, "p99_ns": 277000 },
+          { "p50_ns": 161100, "p95_ns": 183500, "p99_ns": 198500 }
+        ],
+        "median_capture_p50_change_percent": -8.8
+      }
+    },
+    "shuffled_unique_keys": {
+      "records": 1024,
+      "shuffled_read_only_batched_read": {
+        "baseline": [
+          { "p50_ns": 501900, "p95_ns": 602100, "p99_ns": 783700 },
+          { "p50_ns": 504400, "p95_ns": 667500, "p99_ns": 766000 },
+          { "p50_ns": 509700, "p95_ns": 601700, "p99_ns": 680500 }
+        ],
+        "reserved": [
+          { "p50_ns": 461600, "p95_ns": 554200, "p99_ns": 721900 },
+          { "p50_ns": 463600, "p95_ns": 513900, "p99_ns": 554100 },
+          { "p50_ns": 488300, "p95_ns": 946600, "p99_ns": 1097400 }
+        ],
+        "median_capture_p50_change_percent": -8.1
+      }
+    }
+  },
+  "notes": "Three alternating baseline/candidate release-build pairs per workload. Every p50 pair favored the reserved map. A unique-key candidate run had a large p95/p99 outlier, so tail-latency gains are not claimed. This warmed in-process benchmark excludes network latency, durable sync, cold disk, concurrent writers, and larger batch sizes."
+}

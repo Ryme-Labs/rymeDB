@@ -777,7 +777,8 @@ impl SegmentStore {
                 });
                 let mut unique_indices = Vec::with_capacity(key_count);
                 let mut duplicate_indices = Vec::new();
-                let mut first_indices: HashMap<SegmentBatchKey<'a>, usize> = HashMap::new();
+                let mut first_indices: HashMap<SegmentBatchKey<'a>, usize> =
+                    HashMap::with_capacity(key_count);
                 for index in 0..key_count {
                     let key = key_at(index);
                     let batch_key = if same_scope {
