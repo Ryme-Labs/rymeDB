@@ -60,6 +60,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Raft quorum simulation now ignores duplicate or invalid partition members, and
+  rejects replication attempts from unavailable nodes, non-leaders, or leaders
+  without a quorum.
 - Branch metadata can now be atomically updated on Windows when the destination
   file already exists.
 - Server metadata and keyring snapshots now use atomic replacement on Windows,

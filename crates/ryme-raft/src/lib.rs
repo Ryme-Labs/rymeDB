@@ -2,7 +2,7 @@ use ryme_error::{Result, RymeError};
 use ryme_storage::RecordKey;
 use ryme_txn::{decode_writes, encode_writes, TxnManager, WriteOp};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::net::ConfChange;
 
@@ -349,7 +349,13 @@ impl Cluster {
         }
         for cell in &self.cells {
             if cell.contains(&id) {
-                return cell.iter().copied().filter(|m| self.nodes[*m].alive).collect();
+                let mut seen = HashSet::with_capacity(cell.len());
+                return cell
+                    .iter()
+                    .copied()
+                    .filter(|member| seen.insert(*member))
+                    .filter(|member| self.nodes.get(*member).is_some_and(|node| node.alive))
+                    .collect();
             }
         }
         Vec::new()
@@ -434,6 +440,15 @@ impl Cluster {
     }
 
     pub fn replicate_from(&mut self, leader: usize) -> Result<()> {
+        if !self.nodes.get(leader).is_some_and(|node| node.alive) {
+            return Err(RymeError::Unavailable(String::from("leader down")));
+        }
+        if self.nodes[leader].group.role != Role::Leader {
+            return Err(RymeError::Unavailable(String::from("not leader")));
+        }
+        if self.reachable(leader).len() < self.nodes[leader].group.quorum {
+            return Err(RymeError::Unavailable(String::from("no quorum")));
+        }
         let term = self.nodes[leader].group.term;
         let commit = self.nodes[leader].group.commit_index;
         let log = self.nodes[leader].group.log.clone();
@@ -536,12 +551,14 @@ mod tests {
     fn replication_and_failover() {
         let mut cluster = Cluster::new(3).unwrap();
         assert!(cluster.elect(0));
+        assert!(matches!(cluster.replicate_from(1), Err(RymeError::Unavailable(_))));
         cluster.client_write(0, writes(vec![("k", "v1")])).unwrap();
         let key = RecordKey::new("t", "d", "s", b"k");
         for node in 0..3 {
             assert_eq!(cluster.read_latest(node, &key).unwrap(), Some(b"v1".to_vec()));
         }
         cluster.kill(0);
+        assert!(matches!(cluster.replicate_from(0), Err(RymeError::Unavailable(_))));
         assert!(cluster.elect(1));
         cluster.client_write(1, writes(vec![("k", "v2")])).unwrap();
         cluster.revive(0);
@@ -564,6 +581,27 @@ mod tests {
         cluster.replicate_from(1).unwrap();
         let key = RecordKey::new("t", "d", "s", b"k");
         assert_eq!(cluster.read_latest(0, &key).unwrap(), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn malformed_partition_members_cannot_create_a_quorum_or_panic() {
+        let mut cluster = Cluster::new(3).unwrap();
+        assert!(cluster.elect(0));
+        cluster.partition(vec![vec![0, 0, usize::MAX], vec![1, 2]]);
+
+        assert!(!cluster.elect(0));
+        assert!(matches!(cluster.replicate_from(0), Err(RymeError::Unavailable(_))));
+        assert!(cluster.elect(1));
+        cluster.client_write(1, writes(vec![("k", "committed")])).unwrap();
+        assert!(matches!(
+            cluster.replicate_from(usize::MAX),
+            Err(RymeError::Unavailable(_))
+        ));
+
+        cluster.heal();
+        cluster.replicate_from(1).unwrap();
+        let key = RecordKey::new("t", "d", "s", b"k");
+        assert_eq!(cluster.read_latest(0, &key).unwrap(), Some(b"committed".to_vec()));
     }
 
     #[test]
