@@ -1631,6 +1631,31 @@ mod tests {
     }
 
     #[test]
+    fn partitioned_single_term_search_uses_global_document_frequency() {
+        let mut single = IndexRegistry::new();
+        let mut partitioned = PartitionedIndex::new(4);
+        let ids =
+            [("repeated", 0), ("once", 3), ("background", 2)].map(|(prefix, target_partition)| {
+                (0..1_000)
+                    .map(|index| format!("{prefix}-{index:04}"))
+                    .find(|id| partitioned.route("s", id) == target_partition)
+                    .unwrap()
+            });
+        for (id, text) in ids.into_iter().zip(["needle needle", "needle", "background"]) {
+            single.text_index("s", id.clone(), text).unwrap();
+            partitioned.text_index("s", id, text).unwrap();
+        }
+
+        let expected = single.text_search("s", "needle", 10).unwrap();
+        let actual = partitioned.text_search("s", "needle", 10).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.id, expected.id);
+            assert!((actual.score - expected.score).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn exact_vector_top_k_orders_equal_scores_deterministically() {
         let mut registry = IndexRegistry::new();
         for id in ["z", "a", "m"] {
