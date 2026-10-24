@@ -5148,7 +5148,28 @@ where
             .map_err(|_| String::from("syntax"))?
             .max(0) as u64;
         let start_text = std::str::from_utf8(&args[4]).map_err(|_| String::from("syntax"))?;
-        let start = Self::parse_stream_id(start_text)?;
+        let (exclusive, start_text) = match start_text.strip_prefix('(') {
+            Some(id) if !id.is_empty() => (true, id),
+            Some(_) => return Err(String::from("syntax")),
+            None => (false, start_text),
+        };
+        let mut start = match start_text {
+            "-" if !exclusive => (0, 0),
+            "+" if !exclusive => (u64::MAX, u64::MAX),
+            _ => match start_text.split_once('-') {
+                Some(_) => Self::parse_stream_id(start_text)?,
+                None => (start_text.parse::<u64>().map_err(|_| String::from("syntax"))?, 0),
+            },
+        };
+        if exclusive {
+            if let Some(sequence) = start.1.checked_add(1) {
+                start.1 = sequence;
+            } else if let Some(milliseconds) = start.0.checked_add(1) {
+                start = (milliseconds, 0);
+            } else {
+                return Err(String::from("overflow"));
+            }
+        }
         let mut count = 100usize;
         let mut just_id = false;
         let mut index = 5;

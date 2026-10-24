@@ -1000,6 +1000,36 @@ async fn xautoclaim_cursor_includes_the_next_pending_id() {
 }
 
 #[tokio::test]
+async fn xautoclaim_accepts_exclusive_and_incomplete_start_ids() {
+    let addr = serve().await;
+    for id in ["1-1", "1-2", "2-0"] {
+        assert_eq!(command(addr, &["XADD", "claim-exclusive", id, "f", id]).await, format!("${}\r\n{}", id.len(), id));
+    }
+    assert_eq!(command(addr, &["XGROUP", "CREATE", "claim-exclusive", "workers", "0-0"]).await, "+OK");
+    assert!(command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "first", "STREAMS", "claim-exclusive", ">"]
+    )
+    .await
+    .contains("$3\r\n2-0"));
+
+    let exclusive = command(
+        addr,
+        &["XAUTOCLAIM", "claim-exclusive", "workers", "second", "0", "(1-1", "COUNT", "1"],
+    )
+    .await;
+    assert!(exclusive.contains("$3\r\n1-2"), "exclusive start: {exclusive}");
+    assert!(!exclusive.contains("$3\r\n1-1"), "exclusive start returned boundary: {exclusive}");
+
+    let incomplete = command(
+        addr,
+        &["XAUTOCLAIM", "claim-exclusive", "workers", "third", "0", "2", "COUNT", "1"],
+    )
+    .await;
+    assert!(incomplete.contains("$3\r\n2-0"), "incomplete start: {incomplete}");
+}
+
+#[tokio::test]
 async fn xautoclaim_bounds_scans_of_entries_below_idle_threshold() {
     let addr = serve().await;
     for n in 1..=11 {

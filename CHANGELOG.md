@@ -52,6 +52,7 @@ All notable changes to rymeDB are recorded here. Format follows
   Redis.
 - RESP `XAUTOCLAIM` now registers its target consumer even when it finds no
   eligible pending entries.
+- RESP `XAUTOCLAIM` now accepts exclusive and millisecond-only start IDs.
 - RESP `CLIENT HELP` now rejects unexpected arguments.
 - RESP `PFMERGE` now requires at least one source key and leaves the destination
   unchanged when the command has invalid arity.
