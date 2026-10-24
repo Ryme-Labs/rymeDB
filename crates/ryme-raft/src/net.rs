@@ -224,12 +224,14 @@ pub(crate) enum Rpc {
         snapshot: RangeSnapshot,
     },
     RangeInstallRequest {
+        sender: usize,
         snapshot: RangeSnapshot,
     },
     RangeInstallResponse {
         rows: u64,
     },
     RangePurgeRequest {
+        sender: usize,
         group_id: String,
         expected_epoch: u64,
         snapshot: RangeSnapshot,
@@ -2977,6 +2979,14 @@ impl Node {
         }
     }
 
+    async fn require_cluster_leader_sender(&self, sender: usize) -> Result<()> {
+        let inner = self.inner.lock().await;
+        if !inner.is_member(sender) || inner.leader_id != Some(sender) {
+            return Err(RymeError::Unavailable(String::from("cluster leader")));
+        }
+        Ok(())
+    }
+
     async fn handle_rpc(self: &Arc<Self>, rpc: Rpc) -> Result<Rpc> {
         match rpc {
             Rpc::VoteRequest { term, candidate, last_term, last_index } => {
@@ -3291,12 +3301,14 @@ impl Node {
                 )?;
                 Ok(Rpc::RangeSnapshotResponse { snapshot })
             }
-            Rpc::RangeInstallRequest { snapshot } => {
+            Rpc::RangeInstallRequest { sender, snapshot } => {
+                self.require_cluster_leader_sender(sender).await?;
                 let _commit = self.txn_commit_lock.lock().await;
                 let rows = self.install_range_snapshot(&snapshot)?;
                 Ok(Rpc::RangeInstallResponse { rows })
             }
-            Rpc::RangePurgeRequest { group_id, expected_epoch, snapshot } => {
+            Rpc::RangePurgeRequest { sender, group_id, expected_epoch, snapshot } => {
+                self.require_cluster_leader_sender(sender).await?;
                 let rows =
                     self.purge_range_after_transfer(&group_id, expected_epoch, &snapshot).await?;
                 Ok(Rpc::RangePurgeResponse { rows })
@@ -6532,7 +6544,7 @@ impl Node {
         snapshot: RangeSnapshot,
     ) -> Result<u64> {
         let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
-        match pool.roundtrip(&Rpc::RangeInstallRequest { snapshot }).await? {
+        match pool.roundtrip(&Rpc::RangeInstallRequest { sender: self.id, snapshot }).await? {
             Rpc::RangeInstallResponse { rows } => Ok(rows),
             _ => Err(RymeError::Corrupt(String::from("range install rpc"))),
         }
@@ -6546,7 +6558,14 @@ impl Node {
         snapshot: RangeSnapshot,
     ) -> Result<u64> {
         let pool = self.pool_for(peer).ok_or_else(|| RymeError::NotFound(String::from("peer")))?;
-        match pool.roundtrip(&Rpc::RangePurgeRequest { group_id, expected_epoch, snapshot }).await?
+        match pool
+            .roundtrip(&Rpc::RangePurgeRequest {
+                sender: self.id,
+                group_id,
+                expected_epoch,
+                snapshot,
+            })
+            .await?
         {
             Rpc::RangePurgeResponse { rows } => Ok(rows),
             _ => Err(RymeError::Corrupt(String::from("range purge rpc"))),
@@ -7852,6 +7871,91 @@ mod tests {
         assert_eq!(snapshot.snapshot_ts, 10);
         assert_eq!(snapshot.rows.len(), 1);
         assert_eq!(snapshot.rows[0].versions[0].value, Some(b"old".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn range_transfer_mutations_require_the_current_cluster_leader() {
+        let dir = temp_dir("range-transfer-rpc-auth");
+        let node = Node::open(
+            1,
+            vec![String::from("peer-0"), String::from("self"), String::from("peer-2")],
+            vec![0, 1, 2],
+            &dir,
+        )
+        .unwrap();
+        node.inner.lock().await.leader_id = Some(0);
+
+        let start = b"docs\0".to_vec();
+        let end = b"docs\0\xff".to_vec();
+        let existing = RecordKey::new("t", "d", "docs", b"existing");
+        let mut seed = BTreeMap::new();
+        seed.insert(existing.clone(), ryme_txn::WriteOp::put(b"keep".to_vec()));
+        node.manager.replay_at(10, &seed).unwrap();
+        node.set_range_owners(vec![RangeOwner {
+            id: String::from("range-a"),
+            start: start.clone(),
+            end: end.clone(),
+            routing_version: ryme_storage::LEGACY_ROUTING_VERSION,
+            owner: 0,
+            replicas: vec![0, 1],
+            epoch: 2,
+        }]);
+        let current = node
+            .snapshot_range_for_version(
+                ryme_storage::LEGACY_ROUTING_VERSION,
+                &start,
+                &end,
+                10,
+                100,
+                None,
+                None,
+            )
+            .unwrap();
+        let purge = node
+            .handle_rpc(Rpc::RangePurgeRequest {
+                sender: 2,
+                group_id: String::from("range-a"),
+                expected_epoch: 2,
+                snapshot: current.clone(),
+            })
+            .await;
+        assert!(matches!(purge, Err(RymeError::Unavailable(_))));
+        let mut probe = node.manager.begin();
+        assert_eq!(node.manager.get(&mut probe, &existing).unwrap(), Some(b"keep".to_vec()));
+
+        let incoming = RecordKey::new("t", "d", "docs", b"incoming");
+        let snapshot = RangeSnapshot {
+            start,
+            end,
+            routing_version: ryme_storage::LEGACY_ROUTING_VERSION,
+            snapshot_ts: 10,
+            applied_commit: 10,
+            rows: vec![RangeSnapshotRow {
+                tenant: incoming.tenant.clone(),
+                database: incoming.database.clone(),
+                table: incoming.table.clone(),
+                pk: incoming.pk.clone(),
+                value: b"forged".to_vec(),
+                expires_at: 0,
+                versions: vec![RangeSnapshotVersion {
+                    commit_ts: 10,
+                    value: Some(b"forged".to_vec()),
+                    expires_at: 0,
+                }],
+            }],
+            truncated: false,
+        };
+        let install = node.handle_rpc(Rpc::RangeInstallRequest { sender: 2, snapshot }).await;
+        assert!(matches!(install, Err(RymeError::Unavailable(_))));
+        let mut probe = node.manager.begin();
+        assert_eq!(node.manager.get(&mut probe, &incoming).unwrap(), None);
+
+        assert!(node.require_cluster_leader_sender(0).await.is_ok());
+        assert!(matches!(
+            node.require_cluster_leader_sender(3).await,
+            Err(RymeError::Unavailable(_))
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 

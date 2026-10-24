@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- Range snapshot installation and source cleanup reject requests whose declared
+  sender is not a current cluster member recognized as the Raft leader.
 - Lua `redis.call` and `redis.pcall` now enforce RESP argument-count and frame-size
   limits before copying script-generated command arguments.
 - Configured KMS keys now fail closed when invalid, and existing plaintext DEK
