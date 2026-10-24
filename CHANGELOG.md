@@ -50,6 +50,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Standard-mode range moves now preserve rows from multiple tables that share a
+  commit timestamp instead of replacing one table's delta segment with another.
 - Shard startup now ignores out-of-range owners for retired range IDs after a
   scale-down while still rejecting invalid active range ownership.
 - Standard storage recovery now rejects replicated transactions older than its

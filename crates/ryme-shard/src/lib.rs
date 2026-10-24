@@ -792,8 +792,7 @@ impl ShardSet {
             tables.extend(shard.spaces()?);
         }
         let old_ranges = if topology_recovered_from_assignments { ranges } else { &inner.ranges };
-        let mut moves: BTreeMap<(usize, usize, TableRef), ryme_storage::TableRows> =
-            BTreeMap::new();
+        let mut moves: BTreeMap<(usize, TableRef), ryme_storage::TableRows> = BTreeMap::new();
         for (tenant, database, table) in tables {
             for (source_index, source) in inner.shards.iter().enumerate() {
                 let rows = source.export_table(&tenant, &database, &table)?;
@@ -813,23 +812,29 @@ impl ShardSet {
                     let target = route_record(ranges, &key)?
                         .unwrap_or_else(|| hash_table(&table_ref, inner.shards.len()));
                     if target != source_index {
-                        moves
-                            .entry((source_index, target, table_ref))
-                            .or_default()
-                            .push((key.pk, versions));
+                        moves.entry((target, table_ref)).or_default().push((key.pk, versions));
                     }
                 }
             }
         }
 
+        let mut imports: BTreeMap<usize, Vec<(String, String, String, ryme_storage::TableRows)>> =
+            BTreeMap::new();
+        for ((target, table), rows) in moves {
+            imports.entry(target).or_default().push((
+                table.tenant,
+                table.database,
+                table.table,
+                rows,
+            ));
+        }
         let mut changed = HashSet::new();
-        for ((_source_index, target, table), rows) in moves {
+        for (target, tables) in imports {
             let destination = inner
                 .shards
                 .get(target)
                 .ok_or_else(|| RymeError::Unavailable(String::from("range shard")))?;
-            destination.import_table(&table.tenant, &table.database, &table.table, rows)?;
-
+            destination.import_tables(tables)?;
             changed.insert(target);
         }
         for index in changed {
@@ -1988,16 +1993,6 @@ mod tests {
             StorageMode::Standard,
         )
         .unwrap();
-        commit_table(&backend, "t", "d", "users", writes(vec![("a", "one"), ("z", "last")]));
-        backend
-            .set_range_topology(vec![RangePlacement {
-                id: String::from("users-all"),
-                start: Vec::new(),
-                end: Vec::new(),
-                routing_version: 0,
-                shard: 0,
-            }])
-            .unwrap();
         backend
             .set_range_topology(vec![
                 RangePlacement {
@@ -2012,6 +2007,33 @@ mod tests {
                     start: b"users\0m".to_vec(),
                     end: Vec::new(),
                     routing_version: 0,
+                    shard: 1,
+                },
+            ])
+            .unwrap();
+        let mut write_txn = backend.begin();
+        backend.put(&mut write_txn, RecordKey::new("t", "d", "users", b"a"), b"one".to_vec());
+        backend.put(&mut write_txn, RecordKey::new("t", "d", "users", b"z"), b"last".to_vec());
+        backend.put(
+            &mut write_txn,
+            RecordKey::new("t", "d", "widgets", b"w1"),
+            b"widget-one".to_vec(),
+        );
+        futures_executor_block_on(backend.commit(write_txn)).unwrap();
+        backend
+            .set_range_topology(vec![
+                RangePlacement {
+                    id: String::from("users-left"),
+                    start: Vec::new(),
+                    end: b"users\0a".to_vec(),
+                    routing_version: 0,
+                    shard: 0,
+                },
+                RangePlacement {
+                    id: String::from("users-right"),
+                    start: b"users\0a".to_vec(),
+                    end: Vec::new(),
+                    routing_version: 0,
                     shard: 0,
                 },
             ])
@@ -2024,6 +2046,29 @@ mod tests {
         assert_eq!(
             backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
             Some(b"last".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "widgets", b"w1")).unwrap(),
+            Some(b"widget-one".to_vec())
+        );
+        drop(txn);
+        drop(backend);
+        let backend = ShardSet::open_with_mode(
+            &dir,
+            2,
+            SyncPolicy::Never,
+            64 * 1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
+            Some(b"last".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "widgets", b"w1")).unwrap(),
+            Some(b"widget-one".to_vec())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

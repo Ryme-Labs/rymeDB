@@ -3063,39 +3063,43 @@ impl DurableManager {
         table: &str,
         rows: ryme_storage::TableRows,
     ) -> Result<u64> {
+        self.import_tables(vec![(
+            tenant.to_string(),
+            database.to_string(),
+            table.to_string(),
+            rows,
+        )])
+    }
+
+    /// Import table histories as one durable operation.
+    ///
+    /// Standard mode materializes the destination and publishes one new
+    /// snapshot, preserving rows from distinct tables with matching commit
+    /// timestamps.
+    pub fn import_tables(
+        &self,
+        tables: Vec<(String, String, String, ryme_storage::TableRows)>,
+    ) -> Result<u64> {
         self.ensure_persistence_healthy()?;
         if self.mode == StorageMode::Hot {
-            return self.inner.import_table(tenant, database, table, rows);
+            let mut max = 0u64;
+            for (tenant, database, table, rows) in tables {
+                max = max.max(self.inner.import_table(&tenant, &database, &table, rows)?);
+            }
+            return Ok(max);
         }
 
-        let mut deltas: BTreeMap<u64, Vec<SegmentEntry>> = BTreeMap::new();
-        let mut max = 0u64;
-        for (pk, versions) in rows {
-            let key = RecordKey {
-                tenant: tenant.to_string(),
-                database: database.to_string(),
-                table: table.to_string(),
-                pk,
-            };
-            for version in versions {
-                max = max.max(version.commit_ts);
-                deltas.entry(version.commit_ts).or_default().push(SegmentEntry {
-                    key: key.clone(),
-                    commit_ts: version.commit_ts,
-                    value: version.value,
-                    expires_at: version.expires_at,
-                });
-            }
-        }
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
-        for (commit_ts, entries) in deltas {
-            self.segments.write_delta_owned_with_sync(
-                commit_ts,
-                entries,
-                self.policy == SyncPolicy::Always,
-            )?;
+        let mut engine = self.materialized_segments()?;
+        let mut max = 0u64;
+        for (tenant, database, table, rows) in tables {
+            max = max.max(engine.import_table(&tenant, &database, &table, rows)?);
         }
+        if max == 0 {
+            return Ok(0);
+        }
+        self.segments.write_next_snapshot(&engine)?;
         self.inner.advance_to(max);
         Ok(max)
     }
@@ -3252,7 +3256,7 @@ impl DurableManager {
         }
         let raw = snapshot.encode_snapshot()?;
         let max = snapshot.max_commit_ts();
-        self.segments.write(max, &snapshot)?;
+        self.segments.write_next_snapshot(&snapshot)?;
         let dir = self.snapshot_dir();
         std::fs::create_dir_all(&dir)?;
         let path = write_snapshot_file(&dir, max, &raw)?;

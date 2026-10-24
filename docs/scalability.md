@@ -49,7 +49,9 @@ range state records the range bounds and owners. On restart, the shard set loads
 that last completed topology so it can reconcile control-plane placement and
 ignore stale copies when rebuilding ownership. Retired range assignments from
 removed shards are discarded during scale-down recovery; active range owners
-must still refer to configured shards.
+must still refer to configured shards. Standard-mode range moves publish the
+destination's merged history as a new snapshot; allow disk space for that
+temporary copy while a large destination is being rebalanced.
 
 ## Realtime fanout
 
