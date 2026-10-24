@@ -836,7 +836,7 @@ where
                 }
                 encode_simple("OK")
             }
-            b"HELP" => encode_raw_array(vec![
+            b"HELP" if command.args.len() == 1 => encode_raw_array(vec![
                 encode_bulk(b"CLIENT <subcommand> [<arg> [value] ...]"),
                 encode_bulk(b"SETNAME <name>"),
                 encode_bulk(b"GETNAME"),
@@ -844,6 +844,7 @@ where
                 encode_bulk(b"SETINFO <section> <value>"),
                 encode_bulk(b"HELP"),
             ]),
+            b"HELP" => encode_error(String::from("wrong args")),
             _ => encode_error(format!(
                 "unknown subcommand '{}'. Try CLIENT HELP.",
                 String::from_utf8_lossy(sub)

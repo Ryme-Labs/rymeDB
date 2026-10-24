@@ -178,6 +178,7 @@ async fn client_setinfo_accepted_like_drivers() {
     let addr = serve().await;
     assert_eq!(command(addr, &["CLIENT", "SETINFO", "LIB-NAME", "redis-py"]).await, "+OK");
     assert_eq!(command(addr, &["CLIENT", "SETINFO", "LIB-NAME", "x", "LIB-VER", "1"]).await, "+OK");
+    assert!(command(addr, &["CLIENT", "HELP", "extra"]).await.contains("wrong args"));
     assert!(command(addr, &["CLIENT", "FROBNICATE"]).await.contains("unknown subcommand"));
     assert!(command(addr, &["CLIENT"]).await.contains("wrong args"));
 }
