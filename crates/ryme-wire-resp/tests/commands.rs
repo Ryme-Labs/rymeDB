@@ -975,6 +975,19 @@ async fn xinfo_ops() {
     assert!(full.contains("$9\r\npel-count\r\n:2"), "full: {full}");
     let partial = command(addr, &["XINFO", "STREAM", "xi", "FULL", "COUNT", "1"]).await;
     assert!(partial.contains("$7\r\nentries\r\n*1"), "partial: {partial}");
+    for n in 3..=12 {
+        let id = format!("{n}-0");
+        assert_eq!(
+            command(addr, &["XADD", "xi", &id, "f", "v"]).await,
+            format!("${}\r\n{}", id.len(), id)
+        );
+    }
+    let default_count = command(addr, &["XINFO", "STREAM", "xi", "FULL"]).await;
+    assert!(default_count.contains("$7\r\nentries\r\n*10"), "default count: {default_count}");
+    let all_count = command(addr, &["XINFO", "STREAM", "xi", "FULL", "COUNT", "0"]).await;
+    assert!(all_count.contains("$7\r\nentries\r\n*12"), "zero count: {all_count}");
+    let negative_count = command(addr, &["XINFO", "STREAM", "xi", "FULL", "COUNT", "-1"]).await;
+    assert!(negative_count.contains("$7\r\nentries\r\n*10"), "negative count: {negative_count}");
     assert!(command(addr, &["XINFO", "STREAM", "ghost"]).await.starts_with("-ERR"));
     assert!(command(addr, &["XINFO", "GROUPS", "ghost"]).await.starts_with("-ERR"));
     assert!(command(addr, &["XINFO", "CONSUMERS", "ghost", "gg"]).await.starts_with("-ERR"));

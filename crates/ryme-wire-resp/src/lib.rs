@@ -5519,6 +5519,7 @@ where
                 .eq_ignore_ascii_case("FULL")
         {
             full = true;
+            count = Some(10);
             index += 1;
             if index < args.len() {
                 let name = std::str::from_utf8(&args[index]).map_err(|_| String::from("syntax"))?;
@@ -5528,8 +5529,8 @@ where
                 index += 1;
                 let raw = args.get(index).ok_or_else(|| String::from("syntax"))?;
                 let text = std::str::from_utf8(raw).map_err(|_| String::from("syntax"))?;
-                count =
-                    Some(text.parse::<usize>().map_err(|_| String::from("syntax"))?.min(10_000));
+                let parsed = text.parse::<i64>().map_err(|_| String::from("syntax"))?;
+                count = Some(if parsed < 0 { 10 } else { (parsed as usize).min(10_000) });
                 index += 1;
             }
         }
@@ -5556,7 +5557,7 @@ where
         .into_bytes();
         if full {
             let mut shown: Vec<&(String, StreamFields)> = data.entries.iter().collect();
-            if let Some(n) = count {
+            if let Some(n) = count.filter(|n| *n > 0) {
                 shown.truncate(n);
             }
             out.extend_from_slice(b"$7\r\nentries\r\n");
