@@ -43,6 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- HNSW graph scoring now uses single-precision accumulation for normalized
+  vector products; exact vector search keeps double-precision accumulation.
 - HNSW neighbor pruning scores adjacency lists without cloning them, reducing
   median build time by 19% in a three-run, 5,000-vector local benchmark.
 - Same-table shuffled batch reads hash primary-key bytes for duplicate detection,

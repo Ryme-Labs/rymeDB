@@ -182,7 +182,7 @@ fn projected_vector_index_bytes_with_limit(
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| (*x as f64) * (*y as f64)).sum()
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>() as f64
 }
 
 #[derive(Debug, Clone)]
@@ -1517,6 +1517,25 @@ mod tests {
         let scores: HashMap<_, _> = hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
         assert!((scores["x"] - 0.6).abs() < 1e-12);
         assert!((scores["y"] - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hnsw_dot_score_error_stays_bounded_at_supported_dimensions() {
+        let mut state = 0x8f3d_9a21_7c65_b401u64;
+        let mut next_value = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 32) as i32) as f32 / i32::MAX as f32
+        };
+
+        for dimension in [64, 384, MAX_DIM] {
+            let left =
+                normalize(&(0..dimension).map(|_| next_value()).collect::<Vec<_>>()).unwrap();
+            let right =
+                normalize(&(0..dimension).map(|_| next_value()).collect::<Vec<_>>()).unwrap();
+            let reference =
+                left.iter().zip(&right).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>();
+            assert!((dot(&left, &right) - reference).abs() <= 1e-4, "dimension {dimension}");
+        }
     }
 
     #[test]

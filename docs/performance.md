@@ -312,6 +312,17 @@ and 687–741 ms after; these index-only runs were not interleaved. See the
 [raw captures](../bench/results/vector-hnsw-neighbor-pruning-windows-20261024.json)
 and repeat on your own corpus.
 
+HNSW graph construction and traversal now accumulate `f32` products in `f32`;
+exact vector search and normalization retain `f64` accumulation. On the same
+Windows Ryzen 5 4500, three alternating 5,000-vector, 64-dimensional release
+captures reduced median build time from 630 ms to 547 ms (13.1%) and ANN p50
+from 166 µs to 142 µs (14.6%), with mean recall@10 unchanged at 0.979. A
+3,000-vector, 384-dimensional profile measured 1.318 s to 1.271 s median build
+time and 985 µs to 955 µs ANN p50, with mean recall@10 unchanged at 0.971.
+The precision test verifies absolute score error below 1e-4 for sampled
+normalized vectors at 64, 384, and 4,096 dimensions. These are local in-memory
+index measurements; see the [raw captures](../bench/results/vector-hnsw-f32-accumulation-windows-20261024.json).
+
 To measure full-text search when a common term matches every document:
 
 ```bash
