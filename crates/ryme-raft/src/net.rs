@@ -902,12 +902,47 @@ pub struct Member {
 pub(crate) fn valid_member_set(members: &[Member]) -> bool {
     if members.is_empty()
         || members.len() > MAX_RAFT_MEMBERS
-        || members.iter().any(|member| member.addr.len() > MAX_RAFT_MEMBER_ADDR_BYTES)
+        || members.iter().any(|member| {
+            member.addr.len() > MAX_RAFT_MEMBER_ADDR_BYTES
+                || (!member.addr.is_empty() && !valid_peer_address(&member.addr))
+        })
     {
         return false;
     }
     let mut ids = BTreeSet::new();
     members.iter().all(|member| ids.insert(member.id))
+}
+
+fn valid_peer_address(address: &str) -> bool {
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    if host.is_empty() || port == 0 {
+        return false;
+    }
+
+    if host.starts_with('[') {
+        return host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok());
+    }
+    if host.contains(':') || host.len() > 253 || !host.is_ascii() {
+        return false;
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+                && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+                && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -7298,6 +7333,35 @@ mod tests {
         assert!(matches!(decode_apply(&duplicate_ids), Err(RymeError::Corrupt(_))));
     }
 
+    #[test]
+    fn raft_member_addresses_require_a_valid_tcp_authority() {
+        for address in [
+            "localhost:9080",
+            "db-1.internal:9080",
+            "127.0.0.1:9080",
+            "[::1]:9080",
+            "[2001:db8::1]:65535",
+        ] {
+            assert!(valid_peer_address(address), "expected {address} to be valid");
+        }
+        for address in [
+            "",
+            "localhost",
+            ":9080",
+            "localhost:",
+            "localhost:not-a-port",
+            "localhost:0",
+            "localhost:65536",
+            "bad host:9080",
+            "bad..host:9080",
+            "2001:db8::1:9080",
+            "[not-ipv6]:9080",
+        ] {
+            assert!(!valid_peer_address(address), "expected {address} to be invalid");
+        }
+        assert!(!valid_member_set(&[Member { id: 1, addr: String::from("node:bad") }]));
+    }
+
     fn encode_untrusted_conf_change(change: &crate::ConfChange) -> Vec<u8> {
         let mut payload = vec![1];
         payload.extend_from_slice(&serde_json::to_vec(change).unwrap());
@@ -7556,6 +7620,7 @@ mod tests {
             ("self-in-peer-list", vec![String::from("127.0.0.1:1")], vec![0]),
             ("empty-peer-address", vec![String::new()], vec![1]),
             ("nul-peer-address", vec![String::from("127.0.0.1:1\0")], vec![1]),
+            ("malformed-peer-address", vec![String::from("127.0.0.1:not-a-port")], vec![1]),
         ];
         for (label, peers, peer_ids) in cases {
             let dir = temp_dir(label);
@@ -8196,7 +8261,7 @@ mod tests {
         let dir = temp_dir("range-transfer-rpc-auth");
         let node = Node::open(
             1,
-            vec![String::from("peer-0"), String::from("peer-2")],
+            vec![String::from("peer-0:9080"), String::from("peer-2:9080")],
             vec![0, 2],
             &dir,
         )
