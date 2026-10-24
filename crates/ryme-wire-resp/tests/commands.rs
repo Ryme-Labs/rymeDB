@@ -825,6 +825,12 @@ async fn xinfo_ops() {
     assert!(command(addr, &["XREADGROUP", "GROUP", "gg", "cc", "STREAMS", "xi", ">"])
         .await
         .starts_with("*1"));
+    assert!(command(addr, &["XREADGROUP", "GROUP", "gg", "cc", "STREAMS", "xi", "$"])
+        .await
+        .starts_with("-ERR"));
+    assert!(command(addr, &["XREADGROUP", "GROUP", "gg", "cc", "STREAMS", "xi", "+"])
+        .await
+        .starts_with("-ERR"));
     assert_eq!(
         command(addr, &["XINFO", "STREAM", "xi"]).await,
         "*20\r\n$6\r\nlength\r\n:2\r\n$15\r\nradix-tree-keys\r\n:2\r\n$16\r\nradix-tree-nodes\r\n:0\r\n$17\r\nlast-generated-id\r\n$3\r\n2-2\r\n$20\r\nmax-deleted-entry-id\r\n$3\r\n0-0\r\n$13\r\nentries-added\r\n:2\r\n$23\r\nrecorded-first-entry-id\r\n$3\r\n1-1\r\n$6\r\ngroups\r\n:1\r\n$11\r\nfirst-entry\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n$10\r\nlast-entry\r\n*1\r\n*2\r\n$3\r\n2-2\r\n*2\r\n$1\r\nf\r\n$1\r\nw"

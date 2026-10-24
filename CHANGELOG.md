@@ -50,6 +50,8 @@ All notable changes to rymeDB are recorded here. Format follows
   wake the read without replaying older entries.
 - RESP stream `COUNT` options now clamp negative integers to zero with the
   command-specific Redis semantics.
+- RESP `XREADGROUP` now rejects the `$` and `+` IDs, which are only valid for
+  non-group `XREAD` reads.
 - RESP `PING` now echoes its optional message and rejects additional arguments.
 - RESP `PING` in Pub/Sub mode now returns the subscription-compatible `pong`
   array reply.

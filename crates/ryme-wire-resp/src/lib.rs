@@ -4836,6 +4836,11 @@ where
         if rest.is_empty() || !rest.len().is_multiple_of(2) {
             return Err(String::from("syntax"));
         }
+        if rest[rest.len() / 2..].iter().any(|id| id.as_slice() == b"$" || id.as_slice() == b"+") {
+            return Err(String::from(
+                "invalid XREADGROUP ID; use '>' for new entries or an explicit ID for history",
+            ));
+        }
         Ok((count, block, index))
     }
 
