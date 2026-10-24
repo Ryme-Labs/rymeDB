@@ -1,0 +1,61 @@
+{
+  "benchmark": "transaction-batch-read-shuffled-unique-lookup-experiments",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "parameters": {
+    "storage_modes": ["hot", "standard"],
+    "records": 1024,
+    "candidates_per_iteration": 1024,
+    "iterations": 100,
+    "batch_size": 256,
+    "value_bytes": 128,
+    "workload": "shuffled unique same-table primary keys"
+  },
+  "sorted_ordered_walk_candidate": {
+    "description": "Sort unique keys and use the ordered BTreeMap range walk, then restore input order.",
+    "hot_baseline": [
+      { "p50_ns": 407900, "p95_ns": 569300, "p99_ns": 961900 },
+      { "p50_ns": 411400, "p95_ns": 548100, "p99_ns": 791100 }
+    ],
+    "hot_candidate": [
+      { "p50_ns": 615100, "p95_ns": 880400, "p99_ns": 1068200 },
+      { "p50_ns": 610200, "p95_ns": 730700, "p99_ns": 931100 }
+    ],
+    "standard_baseline": { "p50_ns": 449900, "p95_ns": 482500, "p99_ns": 779100 },
+    "standard_candidate": { "p50_ns": 462100, "p95_ns": 526500, "p99_ns": 674600 },
+    "decision": "Discard. Sorting plus ordered traversal was slower for shuffled keys; the scan reaches the gap fallback after extra work."
+  },
+  "direct_version_lookup_candidate": {
+    "description": "Use the map entry and MVCC version selector directly in unordered individual-read fallbacks.",
+    "hot_baseline": [
+      { "p50_ns": 405100, "p95_ns": 511900, "p99_ns": 615500 },
+      { "p50_ns": 417800, "p95_ns": 575300, "p99_ns": 657600 },
+      { "p50_ns": 387500, "p95_ns": 418000, "p99_ns": 438000 }
+    ],
+    "hot_candidate": [
+      { "p50_ns": 408000, "p95_ns": 500700, "p99_ns": 603400 },
+      { "p50_ns": 404900, "p95_ns": 460800, "p99_ns": 565600 },
+      { "p50_ns": 402600, "p95_ns": 590300, "p99_ns": 686800 }
+    ],
+    "standard_baseline": [
+      { "p50_ns": 460000, "p95_ns": 522400, "p99_ns": 914600 },
+      { "p50_ns": 462700, "p95_ns": 613800, "p99_ns": 764400 },
+      { "p50_ns": 454500, "p95_ns": 524400, "p99_ns": 594000 }
+    ],
+    "standard_candidate": [
+      { "p50_ns": 476800, "p95_ns": 840700, "p99_ns": 1009400 },
+      { "p50_ns": 475700, "p95_ns": 575200, "p99_ns": 698000 },
+      { "p50_ns": 473800, "p95_ns": 611300, "p99_ns": 717000 }
+    ],
+    "median_p50_change_percent": {
+      "hot": -0.05,
+      "standard": 3.4
+    },
+    "decision": "Discard. Hot-mode p50 was effectively flat and Standard-mode p50 regressed 3.4%."
+  },
+  "notes": "Release builds on one Windows host. Each timed sample covers 1,024 reads in four 256-key batches. Hot is in-memory only; Standard uses warmed segment cache with WAL and segment sync disabled. Results are in-process and do not represent network or durable-write latency."
+}

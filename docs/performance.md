@@ -228,6 +228,13 @@ from 212.2 µs in the single baseline capture. These are in-process results;
 the repeated-key comparison has one baseline capture, and per-capture p99 is
 noisy. See the [raw before/after captures](../bench/results/txn-read-batch-primary-key-hash-windows-20261024.json).
 
+Two follow-up approaches to shuffled unique-key batches were measured and
+discarded. Sorting keys before the ordered map walk raised Hot-mode p50 from a
+409.7 µs baseline median to 612.7 µs across two captures. Direct MVCC-version
+lookup in the individual-read fallback left Hot-mode p50 effectively flat and
+raised Standard-mode median p50 by 3.4% across three alternating pairs. The
+existing lookup path remains in place. See the [raw captures](../bench/results/txn-read-shuffled-lookup-experiments-windows-20261024.json).
+
 On an AMD Ryzen 5 4500, two release captures with 64 records, 1,024 reads per
 iteration, and batches of 256 measured read-only batched p50 at 157–161 µs vs
 184–185 µs for individual reads in Hot mode (1.15–1.17×). Standard mode
