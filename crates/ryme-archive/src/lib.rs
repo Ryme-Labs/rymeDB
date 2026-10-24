@@ -796,6 +796,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_backup_resumes_from_matching_destination_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-copy-resume-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let source = Archiver::new(LocalStore::new(root.join("primary")));
+        let manifest = source
+            .archive_files(
+                "resume",
+                11,
+                vec![
+                    (String::from("first"), b"one".to_vec()),
+                    (String::from("second"), b"two".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        let replica = LocalStore::new(root.join("replica"));
+        replica.put(&manifest.files[0].key, b"one".to_vec()).await.unwrap();
+
+        assert_eq!(copy_backup(source.store(), &replica, &manifest).await.unwrap(), 2);
+        assert_eq!(Archiver::new(replica).list_backups().await.unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn copy_backup_preserves_conflicting_destination_object() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-arch-copy-conflict-{}-{}",
+            std::process::id(),
+            now_unix_nanos()
+        ));
+        let source = Archiver::new(LocalStore::new(root.join("primary")));
+        let manifest = source
+            .archive_files("conflict", 13, vec![(String::from("state"), b"source".to_vec())])
+            .await
+            .unwrap();
+        let replica = LocalStore::new(root.join("replica"));
+        replica.put(&manifest.files[0].key, b"destination".to_vec()).await.unwrap();
+
+        assert!(matches!(
+            copy_backup(source.store(), &replica, &manifest).await,
+            Err(RymeError::Conflict(_))
+        ));
+        assert_eq!(replica.get(&manifest.files[0].key).await.unwrap(), b"destination");
+        assert!(matches!(replica.get(&manifest.manifest_key()).await, Err(RymeError::NotFound(_))));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn restore_detects_tamper() {
         let root = std::env::temp_dir().join(format!(
             "ryme-arch-tamper-{}-{}",
