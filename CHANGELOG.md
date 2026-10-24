@@ -46,6 +46,8 @@ All notable changes to rymeDB are recorded here. Format follows
   group's pending list when reporting them as deleted IDs.
 - RESP `XAUTOCLAIM JUSTID` now returns claimed IDs without incrementing their
   delivery counters.
+- RESP `XAUTOCLAIM` now treats its start cursor as inclusive and bounds pending
+  entry scans when entries have not reached the idle threshold.
 - RESP `CLIENT HELP` now rejects unexpected arguments.
 - RESP `PFMERGE` now requires at least one source key and leaves the destination
   unchanged when the command has invalid arity.

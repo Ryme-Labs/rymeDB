@@ -5184,15 +5184,20 @@ where
         let mut orphan_ids = HashSet::new();
         let mut cursor = String::from("0-0");
         let mut remaining = count;
+        let mut attempts_remaining = count.saturating_mul(10);
         for slot in order {
-            if remaining == 0 {
+            let id = Self::parse_stream_id(&group.pending[slot].0)
+                .map_err(|_| String::from("corrupt"))?;
+            if id < start {
+                continue;
+            }
+            if remaining == 0 || attempts_remaining == 0 {
                 cursor = group.pending[slot].0.clone();
                 break;
             }
+            attempts_remaining -= 1;
             let idle = now.saturating_sub(group.pending[slot].3);
-            let id = Self::parse_stream_id(&group.pending[slot].0)
-                .map_err(|_| String::from("corrupt"))?;
-            if id <= start || idle < min_idle {
+            if idle < min_idle {
                 continue;
             }
             group.pending[slot].1.clone_from(&consumer);

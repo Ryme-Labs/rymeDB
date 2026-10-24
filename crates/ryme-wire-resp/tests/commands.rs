@@ -970,6 +970,62 @@ async fn xautoclaim_justid_returns_only_claimed_ids() {
 }
 
 #[tokio::test]
+async fn xautoclaim_cursor_includes_the_next_pending_id() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["XADD", "claim-cursor", "1-1", "f", "a"]).await, "$3\r\n1-1");
+    assert_eq!(command(addr, &["XADD", "claim-cursor", "2-2", "f", "b"]).await, "$3\r\n2-2");
+    assert_eq!(command(addr, &["XGROUP", "CREATE", "claim-cursor", "workers", "0-0"]).await, "+OK");
+    assert!(command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "first", "STREAMS", "claim-cursor", ">"]
+    )
+    .await
+    .contains("$3\r\n2-2"));
+
+    let first = command(
+        addr,
+        &["XAUTOCLAIM", "claim-cursor", "workers", "second", "0", "0-0", "COUNT", "1"],
+    )
+    .await;
+    assert!(first.contains("$3\r\n2-2"), "next cursor: {first}");
+    assert!(first.contains("$3\r\n1-1"), "first claimed ID: {first}");
+
+    let second = command(
+        addr,
+        &["XAUTOCLAIM", "claim-cursor", "workers", "third", "0", "2-2", "COUNT", "1"],
+    )
+    .await;
+    assert!(second.contains("$3\r\n2-2"), "second claimed ID: {second}");
+    assert!(second.contains("$3\r\n0-0"), "terminal cursor: {second}");
+}
+
+#[tokio::test]
+async fn xautoclaim_bounds_scans_of_entries_below_idle_threshold() {
+    let addr = serve().await;
+    for n in 1..=11 {
+        let id = format!("{n}-0");
+        assert_eq!(
+            command(addr, &["XADD", "claim-idle", &id, "f", "v"]).await,
+            format!("${}\r\n{}", id.len(), id)
+        );
+    }
+    assert_eq!(command(addr, &["XGROUP", "CREATE", "claim-idle", "workers", "0-0"]).await, "+OK");
+    assert!(command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "first", "STREAMS", "claim-idle", ">"]
+    )
+    .await
+    .contains("$4\r\n11-0"));
+
+    let scanned = command(
+        addr,
+        &["XAUTOCLAIM", "claim-idle", "workers", "second", "99999999", "0-0", "COUNT", "1"],
+    )
+    .await;
+    assert!(scanned.starts_with("*3\r\n$4\r\n11-0\r\n*0\r\n*0"), "bounded scan: {scanned}");
+}
+
+#[tokio::test]
 async fn blocking_xread_pins_dollar_to_initial_stream_position() {
     let addr = serve().await;
     assert_eq!(
