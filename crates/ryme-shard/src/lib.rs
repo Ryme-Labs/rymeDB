@@ -2070,6 +2070,36 @@ mod tests {
             backend.get(&mut txn, &RecordKey::new("t", "d", "widgets", b"w1")).unwrap(),
             Some(b"widget-one".to_vec())
         );
+        drop(txn);
+        let manager = backend.shard_manager(1).unwrap();
+        manager.write_snapshot().unwrap();
+        manager.write_snapshot().unwrap();
+        drop(manager);
+        let mut next_write = backend.begin();
+        backend.put(
+            &mut next_write,
+            RecordKey::new("t", "d", "users", b"z"),
+            b"updated-after-move".to_vec(),
+        );
+        futures_executor_block_on(backend.commit(next_write)).unwrap();
+        drop(backend);
+        let backend = ShardSet::open_with_mode(
+            &dir,
+            2,
+            SyncPolicy::Never,
+            64 * 1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let mut txn = backend.begin();
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "users", b"z")).unwrap(),
+            Some(b"updated-after-move".to_vec())
+        );
+        assert_eq!(
+            backend.get(&mut txn, &RecordKey::new("t", "d", "widgets", b"w1")).unwrap(),
+            Some(b"widget-one".to_vec())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

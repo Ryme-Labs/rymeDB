@@ -537,23 +537,6 @@ impl SegmentStore {
         self.write_segment(segment, true, true)
     }
 
-    /// Write a snapshot after every segment currently in the store.
-    ///
-    /// The segment sequence ID is independent of the engine's commit timestamp,
-    /// so publishing the snapshot cannot collide with a delta at that timestamp.
-    pub fn write_next_snapshot(&self, engine: &Engine) -> Result<(SegmentMeta, PathBuf)> {
-        let next_id = discover_segment_paths(&self.dir)?
-            .iter()
-            .filter_map(|path| {
-                parse_segment_name(path.file_name().and_then(|name| name.to_str()).unwrap_or(""))
-            })
-            .max()
-            .map(|id| id.checked_add(1))
-            .unwrap_or(Some(0))
-            .ok_or_else(|| RymeError::Corrupt(String::from("segment id overflow")))?;
-        self.write(next_id, engine)
-    }
-
     pub fn write_delta(&self, id: u64, entries: &[SegmentEntry]) -> Result<SegmentMeta> {
         self.write_delta_with_sync(id, entries, true)
     }

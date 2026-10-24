@@ -3073,9 +3073,9 @@ impl DurableManager {
 
     /// Import table histories as one durable operation.
     ///
-    /// Standard mode materializes the destination and publishes one new
-    /// snapshot, preserving rows from distinct tables with matching commit
-    /// timestamps.
+    /// Standard mode materializes the destination and publishes one snapshot
+    /// at its latest commit timestamp, preserving rows from distinct tables
+    /// with matching timestamps.
     pub fn import_tables(
         &self,
         tables: Vec<(String, String, String, ryme_storage::TableRows)>,
@@ -3099,7 +3099,8 @@ impl DurableManager {
         if max == 0 {
             return Ok(0);
         }
-        self.segments.write_next_snapshot(&engine)?;
+        let snapshot_ts = engine.max_commit_ts();
+        self.segments.write(snapshot_ts, &engine)?;
         self.inner.advance_to(max);
         Ok(max)
     }
@@ -3256,7 +3257,7 @@ impl DurableManager {
         }
         let raw = snapshot.encode_snapshot()?;
         let max = snapshot.max_commit_ts();
-        self.segments.write_next_snapshot(&snapshot)?;
+        self.segments.write(max, &snapshot)?;
         let dir = self.snapshot_dir();
         std::fs::create_dir_all(&dir)?;
         let path = write_snapshot_file(&dir, max, &raw)?;
