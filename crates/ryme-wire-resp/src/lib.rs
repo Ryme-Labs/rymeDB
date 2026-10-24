@@ -1018,15 +1018,16 @@ where
                     return encode_error(String::from("pubsub lock"));
                 };
                 let pattern = args.get(1).map(Vec::as_slice).unwrap_or(b"*");
-                encode_raw_array(
-                    counts
-                        .iter()
-                        .filter(|((tenant, channel), count)| {
-                            tenant == &self.tenant && **count > 0 && glob_match(pattern, channel)
-                        })
-                        .map(|((_, channel), _)| encode_bulk(channel))
-                        .collect(),
-                )
+                let channels = counts
+                    .iter()
+                    .filter(|((tenant, channel), count)| {
+                        tenant == &self.tenant && **count > 0 && glob_match(pattern, channel)
+                    })
+                    .map(|((_, channel), _)| channel.as_slice());
+                match encode_pubsub_channels(channels) {
+                    Ok(reply) => reply,
+                    Err(error) => encode_error(error),
+                }
             }
             _ => encode_error(String::from("syntax error")),
         }
@@ -6834,6 +6835,27 @@ fn encode_raw_array(replies: Vec<Vec<u8>>) -> Vec<u8> {
     out
 }
 
+fn encode_pubsub_channels<'a>(
+    channels: impl IntoIterator<Item = &'a [u8]>,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut replies = Vec::new();
+    let mut item_bytes = 0usize;
+    for channel in channels {
+        let encoded = encode_bulk(channel);
+        item_bytes = next_resp_collection_bytes(item_bytes, encoded.len())?;
+        replies.push(encoded);
+    }
+    let header = format!("*{}\r\n", replies.len());
+    if item_bytes
+        .checked_add(header.len())
+        .filter(|bytes| *bytes <= RESP_MAX_COLLECTION_BYTES)
+        .is_none()
+    {
+        return Err(String::from("response exceeds the 16 MiB limit"));
+    }
+    Ok(encode_raw_array(replies))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -7495,6 +7517,21 @@ mod tests {
             gateway.subscribe(&[vec![b'x'; RESP_MAX_PUBSUB_NAME_BYTES + 1]], &mut client),
             b"-ERR pubsub channel or pattern is too long\r\n"
         );
+    }
+
+    #[test]
+    fn pubsub_channels_response_is_bounded_before_array_encoding() {
+        let channel = vec![b'x'; RESP_MAX_PUBSUB_NAME_BYTES];
+        let too_many =
+            std::iter::repeat_n(channel.as_slice(), RESP_MAX_GLOBAL_PUBSUB_SUBSCRIPTIONS);
+        assert_eq!(
+            encode_pubsub_channels(too_many).unwrap_err(),
+            "response exceeds the 16 MiB limit"
+        );
+
+        let reply = encode_pubsub_channels([b"orders".as_slice(), b"users".as_slice()]).unwrap();
+        assert!(reply.starts_with(b"*2\r\n"));
+        assert!(reply.len() < RESP_MAX_COLLECTION_BYTES);
     }
 
     #[test]
