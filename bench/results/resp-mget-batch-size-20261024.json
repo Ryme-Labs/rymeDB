@@ -1,0 +1,57 @@
+{
+  "benchmark": "resp-mget-batch-size",
+  "capture_date": "2026-10-24",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "workload": {
+    "server_mode": "standard",
+    "server_durability": "memory",
+    "qos_tier": "dedicated_cluster",
+    "topology": "single local node, one shard",
+    "active_delta_segments": 80,
+    "seeded_keys": 16,
+    "seed_commands": 80,
+    "seed_value_bytes": 16,
+    "request": "RESP MGET 16 keys",
+    "clients": 8,
+    "commands_per_capture": 16000,
+    "pipeline": 1,
+    "latency_unit": "command round trip",
+    "baseline": "commit 4092381, local storage batches of four keys",
+    "candidate": "same source except local MGET storage batches of 16 keys",
+    "cache": "Same persisted dataset; one 16000-command warm-up per configuration"
+  },
+  "summary": {
+    "batch4_median": {
+      "captures": 3,
+      "qps": 42231,
+      "p50_us": 173,
+      "p99_us": 397
+    },
+    "batch16_median": {
+      "captures": 6,
+      "qps": 40431,
+      "p50_us": 178.5,
+      "p99_us": 438
+    },
+    "interpretation": "The batch-16 run-to-run range was wide, with no convincing throughput or latency improvement. The existing four-key MGET batch size was retained. All captures had zero errors."
+  },
+  "batch4_captures": [
+    { "qps": 43917, "p50_us": 165, "p99_us": 392, "errors": 0 },
+    { "qps": 41627, "p50_us": 175, "p99_us": 406, "errors": 0 },
+    { "qps": 42231, "p50_us": 173, "p99_us": 397, "errors": 0 }
+  ],
+  "batch16_warmup": { "qps": 34779, "p50_us": 205, "p99_us": 549, "errors": 0 },
+  "batch16_captures": [
+    { "qps": 29634, "p50_us": 238, "p99_us": 744, "errors": 0 },
+    { "qps": 37274, "p50_us": 193, "p99_us": 488, "errors": 0 },
+    { "qps": 43709, "p50_us": 166, "p99_us": 378, "errors": 0 },
+    { "qps": 39606, "p50_us": 184, "p99_us": 443, "errors": 0 },
+    { "qps": 41256, "p50_us": 173, "p99_us": 433, "errors": 0 },
+    { "qps": 42773, "p50_us": 170, "p99_us": 386, "errors": 0 }
+  ]
+}

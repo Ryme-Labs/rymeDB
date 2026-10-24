@@ -66,6 +66,13 @@ and p99 at 403/397 microseconds. These differences are within run-to-run variati
 do not establish a speedup. The change also makes MGET's 16 MiB limit include
 RESP framing. See the [raw captures](../bench/results/resp-mget-array-encode-20261024.json).
 
+I also tested sending each 16-key local MGET as one storage batch, which would
+activate the segment layer's large-batch Bloom-hash reuse. Against the existing
+four-key MGET batches, six candidate captures were highly variable and had
+median p50/p99 of 178.5/438 microseconds versus 173/397 microseconds. This
+localhost workload did not show a reliable benefit, so the four-key batch size
+remains. See the [raw batch-size captures](../bench/results/resp-mget-batch-size-20261024.json).
+
 To isolate the in-memory transaction core from networking and WAL durability:
 
 ```bash
