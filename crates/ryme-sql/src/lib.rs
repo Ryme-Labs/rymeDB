@@ -18318,6 +18318,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_membership_changes_invalidate_cached_rls_policy_maps() {
+        let executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE scoped_docs (id TEXT PRIMARY KEY, owner_id TEXT)").unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(
+                parse(
+                    "INSERT INTO scoped_docs (id, owner_id) VALUES ('owned', 'user-a'), ('other', 'user-b')",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor.execute(parse("CREATE ROLE policy_reader").unwrap()).await.unwrap();
+        executor.execute(parse("CREATE ROLE app_user").unwrap()).await.unwrap();
+        executor
+            .execute(
+                parse(
+                    "CREATE POLICY reader_docs ON scoped_docs FOR SELECT TO policy_reader USING (auth.uid() = owner_id)",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("ALTER TABLE scoped_docs ENABLE ROW LEVEL SECURITY").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT SELECT ON TABLE scoped_docs TO app_user").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT policy_reader TO app_user").unwrap())
+            .await
+            .unwrap();
+
+        let app_user = executor
+            .clone()
+            .with_role(String::from("app_user"))
+            .with_auth_uid(String::from("user-a"));
+        let visible_rows = || parse("SELECT * FROM scoped_docs").unwrap();
+        let visible = app_user.execute(visible_rows()).await.unwrap();
+        assert!(matches!(
+            visible,
+            QueryResult::Rows { ref rows } if rows.len() == 1 && rows[0].0 == b"owned"
+        ));
+
+        executor.execute(parse("ALTER ROLE app_user NOINHERIT").unwrap()).await.unwrap();
+        let hidden = app_user.execute(visible_rows()).await.unwrap();
+        assert!(matches!(hidden, QueryResult::Rows { ref rows } if rows.is_empty()));
+
+        executor.execute(parse("ALTER ROLE app_user INHERIT").unwrap()).await.unwrap();
+        let visible_again = app_user.execute(visible_rows()).await.unwrap();
+        assert!(matches!(visible_again, QueryResult::Rows { ref rows } if rows.len() == 1));
+
+        executor
+            .execute(parse("REVOKE policy_reader FROM app_user").unwrap())
+            .await
+            .unwrap();
+        let hidden_after_revoke = app_user.execute(visible_rows()).await.unwrap();
+        assert!(matches!(hidden_after_revoke, QueryResult::Rows { ref rows } if rows.is_empty()));
+    }
+
+    #[tokio::test]
     async fn returning_requires_select_privilege_on_mutated_rows() {
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor
