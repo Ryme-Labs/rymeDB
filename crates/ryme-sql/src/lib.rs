@@ -18387,6 +18387,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_superusers_cannot_change_roles_or_privileges() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE public.docs (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        executor.execute(parse("CREATE ROLE app_user").unwrap()).await.unwrap();
+        executor.execute(parse("CREATE ROLE member_role").unwrap()).await.unwrap();
+
+        let app_user = executor.clone().with_role(String::from("app_user"));
+        for sql in [
+            "GRANT SELECT ON TABLE public.docs TO member_role",
+            "GRANT member_role TO app_user",
+            "CREATE ROLE escalated SUPERUSER",
+            "ALTER ROLE app_user NOINHERIT",
+            "DROP ROLE member_role",
+        ] {
+            assert!(
+                matches!(app_user.execute(parse(sql).unwrap()).await, Err(RymeError::Forbidden)),
+                "non-superuser executed {sql}"
+            );
+        }
+
+        let mut txn = app_user.begin_transaction(Isolation::Serializable);
+        assert!(matches!(
+            app_user
+                .execute_in_transaction(
+                    &mut txn,
+                    parse("GRANT SELECT ON TABLE public.docs TO app_user").unwrap()
+                )
+                .await,
+            Err(RymeError::Forbidden)
+        ));
+
+        let snapshot = executor.schema_snapshot();
+        assert!(!snapshot.roles.contains_key("escalated"));
+        assert!(!snapshot.privileges.iter().any(|grant| {
+            grant.object == "public.docs" && grant.grantee == "member_role"
+        }));
+        assert!(!snapshot.privileges.iter().any(|grant| {
+            grant.object_type == SQL_ROLE_MEMBERSHIP_OBJECT && grant.grantee == "app_user"
+        }));
+    }
+
+    #[tokio::test]
     async fn returning_requires_select_privilege_on_mutated_rows() {
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor
