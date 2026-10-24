@@ -62,6 +62,8 @@ All notable changes to rymeDB are recorded here. Format follows
   they can enter the committed log.
 - Raft now rejects recovered or replicated configuration entries with empty
   membership sets instead of applying an unusable cluster configuration.
+- Raft startup now rejects persisted joint membership metadata with an empty
+  member set.
 - Transaction apply and replay now validate every key and value before mutating
   storage, preventing malformed batches from partially changing engine state.
 - WAL retention now validates LSN ordering across all segments before deleting

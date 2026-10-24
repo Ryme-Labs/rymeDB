@@ -1286,6 +1286,11 @@ impl Node {
                 Meta { term: 0, voted_for: None, commit_index: 0, members: Vec::new(), joint: None }
             }
         };
+        if (meta.members.is_empty() && meta.joint.is_some())
+            || meta.joint.as_ref().is_some_and(Vec::is_empty)
+        {
+            return Err(RymeError::Corrupt(String::from("raft membership metadata")));
+        }
         let meta_fresh = meta.members.is_empty() && meta.joint.is_none();
         let mut members: Vec<Member> =
             peer_ids.into_iter().zip(peers).map(|(id, addr)| Member { id, addr }).collect();
@@ -7393,6 +7398,26 @@ mod tests {
         let result = Node::open(0, Vec::new(), Vec::new(), &dir);
         assert!(
             matches!(result, Err(RymeError::Corrupt(message)) if message.starts_with("raft metadata:"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_rejects_empty_joint_membership_metadata() {
+        let dir = temp_dir("empty-joint-meta");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = Meta {
+            term: 1,
+            voted_for: None,
+            commit_index: 0,
+            members: vec![Member { id: 0, addr: String::new() }],
+            joint: Some(Vec::new()),
+        };
+        std::fs::write(dir.join("raft-meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let result = Node::open(0, Vec::new(), Vec::new(), &dir);
+        assert!(
+            matches!(result, Err(RymeError::Corrupt(message)) if message == "raft membership metadata")
         );
         let _ = std::fs::remove_dir_all(dir);
     }
