@@ -1,0 +1,403 @@
+{
+  "experiment": "text-search-equal-two-term-posting-set-fast-path",
+  "date": "2026-10-24",
+  "baseline_revision": "e211593",
+  "candidate_revision": "working-tree-not-retained",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "architecture": "x86_64",
+    "os": "Windows"
+  },
+  "parameters": {
+    "documents": 10000,
+    "queries": 500,
+    "partitions": 4,
+    "top_k": 10,
+    "build_profile": "release",
+    "command": "ryme-bench text-index --documents 10000 --queries 500 --partitions 4 --top-k 10 --query-terms N --json",
+    "method": "Eight alternating baseline/candidate release pairs for each workload. Candidate detects equal posting ID sets, then directly scores two terms without constructing the document score map."
+  },
+  "two_term_common_workload": {
+    "query_terms": 2,
+    "baseline": [
+      {
+        "terms": 2,
+        "pair": 1,
+        "variant": "baseline",
+        "index_build_ns": 30098200,
+        "p50_ns": 772500,
+        "p95_ns": 1485900,
+        "p99_ns": 1767300,
+        "qps": 1112.9098206946471
+      },
+      {
+        "terms": 2,
+        "pair": 2,
+        "variant": "baseline",
+        "index_build_ns": 32040800,
+        "p50_ns": 679100,
+        "p95_ns": 1383100,
+        "p99_ns": 1764400,
+        "qps": 1233.0246415042507
+      },
+      {
+        "terms": 2,
+        "pair": 3,
+        "variant": "baseline",
+        "index_build_ns": 29079200,
+        "p50_ns": 684500,
+        "p95_ns": 1200400,
+        "p99_ns": 1509800,
+        "qps": 1271.5376221280098
+      },
+      {
+        "terms": 2,
+        "pair": 4,
+        "variant": "baseline",
+        "index_build_ns": 30985800,
+        "p50_ns": 695700,
+        "p95_ns": 1318900,
+        "p99_ns": 1646800,
+        "qps": 1228.3267879893224
+      },
+      {
+        "terms": 2,
+        "pair": 5,
+        "variant": "baseline",
+        "index_build_ns": 31747300,
+        "p50_ns": 682600,
+        "p95_ns": 1420500,
+        "p99_ns": 1841700,
+        "qps": 1200.8509710321123
+      },
+      {
+        "terms": 2,
+        "pair": 6,
+        "variant": "baseline",
+        "index_build_ns": 32052500,
+        "p50_ns": 652100,
+        "p95_ns": 1135100,
+        "p99_ns": 1415600,
+        "qps": 1350.0166592055746
+      },
+      {
+        "terms": 2,
+        "pair": 7,
+        "variant": "baseline",
+        "index_build_ns": 31287200,
+        "p50_ns": 691900,
+        "p95_ns": 1378100,
+        "p99_ns": 1576100,
+        "qps": 1216.7593512823184
+      },
+      {
+        "terms": 2,
+        "pair": 8,
+        "variant": "baseline",
+        "index_build_ns": 29118100,
+        "p50_ns": 708300,
+        "p95_ns": 1454800,
+        "p99_ns": 1745200,
+        "qps": 1185.1697340834667
+      }
+    ],
+    "candidate": [
+      {
+        "terms": 2,
+        "pair": 1,
+        "variant": "candidate",
+        "index_build_ns": 29602700,
+        "p50_ns": 724000,
+        "p95_ns": 1496300,
+        "p99_ns": 1898100,
+        "qps": 1126.6074717058166
+      },
+      {
+        "terms": 2,
+        "pair": 2,
+        "variant": "candidate",
+        "index_build_ns": 29973900,
+        "p50_ns": 754600,
+        "p95_ns": 1472900,
+        "p99_ns": 1630900,
+        "qps": 1108.5127572082151
+      },
+      {
+        "terms": 2,
+        "pair": 3,
+        "variant": "candidate",
+        "index_build_ns": 33827200,
+        "p50_ns": 707100,
+        "p95_ns": 1237000,
+        "p99_ns": 1525400,
+        "qps": 1225.7119057319683
+      },
+      {
+        "terms": 2,
+        "pair": 4,
+        "variant": "candidate",
+        "index_build_ns": 29689500,
+        "p50_ns": 694200,
+        "p95_ns": 1261600,
+        "p99_ns": 1507500,
+        "qps": 1248.4980568376243
+      },
+      {
+        "terms": 2,
+        "pair": 5,
+        "variant": "candidate",
+        "index_build_ns": 30751100,
+        "p50_ns": 700400,
+        "p95_ns": 1497500,
+        "p99_ns": 2100400,
+        "qps": 1170.324046343896
+      },
+      {
+        "terms": 2,
+        "pair": 6,
+        "variant": "candidate",
+        "index_build_ns": 34312800,
+        "p50_ns": 698700,
+        "p95_ns": 1383700,
+        "p99_ns": 1632600,
+        "qps": 1205.3586387933105
+      },
+      {
+        "terms": 2,
+        "pair": 7,
+        "variant": "candidate",
+        "index_build_ns": 28984500,
+        "p50_ns": 688200,
+        "p95_ns": 1288600,
+        "p99_ns": 1560700,
+        "qps": 1230.1996294146636
+      },
+      {
+        "terms": 2,
+        "pair": 8,
+        "variant": "candidate",
+        "index_build_ns": 32030000,
+        "p50_ns": 753600,
+        "p95_ns": 1445700,
+        "p99_ns": 1657200,
+        "qps": 1111.650137911316
+      }
+    ],
+    "median_change": {
+      "p50_ns": {
+        "baseline_median": 688200.0,
+        "candidate_median": 703750.0,
+        "change_percent": 2.26
+      },
+      "p95_ns": {
+        "baseline_median": 1380600.0,
+        "candidate_median": 1414700.0,
+        "change_percent": 2.47
+      },
+      "p99_ns": {
+        "baseline_median": 1696000.0,
+        "candidate_median": 1631750.0,
+        "change_percent": -3.79
+      },
+      "qps": {
+        "baseline_median": 1222.5430696358203,
+        "candidate_median": 1187.8413425686033,
+        "change_percent": -2.84
+      }
+    },
+    "candidate_faster_p50_pairs": 3
+  },
+  "single_term_control": {
+    "query_terms": 1,
+    "baseline": [
+      {
+        "terms": 1,
+        "pair": 1,
+        "variant": "baseline",
+        "index_build_ns": 32879900,
+        "p50_ns": 75400,
+        "p95_ns": 133200,
+        "p99_ns": 207800,
+        "qps": 11844.860751817001
+      },
+      {
+        "terms": 1,
+        "pair": 2,
+        "variant": "baseline",
+        "index_build_ns": 29163400,
+        "p50_ns": 75800,
+        "p95_ns": 82500,
+        "p99_ns": 102800,
+        "qps": 12934.435347224917
+      },
+      {
+        "terms": 1,
+        "pair": 3,
+        "variant": "baseline",
+        "index_build_ns": 31808000,
+        "p50_ns": 75400,
+        "p95_ns": 137000,
+        "p99_ns": 157200,
+        "qps": 11861.720803560414
+      },
+      {
+        "terms": 1,
+        "pair": 4,
+        "variant": "baseline",
+        "index_build_ns": 35552200,
+        "p50_ns": 76500,
+        "p95_ns": 89400,
+        "p99_ns": 166400,
+        "qps": 12296.67448735164
+      },
+      {
+        "terms": 1,
+        "pair": 5,
+        "variant": "baseline",
+        "index_build_ns": 31233400,
+        "p50_ns": 80700,
+        "p95_ns": 87000,
+        "p99_ns": 99500,
+        "qps": 12462.767482147086
+      },
+      {
+        "terms": 1,
+        "pair": 6,
+        "variant": "baseline",
+        "index_build_ns": 29642400,
+        "p50_ns": 75200,
+        "p95_ns": 90700,
+        "p99_ns": 181300,
+        "qps": 12393.017278344689
+      },
+      {
+        "terms": 1,
+        "pair": 7,
+        "variant": "baseline",
+        "index_build_ns": 29619600,
+        "p50_ns": 74900,
+        "p95_ns": 82600,
+        "p99_ns": 112700,
+        "qps": 13023.207355507515
+      },
+      {
+        "terms": 1,
+        "pair": 8,
+        "variant": "baseline",
+        "index_build_ns": 31526500,
+        "p50_ns": 76100,
+        "p95_ns": 92200,
+        "p99_ns": 148900,
+        "qps": 12464.600534482071
+      }
+    ],
+    "candidate": [
+      {
+        "terms": 1,
+        "pair": 1,
+        "variant": "candidate",
+        "index_build_ns": 29462100,
+        "p50_ns": 76000,
+        "p95_ns": 82500,
+        "p99_ns": 88400,
+        "qps": 12981.820258909424
+      },
+      {
+        "terms": 1,
+        "pair": 2,
+        "variant": "candidate",
+        "index_build_ns": 30823800,
+        "p50_ns": 76600,
+        "p95_ns": 89500,
+        "p99_ns": 116900,
+        "qps": 12520.75314834338
+      },
+      {
+        "terms": 1,
+        "pair": 3,
+        "variant": "candidate",
+        "index_build_ns": 31442100,
+        "p50_ns": 75700,
+        "p95_ns": 94400,
+        "p99_ns": 139900,
+        "qps": 12494.90832485762
+      },
+      {
+        "terms": 1,
+        "pair": 4,
+        "variant": "candidate",
+        "index_build_ns": 30316600,
+        "p50_ns": 76300,
+        "p95_ns": 120800,
+        "p99_ns": 226900,
+        "qps": 11982.361963190184
+      },
+      {
+        "terms": 1,
+        "pair": 5,
+        "variant": "candidate",
+        "index_build_ns": 30355600,
+        "p50_ns": 76300,
+        "p95_ns": 82600,
+        "p99_ns": 106200,
+        "qps": 12870.344153002652
+      },
+      {
+        "terms": 1,
+        "pair": 6,
+        "variant": "candidate",
+        "index_build_ns": 33120100,
+        "p50_ns": 77300,
+        "p95_ns": 146800,
+        "p99_ns": 221100,
+        "qps": 11532.242998198664
+      },
+      {
+        "terms": 1,
+        "pair": 7,
+        "variant": "candidate",
+        "index_build_ns": 29171300,
+        "p50_ns": 81300,
+        "p95_ns": 86600,
+        "p99_ns": 100300,
+        "qps": 12369.10395737112
+      },
+      {
+        "terms": 1,
+        "pair": 8,
+        "variant": "candidate",
+        "index_build_ns": 32076600,
+        "p50_ns": 75500,
+        "p95_ns": 83800,
+        "p99_ns": 114600,
+        "qps": 12633.696088860364
+      }
+    ],
+    "median_change": {
+      "p50_ns": {
+        "baseline_median": 75600.0,
+        "candidate_median": 76300.0,
+        "change_percent": 0.93
+      },
+      "p95_ns": {
+        "baseline_median": 90050.0,
+        "candidate_median": 88050.0,
+        "change_percent": -2.22
+      },
+      "p99_ns": {
+        "baseline_median": 153050.0,
+        "candidate_median": 115750.0,
+        "change_percent": -24.37
+      },
+      "qps": {
+        "baseline_median": 12427.892380245888,
+        "candidate_median": 12507.8307366005,
+        "change_percent": 0.64
+      }
+    },
+    "candidate_faster_p50_pairs": 3
+  },
+  "decision": "Discarded. The two-term candidate was slower at median p50 and p95, with lower QPS; the one-term control was effectively flat.",
+  "caveat": "One Windows host, local in-memory text index. The two-term benchmark corpus makes both query terms match every document; these results do not represent networked or end-to-end database latency."
+}

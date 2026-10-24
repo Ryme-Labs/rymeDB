@@ -528,6 +528,14 @@ aligned to query terms, avoiding cloned term strings. On a Windows Ryzen 5 4500,
 change was not retained; allocation effects for long queries remain unmeasured.
 See the [raw captures](../bench/results/text-search-document-frequency-vector-20261024.json).
 
+A follow-up fast path tried scoring directly when two terms had identical
+posting IDs, avoiding the per-document score map. Across eight alternating
+release pairs on the same Windows host, the 10,000-document/two-term workload
+was 2.3% slower at median p50, 2.5% slower at p95, and 2.8% lower in QPS; only
+three candidate p50 captures were faster. The one-term control was effectively
+flat. The fast path was discarded. A test now pins exact scores and stable ID
+ties for shared postings. See the [raw captures](../bench/results/text-search-shared-postings-experiment-windows-20261024.json).
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash
