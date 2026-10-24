@@ -310,7 +310,7 @@ async fn autoclaim_moves_idle_entries() {
         "*3\r\n$5\r\n500-2\r\n*1\r\n*2\r\n$5\r\n500-1\r\n*2\r\n$1\r\nf\r\n$1\r\na\r\n*0"
     );
     assert_eq!(
-        session.command(&["XAUTOCLAIM", "ac:s", "g", "fast", "0", "500-1", "COUNT", "1"]).await,
+        session.command(&["XAUTOCLAIM", "ac:s", "g", "fast", "0", "500-2", "COUNT", "1"]).await,
         "*3\r\n$3\r\n0-0\r\n*1\r\n*2\r\n$5\r\n500-2\r\n*2\r\n$1\r\nf\r\n$1\r\nb\r\n*0"
     );
     assert!(session
