@@ -3965,7 +3965,13 @@ where
             count = Some(text.parse::<usize>().map_err(|_| String::from("syntax"))?.min(10_000));
             index += 1;
         }
-        let data = self.read_stream(txn, &args[0])?.unwrap_or_default();
+        let data = match self.read_stream(txn, &args[0])? {
+            Some(data) => data,
+            None => return Ok(encode_array(Vec::new())),
+        };
+        if count == Some(0) {
+            return Ok(encode_nil_array());
+        }
         let mut picked: Vec<&(String, Vec<(String, String)>)> = Vec::new();
         let mut ordered: Vec<&(String, Vec<(String, String)>)> = data.entries.iter().collect();
         if reverse {

@@ -680,6 +680,12 @@ async fn stream_ops() {
         command(addr, &["XREVRANGE", "st", "+", "-", "COUNT", "1"]).await,
         "*1\r\n*2\r\n$5\r\n100-2\r\n*2\r\n$1\r\nf\r\n$1\r\nb"
     );
+    assert_eq!(command(addr, &["XRANGE", "st", "-", "+", "COUNT", "0"]).await, "*-1");
+    assert_eq!(
+        command(addr, &["XREVRANGE", "st", "+", "-", "COUNT", "0"]).await,
+        "*-1"
+    );
+    assert_eq!(command(addr, &["XRANGE", "missing", "-", "+", "COUNT", "0"]).await, "*0");
     assert_eq!(
         command(addr, &["XREAD", "STREAMS", "st", "100-1"]).await,
         "*1\r\n*2\r\n$2\r\nst\r\n*1\r\n*2\r\n$5\r\n100-2\r\n*2\r\n$1\r\nf\r\n$1\r\nb"
