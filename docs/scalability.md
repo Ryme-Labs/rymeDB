@@ -41,6 +41,10 @@ low-latency network and configure TLS/mTLS when the network is not trusted.
 Follow the [cluster operations](cluster-operations.md) runbook for membership,
 range placement, and quorum failures. A cluster does not replace tested backups:
 replication can faithfully replicate accidental deletion or corruption.
+Range movement copies the current version history to the new owner and keeps
+the previous shard's copy so a later move cannot apply a stale migration
+tombstone over newer data. This currently trades disk space for safe repeated
+rebalancing; plan capacity for duplicate shard history.
 
 ## Realtime fanout
 

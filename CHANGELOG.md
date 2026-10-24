@@ -74,6 +74,8 @@ All notable changes to rymeDB are recorded here. Format follows
   stream syntax, control characters, and trailing dots or spaces.
 - Branch and shard metadata readers now open final paths without following
   symlinks or Windows reparse points, closing a check-to-open race.
+- Range rebalancing now reads from the previous owner and retains its source
+  history, preventing stale cleanup tombstones from hiding rows on later moves.
 - RESP `XINFO STREAM FULL` now defaults to 10 entries, treats `COUNT 0` as all
   entries, and treats negative counts as the default.
 - RESP `XAUTOCLAIM` now removes deleted stream entries from the consumer

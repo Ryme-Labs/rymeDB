@@ -713,7 +713,10 @@ impl ShardSet {
             range.shard = assignments[&range.id];
         }
 
-        let purges = Self::rebalance_ranges_locked(&inner, &ranges)?;
+        // Keep source histories after ownership moves. A purge writes a newer
+        // tombstone, which could hide the imported value if a later topology
+        // moves the range back to this shard.
+        Self::rebalance_ranges_locked(&inner, &ranges)?;
         let previous_ranges = inner.ranges.clone();
         let previous_assignments = inner.range_assignments.clone();
         inner.ranges = ranges;
@@ -727,24 +730,10 @@ impl ShardSet {
                 return Err(error);
             }
         }
-        for (source_index, keys) in purges {
-            let Some(source) = inner.shards.get(source_index) else {
-                continue;
-            };
-            // Routing is durable now. Cleanup is deliberately best effort:
-            // retaining a duplicate is safe, while deleting before routing is
-            // durable can make the old topology lose data.
-            if source.purge_keys(&keys).is_ok() {
-                let _ = source.write_snapshot();
-            }
-        }
         Ok(())
     }
 
-    fn rebalance_ranges_locked(
-        inner: &ShardInner,
-        ranges: &[RangePlacement],
-    ) -> Result<Vec<(usize, Vec<RecordKey>)>> {
+    fn rebalance_ranges_locked(inner: &ShardInner, ranges: &[RangePlacement]) -> Result<()> {
         let mut tables = std::collections::BTreeSet::new();
         for shard in &inner.shards {
             tables.extend(shard.spaces()?);
@@ -756,11 +745,22 @@ impl ShardSet {
                 let rows = source.export_table(&tenant, &database, &table)?;
                 for (pk, versions) in rows {
                     let key = RecordKey::new(&tenant, &database, &table, &pk);
+                    let table_ref = TableRef::of(&key);
+                    let old_owner = route_record(&inner.ranges, &key)?.unwrap_or_else(|| {
+                        inner
+                            .place
+                            .get(&table_ref)
+                            .copied()
+                            .unwrap_or_else(|| hash_table(&table_ref, inner.shards.len()))
+                    });
+                    if old_owner != source_index {
+                        continue;
+                    }
                     let target = route_record(ranges, &key)?
-                        .unwrap_or_else(|| hash_table(&TableRef::of(&key), inner.shards.len()));
+                        .unwrap_or_else(|| hash_table(&table_ref, inner.shards.len()));
                     if target != source_index {
                         moves
-                            .entry((source_index, target, TableRef::of(&key)))
+                            .entry((source_index, target, table_ref))
                             .or_default()
                             .push((key.pk, versions));
                     }
@@ -769,29 +769,19 @@ impl ShardSet {
         }
 
         let mut changed = HashSet::new();
-        let mut purges = Vec::new();
-        for ((source_index, target, table), rows) in moves {
+        for ((_source_index, target, table), rows) in moves {
             let destination = inner
                 .shards
                 .get(target)
                 .ok_or_else(|| RymeError::Unavailable(String::from("range shard")))?;
-            let keys: Vec<RecordKey> = rows
-                .iter()
-                .map(|(pk, _)| RecordKey::new(&table.tenant, &table.database, &table.table, pk))
-                .collect();
             destination.import_table(&table.tenant, &table.database, &table.table, rows)?;
 
-            inner
-                .shards
-                .get(source_index)
-                .ok_or_else(|| RymeError::Unavailable(String::from("range shard")))?;
             changed.insert(target);
-            purges.push((source_index, keys));
         }
         for index in changed {
             inner.shards[index].write_snapshot()?;
         }
-        Ok(purges)
+        Ok(())
     }
 
     pub fn route_table(&self, tenant: &str, database: &str, table: &str) -> usize {
