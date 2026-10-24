@@ -44,6 +44,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Standard storage recovery now rejects replicated transactions older than its
+  segment floor when prior conflict metadata is no longer available.
 - RESP `SET` now rejects zero `EXAT` and `PXAT` timestamps, and `GETEX` rejects
   zero expiration values, matching Redis and avoiding `EXAT 0` becoming no expiry.
 - Snapshot, segment, and WAL rewrites now replace existing files on Windows;

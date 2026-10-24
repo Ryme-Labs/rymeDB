@@ -2301,6 +2301,15 @@ impl TxnManager {
         self.inner.applied.fetch_max(visible_ts, Ordering::SeqCst);
     }
 
+    fn clear_conflicts_through(&self, read_ts: u64) -> Result<()> {
+        self.inner
+            .commit
+            .lock()
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?
+            .clear_through(read_ts);
+        Ok(())
+    }
+
     pub fn clear_engine(&self) -> Result<()> {
         let _guard = self
             .inner
@@ -2961,7 +2970,15 @@ impl DurableManager {
                 Some(floor) => floor,
                 None => manager.load_all_segments()?.unwrap_or(0),
             },
-            StorageMode::Standard => manager.segments.max_commit_ts()?,
+            StorageMode::Standard => {
+                let floor = manager.segments.max_commit_ts()?;
+                // Standard mode serves rows directly from segments, so its
+                // in-memory engine cannot validate transactions older than
+                // the recovered segment floor. Reject them instead of letting
+                // missing pre-floor conflict history admit stale writes.
+                manager.inner.clear_conflicts_through(floor.saturating_add(1))?;
+                floor
+            }
         };
         manager.inner.advance_to(floor);
         let recovered = manager.recover_from(floor)?;
@@ -5321,6 +5338,48 @@ mod tests {
 
         drop(manager);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_recovery_rejects_transactions_older_than_segment_floor() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-standard-stale-snapshot-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let scanned = RecordKey::new("t", "d", "scanned", b"inserted");
+        let output = RecordKey::new("t", "d", "output", b"stale-write");
+        let mut stale = manager.begin();
+        assert!(manager.scan(&mut stale, "t", "d", "scanned", 10).unwrap().is_empty());
+        manager.put(&mut stale, output, b"must-not-commit".to_vec());
+        let stale_state = stale.state();
+        drop(stale);
+
+        let mut concurrent = manager.begin();
+        manager.put(&mut concurrent, scanned, b"new-row".to_vec());
+        manager.commit(concurrent).unwrap();
+        drop(manager);
+
+        let reopened = DurableManager::open_with_mode(
+            &dir,
+            1024 * 1024,
+            SyncPolicy::Always,
+            1024 * 1024,
+            StorageMode::Standard,
+        )
+        .unwrap();
+        let stale = reopened.inner().from_state(stale_state).unwrap();
+        assert!(matches!(reopened.commit(stale), Err(RymeError::Conflict(_))));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
