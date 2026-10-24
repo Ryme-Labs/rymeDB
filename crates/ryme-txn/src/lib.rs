@@ -3579,25 +3579,27 @@ impl DurableManager {
             Ok(())
         })?;
         let replayed = replay.len() as u64;
-        self.inner.restore_with_replay(snapshot, &replay)?;
-        let restored_raw = self.inner.encode_snapshot()?;
-        let restored = Engine::decode_snapshot(&restored_raw)?;
-        let restored_max = restored.max_commit_ts();
-        let (_, newest) = self.segments.write(restored_max, &restored)?;
-        self.segments.remove_except(&newest)?;
-        self.publish_restored_snapshot(restored_max, target, &restored_raw)?;
-        {
-            let mut wal =
-                self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-            wal.truncate_above(target)?;
-            if self.policy == SyncPolicy::Always {
-                wal.sync()?;
+        self.record_persistence_result((|| {
+            self.inner.restore_with_replay(snapshot, &replay)?;
+            let restored_raw = self.inner.encode_snapshot()?;
+            let restored = Engine::decode_snapshot(&restored_raw)?;
+            let restored_max = restored.max_commit_ts();
+            let (_, newest) = self.segments.write(restored_max, &restored)?;
+            self.segments.remove_except(&newest)?;
+            self.publish_restored_snapshot(restored_max, target, &restored_raw)?;
+            {
+                let mut wal =
+                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                wal.truncate_above(target)?;
+                if self.policy == SyncPolicy::Always {
+                    wal.sync()?;
+                }
             }
-        }
-        if self.mode == StorageMode::Standard {
-            self.inner.clear_engine()?;
-        }
-        Ok(replayed)
+            if self.mode == StorageMode::Standard {
+                self.inner.clear_engine()?;
+            }
+            Ok(replayed)
+        })())
     }
 
     fn publish_restored_snapshot(&self, commit_ts: u64, target: u64, raw: &[u8]) -> Result<()> {
@@ -5983,6 +5985,40 @@ mod tests {
 
         assert!(manager.publish_restored_snapshot(10, 10, b"restored snapshot").is_err());
         assert!(future.exists());
+
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_persistence_failure_latches_manager_unhealthy() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-restore-persistence-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let key = RecordKey::new("t", "d", "restore-failure", b"key");
+        let mut initial = manager.begin();
+        manager.put(&mut initial, key.clone(), b"checkpoint".to_vec());
+        let checkpoint = manager.commit(initial).unwrap();
+        manager.write_snapshot().unwrap();
+        let mut later = manager.begin();
+        manager.put(&mut later, key.clone(), b"later".to_vec());
+        manager.commit(later).unwrap();
+
+        let segment_dir = manager.segment_dir();
+        std::fs::remove_dir_all(&segment_dir).unwrap();
+        std::fs::write(&segment_dir, b"not a directory").unwrap();
+
+        assert!(manager.restore_to(checkpoint).is_err());
+        let mut probe = manager.begin();
+        assert!(matches!(
+            manager.get(&mut probe, &key),
+            Err(RymeError::Unavailable(message))
+                if message == "durable storage requires reopen after a persistence failure"
+        ));
 
         drop(manager);
         let _ = std::fs::remove_dir_all(&dir);

@@ -60,6 +60,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - Point-in-time restore now publishes its recovery pointer before pruning newer
   snapshots, preserving the existing recovery point if publication fails.
+- A point-in-time restore persistence error now marks the durable manager
+  unhealthy, preventing reads or writes against state that may not match disk.
 - Raft now broadcasts the committed index for membership changes before
   returning, so followers can apply the new quorum configuration before leader
   loss.
