@@ -400,6 +400,41 @@ fn now_ms() -> u128 {
 }
 
 #[tokio::test]
+async fn e2e_automatic_archive_reuses_same_commit() {
+    std::env::set_var("RYME_API_KEY", KEY);
+    let root = std::env::temp_dir().join(format!(
+        "ryme-e2e-auto-archive-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let pg_listener = bind_listener().await;
+    let pg = pg_listener.local_addr().unwrap();
+    let resp_listener = bind_listener().await;
+    let resp = resp_listener.local_addr().unwrap();
+    let http_listener = bind_listener().await;
+    let http = http_listener.local_addr().unwrap();
+    let config = test_config(&root, pg, resp, http);
+    let server = tokio::spawn(async move {
+        let _ = ryme_server::serve(config, pg_listener, resp_listener, http_listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let (status, first_body) = http_request(http, "POST /v1/backups/archive", b"{}").await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&first_body));
+    let first: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    let first_id = first["backup_id"].as_str().unwrap();
+    let (status, second_body) = http_request(http, "POST /v1/backups/archive", b"{}").await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&second_body));
+    let second: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(second["backup_id"].as_str(), Some(first_id));
+
+    server.abort();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn e2e_pitr_restore_roundtrip() {
     std::env::set_var("RYME_API_KEY", KEY);
     let root =

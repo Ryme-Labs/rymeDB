@@ -89,7 +89,9 @@ artifacts as applicable.
 Treat each `(commit timestamp, backup ID)` pair as immutable. Reusing a pair
 that already has a manifest returns a conflict so it cannot overwrite objects
 belonging to the existing backup. If an archive fails before its manifest is
-published, the archiver attempts to remove the objects it uploaded.
+published, the archiver attempts to remove the objects it uploaded. When no ID
+is supplied, repeated archive requests at the same commit reuse the existing
+`auto-{commit timestamp}` backup.
 
 ## Restore
 

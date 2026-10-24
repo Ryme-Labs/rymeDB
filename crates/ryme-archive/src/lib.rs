@@ -194,6 +194,29 @@ impl<S: ObjectStore> Archiver<S> {
         &self.store
     }
 
+    /// Loads one published backup manifest, returning `None` when its key is
+    /// absent. The manifest schema and its paths are validated before it is
+    /// returned.
+    pub async fn get_backup(
+        &self,
+        backup_id: &str,
+        commit_ts: u64,
+    ) -> Result<Option<BackupManifest>> {
+        if !valid_backup_id(backup_id) {
+            return Err(RymeError::InvalidArgument(String::from("backup_id")));
+        }
+        let key = format!("backups/{commit_ts:020}-{backup_id}/manifest.json");
+        let raw = match self.store.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await {
+            Ok(raw) => raw,
+            Err(RymeError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let manifest: BackupManifest = serde_json::from_slice(&raw)
+            .map_err(|_| RymeError::Corrupt(String::from("manifest")))?;
+        validate_manifest(&key, &manifest)?;
+        Ok(Some(manifest))
+    }
+
     pub async fn archive_files(
         &self,
         backup_id: &str,
@@ -576,6 +599,8 @@ mod tests {
             .archive_files("stable-id", 23, vec![(String::from("state"), b"original".to_vec())])
             .await
             .unwrap();
+        assert_eq!(archiver.get_backup("stable-id", 23).await.unwrap(), Some(manifest.clone()));
+        assert_eq!(archiver.get_backup("missing", 23).await.unwrap(), None);
 
         let duplicate = archiver
             .archive_files("stable-id", 23, vec![(String::from("state"), b"replacement".to_vec())])

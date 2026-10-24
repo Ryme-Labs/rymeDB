@@ -1488,6 +1488,19 @@ pub enum ArchiveTarget {
 }
 
 impl ArchiveTarget {
+    async fn get_backup(
+        &self,
+        backup_id: &str,
+        commit_ts: u64,
+    ) -> ryme_error::Result<Option<BackupManifest>> {
+        match self {
+            Self::Local(store) => {
+                Archiver::new(store.clone()).get_backup(backup_id, commit_ts).await
+            }
+            Self::S3(store) => Archiver::new(store.clone()).get_backup(backup_id, commit_ts).await,
+        }
+    }
+
     async fn archive_files_from<I>(
         &self,
         backup_id: &str,
@@ -2981,7 +2994,13 @@ impl SharedState {
         if sources.len() > ryme_archive::MAX_ARCHIVE_FILES {
             return Err(ryme_error::RymeError::Overload(String::from("archive manifest files")));
         }
+        let automatic_id = backup_id.is_none();
         let id = backup_id.unwrap_or_else(|| format!("auto-{commit}"));
+        if automatic_id {
+            if let Some(manifest) = target.get_backup(&id, commit).await? {
+                return Ok(manifest);
+            }
+        }
         let files = sources
             .into_iter()
             .map(|(name, path)| read_archive_source_file(&path).map(|bytes| (name, bytes)));
