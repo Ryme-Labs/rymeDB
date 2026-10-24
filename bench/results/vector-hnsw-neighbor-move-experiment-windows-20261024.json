@@ -1,0 +1,73 @@
+{
+  "experiment": "hnsw-selected-neighbor-vector-move",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "607ea9f",
+  "candidate_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "arch": "x86_64",
+    "os": "Windows"
+  },
+  "method": "Release-mode in-process vector-index benchmark. Eight alternating baseline/candidate pairs for each workload. Candidate moved the selected-neighbor Vec into the new node after linking reverse edges instead of cloning it first.",
+  "workloads": {
+    "dimensions_64": {
+      "vectors": 5000,
+      "queries": 500,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 64,
+      "baseline": [
+        { "index_build_ns": 424886600, "adaptive_ann_p50_ns": 101100, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 395365000, "adaptive_ann_p50_ns": 98900, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 443656400, "adaptive_ann_p50_ns": 102800, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 535808500, "adaptive_ann_p50_ns": 137300, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 396952000, "adaptive_ann_p50_ns": 96400, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 392474100, "adaptive_ann_p50_ns": 97700, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 390576200, "adaptive_ann_p50_ns": 94300, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 388496900, "adaptive_ann_p50_ns": 95900, "mean_recall_at_k": 0.978999999999999 }
+      ],
+      "candidate": [
+        { "index_build_ns": 385351200, "adaptive_ann_p50_ns": 93400, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 426291300, "adaptive_ann_p50_ns": 108100, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 446448900, "adaptive_ann_p50_ns": 114700, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 402625200, "adaptive_ann_p50_ns": 96600, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 395443100, "adaptive_ann_p50_ns": 96400, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 392064400, "adaptive_ann_p50_ns": 97700, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 385888800, "adaptive_ann_p50_ns": 96800, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 392064400, "adaptive_ann_p50_ns": 96600, "mean_recall_at_k": 0.978999999999999 }
+      ],
+      "median_build_change_percent": 0.7
+    },
+    "dimensions_384": {
+      "vectors": 3000,
+      "queries": 100,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 128,
+      "baseline": [
+        { "index_build_ns": 582017300, "adaptive_ann_p50_ns": 662200, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 616919600, "adaptive_ann_p50_ns": 605200, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 563116400, "adaptive_ann_p50_ns": 591200, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 559382100, "adaptive_ann_p50_ns": 498900, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 536493100, "adaptive_ann_p50_ns": 500600, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 548098600, "adaptive_ann_p50_ns": 478700, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 592283300, "adaptive_ann_p50_ns": 575100, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 557964600, "adaptive_ann_p50_ns": 500500, "mean_recall_at_k": 0.9710000000000002 }
+      ],
+      "candidate": [
+        { "index_build_ns": 556269200, "adaptive_ann_p50_ns": 540900, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 559590500, "adaptive_ann_p50_ns": 485800, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 545384400, "adaptive_ann_p50_ns": 483000, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 582953600, "adaptive_ann_p50_ns": 517500, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 538117200, "adaptive_ann_p50_ns": 484800, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 561091100, "adaptive_ann_p50_ns": 531100, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 545804000, "adaptive_ann_p50_ns": 460700, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 533233000, "adaptive_ann_p50_ns": 460100, "mean_recall_at_k": 0.9710000000000002 }
+      ],
+      "median_build_change_percent": -1.8
+    }
+  },
+  "decision": "Discard. Median build time was effectively unchanged in both dimensions and ANN recall was unchanged; retain the simpler clone-before-link ordering.",
+  "notes": "One Windows host, local in-memory index benchmark. Exact search and ANN were also measured in each invocation; these captures preserve build time, ANN p50, and recall for this build-path experiment."
+}

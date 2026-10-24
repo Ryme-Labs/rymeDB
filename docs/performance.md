@@ -464,6 +464,13 @@ approximately flat. The existing dot-score error check and all 38 index-crate
 tests passed. These are local index benchmarks, not end-to-end results; see the
 [paired captures](../bench/results/vector-hnsw-dot-unrolled-windows-20261024.json).
 
+An HNSW build experiment moved the selected-neighbor vector into the new node
+instead of cloning it before linking reverse edges. Eight alternating release
+pairs showed median build time effectively flat: 396.2 to 399.0 ms for 5,000
+64D vectors and 561.2 to 551.0 ms for 3,000 384D vectors. The small differences
+were not consistent across dimensions, and recall was unchanged, so the
+existing ordering remains. See the [raw captures](../bench/results/vector-hnsw-neighbor-move-experiment-windows-20261024.json).
+
 Exact vector search now uses four independent `f64` accumulators for its dot
 product as well. Across three alternating release pairs, exact-search median
 p50 fell 50.3% for 5,000 64D vectors and 49.6% for 3,000 384D vectors; median
