@@ -61,6 +61,8 @@ pub const LEGACY_ROUTING_VERSION: u8 = 0;
 pub const SCOPED_ROUTING_VERSION: u8 = 1;
 pub const CURRENT_ROUTING_VERSION: u8 = SCOPED_ROUTING_VERSION;
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum byte length of a record key or value chunk in durable formats.
+pub const MAX_RECORD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MIN_ORDERED_BATCH_READ: usize = 16;
 const MAX_ORDERED_BATCH_READ_GAP: usize = 64;
 
@@ -137,6 +139,31 @@ fn validate_record_scope(tenant: &str, database: &str, table: &str) -> Result<()
         || table.as_bytes().contains(&0)
     {
         return Err(RymeError::InvalidArgument(String::from("record scope")));
+    }
+    Ok(())
+}
+
+/// Validates that a key fits the storage and WAL formats and has an unambiguous scope.
+pub fn validate_record_key(key: &RecordKey) -> Result<()> {
+    validate_record_scope(&key.tenant, &key.database, &key.table)?;
+    validate_record_key_lengths(key)
+}
+
+fn validate_record_key_lengths(key: &RecordKey) -> Result<()> {
+    if key.tenant.len() > u16::MAX as usize
+        || key.database.len() > u16::MAX as usize
+        || key.table.len() > u16::MAX as usize
+        || key.pk.len() > MAX_RECORD_CHUNK_BYTES
+    {
+        return Err(RymeError::InvalidArgument(String::from("record key size")));
+    }
+    Ok(())
+}
+
+/// Validates that a value fits the storage and WAL formats.
+pub fn validate_record_value(value: &[u8]) -> Result<()> {
+    if value.len() > MAX_RECORD_CHUNK_BYTES {
+        return Err(RymeError::InvalidArgument(String::from("record value size")));
     }
     Ok(())
 }
@@ -273,7 +300,10 @@ impl Engine {
         if commit_ts == 0 {
             return Err(RymeError::InvalidArgument(String::from("commit_ts")));
         }
-        validate_record_scope(&key.tenant, &key.database, &key.table)?;
+        validate_record_key(&key)?;
+        if let Some(value) = value.as_deref() {
+            validate_record_value(value)?;
+        }
         let versions = self.inner.entry(key).or_default();
         if let Some(last) = versions.back() {
             if commit_ts <= last.commit_ts {
@@ -675,15 +705,16 @@ impl Engine {
         // visible to readers.
         let mut histories: ImportHistory<'_> = BTreeMap::new();
         for (pk, versions) in &rows {
+            let key = RecordKey::new(tenant, database, table, pk);
+            validate_record_key_lengths(&key)?;
             if versions.iter().any(|version| version.commit_ts == 0) {
                 return Err(RymeError::Corrupt(String::from("import commit timestamp")));
             }
-            let key = RecordKey {
-                tenant: tenant.to_string(),
-                database: database.to_string(),
-                table: table.to_string(),
-                pk: pk.clone(),
-            };
+            for version in versions {
+                if let Some(value) = version.value.as_deref() {
+                    validate_record_value(value)?;
+                }
+            }
             let (last, known) = histories.entry(key.clone()).or_insert_with(|| {
                 let existing = self.inner.get(&key);
                 (
@@ -1144,8 +1175,8 @@ impl Engine {
                 versions.push_back(Version { commit_ts, value, expires_at });
             }
             let key = RecordKey { tenant, database, table, pk };
-            validate_record_scope(&key.tenant, &key.database, &key.table)
-                .map_err(|_| RymeError::Corrupt(String::from("snapshot record scope")))?;
+            validate_record_key(&key)
+                .map_err(|_| RymeError::Corrupt(String::from("snapshot record key")))?;
             if engine.inner.contains_key(&key) {
                 return Err(RymeError::Corrupt(String::from("snapshot duplicate key")));
             }
@@ -1193,7 +1224,7 @@ fn push_field(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
 }
 
 fn push_chunk(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > 8 * 1024 * 1024 {
+    if bytes.len() > MAX_RECORD_CHUNK_BYTES {
         return Err(RymeError::InvalidArgument(String::from("snapshot chunk")));
     }
     push_snapshot_bytes(out, &(bytes.len() as u32).to_be_bytes())?;

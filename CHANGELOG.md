@@ -65,6 +65,8 @@ All notable changes to rymeDB are recorded here. Format follows
   avoiding a panic from invalid caller-supplied ranges.
 - Storage writes and snapshot loading now reject NUL bytes in tenant, database,
   and table names before they can produce ambiguous routing keys.
+- Transaction staging, restored transaction state, and WAL replay now reject
+  duplicate or unrepresentable record keys and values before durable mutation.
 - Raft peer dialing now tries all resolved address families, so DNS names work
   when only an IPv4 or IPv6 listener is available.
 - Range election ticks no longer restore the configured owner after a vote clears

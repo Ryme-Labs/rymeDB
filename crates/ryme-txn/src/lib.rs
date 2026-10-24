@@ -877,6 +877,12 @@ impl Transaction {
         if let Some(error) = self.resource_error.clone() {
             return Err(error);
         }
+        if let Err(error) = ryme_storage::validate_record_key(&key)
+            .and_then(|()| op.value.as_deref().map_or(Ok(()), ryme_storage::validate_record_value))
+        {
+            self.resource_error = Some(error.clone());
+            return Err(error);
+        }
         let old_bytes =
             self.writes.get(&key).map(|old| transaction_write_bytes(&key, old)).unwrap_or(0);
         let new_bytes = transaction_write_bytes(&key, &op);
@@ -1301,11 +1307,32 @@ impl TxnManager {
         if state.read_only && !state.writes.is_empty() {
             return Err(RymeError::Corrupt(String::from("read-only transaction writes")));
         }
+        for (key, op) in &state.writes {
+            ryme_storage::validate_record_key(key)
+                .map_err(|_| RymeError::Corrupt(String::from("transaction write key")))?;
+            if let Some(value) = op.value.as_deref() {
+                ryme_storage::validate_record_value(value)
+                    .map_err(|_| RymeError::Corrupt(String::from("transaction write value")))?;
+            }
+        }
+        for key in &state.read_set {
+            ryme_storage::validate_record_key(key)
+                .map_err(|_| RymeError::Corrupt(String::from("transaction read key")))?;
+        }
+        for (tenant, database, table) in state.scanned.iter().chain(&state.constraint_scanned) {
+            let scope_key = RecordKey::new(tenant, database, table, &[]);
+            ryme_storage::validate_record_key(&scope_key)
+                .map_err(|_| RymeError::Corrupt(String::from("transaction scan scope")))?;
+        }
+        let write_entries = state.writes.len();
         let read_set_entries = state.read_set.len();
         let observed_entries = state.observed.len();
         let writes: BTreeMap<_, _> = state.writes.into_iter().collect();
         let read_set: BTreeSet<_> = state.read_set.into_iter().collect();
         let observed: BTreeMap<_, _> = state.observed.into_iter().collect();
+        if writes.len() != write_entries {
+            return Err(RymeError::Corrupt(String::from("transaction write state")));
+        }
         if read_set.len() != read_set_entries
             || observed.len() != observed_entries
             || !read_set.iter().eq(observed.keys())
@@ -2765,6 +2792,10 @@ pub fn encode_writes(writes: &BTreeMap<RecordKey, WriteOp>) -> Result<Vec<u8>> {
         .map_err(|_| RymeError::InvalidArgument(String::from("write count")))?;
     out.extend_from_slice(&count.to_be_bytes());
     for (key, op) in writes {
+        ryme_storage::validate_record_key(key)?;
+        if let Some(value) = op.value.as_deref() {
+            ryme_storage::validate_record_value(value)?;
+        }
         push_str(&mut out, key.tenant.as_bytes())?;
         push_str(&mut out, key.database.as_bytes())?;
         push_str(&mut out, key.table.as_bytes())?;
@@ -2784,10 +2815,20 @@ pub fn encode_writes(writes: &BTreeMap<RecordKey, WriteOp>) -> Result<Vec<u8>> {
 }
 
 pub fn decode_writes(input: &[u8]) -> Result<BTreeMap<RecordKey, WriteOp>> {
-    if input.first() == Some(&2u8) {
-        return decode_writes_v2(&input[1..]);
+    let writes = if input.first() == Some(&2u8) {
+        decode_writes_v2(&input[1..])?
+    } else {
+        decode_writes_v1(input)?
+    };
+    for (key, op) in &writes {
+        ryme_storage::validate_record_key(key)
+            .map_err(|_| RymeError::Corrupt(String::from("record key")))?;
+        if let Some(value) = op.value.as_deref() {
+            ryme_storage::validate_record_value(value)
+                .map_err(|_| RymeError::Corrupt(String::from("record value")))?;
+        }
     }
-    decode_writes_v1(input)
+    Ok(writes)
 }
 
 fn decode_writes_v2(input: &[u8]) -> Result<BTreeMap<RecordKey, WriteOp>> {
@@ -2868,7 +2909,7 @@ fn push_str(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
 }
 
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > 8 * 1024 * 1024 {
+    if bytes.len() > ryme_storage::MAX_RECORD_CHUNK_BYTES {
         return Err(RymeError::InvalidArgument(String::from("value too large")));
     }
     out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -2921,7 +2962,7 @@ fn take_str<'a>(cursor: &mut &'a [u8]) -> Result<&'a [u8]> {
 
 fn take_bytes<'a>(cursor: &mut &'a [u8]) -> Result<&'a [u8]> {
     let len = take_u32(cursor)? as usize;
-    if len > 8 * 1024 * 1024 {
+    if len > ryme_storage::MAX_RECORD_CHUNK_BYTES {
         return Err(RymeError::Corrupt(String::from("value too large")));
     }
     if cursor.len() < len {
@@ -6326,21 +6367,71 @@ mod tests {
     }
 
     #[test]
-    fn transaction_state_budget_rejects_oversized_value_before_staging() {
+    fn transaction_state_budget_rejects_aggregate_writes_before_staging() {
         let manager = TxnManager::new();
         let mut txn = manager.begin();
+        for index in 0..7u8 {
+            manager
+                .try_put(
+                    &mut txn,
+                    RecordKey::new("tenant", "database", "table", &[index]),
+                    vec![0; ryme_storage::MAX_RECORD_CHUNK_BYTES],
+                )
+                .unwrap();
+        }
         let result = manager.try_put(
             &mut txn,
-            RecordKey::new("tenant", "database", "table", b"oversized"),
-            vec![0; MAX_TRANSACTION_STATE_BYTES],
+            RecordKey::new("tenant", "database", "table", b"overflow"),
+            vec![0; ryme_storage::MAX_RECORD_CHUNK_BYTES],
         );
         assert!(
             matches!(result, Err(RymeError::Overload(message)) if message == "transaction state bytes")
         );
-        assert!(txn.writes().is_empty());
+        assert_eq!(txn.writes().len(), 7);
         assert!(
             matches!(manager.commit(txn), Err(RymeError::Overload(message)) if message == "transaction state bytes")
         );
+    }
+
+    #[test]
+    fn transaction_rejects_unpersistable_record_scope_before_commit() {
+        let manager = TxnManager::new();
+        let latest_before = manager.latest_commit();
+        let mut txn = manager.begin();
+        assert!(matches!(
+            manager.try_put(
+                &mut txn,
+                RecordKey::new("tenant\0other", "database", "table", b"key"),
+                b"value".to_vec(),
+            ),
+            Err(RymeError::InvalidArgument(message)) if message == "record scope"
+        ));
+        assert!(txn.writes().is_empty());
+        assert!(matches!(
+            manager.commit(txn),
+            Err(RymeError::InvalidArgument(message)) if message == "record scope"
+        ));
+        assert_eq!(manager.latest_commit(), latest_before);
+    }
+
+    #[test]
+    fn wal_replay_rejects_unpersistable_record_scope() {
+        let mut wal_payload = vec![2, 0, 0, 0, 1];
+        for field in [&b"tenant\0other"[..], &b"database"[..], &b"table"[..]] {
+            wal_payload.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            wal_payload.extend_from_slice(field);
+        }
+        wal_payload.extend_from_slice(&1u32.to_be_bytes());
+        wal_payload.push(b'k');
+        wal_payload.push(0);
+        wal_payload.extend_from_slice(&1u32.to_be_bytes());
+        wal_payload.push(b'v');
+        wal_payload.extend_from_slice(&0u64.to_be_bytes());
+
+        assert!(matches!(
+            decode_writes(&wal_payload),
+            Err(RymeError::Corrupt(message)) if message == "record key"
+        ));
     }
 
     #[test]
@@ -6386,6 +6477,22 @@ mod tests {
         assert!(
             matches!(manager.from_state(state), Err(RymeError::Overload(message)) if message == "transaction write set")
         );
+    }
+
+    #[test]
+    fn transaction_state_reconstruction_rejects_duplicate_writes() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "table", b"key");
+        let mut state = manager.begin().state();
+        state.writes = vec![
+            (key.clone(), WriteOp::put(b"first".to_vec())),
+            (key, WriteOp::put(b"second".to_vec())),
+        ];
+
+        assert!(matches!(
+            manager.from_state(state),
+            Err(RymeError::Corrupt(message)) if message == "transaction write state"
+        ));
     }
 
     #[test]
