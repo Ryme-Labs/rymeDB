@@ -114,6 +114,9 @@ impl Wal {
     /// payload into a `WalRecord` that the caller may not need.
     pub fn append_lsn(&mut self, commit_ts: u64, payload: &[u8]) -> Result<u64> {
         self.ensure_usable()?;
+        if commit_ts == 0 {
+            return Err(RymeError::InvalidArgument(String::from("commit timestamp")));
+        }
         let lsn = self.next_lsn;
         let next_lsn = lsn
             .checked_add(1)
@@ -789,6 +792,9 @@ fn decode_frame(input: &[u8]) -> Result<Option<(WalRecord, usize)>> {
     if magic != WAL_MAGIC || version != WAL_VERSION || reserved != 0 {
         return Err(RymeError::Corrupt(String::from("wal header")));
     }
+    if commit_ts == 0 {
+        return Err(RymeError::Corrupt(String::from("wal commit timestamp")));
+    }
     if len > MAX_WAL_PAYLOAD_BYTES {
         return Err(RymeError::Corrupt(String::from("wal payload length")));
     }
@@ -844,6 +850,34 @@ mod tests {
         assert_eq!(records[0].payload, b"first");
         assert_eq!(records[1].payload, b"second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_rejects_zero_commit_timestamp_without_consuming_lsn() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-zero-commit-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 1024 * 1024).unwrap();
+        assert!(matches!(
+            wal.append_lsn(0, b"invalid"),
+            Err(RymeError::InvalidArgument(message)) if message == "commit timestamp"
+        ));
+        assert_eq!(wal.append_lsn(1, b"valid").unwrap(), 0);
+        wal.sync().unwrap();
+        assert_eq!(Wal::read_all(&dir).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_rejects_zero_commit_timestamp() {
+        let raw = encode_frame(0, 0, b"invalid").unwrap();
+        assert!(matches!(
+            decode_frame(&raw),
+            Err(RymeError::Corrupt(message)) if message == "wal commit timestamp"
+        ));
     }
 
     #[test]
