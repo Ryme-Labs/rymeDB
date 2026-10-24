@@ -113,6 +113,24 @@ throughput. This isolates executor/storage work for one fixed query shape; it
 does not measure SQL parsing, concurrent clients, WAL durability, network
 overhead, or establish a cross-database performance claim.
 
+To reproduce the indexed small-limit case and its large-result control:
+
+```bash
+cargo run --locked --release -j 1 -p ryme-bench -- sql-local \
+  --rows 20000 --ops 300 --limit 10 --concurrency 1 --json
+cargo run --locked --release -j 1 -p ryme-bench -- sql-local \
+  --rows 20000 --ops 300 --limit 4000 --concurrency 1 --json
+```
+
+Indexed SQL scans now start with `min(limit, 256)` candidate reads and grow the
+batch up to 256 when residual predicates or RLS reject rows. On the same host,
+five alternating release pairs over 20,000 seeded rows and 834 indexed
+candidates measured median p50 549 Âµs before and 131 Âµs after for `LIMIT 10`
+(76.2% lower). The 834-row control measured 2.81 ms for both versions. A SQL
+test covers refill through early residual-predicate and RLS rejects. These are
+in-process results, not PostgreSQL-wire or network
+latency; see the [raw captures](../bench/results/sql-indexed-limit-adaptive-batches-windows-20261024.json).
+
 The SQL indexed-row fetch chunk remains 256. A 512-row candidate halved fetch
 calls for the measured indexed query, but alternating release runs with 20,000
 rows/834 results showed median p50 only 0.7% lower and median throughput 0.3%

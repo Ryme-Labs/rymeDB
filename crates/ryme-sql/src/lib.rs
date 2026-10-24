@@ -12041,7 +12041,14 @@ where
                         }
                     }
                 } else {
-                    for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
+                    let mut candidate_offset = 0;
+                    let mut candidate_batch_size = INDEX_READ_BATCH_SIZE.min(limit);
+                    while candidate_offset < candidates.len() {
+                        let candidate_end = candidate_offset
+                            .saturating_add(candidate_batch_size)
+                            .min(candidates.len());
+                        let candidate_batch = &candidates[candidate_offset..candidate_end];
+                        candidate_offset = candidate_end;
                         let keys = candidate_batch
                             .iter()
                             .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
@@ -12053,10 +12060,15 @@ where
                             .filter_map(|(key, value)| value.map(|value| (key.pk, value)))
                             .collect::<Vec<_>>();
                         ensure_materialized_rows(&batch_rows)?;
+                        let matched_before = rows.len();
                         rows.extend(batch_rows.into_iter().filter(|(pk, value)| {
                             self.rls_allows_with_context(table, value, rls_applies)
                                 && predicates_match_except(filter, &covered_predicates, pk, value)
                         }));
+                        if rows.len() - matched_before < candidate_batch.len() {
+                            candidate_batch_size =
+                                candidate_batch_size.saturating_mul(2).min(INDEX_READ_BATCH_SIZE);
+                        }
                         if rows.len() >= limit {
                             rows.truncate(limit);
                             break;
@@ -12315,7 +12327,14 @@ where
                         }
                     }
                 } else {
-                    for candidate_batch in candidates.chunks(INDEX_READ_BATCH_SIZE) {
+                    let mut candidate_offset = 0;
+                    let mut candidate_batch_size = INDEX_READ_BATCH_SIZE.min(limit);
+                    while candidate_offset < candidates.len() {
+                        let candidate_end = candidate_offset
+                            .saturating_add(candidate_batch_size)
+                            .min(candidates.len());
+                        let candidate_batch = &candidates[candidate_offset..candidate_end];
+                        candidate_offset = candidate_end;
                         let keys = candidate_batch
                             .iter()
                             .map(|pk| RecordKey::new(&self.tenant, &self.database, table, pk))
@@ -12327,10 +12346,15 @@ where
                             .filter_map(|(key, value)| value.map(|value| (key.pk, value)))
                             .collect::<Vec<_>>();
                         ensure_materialized_rows(&batch_rows)?;
+                        let matched_before = rows.len();
                         rows.extend(batch_rows.into_iter().filter(|(pk, value)| {
                             self.rls_allows_with_context(table, value, rls_applies)
                                 && predicates_match_except(filter, &covered_predicates, pk, value)
                         }));
+                        if rows.len() - matched_before < candidate_batch.len() {
+                            candidate_batch_size =
+                                candidate_batch_size.saturating_mul(2).min(INDEX_READ_BATCH_SIZE);
+                        }
                         if rows.len() >= limit {
                             rows.truncate(limit);
                             break;
@@ -21670,6 +21694,81 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, QueryResult::Rows { rows } if rows.len() == 600));
+    }
+
+    #[tokio::test]
+    async fn indexed_limit_batch_growth_preserves_residual_and_rls_filters() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(
+                parse("CREATE TABLE messages (id TEXT PRIMARY KEY, tenant_id TEXT, group_name TEXT, state TEXT)")
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let values = (0..600)
+            .map(|id| {
+                let tenant = if id == 599 { "t" } else { "other" };
+                let state = if id == 599 { "target" } else { "idle" };
+                format!("('row-{id:03}', '{tenant}', 'shared', '{state}')")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        executor
+            .execute(
+                parse(&format!(
+                    "INSERT INTO messages (id, tenant_id, group_name, state) VALUES {values}"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE INDEX messages_group_idx ON messages (group_name)").unwrap())
+            .await
+            .unwrap();
+        let executor = executor.with_rls_tables(HashMap::from([(
+            String::from("messages"),
+            String::from("tenant_id"),
+        )]));
+
+        let filter = vec![
+            Predicate {
+                field: Field::Value,
+                column: Some(String::from("group_name")),
+                op: Cmp::Eq,
+                operand: b"shared".to_vec(),
+                operands: Vec::new(),
+                alternatives: Vec::new(),
+            },
+            Predicate {
+                field: Field::Value,
+                column: Some(String::from("state")),
+                op: Cmp::Eq,
+                operand: b"target".to_vec(),
+                operands: Vec::new(),
+                alternatives: Vec::new(),
+            },
+        ];
+        let mut txn = executor.begin_transaction(Isolation::Snapshot);
+        let rows = executor.scan_rows(&mut txn, "messages", &filter, 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, b"row-599");
+
+        let result = executor
+            .execute(
+                parse(
+                    "SELECT id FROM messages WHERE group_name = 'shared' AND state = 'target' LIMIT 1",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            QueryResult::Table { ref rows, .. }
+                if rows == &vec![vec![b"row-599".to_vec()]]
+        ));
     }
 
     #[tokio::test]

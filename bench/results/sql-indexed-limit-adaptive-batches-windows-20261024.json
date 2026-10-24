@@ -1,0 +1,69 @@
+{
+  "benchmark": "sql-indexed-limit-adaptive-read-batches",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_sql_executor",
+  "storage_mode": "hot",
+  "durability": "in_memory_only",
+  "baseline_revision": "39cff3a",
+  "candidate_change": "Start indexed row fetches at min(limit, 256); double the batch size up to 256 whenever residual predicates or RLS reject candidates.",
+  "common_parameters": {
+    "concurrency": 1,
+    "value_bytes": 128,
+    "topology": "single in-process executor",
+    "seed_rows": 20000,
+    "query": "tenant = tenant-0001 AND state = active AND seq >= 0; tenant and state indexes",
+    "matching_index_candidates": 834,
+    "seed_pattern": "tenant matches 1/8 rows; state matches 1/3 rows"
+  },
+  "limit_10": {
+    "ops_per_capture": 300,
+    "result_rows": 10,
+    "baseline_fixed_256": [
+      { "p50_ns": 1242500, "p95_ns": 1603100, "p99_ns": 1742700, "qps": 851 },
+      { "p50_ns": 548600, "p95_ns": 802000, "p99_ns": 1069800, "qps": 1674 },
+      { "p50_ns": 544600, "p95_ns": 802300, "p99_ns": 1028200, "qps": 1683 },
+      { "p50_ns": 555600, "p95_ns": 885900, "p99_ns": 1033100, "qps": 1610 },
+      { "p50_ns": 547500, "p95_ns": 799800, "p99_ns": 963400, "qps": 1681 }
+    ],
+    "candidate_adaptive": [
+      { "p50_ns": 130500, "p95_ns": 142600, "p99_ns": 189400, "qps": 7444 },
+      { "p50_ns": 130800, "p95_ns": 160500, "p99_ns": 244000, "qps": 7282 },
+      { "p50_ns": 132200, "p95_ns": 160600, "p99_ns": 310700, "qps": 7146 },
+      { "p50_ns": 131500, "p95_ns": 160900, "p99_ns": 277600, "qps": 7174 },
+      { "p50_ns": 128700, "p95_ns": 142800, "p99_ns": 208700, "qps": 7541 }
+    ],
+    "median_p50_change_percent": -76.2,
+    "median_p95_change_percent": -80.0,
+    "median_p99_change_percent": -76.4,
+    "median_qps_change_percent": 335.0
+  },
+  "limit_4000": {
+    "ops_per_capture": 300,
+    "result_rows": 834,
+    "baseline_fixed_256": [
+      { "p50_ns": 2808500, "p95_ns": 3058700, "p99_ns": 3367000, "qps": 351 },
+      { "p50_ns": 2835700, "p95_ns": 3083800, "p99_ns": 3545300, "qps": 348 },
+      { "p50_ns": 2805600, "p95_ns": 3009900, "p99_ns": 3485900, "qps": 353 },
+      { "p50_ns": 2810600, "p95_ns": 3054300, "p99_ns": 3329000, "qps": 352 },
+      { "p50_ns": 2785200, "p95_ns": 3023000, "p99_ns": 3143800, "qps": 356 }
+    ],
+    "candidate_adaptive": [
+      { "p50_ns": 2807400, "p95_ns": 3034300, "p99_ns": 3289700, "qps": 352 },
+      { "p50_ns": 2835000, "p95_ns": 3087500, "p99_ns": 3225000, "qps": 350 },
+      { "p50_ns": 2801700, "p95_ns": 3035100, "p99_ns": 3370600, "qps": 353 },
+      { "p50_ns": 2830700, "p95_ns": 3121900, "p99_ns": 3433200, "qps": 348 },
+      { "p50_ns": 2798700, "p95_ns": 3068100, "p99_ns": 3433400, "qps": 353 }
+    ],
+    "median_p50_change_percent": 0.0,
+    "median_p95_change_percent": 0.5,
+    "median_p99_change_percent": 2.0,
+    "median_qps_change_percent": 0.0
+  },
+  "notes": "Five alternating release-build pairs per limit on one Windows host. The small-limit query returns 10 rows from 834 index candidates; its seeded residual seq >= 0 predicate passes every row. Separate correctness coverage verifies growth when residual predicates and RLS reject early candidates. This in-process microbenchmark excludes wire protocol, network, durable sync, and concurrent clients."
+}
