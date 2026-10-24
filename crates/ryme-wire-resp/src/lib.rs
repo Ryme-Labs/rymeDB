@@ -2152,7 +2152,9 @@ where
 
     fn dispatch_in(&self, txn: &mut Transaction, command: RespCommand) -> Vec<u8> {
         match command.name.as_str() {
-            "PING" => encode_simple("PONG"),
+            "PING" if command.args.is_empty() => encode_simple("PONG"),
+            "PING" if command.args.len() == 1 => encode_bulk(&command.args[0]),
+            "PING" => encode_error(String::from("wrong args")),
             "EVAL" | "EVALSHA" => self.eval_command(txn, &command.name, &command.args),
             "SCRIPT" => self.script_command(&command.args),
             "PUBLISH" => {

@@ -211,6 +211,14 @@ async fn echo_roundtrip() {
 }
 
 #[tokio::test]
+async fn ping_echoes_one_optional_argument_and_rejects_extras() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["PING"]).await, "+PONG");
+    assert_eq!(command(addr, &["PING", "hello"]).await, "$5\r\nhello");
+    assert!(command(addr, &["PING", "hello", "extra"]).await.contains("wrong args"));
+}
+
+#[tokio::test]
 async fn hello_full_shape() {
     let addr = serve().await;
     let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();

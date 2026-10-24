@@ -40,6 +40,7 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP `PING` now echoes its optional message and rejects additional arguments.
 - RESP blocking-command timeouts now reject out-of-range seconds without
   panicking while converting the client-supplied duration.
 - RESP `XREAD BLOCK` and `XREADGROUP BLOCK` deadlines now use checked `Instant`
