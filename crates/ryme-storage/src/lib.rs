@@ -57,6 +57,8 @@ type ImportHistory<'a> = BTreeMap<RecordKey, (Option<u64>, BTreeMap<u64, (Option
 /// Routing-key formats are part of persisted range topology. Keep the legacy
 /// format readable so an existing deployment can restart, while new
 /// topologies include the isolation scopes that precede every record.
+/// Scoped routing escapes NUL bytes in database names as `[0, 255]`; existing
+/// names keep their original byte representation.
 pub const LEGACY_ROUTING_VERSION: u8 = 0;
 pub const SCOPED_ROUTING_VERSION: u8 = 1;
 pub const CURRENT_ROUTING_VERSION: u8 = SCOPED_ROUTING_VERSION;
@@ -98,20 +100,24 @@ pub fn routing_key(
 ) -> Result<Vec<u8>> {
     validate_routing_version(version)?;
     let has_invalid_component = if version == SCOPED_ROUTING_VERSION {
-        tenant.as_bytes().contains(&0)
-            || database.as_bytes().contains(&0)
-            || table.as_bytes().contains(&0)
+        tenant.as_bytes().contains(&0) || table.as_bytes().contains(&0)
     } else {
         table.as_bytes().contains(&0)
     };
     if has_invalid_component {
         return Err(RymeError::InvalidArgument(String::from("routing component")));
     }
+    let escaped_database_bytes = if version == SCOPED_ROUTING_VERSION {
+        database.as_bytes().iter().filter(|byte| **byte == 0).count()
+    } else {
+        0
+    };
     let capacity = tenant
         .len()
         .checked_add(database.len())
         .and_then(|capacity| capacity.checked_add(table.len()))
         .and_then(|capacity| capacity.checked_add(pk.len()))
+        .and_then(|capacity| capacity.checked_add(escaped_database_bytes))
         .and_then(|capacity| capacity.checked_add(if version == 0 { 1 } else { 3 }))
         .ok_or_else(|| RymeError::Overload(String::from("routing key")))?;
     let mut out = Vec::new();
@@ -120,7 +126,15 @@ pub fn routing_key(
     if version == SCOPED_ROUTING_VERSION {
         out.extend_from_slice(tenant.as_bytes());
         out.push(0);
-        out.extend_from_slice(database.as_bytes());
+        for byte in database.as_bytes() {
+            if *byte == 0 {
+                // A literal NUL would be indistinguishable from the component
+                // separator. Escape it without changing non-NUL legacy keys.
+                out.extend_from_slice(&[0, u8::MAX]);
+            } else {
+                out.push(*byte);
+            }
+        }
         out.push(0);
     }
     out.extend_from_slice(table.as_bytes());
@@ -133,11 +147,10 @@ pub fn record_routing_key(version: u8, key: &RecordKey) -> Result<Vec<u8>> {
     routing_key(version, &key.tenant, &key.database, &key.table, &key.pk)
 }
 
-fn validate_record_scope(tenant: &str, database: &str, table: &str) -> Result<()> {
-    if tenant.as_bytes().contains(&0)
-        || database.as_bytes().contains(&0)
-        || table.as_bytes().contains(&0)
-    {
+fn validate_record_scope(tenant: &str, _database: &str, table: &str) -> Result<()> {
+    // BranchBackend encodes its internal namespace in the database field with
+    // NUL separators. Tenant and table names remain delimiter-safe identifiers.
+    if tenant.as_bytes().contains(&0) || table.as_bytes().contains(&0) {
         return Err(RymeError::InvalidArgument(String::from("record scope")));
     }
     Ok(())
@@ -1868,6 +1881,10 @@ mod tests {
             routing_key(SCOPED_ROUTING_VERSION, "tenant-b", "db-a", "docs", b"k").unwrap()
         );
         assert!(routing_key(SCOPED_ROUTING_VERSION, "tenant\0a", "db", "docs", b"k").is_err());
+        assert_eq!(
+            routing_key(SCOPED_ROUTING_VERSION, "tenant", "db\0branch", "docs", b"k").unwrap(),
+            b"tenant\0db\0\xffbranch\0docs\0k"
+        );
         assert!(routing_key(9, "tenant", "db", "docs", b"k").is_err());
     }
 
@@ -1897,12 +1914,34 @@ mod tests {
     }
 
     #[test]
+    fn branch_internal_database_namespace_survives_storage_roundtrip() {
+        let mut engine = Engine::new();
+        let key = RecordKey::new("tenant", "app\0branch\0preview", "items", b"key");
+        engine.apply(key.clone(), 1, Some(b"branch value".to_vec())).unwrap();
+        let restored = Engine::decode_snapshot(&engine.encode_snapshot().unwrap()).unwrap();
+        assert_eq!(restored.read(&key, 1, 0).unwrap(), Some(b"branch value".to_vec()));
+    }
+
+    #[test]
     fn scoped_table_bounds_cover_only_one_database_table() {
         let (start, end) = table_routing_bounds(SCOPED_ROUTING_VERSION, "t", "d", "docs").unwrap();
         assert_eq!(start, b"t\0d\0docs\0");
         assert_eq!(end, b"t\0d\0docs\x01");
         assert!(routing_key(SCOPED_ROUTING_VERSION, "t", "d", "docs", b"z").unwrap() < end);
         assert!(routing_key(SCOPED_ROUTING_VERSION, "t", "d2", "docs", b"a").unwrap() >= end);
+    }
+
+    #[test]
+    fn scoped_table_bounds_support_internal_branch_database_namespaces() {
+        let database = "app\0branch\0preview";
+        let (start, end) =
+            table_routing_bounds(SCOPED_ROUTING_VERSION, "tenant", database, "docs").unwrap();
+        let row = routing_key(SCOPED_ROUTING_VERSION, "tenant", database, "docs", b"key").unwrap();
+        let adjacent =
+            routing_key(SCOPED_ROUTING_VERSION, "tenant", "app", "branch", b"key").unwrap();
+
+        assert!(row >= start && row < end);
+        assert!(!(adjacent >= start && adjacent < end));
     }
 
     #[test]

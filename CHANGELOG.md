@@ -63,8 +63,8 @@ All notable changes to rymeDB are recorded here. Format follows
   late timestamp conflict cannot leave an in-memory engine partially merged.
 - Storage range reads now return an empty result for reversed or empty bounds,
   avoiding a panic from invalid caller-supplied ranges.
-- Storage writes and snapshot loading now reject NUL bytes in tenant, database,
-  and table names before they can produce ambiguous routing keys.
+- Storage rejects NUL bytes in tenant and table names while scoped routing
+  escapes NUL separators in internal branch database namespaces.
 - Transaction staging, restored transaction state, and WAL replay now reject
   duplicate or unrepresentable record keys and values before durable mutation.
 - WAL append, rewrite, and recovery now reject commit timestamp zero, which
