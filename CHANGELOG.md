@@ -46,6 +46,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - Standard storage recovery now rejects replicated transactions older than its
   segment floor when prior conflict metadata is no longer available.
+- Standard-mode MVCC garbage collection now compacts reclaimed history into a
+  durable segment snapshot while retaining versions visible to active readers.
 - Standard-mode key purges now persist bounded tombstone batches so older WAL
   puts cannot resurrect transferred or administratively purged rows on restart.
 - RESP `SET` now rejects zero `EXAT` and `PXAT` timestamps, and `GETEX` rejects

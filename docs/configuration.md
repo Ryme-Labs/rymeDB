@@ -40,7 +40,7 @@ ryme-server --config /etc/rymedb/node.json
 | `http_max_body_bytes` | `2097152` | HTTP per-request limit; maximum 64 MiB. HTTP and HTTPS share a bounded request-concurrency budget derived from 256 MiB divided by this limit; excess concurrent requests receive `429 Too Many Requests`. |
 | `region` | `local-1` | Region label returned by placement APIs. |
 | `read_only` | `false` | Reject mutations while serving reads. |
-| `sweep_interval_secs` | `30` | TTL, MVCC, and retention sweep period; `0` disables it. |
+| `sweep_interval_secs` | `30` | TTL, MVCC, and retention sweep period; Standard storage also rewrites segments when MVCC versions become safe to reclaim. `0` disables it. |
 | `shards` | `1` | Local shard count, from 1 to 256. Cluster mode currently requires 1. |
 | `index_partitions` | `4` | Vector/text index partitions, from 1 to 64. |
 | `replicated_tables` | `[]` | Tables using the clustered backend; requires `cluster.raft_listen`. |

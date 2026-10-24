@@ -917,15 +917,25 @@ impl Engine {
     }
 
     pub fn gc(&mut self, retain_ts: u64) {
+        let _ = self.gc_with_count(retain_ts);
+    }
+
+    /// Collects versions older than the retention timestamp and returns the
+    /// number of versions removed. The newest version at or before the
+    /// timestamp is retained for every key.
+    pub fn gc_with_count(&mut self, retain_ts: u64) -> usize {
         let mut cursor = None;
+        let mut removed = 0;
         loop {
-            let (next, complete) =
-                self.gc_batch(retain_ts, cursor.as_ref(), usize::MAX, usize::MAX);
+            let (next, complete, removed_batch) =
+                self.gc_batch_with_count(retain_ts, cursor.as_ref(), usize::MAX, usize::MAX);
+            removed += removed_batch;
             if complete {
                 break;
             }
             cursor = next;
         }
+        removed
     }
 
     /// Collects bounded key/version work, returning a cursor and whether the
@@ -938,10 +948,23 @@ impl Engine {
         max_keys: usize,
         max_versions: usize,
     ) -> (Option<GcCursor>, bool) {
+        let (cursor, complete, _) =
+            self.gc_batch_with_count(retain_ts, cursor, max_keys, max_versions);
+        (cursor, complete)
+    }
+
+    fn gc_batch_with_count(
+        &mut self,
+        retain_ts: u64,
+        cursor: Option<&GcCursor>,
+        max_keys: usize,
+        max_versions: usize,
+    ) -> (Option<GcCursor>, bool, usize) {
         if max_keys == 0 || max_versions == 0 {
-            return (cursor.cloned(), false);
+            return (cursor.cloned(), false, 0);
         }
         let mut reclaimed_bytes = 0u64;
+        let mut removed_total = 0usize;
         let (next_cursor, complete) = {
             let bounds: (Bound<&RecordKey>, Bound<&RecordKey>) = match cursor {
                 Some(cursor) if cursor.inclusive => {
@@ -974,6 +997,7 @@ impl Engine {
                     versions.shrink_to_fit();
                 }
                 removed_versions += remove_count;
+                removed_total += remove_count;
                 visited_keys += 1;
                 last_key = Some(key);
                 if remove_count < removable {
@@ -992,7 +1016,7 @@ impl Engine {
             (next_cursor, !resume_current && !has_more)
         };
         self.bytes_held = self.bytes_held.saturating_sub(reclaimed_bytes);
-        (next_cursor, complete)
+        (next_cursor, complete, removed_total)
     }
 
     fn version_partition_at(versions: &VecDeque<Version>, read_ts: u64) -> usize {
