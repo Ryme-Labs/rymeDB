@@ -329,6 +329,12 @@ async fn owner_reader_batches_local_reads_in_standard_storage_mode() {
         command(addr, &["MGET", "local", "missing"]).await,
         "*2\r\n$11\r\nlocal-value\r\n$-1"
     );
+    assert_eq!(command(addr, &["TTL", "remote"]).await, ":-1");
+    assert_eq!(command(addr, &["PTTL", "remote"]).await, ":-1");
+    assert_eq!(command(addr, &["EXPIRETIME", "remote"]).await, ":-1");
+    assert_eq!(command(addr, &["PEXPIRETIME", "remote"]).await, ":-1");
+    assert_eq!(command(addr, &["EXPIRETIME", "missing"]).await, ":-2");
+    assert_eq!(command(addr, &["PEXPIRETIME", "missing"]).await, ":-2");
 
     server.abort();
     let _ = server.await;

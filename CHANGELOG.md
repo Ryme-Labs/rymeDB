@@ -45,6 +45,8 @@ All notable changes to rymeDB are recorded here. Format follows
   of silently allowing the last flag to override earlier ones.
 - RESP expiry commands inside `MULTI` now honor earlier staged values and
   expiration deadlines in that transaction.
+- RESP implements `EXPIRETIME` and `PEXPIRETIME` for local and remote keys,
+  including the standard `-1` persistent and `-2` missing results.
 - Ordered SQL scans now sort the full bounded result set or return an overload
   error instead of silently sorting only the first 10,000 rows.
 - Primary-key-ordered SQL scans now size their read window for both `LIMIT` and

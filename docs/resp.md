@@ -18,7 +18,7 @@ Enable `RYME_RESP_PASSWORD` for password authentication. Use the dedicated
 | Family | Commands and behavior |
 | --- | --- |
 | Strings/keys | `GET`, `SET`, `SETNX`, `GETSET`, `GETEX`, `GETDEL`, `MGET`, `MSET`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `TYPE` |
-| Expiry | `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST` |
+| Expiry | `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST` |
 | Counters | `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT` |
 | Hashes | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HLEN`, `HGETALL`, `HKEYS`, `HVALS` |
 | Lists | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `BLPOP`, `BRPOP`, `BLMOVE` |
@@ -35,7 +35,9 @@ milliseconds. Relative `EXPIRE`/`PEXPIRE` and `SET EX`/`PX` plus `GETEX EX`/`PX`
 use precise relative deadlines. `PXAT` absolute values retain millisecond
 precision. `PTTL` reports remaining milliseconds; `TTL` reports whole seconds
 and may return `0` while a key has less than one second remaining. Existing
-persisted expiry timestamps remain readable.
+persisted expiry timestamps remain readable. `EXPIRETIME` and `PEXPIRETIME`
+return absolute expiry timestamps; both return `-1` for a persistent key and
+`-2` for a missing or expired key.
 Expiry conditions `NX`, `XX`, `GT`, and `LT` are mutually exclusive; repeated
 or conflicting conditions return a syntax error without changing the key.
 

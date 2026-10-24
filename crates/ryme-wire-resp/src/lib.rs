@@ -2071,6 +2071,20 @@ where
                     Err(error) => Some(encode_error(error.to_string())),
                 }
             }
+            "EXPIRETIME" | "PEXPIRETIME" if command.args.len() == 1 => {
+                let key = RecordKey::new(&self.tenant, &self.database, KV_TABLE, &command.args[0]);
+                match reader.read(key).await {
+                    Ok(RemoteRead::Local) => None,
+                    Ok(RemoteRead::Value { value, expires_at }) => Some(encode_integer(
+                        remote_expire_time(
+                            value.is_some(),
+                            expires_at,
+                            command.name == "PEXPIRETIME",
+                        ),
+                    )),
+                    Err(error) => Some(encode_error(error.to_string())),
+                }
+            }
             _ => None,
         }
     }
@@ -2278,6 +2292,19 @@ where
                 },
                 None => encode_error(String::from("wrong args")),
             },
+            "EXPIRETIME" | "PEXPIRETIME" => {
+                if command.args.len() != 1 {
+                    return encode_error(String::from("wrong args"));
+                }
+                match self.expire_time(
+                    txn,
+                    &command.args[0],
+                    command.name == "PEXPIRETIME",
+                ) {
+                    Ok(timestamp) => encode_integer(timestamp),
+                    Err(error) => encode_error(error.to_string()),
+                }
+            }
             "PERSIST" => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
@@ -5330,6 +5357,31 @@ where
         }
     }
 
+    fn expire_time(&self, txn: &mut Transaction, key: &[u8], millis: bool) -> Result<i64> {
+        let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
+        let now = ryme_txn::now_unix_millis();
+        let expires_at = if let Some(write) = txn.writes().get(&record) {
+            if write.value.is_none() || ryme_storage::expiry_is_expired(write.expires_at, now) {
+                return Ok(-2);
+            }
+            write.expires_at
+        } else {
+            if self.manager.get(txn, &record)?.is_none() {
+                return Ok(-2);
+            }
+            self.manager.expires_at(&record)?.unwrap_or(0)
+        };
+        if expires_at == 0 {
+            return Ok(-1);
+        }
+        if ryme_storage::expiry_is_expired(expires_at, now) {
+            return Ok(-2);
+        }
+        let timestamp_millis = ryme_storage::expiry_to_millis(expires_at);
+        let timestamp = if millis { timestamp_millis } else { timestamp_millis / 1000 };
+        Ok(timestamp.min(i64::MAX as u64) as i64)
+    }
+
     fn getex(&self, txn: &mut Transaction, args: &[Vec<u8>]) -> Vec<u8> {
         if args.is_empty() {
             return encode_error(String::from("wrong args"));
@@ -5620,6 +5672,8 @@ fn is_read_only_command(command: &RespCommand) -> bool {
         "GET"
             | "TTL"
             | "PTTL"
+            | "EXPIRETIME"
+            | "PEXPIRETIME"
             | "EXISTS"
             | "TYPE"
             | "STRLEN"
@@ -6129,6 +6183,8 @@ fn is_known(name: &str) -> bool {
             | "PEXPIREAT"
             | "TTL"
             | "PTTL"
+            | "EXPIRETIME"
+            | "PEXPIRETIME"
             | "PERSIST"
             | "DEL"
             | "EXISTS"
@@ -6534,7 +6590,8 @@ fn encode_array(items: Vec<Option<Vec<u8>>>) -> Vec<u8> {
 
 fn remote_ttl(present: bool, expires_at: Option<u64>, millis: bool) -> i64 {
     match (present, expires_at) {
-        (false, _) | (true, None) => -2,
+        (false, _) => -2,
+        (true, None) => -1,
         (true, Some(0)) => -1,
         (true, Some(ts)) => {
             let remaining =
@@ -6549,6 +6606,22 @@ fn remote_ttl(present: bool, expires_at: Option<u64>, millis: bool) -> i64 {
             }
         }
     }
+}
+
+fn remote_expire_time(present: bool, expires_at: Option<u64>, millis: bool) -> i64 {
+    if !present {
+        return -2;
+    }
+    let Some(expires_at) = expires_at.filter(|expires_at| *expires_at != 0) else {
+        return -1;
+    };
+    let now = ryme_txn::now_unix_millis();
+    if ryme_storage::expiry_is_expired(expires_at, now) {
+        return -2;
+    }
+    let timestamp_millis = ryme_storage::expiry_to_millis(expires_at);
+    let timestamp = if millis { timestamp_millis } else { timestamp_millis / 1000 };
+    timestamp.min(i64::MAX as u64) as i64
 }
 
 // Command handlers share one compact RESP2 encoder.  RESP2 scalar replies are

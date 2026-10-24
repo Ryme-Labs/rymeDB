@@ -93,12 +93,22 @@ async fn absolute_expiry_commands_handle_units_and_conditional_flags() {
     let expires_at_secs = now.as_secs() + 10;
     assert_eq!(command(addr, &["SET", "seconds", "v"]).await, "+OK");
     assert_eq!(command(addr, &["EXPIREAT", "seconds", &expires_at_secs.to_string()]).await, ":1");
+    assert_eq!(command(addr, &["EXPIRETIME", "seconds"]).await, format!(":{expires_at_secs}"));
+    assert_eq!(
+        command(addr, &["PEXPIRETIME", "seconds"]).await,
+        format!(":{}", expires_at_secs * 1000)
+    );
     let ttl: i64 = command(addr, &["TTL", "seconds"]).await[1..].parse().unwrap();
     assert!((1..=10).contains(&ttl));
 
     let expires_at_millis = now.as_millis() + 350;
     assert_eq!(command(addr, &["SET", "millis", "v"]).await, "+OK");
     assert_eq!(command(addr, &["PEXPIREAT", "millis", &expires_at_millis.to_string()]).await, ":1");
+    assert_eq!(command(addr, &["PEXPIRETIME", "millis"]).await, format!(":{expires_at_millis}"));
+    assert_eq!(
+        command(addr, &["EXPIRETIME", "millis"]).await,
+        format!(":{}", expires_at_millis / 1000)
+    );
     let pttl: i64 = command(addr, &["PTTL", "millis"]).await[1..].parse().unwrap();
     assert!((1..=350).contains(&pttl));
 
@@ -117,6 +127,19 @@ async fn absolute_expiry_commands_handle_units_and_conditional_flags() {
     assert_eq!(command(addr, &["SET", "past", "v"]).await, "+OK");
     assert_eq!(command(addr, &["EXPIREAT", "past", "0", "NX"]).await, ":1");
     assert_eq!(command(addr, &["GET", "past"]).await, "$-1");
+}
+
+#[tokio::test]
+async fn expire_time_commands_distinguish_persistent_and_missing_keys() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["SET", "persistent", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["EXPIRETIME", "persistent"]).await, ":-1");
+    assert_eq!(command(addr, &["PEXPIRETIME", "persistent"]).await, ":-1");
+    assert_eq!(command(addr, &["EXPIRETIME", "missing"]).await, ":-2");
+    assert_eq!(command(addr, &["PEXPIRETIME", "missing"]).await, ":-2");
+    assert_eq!(command(addr, &["SET", "expired", "v", "PX", "0"]).await, "+OK");
+    assert_eq!(command(addr, &["EXPIRETIME", "expired"]).await, ":-2");
+    assert_eq!(command(addr, &["PEXPIRETIME", "expired"]).await, ":-2");
 }
 
 #[tokio::test]
