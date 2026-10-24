@@ -1393,7 +1393,7 @@ impl Node {
         let mut log_by_index = BTreeMap::<u64, LogEntry>::new();
         for record in records {
             let (index, term, apply) = decode_log_frame(&record.payload)?;
-            if index == 0 || term == 0 {
+            if index == 0 || term == 0 || term != record.commit_ts {
                 return Err(RymeError::Corrupt(String::from("raft log metadata")));
             }
             validate_apply_payload(&apply)?;
@@ -7397,6 +7397,21 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_log_term_that_disagrees_with_wal_timestamp() {
+        let dir = temp_dir("log-term");
+        let mut wal = ryme_wal::Wal::open(&dir, 1024 * 1024).unwrap();
+        let payload = crate::encode_metadata(b"metadata").unwrap();
+        wal.append(1, &encode_log_frame(1, 2, &payload)).unwrap();
+        wal.sync().unwrap();
+
+        let result = Node::open(0, Vec::new(), Vec::new(), &dir);
+        assert!(
+            matches!(result, Err(RymeError::Corrupt(message)) if message == "raft log metadata")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn conflicting_append_rewrites_suffix_and_survives_restart() {
         let dir = temp_dir("append-conflict");
         let first =
@@ -7731,7 +7746,7 @@ mod tests {
         writes.insert(key.clone(), ryme_txn::WriteOp::put(b"value".to_vec()));
         let mut wal = Wal::open(&dir, 64 * 1024 * 1024).unwrap();
         let apply = encode_applied(2, &encode_writes(&writes).unwrap());
-        wal.append(2, &encode_log_frame(1, 1, &apply)).unwrap();
+        wal.append(1, &encode_log_frame(1, 1, &apply)).unwrap();
         wal.sync().unwrap();
         let meta =
             Meta { term: 1, voted_for: None, commit_index: 1, members: Vec::new(), joint: None };

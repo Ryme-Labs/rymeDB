@@ -52,6 +52,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Raft recovery now rejects log entries whose embedded term disagrees with the
+  durable WAL timestamp.
 - User, passkey, and OTP enrollment and OTP verification now publish credential
   state only after the auth snapshot is atomically replaced, so failed
   persistence cannot activate undisclosed secrets or leave volatile accounts.
