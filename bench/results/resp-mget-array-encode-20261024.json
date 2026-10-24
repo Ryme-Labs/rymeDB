@@ -1,0 +1,66 @@
+{
+  "benchmark": "resp-mget-array-encode",
+  "capture_date": "2026-10-24",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "workload": {
+    "server_mode": "standard",
+    "server_durability": "memory",
+    "qos_tier": "dedicated_cluster",
+    "topology": "single local node, one shard",
+    "active_delta_segments": 80,
+    "seeded_keys": 16,
+    "seed_commands": 80,
+    "seed_value_bytes": 16,
+    "request": "RESP MGET 16 keys",
+    "clients": 8,
+    "commands_per_capture": 16000,
+    "pipeline": 1,
+    "latency_unit": "command round trip",
+    "cache": "Same persisted dataset; one 16000-command warm-up before each three-capture group",
+    "comparison": "baseline ee013c8 array encoder versus candidate direct array serialization; storage cache-window code is not exercised by four-key MGET storage batches"
+  },
+  "summary": {
+    "baseline_median": {
+      "qps": 41836,
+      "p50_us": 175,
+      "p99_us": 403
+    },
+    "candidate_median": {
+      "qps": 42231,
+      "p50_us": 173,
+      "p99_us": 397
+    },
+    "interpretation": "Differences are within run-to-run variation and do not establish a speedup. All captures had zero errors."
+  },
+  "warmup": {
+    "baseline": {
+      "qps": 38819,
+      "p50_us": 186,
+      "p99_us": 465,
+      "errors": 0
+    },
+    "candidate": {
+      "qps": 42212,
+      "p50_us": 170,
+      "p99_us": 413,
+      "errors": 0
+    }
+  },
+  "captures": {
+    "baseline": [
+      { "qps": 41836, "p50_us": 175, "p99_us": 403, "errors": 0 },
+      { "qps": 44085, "p50_us": 167, "p99_us": 370, "errors": 0 },
+      { "qps": 40355, "p50_us": 180, "p99_us": 412, "errors": 0 }
+    ],
+    "candidate": [
+      { "qps": 43917, "p50_us": 165, "p99_us": 392, "errors": 0 },
+      { "qps": 41627, "p50_us": 175, "p99_us": 406, "errors": 0 },
+      { "qps": 42231, "p50_us": 173, "p99_us": 397, "errors": 0 }
+    ]
+  }
+}

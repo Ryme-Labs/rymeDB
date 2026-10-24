@@ -2030,7 +2030,10 @@ where
                         values[index] = value;
                     }
                 }
-                Some(encode_array(values))
+                Some(match encode_array_bounded(values, RESP_MAX_COLLECTION_BYTES) {
+                    Ok(reply) => reply,
+                    Err(error) => encode_error(error),
+                })
             }
             "EXISTS" if !command.args.is_empty() => {
                 let results = match reader
@@ -2541,7 +2544,10 @@ where
                         }
                     }
                 }
-                encode_array(items)
+                match encode_array_bounded(items, RESP_MAX_COLLECTION_BYTES) {
+                    Ok(reply) => reply,
+                    Err(error) => encode_error(error),
+                }
             }
             "MSET" => {
                 if command.args.is_empty() || !command.args.len().is_multiple_of(2) {
@@ -7021,18 +7027,68 @@ fn glob_class(pattern: &[u8], byte: Option<&u8>) -> Option<(bool, usize)> {
 }
 
 fn encode_array(items: Vec<Option<Vec<u8>>>) -> Vec<u8> {
-    let mut out = format!("*{}\r\n", items.len()).into_bytes();
+    let capacity = array_encoded_len(&items).unwrap_or(0);
+    let mut out = Vec::with_capacity(capacity);
+    append_array(&mut out, items);
+    out
+}
+
+fn encode_array_bounded(
+    items: Vec<Option<Vec<u8>>>,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let total_bytes = array_encoded_len(&items)
+        .filter(|bytes| *bytes <= max_bytes)
+        .ok_or_else(|| String::from("response exceeds the 16 MiB limit"))?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(total_bytes)
+        .map_err(|_| String::from("response allocation failed"))?;
+    append_array(&mut out, items);
+    Ok(out)
+}
+
+fn array_encoded_len(items: &[Option<Vec<u8>>]) -> Option<usize> {
+    let mut total = decimal_digits(items.len()).checked_add(3)?;
+    for item in items {
+        let item_bytes = match item {
+            Some(value) => value.len().checked_add(decimal_digits(value.len()))?.checked_add(5)?,
+            None => 5,
+        };
+        total = total.checked_add(item_bytes)?;
+    }
+    Some(total)
+}
+
+fn append_decimal(out: &mut Vec<u8>, mut value: usize) {
+    let mut digits = [0u8; std::mem::size_of::<usize>() * 3];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[start..]);
+}
+
+fn append_array(out: &mut Vec<u8>, items: Vec<Option<Vec<u8>>>) {
+    out.push(b'*');
+    append_decimal(out, items.len());
+    out.extend_from_slice(b"\r\n");
     for item in items {
         match item {
             Some(value) => {
-                out.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+                out.push(b'$');
+                append_decimal(out, value.len());
+                out.extend_from_slice(b"\r\n");
                 out.extend_from_slice(&value);
                 out.extend_from_slice(b"\r\n");
             }
             None => out.extend_from_slice(b"$-1\r\n"),
         }
     }
-    out
 }
 
 fn remote_ttl(present: bool, expires_at: Option<u64>, millis: bool) -> i64 {
@@ -7383,6 +7439,16 @@ mod tests {
             bus.total_subscriptions.load(Ordering::Relaxed),
             RESP_MAX_GLOBAL_PUBSUB_PATTERNS + 1
         );
+    }
+
+    #[test]
+    fn bounded_array_encoding_matches_resp_and_checks_full_reply_size() {
+        let items = vec![Some(b"value".to_vec()), None, Some(Vec::new())];
+        let expected = b"*3\r\n$5\r\nvalue\r\n$-1\r\n$0\r\n\r\n";
+        assert_eq!(encode_array(items.clone()), expected);
+        assert_eq!(encode_array_bounded(items.clone(), expected.len()).unwrap(), expected);
+        assert!(encode_array_bounded(items, expected.len() - 1).is_err());
+        assert_eq!(encode_array_bounded(Vec::new(), 4).unwrap(), b"*0\r\n");
     }
 
     #[test]

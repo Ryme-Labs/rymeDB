@@ -44,6 +44,7 @@ All notable changes to rymeDB are recorded here. Format follows
 ### Performance
 
 - Standard-mode batched reads reuse precomputed Bloom hashes across delta segments, reducing the 16-key, 80-segment in-process benchmark median p50 by 48% on an AMD Ryzen 5 4500.
+- RESP array replies preallocate their encoded size and write bulk lengths without temporary formatted strings. Local and remote MGET now enforce the 16 MiB limit against the complete encoded reply.
 
 - HNSW graph scoring now uses single-precision accumulation for normalized
   vector products; exact vector search keeps double-precision accumulation.

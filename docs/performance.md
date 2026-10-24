@@ -58,6 +58,14 @@ The earlier eager-cache measurements in
 [this capture](../bench/results/resp-mget-standard-80segments-8clients.json)
 predate lazy segment loading and are historical.
 
+RESP array replies now calculate the exact output size once and append bulk
+lengths directly, avoiding a temporary formatted string for each item. Three
+16-key MGET captures on the same Windows Ryzen 5 4500 setup measured median
+throughput of 41.8k commands/s before and 42.2k after, with p50 at 175/173 microseconds
+and p99 at 403/397 microseconds. These differences are within run-to-run variation and
+do not establish a speedup. The change also makes MGET's 16 MiB limit include
+RESP framing. See the [raw captures](../bench/results/resp-mget-array-encode-20261024.json).
+
 To isolate the in-memory transaction core from networking and WAL durability:
 
 ```bash
