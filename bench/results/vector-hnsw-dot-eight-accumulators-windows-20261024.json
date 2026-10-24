@@ -1,0 +1,68 @@
+{
+  "experiment": "hnsw-f32-dot-eight-accumulators",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "748dcd7",
+  "candidate_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "arch": "x86_64",
+    "os": "Windows"
+  },
+  "method": "Release-mode in-process vector-index benchmark. Ten alternating baseline/candidate pairs at 384D. Candidate uses eight independent f32 accumulators in the HNSW dot product. ANN recall is measured against exact top-k results.",
+  "workload_384d": {
+    "vectors": 3000,
+    "dimensions": 384,
+    "queries": 100,
+    "partitions": 1,
+    "top_k": 10,
+    "ann_ef": 128,
+    "baseline": [
+      { "build_ns": 553555100, "ann_p50_ns": 464300, "ann_p95_ns": 602500, "ann_p99_ns": 637800, "recall": 0.9710000000000002 },
+      { "build_ns": 548684500, "ann_p50_ns": 489800, "ann_p95_ns": 672300, "ann_p99_ns": 719500, "recall": 0.9710000000000002 },
+      { "build_ns": 545664000, "ann_p50_ns": 482000, "ann_p95_ns": 681400, "ann_p99_ns": 792500, "recall": 0.9710000000000002 },
+      { "build_ns": 561670900, "ann_p50_ns": 485600, "ann_p95_ns": 757600, "ann_p99_ns": 896400, "recall": 0.9710000000000002 },
+      { "build_ns": 585136100, "ann_p50_ns": 513700, "ann_p95_ns": 680900, "ann_p99_ns": 954600, "recall": 0.9710000000000002 },
+      { "build_ns": 559737600, "ann_p50_ns": 501600, "ann_p95_ns": 709700, "ann_p99_ns": 809600, "recall": 0.9710000000000002 },
+      { "build_ns": 575065200, "ann_p50_ns": 497800, "ann_p95_ns": 731400, "ann_p99_ns": 813300, "recall": 0.9710000000000002 },
+      { "build_ns": 548530000, "ann_p50_ns": 453400, "ann_p95_ns": 626300, "ann_p99_ns": 808100, "recall": 0.9710000000000002 },
+      { "build_ns": 581067000, "ann_p50_ns": 510600, "ann_p95_ns": 682300, "ann_p99_ns": 742400, "recall": 0.9710000000000002 },
+      { "build_ns": 523050600, "ann_p50_ns": 480400, "ann_p95_ns": 683600, "ann_p99_ns": 839900, "recall": 0.9710000000000002 }
+    ],
+    "candidate": [
+      { "build_ns": 456157000, "ann_p50_ns": 440300, "ann_p95_ns": 597100, "ann_p99_ns": 635400, "recall": 0.9710000000000002 },
+      { "build_ns": 524080600, "ann_p50_ns": 500600, "ann_p95_ns": 743300, "ann_p99_ns": 886700, "recall": 0.9710000000000002 },
+      { "build_ns": 524250400, "ann_p50_ns": 498900, "ann_p95_ns": 692300, "ann_p99_ns": 766500, "recall": 0.9710000000000002 },
+      { "build_ns": 467621900, "ann_p50_ns": 490100, "ann_p95_ns": 746100, "ann_p99_ns": 801500, "recall": 0.9710000000000002 },
+      { "build_ns": 498179100, "ann_p50_ns": 435000, "ann_p95_ns": 616200, "ann_p99_ns": 683400, "recall": 0.9710000000000002 },
+      { "build_ns": 492372400, "ann_p50_ns": 457500, "ann_p95_ns": 647300, "ann_p99_ns": 752600, "recall": 0.9710000000000002 },
+      { "build_ns": 498889700, "ann_p50_ns": 510600, "ann_p95_ns": 799000, "ann_p99_ns": 902300, "recall": 0.9710000000000002 },
+      { "build_ns": 475038100, "ann_p50_ns": 470200, "ann_p95_ns": 639600, "ann_p99_ns": 678700, "recall": 0.9710000000000002 },
+      { "build_ns": 489470300, "ann_p50_ns": 451400, "ann_p95_ns": 747400, "ann_p99_ns": 873000, "recall": 0.9710000000000002 },
+      { "build_ns": 508032500, "ann_p50_ns": 519500, "ann_p95_ns": 751400, "ann_p99_ns": 812100, "recall": 0.9710000000000002 }
+    ],
+    "median_changes_percent": {
+      "index_build_time": -11.0,
+      "ann_p50": -1.6,
+      "ann_p95": 5.3,
+      "ann_p99": -3.1
+    },
+    "candidate_build_pairs_faster": 10
+  },
+  "control_64d": {
+    "vectors": 5000,
+    "dimensions": 64,
+    "queries": 500,
+    "ann_ef": 64,
+    "pairs": 5,
+    "median_build_change_percent": -0.3,
+    "median_ann_p50_change_percent": -1.8,
+    "mean_recall": 0.978999999999999,
+    "interpretation": "effectively flat"
+  },
+  "correctness": {
+    "recall_384d": 0.9710000000000002,
+    "index_crate_tests": "38 passed, including dot score bounds for dimensions 63-65, 383-385, and 4095-4096"
+  },
+  "notes": "One Windows host, local in-memory benchmark. Build time improved consistently. ANN p50 was nearly flat, p95 regressed by median, and recall was unchanged; no broad query-latency claim is made."
+}

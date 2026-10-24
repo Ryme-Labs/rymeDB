@@ -453,9 +453,9 @@ The precision test verifies absolute score error below 1e-4 for sampled
 normalized vectors at 64, 384, and 4,096 dimensions. These are local in-memory
 index measurements; see the [raw captures](../bench/results/vector-hnsw-f32-accumulation-windows-20261024.json).
 
-The HNSW dot product now uses four independent `f32` accumulators over groups
-of four elements, exposing instruction-level parallelism while retaining a
-scalar tail for dimensions not divisible by four. Across three alternating
+The HNSW dot product now uses eight independent `f32` accumulators over groups
+of eight elements, exposing instruction-level parallelism while retaining a
+scalar tail for dimensions not divisible by eight. Across three alternating
 release pairs, median index build time fell 36.4% for 5,000 64D vectors and
 59.4% for 3,000 384D vectors. ANN p50 fell 32.0% and 50.5%, respectively;
 mean recall@10 was unchanged at 0.979 and 0.971. The 64D p99 was noisy and
@@ -463,6 +463,17 @@ regressed by median, while 384D p95/p99 improved. Exact-search controls were
 approximately flat. The existing dot-score error check and all 38 index-crate
 tests passed. These are local index benchmarks, not end-to-end results; see the
 [paired captures](../bench/results/vector-hnsw-dot-unrolled-windows-20261024.json).
+
+An eight-accumulator candidate was compared with the four-accumulator version
+in ten alternating release pairs on the same Windows host. For 3,000 384D
+vectors, median index build time fell from 556.6 ms to 495.3 ms (11.0%), and
+the candidate built faster in all ten pairs. ANN p50 was nearly flat (487.7 to
+480.2 µs, -1.6%); p95 regressed 5.3% (681.9 to 717.8 µs), while p99 improved
+3.1%. Recall@10 stayed at 0.971. A 5,000-vector 64D control was effectively
+flat for build time (-0.3%) and p50 (-1.8%), with recall unchanged at 0.979.
+All 38 index-crate tests passed, including score-bound checks at tail and large
+dimensions. This is a local build-time result, not a general query-latency
+gain; see the [raw captures](../bench/results/vector-hnsw-dot-eight-accumulators-windows-20261024.json).
 
 An HNSW build experiment moved the selected-neighbor vector into the new node
 instead of cloning it before linking reverse edges. Eight alternating release
