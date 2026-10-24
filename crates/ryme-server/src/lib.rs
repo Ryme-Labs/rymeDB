@@ -1957,7 +1957,7 @@ fn publish_metadata_temp(
     temporary: &std::path::Path,
     destination: &std::path::Path,
 ) -> ryme_error::Result<()> {
-    if let Err(error) = std::fs::rename(temporary, destination) {
+    if let Err(error) = ryme_error::replace_file_atomically(temporary, destination) {
         let _ = std::fs::remove_file(temporary);
         return Err(error.into());
     }
@@ -15633,7 +15633,10 @@ fn persist_ring_with_kms<K: KmsProvider>(
         return Err(error.into());
     }
     drop(file);
-    std::fs::rename(temporary, path)?;
+    if let Err(error) = ryme_error::replace_file_atomically(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     if let Some(parent) = path.parent() {
         sync_metadata_directory(parent)?;
     }
@@ -16043,6 +16046,28 @@ fn archive_target(
 #[allow(clippy::field_reassign_with_default)]
 mod auth_persistence_tests {
     use super::*;
+
+    #[test]
+    fn metadata_publication_replaces_existing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-metadata-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        for contents in [b"first".as_slice(), b"second".as_slice()] {
+            let temporary = write_metadata_temp(&path, contents, true).unwrap();
+            publish_metadata_temp(&temporary, &path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), contents);
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn auth_snapshot_temp_is_private_before_writing_secrets() {
@@ -17306,6 +17331,7 @@ mod realtime_policy_tests {
             symlink(&marker, path.with_extension("tmp")).unwrap();
         }
 
+        persist_ring(&ring, &path).unwrap();
         persist_ring(&ring, &path).unwrap();
         #[cfg(unix)]
         assert_eq!(std::fs::read(dir.join("marker")).unwrap(), b"preserve");
