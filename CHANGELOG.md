@@ -42,6 +42,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - RESP `CLIENT HELP` now rejects unexpected arguments.
 - RESP `PING` now echoes its optional message and rejects additional arguments.
+- RESP `PING` in Pub/Sub mode now returns the subscription-compatible `pong`
+  array reply.
 - RESP blocking-command timeouts now reject out-of-range seconds without
   panicking while converting the client-supplied duration.
 - RESP `XREAD BLOCK` and `XREADGROUP BLOCK` deadlines now use checked `Instant`

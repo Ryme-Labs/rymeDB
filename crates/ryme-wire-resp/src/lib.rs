@@ -852,6 +852,14 @@ where
         }
     }
 
+    fn pubsub_ping(args: &[Vec<u8>]) -> Vec<u8> {
+        match args {
+            [] => encode_raw_array(vec![encode_bulk(b"pong"), encode_bulk(b"")]),
+            [message] => encode_raw_array(vec![encode_bulk(b"pong"), encode_bulk(message)]),
+            _ => encode_error(String::from("wrong args")),
+        }
+    }
+
     fn subscribe(&self, channels: &[Vec<u8>], client: &mut ClientState) -> Vec<u8> {
         if channels.is_empty() {
             return encode_error(String::from("wrong args"));
@@ -1514,6 +1522,21 @@ where
             "PSUBSCRIBE" => self.psubscribe(&command.args, client),
             "PUNSUBSCRIBE" => self.punsubscribe(&command.args, client),
             "PUBSUB" => self.pubsub_command(&command.args),
+            "PING"
+                if multi.is_none()
+                    && (!client.subscriptions.is_empty() || !client.patterns.is_empty()) =>
+            {
+                let start = std::time::Instant::now();
+                let bytes = Self::command_bytes(&command);
+                if let Some(denied) = self.admit(false, bytes) {
+                    self.record_timing("PING", start.elapsed().as_micros() as u64);
+                    return denied;
+                }
+                let reply = Self::pubsub_ping(&command.args);
+                self.observe(false);
+                self.record_timing("PING", start.elapsed().as_micros() as u64);
+                reply
+            }
             "MULTI" => {
                 if multi.is_some() {
                     return encode_error(String::from("MULTI calls can not be nested"));

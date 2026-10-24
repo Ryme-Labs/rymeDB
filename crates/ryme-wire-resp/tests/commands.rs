@@ -131,6 +131,24 @@ async fn pubsub_delivers_messages_to_subscribed_connections() {
 }
 
 #[tokio::test]
+async fn ping_in_pubsub_mode_uses_the_pubsub_reply_shape() {
+    let addr = serve().await;
+    let mut subscriber = tokio::net::TcpStream::connect(addr).await.unwrap();
+    subscriber.write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nchat\r\n").await.unwrap();
+    assert_eq!(
+        read_reply(&mut subscriber).await,
+        "*3\r\n$9\r\nsubscribe\r\n$4\r\nchat\r\n:1\r\n"
+    );
+
+    assert_eq!(command_on(&mut subscriber, &["PING"]).await, "*2\r\n$4\r\npong\r\n$0");
+    assert_eq!(
+        command_on(&mut subscriber, &["PING", "heartbeat"]).await,
+        "*2\r\n$4\r\npong\r\n$9\r\nheartbeat"
+    );
+    assert!(command_on(&mut subscriber, &["PING", "one", "extra"]).await.contains("wrong args"));
+}
+
+#[tokio::test]
 async fn counters_roundtrip() {
     let addr = serve().await;
     assert_eq!(command(addr, &["DEL", "n"]).await, ":0");
