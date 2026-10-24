@@ -150,6 +150,15 @@ Standard mode. Ordered batches measured 117–119 µs and 373–389 µs respecti
 This identifies an optimization target, not a before/after claim; see the
 [raw captures](../bench/results/txn-read-batch-unique-windows-20261024.json).
 
+For same-table shuffled batches, duplicate detection now hashes only primary-key
+bytes after the batch scope check. On the same Windows Ryzen 5 4500 host, three
+Hot-mode captures of 1,024 unique keys measured median p50 at 390.7 µs, down
+from 415.4 µs across three baseline captures. For 64 records repeated across
+1,024 reads, three post-change captures measured median p50 at 168.6 µs, down
+from 212.2 µs in the single baseline capture. These are in-process results;
+the repeated-key comparison has one baseline capture, and per-capture p99 is
+noisy. See the [raw before/after captures](../bench/results/txn-read-batch-primary-key-hash-windows-20261024.json).
+
 On an AMD Ryzen 5 4500, two release captures with 64 records, 1,024 reads per
 iteration, and batches of 256 measured read-only batched p50 at 157–161 µs vs
 184–185 µs for individual reads in Hot mode (1.15–1.17×). Standard mode

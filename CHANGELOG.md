@@ -31,6 +31,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- Same-table shuffled batch reads hash primary-key bytes for duplicate detection,
+  avoiding repeated hashing of tenant, database, and table components.
 - RESP benchmark percentiles now use whole pipeline-batch samples when pipelining,
   with an explicit latency sample unit; throughput remains command-based.
 - Benchmark JSON now reports durability mode and captures CPU and memory

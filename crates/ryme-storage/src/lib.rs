@@ -380,7 +380,8 @@ impl Engine {
 
         if !ordered && !reversed {
             let mut seen = HashSet::with_capacity(keys.len());
-            let has_duplicates = keys.iter().any(|key| !seen.insert(key.record_key()));
+            let has_duplicates =
+                keys.iter().any(|key| !seen.insert(key.record_key().pk.as_slice()));
             drop(seen);
             if !has_duplicates {
                 return keys.iter().map(|key| self.read(key.record_key(), read_ts, now)).collect();
@@ -391,10 +392,11 @@ impl Engine {
             let mut duplicates = Vec::new();
             for (index, key) in keys.iter().enumerate() {
                 let key = key.record_key();
-                if let Some(first) = first_indices.get(key) {
+                let primary_key = key.pk.as_slice();
+                if let Some(first) = first_indices.get(primary_key) {
                     duplicates.push((index, *first));
                 } else {
-                    first_indices.insert(key, index);
+                    first_indices.insert(primary_key, index);
                     unique.push((index, key));
                 }
             }

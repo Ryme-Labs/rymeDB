@@ -1,0 +1,49 @@
+{
+  "benchmark": "transaction-batch-read-same-table-shuffled-primary-key-hash",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_transaction_core",
+  "storage_mode": "hot",
+  "durability": "in_memory_only",
+  "iterations": 100,
+  "batch_size": 256,
+  "value_bytes": 128,
+  "unique_keys": {
+    "records": 1024,
+    "candidates_per_iteration": 1024,
+    "baseline": [
+      { "p50_ns": 415400, "p95_ns": 448800, "p99_ns": 598700 },
+      { "p50_ns": 417800, "p95_ns": 502600, "p99_ns": 557700 },
+      { "p50_ns": 414600, "p95_ns": 459400, "p99_ns": 591700 }
+    ],
+    "primary_key_hash": [
+      { "p50_ns": 389600, "p95_ns": 459200, "p99_ns": 567100 },
+      { "p50_ns": 390700, "p95_ns": 431900, "p99_ns": 700000 },
+      { "p50_ns": 398100, "p95_ns": 462400, "p99_ns": 558600 }
+    ],
+    "median_capture_p50_change_percent": -5.9,
+    "median_capture_p95_change_percent": -0.04,
+    "median_capture_p99_change_percent": -4.2
+  },
+  "repeated_keys": {
+    "records": 64,
+    "candidates_per_iteration": 1024,
+    "baseline": [
+      { "p50_ns": 212200, "p95_ns": 246800, "p99_ns": 299900 }
+    ],
+    "primary_key_hash": [
+      { "p50_ns": 168600, "p95_ns": 195700, "p99_ns": 235100 },
+      { "p50_ns": 170800, "p95_ns": 196600, "p99_ns": 269600 },
+      { "p50_ns": 166100, "p95_ns": 182800, "p99_ns": 238100 }
+    ],
+    "median_capture_p50_change_percent": -20.5,
+    "median_capture_p95_change_percent": -20.7,
+    "median_capture_p99_change_percent": -20.6
+  },
+  "notes": "The baseline captures were collected on the same host and build settings before the change; two unique-key captures also appear in txn-read-batch-unique-windows-20261024.json. Primary-key-hash captures use the same benchmark command and compile settings. Each percentile is from 100 measured iterations; p99 is sensitive to single-run host noise. This is a Hot-mode in-process result, not Standard storage, network, or end-to-end RESP latency."
+}
