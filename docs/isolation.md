@@ -39,6 +39,10 @@ Do not retry only the last statement: the snapshot and all earlier reads are
 part of the transaction's validation. Cap retries and return a useful error
 when contention remains high.
 
+Transactions restored or forwarded below the retained MVCC history are rejected
+before reads or commits, with a `transaction snapshot too old` conflict. Start
+a new transaction to obtain a snapshot within the current retention window.
+
 Full-table scans record a conservative table-level read dependency. Separate
 hot counters or use point reads when independent keys must commit in parallel.
 

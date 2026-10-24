@@ -371,6 +371,7 @@ impl Drop for PendingCommitGuard {
 struct TxnInner {
     clock: AtomicU64,
     applied: AtomicU64,
+    gc_floor: Arc<AtomicU64>,
     pending: Mutex<BTreeMap<u64, BTreeSet<RecordKey>>>,
     engine: RwLock<Engine>,
     // This gate owns commit ordering and its conflict-history index.
@@ -503,27 +504,54 @@ static TXN_ID: AtomicU64 = AtomicU64::new(1);
 struct TxnPin {
     id: u64,
     active: Arc<ActiveRegistry>,
-    additional: Mutex<Vec<Arc<ActiveRegistry>>>,
+    gc_floor: Arc<AtomicU64>,
+    additional: Mutex<Vec<(Arc<ActiveRegistry>, Arc<AtomicU64>)>>,
 }
 
 impl TxnPin {
-    fn track(&self, active: &Arc<ActiveRegistry>, read_ts: u64) {
-        if Arc::ptr_eq(&self.active, active) {
-            return;
-        }
+    fn track(&self, active: &Arc<ActiveRegistry>, gc_floor: &Arc<AtomicU64>, read_ts: u64) {
         let mut additional = self.additional.lock().unwrap_or_else(|error| error.into_inner());
-        if additional.iter().any(|registry| Arc::ptr_eq(registry, active)) {
+        if Arc::ptr_eq(&self.gc_floor, gc_floor)
+            || additional.iter().any(|(_, floor)| Arc::ptr_eq(floor, gc_floor))
+        {
             return;
         }
-        active.insert(self.id, read_ts);
-        additional.push(Arc::clone(active));
+        if read_ts >= gc_floor.load(Ordering::SeqCst)
+            && !Arc::ptr_eq(&self.active, active)
+            && !additional.iter().any(|(registry, _)| Arc::ptr_eq(registry, active))
+        {
+            active.insert(self.id, read_ts);
+        }
+        additional.push((Arc::clone(active), Arc::clone(gc_floor)));
+    }
+
+    fn ensure_snapshot_current(&self, read_ts: u64) -> Result<()> {
+        if read_ts < self.gc_floor.load(Ordering::SeqCst)
+            || self
+                .additional
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .any(|(_, floor)| read_ts < floor.load(Ordering::SeqCst))
+        {
+            return Err(RymeError::Conflict(String::from("transaction snapshot too old")));
+        }
+        Ok(())
     }
 
     fn restamp(&self, read_ts: u64) {
-        self.active.insert(self.id, read_ts);
+        if read_ts >= self.gc_floor.load(Ordering::SeqCst) {
+            self.active.insert(self.id, read_ts);
+        } else {
+            self.active.remove(self.id);
+        }
         let additional = self.additional.lock().unwrap_or_else(|error| error.into_inner());
-        for registry in additional.iter() {
-            registry.insert(self.id, read_ts);
+        for (registry, floor) in additional.iter() {
+            if read_ts >= floor.load(Ordering::SeqCst) {
+                registry.insert(self.id, read_ts);
+            } else {
+                registry.remove(self.id);
+            }
         }
     }
 }
@@ -532,7 +560,7 @@ impl Drop for TxnPin {
     fn drop(&mut self) {
         self.active.remove(self.id);
         let additional = self.additional.get_mut().unwrap_or_else(|error| error.into_inner());
-        for registry in additional.iter() {
+        for (registry, _) in additional.iter() {
             registry.remove(self.id);
         }
     }
@@ -827,7 +855,9 @@ impl Transaction {
     }
 
     pub fn ensure_healthy(&self) -> Result<()> {
-        self.resource_error.clone().map_or(Ok(()), Err)
+        self.resource_error
+            .clone()
+            .map_or_else(|| self.pin.ensure_snapshot_current(self.read_ts), Err)
     }
 
     /// Marks this transaction as failed so that later writes and commit fail.
@@ -1211,6 +1241,7 @@ impl TxnManager {
             inner: Arc::new(TxnInner {
                 clock: AtomicU64::new(1),
                 applied: AtomicU64::new(1),
+                gc_floor: Arc::new(AtomicU64::new(0)),
                 pending: Mutex::new(BTreeMap::new()),
                 engine: RwLock::new(Engine::new()),
                 commit: Mutex::new(CommitIndex::default()),
@@ -1224,6 +1255,7 @@ impl TxnManager {
         let pin = Arc::new(TxnPin {
             id,
             active: Arc::clone(&self.inner.active),
+            gc_floor: Arc::clone(&self.inner.gc_floor),
             additional: Mutex::new(Vec::new()),
         });
         let read_ts = pin.active.insert_with(id, || self.inner.applied.load(Ordering::SeqCst));
@@ -1247,7 +1279,7 @@ impl TxnManager {
     /// Keeps a transaction snapshot visible to this manager's garbage collector.
     /// Use when one transaction reads or writes across managers in the same timestamp domain.
     pub fn track_transaction(&self, txn: &mut Transaction) {
-        txn.pin.track(&self.inner.active, txn.read_ts);
+        txn.pin.track(&self.inner.active, &self.inner.gc_floor, txn.read_ts);
     }
 
     #[allow(clippy::wrong_self_convention)]
@@ -1314,9 +1346,20 @@ impl TxnManager {
         let pin = Arc::new(TxnPin {
             id,
             active: Arc::clone(&self.inner.active),
+            gc_floor: Arc::clone(&self.inner.gc_floor),
             additional: Mutex::new(Vec::new()),
         });
-        pin.active.insert(id, state.read_ts);
+        {
+            let _commit = self
+                .inner
+                .commit
+                .lock()
+                .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+            if state.read_ts < self.inner.gc_floor.load(Ordering::SeqCst) {
+                return Err(RymeError::Conflict(String::from("transaction snapshot too old")));
+            }
+            pin.active.insert(id, state.read_ts);
+        }
         Ok(Transaction {
             id,
             read_ts: state.read_ts,
@@ -1528,6 +1571,7 @@ impl TxnManager {
         commit_ts: u64,
         committed: &mut CommitIndex,
     ) -> Result<()> {
+        txn.ensure_healthy()?;
         if commit_ts <= txn.read_ts {
             return Err(RymeError::Conflict(String::from(
                 "commit timestamp must be newer than transaction snapshot",
@@ -2303,11 +2347,13 @@ impl TxnManager {
     }
 
     fn clear_conflicts_through(&self, read_ts: u64) -> Result<()> {
-        self.inner
+        let mut committed = self
+            .inner
             .commit
             .lock()
-            .map_err(|_| RymeError::Internal(String::from("commit lock")))?
-            .clear_through(read_ts);
+            .map_err(|_| RymeError::Internal(String::from("commit lock")))?;
+        committed.clear_through(read_ts);
+        self.inner.gc_floor.fetch_max(read_ts, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2371,6 +2417,7 @@ impl TxnManager {
                     MVCC_GC_KEYS_PER_LOCK,
                     MVCC_GC_VERSIONS_PER_LOCK,
                 );
+                self.inner.gc_floor.fetch_max(batch_horizon, Ordering::SeqCst);
                 (next, complete, batch_horizon)
             };
             if complete {
@@ -2653,6 +2700,7 @@ impl TxnManager {
             engine.replace_from(snapshot);
         }
         guard.clear_through(recovery_floor);
+        self.inner.gc_floor.fetch_max(recovery_floor, Ordering::SeqCst);
         self.inner
             .pending
             .lock()
@@ -2692,6 +2740,7 @@ impl TxnManager {
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?
             .replace_from(snapshot);
         guard.clear_through(recovery_floor);
+        self.inner.gc_floor.fetch_max(recovery_floor, Ordering::SeqCst);
         self.inner
             .pending
             .lock()
@@ -4854,6 +4903,38 @@ mod tests {
     }
 
     #[test]
+    fn restored_and_restamped_transactions_cannot_read_below_gc_floor() {
+        let manager = TxnManager::new();
+        let key = RecordKey::new("t", "d", "gc-floor", b"key");
+        let mut first = manager.begin();
+        manager.put(&mut first, key.clone(), b"v1".to_vec());
+        manager.commit(first).unwrap();
+
+        let mut stale = manager.begin();
+        assert_eq!(manager.get(&mut stale, &key).unwrap(), Some(b"v1".to_vec()));
+        let stale_ts = stale.read_ts;
+        let state = stale.state();
+        drop(stale);
+
+        let mut second = manager.begin();
+        manager.put(&mut second, key.clone(), b"v2".to_vec());
+        manager.commit(second).unwrap();
+        assert!(manager.gc_oldest().unwrap() > stale_ts);
+        assert!(matches!(
+            manager.from_state(state),
+            Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
+        ));
+
+        let mut restamped = manager.begin();
+        restamped.restamp(stale_ts);
+        assert!(matches!(
+            manager.get(&mut restamped, &key),
+            Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
+        ));
+        assert_eq!(manager.inner.active.oldest(), None);
+    }
+
+    #[test]
     fn restored_snapshot_rejects_validation_after_conflict_history_pruning() {
         let manager = TxnManager::new();
         let observed_key = RecordKey::new("t", "d", "stale-snapshot", b"observed");
@@ -4900,9 +4981,8 @@ mod tests {
         let snapshot = manager.encode_snapshot().unwrap();
         manager.restore_snapshot(&snapshot).unwrap();
 
-        let restored = manager.from_state(stale_state).unwrap();
         assert!(matches!(
-            manager.commit(restored),
+            manager.from_state(stale_state),
             Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
         ));
     }
@@ -4930,9 +5010,8 @@ mod tests {
 
         manager.restore_snapshot(&restore_point).unwrap();
 
-        let restored = manager.from_state(stale_state).unwrap();
         assert!(matches!(
-            manager.commit(restored),
+            manager.from_state(stale_state),
             Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
         ));
 
@@ -5549,8 +5628,10 @@ mod tests {
             StorageMode::Standard,
         )
         .unwrap();
-        let stale = reopened.inner().from_state(stale_state).unwrap();
-        assert!(matches!(reopened.commit(stale), Err(RymeError::Conflict(_))));
+        assert!(matches!(
+            reopened.inner().from_state(stale_state),
+            Err(RymeError::Conflict(message)) if message == "transaction snapshot too old"
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 

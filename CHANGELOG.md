@@ -50,6 +50,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- MVCC now rejects restored or restamped transactions before they read below
+  the version-retention floor.
 - Archive replication now preserves conflicting destination objects and
   manifests with atomic conditional writes, while allowing interrupted copies
   to resume from matching objects.
