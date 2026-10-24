@@ -14,7 +14,7 @@ and [OpenAPI JSON](https://db.rymelabs.dev/openapi/rest.json).
 
 ## Authentication
 
-Send `Authorization: Bearer <key>` or `x-api-key: <key>`:
+Send `Authorization: Bearer <key>`, `x-api-key: <key>`, or `apikey: <key>`:
 
 ```bash
 curl -fsS -H 'Authorization: Bearer local-dev-key' \

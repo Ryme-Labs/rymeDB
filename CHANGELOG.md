@@ -52,6 +52,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- HTTP authentication now accepts the standard `apikey` header, and invalid
+  WebSocket header credentials cannot fall back to anonymous query credentials.
 - Raft recovery now rejects log entries whose embedded term disagrees with the
   durable WAL timestamp.
 - Raft startup now restores the current term from a newer validated log term

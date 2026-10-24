@@ -8,8 +8,8 @@ model supplies a tenant, roles, and capabilities across all gateways.
 
 | Credential | Configure with | Use |
 | --- | --- | --- |
-| Development API key | `RYME_API_KEY` | Bearer header or `x-api-key` |
-| Public project key | `RYME_PUBLIC_API_KEY` | Bearer header, `x-api-key`, or WebSocket `api_key` query parameter; intentionally public and limited to SQL `anon` |
+| Development API key | `RYME_API_KEY` | Bearer, `x-api-key`, or `apikey` header |
+| Public project key | `RYME_PUBLIC_API_KEY` | Bearer, `x-api-key`, or `apikey` header; WebSocket `api_key` query parameter is also supported and is limited to SQL `anon` |
 | PostgreSQL password | `RYME_PG_PASSWORD` | Cleartext startup password; unset means local trust mode |
 | RESP password | `RYME_RESP_PASSWORD` | `AUTH` command; unset means local trust mode |
 | HMAC JWT | `RYME_JWT_SECRET` | HS256 bearer tokens |
@@ -25,6 +25,7 @@ For HTTP:
 ```bash
 curl -H "Authorization: Bearer $RYME_API_KEY" https://db.example.com/ready
 curl -H "x-api-key: $RYME_API_KEY" https://db.example.com/v1/scan/messages
+curl -H "apikey: $RYME_API_KEY" https://db.example.com/v1/scan/messages
 ```
 
 HTTP database API responses use `Cache-Control: no-store`, including login
@@ -44,9 +45,10 @@ wss://db.example.com/v1/stream?table=messages&api_key=...&branch=main
 URL credentials may be captured by reverse-proxy/access logs and monitoring.
 An `anon` key is designed to be public, but configure every proxy in the path
 to redact `api_key` query parameters. Server-side WebSocket clients should use
-`Authorization` or `x-api-key` headers for non-anonymous credentials.
-`Authorization` is checked before `x-api-key`. If an explicit header credential
-fails authentication, the request does not downgrade to a query-string key.
+`Authorization`, `x-api-key`, or `apikey` headers for credentials.
+`Authorization` is checked before `x-api-key` or `apikey`. If an explicit
+header credential fails authentication, the request does not downgrade to a
+query-string key.
 Configure RLS and SQL grants before exposing an `anon` key; the role alone does
 not make tables safe.
 

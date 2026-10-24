@@ -11,6 +11,7 @@ servers:
 security:
   - bearerAuth: []
   - apiKeyHeader: []
+  - apiKeyProjectHeader: []
 tags:
   - name: node
   - name: dashboard
@@ -2182,6 +2183,10 @@ components:
       type: apiKey
       in: header
       name: x-api-key
+    apiKeyProjectHeader:
+      type: apiKey
+      in: header
+      name: apikey
   parameters:
     TableParam:
       name: table

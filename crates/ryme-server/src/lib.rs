@@ -3248,7 +3248,11 @@ impl SharedState {
                 .ok_or(ryme_error::RymeError::Unauthorized)?
                 .principal_from_token(token, now_secs());
         }
-        if let Some(value) = headers.get("x-api-key").and_then(|value| value.to_str().ok()) {
+        if let Some(value) = headers
+            .get("x-api-key")
+            .or_else(|| headers.get("apikey"))
+            .and_then(|value| value.to_str().ok())
+        {
             return self.keys.authenticate(value);
         }
         Err(ryme_error::RymeError::Unauthorized)
@@ -3260,7 +3264,8 @@ impl SharedState {
         api_key: Option<&str>,
     ) -> ryme_error::Result<Principal> {
         let has_header_credential = headers.contains_key(axum::http::header::AUTHORIZATION)
-            || headers.contains_key("x-api-key");
+            || headers.contains_key("x-api-key")
+            || headers.contains_key("apikey");
         if has_header_credential {
             return self.principal(headers);
         }
@@ -3364,6 +3369,21 @@ mod websocket_credential_precedence_tests {
             .principal_for_websocket(&empty_headers, Some("query-anon-key"))
             .unwrap();
         assert_eq!(public.roles, [Role::Anon].into_iter().collect());
+
+        let mut project_headers = HeaderMap::new();
+        project_headers.insert("apikey", HeaderValue::from_static("user-key"));
+        let project_principal = state.principal(&project_headers).unwrap();
+        assert_eq!(project_principal.id, "app-user");
+        let websocket_principal =
+            state.principal_for_websocket(&project_headers, Some("query-admin-key")).unwrap();
+        assert_eq!(websocket_principal.id, "app-user");
+
+        let mut invalid_project_headers = HeaderMap::new();
+        invalid_project_headers.insert("apikey", HeaderValue::from_static("invalid-key"));
+        assert!(matches!(
+            state.principal_for_websocket(&invalid_project_headers, Some("query-anon-key")),
+            Err(ryme_error::RymeError::Unauthorized)
+        ));
 
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -7964,7 +7984,10 @@ async fn passkey_challenge(
     if request.user.is_empty() || request.user.len() > ryme_auth::MAX_USER_LEN {
         return error_response(ryme_error::RymeError::InvalidArgument(String::from("user")));
     }
-    if headers.contains_key(axum::http::header::AUTHORIZATION) || headers.contains_key("x-api-key") {
+    if headers.contains_key(axum::http::header::AUTHORIZATION)
+        || headers.contains_key("x-api-key")
+        || headers.contains_key("apikey")
+    {
         let principal = match state.principal(&headers) {
             Ok(principal) => principal,
             Err(error) => return error_response(error),
