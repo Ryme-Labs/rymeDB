@@ -2608,6 +2608,9 @@ where
                                 removed += 1;
                             }
                         }
+                        if removed == 0 {
+                            return encode_integer(0);
+                        }
                         match self.write_map(txn, &command.args[0], &map) {
                             Ok(()) => encode_integer(removed),
                             Err(e) => encode_error(e),
@@ -2752,6 +2755,9 @@ where
                                 removed += 1;
                             }
                         }
+                        if removed == 0 {
+                            return encode_integer(0);
+                        }
                         match self.write_set(txn, &command.args[0], &set) {
                             Ok(()) => encode_integer(removed),
                             Err(e) => encode_error(e),
@@ -2839,6 +2845,9 @@ where
                             if set.remove(String::from_utf8_lossy(member).as_ref()).is_some() {
                                 removed += 1;
                             }
+                        }
+                        if removed == 0 {
+                            return encode_integer(0);
                         }
                         match self.write_zset(txn, &command.args[0], &set) {
                             Ok(()) => encode_integer(removed),
@@ -3148,6 +3157,10 @@ where
         map: &std::collections::HashMap<String, String>,
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
+        if map.is_empty() {
+            self.manager.delete(txn, record);
+            return Ok(());
+        }
         let raw = serde_json::to_vec(map).map_err(|_| String::from("wrong type"))?;
         check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
@@ -3177,6 +3190,10 @@ where
         list: &[String],
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
+        if list.is_empty() {
+            self.manager.delete(txn, record);
+            return Ok(());
+        }
         let raw = serde_json::to_vec(list).map_err(|_| String::from("wrong type"))?;
         check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
@@ -3251,6 +3268,11 @@ where
         key: &[u8],
         set: &std::collections::HashSet<String>,
     ) -> std::result::Result<(), String> {
+        if set.is_empty() {
+            let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
+            self.manager.delete(txn, record);
+            return Ok(());
+        }
         let mut list: Vec<String> = set.iter().cloned().collect();
         list.sort();
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
@@ -3303,6 +3325,10 @@ where
         set: &std::collections::HashMap<String, f64>,
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
+        if set.is_empty() {
+            self.manager.delete(txn, record);
+            return Ok(());
+        }
         let values = set
             .iter()
             .map(|(member, score)| {

@@ -478,6 +478,11 @@ async fn hash_ops() {
     );
     assert_eq!(command(addr, &["HDEL", "h", "f1", "ghost"]).await, ":1");
     assert_eq!(command(addr, &["HLEN", "h"]).await, ":1");
+    assert_eq!(command(addr, &["HDEL", "h", "f2"]).await, ":1");
+    assert_eq!(command(addr, &["HLEN", "h"]).await, ":0");
+    assert_eq!(command(addr, &["TYPE", "h"]).await, "+none");
+    assert_eq!(command(addr, &["HDEL", "missing", "f"]).await, ":0");
+    assert_eq!(command(addr, &["TYPE", "missing"]).await, "+none");
     assert_eq!(command(addr, &["SET", "plain", "x"]).await, "+OK");
     assert!(command(addr, &["HGET", "plain", "f"]).await.starts_with("-ERR"));
 }
@@ -498,6 +503,10 @@ async fn list_ops() {
     assert_eq!(command(addr, &["LPOP", "l"]).await, "$1\r\nz");
     assert_eq!(command(addr, &["RPOP", "l"]).await, "$1\r\nc");
     assert_eq!(command(addr, &["LLEN", "l"]).await, ":2");
+    assert_eq!(command(addr, &["LPOP", "l"]).await, "$1\r\na");
+    assert_eq!(command(addr, &["RPOP", "l"]).await, "$1\r\nb");
+    assert_eq!(command(addr, &["LLEN", "l"]).await, ":0");
+    assert_eq!(command(addr, &["TYPE", "l"]).await, "+none");
     assert_eq!(command(addr, &["LPOP", "ghost"]).await, "$-1");
 }
 
@@ -543,6 +552,11 @@ async fn zset_ops() {
     assert_eq!(command(addr, &["ZSCORE", "z", "a"]).await, "$1\r\n5");
     assert_eq!(command(addr, &["ZREM", "z", "a", "ghost"]).await, ":1");
     assert_eq!(command(addr, &["ZCARD", "z"]).await, ":3");
+    assert_eq!(command(addr, &["ZREM", "z", "b", "c", "new"]).await, ":3");
+    assert_eq!(command(addr, &["ZCARD", "z"]).await, ":0");
+    assert_eq!(command(addr, &["TYPE", "z"]).await, "+none");
+    assert_eq!(command(addr, &["ZREM", "missing", "member"]).await, ":0");
+    assert_eq!(command(addr, &["TYPE", "missing"]).await, "+none");
     assert!(command(addr, &["ZADD", "z", "nan", "x"]).await.starts_with("-ERR"));
     assert_eq!(command(addr, &["SET", "plain", "x"]).await, "+OK");
     assert!(command(addr, &["ZSCORE", "plain", "f"]).await.starts_with("-ERR"));
@@ -573,6 +587,11 @@ async fn set_ops() {
     assert_eq!(command(addr, &["SMEMBERS", "s"]).await, "*2\r\n$1\r\na\r\n$1\r\nb");
     assert_eq!(command(addr, &["SREM", "s", "a", "ghost"]).await, ":1");
     assert_eq!(command(addr, &["SCARD", "s"]).await, ":1");
+    assert_eq!(command(addr, &["SREM", "s", "b"]).await, ":1");
+    assert_eq!(command(addr, &["SCARD", "s"]).await, ":0");
+    assert_eq!(command(addr, &["TYPE", "s"]).await, "+none");
+    assert_eq!(command(addr, &["SREM", "missing", "member"]).await, ":0");
+    assert_eq!(command(addr, &["TYPE", "missing"]).await, "+none");
 }
 
 #[tokio::test]
