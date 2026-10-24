@@ -522,7 +522,11 @@ impl Cluster {
     }
 
     pub fn read_latest(&self, node: usize, key: &RecordKey) -> Result<Option<Vec<u8>>> {
-        let manager = &self.nodes[node].manager;
+        let manager = &self
+            .nodes
+            .get(node)
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("node")))?
+            .manager;
         let mut txn = manager.begin();
         manager.get(&mut txn, key)
     }
@@ -588,6 +592,11 @@ mod tests {
         let mut cluster = Cluster::new(3).unwrap();
         assert!(cluster.elect(0));
         cluster.partition(vec![vec![0, 0, usize::MAX], vec![1, 2]]);
+        let key = RecordKey::new("t", "d", "s", b"k");
+        assert!(matches!(
+            cluster.read_latest(usize::MAX, &key),
+            Err(RymeError::InvalidArgument(_))
+        ));
 
         assert!(!cluster.elect(0));
         assert!(matches!(cluster.replicate_from(0), Err(RymeError::Unavailable(_))));
@@ -600,7 +609,6 @@ mod tests {
 
         cluster.heal();
         cluster.replicate_from(1).unwrap();
-        let key = RecordKey::new("t", "d", "s", b"k");
         assert_eq!(cluster.read_latest(0, &key).unwrap(), Some(b"committed".to_vec()));
     }
 
