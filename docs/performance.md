@@ -643,6 +643,16 @@ lower; p95 was 7.59–7.81 ms versus 61.7–63.6 µs. This is a warm-cache,
 synthetic page workload (10,000 snapshot rows, 100 one-row deltas, limit 100),
 not a general database or end-to-end performance claim.
 
+For exactly one delta over a snapshot, a direct two-cursor merge avoids the
+binary heap used by the general multi-segment scan. Eight alternating release
+pairs on this Windows host (10,000 snapshot rows, 100 returned rows) reduced
+median scan p50 from 31.6 to 28.6 µs (9.5%) and p95 from 43.9 to 37.6 µs
+(14.5%); seven of eight candidate p50 captures were faster. A 100-delta control
+uses the unchanged heap path; its p50 was flat and p95 noisy. The storage
+tests cover overlapping keys, tombstones, expiry, read timestamps, and cursor
+pagination in the two-segment path. These are local warm-cache scans, not
+end-to-end SQL latency; see the [paired captures](../bench/results/segment-scan-two-way-merge-windows-20261024.json).
+
 A local three-pair batch comparison on the AMD Ryzen 5 4500 used one shard,
 one worker, 500 transactions × 64 distinct 128-byte writes, and no per-write
 fsync. All runs completed with zero failures. After removing the redundant

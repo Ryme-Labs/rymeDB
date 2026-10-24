@@ -1,0 +1,270 @@
+{
+  "benchmark": "segment-scan-page-two-way-merge",
+  "date": "2026-10-24",
+  "baseline_revision": "378e09e",
+  "candidate_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "architecture": "x86_64",
+    "os": "Windows"
+  },
+  "parameters": {
+    "snapshot_rows": 10000,
+    "scan_limit": 100,
+    "iterations_per_capture": 100,
+    "concurrency": 1,
+    "segment_cache_bytes": 67108864,
+    "durability": "local segment files with warmed in-process cache; no concurrent writers"
+  },
+  "two_segment_workload": {
+    "delta_segments": 1,
+    "baseline": [
+      {
+        "p50_ns": 31400,
+        "p95_ns": 49800,
+        "scans_per_second": 23922.87265854884,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 32000,
+        "p95_ns": 64900,
+        "scans_per_second": 21389.45927446954,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 31200,
+        "p95_ns": 32900,
+        "scans_per_second": 26621.941804435213,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 31500,
+        "p95_ns": 59200,
+        "scans_per_second": 23103.22521023935,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 32100,
+        "p95_ns": 47200,
+        "scans_per_second": 24307.834415031964,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 31900,
+        "p95_ns": 39200,
+        "scans_per_second": 24780.690885661894,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 31600,
+        "p95_ns": 34100,
+        "scans_per_second": 26910.656620021527,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 31300,
+        "p95_ns": 40600,
+        "scans_per_second": 25649.575499525483,
+        "cache_hits": 200,
+        "cache_misses": 2
+      }
+    ],
+    "candidate": [
+      {
+        "p50_ns": 28400,
+        "p95_ns": 37200,
+        "scans_per_second": 28057.57414213967,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 28800,
+        "p95_ns": 46300,
+        "scans_per_second": 26284.662899198316,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 28300,
+        "p95_ns": 30000,
+        "scans_per_second": 29275.718718894546,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 35200,
+        "p95_ns": 38000,
+        "scans_per_second": 25585.917511001942,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 28300,
+        "p95_ns": 39400,
+        "scans_per_second": 27844.29470401515,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 28700,
+        "p95_ns": 37900,
+        "scans_per_second": 25850.48081894323,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 29300,
+        "p95_ns": 32400,
+        "scans_per_second": 28119.11256080758,
+        "cache_hits": 200,
+        "cache_misses": 2
+      },
+      {
+        "p50_ns": 28300,
+        "p95_ns": 37100,
+        "scans_per_second": 27929.840241313817,
+        "cache_hits": 200,
+        "cache_misses": 2
+      }
+    ],
+    "median_change_percent": {
+      "p50": -9.51,
+      "p95": -14.46
+    },
+    "candidate_faster_p50_pairs": 7
+  },
+  "many_segment_control": {
+    "delta_segments": 100,
+    "baseline": [
+      {
+        "p50_ns": 60300,
+        "p95_ns": 97500,
+        "scans_per_second": 14105.765026166195,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59600,
+        "p95_ns": 72800,
+        "scans_per_second": 14886.26890556151,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59600,
+        "p95_ns": 66000,
+        "scans_per_second": 15155.418819999091,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59800,
+        "p95_ns": 64600,
+        "scans_per_second": 15155.189136760428,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59600,
+        "p95_ns": 65700,
+        "scans_per_second": 15289.818509854289,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59400,
+        "p95_ns": 66000,
+        "scans_per_second": 15031.039095732689,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 60300,
+        "p95_ns": 66700,
+        "scans_per_second": 14942.99248367478,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59900,
+        "p95_ns": 82100,
+        "scans_per_second": 14305.128388527286,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      }
+    ],
+    "candidate": [
+      {
+        "p50_ns": 62000,
+        "p95_ns": 66000,
+        "scans_per_second": 14796.182584893098,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59600,
+        "p95_ns": 76900,
+        "scans_per_second": 14553.498661078123,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59600,
+        "p95_ns": 80000,
+        "scans_per_second": 14508.73425802333,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59400,
+        "p95_ns": 80600,
+        "scans_per_second": 14552.651493102043,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 60700,
+        "p95_ns": 68700,
+        "scans_per_second": 14687.522949254608,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 60400,
+        "p95_ns": 65400,
+        "scans_per_second": 15057.292999864483,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 63600,
+        "p95_ns": 98400,
+        "scans_per_second": 12424.829779832015,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      },
+      {
+        "p50_ns": 59900,
+        "p95_ns": 66700,
+        "scans_per_second": 14975.888819001408,
+        "cache_hits": 10100,
+        "cache_misses": 101
+      }
+    ],
+    "median_change_percent": {
+      "p50": 0.75,
+      "p95": 9.72
+    },
+    "candidate_faster_p50_pairs": 1
+  },
+  "correctness": "Storage crate suite passed: 61 tests, including two-segment overlap, tombstone, expiry, MVCC timestamp, and pagination assertions.",
+  "caveat": "One Windows host, warm local segment cache, synthetic in-process scan benchmark. Results do not include network latency, cold storage, concurrent writers, or end-to-end SQL execution."
+}

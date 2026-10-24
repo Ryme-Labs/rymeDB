@@ -957,7 +957,7 @@ impl SegmentStore {
         }
         let segments = self.read_scan_segments(tenant, database, table, start_after)?;
         if let Some((segment, _, _)) = segments.first() {
-            if segment.is_snapshot() {
+            if segment.is_snapshot() || segments.len() == 1 {
                 return Ok(match start_after {
                     Some(after) => segment
                         .engine
@@ -965,6 +965,10 @@ impl SegmentStore {
                     None => segment.engine.scan(tenant, database, table, read_ts, now, limit),
                 });
             }
+        }
+
+        if segments.len() == 2 {
+            return Ok(Self::scan_two_segments(&segments, read_ts, now, limit));
         }
 
         // Every segment is ordered by RecordKey. Merge the scoped key ranges
@@ -1017,6 +1021,71 @@ impl SegmentStore {
             }
         }
         Ok(out)
+    }
+
+    fn scan_two_segments(
+        segments: &[(Arc<ImmutableSegment>, usize, usize)],
+        read_ts: u64,
+        now: u64,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (newer, newer_start, newer_end) = &segments[0];
+        let (older, older_start, older_end) = &segments[1];
+        let mut newer_index = *newer_start;
+        let mut older_index = *older_start;
+        let mut out = Vec::with_capacity(limit.min(1024));
+
+        let visible_value = |segment: &ImmutableSegment, key: &RecordKey| {
+            segment.engine.version_at(key, read_ts).map(|(_, value, expires_at)| {
+                if super::expiry_is_expired(expires_at, now) {
+                    None
+                } else {
+                    value
+                }
+            })
+        };
+
+        while out.len() < limit && (newer_index < *newer_end || older_index < *older_end) {
+            let newer_key = (newer_index < *newer_end).then(|| &newer.keys[newer_index]);
+            let older_key = (older_index < *older_end).then(|| &older.keys[older_index]);
+            let ordering = match (newer_key, older_key) {
+                (Some(newer_key), Some(older_key)) => {
+                    newer_key.pk.as_slice().cmp(older_key.pk.as_slice())
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => break,
+            };
+
+            match ordering {
+                Ordering::Less => {
+                    let key = newer_key.expect("newer scan cursor is in range");
+                    newer_index += 1;
+                    if let Some(Some(value)) = visible_value(newer, key) {
+                        out.push((key.pk.clone(), value));
+                    }
+                }
+                Ordering::Greater => {
+                    let key = older_key.expect("older scan cursor is in range");
+                    older_index += 1;
+                    if let Some(Some(value)) = visible_value(older, key) {
+                        out.push((key.pk.clone(), value));
+                    }
+                }
+                Ordering::Equal => {
+                    let newer_key = newer_key.expect("newer scan cursor is in range");
+                    let older_key = older_key.expect("older scan cursor is in range");
+                    newer_index += 1;
+                    older_index += 1;
+                    let chosen =
+                        visible_value(newer, newer_key).or_else(|| visible_value(older, older_key));
+                    if let Some(Some(value)) = chosen {
+                        out.push((newer_key.pk.clone(), value));
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn latest_path(&self) -> Result<Option<PathBuf>> {
@@ -2457,6 +2526,12 @@ mod tests {
                 2,
                 vec![
                     SegmentEntry {
+                        key: RecordKey::new("other", "db", "items", b"a"),
+                        commit_ts: 2,
+                        value: Some(b"other-tenant".to_vec()),
+                        expires_at: 0,
+                    },
+                    SegmentEntry {
                         key: RecordKey::new("tenant", "db", "items", b"a"),
                         commit_ts: 2,
                         value: None,
@@ -2480,10 +2555,37 @@ mod tests {
                         value: Some(b"E".to_vec()),
                         expires_at: 0,
                     },
+                    SegmentEntry {
+                        key: RecordKey::new("tenant", "db", "later", b"a"),
+                        commit_ts: 2,
+                        value: Some(b"later-table".to_vec()),
+                        expires_at: 0,
+                    },
                 ],
                 false,
             )
             .unwrap();
+        assert_eq!(
+            store.scan("tenant", "db", "items", 2, 10_000, 10).unwrap(),
+            vec![
+                (b"b".to_vec(), b"B2".to_vec()),
+                (b"d".to_vec(), b"D".to_vec()),
+                (b"e".to_vec(), b"E".to_vec()),
+            ]
+        );
+        assert_eq!(
+            store.scan_after("tenant", "db", "items", 2, 10_000, b"b", 2).unwrap(),
+            vec![(b"d".to_vec(), b"D".to_vec()), (b"e".to_vec(), b"E".to_vec())]
+        );
+        assert_eq!(
+            store.scan("tenant", "db", "items", 1, 10_000, 10).unwrap(),
+            vec![
+                (b"a".to_vec(), b"A".to_vec()),
+                (b"b".to_vec(), b"B".to_vec()),
+                (b"c".to_vec(), b"C".to_vec()),
+                (b"d".to_vec(), b"D".to_vec()),
+            ]
+        );
         store
             .write_delta_owned_with_sync(
                 3,
