@@ -250,7 +250,9 @@ pub fn decode_apply(input: &[u8]) -> Result<ApplyPayload> {
         } else {
             serde_json::from_slice(body).map_err(|_| RymeError::Corrupt(String::from("conf")))?
         };
-        if change.old.is_empty() || change.new.as_ref().is_some_and(Vec::is_empty) {
+        if !crate::net::valid_member_set(&change.old)
+            || change.new.as_ref().is_some_and(|members| !crate::net::valid_member_set(members))
+        {
             return Err(RymeError::Corrupt(String::from("conf membership")));
         }
         return Ok(ApplyPayload::Conf { change });

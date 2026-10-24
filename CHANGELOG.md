@@ -67,6 +67,8 @@ All notable changes to rymeDB are recorded here. Format follows
   membership sets instead of applying an unusable cluster configuration.
 - Raft startup now rejects persisted joint membership metadata with an empty
   member set.
+- Raft membership changes now cap configurations at 1,024 members and peer
+  addresses at 512 bytes before constructing peer state.
 - Transaction apply and replay now validate every key and value before mutating
   storage, preventing malformed batches from partially changing engine state.
 - WAL retention now validates LSN ordering across all segments before deleting

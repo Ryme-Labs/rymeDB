@@ -22,6 +22,8 @@ use tokio::sync::{Mutex, Semaphore};
 const ELECTION_TIMEOUT_MIN_MS: u64 = 500;
 const ELECTION_TIMEOUT_JITTER_MS: u64 = 400;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+const MAX_RAFT_MEMBERS: usize = 1024;
+const MAX_RAFT_MEMBER_ADDR_BYTES: usize = 512;
 const MAX_RAFT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const APPEND_RPC_BASE_ESTIMATE_BYTES: usize = 256;
@@ -897,6 +899,12 @@ pub struct Member {
     pub addr: String,
 }
 
+pub(crate) fn valid_member_set(members: &[Member]) -> bool {
+    !members.is_empty()
+        && members.len() <= MAX_RAFT_MEMBERS
+        && members.iter().all(|member| member.addr.len() <= MAX_RAFT_MEMBER_ADDR_BYTES)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfChange {
     pub old: Vec<Member>,
@@ -1286,6 +1294,11 @@ impl Node {
                 Meta { term: 0, voted_for: None, commit_index: 0, members: Vec::new(), joint: None }
             }
         };
+        if (!meta.members.is_empty() && !valid_member_set(&meta.members))
+            || meta.joint.as_ref().is_some_and(|members| !valid_member_set(members))
+        {
+            return Err(RymeError::Corrupt(String::from("raft membership metadata")));
+        }
         if (meta.members.is_empty() && meta.joint.is_some())
             || meta.joint.as_ref().is_some_and(Vec::is_empty)
         {
@@ -1308,6 +1321,9 @@ impl Node {
         }
         members.sort_by_key(|member| member.id);
         members.dedup_by_key(|member| member.id);
+        if !valid_member_set(&members) {
+            return Err(RymeError::InvalidArgument(String::from("members")));
+        }
         let mut wal = ryme_wal::Wal::open(dir, 64 * 1024 * 1024)?;
         let _ = &mut wal;
         let records = ryme_wal::Wal::read_all(dir)?;
@@ -5893,10 +5909,10 @@ impl Node {
                 return Err(RymeError::Unavailable(String::from("not leader")));
             }
         }
-        let target = normalize_members(target);
-        if target.is_empty() {
+        if !valid_member_set(&target) {
             return Err(RymeError::InvalidArgument(String::from("member")));
         }
+        let target = normalize_members(target);
         self.ensure_pools(&target);
         let current = {
             let inner = self.inner.lock().await;
@@ -5926,10 +5942,10 @@ impl Node {
                 return Err(RymeError::Unavailable(String::from("not leader")));
             }
         }
-        let target = normalize_members(target);
-        if target.is_empty() {
+        if !valid_member_set(&target) {
             return Err(RymeError::InvalidArgument(String::from("member")));
         }
+        let target = normalize_members(target);
         if !target.iter().any(|member| member.id == self.id) {
             return Err(RymeError::InvalidArgument(String::from("transfer first")));
         }
@@ -7211,6 +7227,20 @@ impl ResetFlag for Inner {
 mod tests {
     use super::*;
     use ryme_txn::WriteOp;
+
+    #[test]
+    fn raft_membership_payloads_enforce_peer_count_and_address_bounds() {
+        let too_many = (0..=MAX_RAFT_MEMBERS)
+            .map(|id| Member { id, addr: String::from("127.0.0.1:1") })
+            .collect();
+        let too_many = crate::encode_conf_change(&crate::ConfChange::single(too_many)).unwrap();
+        assert!(matches!(decode_apply(&too_many), Err(RymeError::Corrupt(_))));
+
+        let long_address = vec![Member { id: 1, addr: "a".repeat(MAX_RAFT_MEMBER_ADDR_BYTES + 1) }];
+        let long_address =
+            crate::encode_conf_change(&crate::ConfChange::single(long_address)).unwrap();
+        assert!(matches!(decode_apply(&long_address), Err(RymeError::Corrupt(_))));
+    }
 
     #[test]
     fn raft_data_entries_reject_zero_commit_timestamps() {
