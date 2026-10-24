@@ -5422,6 +5422,9 @@ where
     ) -> std::result::Result<bool, String> {
         let mut mode = ExpireMode::Always;
         for flag in flags {
+            if mode != ExpireMode::Always {
+                return Err(String::from("syntax"));
+            }
             let name = std::str::from_utf8(flag).map_err(|_| String::from("syntax"))?;
             match name.to_ascii_uppercase().as_str() {
                 "NX" => mode = ExpireMode::OnlyMissing,

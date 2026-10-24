@@ -36,6 +36,8 @@ use precise relative deadlines. `PXAT` absolute values retain millisecond
 precision. `PTTL` reports remaining milliseconds; `TTL` reports whole seconds
 and may return `0` while a key has less than one second remaining. Existing
 persisted expiry timestamps remain readable.
+Expiry conditions `NX`, `XX`, `GT`, and `LT` are mutually exclusive; repeated
+or conflicting conditions return a syntax error without changing the key.
 
 The exact compatibility suite is in `crates/ryme-wire-resp/tests/`. Unsupported
 option combinations should be treated as errors, not silently assumed to have

@@ -123,6 +123,10 @@ async fn absolute_expiry_commands_handle_units_and_conditional_flags() {
 async fn expire_modes_and_nx_xx() {
     let addr = serve().await;
     assert_eq!(command(addr, &["EXPIRE", "missing", "10"]).await, ":0");
+    assert_eq!(command(addr, &["SET", "flags", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["EXPIRE", "flags", "10", "NX", "XX"]).await, "-ERR syntax");
+    assert_eq!(command(addr, &["EXPIRE", "flags", "10", "NX", "NX"]).await, "-ERR syntax");
+    assert_eq!(command(addr, &["TTL", "flags"]).await, ":-1");
     assert_eq!(command(addr, &["SET", "k", "v", "NX"]).await, "+OK");
     assert_eq!(command(addr, &["SET", "k", "v2", "NX"]).await, "$-1");
     assert_eq!(command(addr, &["SET", "k", "v2", "XX"]).await, "+OK");
