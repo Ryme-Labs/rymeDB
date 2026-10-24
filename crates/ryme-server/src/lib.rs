@@ -2060,6 +2060,27 @@ impl SharedState {
         self.persist_auth_snapshot_locked(snapshot, || *credentials = staged)
     }
 
+    fn verify_otp(
+        &self,
+        user: &str,
+        code: &str,
+        now_secs: u64,
+    ) -> ryme_error::Result<Principal> {
+        let _persist_guard = self
+            .auth_persist_lock
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+        let mut credentials = self
+            .credentials
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
+        let mut staged = credentials.clone();
+        let principal = staged.verify_otp(user, code, now_secs)?;
+        let snapshot = self.auth_snapshot(Some(staged.snapshot()), None)?;
+        self.persist_auth_snapshot_locked(snapshot, || *credentials = staged)?;
+        Ok(principal)
+    }
+
     fn persist_control(&self) -> ryme_error::Result<()> {
         let control = self
             .control
@@ -7438,13 +7459,7 @@ async fn auth_token(
         };
         if otp_enrolled {
             let code = request.code.as_deref().unwrap_or("");
-            let mut store = match credentials.lock() {
-                Ok(store) => store,
-                Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
-            };
-            if store.verify_otp(&request.id, code, now).is_err() {
-                return Err(ryme_error::RymeError::Unauthorized);
-            }
+            auth_state.verify_otp(&request.id, code, now)?;
         }
         persist_auth_mutation(&auth_state, || {
             let refresh_token = refresh_tokens.issue(principal.clone(), now)?;
@@ -7824,22 +7839,15 @@ async fn otp_verify(
         return error_response(error);
     }
     let now = ryme_txn::now_unix();
-    let verified = match state.credentials.lock() {
-        Ok(mut store) => store.verify_otp(&request.id, &request.code, now),
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
-    match verified {
-        Ok(principal) => match state.persist_auth() {
-            Ok(()) => {
-                complete_auth_attempt(&state, &attempt_key, client_ip.address);
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })),
-                )
-                    .into_response()
-            }
-            Err(error) => error_response(error),
-        },
+    match state.verify_otp(&request.id, &request.code, now) {
+        Ok(principal) => {
+            complete_auth_attempt(&state, &attempt_key, client_ip.address);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "tenant": principal.tenant })),
+            )
+                .into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -16482,6 +16490,39 @@ mod realtime_policy_tests {
 
         assert!(state.set_otp_secret("ada", vec![7; 20]).is_err());
         assert!(!state.credentials.lock().unwrap().otp_enrolled("ada"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_otp_verification_persistence_does_not_consume_code_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-otp-verify-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+        let now = 1_700_000_000;
+        let user = ryme_auth::StoredUser {
+            tenant: String::from("default"),
+            roles: [Role::Admin].into_iter().collect(),
+            password: None,
+            otp_secret: Some(vec![7; 20]),
+            otp_last_used_step: None,
+        };
+        *state.credentials.lock().unwrap() =
+            ryme_auth::CredentialStore::from_snapshot(HashMap::from([(String::from("ada"), user)]))
+                .unwrap();
+        let code = ryme_auth::totp_code(&[7; 20], now);
+
+        assert!(state.verify_otp("ada", &code, now).is_err());
+        assert_eq!(
+            state.credentials.lock().unwrap().snapshot()["ada"].otp_last_used_step,
+            None
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }
