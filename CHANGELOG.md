@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- Public TOTP verification now rejects secrets shorter than 128 bits, matching
+  the credential store's enrollment requirement.
 - Authentication now rejects NUL bytes in user, principal, and tenant IDs,
   keeping identities representable consistently across PostgreSQL and storage.
 - SQL row-level security now denies rows when an explicitly configured tenant

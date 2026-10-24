@@ -1107,6 +1107,7 @@ const PASSWORD_HASH_B64_LEN: usize = 43;
 const MAX_LEGACY_PASSWORD_ROUNDS: u32 = 1_000_000;
 const MAX_PASSWORD_SALT_BYTES: usize = 1024;
 const MAX_PASSWORD_SALT_B64_LEN: usize = 1366;
+const MIN_OTP_SECRET_BYTES: usize = 16;
 const MAX_OTP_SECRET_BYTES: usize = 1024;
 pub const MAX_PASSWORD_LEN: usize = 256;
 pub const MAX_USER_LEN: usize = 256;
@@ -1231,7 +1232,11 @@ pub fn totp_code(secret: &[u8], unix_secs: u64) -> String {
     format!("{:06}", code % 1_000_000)
 }
 
+/// Verify a TOTP code for a secret containing at least 128 bits of key material.
 pub fn verify_totp(secret: &[u8], code: &str, unix_secs: u64) -> bool {
+    if secret.len() < MIN_OTP_SECRET_BYTES {
+        return false;
+    }
     matching_totp_step(secret, code, unix_secs).is_some()
 }
 
@@ -1702,7 +1707,7 @@ impl CredentialStore {
     }
 
     pub fn set_otp_secret(&mut self, id: &str, secret: Vec<u8>) -> Result<()> {
-        if !(16..=MAX_OTP_SECRET_BYTES).contains(&secret.len()) {
+        if !(MIN_OTP_SECRET_BYTES..=MAX_OTP_SECRET_BYTES).contains(&secret.len()) {
             return Err(RymeError::InvalidArgument(String::from("otp secret")));
         }
         let user = self.users.get_mut(id).ok_or(RymeError::NotFound(String::from("user")))?;
@@ -1758,7 +1763,9 @@ impl CredentialStore {
                     || user
                         .otp_secret
                         .as_ref()
-                        .is_some_and(|secret| !(16..=MAX_OTP_SECRET_BYTES).contains(&secret.len()))
+                        .is_some_and(|secret| {
+                            !(MIN_OTP_SECRET_BYTES..=MAX_OTP_SECRET_BYTES).contains(&secret.len())
+                        })
                     || (user.otp_secret.is_none() && user.otp_last_used_step.is_some())
             })
         {
@@ -2741,13 +2748,15 @@ mod tests {
 
     #[test]
     fn totp_window() {
-        let secret = b"totp-secret";
+        let secret = b"totp-secret-1234";
         let now = 1_700_000_000;
         assert!(verify_totp(secret, &totp_code(secret, now), now));
         assert!(verify_totp(secret, &totp_code(secret, now - 30), now));
         assert!(verify_totp(secret, &totp_code(secret, now - 60), now));
         assert!(!verify_totp(secret, &totp_code(secret, now - 90), now));
         assert!(!verify_totp(secret, "000000", now));
+        assert!(!verify_totp(b"short-secret", &totp_code(b"short-secret", now), now));
+        assert!(!verify_totp(b"", &totp_code(b"", now), now));
     }
 
     #[test]
