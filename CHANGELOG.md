@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- Windows atomic file replacement now rejects embedded NUL path characters
+  before passing paths to Win32.
 - HTTP authentication rejects repeated `Authorization`, `x-api-key`, or
   `apikey` headers so intermediaries cannot disagree about the selected value.
 - Range snapshot installation and source cleanup reject requests whose declared

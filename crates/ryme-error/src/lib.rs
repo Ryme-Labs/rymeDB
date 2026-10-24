@@ -69,8 +69,16 @@ pub fn replace_file_atomically(
             REPLACEFILE_WRITE_THROUGH,
         };
 
-        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut source: Vec<u16> = source.as_os_str().encode_wide().collect();
+        let mut destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+        if source.contains(&0) || destination.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains a null character",
+            ));
+        }
+        source.push(0);
+        destination.push(0);
         let replaced = unsafe {
             ReplaceFileW(
                 destination.as_ptr(),
@@ -163,5 +171,24 @@ mod file_publication_tests {
         drop(open_destination);
         assert_eq!(std::fs::read(&destination).unwrap(), b"new");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_rejects_paths_with_embedded_nul() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let embedded_nul =
+            std::path::PathBuf::from(std::ffi::OsString::from_wide(&[b'a' as u16, 0, b'b' as u16]));
+        let regular = std::path::PathBuf::from("regular-path");
+        for (source, destination) in [
+            (embedded_nul.as_path(), regular.as_path()),
+            (regular.as_path(), embedded_nul.as_path()),
+        ] {
+            assert_eq!(
+                replace_file_atomically(source, destination).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
     }
 }
