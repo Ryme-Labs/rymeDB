@@ -326,7 +326,7 @@ fn load_range_state(
     };
     let stored: RangePlacementFile = serde_json::from_slice(&raw)
         .map_err(|error| RymeError::Corrupt(format!("range placements: {error}")))?;
-    let (assignments, ranges) = match stored {
+    let (mut assignments, ranges) = match stored {
         RangePlacementFile::Current(state) => {
             if state.version != RANGE_PLACEMENT_STATE_VERSION {
                 return Err(RymeError::Corrupt(String::from("range placement version")));
@@ -340,9 +340,9 @@ fn load_range_state(
         }
         RangePlacementFile::Legacy(assignments) => (assignments, Vec::new()),
     };
-    if assignments.values().any(|shard| *shard >= shard_count) {
-        return Err(RymeError::Corrupt(String::from("range placement shard")));
-    }
+    // Retired range IDs may retain owners from a larger historical shard set.
+    // Active range owners have already been validated against `shard_count`.
+    assignments.retain(|_, shard| *shard < shard_count);
     Ok((assignments, ranges))
 }
 
@@ -1782,6 +1782,27 @@ mod tests {
         let (assignments, ranges) = load_range_state(&path, 2).unwrap();
         assert_eq!(assignments.get("legacy-range"), Some(&1));
         assert!(ranges.is_empty());
+
+        let active = RangePlacement {
+            id: String::from("active"),
+            start: Vec::new(),
+            end: Vec::new(),
+            routing_version: 0,
+            shard: 0,
+        };
+        persist_range_state(
+            &path,
+            &HashMap::from([
+                (String::from("active"), 0),
+                (String::from("retired-on-removed-shard"), 3),
+            ]),
+            &[active],
+        )
+        .unwrap();
+        let (assignments, ranges) = load_range_state(&path, 2).unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments.get("active"), Some(&0));
+        assert_eq!(ranges.len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

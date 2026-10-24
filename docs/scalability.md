@@ -47,7 +47,9 @@ tombstone over newer data. This currently trades disk space for safe repeated
 rebalancing; plan capacity for duplicate shard history. After restart, persisted
 range state records the range bounds and owners. On restart, the shard set loads
 that last completed topology so it can reconcile control-plane placement and
-ignore stale copies when rebuilding ownership.
+ignore stale copies when rebuilding ownership. Retired range assignments from
+removed shards are discarded during scale-down recovery; active range owners
+must still refer to configured shards.
 
 ## Realtime fanout
 

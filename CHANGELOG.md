@@ -50,6 +50,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Shard startup now ignores out-of-range owners for retired range IDs after a
+  scale-down while still rejecting invalid active range ownership.
 - Standard storage recovery now rejects replicated transactions older than its
   segment floor when prior conflict metadata is no longer available.
 - Standard-mode snapshots and bounded delta compaction now apply the MVCC GC
