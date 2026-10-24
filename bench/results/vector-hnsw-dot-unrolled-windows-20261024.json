@@ -1,0 +1,70 @@
+{
+  "experiment": "hnsw-f32-dot-four-accumulator-unroll",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "8b9a178",
+  "candidate_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "arch": "x86_64",
+    "os": "Windows"
+  },
+  "method": "Release-mode in-process vector-index benchmark, three alternating baseline/candidate pairs per workload. ANN recall is measured against exact top-k results. Exact search is a control and retains f64 accumulation.",
+  "workloads": {
+    "dimensions_64": {
+      "vectors": 5000,
+      "queries": 500,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 64,
+      "baseline": [
+        { "index_build_ns": 619146900, "adaptive_ann_p50_ns": 147300, "adaptive_ann_p95_ns": 231000, "adaptive_ann_p99_ns": 332700, "exact_p50_ns": 299100, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 747616300, "adaptive_ann_p50_ns": 185800, "adaptive_ann_p95_ns": 572400, "adaptive_ann_p99_ns": 871600, "exact_p50_ns": 406300, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 592326800, "adaptive_ann_p50_ns": 147100, "adaptive_ann_p95_ns": 237000, "adaptive_ann_p99_ns": 312200, "exact_p50_ns": 298400, "mean_recall_at_k": 0.978999999999999 }
+      ],
+      "candidate": [
+        { "index_build_ns": 390030000, "adaptive_ann_p50_ns": 101800, "adaptive_ann_p95_ns": 281800, "adaptive_ann_p99_ns": 469500, "exact_p50_ns": 311300, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 443108300, "adaptive_ann_p50_ns": 100200, "adaptive_ann_p95_ns": 229500, "adaptive_ann_p99_ns": 367600, "exact_p50_ns": 305800, "mean_recall_at_k": 0.978999999999999 },
+        { "index_build_ns": 393868800, "adaptive_ann_p50_ns": 97700, "adaptive_ann_p95_ns": 151500, "adaptive_ann_p99_ns": 216800, "exact_p50_ns": 295600, "mean_recall_at_k": 0.978999999999999 }
+      ],
+      "median_changes_percent": {
+        "index_build_time": -36.4,
+        "adaptive_ann_p50": -32.0,
+        "adaptive_ann_p95": -3.2,
+        "adaptive_ann_p99": 10.5,
+        "exact_search_p50": 2.2
+      }
+    },
+    "dimensions_384": {
+      "vectors": 3000,
+      "queries": 100,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 128,
+      "baseline": [
+        { "index_build_ns": 1362716000, "adaptive_ann_p50_ns": 1042500, "adaptive_ann_p95_ns": 1357100, "adaptive_ann_p99_ns": 1708400, "exact_p50_ns": 1219500, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 1351280600, "adaptive_ann_p50_ns": 1026600, "adaptive_ann_p95_ns": 1234600, "adaptive_ann_p99_ns": 1327300, "exact_p50_ns": 1169200, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 1362115600, "adaptive_ann_p50_ns": 1027500, "adaptive_ann_p95_ns": 1197800, "adaptive_ann_p99_ns": 1264600, "exact_p50_ns": 1144200, "mean_recall_at_k": 0.9710000000000002 }
+      ],
+      "candidate": [
+        { "index_build_ns": 545513700, "adaptive_ann_p50_ns": 511400, "adaptive_ann_p95_ns": 760900, "adaptive_ann_p99_ns": 823400, "exact_p50_ns": 1134500, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 553358400, "adaptive_ann_p50_ns": 508500, "adaptive_ann_p95_ns": 739600, "adaptive_ann_p99_ns": 918000, "exact_p50_ns": 1138100, "mean_recall_at_k": 0.9710000000000002 },
+        { "index_build_ns": 843980400, "adaptive_ann_p50_ns": 500600, "adaptive_ann_p95_ns": 951100, "adaptive_ann_p99_ns": 1474500, "exact_p50_ns": 1143600, "mean_recall_at_k": 0.9710000000000002 }
+      ],
+      "median_changes_percent": {
+        "index_build_time": -59.4,
+        "adaptive_ann_p50": -50.5,
+        "adaptive_ann_p95": -38.4,
+        "adaptive_ann_p99": -30.8,
+        "exact_search_p50": -2.7
+      }
+    }
+  },
+  "correctness": {
+    "mean_recall_64d": 0.978999999999999,
+    "mean_recall_384d": 0.9710000000000002,
+    "existing_dot_error_test": "passed for dimensions 64, 384, and 4096 with absolute score error <= 1e-4",
+    "index_crate_tests": "38 passed"
+  },
+  "notes": "Single-host local in-memory index measurements. The 64D p99 is noisy and regressed by median; exact-search controls were approximately flat. Results do not imply end-to-end or cross-database gains."
+}

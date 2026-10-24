@@ -182,7 +182,24 @@ fn projected_vector_index_bytes_with_limit(
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>() as f64
+    let len = a.len().min(b.len());
+    let mut left_sum = 0.0f32;
+    let mut middle_left_sum = 0.0f32;
+    let mut middle_right_sum = 0.0f32;
+    let mut right_sum = 0.0f32;
+    let mut left_chunks = a[..len].chunks_exact(4);
+    let mut right_chunks = b[..len].chunks_exact(4);
+    for (left, right) in left_chunks.by_ref().zip(right_chunks.by_ref()) {
+        left_sum += left[0] * right[0];
+        middle_left_sum += left[1] * right[1];
+        middle_right_sum += left[2] * right[2];
+        right_sum += left[3] * right[3];
+    }
+    let mut sum = (left_sum + middle_left_sum) + (middle_right_sum + right_sum);
+    for (left, right) in left_chunks.remainder().iter().zip(right_chunks.remainder()) {
+        sum += left * right;
+    }
+    sum as f64
 }
 
 #[derive(Debug, Clone)]
