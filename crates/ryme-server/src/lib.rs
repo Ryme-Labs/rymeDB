@@ -1953,18 +1953,14 @@ impl SharedState {
     }
 
     fn persist_auth_locked(&self, on_replace: impl FnOnce()) -> ryme_error::Result<()> {
-        let passkeys = self
-            .passkeys
-            .lock()
-            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
-            .snapshot();
-        let snapshot = self.auth_snapshot(passkeys)?;
+        let snapshot = self.auth_snapshot(None, None)?;
         self.persist_auth_snapshot_locked(snapshot, on_replace)
     }
 
     fn auth_snapshot(
         &self,
-        passkeys: HashMap<String, ryme_auth::PasskeyCredential>,
+        users: Option<HashMap<String, ryme_auth::StoredUser>>,
+        passkeys: Option<HashMap<String, ryme_auth::PasskeyCredential>>,
     ) -> ryme_error::Result<AuthSnapshot> {
         let snapshot = AuthSnapshot {
             api_keys: self.keys.snapshot()?,
@@ -1974,13 +1970,23 @@ impl SharedState {
                 .lock()
                 .map_err(|_| ryme_error::RymeError::Internal(String::from("named api key lock")))?
                 .clone(),
-            users: self
-                .credentials
-                .lock()
-                .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
-                .snapshot(),
+            users: match users {
+                Some(users) => users,
+                None => self
+                    .credentials
+                    .lock()
+                    .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
+                    .snapshot(),
+            },
             refresh_tokens: self.refresh_tokens.snapshot()?,
-            passkeys,
+            passkeys: match passkeys {
+                Some(passkeys) => passkeys,
+                None => self
+                    .passkeys
+                    .lock()
+                    .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
+                    .snapshot(),
+            },
         };
         Ok(snapshot)
     }
@@ -2035,8 +2041,23 @@ impl SharedState {
             .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
         let mut staged = passkeys.clone();
         staged.register(user, credential_id, public_key)?;
-        let snapshot = self.auth_snapshot(staged.snapshot())?;
+        let snapshot = self.auth_snapshot(None, Some(staged.snapshot()))?;
         self.persist_auth_snapshot_locked(snapshot, || *passkeys = staged)
+    }
+
+    fn set_otp_secret(&self, user: &str, secret: Vec<u8>) -> ryme_error::Result<()> {
+        let _persist_guard = self
+            .auth_persist_lock
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+        let mut credentials = self
+            .credentials
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
+        let mut staged = credentials.clone();
+        staged.set_otp_secret(user, secret)?;
+        let snapshot = self.auth_snapshot(Some(staged.snapshot()), None)?;
+        self.persist_auth_snapshot_locked(snapshot, || *credentials = staged)
     }
 
     fn persist_control(&self) -> ryme_error::Result<()> {
@@ -7780,17 +7801,8 @@ async fn otp_setup(
     }
     let secret = ryme_auth::random_bytes(20);
     let encoded = ryme_auth::base64_url_encode(&secret);
-    let updated = match state.credentials.lock() {
-        Ok(mut store) => store.set_otp_secret(&request.id, secret),
-        Err(_) => Err(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
-    match updated {
-        Ok(()) => match state.persist_auth() {
-            Ok(()) => {
-                (StatusCode::OK, Json(serde_json::json!({ "secret": encoded }))).into_response()
-            }
-            Err(e) => error_response(e),
-        },
+    match state.set_otp_secret(&request.id, secret) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "secret": encoded }))).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -16442,6 +16454,34 @@ mod realtime_policy_tests {
 
         assert!(state.register_passkey("ada", String::from("credential"), &public_key).is_err());
         assert_eq!(state.passkeys.lock().unwrap().owner_of("credential"), None);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_otp_persistence_does_not_enroll_secret_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-otp-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+        let user = ryme_auth::StoredUser {
+            tenant: String::from("default"),
+            roles: [Role::Admin].into_iter().collect(),
+            password: None,
+            otp_secret: None,
+            otp_last_used_step: None,
+        };
+        *state.credentials.lock().unwrap() =
+            ryme_auth::CredentialStore::from_snapshot(HashMap::from([(String::from("ada"), user)]))
+                .unwrap();
+
+        assert!(state.set_otp_secret("ada", vec![7; 20]).is_err());
+        assert!(!state.credentials.lock().unwrap().otp_enrolled("ada"));
 
         std::fs::remove_dir_all(dir).unwrap();
     }

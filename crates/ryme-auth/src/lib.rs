@@ -1591,7 +1591,7 @@ pub struct StoredUser {
     pub otp_last_used_step: Option<u64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CredentialStore {
     users: HashMap<String, StoredUser>,
 }
