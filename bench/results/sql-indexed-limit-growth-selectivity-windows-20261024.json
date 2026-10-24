@@ -1,0 +1,64 @@
+{
+  "experiment": "sql-indexed-limit-selectivity-estimated-batch-growth",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_sql_executor",
+  "storage_mode": "hot",
+  "durability": "in_memory_only",
+  "baseline_revision": "061ce2c",
+  "baseline_rule": "Double the candidate batch after a partial match, up to 256.",
+  "candidate_rule": "Estimate next batch size as remaining rows divided by observed match rate, capped at 256; zero matches jump to 256.",
+  "common_parameters": {
+    "concurrency": 1,
+    "seed_rows": 20000,
+    "indexed_candidates": 834,
+    "query": "tenant = tenant-0001 AND state = active AND seq >= seq_min; tenant and state indexes",
+    "seq_min": 19990,
+    "result_rows": 1,
+    "iterations": 300,
+    "candidate_batch_ceiling": 256
+  },
+  "selective_residual": {
+    "doubling_rule": [
+      { "p50_ns": 1185700, "p95_ns": 1487200, "p99_ns": 1615100, "qps": 807 },
+      { "p50_ns": 1179300, "p95_ns": 1445900, "p99_ns": 1611100, "qps": 816 },
+      { "p50_ns": 1200900, "p95_ns": 1470200, "p99_ns": 1836200, "qps": 805 },
+      { "p50_ns": 1154700, "p95_ns": 1421300, "p99_ns": 1541400, "qps": 834 },
+      { "p50_ns": 1204500, "p95_ns": 1516800, "p99_ns": 1762900, "qps": 795 }
+    ],
+    "estimated_rule": [
+      { "p50_ns": 1238500, "p95_ns": 1619000, "p99_ns": 1826200, "qps": 778 },
+      { "p50_ns": 1235900, "p95_ns": 1543800, "p99_ns": 1760500, "qps": 784 },
+      { "p50_ns": 1145900, "p95_ns": 1456400, "p99_ns": 1564400, "qps": 834 },
+      { "p50_ns": 1175800, "p95_ns": 1469300, "p99_ns": 1601100, "qps": 817 },
+      { "p50_ns": 1222600, "p95_ns": 1550400, "p99_ns": 1793400, "qps": 789 }
+    ],
+    "median_p50_change_percent": 3.1,
+    "median_p95_change_percent": 5.0,
+    "median_p99_change_percent": 9.0,
+    "median_qps_change_percent": -2.2
+  },
+  "all_match_limit_10_control": {
+    "seq_min": 0,
+    "result_rows": 10,
+    "doubling_rule": [
+      { "p50_ns": 133600, "p95_ns": 143600, "p99_ns": 225700, "qps": 7273 },
+      { "p50_ns": 131200, "p95_ns": 144500, "p99_ns": 208000, "qps": 7357 },
+      { "p50_ns": 133300, "p95_ns": 164700, "p99_ns": 338700, "qps": 7055 }
+    ],
+    "estimated_rule": [
+      { "p50_ns": 133100, "p95_ns": 166600, "p99_ns": 206500, "qps": 7172 },
+      { "p50_ns": 133700, "p95_ns": 151900, "p99_ns": 207500, "qps": 7237 },
+      { "p50_ns": 133300, "p95_ns": 156200, "p99_ns": 202400, "qps": 7262 }
+    ],
+    "median_p50_change_percent": 0.0,
+    "median_qps_change_percent": -0.5
+  },
+  "decision": "Discard the selectivity-estimated growth rule. It did not improve the selective residual workload or the all-match control. Keep bounded doubling, which is simpler and matched or beat candidate medians.",
+  "notes": "Five alternating release-build pairs for the selective case and three for the control. This is a single-host, in-process benchmark without wire, network, durability, or concurrent-client overhead."
+}

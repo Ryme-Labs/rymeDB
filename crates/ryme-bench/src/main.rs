@@ -184,6 +184,8 @@ enum Command {
         ops: usize,
         #[arg(long, default_value_t = 4000, help = "SQL LIMIT value to benchmark (0..=4000)")]
         limit: usize,
+        #[arg(long, default_value_t = 0, help = "Lower bound for the residual seq predicate")]
+        seq_min: usize,
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
         #[arg(long, help = "Project a non-key column from a composite-primary-key table")]
@@ -361,10 +363,14 @@ async fn main() {
             rows,
             ops,
             limit,
+            seq_min,
             concurrency,
             composite_key_projection,
             json,
-        }) => sql_local_bench(rows, ops, limit, concurrency, composite_key_projection, json).await,
+        }) => {
+            sql_local_bench(rows, ops, limit, seq_min, concurrency, composite_key_projection, json)
+                .await
+        }
         Some(Command::TxnReadBatch {
             records,
             candidates,
@@ -2781,6 +2787,7 @@ async fn sql_local_bench(
     rows: usize,
     ops: usize,
     limit: usize,
+    seq_min: usize,
     concurrency: usize,
     composite_key_projection: bool,
     json: bool,
@@ -2790,12 +2797,13 @@ async fn sql_local_bench(
         || ops == 0
         || ops > 1_000_000
         || limit > 4_000
+        || seq_min > rows
         || concurrency == 0
         || concurrency > 64
         || concurrency > ops
     {
         eprintln!(
-            "rows must be 1..=50000, ops 1..=1000000, limit 0..=4000, and concurrency 1..=64"
+            "rows must be 1..=50000, ops 1..=1000000, limit 0..=4000, seq-min <= rows, and concurrency 1..=64"
         );
         return;
     }
@@ -2840,7 +2848,7 @@ async fn sql_local_bench(
 
     let projection = if composite_key_projection { "state" } else { "id, state" };
     let statement = match parse(&format!(
-        "SELECT {projection} FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT {limit}"
+        "SELECT {projection} FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= {seq_min} LIMIT {limit}"
     )) {
         Ok(statement) => statement,
         Err(error) => {
@@ -2848,7 +2856,8 @@ async fn sql_local_bench(
             return;
         }
     };
-    let expected_rows = rows.div_ceil(24).min(limit);
+    let matching_candidates = rows.div_ceil(24).saturating_sub(seq_min.div_ceil(24));
+    let expected_rows = matching_candidates.min(limit);
     let warmup_ops = ops.min(100);
     for _ in 0..warmup_ops {
         if !matches!(executor.execute(statement.clone()).await, Ok(QueryResult::Table { ref rows, .. }) if rows.len() == expected_rows)
@@ -2909,6 +2918,7 @@ async fn sql_local_bench(
         "composite_key_projection": composite_key_projection,
         "rows": rows,
         "limit": limit,
+        "seq_min": seq_min,
         "result_rows": expected_rows,
         "warmup_ops": warmup_ops,
         "ops": ops,

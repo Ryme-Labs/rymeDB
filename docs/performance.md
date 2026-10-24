@@ -120,6 +120,8 @@ cargo run --locked --release -j 1 -p ryme-bench -- sql-local \
   --rows 20000 --ops 300 --limit 10 --concurrency 1 --json
 cargo run --locked --release -j 1 -p ryme-bench -- sql-local \
   --rows 20000 --ops 300 --limit 4000 --concurrency 1 --json
+cargo run --locked --release -j 1 -p ryme-bench -- sql-local \
+  --rows 20000 --ops 300 --limit 1 --seq-min 19990 --concurrency 1 --json
 ```
 
 Indexed SQL scans now start with `min(limit, 256)` candidate reads and grow the
@@ -130,6 +132,15 @@ candidates measured median p50 549 Âµs before and 131 Âµs after for `LIMIT 1
 test covers refill through early residual-predicate and RLS rejects. These are
 in-process results, not PostgreSQL-wire or network
 latency; see the [raw captures](../bench/results/sql-indexed-limit-adaptive-batches-windows-20261024.json).
+
+The `--seq-min` option sets a residual predicate threshold to reproduce
+selective-match workloads. An estimated-selectivity batch-growth rule was
+compared with bounded doubling on the same host for five alternating release
+pairs, using 20,000 rows, 834 indexed candidates, and one result row. The
+estimated rule had median p50 3.1% higher, p95 5.0% higher, p99 9.0% higher,
+and throughput 2.2% lower. An all-match `LIMIT 10` control was effectively
+flat. The estimated rule was discarded; bounded doubling remains in use. See
+the [raw captures](../bench/results/sql-indexed-limit-growth-selectivity-windows-20261024.json).
 
 The SQL indexed-row fetch chunk remains 256. A 512-row candidate halved fetch
 calls for the measured indexed query, but alternating release runs with 20,000
