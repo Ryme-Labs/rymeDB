@@ -875,13 +875,33 @@ impl OidcStateStore {
         self.pending.get(state).map(|pending| pending.nonce.clone())
     }
 
-    fn consume(&mut self, state: &str, now: u64) -> ryme_error::Result<()> {
+    fn consume(&mut self, state: &str, now: u64) -> ryme_error::Result<OidcPendingState> {
         self.prune(now);
         let pending = self.pending.remove(state).ok_or(ryme_error::RymeError::Unauthorized)?;
         if let Some(expires_at) = pending.expires_at {
             self.expirations.remove(&(expires_at, state.to_string()));
         }
-        Ok(())
+        Ok(pending)
+    }
+
+    fn consume_matching_nonce(
+        &mut self,
+        state: &str,
+        nonce: &str,
+        now: u64,
+    ) -> ryme_error::Result<OidcPendingState> {
+        self.prune(now);
+        if !self.pending.get(state).is_some_and(|pending| pending.nonce == nonce) {
+            return Err(ryme_error::RymeError::Unauthorized);
+        }
+        self.consume(state, now)
+    }
+
+    fn restore(&mut self, state: String, pending: OidcPendingState) {
+        if let Some(expires_at) = pending.expires_at {
+            self.expirations.insert((expires_at, state.clone()));
+        }
+        self.pending.insert(state, pending);
     }
 
     fn prune(&mut self, now: u64) {
@@ -1091,6 +1111,19 @@ mod oidc_state_tests {
         states.issue(String::from("expired"), String::from("nonce"), 100).unwrap();
         assert!(states.nonce_for("expired", 100 + OIDC_STATE_TTL_SECS).is_none());
         assert!(states.consume("expired", 100 + OIDC_STATE_TTL_SECS).is_err());
+    }
+
+    #[test]
+    fn oidc_state_nonce_mismatch_preserves_pending_state() {
+        let mut states = OidcStateStore::default();
+        states.issue(String::from("state"), String::from("nonce"), 100).unwrap();
+
+        assert!(states.consume_matching_nonce("state", "other", 100).is_err());
+        assert_eq!(states.nonce_for("state", 100).as_deref(), Some("nonce"));
+        let pending = states.consume_matching_nonce("state", "nonce", 100).unwrap();
+        assert!(states.nonce_for("state", 100).is_none());
+        states.restore(String::from("state"), pending);
+        assert_eq!(states.nonce_for("state", 100).as_deref(), Some("nonce"));
     }
 
     #[test]
@@ -2075,6 +2108,40 @@ impl SharedState {
         now_secs: u64,
     ) -> ryme_error::Result<Principal> {
         self.update_credentials_durably(|credentials| credentials.verify_otp(user, code, now_secs))
+    }
+
+    fn issue_oidc_api_key(
+        &self,
+        state_id: &str,
+        expected_nonce: &str,
+        principal: &Principal,
+        now_secs: u64,
+    ) -> ryme_error::Result<(String, String)> {
+        let _persist_guard = self
+            .auth_persist_lock
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+        let mut oidc_states = self
+            .oidc_states
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("oidc state lock")))?;
+        let pending = oidc_states.consume_matching_nonce(state_id, expected_nonce, now_secs)?;
+        let (key, tenant) = match issue_api_key(&self.keys, principal, now_secs) {
+            Ok(issued) => issued,
+            Err(error) => {
+                oidc_states.restore(state_id.to_string(), pending);
+                return Err(error);
+            }
+        };
+        let mut replaced = false;
+        if let Err(error) = self.persist_auth_locked(|| replaced = true) {
+            if !replaced {
+                self.keys.remove(&key);
+                oidc_states.restore(state_id.to_string(), pending);
+            }
+            return Err(error);
+        }
+        Ok((key, tenant))
     }
 
     fn persist_control(&self) -> ryme_error::Result<()> {
@@ -8104,31 +8171,25 @@ async fn oidc_token(
     };
     match verified {
         Ok(principal) => {
-            if let Err(error) = state
-                .oidc_states
-                .lock()
-                .map_err(|_| ryme_error::RymeError::Internal(String::from("oidc state lock")))
-                .and_then(|mut states| states.consume(&request.state, now))
-            {
-                return error_response(error);
-            }
-            let (key, tenant) = match issue_api_key(&state.keys, &principal, now) {
+            let (key, tenant) = match state.issue_oidc_api_key(
+                &request.state,
+                &expected_nonce,
+                &principal,
+                now,
+            ) {
                 Ok(issued) => issued,
                 Err(error) => return error_response(error),
             };
             complete_auth_attempt(&state, &attempt_key, client_ip.address);
-            match state.persist_auth() {
-                Ok(()) => (
-                        StatusCode::CREATED,
-                        Json(serde_json::json!({
-                            "key": key,
-                            "tenant": tenant,
-                            "expires_in": ACCESS_TOKEN_TTL_SECS,
-                        })),
-                    )
-                    .into_response(),
-                Err(e) => error_response(e),
-            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "key": key,
+                    "tenant": tenant,
+                    "expires_in": ACCESS_TOKEN_TTL_SECS,
+                })),
+            )
+                .into_response()
         }
         Err(e) => error_response(e),
     }
@@ -16539,6 +16600,51 @@ mod realtime_policy_tests {
             })
             .is_err());
         assert!(state.credentials.lock().unwrap().principal("ada").is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_oidc_persistence_restores_state_and_removes_api_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-oidc-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+        state
+            .oidc_states
+            .lock()
+            .unwrap()
+            .issue(String::from("state"), String::from("nonce"), 100)
+            .unwrap();
+        let principal = Principal {
+            id: String::from("ada"),
+            tenant: String::from("default"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+        };
+        let keys_before = state
+            .keys
+            .snapshot()
+            .unwrap()
+            .into_keys()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(state.issue_oidc_api_key("state", "nonce", &principal, 100).is_err());
+        assert_eq!(
+            state.oidc_states.lock().unwrap().nonce_for("state", 100).as_deref(),
+            Some("nonce")
+        );
+        let keys_after = state
+            .keys
+            .snapshot()
+            .unwrap()
+            .into_keys()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys_after, keys_before);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
