@@ -87,6 +87,7 @@ impl S3Store {
         key: &str,
         query: &str,
         body: Option<Vec<u8>>,
+        if_none_match: bool,
         now: u64,
     ) -> Result<reqwest::Response> {
         let payload_hash = match body.as_ref() {
@@ -97,11 +98,13 @@ impl S3Store {
         let mut url = self.url(key)?;
         let path = canonical_uri(&url)?;
         let (datestamp, amztime) = amz_datetime(now);
-        let headers = vec![
-            (String::from("host"), host.clone()),
-            (String::from("x-amz-content-sha256"), payload_hash.clone()),
-            (String::from("x-amz-date"), amztime.clone()),
-        ];
+        let mut headers = vec![(String::from("host"), host.clone())];
+        if if_none_match {
+            headers.push((String::from("if-none-match"), String::from("*")));
+        }
+        headers.push((String::from("x-amz-content-sha256"), payload_hash.clone()));
+        headers.push((String::from("x-amz-date"), amztime.clone()));
+        headers.sort_by(|left, right| left.0.cmp(&right.0));
         let canonical = canonical_request(method, &path, query, &headers, &payload_hash);
         let scope = format!("{}/{}/{}/aws4_request", datestamp, self.config.region, "s3");
         let string_to_sign = format!(
@@ -115,7 +118,8 @@ impl S3Store {
             "s3",
             &string_to_sign,
         );
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let signed_headers =
+            headers.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(";");
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
             self.config.access_key, scope, signed_headers, signature
@@ -129,11 +133,15 @@ impl S3Store {
             "DELETE" => self.client.delete(&url),
             _ => self.client.get(&url),
         };
-        let response = builder
+        let mut builder = builder
             .header("host", host)
             .header("x-amz-date", amztime)
             .header("x-amz-content-sha256", payload_hash)
-            .header("authorization", authorization)
+            .header("authorization", authorization);
+        if if_none_match {
+            builder = builder.header("if-none-match", "*");
+        }
+        let response = builder
             .body(body.unwrap_or_default())
             .send()
             .await
@@ -152,7 +160,7 @@ impl S3Store {
             query_params.push(("continuation-token", token));
         }
         let query = canonical_query(&query_params);
-        let response = self.signed("GET", "", &query, None, now).await?;
+        let response = self.signed("GET", "", &query, None, false, now).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok((Vec::new(), None));
         }
@@ -195,11 +203,25 @@ impl crate::ObjectStore for S3Store {
         if bytes.len() > crate::MAX_ARCHIVE_OBJECT_BYTES {
             return Err(RymeError::Overload(String::from("archive object")));
         }
-        let response = self.signed("PUT", key, "", Some(bytes), crate::now_unix()).await?;
+        let response = self.signed("PUT", key, "", Some(bytes), false, crate::now_unix()).await?;
         if response.status().is_success() {
             Ok(())
         } else {
             Err(RymeError::Unavailable(format!("put {}", response.status())))
+        }
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool> {
+        if bytes.len() > crate::MAX_ARCHIVE_OBJECT_BYTES {
+            return Err(RymeError::Overload(String::from("archive object")));
+        }
+        let response = self.signed("PUT", key, "", Some(bytes), true, crate::now_unix()).await?;
+        if response.status().is_success() {
+            Ok(true)
+        } else if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+            Ok(false)
+        } else {
+            Err(RymeError::Unavailable(format!("conditional put {}", response.status())))
         }
     }
 
@@ -209,7 +231,7 @@ impl crate::ObjectStore for S3Store {
 
     async fn get_bounded(&self, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let max_bytes = max_bytes.min(crate::MAX_ARCHIVE_OBJECT_BYTES);
-        let response = self.signed("GET", key, "", None, crate::now_unix()).await?;
+        let response = self.signed("GET", key, "", None, false, crate::now_unix()).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RymeError::NotFound(String::from("key")));
         }
@@ -250,7 +272,7 @@ impl crate::ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let response = self.signed("DELETE", key, "", None, crate::now_unix()).await?;
+        let response = self.signed("DELETE", key, "", None, false, crate::now_unix()).await?;
         if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
             Ok(())
         } else {
@@ -603,9 +625,16 @@ mod tests {
                     };
                     let key = path.trim_start_matches("/test-bucket/").to_string();
                     let response = if method == "PUT" {
-                        files.lock().await.insert(key, body);
-                        "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n"
-                            .to_string()
+                        let mut files = files.lock().await;
+                        if headers.get("if-none-match").is_some_and(|value| value == "*")
+                            && files.contains_key(&key)
+                        {
+                            "HTTP/1.1 412 Precondition Failed\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n".to_string()
+                        } else {
+                            files.insert(key, body);
+                            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n"
+                                .to_string()
+                        }
                     } else if method == "DELETE" {
                         files.lock().await.remove(&key);
                         "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n".to_string()
@@ -708,6 +737,20 @@ mod tests {
         assert!(auths
             .iter()
             .all(|a| a.starts_with("AWS4-HMAC-SHA256 ") && a.contains("Signature=")));
+    }
+
+    #[tokio::test]
+    async fn s3_conditional_put_does_not_replace_existing_object() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state =
+            FakeS3 { files: Default::default(), seen_auth: Default::default(), list_pages: None };
+        tokio::spawn(run_fake_s3(listener, state));
+        let store = S3Store::new(test_s3_config(&format!("http://{addr}"), true)).unwrap();
+
+        assert!(store.put_if_absent("backups/a", b"original".to_vec()).await.unwrap());
+        assert!(!store.put_if_absent("backups/a", b"replacement".to_vec()).await.unwrap());
+        assert_eq!(store.get("backups/a").await.unwrap(), b"original");
     }
 
     #[tokio::test]

@@ -50,6 +50,12 @@ pub trait ObjectStore: Send + Sync {
     /// Store one object. Implementations reject objects larger than
     /// `MAX_ARCHIVE_OBJECT_BYTES`, including direct calls that bypass `Archiver`.
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<()>;
+    /// Atomically create an object only when its key is absent. Returns `false`
+    /// when an object already exists. Backends without conditional creation
+    /// must keep the default failure rather than emulate this with a racy read.
+    async fn put_if_absent(&self, _key: &str, _bytes: Vec<u8>) -> Result<bool> {
+        Err(RymeError::Unavailable(String::from("atomic archive create unsupported")))
+    }
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         self.get_bounded(key, MAX_ARCHIVE_OBJECT_BYTES).await
     }
@@ -580,10 +586,26 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
                 return Err(RymeError::Conflict(String::from("copy destination object")));
             }
             Err(RymeError::NotFound(_)) => {
-                dest.put(&file.key, bytes).await?;
-                let roundtrip = dest.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
-                if roundtrip.len() as u64 != file.bytes || sha256_hex(&roundtrip) != file.sha256 {
-                    return Err(RymeError::Corrupt(String::from("copy verify")));
+                if dest.put_if_absent(&file.key, bytes).await? {
+                    let roundtrip = dest.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
+                    if roundtrip.len() as u64 != file.bytes || sha256_hex(&roundtrip) != file.sha256
+                    {
+                        return Err(RymeError::Corrupt(String::from("copy verify")));
+                    }
+                } else {
+                    let existing = match dest.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await
+                    {
+                        Ok(existing) => existing,
+                        Err(RymeError::Overload(_)) => {
+                            return Err(RymeError::Conflict(String::from(
+                                "copy destination object",
+                            )));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if existing.len() as u64 != file.bytes || sha256_hex(&existing) != file.sha256 {
+                        return Err(RymeError::Conflict(String::from("copy destination object")));
+                    }
                 }
             }
             Err(error) => return Err(error),
@@ -597,7 +619,20 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
         Ok(_) | Err(RymeError::Overload(_)) => {
             return Err(RymeError::Conflict(String::from("copy destination manifest")));
         }
-        Err(RymeError::NotFound(_)) => dest.put(&key, raw).await?,
+        Err(RymeError::NotFound(_)) => {
+            if !dest.put_if_absent(&key, raw.clone()).await? {
+                let existing = match dest.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await {
+                    Ok(existing) => existing,
+                    Err(RymeError::Overload(_)) => {
+                        return Err(RymeError::Conflict(String::from("copy destination manifest")));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if existing != raw {
+                    return Err(RymeError::Conflict(String::from("copy destination manifest")));
+                }
+            }
+        }
         Err(error) => return Err(error),
     }
     Ok(copied)

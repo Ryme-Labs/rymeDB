@@ -217,6 +217,22 @@ mod tests {
         assert!(matches!(store.get("oversized").await, Err(RymeError::Overload(_))));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn local_store_conditional_put_preserves_existing_object() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-local-store-conditional-{}-{}",
+            std::process::id(),
+            crate::now_unix()
+        ));
+        let store = LocalStore::new(root.clone());
+
+        assert!(store.put_if_absent("backups/object", b"original".to_vec()).await.unwrap());
+        assert!(!store.put_if_absent("backups/object", b"replacement".to_vec()).await.unwrap());
+        assert_eq!(store.get("backups/object").await.unwrap(), b"original");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 impl crate::ObjectStore for LocalStore {
@@ -249,6 +265,39 @@ impl crate::ObjectStore for LocalStore {
         }
         write_result?;
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool> {
+        if bytes.len() > super::MAX_ARCHIVE_OBJECT_BYTES {
+            return Err(RymeError::Overload(String::from("archive object")));
+        }
+        let path = self.path(key)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| RymeError::InvalidArgument(String::from("archive path")))?;
+        let missing_directories = self.create_parent_directories(parent)?;
+        let path = self.path(key)?;
+        let (tmp, mut file) = super::create_archive_temp_file(&path)?;
+        let result = (|| -> Result<bool> {
+            std::io::Write::write_all(&mut file, &bytes)?;
+            file.sync_all()?;
+            drop(file);
+            match std::fs::hard_link(&tmp, &path) {
+                Ok(()) => {
+                    sync_archive_directory(parent)?;
+                    for directory in &missing_directories {
+                        if let Some(parent) = directory.parent() {
+                            sync_archive_directory(parent)?;
+                        }
+                    }
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>> {

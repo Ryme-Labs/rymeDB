@@ -98,7 +98,9 @@ is supplied, repeated archive requests at the same commit reuse the existing
 Copying a backup to another archive target verifies the source and reuses
 matching destination objects, so an interrupted copy can resume. A different
 destination manifest or object at the same backup key returns a conflict and
-is left untouched.
+is left untouched. The built-in local and S3 archive stores use atomic
+create-if-absent writes to protect against concurrent copies; custom object
+store implementations must provide this operation for backup copying.
 
 New backup IDs may be up to 128 bytes and may contain only ASCII letters,
 digits, `_`, and `-`. This keeps new archive paths portable across operating
