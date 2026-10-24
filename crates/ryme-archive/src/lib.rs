@@ -552,21 +552,54 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
         return Err(RymeError::Corrupt(String::from("copy manifest")));
     }
 
+    // A published destination manifest makes this backup identity immutable.
+    // Accept an identical manifest so interrupted copies can be resumed, but
+    // never replace a different backup that happens to use the same key.
+    match dest.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await {
+        Ok(existing) if existing == raw => {}
+        Ok(_) | Err(RymeError::Overload(_)) => {
+            return Err(RymeError::Conflict(String::from("copy destination manifest")));
+        }
+        Err(RymeError::NotFound(_)) => {}
+        Err(error) => return Err(error),
+    }
+
     let mut copied = 0u64;
     for file in &manifest.files {
         let bytes = source.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
         if bytes.len() as u64 != file.bytes || sha256_hex(&bytes) != file.sha256 {
             return Err(RymeError::Corrupt(String::from("copy verify")));
         }
-        dest.put(&file.key, bytes).await?;
-        let roundtrip = dest.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
-        if sha256_hex(&roundtrip) != file.sha256 {
-            dest.delete(&file.key).await?;
-            return Err(RymeError::Corrupt(String::from("copy verify")));
+        match dest.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await {
+            Ok(existing) => {
+                if existing.len() as u64 != file.bytes || sha256_hex(&existing) != file.sha256 {
+                    return Err(RymeError::Conflict(String::from("copy destination object")));
+                }
+            }
+            Err(RymeError::Overload(_)) => {
+                return Err(RymeError::Conflict(String::from("copy destination object")));
+            }
+            Err(RymeError::NotFound(_)) => {
+                dest.put(&file.key, bytes).await?;
+                let roundtrip = dest.get_bounded(&file.key, MAX_ARCHIVE_OBJECT_BYTES).await?;
+                if roundtrip.len() as u64 != file.bytes || sha256_hex(&roundtrip) != file.sha256 {
+                    return Err(RymeError::Corrupt(String::from("copy verify")));
+                }
+            }
+            Err(error) => return Err(error),
         }
         copied += 1;
     }
-    dest.put(&key, raw).await?;
+    // Recheck in case another writer published this backup while objects were
+    // being copied. Do not overwrite a manifest or any object on conflict.
+    match dest.get_bounded(&key, MAX_ARCHIVE_MANIFEST_BYTES).await {
+        Ok(existing) if existing == raw => {}
+        Ok(_) | Err(RymeError::Overload(_)) => {
+            return Err(RymeError::Conflict(String::from("copy destination manifest")));
+        }
+        Err(RymeError::NotFound(_)) => dest.put(&key, raw).await?,
+        Err(error) => return Err(error),
+    }
     Ok(copied)
 }
 

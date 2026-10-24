@@ -95,6 +95,11 @@ published, the archiver attempts to remove the objects it uploaded. When no ID
 is supplied, repeated archive requests at the same commit reuse the existing
 `auto-{commit timestamp}` backup.
 
+Copying a backup to another archive target verifies the source and reuses
+matching destination objects, so an interrupted copy can resume. A different
+destination manifest or object at the same backup key returns a conflict and
+is left untouched.
+
 New backup IDs may be up to 128 bytes and may contain only ASCII letters,
 digits, `_`, and `-`. This keeps new archive paths portable across operating
 systems and storage backends. Existing S3 manifests with other characters remain

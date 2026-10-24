@@ -50,6 +50,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Archive replication now preserves conflicting destination objects and
+  manifests, while allowing interrupted copies to resume from matching objects.
 - RESP `PUBSUB CHANNELS` now rejects replies above the 16 MiB collection limit
   before encoding the full array.
 - RESP `PUBSUB CHANNELS` now writes accepted replies into one pre-sized buffer,
