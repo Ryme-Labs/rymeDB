@@ -28,6 +28,9 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
   SQL `NULL` remains represented by PostgreSQL's `-1` parameter length, and
   the Bind parameter count must match the prepared statement. Placeholder
   counting uses SQL lexical rules for nested comments and dollar-quoted text.
+- `Parse` accepts partial parameter-type OID lists; supplied OIDs are retained
+  for statement descriptions and remaining parameters are reported as
+  unspecified.
 - Text-format query results preserve SQL `NULL` and reject invalid UTF-8 or
   embedded NUL cell bytes with `22021` rather than rewriting stored values.
 - Startup, TLS negotiation, and authentication must complete within 15 seconds;

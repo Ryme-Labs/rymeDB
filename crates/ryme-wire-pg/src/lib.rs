@@ -59,6 +59,12 @@ struct Portal {
     cached: Option<(String, Statement)>,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedStatement {
+    query: String,
+    parameter_types: Vec<u32>,
+}
+
 enum CopyInState {
     Receiving {
         table: String,
@@ -104,19 +110,28 @@ const COPY_MEMORY_UNIT_BYTES: usize = 64 * 1024;
 static COPY_MEMORY_BUDGET: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(COPY_MEMORY_BUDGET_BYTES / COPY_MEMORY_UNIT_BYTES)));
 
-fn prepared_state_exceeds_limit(
-    statements: &HashMap<String, String>,
+fn pg_prepared_state_exceeds_limit(
+    statements: &HashMap<String, PreparedStatement>,
     name: &str,
     query: &str,
+    parameter_types: &[u32],
 ) -> bool {
+    let statement_bytes = |name: &str, statement: &PreparedStatement| {
+        name.len().saturating_add(statement.query.len()).saturating_add(
+            statement.parameter_types.len().saturating_mul(std::mem::size_of::<u32>()),
+        )
+    };
     let used = statements
         .iter()
-        .map(|(name, query)| name.len().saturating_add(query.len()))
+        .map(|(name, statement)| statement_bytes(name, statement))
         .fold(0usize, usize::saturating_add);
     let replaced =
-        statements.get(name).map(|query| name.len().saturating_add(query.len())).unwrap_or(0);
-    used.saturating_sub(replaced).saturating_add(name.len()).saturating_add(query.len())
-        > MAX_PREPARED_STATE_BYTES
+        statements.get(name).map(|statement| statement_bytes(name, statement)).unwrap_or(0);
+    let candidate = name
+        .len()
+        .saturating_add(query.len())
+        .saturating_add(parameter_types.len().saturating_mul(std::mem::size_of::<u32>()));
+    used.saturating_sub(replaced).saturating_add(candidate) > MAX_PREPARED_STATE_BYTES
 }
 
 fn portal_state_exceeds_limit(
@@ -1077,7 +1092,7 @@ where
     B: TxnBackend,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut statements: HashMap<String, String> = HashMap::new();
+    let mut statements: HashMap<String, PreparedStatement> = HashMap::new();
     let mut portals: HashMap<String, Portal> = HashMap::new();
     let mut prepared_cache: HashMap<String, (String, Statement)> = HashMap::new();
     let mut session = HashMap::from([
@@ -1680,7 +1695,7 @@ where
                 }
             }
             b'P' => match parse_prepare(&payload) {
-                Ok((name, query)) => {
+                Ok((name, query, parameter_types)) => {
                     if !name.is_empty() && statements.contains_key(&name) {
                         ignore_until_sync = true;
                         if let Some(transaction) = active_transaction.as_mut() {
@@ -1697,7 +1712,12 @@ where
                     }
                     if (statements.len() >= MAX_PREPARED_STATEMENTS
                         && !statements.contains_key(&name))
-                        || prepared_state_exceeds_limit(&statements, &name, &query)
+                        || pg_prepared_state_exceeds_limit(
+                            &statements,
+                            &name,
+                            &query,
+                            &parameter_types,
+                        )
                     {
                         ignore_until_sync = true;
                         if let Some(transaction) = active_transaction.as_mut() {
@@ -1717,7 +1737,7 @@ where
                         portals.retain(|_, portal| !portal.statement.is_empty());
                     }
                     prepared_cache.remove(&name);
-                    statements.insert(name, query);
+                    statements.insert(name, PreparedStatement { query, parameter_types });
                     socket
                         .write_all(&frame(b'1', b""))
                         .await
@@ -1748,8 +1768,9 @@ where
                             .map_err(|e| RymeError::Io(e.to_string()))?;
                         continue;
                     }
-                    let expected_params =
-                        statements.get(&statement).map_or(0, |query| parameter_count(query));
+                    let expected_params = statements
+                        .get(&statement)
+                        .map_or(0, |prepared| parameter_count(&prepared.query));
                     if params.len() != expected_params {
                         ignore_until_sync = true;
                         if let Some(transaction) = active_transaction.as_mut() {
@@ -1839,18 +1860,21 @@ where
                         .map_err(|e| RymeError::Io(e.to_string()))?;
                     continue;
                 };
-                let query = if kind == b'P' {
-                    portals.get(&name).and_then(|portal| statements.get(&portal.statement)).cloned()
+                let prepared = if kind == b'P' {
+                    portals.get(&name).and_then(|portal| statements.get(&portal.statement))
                 } else {
-                    statements.get(&name).cloned()
+                    statements.get(&name)
                 };
-                let response = match query {
-                    Some(query) => {
+                let response = match prepared {
+                    Some(prepared) => {
                         let mut response = Vec::new();
                         if kind == b'S' {
-                            response.extend(parameter_description(&query));
+                            response.extend(parameter_description(
+                                &prepared.query,
+                                &prepared.parameter_types,
+                            ));
                         }
-                        response.extend(describe_query(&query));
+                        response.extend(describe_query(&prepared.query));
                         response
                     }
                     None => {
@@ -1904,8 +1928,8 @@ where
                 let mut committed_notifications = Vec::new();
                 let response = match portals.get_mut(&portal) {
                     Some(entry) => match statements.get(&entry.statement) {
-                        Some(query) => {
-                            let bound = bind(query, &entry.params);
+                        Some(prepared) => {
+                            let bound = bind(&prepared.query, &entry.params);
                             let trimmed = bound.trim_matches(|c| c == '\0' || c == ';' || c == ' ');
                             let cached = entry
                                 .cached
@@ -2059,12 +2083,12 @@ where
     }
 }
 
-fn parameter_description(query: &str) -> Vec<u8> {
+fn parameter_description(query: &str, parameter_types: &[u32]) -> Vec<u8> {
     let count = parameter_count(query).min(i16::MAX as usize) as i16;
     let mut body = Vec::with_capacity(2 + count as usize * 4);
     body.extend_from_slice(&count.to_be_bytes());
-    for _ in 0..count {
-        body.extend_from_slice(&0u32.to_be_bytes());
+    for index in 0..count as usize {
+        body.extend_from_slice(&parameter_types.get(index).copied().unwrap_or(0).to_be_bytes());
     }
     frame(b't', &body)
 }
@@ -4097,7 +4121,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn prepared_command<B>(
     query: &str,
-    statements: &mut HashMap<String, String>,
+    statements: &mut HashMap<String, PreparedStatement>,
     prepared_cache: &mut HashMap<String, (String, Statement)>,
     executor: &Arc<Executor<B>>,
     session: &mut HashMap<String, String>,
@@ -4139,7 +4163,7 @@ where
                 return Some(encode_error_code("42601", format!("unsupported statement: {query}")));
             }
             if (statements.len() >= MAX_PREPARED_STATEMENTS && !statements.contains_key(&name))
-                || prepared_state_exceeds_limit(statements, &name, body)
+                || pg_prepared_state_exceeds_limit(statements, &name, body, &[])
             {
                 return Some(encode_error_code(
                     "54000",
@@ -4147,7 +4171,10 @@ where
                 ));
             }
             prepared_cache.remove(&name);
-            statements.insert(name, body.to_string());
+            statements.insert(
+                name,
+                PreparedStatement { query: body.to_string(), parameter_types: Vec::new() },
+            );
             Some(command_complete("PREPARE"))
         }
         "EXECUTE" => {
@@ -4160,7 +4187,7 @@ where
                 None => (rest.trim_end_matches([';', ' ']), ""),
             };
             let stored = match statements.get(name) {
-                Some(stored) => stored.clone(),
+                Some(stored) => stored.query.clone(),
                 None => {
                     return Some(encode_error_code(
                         "26000",
@@ -4955,7 +4982,15 @@ fn read_i32(payload: &[u8], offset: &mut usize) -> Option<i32> {
     Some(value)
 }
 
-fn parse_prepare(payload: &[u8]) -> std::result::Result<(String, String), RymeError> {
+fn read_u32(payload: &[u8], offset: &mut usize) -> Option<u32> {
+    let end = (*offset).checked_add(4)?;
+    let bytes = payload.get(*offset..end)?;
+    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    *offset = end;
+    Some(value)
+}
+
+fn parse_prepare(payload: &[u8]) -> std::result::Result<(String, String, Vec<u32>), RymeError> {
     let mut offset = 0;
     let name = read_cstring(payload, &mut offset)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("parse name")))?;
@@ -4964,17 +4999,20 @@ fn parse_prepare(payload: &[u8]) -> std::result::Result<(String, String), RymeEr
     let type_count = read_i16(payload, &mut offset)
         .filter(|count| *count >= 0)
         .ok_or_else(|| RymeError::InvalidArgument(String::from("parse parameter types")))?;
+    let mut parameter_types = Vec::with_capacity(type_count as usize);
     for _ in 0..type_count {
-        read_i32(payload, &mut offset)
-            .ok_or_else(|| RymeError::InvalidArgument(String::from("parse parameter type")))?;
+        parameter_types.push(
+            read_u32(payload, &mut offset)
+                .ok_or_else(|| RymeError::InvalidArgument(String::from("parse parameter type")))?,
+        );
     }
-    if type_count > 0 && type_count as usize != parameter_count(&query) {
+    if type_count as usize > parameter_count(&query) {
         return Err(RymeError::InvalidArgument(String::from("parse parameter type count")));
     }
     if offset != payload.len() {
         return Err(RymeError::InvalidArgument(String::from("parse trailing bytes")));
     }
-    Ok((name, query))
+    Ok((name, query, parameter_types))
 }
 
 fn parse_bind(payload: &[u8]) -> std::result::Result<(String, String, Vec<String>), RymeError> {
@@ -5530,9 +5568,13 @@ mod tests {
     #[test]
     fn prepared_statements_and_portals_have_aggregate_byte_budgets() {
         let query = "x".repeat(MAX_PREPARED_STATE_BYTES - 1);
-        let statements = HashMap::from([(String::from("q"), query.clone())]);
-        assert!(!prepared_state_exceeds_limit(&statements, "q", &query));
-        assert!(prepared_state_exceeds_limit(&statements, "other", "x"));
+        let statements = HashMap::from([(
+            String::from("q"),
+            PreparedStatement { query: query.clone(), parameter_types: Vec::new() },
+        )]);
+        assert!(!pg_prepared_state_exceeds_limit(&statements, "q", &query, &[]));
+        assert!(pg_prepared_state_exceeds_limit(&statements, "q", &query, &[23]));
+        assert!(pg_prepared_state_exceeds_limit(&statements, "other", "x", &[]));
 
         let params = vec![String::from("x").repeat(MAX_PORTAL_STATE_BYTES - 2)];
         let portal = Portal { statement: String::from("s"), params: params.clone(), cached: None };
@@ -6228,9 +6270,28 @@ mod tests {
     fn parameter_description_ignores_quoted_and_commented_placeholders() {
         assert_eq!(parameter_count("SELECT '$12', \"$13\", $2, $10 -- $20\n/* $30 */"), 10);
         assert_eq!(parameter_count("SELECT $1, $$ $20 $$, /* outer /* $30 */ $40 */ $2"), 2);
-        let description = parameter_description("SELECT $2");
+        let description = parameter_description("SELECT $2", &[]);
         assert_eq!(description[0], b't');
         assert_eq!(i16::from_be_bytes([description[5], description[6]]), 2);
+    }
+
+    #[test]
+    fn parse_accepts_partial_parameter_types_and_describes_unspecified_types() {
+        let mut payload = b"prepared\0SELECT $1, $2\0".to_vec();
+        payload.extend_from_slice(&1i16.to_be_bytes());
+        payload.extend_from_slice(&23u32.to_be_bytes());
+        let (_, query, parameter_types) = parse_prepare(&payload).unwrap();
+        assert_eq!(parameter_types, vec![23]);
+
+        let description = parameter_description(&query, &parameter_types);
+        assert_eq!(u32::from_be_bytes(description[7..11].try_into().unwrap()), 23);
+        assert_eq!(u32::from_be_bytes(description[11..15].try_into().unwrap()), 0);
+
+        let mut excess_types = b"prepared\0SELECT $1\0".to_vec();
+        excess_types.extend_from_slice(&2i16.to_be_bytes());
+        excess_types.extend_from_slice(&23u32.to_be_bytes());
+        excess_types.extend_from_slice(&25u32.to_be_bytes());
+        assert!(parse_prepare(&excess_types).is_err());
     }
 
     #[test]
