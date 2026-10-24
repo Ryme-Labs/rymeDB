@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 pub const MAX_TRANSACTION_WRITE_ENTRIES: usize = 100_000;
+const PURGE_BATCH_KEYS: usize = 1_024;
 pub const MAX_TRANSACTION_READ_KEYS: usize = 100_000;
 pub const MAX_TRANSACTION_SCANNED_TABLES: usize = 10_000;
 pub const MAX_TRANSACTION_CONSTRAINT_SCANS: usize = 10_000;
@@ -3103,16 +3104,71 @@ impl DurableManager {
         self.ensure_persistence_healthy()?;
         let _gate =
             self.gate.lock().map_err(|_| RymeError::Internal(String::from("durable gate")))?;
-        if self.mode == StorageMode::Hot {
-            return self.inner.purge_keys(keys);
+        let engine = match self.mode {
+            StorageMode::Hot => self.inner.clone_engine_snapshot()?,
+            StorageMode::Standard => self.materialized_segments()?,
+        };
+        let unique_keys = keys.iter().collect::<BTreeSet<_>>();
+        let removed =
+            unique_keys.iter().filter(|key| engine.latest_commit_ts(key).is_some()).count();
+        if removed == 0 {
+            return Ok(0);
         }
-        let mut engine = self.materialized_segments()?;
-        let removed = engine.purge_keys(keys);
-        let max = engine.max_commit_ts();
-        let (_, newest) = self.segments.write(max, &engine)?;
-        self.segments.remove_except(&newest)?;
-        self.inner.advance_to(max);
+
+        // Persist tombstones instead of deleting segment history without a
+        // corresponding WAL record. Otherwise recovery can replay an old put
+        // and resurrect a key that this purge already removed.
+        let first_commit_ts = self
+            .latest_commit()
+            .checked_add(1)
+            .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+        let batch_count = removed.div_ceil(PURGE_BATCH_KEYS);
+        first_commit_ts
+            .checked_add(
+                u64::try_from(batch_count - 1)
+                    .map_err(|_| RymeError::Corrupt(String::from("commit timestamp overflow")))?,
+            )
+            .ok_or_else(|| RymeError::Corrupt(String::from("commit timestamp overflow")))?;
+        let mut batch = Vec::with_capacity(PURGE_BATCH_KEYS);
+        let mut batch_index = 0usize;
+        for key in unique_keys.iter().filter(|key| engine.latest_commit_ts(key).is_some()) {
+            batch.push((*key).clone());
+            if batch.len() == PURGE_BATCH_KEYS {
+                self.persist_purge_batch(first_commit_ts + batch_index as u64, &batch)?;
+                batch_index += 1;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.persist_purge_batch(first_commit_ts + batch_index as u64, &batch)?;
+        }
         Ok(removed)
+    }
+
+    fn persist_purge_batch(&self, commit_ts: u64, keys: &[RecordKey]) -> Result<()> {
+        let writes =
+            keys.iter().cloned().map(|key| (key, WriteOp::delete())).collect::<BTreeMap<_, _>>();
+        let payload = encode_writes(&writes)?;
+        self.record_persistence_result((|| {
+            {
+                let mut wal =
+                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+                wal.append_lsn(commit_ts, &payload)?;
+                if self.policy == SyncPolicy::Always {
+                    wal.sync()?;
+                }
+            }
+            self.segments.write_delta_owned_with_sync(
+                commit_ts,
+                segment_entries(commit_ts, &writes),
+                self.policy == SyncPolicy::Always,
+            )?;
+            self.inner.replay_at(commit_ts, &writes)?;
+            if self.mode == StorageMode::Standard {
+                self.inner.clear_engine()?;
+            }
+            Ok(())
+        })())
     }
 
     /// Removes a transferred table and publishes the removal before shard
@@ -5380,6 +5436,45 @@ mod tests {
         let stale = reopened.inner().from_state(stale_state).unwrap();
         assert!(matches!(reopened.commit(stale), Err(RymeError::Conflict(_))));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hot_and_standard_table_purges_stay_removed_after_restart() {
+        for mode in [StorageMode::Hot, StorageMode::Standard] {
+            let dir = std::env::temp_dir().join(format!(
+                "ryme-purge-restart-{}-{mode:?}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let manager = DurableManager::open_with_mode(
+                &dir,
+                1024 * 1024,
+                SyncPolicy::Always,
+                1024 * 1024,
+                mode,
+            )
+            .unwrap();
+            let key = RecordKey::new("t", "d", "transfer", b"source-row");
+            let mut seed = manager.begin();
+            manager.put(&mut seed, key.clone(), b"payload".to_vec());
+            manager.commit(seed).unwrap();
+            assert_eq!(manager.drop_table_for_transfer("t", "d", "transfer").unwrap(), 1);
+            drop(manager);
+
+            let reopened = DurableManager::open_with_mode(
+                &dir,
+                1024 * 1024,
+                SyncPolicy::Always,
+                1024 * 1024,
+                mode,
+            )
+            .unwrap();
+            let mut probe = reopened.begin();
+            assert_eq!(reopened.get(&mut probe, &key).unwrap(), None, "{mode:?}");
+            drop(reopened);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
