@@ -41,6 +41,8 @@ All notable changes to rymeDB are recorded here. Format follows
 ### Fixed
 
 - RESP `CLIENT HELP` now rejects unexpected arguments.
+- RESP `PFMERGE` now requires at least one source key and leaves the destination
+  unchanged when the command has invalid arity.
 - RESP `PING` now echoes its optional message and rejects additional arguments.
 - RESP `PING` in Pub/Sub mode now returns the subscription-compatible `pong`
   array reply.

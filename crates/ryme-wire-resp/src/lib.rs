@@ -3079,7 +3079,7 @@ where
                 }
             }
             "PFMERGE" => {
-                if command.args.is_empty() {
+                if command.args.len() < 2 {
                     return encode_error(String::from("wrong args"));
                 }
                 match self.pfmerge(txn, &command.args) {

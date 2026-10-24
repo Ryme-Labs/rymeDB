@@ -767,6 +767,9 @@ async fn hyperloglog_ops() {
     assert_eq!(command(addr, &["PFMERGE", "hm", "h1", "h2"]).await, "+OK");
     let merged: u64 = command(addr, &["PFCOUNT", "hm"]).await[1..].parse().unwrap();
     assert!(merged >= count && merged <= count + 3, "merged: {merged}");
+    assert!(command(addr, &["PFMERGE", "hm"]).await.starts_with("-ERR"));
+    let after_invalid_merge: u64 = command(addr, &["PFCOUNT", "hm"]).await[1..].parse().unwrap();
+    assert_eq!(after_invalid_merge, merged, "invalid PFMERGE must not mutate destination");
     let union: u64 = command(addr, &["PFCOUNT", "h1", "h2"]).await[1..].parse().unwrap();
     assert_eq!(union, merged);
     assert_eq!(command(addr, &["SET", "plain", "x"]).await, "+OK");
