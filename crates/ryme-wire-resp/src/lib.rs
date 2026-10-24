@@ -2147,12 +2147,13 @@ where
                 }
                 self.publish_pubsub(command.args[0].clone(), command.args[1].clone())
             }
-            "ECHO" => match command.args.first() {
+            "ECHO" if command.args.len() == 1 => match command.args.first() {
                 Some(message) => encode_bulk(message),
                 None => encode_error(String::from("wrong args")),
             },
+            "ECHO" => encode_error(String::from("wrong args")),
             "AUTH" => encode_error(String::from("Client sent AUTH, but no password is set")),
-            "GET" => match command.args.first() {
+            "GET" if command.args.len() == 1 => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
                     match self.manager.get(txn, &record) {
@@ -2163,6 +2164,7 @@ where
                 }
                 None => encode_error(String::from("wrong args")),
             },
+            "GET" => encode_error(String::from("wrong args")),
             "SET" => {
                 if command.args.len() < 2 {
                     return encode_error(String::from("wrong args"));
@@ -2233,7 +2235,7 @@ where
                 }
             }
             "GETEX" => self.getex(txn, &command.args),
-            "GETDEL" => match command.args.first() {
+            "GETDEL" if command.args.len() == 1 => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
                     match self.manager.get(txn, &record) {
@@ -2247,6 +2249,7 @@ where
                 }
                 None => encode_error(String::from("wrong args")),
             },
+            "GETDEL" => encode_error(String::from("wrong args")),
             "EXPIRE" => {
                 if command.args.len() < 2 {
                     return encode_error(String::from("wrong args"));
@@ -2285,20 +2288,22 @@ where
                     Err(error) => encode_error(error),
                 }
             }
-            "TTL" => match command.args.first() {
+            "TTL" if command.args.len() == 1 => match command.args.first() {
                 Some(key) => match self.ttl_secs(txn, key) {
                     Ok(ttl) => encode_integer(ttl),
                     Err(error) => encode_error(error.to_string()),
                 },
                 None => encode_error(String::from("wrong args")),
             },
-            "PTTL" => match command.args.first() {
+            "TTL" => encode_error(String::from("wrong args")),
+            "PTTL" if command.args.len() == 1 => match command.args.first() {
                 Some(key) => match self.ttl_millis(txn, key) {
                     Ok(ttl) => encode_integer(ttl),
                     Err(error) => encode_error(error.to_string()),
                 },
                 None => encode_error(String::from("wrong args")),
             },
+            "PTTL" => encode_error(String::from("wrong args")),
             "EXPIRETIME" | "PEXPIRETIME" => {
                 if command.args.len() != 1 {
                     return encode_error(String::from("wrong args"));
@@ -2312,7 +2317,7 @@ where
                     Err(error) => encode_error(error.to_string()),
                 }
             }
-            "PERSIST" => match command.args.first() {
+            "PERSIST" if command.args.len() == 1 => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
                     let staged_expiry = txn.writes().get(&record).is_some_and(|write| {
@@ -2351,6 +2356,7 @@ where
                 }
                 None => encode_error(String::from("wrong args")),
             },
+            "PERSIST" => encode_error(String::from("wrong args")),
             "DEL" => {
                 if command.args.is_empty() {
                     return encode_error(String::from("wrong args"));
@@ -2401,7 +2407,7 @@ where
                 }
                 encode_integer(found as i64)
             }
-            "TYPE" => match command.args.first() {
+            "TYPE" if command.args.len() == 1 => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
                     match self.manager.get(txn, &record) {
@@ -2412,6 +2418,7 @@ where
                 }
                 None => encode_error(String::from("wrong args")),
             },
+            "TYPE" => encode_error(String::from("wrong args")),
             "APPEND" => {
                 if command.args.len() != 2 {
                     return encode_error(String::from("wrong args"));
@@ -2430,7 +2437,7 @@ where
                 self.manager.put(txn, record, current);
                 encode_integer(length as i64)
             }
-            "STRLEN" => match command.args.first() {
+            "STRLEN" if command.args.len() == 1 => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
                     match self.manager.get(txn, &record) {
@@ -2441,6 +2448,7 @@ where
                 }
                 None => encode_error(String::from("wrong args")),
             },
+            "STRLEN" => encode_error(String::from("wrong args")),
             "INCR" => self.incr_by(txn, &command.args, 1),
             "DECR" => self.incr_by(txn, &command.args, -1),
             "INCRBY" => {

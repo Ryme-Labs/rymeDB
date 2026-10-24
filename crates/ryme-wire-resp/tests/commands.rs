@@ -389,6 +389,34 @@ async fn integer_counters_reject_overflow_without_changing_value() {
 }
 
 #[tokio::test]
+async fn single_argument_commands_reject_extra_arguments() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["SET", "key", "value"]).await, "+OK");
+    assert_eq!(command(addr, &["EXPIRE", "key", "60"]).await, ":1");
+
+    for args in [
+        vec!["ECHO", "message", "extra"],
+        vec!["GET", "key", "extra"],
+        vec!["GETDEL", "key", "extra"],
+        vec!["STRLEN", "key", "extra"],
+        vec!["TTL", "key", "extra"],
+        vec!["PTTL", "key", "extra"],
+        vec!["TYPE", "key", "extra"],
+        vec!["PERSIST", "key", "extra"],
+    ] {
+        assert!(command(addr, &args).await.starts_with("-ERR"), "accepted {args:?}");
+    }
+
+    assert_eq!(command(addr, &["GET", "key"]).await, "$5\r\nvalue");
+    let ttl = command(addr, &["TTL", "key"]).await;
+    assert!(
+        ttl.strip_prefix(':')
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|ttl| ttl > 0)
+    );
+}
+
+#[tokio::test]
 async fn multi_key_ops() {
     let addr = serve().await;
     assert_eq!(command(addr, &["MSET", "a", "1", "b", "2"]).await, "+OK");

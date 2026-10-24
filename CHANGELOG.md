@@ -36,6 +36,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP single-key string and metadata commands now reject extra arguments,
+  keeping local command behavior consistent with owner-routed reads.
 - RESP `APPEND` now enforces the shared 4 MiB value limit before extending a
   stored string.
 - RESP `INCR`/`DECR`/`INCRBY`/`DECRBY` now return errors on integer overflow
