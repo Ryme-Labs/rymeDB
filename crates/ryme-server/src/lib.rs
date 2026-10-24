@@ -15286,10 +15286,20 @@ struct WrappedRing {
     deks: Vec<WrappedDek>,
 }
 
-fn kms_from_env() -> Option<EnvKms> {
-    std::env::var("RYME_KMS_KEY")
-        .ok()
-        .and_then(|key| EnvKms::from_key(String::from("env-1"), key.into_bytes()).ok())
+fn kms_from_value(
+    value: std::result::Result<String, std::env::VarError>,
+) -> ryme_error::Result<Option<EnvKms>> {
+    match value {
+        Ok(key) => EnvKms::from_key(String::from("env-1"), key.into_bytes()).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ryme_error::RymeError::InvalidArgument(String::from("kms key")))
+        }
+    }
+}
+
+fn kms_from_env() -> ryme_error::Result<Option<EnvKms>> {
+    kms_from_value(std::env::var("RYME_KMS_KEY"))
 }
 
 fn read_keyring(path: &std::path::Path) -> ryme_error::Result<Option<Vec<u8>>> {
@@ -15360,13 +15370,21 @@ fn load_or_create_ring(
     data_dir: &std::path::Path,
     tenant: &str,
 ) -> ryme_error::Result<Arc<Mutex<KeyRing>>> {
+    load_or_create_ring_with_kms(data_dir, tenant, kms_from_env()?)
+}
+
+fn load_or_create_ring_with_kms(
+    data_dir: &std::path::Path,
+    tenant: &str,
+    kms: Option<EnvKms>,
+) -> ryme_error::Result<Arc<Mutex<KeyRing>>> {
     let path = data_dir.join("keyring.json");
     if let Some(raw) = read_keyring(&path)? {
         if let Ok(wrapped) = serde_json::from_slice::<WrappedRing>(&raw) {
-            if let Some(kms) = kms_from_env() {
+            if let Some(kms) = kms.as_ref() {
                 if kms.kek_id() == wrapped.kek_id {
                     let mut ring = KeyRing::new();
-                    if ring.import_wrapped(wrapped.deks, &kms).is_ok()
+                    if ring.import_wrapped(wrapped.deks, kms).is_ok()
                         && ring.active(tenant).is_some()
                     {
                         return Ok(Arc::new(Mutex::new(ring)));
@@ -15376,6 +15394,9 @@ fn load_or_create_ring(
         }
         if let Ok(ring) = serde_json::from_slice::<KeyRing>(&raw) {
             if ring.active(tenant).is_some() {
+                if let Some(kms) = kms.as_ref() {
+                    persist_ring_with_kms(&ring, &path, Some(kms))?;
+                }
                 return Ok(Arc::new(Mutex::new(ring)));
             }
         }
@@ -15383,13 +15404,22 @@ fn load_or_create_ring(
     }
     let mut ring = KeyRing::new();
     ring.rotate(tenant, now_secs());
-    persist_ring(&ring, &path)?;
+    persist_ring_with_kms(&ring, &path, kms.as_ref())?;
     Ok(Arc::new(Mutex::new(ring)))
 }
 
 fn persist_ring(ring: &KeyRing, path: &std::path::Path) -> ryme_error::Result<()> {
-    let raw = match kms_from_env() {
-        Some(kms) => wrapped_ring_bytes(ring, &kms)?,
+    let kms = kms_from_env()?;
+    persist_ring_with_kms(ring, path, kms.as_ref())
+}
+
+fn persist_ring_with_kms<K: KmsProvider>(
+    ring: &KeyRing,
+    path: &std::path::Path,
+    kms: Option<&K>,
+) -> ryme_error::Result<()> {
+    let raw = match kms {
+        Some(kms) => wrapped_ring_bytes(ring, kms)?,
         None => {
             tracing::warn!(
                 "persisting DEK ring without KMS wrap; volume encryption is the outer layer"
@@ -16866,6 +16896,40 @@ mod realtime_policy_tests {
             Err(ryme_error::RymeError::Corrupt(_))
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plaintext_keyring_is_wrapped_when_kms_is_configured() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-keyring-migrate-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keyring.json");
+        let mut ring = KeyRing::new();
+        ring.rotate("tenant-a", now_secs());
+        std::fs::write(&path, serde_json::to_vec(&ring).unwrap()).unwrap();
+
+        let kms = EnvKms::from_key(String::from("env-1"), vec![7; 32]).unwrap();
+        let loaded = load_or_create_ring_with_kms(&dir, "tenant-a", Some(kms.clone())).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let wrapped: WrappedRing = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(wrapped.kek_id, "env-1");
+
+        let loaded = loaded.lock().unwrap();
+        let plaintext = b"archive encryption keyring migration";
+        let envelope = loaded.seal("tenant-a", plaintext).unwrap();
+        assert_eq!(loaded.open("tenant-a", &envelope).unwrap(), plaintext);
+        drop(loaded);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_configured_kms_key_fails_instead_of_disabling_wrapping() {
+        assert!(kms_from_value(Ok(String::from("short"))).is_err());
+        assert!(kms_from_value(Err(std::env::VarError::NotPresent)).unwrap().is_none());
     }
 
     #[test]

@@ -119,8 +119,10 @@ recovery plan.
 
 Archive files are sealed with tenant data-encryption keys in
 `data_dir/keyring.json`. Set `RYME_KMS_KEY` to wrap the key ring with an
-external key; otherwise rely on disk/object-store encryption and strict file
-permissions. Keep the key ring and KMS material separate from the data copy.
+external key; an existing plaintext key ring is wrapped on startup. If the
+variable is set but invalid, startup fails rather than silently disabling key
+wrapping. Without a KMS key, rely on disk/object-store encryption and strict
+file permissions. Keep KMS material separate from the data copy.
 
 ## Recovery checklist
 

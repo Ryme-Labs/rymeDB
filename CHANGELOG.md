@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- Configured KMS keys now fail closed when invalid, and existing plaintext DEK
+  rings are wrapped on startup when KMS is enabled.
 - Public TOTP verification now rejects secrets shorter than 128 bits, matching
   the credential store's enrollment requirement.
 - Authentication now rejects NUL bytes in user, principal, and tenant IDs,
