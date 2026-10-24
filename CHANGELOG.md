@@ -52,6 +52,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - RESP `PUBSUB CHANNELS` now rejects replies above the 16 MiB collection limit
   before encoding the full array.
+- RESP `PUBSUB CHANNELS` now writes accepted replies into one pre-sized buffer,
+  avoiding per-channel encoded buffers and a second full-response copy.
 - Standard-mode range moves now preserve rows from multiple tables that share a
   commit timestamp instead of replacing one table's delta segment with another.
 - Repeated standard-mode snapshots keep segment IDs aligned with commit time,

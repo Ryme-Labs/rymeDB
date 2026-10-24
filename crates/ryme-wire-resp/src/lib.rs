@@ -6836,24 +6836,50 @@ fn encode_raw_array(replies: Vec<Vec<u8>>) -> Vec<u8> {
 }
 
 fn encode_pubsub_channels<'a>(
-    channels: impl IntoIterator<Item = &'a [u8]>,
+    channel_names: impl IntoIterator<Item = &'a [u8]>,
 ) -> std::result::Result<Vec<u8>, String> {
-    let mut replies = Vec::new();
+    let mut channels = Vec::new();
     let mut item_bytes = 0usize;
-    for channel in channels {
-        let encoded = encode_bulk(channel);
-        item_bytes = next_resp_collection_bytes(item_bytes, encoded.len())?;
-        replies.push(encoded);
+    for channel in channel_names {
+        let digits = decimal_digits(channel.len());
+        let encoded_len = channel
+            .len()
+            .checked_add(digits)
+            .and_then(|length| length.checked_add(5))
+            .ok_or_else(|| String::from("response exceeds the 16 MiB limit"))?;
+        item_bytes = next_resp_collection_bytes(item_bytes, encoded_len)?;
+        channels
+            .try_reserve(1)
+            .map_err(|_| String::from("response allocation failed"))?;
+        channels.push(channel);
     }
-    let header = format!("*{}\r\n", replies.len());
-    if item_bytes
+    let header = format!("*{}\r\n", channels.len());
+    let total_bytes = item_bytes
         .checked_add(header.len())
         .filter(|bytes| *bytes <= RESP_MAX_COLLECTION_BYTES)
-        .is_none()
-    {
-        return Err(String::from("response exceeds the 16 MiB limit"));
+        .ok_or_else(|| String::from("response exceeds the 16 MiB limit"))?;
+    let mut reply = Vec::new();
+    reply
+        .try_reserve_exact(total_bytes)
+        .map_err(|_| String::from("response allocation failed"))?;
+    reply.extend_from_slice(header.as_bytes());
+    for channel in channels {
+        reply.push(b'$');
+        reply.extend_from_slice(channel.len().to_string().as_bytes());
+        reply.extend_from_slice(b"\r\n");
+        reply.extend_from_slice(channel);
+        reply.extend_from_slice(b"\r\n");
     }
-    Ok(encode_raw_array(replies))
+    Ok(reply)
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -7530,7 +7556,7 @@ mod tests {
         );
 
         let reply = encode_pubsub_channels([b"orders".as_slice(), b"users".as_slice()]).unwrap();
-        assert!(reply.starts_with(b"*2\r\n"));
+        assert_eq!(reply, b"*2\r\n$6\r\norders\r\n$5\r\nusers\r\n");
         assert!(reply.len() < RESP_MAX_COLLECTION_BYTES);
     }
 
