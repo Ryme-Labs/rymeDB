@@ -1,0 +1,38 @@
+{
+  "experiment": "sql-composite-key-projection-unneeded-key-decode",
+  "command": "ryme-bench sql-local --rows 50000 --ops 500 --limit 4000 --concurrency 1 --composite-key-projection --json",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "baseline_revision": "b15e9e8",
+  "method": "Five alternating baseline/candidate pairs from separate release binaries. The candidate only skips decoding composite primary-key parts when projection does not select a primary-key column. Each capture uses the same in-process SQL fixture and 100 warmup operations.",
+  "baseline_runs": [
+    { "qps": 118, "p50_ns": 8143500, "p95_ns": 10014100, "p99_ns": 15601400, "max_ns": 18941800, "seconds": 4.251, "rows": 50000, "result_rows": 2084 },
+    { "qps": 116, "p50_ns": 8262100, "p95_ns": 10395300, "p99_ns": 13965700, "max_ns": 17510400, "seconds": 4.298, "rows": 50000, "result_rows": 2084 },
+    { "qps": 113, "p50_ns": 8180100, "p95_ns": 13173600, "p99_ns": 14810700, "max_ns": 37803000, "seconds": 4.419, "rows": 50000, "result_rows": 2084 },
+    { "qps": 119, "p50_ns": 8177200, "p95_ns": 9423800, "p99_ns": 11631800, "max_ns": 20316700, "seconds": 4.202, "rows": 50000, "result_rows": 2084 },
+    { "qps": 114, "p50_ns": 8389900, "p95_ns": 10999700, "p99_ns": 15727200, "max_ns": 25027900, "seconds": 4.386, "rows": 50000, "result_rows": 2084 }
+  ],
+  "candidate_runs": [
+    { "qps": 120, "p50_ns": 7996400, "p95_ns": 9936800, "p99_ns": 13135600, "max_ns": 17592500, "seconds": 4.152, "rows": 50000, "result_rows": 2084 },
+    { "qps": 122, "p50_ns": 7971700, "p95_ns": 9665000, "p99_ns": 11870000, "max_ns": 14414900, "seconds": 4.114, "rows": 50000, "result_rows": 2084 },
+    { "qps": 125, "p50_ns": 7868700, "p95_ns": 8649300, "p99_ns": 9421700, "max_ns": 11531100, "seconds": 3.989, "rows": 50000, "result_rows": 2084 },
+    { "qps": 115, "p50_ns": 8136400, "p95_ns": 11964200, "p99_ns": 14831900, "max_ns": 25027900, "seconds": 4.348, "rows": 50000, "result_rows": 2084 },
+    { "qps": 109, "p50_ns": 8279300, "p95_ns": 14467000, "p99_ns": 17385100, "max_ns": 19563700, "seconds": 4.58, "rows": 50000, "result_rows": 2084 }
+  ],
+  "median_summary": {
+    "baseline_qps": 116,
+    "candidate_qps": 120,
+    "baseline_p50_ns": 8180100,
+    "candidate_p50_ns": 7996400,
+    "baseline_p95_ns": 10395300,
+    "candidate_p95_ns": 9936800,
+    "baseline_p99_ns": 14810700,
+    "candidate_p99_ns": 13135600
+  },
+  "result": "Retained. Candidate p50 was lower in all five alternating pairs. Median p50 fell about 2.2% and median QPS rose about 3.4%. p95 and p99 varied in both directions across pairs, so no tail-latency improvement is claimed.",
+  "caveat": "Single Windows host, one in-process workload, one worker. Benchmark reports latency per complete SQL query, so the per-row key decoding is only one part of the operation. This does not characterize concurrent, networked, or WAL-backed query latency."
+}

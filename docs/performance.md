@@ -103,6 +103,16 @@ throughput. This isolates executor/storage work for one fixed query shape; it
 does not measure SQL parsing, concurrent clients, WAL durability, network
 overhead, or establish a cross-database performance claim.
 
+Use `--composite-key-projection` to benchmark a composite-primary-key table
+while projecting only a non-key column. SQL projection decodes the composite
+key only when a selected column needs one of its components. Five alternating
+release-run pairs on a Windows Ryzen 5 4500, each returning 2,084 rows, measured
+median p50 at 8.18 ms before and 8.00 ms after (2.2% lower); candidate p50 was
+lower in each pair. Median throughput was 116 versus 120 queries/s. Tail
+percentiles varied across pairs, so no p95/p99 improvement is claimed. This is
+one in-process workload and does not establish end-to-end latency gains. See
+the [paired captures](../bench/results/sql-composite-key-projection-20261024.json).
+
 The `--limit` option accepts values from 0 through 4,000. A sequential
 before/after capture for the same 1,000-row indexed query with `LIMIT 0` on an
 AMD Ryzen 5 4500 (12 logical CPUs, Windows 11) measured median p50 falling from

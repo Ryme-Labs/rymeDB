@@ -11485,20 +11485,22 @@ where
             .collect::<Vec<_>>();
         let needs_json =
             projection.iter().any(|source| matches!(source, ProjectionSource::Json(_)));
+        let needs_composite_parts = primary_keys.len() > 1
+            && projection.iter().any(|source| matches!(source, ProjectionSource::PrimaryKey(_)));
         rows.map(|(pk, value)| {
-            Self::project_row(&primary_keys, &projection, needs_json, &pk, &value)
+            Self::project_row(&projection, needs_composite_parts, needs_json, &pk, &value)
         })
         .collect()
     }
 
     fn project_row(
-        primary_keys: &[&ColumnDefinition],
         projection: &[ProjectionSource],
+        needs_composite_parts: bool,
         needs_json: bool,
         pk: &[u8],
         value: &[u8],
     ) -> Vec<Vec<u8>> {
-        let composite_parts = (primary_keys.len() > 1).then(|| decode_key_parts(pk)).flatten();
+        let composite_parts = needs_composite_parts.then(|| decode_key_parts(pk)).flatten();
         let object = needs_json.then(|| projected_json_object(value, projection)).flatten();
         projection
             .iter()
@@ -17249,10 +17251,10 @@ mod tests {
         assert_eq!(selected.len(), 3);
         assert!(!selected.contains_key("discard"));
 
-        let row = Executor::<TxnManager>::project_row(&[], &projection, true, b"pk", value);
+        let row = Executor::<TxnManager>::project_row(&projection, false, true, b"pk", value);
         assert_eq!(row, vec![b"admin".to_vec(), b"ready".to_vec(), b"escaped".to_vec()]);
         assert_eq!(
-            Executor::<TxnManager>::project_row(&[], &projection, true, b"pk", b"not-json"),
+            Executor::<TxnManager>::project_row(&projection, false, true, b"pk", b"not-json"),
             vec![b"not-json".to_vec(); projection.len()]
         );
         assert!(projected_json_object(b"[]", &projection).is_none());

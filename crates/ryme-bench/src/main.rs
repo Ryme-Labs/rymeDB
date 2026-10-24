@@ -184,6 +184,8 @@ enum Command {
         limit: usize,
         #[arg(long, default_value_t = 1)]
         concurrency: usize,
+        #[arg(long, help = "Project a non-key column from a composite-primary-key table")]
+        composite_key_projection: bool,
         #[arg(long)]
         json: bool,
     },
@@ -353,9 +355,14 @@ async fn main() {
             })
             .await;
         }
-        Some(Command::SqlLocal { rows, ops, limit, concurrency, json }) => {
-            sql_local_bench(rows, ops, limit, concurrency, json).await
-        }
+        Some(Command::SqlLocal {
+            rows,
+            ops,
+            limit,
+            concurrency,
+            composite_key_projection,
+            json,
+        }) => sql_local_bench(rows, ops, limit, concurrency, composite_key_projection, json).await,
         Some(Command::TxnReadBatch {
             records,
             candidates,
@@ -2726,7 +2733,14 @@ async fn sql_bench(config: SqlBench) {
     }
 }
 
-async fn sql_local_bench(rows: usize, ops: usize, limit: usize, concurrency: usize, json: bool) {
+async fn sql_local_bench(
+    rows: usize,
+    ops: usize,
+    limit: usize,
+    concurrency: usize,
+    composite_key_projection: bool,
+    json: bool,
+) {
     if rows == 0
         || rows > 50_000
         || ops == 0
@@ -2744,10 +2758,13 @@ async fn sql_local_bench(rows: usize, ops: usize, limit: usize, concurrency: usi
 
     let executor = Executor::new(String::from("bench"), String::from("bench"));
     let setup = async {
+        let create_table = if composite_key_projection {
+            "CREATE TABLE bench_rows (id TEXT, tenant TEXT, state TEXT, seq INTEGER, PRIMARY KEY (tenant, id))"
+        } else {
+            "CREATE TABLE bench_rows (id TEXT PRIMARY KEY, tenant TEXT, state TEXT, seq INTEGER)"
+        };
         executor
-            .execute(parse(
-                "CREATE TABLE bench_rows (id TEXT PRIMARY KEY, tenant TEXT, state TEXT, seq INTEGER)",
-            )?)
+            .execute(parse(create_table)?)
             .await?;
         for start in (0..rows).step_by(64) {
             let values = (start..rows.min(start + 64))
@@ -2777,8 +2794,9 @@ async fn sql_local_bench(rows: usize, ops: usize, limit: usize, concurrency: usi
         return;
     }
 
+    let projection = if composite_key_projection { "state" } else { "id, state" };
     let statement = match parse(&format!(
-        "SELECT id, state FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT {limit}"
+        "SELECT {projection} FROM bench_rows WHERE tenant = 'tenant-0001' AND state = 'active' AND seq >= 0 LIMIT {limit}"
     )) {
         Ok(statement) => statement,
         Err(error) => {
@@ -2844,6 +2862,7 @@ async fn sql_local_bench(rows: usize, ops: usize, limit: usize, concurrency: usi
         "execution": "in-process",
         "protocol": "ryme-sql-executor",
         "workload": "indexed-filtered-projection-three-predicates",
+        "composite_key_projection": composite_key_projection,
         "rows": rows,
         "limit": limit,
         "result_rows": expected_rows,
