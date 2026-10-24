@@ -1,0 +1,479 @@
+{
+    "benchmark":  "transaction-batch-read",
+    "capture_date":  "2026-10-24",
+    "machine":  {
+                    "arch":  "x86_64",
+                    "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                    "logical_cpus":  12,
+                    "os":  "windows"
+                },
+    "workload":  {
+                     "storage_mode":  "standard",
+                     "records":  80,
+                     "delta_segments":  80,
+                     "candidates_per_iteration":  16,
+                     "batch_size":  16,
+                     "iterations":  100,
+                     "value_bytes":  128,
+                     "durability":  "wal_and_segment_sync_disabled",
+                     "binary":  "release",
+                     "harness":  "in-process transaction benchmark; warmed cache"
+                 },
+    "comparison":  {
+                       "metric":  "read_only_batched_read",
+                       "baseline_p50_ns":  [
+                                               71300,
+                                               71300,
+                                               71500
+                                           ],
+                       "baseline_p95_ns":  [
+                                               89600,
+                                               81300,
+                                               75200
+                                           ],
+                       "after_p50_ns":  [
+                                            37200,
+                                            36900,
+                                            37000
+                                        ],
+                       "after_p95_ns":  [
+                                            40000,
+                                            37600,
+                                            43200
+                                        ],
+                       "median_capture_p50_ns":  {
+                                                     "baseline":  71300,
+                                                     "after":  37000
+                                                 }
+                   },
+    "baseline":  [
+                     {
+                         "batch_size":  16,
+                         "batched_read":  {
+                                              "p50_ns":  77600,
+                                              "p95_ns":  97200,
+                                              "p99_ns":  109000,
+                                              "rows_per_second":  201321
+                                          },
+                         "benchmark":  "transaction-batch-read",
+                         "candidates_per_iteration":  16,
+                         "distinct_keys_per_iteration":  16,
+                         "durability":  "wal_and_segment_sync_disabled",
+                         "iterations":  100,
+                         "machine":  {
+                                         "arch":  "x86_64",
+                                         "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                         "logical_cpus":  12,
+                                         "os":  "windows"
+                                     },
+                         "p50_speedup":  3.06,
+                         "read_only_batch_p50_speedup":  3.23,
+                         "read_only_batched_read":  {
+                                                        "p50_ns":  71300,
+                                                        "p95_ns":  89600,
+                                                        "p99_ns":  100800,
+                                                        "rows_per_second":  218809
+                                                    },
+                         "read_only_p50_speedup":  1.03,
+                         "read_only_single_read":  {
+                                                       "p50_ns":  230600,
+                                                       "p95_ns":  274800,
+                                                       "p99_ns":  316100,
+                                                       "rows_per_second":  68069
+                                                   },
+                         "records":  80,
+                         "reversed_read_only_batch_p50_speedup":  3.23,
+                         "reversed_read_only_batched_read":  {
+                                                                 "p50_ns":  71300,
+                                                                 "p95_ns":  92700,
+                                                                 "p99_ns":  96700,
+                                                                 "rows_per_second":  218248
+                                                             },
+                         "segment_count":  80,
+                         "shuffled_read_only_batched_read":  {
+                                                                 "p50_ns":  74500,
+                                                                 "p95_ns":  98800,
+                                                                 "p99_ns":  101700,
+                                                                 "rows_per_second":  209049
+                                                             },
+                         "single_read":  {
+                                             "p50_ns":  237800,
+                                             "p95_ns":  295200,
+                                             "p99_ns":  339100,
+                                             "rows_per_second":  65691
+                                         },
+                         "staged_write_batch_p50_speedup":  3.04,
+                         "staged_write_batched_read":  {
+                                                           "p50_ns":  78000,
+                                                           "p95_ns":  100700,
+                                                           "p99_ns":  107600,
+                                                           "rows_per_second":  199748
+                                                       },
+                         "staged_write_single_read":  {
+                                                          "p50_ns":  237500,
+                                                          "p95_ns":  291200,
+                                                          "p99_ns":  325800,
+                                                          "rows_per_second":  65658
+                                                      },
+                         "storage_mode":  "standard",
+                         "value_bytes":  128
+                     },
+                     {
+                         "batch_size":  16,
+                         "batched_read":  {
+                                              "p50_ns":  77500,
+                                              "p95_ns":  97200,
+                                              "p99_ns":  106200,
+                                              "rows_per_second":  201671
+                                          },
+                         "benchmark":  "transaction-batch-read",
+                         "candidates_per_iteration":  16,
+                         "distinct_keys_per_iteration":  16,
+                         "durability":  "wal_and_segment_sync_disabled",
+                         "iterations":  100,
+                         "machine":  {
+                                         "arch":  "x86_64",
+                                         "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                         "logical_cpus":  12,
+                                         "os":  "windows"
+                                     },
+                         "p50_speedup":  3.01,
+                         "read_only_batch_p50_speedup":  3.18,
+                         "read_only_batched_read":  {
+                                                        "p50_ns":  71300,
+                                                        "p95_ns":  81300,
+                                                        "p99_ns":  94800,
+                                                        "rows_per_second":  215195
+                                                    },
+                         "read_only_p50_speedup":  1.03,
+                         "read_only_single_read":  {
+                                                       "p50_ns":  226900,
+                                                       "p95_ns":  251400,
+                                                       "p99_ns":  299000,
+                                                       "rows_per_second":  69421
+                                                   },
+                         "records":  80,
+                         "reversed_read_only_batch_p50_speedup":  3.18,
+                         "reversed_read_only_batched_read":  {
+                                                                 "p50_ns":  71300,
+                                                                 "p95_ns":  75100,
+                                                                 "p99_ns":  89200,
+                                                                 "rows_per_second":  222404
+                                                             },
+                         "segment_count":  80,
+                         "shuffled_read_only_batched_read":  {
+                                                                 "p50_ns":  74600,
+                                                                 "p95_ns":  94600,
+                                                                 "p99_ns":  102000,
+                                                                 "rows_per_second":  208894
+                                                             },
+                         "single_read":  {
+                                             "p50_ns":  233200,
+                                             "p95_ns":  255200,
+                                             "p99_ns":  310500,
+                                             "rows_per_second":  67333
+                                         },
+                         "staged_write_batch_p50_speedup":  3.0,
+                         "staged_write_batched_read":  {
+                                                           "p50_ns":  77900,
+                                                           "p95_ns":  86500,
+                                                           "p99_ns":  106900,
+                                                           "rows_per_second":  201855
+                                                       },
+                         "staged_write_single_read":  {
+                                                          "p50_ns":  233900,
+                                                          "p95_ns":  274800,
+                                                          "p99_ns":  296300,
+                                                          "rows_per_second":  67045
+                                                      },
+                         "storage_mode":  "standard",
+                         "value_bytes":  128
+                     },
+                     {
+                         "batch_size":  16,
+                         "batched_read":  {
+                                              "p50_ns":  77800,
+                                              "p95_ns":  81600,
+                                              "p99_ns":  88200,
+                                              "rows_per_second":  205865
+                                          },
+                         "benchmark":  "transaction-batch-read",
+                         "candidates_per_iteration":  16,
+                         "distinct_keys_per_iteration":  16,
+                         "durability":  "wal_and_segment_sync_disabled",
+                         "iterations":  100,
+                         "machine":  {
+                                         "arch":  "x86_64",
+                                         "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                         "logical_cpus":  12,
+                                         "os":  "windows"
+                                     },
+                         "p50_speedup":  3.02,
+                         "read_only_batch_p50_speedup":  3.2,
+                         "read_only_batched_read":  {
+                                                        "p50_ns":  71500,
+                                                        "p95_ns":  75200,
+                                                        "p99_ns":  91200,
+                                                        "rows_per_second":  222723
+                                                    },
+                         "read_only_p50_speedup":  1.02,
+                         "read_only_single_read":  {
+                                                       "p50_ns":  229100,
+                                                       "p95_ns":  234800,
+                                                       "p99_ns":  238900,
+                                                       "rows_per_second":  69177
+                                                   },
+                         "records":  80,
+                         "reversed_read_only_batch_p50_speedup":  3.2,
+                         "reversed_read_only_batched_read":  {
+                                                                 "p50_ns":  71500,
+                                                                 "p95_ns":  73500,
+                                                                 "p99_ns":  89500,
+                                                                 "rows_per_second":  223989
+                                                             },
+                         "segment_count":  80,
+                         "shuffled_read_only_batched_read":  {
+                                                                 "p50_ns":  74600,
+                                                                 "p95_ns":  78400,
+                                                                 "p99_ns":  90400,
+                                                                 "rows_per_second":  213804
+                                                             },
+                         "single_read":  {
+                                             "p50_ns":  234600,
+                                             "p95_ns":  241600,
+                                             "p99_ns":  251200,
+                                             "rows_per_second":  67422
+                                         },
+                         "staged_write_batch_p50_speedup":  3.01,
+                         "staged_write_batched_read":  {
+                                                           "p50_ns":  78200,
+                                                           "p95_ns":  78900,
+                                                           "p99_ns":  82400,
+                                                           "rows_per_second":  205666
+                                                       },
+                         "staged_write_single_read":  {
+                                                          "p50_ns":  235200,
+                                                          "p95_ns":  243000,
+                                                          "p99_ns":  279200,
+                                                          "rows_per_second":  67268
+                                                      },
+                         "storage_mode":  "standard",
+                         "value_bytes":  128
+                     }
+                 ],
+    "after":  [
+                  {
+                      "batch_size":  16,
+                      "batched_read":  {
+                                           "p50_ns":  43400,
+                                           "p95_ns":  46900,
+                                           "p99_ns":  54500,
+                                           "rows_per_second":  364548
+                                       },
+                      "benchmark":  "transaction-batch-read",
+                      "candidates_per_iteration":  16,
+                      "distinct_keys_per_iteration":  16,
+                      "durability":  "wal_and_segment_sync_disabled",
+                      "iterations":  100,
+                      "machine":  {
+                                      "arch":  "x86_64",
+                                      "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                      "logical_cpus":  12,
+                                      "os":  "windows"
+                                  },
+                      "p50_speedup":  5.67,
+                      "read_only_batch_p50_speedup":  6.44,
+                      "read_only_batched_read":  {
+                                                     "p50_ns":  37200,
+                                                     "p95_ns":  40000,
+                                                     "p99_ns":  43500,
+                                                     "rows_per_second":  433264
+                                                 },
+                      "read_only_p50_speedup":  1.03,
+                      "read_only_single_read":  {
+                                                    "p50_ns":  239600,
+                                                    "p95_ns":  262400,
+                                                    "p99_ns":  294900,
+                                                    "rows_per_second":  66207
+                                                },
+                      "records":  80,
+                      "reversed_read_only_batch_p50_speedup":  6.49,
+                      "reversed_read_only_batched_read":  {
+                                                              "p50_ns":  36900,
+                                                              "p95_ns":  37400,
+                                                              "p99_ns":  41100,
+                                                              "rows_per_second":  434381
+                                                          },
+                      "segment_count":  80,
+                      "shuffled_read_only_batched_read":  {
+                                                              "p50_ns":  40200,
+                                                              "p95_ns":  43900,
+                                                              "p99_ns":  59000,
+                                                              "rows_per_second":  390997
+                                                          },
+                      "single_read":  {
+                                          "p50_ns":  246000,
+                                          "p95_ns":  257700,
+                                          "p99_ns":  312500,
+                                          "rows_per_second":  64489
+                                      },
+                      "staged_write_batch_p50_speedup":  5.63,
+                      "staged_write_batched_read":  {
+                                                        "p50_ns":  43800,
+                                                        "p95_ns":  46000,
+                                                        "p99_ns":  48300,
+                                                        "rows_per_second":  367436
+                                                    },
+                      "staged_write_single_read":  {
+                                                       "p50_ns":  246400,
+                                                       "p95_ns":  259300,
+                                                       "p99_ns":  287900,
+                                                       "rows_per_second":  64536
+                                                   },
+                      "storage_mode":  "standard",
+                      "value_bytes":  128
+                  },
+                  {
+                      "batch_size":  16,
+                      "batched_read":  {
+                                           "p50_ns":  42900,
+                                           "p95_ns":  46500,
+                                           "p99_ns":  51700,
+                                           "rows_per_second":  375243
+                                       },
+                      "benchmark":  "transaction-batch-read",
+                      "candidates_per_iteration":  16,
+                      "distinct_keys_per_iteration":  16,
+                      "durability":  "wal_and_segment_sync_disabled",
+                      "iterations":  100,
+                      "machine":  {
+                                      "arch":  "x86_64",
+                                      "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                      "logical_cpus":  12,
+                                      "os":  "windows"
+                                  },
+                      "p50_speedup":  5.61,
+                      "read_only_batch_p50_speedup":  6.34,
+                      "read_only_batched_read":  {
+                                                     "p50_ns":  36900,
+                                                     "p95_ns":  37600,
+                                                     "p99_ns":  46400,
+                                                     "rows_per_second":  435173
+                                                 },
+                      "read_only_p50_speedup":  1.03,
+                      "read_only_single_read":  {
+                                                    "p50_ns":  233800,
+                                                    "p95_ns":  244800,
+                                                    "p99_ns":  274400,
+                                                    "rows_per_second":  67708
+                                                },
+                      "records":  80,
+                      "reversed_read_only_batch_p50_speedup":  6.41,
+                      "reversed_read_only_batched_read":  {
+                                                              "p50_ns":  36500,
+                                                              "p95_ns":  37500,
+                                                              "p99_ns":  42700,
+                                                              "rows_per_second":  442404
+                                                          },
+                      "segment_count":  80,
+                      "shuffled_read_only_batched_read":  {
+                                                              "p50_ns":  39500,
+                                                              "p95_ns":  43900,
+                                                              "p99_ns":  49500,
+                                                              "rows_per_second":  405546
+                                                          },
+                      "single_read":  {
+                                          "p50_ns":  240700,
+                                          "p95_ns":  249400,
+                                          "p99_ns":  283000,
+                                          "rows_per_second":  65664
+                                      },
+                      "staged_write_batch_p50_speedup":  5.57,
+                      "staged_write_batched_read":  {
+                                                        "p50_ns":  43300,
+                                                        "p95_ns":  46800,
+                                                        "p99_ns":  60800,
+                                                        "rows_per_second":  368953
+                                                    },
+                      "staged_write_single_read":  {
+                                                       "p50_ns":  241000,
+                                                       "p95_ns":  247200,
+                                                       "p99_ns":  328700,
+                                                       "rows_per_second":  65299
+                                                   },
+                      "storage_mode":  "standard",
+                      "value_bytes":  128
+                  },
+                  {
+                      "batch_size":  16,
+                      "batched_read":  {
+                                           "p50_ns":  43000,
+                                           "p95_ns":  45300,
+                                           "p99_ns":  65000,
+                                           "rows_per_second":  370817
+                                       },
+                      "benchmark":  "transaction-batch-read",
+                      "candidates_per_iteration":  16,
+                      "distinct_keys_per_iteration":  16,
+                      "durability":  "wal_and_segment_sync_disabled",
+                      "iterations":  100,
+                      "machine":  {
+                                      "arch":  "x86_64",
+                                      "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                      "logical_cpus":  12,
+                                      "os":  "windows"
+                                  },
+                      "p50_speedup":  5.66,
+                      "read_only_batch_p50_speedup":  6.36,
+                      "read_only_batched_read":  {
+                                                     "p50_ns":  37000,
+                                                     "p95_ns":  43200,
+                                                     "p99_ns":  54800,
+                                                     "rows_per_second":  422275
+                                                 },
+                      "read_only_p50_speedup":  1.03,
+                      "read_only_single_read":  {
+                                                    "p50_ns":  235500,
+                                                    "p95_ns":  276100,
+                                                    "p99_ns":  375200,
+                                                    "rows_per_second":  66195
+                                                },
+                      "records":  80,
+                      "reversed_read_only_batch_p50_speedup":  6.45,
+                      "reversed_read_only_batched_read":  {
+                                                              "p50_ns":  36500,
+                                                              "p95_ns":  42400,
+                                                              "p99_ns":  51800,
+                                                              "rows_per_second":  428438
+                                                          },
+                      "segment_count":  80,
+                      "shuffled_read_only_batched_read":  {
+                                                              "p50_ns":  39700,
+                                                              "p95_ns":  48800,
+                                                              "p99_ns":  54500,
+                                                              "rows_per_second":  399012
+                                                          },
+                      "single_read":  {
+                                          "p50_ns":  243400,
+                                          "p95_ns":  279200,
+                                          "p99_ns":  328900,
+                                          "rows_per_second":  64537
+                                      },
+                      "staged_write_batch_p50_speedup":  5.57,
+                      "staged_write_batched_read":  {
+                                                        "p50_ns":  43400,
+                                                        "p95_ns":  48700,
+                                                        "p99_ns":  57800,
+                                                        "rows_per_second":  365823
+                                                    },
+                      "staged_write_single_read":  {
+                                                       "p50_ns":  241800,
+                                                       "p95_ns":  284300,
+                                                       "p99_ns":  334000,
+                                                       "rows_per_second":  64268
+                                                   },
+                      "storage_mode":  "standard",
+                      "value_bytes":  128
+                  }
+              ]
+}

@@ -43,6 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- Standard-mode batched reads reuse precomputed Bloom hashes across delta segments, reducing the 16-key, 80-segment in-process benchmark median p50 by 48% on an AMD Ryzen 5 4500.
+
 - HNSW graph scoring now uses single-precision accumulation for normalized
   vector products; exact vector search keeps double-precision accumulation.
 - HNSW neighbor pruning scores adjacency lists without cloning them, reducing

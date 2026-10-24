@@ -198,6 +198,12 @@ enum Command {
         batch_size: usize,
         #[arg(long, default_value_t = 128)]
         value_bytes: usize,
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Number of delta segments to seed in Standard mode"
+        )]
+        segment_count: usize,
         #[arg(long, help = "Benchmark disk-backed Standard storage mode")]
         standard_mode: bool,
         #[arg(long)]
@@ -356,6 +362,7 @@ async fn main() {
             iterations,
             batch_size,
             value_bytes,
+            segment_count,
             standard_mode,
             json,
         }) => txn_read_batch_bench(
@@ -364,6 +371,7 @@ async fn main() {
             iterations,
             batch_size,
             value_bytes,
+            segment_count,
             standard_mode,
             json,
         ),
@@ -2345,11 +2353,21 @@ fn txn_read_batch_bench(
     iterations: usize,
     batch_size: usize,
     value_bytes: usize,
+    segment_count: usize,
     standard_mode: bool,
     json: bool,
 ) {
-    if records == 0 || candidates == 0 || iterations == 0 || batch_size == 0 {
-        eprintln!("records, candidates, iterations, and batch-size must be positive");
+    if records == 0
+        || candidates == 0
+        || iterations == 0
+        || batch_size == 0
+        || segment_count == 0
+        || segment_count > records
+        || (!standard_mode && segment_count != 1)
+    {
+        eprintln!(
+            "records, candidates, iterations, batch-size, and a valid segment-count are required"
+        );
         return;
     }
 
@@ -2383,16 +2401,20 @@ fn txn_read_batch_bench(
     };
     let value = vec![b'x'; value_bytes];
     let mut keys = Vec::with_capacity(records);
-    let mut seed = manager.begin();
-    for id in 0..records {
-        let pk = (id as u64).to_be_bytes();
-        let key = RecordKey::new("bench", "default", "batch-read", &pk);
-        manager.put(&mut seed, key.clone(), value.clone());
-        keys.push(key);
-    }
-    if let Err(error) = manager.commit(seed) {
-        eprintln!("failed to seed batch-read benchmark: {error}");
-        return;
+    for segment in 0..segment_count {
+        let start = segment * records / segment_count;
+        let end = (segment + 1) * records / segment_count;
+        let mut seed = manager.begin();
+        for id in start..end {
+            let pk = (id as u64).to_be_bytes();
+            let key = RecordKey::new("bench", "default", "batch-read", &pk);
+            manager.put(&mut seed, key.clone(), value.clone());
+            keys.push(key);
+        }
+        if let Err(error) = manager.commit(seed) {
+            eprintln!("failed to seed batch-read benchmark segment: {error}");
+            return;
+        }
     }
     let keys = (0..candidates).map(|index| keys[index % records].clone()).collect::<Vec<_>>();
     let reversed_keys = keys.iter().rev().cloned().collect::<Vec<_>>();
@@ -2496,6 +2518,7 @@ fn txn_read_batch_bench(
         "records": records,
         "candidates_per_iteration": candidates,
         "distinct_keys_per_iteration": candidates.min(records),
+        "segment_count": if standard_mode { segment_count } else { 0 },
         "iterations": iterations,
         "batch_size": batch_size,
         "value_bytes": value_bytes,

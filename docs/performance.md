@@ -632,3 +632,13 @@ results are in
 There is no defensible blanket “10000x faster than PostgreSQL” or “100x faster
 than Valkey” claim. The goal is workload-specific, reproducible improvement
 while retaining transactions, durability, realtime, and compatibility.
+
+For 16-key read-only batches across 80 Standard-mode delta segments, three
+sequential release captures on an AMD Ryzen 5 4500 measured p50 at 36.9–37.2 µs
+after reusing each key's Bloom hashes across segment checks, down from 71.3 µs
+in all three baseline captures (48% lower by median capture p50). After p95 was
+37.6–43.2 µs, compared with 75.2–89.6 µs before. The benchmark seeds 80 records
+as 80 delta segments, uses 128-byte values, 100 iterations, and disables WAL and
+segment sync; it measures the in-process transaction path with a warmed cache,
+not network latency or durable write performance. Exact segment engine lookups
+still confirm Bloom positives. See the [raw captures](../bench/results/txn-read-batch-segment-bloom-windows-20261024.json).

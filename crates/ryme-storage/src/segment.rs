@@ -354,6 +354,18 @@ impl ImmutableSegment {
         self.engine.version_at(key, read_ts)
     }
 
+    fn version_at_prehashed(
+        &self,
+        key: &RecordKey,
+        read_ts: u64,
+        hashes: (u64, u64),
+    ) -> Option<(u64, Option<Vec<u8>>, u64)> {
+        if !bloom_might_contain_prehashed(&self.bloom, hashes) {
+            return None;
+        }
+        self.engine.version_at(key, read_ts)
+    }
+
     pub fn scan(
         &self,
         tenant: &str,
@@ -773,6 +785,16 @@ impl SegmentStore {
             .read()
             .map_err(|_| RymeError::Internal(String::from("segment read lock")))?;
         let paths = self.newest_paths()?;
+        let key_hashes = if paths.len() > 1 && key_count >= MIN_SEGMENT_DEDUP_BATCH_READ {
+            let mut hashes = Vec::new();
+            hashes
+                .try_reserve_exact(key_count)
+                .map_err(|_| RymeError::Overload(String::from("segment batch")))?;
+            hashes.extend((0..key_count).map(|index| bloom_hash_values(key_at(index))));
+            Some(hashes)
+        } else {
+            None
+        };
         let mut values = vec![None; key_count];
         let (mut unresolved, duplicate_indices) =
             deduplicated.unwrap_or_else(|| ((0..key_count).collect(), Vec::new()));
@@ -783,7 +805,12 @@ impl SegmentStore {
             let is_snapshot = segment.is_snapshot();
             next_unresolved.clear();
             for index in unresolved.drain(..) {
-                if let Some((_, value, expires_at)) = segment.version_at(key_at(index), read_ts) {
+                let key = key_at(index);
+                let version = match key_hashes.as_ref() {
+                    Some(hashes) => segment.version_at_prehashed(key, read_ts, hashes[index]),
+                    None => segment.version_at(key, read_ts),
+                };
+                if let Some((_, value, expires_at)) = version {
                     values[index] =
                         if super::expiry_is_expired(expires_at, now) { None } else { value };
                 } else if !is_snapshot {
@@ -1586,20 +1613,32 @@ fn bloom_might_contain(bloom: &[u8], key: &RecordKey) -> bool {
     if bloom.is_empty() {
         return false;
     }
-    let (first, second) = bloom_hashes(key, bloom.len() * 8);
+    bloom_might_contain_prehashed(bloom, bloom_hash_values(key))
+}
+
+fn bloom_might_contain_prehashed(bloom: &[u8], hashes: (u64, u64)) -> bool {
+    if bloom.is_empty() {
+        return false;
+    }
+    let (first, second) = bloom_positions(hashes, bloom.len() * 8);
     [first, second].into_iter().all(|bit| bloom[bit / 8] & (1 << (bit % 8)) != 0)
 }
 
 fn set_bloom_bits(bloom: &mut [u8], key: &RecordKey) {
-    let (first, second) = bloom_hashes(key, bloom.len() * 8);
+    let (first, second) = bloom_positions(bloom_hash_values(key), bloom.len() * 8);
     for bit in [first, second] {
         bloom[bit / 8] |= 1 << (bit % 8);
     }
 }
 
-fn bloom_hashes(key: &RecordKey, bits: usize) -> (usize, usize) {
-    let first = (stable_hash(key, 0) as usize) % bits;
-    let second = (stable_hash(key, 0x9e37_79b9_7f4a_7c15) as usize) % bits;
+fn bloom_hash_values(key: &RecordKey) -> (u64, u64) {
+    (stable_hash(key, 0), stable_hash(key, 0x9e37_79b9_7f4a_7c15))
+}
+
+fn bloom_positions(hashes: (u64, u64), bits: usize) -> (usize, usize) {
+    let (first, second) = hashes;
+    let first = (first as usize) % bits;
+    let second = (second as usize) % bits;
     (first, second)
 }
 
