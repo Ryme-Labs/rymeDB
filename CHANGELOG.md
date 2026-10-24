@@ -46,6 +46,8 @@ All notable changes to rymeDB are recorded here. Format follows
 - RESP `XRANGE` and `XREVRANGE` now match Redis for `COUNT 0` on existing and
   missing streams.
 - RESP `XREAD` and `XREADGROUP` now treat `COUNT 0` as unlimited, matching Redis.
+- Blocking RESP `XREAD` now pins `$` stream IDs before waiting, so new entries
+  wake the read without replaying older entries.
 - RESP `PING` now echoes its optional message and rejects additional arguments.
 - RESP `PING` in Pub/Sub mode now returns the subscription-compatible `pong`
   array reply.

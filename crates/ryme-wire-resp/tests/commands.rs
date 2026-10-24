@@ -760,6 +760,31 @@ async fn stream_reads_treat_zero_count_as_unlimited() {
 }
 
 #[tokio::test]
+async fn blocking_xread_pins_dollar_to_initial_stream_position() {
+    let addr = serve().await;
+    assert_eq!(
+        command(addr, &["XADD", "blocking-dollar", "1-1", "f", "old"]).await,
+        "$3\r\n1-1"
+    );
+
+    let reader = tokio::spawn(async move {
+        command(addr, &["XREAD", "BLOCK", "1000", "STREAMS", "blocking-dollar", "$"]).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_eq!(
+        command(addr, &["XADD", "blocking-dollar", "2-2", "f", "new"]).await,
+        "$3\r\n2-2"
+    );
+
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+        .await
+        .expect("blocking XREAD should wake after XADD")
+        .expect("reader task should complete");
+    assert!(reply.contains("$3\r\n2-2"), "reply: {reply}");
+    assert!(!reply.contains("$3\r\n1-1"), "reply included the old entry: {reply}");
+}
+
+#[tokio::test]
 async fn xinfo_ops() {
     let addr = serve().await;
     assert_eq!(command(addr, &["DEL", "xi"]).await, ":0");

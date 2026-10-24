@@ -4152,6 +4152,33 @@ where
         false
     }
 
+    fn xread_pin_dollar(
+        &self,
+        txn: &mut Transaction,
+        args: &mut [Vec<u8>],
+        keys_at: usize,
+    ) -> std::result::Result<(), String> {
+        let rest = args.get(keys_at..).ok_or_else(|| String::from("syntax"))?;
+        if rest.is_empty() || !rest.len().is_multiple_of(2) {
+            return Err(String::from("syntax"));
+        }
+        let half = rest.len() / 2;
+        let mut replacements = Vec::new();
+        for pair in 0..half {
+            if rest[half + pair].as_slice() == b"$" {
+                let last_id = self
+                    .read_stream(txn, &rest[pair])?
+                    .and_then(|stream| stream.entries.last().map(|(id, _)| id.clone()))
+                    .unwrap_or_else(|| String::from("0-0"));
+                replacements.push((keys_at + half + pair, last_id.into_bytes()));
+            }
+        }
+        for (index, id) in replacements {
+            args[index] = id;
+        }
+        Ok(())
+    }
+
     async fn xread_blocking(&self, args: Vec<Vec<u8>>) -> Vec<u8> {
         let (count, block, keys_at) = match Self::xread_options(&args) {
             Ok(parsed) => parsed,
@@ -4165,6 +4192,12 @@ where
             Err(error) => return encode_error(error),
         };
         let mut waiter = ryme_txn::subscribe_commits();
+        let mut args = args;
+        let mut pin_txn = self.manager.begin();
+        if let Err(error) = self.xread_pin_dollar(&mut pin_txn, &mut args, keys_at) {
+            return encode_error(error);
+        }
+        drop(pin_txn);
         loop {
             let mut txn = self.manager.begin();
             let rest = args.get(keys_at..).unwrap_or(&[]);
