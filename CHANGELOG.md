@@ -38,6 +38,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - RESP blocking-command timeouts now reject out-of-range seconds without
   panicking while converting the client-supplied duration.
+- RESP `XREAD BLOCK` and `XREADGROUP BLOCK` deadlines now use checked `Instant`
+  arithmetic and return an error when a timeout exceeds the platform range.
 - RESP hash, list, set, and sorted-set mutations now remove keys when their
   collection becomes empty; no-op removals leave missing keys untouched.
 - RESP sorted sets now preserve `+inf` and `-inf` scores across reads and writes

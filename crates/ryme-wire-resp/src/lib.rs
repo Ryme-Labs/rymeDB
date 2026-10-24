@@ -82,6 +82,18 @@ fn next_resp_value_len(current: usize, append: usize) -> std::result::Result<usi
         .ok_or_else(|| String::from("value exceeds the 4 MiB limit"))
 }
 
+fn blocking_deadline_millis(
+    timeout_ms: u64,
+) -> std::result::Result<Option<std::time::Instant>, String> {
+    if timeout_ms == 0 {
+        return Ok(None);
+    }
+    std::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(timeout_ms))
+        .map(Some)
+        .ok_or_else(|| String::from("timeout is out of range"))
+}
+
 fn next_scan_result_key_bytes(
     item_count: usize,
     current_bytes: usize,
@@ -4113,10 +4125,9 @@ where
         let Some(block_ms) = block else {
             return encode_error(String::from("syntax"));
         };
-        let deadline = if block_ms == 0 {
-            None
-        } else {
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(block_ms))
+        let deadline = match blocking_deadline_millis(block_ms) {
+            Ok(deadline) => deadline,
+            Err(error) => return encode_error(error),
         };
         let mut waiter = ryme_txn::subscribe_commits();
         loop {
@@ -4870,10 +4881,9 @@ where
         let Some(block_ms) = block else {
             return encode_error(String::from("syntax"));
         };
-        let deadline = if block_ms == 0 {
-            None
-        } else {
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(block_ms))
+        let deadline = match blocking_deadline_millis(block_ms) {
+            Ok(deadline) => deadline,
+            Err(error) => return encode_error(error),
         };
         let mut waiter = ryme_txn::subscribe_commits();
         loop {
@@ -7014,6 +7024,13 @@ mod tests {
         assert!(RespGateway::<TxnManager>::blocking_timeout(&[b"0.5".to_vec()])
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn millisecond_block_deadlines_handle_maximum_timeout_without_panicking() {
+        assert!(std::panic::catch_unwind(|| blocking_deadline_millis(u64::MAX)).is_ok());
+        assert!(blocking_deadline_millis(0).unwrap().is_none());
+        assert!(blocking_deadline_millis(1).unwrap().is_some());
     }
 
     #[test]
