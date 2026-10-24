@@ -136,6 +136,17 @@ fn valid_new_backup_id(backup_id: &str) -> bool {
         && backup_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+/// Validates an ID before starting work to create a new archive.
+///
+/// New IDs are limited to portable ASCII letters, digits, underscores, and
+/// hyphens. Existing manifests are validated separately to preserve legacy IDs.
+pub fn validate_new_backup_id(backup_id: &str) -> Result<()> {
+    if !valid_new_backup_id(backup_id) {
+        return Err(RymeError::InvalidArgument(String::from("backup_id")));
+    }
+    Ok(())
+}
+
 fn valid_sha256(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -289,9 +300,7 @@ impl<S: ObjectStore> Archiver<S> {
         I: IntoIterator<Item = Result<(String, Vec<u8>)>>,
         F: Fn(&[u8]) -> Result<(Vec<u8>, Option<FileEncryption>)> + Send + Sync,
     {
-        if !valid_new_backup_id(backup_id) {
-            return Err(RymeError::InvalidArgument(String::from("backup_id")));
-        }
+        validate_new_backup_id(backup_id)?;
         let files = files.into_iter();
         let (file_count_lower_bound, _) = files.size_hint();
         if file_count_lower_bound > MAX_ARCHIVE_FILES {
@@ -536,11 +545,11 @@ mod tests {
 
     #[test]
     fn new_backup_ids_are_portable_and_legacy_ids_remain_valid() {
-        assert!(!valid_new_backup_id(r"legacy\id"));
-        assert!(!valid_new_backup_id("legacy:id"));
-        assert!(!valid_new_backup_id("trailing."));
-        assert!(!valid_new_backup_id("unicode-λ"));
-        assert!(valid_new_backup_id("backup_2026-10"));
+        assert!(validate_new_backup_id(r"legacy\id").is_err());
+        assert!(validate_new_backup_id("legacy:id").is_err());
+        assert!(validate_new_backup_id("trailing.").is_err());
+        assert!(validate_new_backup_id("unicode-λ").is_err());
+        assert!(validate_new_backup_id("backup_2026-10").is_ok());
         assert!(valid_backup_id(r"legacy\id"));
 
         let manifest = BackupManifest {

@@ -2934,6 +2934,9 @@ impl SharedState {
             .archive
             .clone()
             .ok_or_else(|| ryme_error::RymeError::InvalidArgument(String::from("archive")))?;
+        if let Some(backup_id) = backup_id.as_deref() {
+            ryme_archive::validate_new_backup_id(backup_id)?;
+        }
         let snapshots = snapshot_backend_files(self).await?;
         let mut sources = Vec::new();
         let mut commit = 0u64;
