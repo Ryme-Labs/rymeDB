@@ -928,11 +928,13 @@ async fn xautoclaim_removes_deleted_entries_from_pending_list() {
 
     let claimed = command(
         addr,
-        &["XAUTOCLAIM", "claim-orphan", "workers", "second", "0", "0-0", "COUNT", "10"],
+        &["XAUTOCLAIM", "claim-orphan", "workers", "second", "99999999", "0-0", "COUNT", "10"],
     )
     .await;
     assert!(claimed.contains("*1\r\n$3\r\n1-1"), "deleted IDs: {claimed}");
     assert!(command(addr, &["XPENDING", "claim-orphan", "workers"]).await.contains("*4\r\n:0"));
+    let stream_info = command(addr, &["XINFO", "STREAM", "claim-orphan", "FULL"]).await;
+    assert!(stream_info.contains("$11\r\nactive-time\r\n:-1"), "orphan cleanup is not a delivery: {stream_info}");
 
     let claimed_again = command(
         addr,

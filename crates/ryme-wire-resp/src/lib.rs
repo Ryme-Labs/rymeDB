@@ -5221,19 +5221,21 @@ where
                 break;
             }
             attempts_remaining -= 1;
-            let idle = now.saturating_sub(group.pending[slot].3);
-            if idle < min_idle {
-                continue;
-            }
-            group.pending[slot].1.clone_from(&consumer);
-            if !just_id {
-                group.pending[slot].2 = group.pending[slot].2.saturating_add(1);
-            }
-            group.pending[slot].3 = now;
-            group.consumers.entry(consumer.clone()).or_default().delivered_ms = Some(now);
             let claimed_id = group.pending[slot].0.clone();
             match data.entries.iter().find(|(eid, _)| eid == &claimed_id) {
-                Some(entry) => claimed.push(entry),
+                Some(entry) => {
+                    let idle = now.saturating_sub(group.pending[slot].3);
+                    if idle < min_idle {
+                        continue;
+                    }
+                    group.pending[slot].1.clone_from(&consumer);
+                    if !just_id {
+                        group.pending[slot].2 = group.pending[slot].2.saturating_add(1);
+                    }
+                    group.pending[slot].3 = now;
+                    group.consumers.entry(consumer.clone()).or_default().delivered_ms = Some(now);
+                    claimed.push(entry);
+                }
                 None => {
                     orphans.push(format!("${}\r\n{claimed_id}\r\n", claimed_id.len()).into_bytes());
                     orphan_ids.insert(claimed_id);
