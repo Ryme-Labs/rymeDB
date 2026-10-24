@@ -1894,6 +1894,25 @@ mod tests {
     }
 
     #[test]
+    fn text_search_shared_two_term_postings_preserves_scores_and_ties() {
+        let mut index = PartitionedIndex::new(3);
+        for (id, text) in
+            [("a", "needle needle common"), ("b", "needle common common"), ("c", "needle common")]
+        {
+            index.text_index("docs", id.to_string(), text).unwrap();
+        }
+
+        let hits = index.text_search("docs", "needle common", 3).unwrap();
+        let idf = (1.0f64 + 3.0 / 3.5).ln();
+        let high_score = idf * (2.0 / 3.2 + 1.0 / 2.2);
+        let low_score = idf * (2.0 / 2.2);
+        assert_eq!(hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert!((hits[0].score - high_score).abs() < 1e-12);
+        assert!((hits[1].score - high_score).abs() < 1e-12);
+        assert!((hits[2].score - low_score).abs() < 1e-12);
+    }
+
+    #[test]
     fn text_top_k_ties_are_stable_and_bounded() {
         let mut registry = IndexRegistry::new();
         for id in ["z", "a", "m", "b"] {
