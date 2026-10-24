@@ -956,7 +956,7 @@ async fn xautoclaim_justid_returns_only_claimed_ids() {
 
     let claimed = command(
         addr,
-        &["XAUTOCLAIM", "claim-justid", "workers", "second", "0", "0-0", "JUSTID"],
+        &["XAUTOCLAIM", "claim-justid", "workers", "second", "-1", "0-0", "JUSTID"],
     )
     .await;
     assert_eq!(claimed, "*3\r\n$3\r\n0-0\r\n*1\r\n$3\r\n1-1\r\n*0");

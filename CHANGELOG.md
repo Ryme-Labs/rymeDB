@@ -48,6 +48,8 @@ All notable changes to rymeDB are recorded here. Format follows
   delivery counters.
 - RESP `XAUTOCLAIM` now treats its start cursor as inclusive and bounds pending
   entry scans when entries have not reached the idle threshold.
+- RESP `XAUTOCLAIM` now treats negative minimum idle times as zero, matching
+  Redis.
 - RESP `CLIENT HELP` now rejects unexpected arguments.
 - RESP `PFMERGE` now requires at least one source key and leaves the destination
   unchanged when the command has invalid arity.

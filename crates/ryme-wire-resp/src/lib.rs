@@ -5143,7 +5143,10 @@ where
             return Err(String::from("wrong args"));
         }
         let idle_text = std::str::from_utf8(&args[3]).map_err(|_| String::from("syntax"))?;
-        let min_idle = idle_text.parse::<u64>().map_err(|_| String::from("syntax"))?;
+        let min_idle = idle_text
+            .parse::<i64>()
+            .map_err(|_| String::from("syntax"))?
+            .max(0) as u64;
         let start_text = std::str::from_utf8(&args[4]).map_err(|_| String::from("syntax"))?;
         let start = Self::parse_stream_id(start_text)?;
         let mut count = 100usize;
