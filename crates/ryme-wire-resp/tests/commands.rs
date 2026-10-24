@@ -854,6 +854,65 @@ async fn blocking_xreadgroup_persists_consumer_before_timeout() {
 }
 
 #[tokio::test]
+async fn stream_last_generated_id_survives_entry_deletion() {
+    let addr = serve().await;
+    assert_eq!(
+        command(addr, &["XADD", "deleted-stream", "9-1", "f", "old"]).await,
+        "$3\r\n9-1"
+    );
+    assert_eq!(command(addr, &["XDEL", "deleted-stream", "9-1"]).await, ":1");
+
+    let info = command(addr, &["XINFO", "STREAM", "deleted-stream"]).await;
+    assert!(
+        info.contains("$17\r\nlast-generated-id\r\n$3\r\n9-1"),
+        "stream info: {info}"
+    );
+    assert!(command(addr, &["XADD", "deleted-stream", "9-1", "f", "duplicate"])
+        .await
+        .starts_with("-ERR"));
+
+    assert_eq!(
+        command(addr, &["XGROUP", "CREATE", "deleted-stream", "workers", "$"]).await,
+        "+OK"
+    );
+    let groups = command(addr, &["XINFO", "GROUPS", "deleted-stream"]).await;
+    assert!(
+        groups.contains("$17\r\nlast-delivered-id\r\n$3\r\n9-1"),
+        "group info: {groups}"
+    );
+    assert_eq!(
+        command(addr, &["XGROUP", "CREATE", "deleted-stream", "reset-workers", "0-0"]).await,
+        "+OK"
+    );
+    assert_eq!(
+        command(addr, &["XGROUP", "SETID", "deleted-stream", "reset-workers", "$"]).await,
+        "+OK"
+    );
+    let groups = command(addr, &["XINFO", "GROUPS", "deleted-stream"]).await;
+    assert_eq!(groups.matches("$17\r\nlast-delivered-id\r\n$3\r\n9-1").count(), 2);
+    assert_eq!(
+        command(addr, &["XADD", "deleted-stream", "9-2", "f", "new"]).await,
+        "$3\r\n9-2"
+    );
+    let delivered = command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "consumer", "STREAMS", "deleted-stream", ">"],
+    )
+    .await;
+    assert!(delivered.contains("$3\r\n9-2"), "delivery: {delivered}");
+
+    assert_eq!(
+        command(addr, &["XGROUP", "CREATE", "empty-stream", "empty-group", "$", "MKSTREAM"]).await,
+        "+OK"
+    );
+    let empty_group = command(addr, &["XINFO", "GROUPS", "empty-stream"]).await;
+    assert!(
+        empty_group.contains("$17\r\nlast-delivered-id\r\n$3\r\n0-0"),
+        "empty group: {empty_group}"
+    );
+}
+
+#[tokio::test]
 async fn blocking_xread_pins_dollar_to_initial_stream_position() {
     let addr = serve().await;
     assert_eq!(

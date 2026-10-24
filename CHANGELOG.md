@@ -56,6 +56,8 @@ All notable changes to rymeDB are recorded here. Format follows
   requesting consumer and leave the new-entry read counter unchanged.
 - Blocking RESP `XREADGROUP` now persists its consumer registration before
   waiting, including reads that time out without delivering entries.
+- RESP stream ID generation, `XGROUP ... $`, and `XINFO STREAM` now preserve
+  the last-generated ID after entries are deleted or trimmed.
 - RESP `XREAD` supports Redis's `+` cursor for returning only each stream's
   latest entry, independently of `COUNT`.
 - RESP `PING` now echoes its optional message and rejects additional arguments.

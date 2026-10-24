@@ -3771,16 +3771,27 @@ where
         command.args.iter().try_fold(command_and_args, |total, arg| total.checked_add(arg.len()))
     }
 
-    fn stream_last(entries: &[(String, Vec<(String, String)>)]) -> (u64, u64) {
-        entries.last().and_then(|(id, _)| Self::parse_stream_id(id).ok()).unwrap_or((0, 0))
+    fn stream_last(data: &StreamData) -> (u64, u64) {
+        let entry_last = data
+            .entries
+            .last()
+            .and_then(|(id, _)| Self::parse_stream_id(id).ok())
+            .unwrap_or((0, 0));
+        let deleted_last = Self::parse_stream_id(&data.max_deleted).unwrap_or((0, 0));
+        entry_last.max(deleted_last)
+    }
+
+    fn stream_last_id(data: &StreamData) -> String {
+        let (milliseconds, sequence) = Self::stream_last(data);
+        format!("{milliseconds}-{sequence}")
     }
 
     fn assign_stream_id(
-        entries: &[(String, Vec<(String, String)>)],
+        data: &StreamData,
         raw: &[u8],
     ) -> std::result::Result<String, String> {
         let text = std::str::from_utf8(raw).map_err(|_| String::from("syntax"))?;
-        let last = Self::stream_last(entries);
+        let last = Self::stream_last(data);
         if text == "*" {
             let now = Self::stream_now_ms();
             let next = if now > last.0 {
@@ -3898,7 +3909,7 @@ where
             return Err(String::from("wrong args"));
         }
         let mut data = self.read_stream(txn, &args[0])?.unwrap_or_default();
-        let id = Self::assign_stream_id(&data.entries, id_raw)?;
+        let id = Self::assign_stream_id(&data, id_raw)?;
         let mut record = Vec::with_capacity(fields.len() / 2);
         for pair in fields.as_chunks::<2>().0 {
             let field =
@@ -4175,7 +4186,7 @@ where
             if rest[half + pair].as_slice() == b"$" {
                 let last_id = self
                     .read_stream(txn, &rest[pair])?
-                    .and_then(|stream| stream.entries.last().map(|(id, _)| id.clone()))
+                    .map(|stream| Self::stream_last_id(&stream))
                     .unwrap_or_else(|| String::from("0-0"));
                 replacements.push((keys_at + half + pair, last_id.into_bytes()));
             }
@@ -4768,10 +4779,7 @@ where
                 }
                 let id_text = std::str::from_utf8(&args[3]).map_err(|_| String::from("syntax"))?;
                 let last = if id_text == "$" {
-                    data.entries
-                        .last()
-                        .map(|(id, _)| id.clone())
-                        .ok_or_else(|| String::from("invalid ID"))?
+                    Self::stream_last_id(&data)
                 } else {
                     let id = Self::parse_stream_id(id_text)?;
                     if id == (0, 0) {
@@ -4810,16 +4818,19 @@ where
                 }
                 let mut data = self.read_stream(txn, &args[1])?.unwrap_or_default();
                 let group_name = String::from_utf8_lossy(&args[2]).into_owned();
-                let Some(group) = data.groups.get_mut(&group_name) else {
+                if !data.groups.contains_key(&group_name) {
                     return Err(Self::nogroup(&args[1], &args[2]));
-                };
+                }
                 let id_text = std::str::from_utf8(&args[3]).map_err(|_| String::from("syntax"))?;
-                group.last = if id_text == "$" {
-                    data.entries.last().map(|(id, _)| id.clone()).unwrap_or(String::from("0-0"))
+                let last = if id_text == "$" {
+                    Self::stream_last_id(&data)
                 } else {
                     Self::parse_stream_id(id_text)?;
                     id_text.to_string()
                 };
+                if let Some(group) = data.groups.get_mut(&group_name) {
+                    group.last = last;
+                }
                 self.write_stream(txn, &args[1], &data)?;
                 Ok(encode_simple("OK"))
             }
@@ -5526,7 +5537,7 @@ where
             return Err(String::from("syntax"));
         }
         let data = self.read_stream(txn, &args[1])?.ok_or_else(|| String::from("no such key"))?;
-        let last_id = data.entries.last().map(|(id, _)| id.clone()).unwrap_or(String::from("0-0"));
+        let last_id = Self::stream_last_id(&data);
         let first_id =
             data.entries.first().map(|(id, _)| id.clone()).unwrap_or(String::from("0-0"));
         let mut names: Vec<&String> = data.groups.keys().collect();
