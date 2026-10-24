@@ -5180,6 +5180,7 @@ where
             return Err(Self::nogroup(&args[0], &args[1]));
         };
         let now = Self::stream_now_ms();
+        group.consumers.entry(consumer.clone()).or_default().seen_ms = Some(now);
         let mut order: Vec<usize> = (0..group.pending.len()).collect();
         order.sort_by_key(|slot| Self::parse_stream_id(&group.pending[*slot].0).unwrap_or((0, 0)));
         let mut claimed: Vec<&(String, StreamFields)> = Vec::new();

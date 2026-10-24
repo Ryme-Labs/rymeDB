@@ -1023,6 +1023,9 @@ async fn xautoclaim_bounds_scans_of_entries_below_idle_threshold() {
     )
     .await;
     assert!(scanned.starts_with("*3\r\n$4\r\n11-0\r\n*0\r\n*0"), "bounded scan: {scanned}");
+    let consumers = command(addr, &["XINFO", "CONSUMERS", "claim-idle", "workers"]).await;
+    assert!(consumers.contains("second"), "consumer should be registered: {consumers}");
+    assert!(consumers.contains("pending\r\n:0"), "consumer has no pending entries: {consumers}");
 }
 
 #[tokio::test]
