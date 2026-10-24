@@ -75,6 +75,13 @@ fn check_collection_bytes(bytes: &[u8]) -> std::result::Result<(), String> {
     }
 }
 
+fn next_resp_value_len(current: usize, append: usize) -> std::result::Result<usize, String> {
+    current
+        .checked_add(append)
+        .filter(|length| *length <= ryme_gateway::MAX_VALUE_BYTES)
+        .ok_or_else(|| String::from("value exceeds the 4 MiB limit"))
+}
+
 fn next_scan_result_key_bytes(
     item_count: usize,
     current_bytes: usize,
@@ -2406,7 +2413,7 @@ where
                 None => encode_error(String::from("wrong args")),
             },
             "APPEND" => {
-                if command.args.len() < 2 {
+                if command.args.len() != 2 {
                     return encode_error(String::from("wrong args"));
                 }
                 let record =
@@ -2415,8 +2422,11 @@ where
                     Ok(value) => value.unwrap_or_default(),
                     Err(error) => return encode_error(error.to_string()),
                 };
+                let length = match next_resp_value_len(current.len(), command.args[1].len()) {
+                    Ok(length) => length,
+                    Err(error) => return encode_error(error),
+                };
                 current.extend_from_slice(&command.args[1]);
-                let length = current.len();
                 self.manager.put(txn, record, current);
                 encode_integer(length as i64)
             }
@@ -6912,6 +6922,16 @@ mod tests {
     fn collection_payloads_are_bounded() {
         assert!(check_collection_bytes(&vec![0; RESP_MAX_COLLECTION_BYTES]).is_ok());
         assert!(check_collection_bytes(&vec![0; RESP_MAX_COLLECTION_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn append_value_length_is_bounded_before_allocation() {
+        assert_eq!(
+            next_resp_value_len(ryme_gateway::MAX_VALUE_BYTES - 1, 1).unwrap(),
+            ryme_gateway::MAX_VALUE_BYTES
+        );
+        assert!(next_resp_value_len(ryme_gateway::MAX_VALUE_BYTES, 1).is_err());
+        assert!(next_resp_value_len(usize::MAX, 1).is_err());
     }
 
     #[test]
