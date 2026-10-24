@@ -360,6 +360,18 @@ async fn float_counter_formats_cleanly() {
 }
 
 #[tokio::test]
+async fn float_counter_rejects_non_finite_results_without_changing_value() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["SET", "f", "1e308"]).await, "+OK");
+    assert!(command(addr, &["INCRBYFLOAT", "f", "1e308"]).await.starts_with("-ERR"));
+    assert_eq!(command(addr, &["GET", "f"]).await, "$5\r\n1e308");
+
+    assert_eq!(command(addr, &["SET", "f", "inf"]).await, "+OK");
+    assert!(command(addr, &["INCRBYFLOAT", "f", "1"]).await.starts_with("-ERR"));
+    assert_eq!(command(addr, &["GET", "f"]).await, "$3\r\ninf");
+}
+
+#[tokio::test]
 async fn multi_key_ops() {
     let addr = serve().await;
     assert_eq!(command(addr, &["MSET", "a", "1", "b", "2"]).await, "+OK");

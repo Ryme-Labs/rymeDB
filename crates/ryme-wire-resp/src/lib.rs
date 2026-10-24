@@ -3084,12 +3084,19 @@ where
         let base: f64 = if current.is_empty() {
             0.0
         } else {
-            match std::str::from_utf8(&current).ok().and_then(|s| s.parse().ok()) {
-                Some(base) => base,
+            match std::str::from_utf8(&current)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                Some(base) if base.is_finite() => base,
                 None => return encode_error(String::from("value is not a valid float")),
+                Some(_) => return encode_error(String::from("value is not a valid float")),
             }
         };
         let next = base + delta;
+        if !next.is_finite() {
+            return encode_error(String::from("increment would produce a non-finite value"));
+        }
         self.manager.put(txn, record, format_float(next).into_bytes());
         encode_bulk(format_float(next).as_bytes())
     }
