@@ -333,6 +333,9 @@ fn load_range_state(
             }
             let ranges = normalize_range_topology(state.ranges, shard_count)
                 .map_err(|_| RymeError::Corrupt(String::from("range placements")))?;
+            if ranges.iter().any(|range| state.assignments.get(&range.id) != Some(&range.shard)) {
+                return Err(RymeError::Corrupt(String::from("range placement owner mismatch")));
+            }
             (state.assignments, ranges)
         }
         RangePlacementFile::Legacy(assignments) => (assignments, Vec::new()),
@@ -1746,6 +1749,39 @@ mod tests {
             }
         }
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn range_state_rejects_conflicting_owners_and_reads_legacy_assignments() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-shard-range-state-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("range-placements.json");
+        let range = RangePlacement {
+            id: String::from("all"),
+            start: Vec::new(),
+            end: Vec::new(),
+            routing_version: 0,
+            shard: 0,
+        };
+
+        persist_range_state(&path, &HashMap::from([(String::from("all"), 0)]), &[range.clone()])
+            .unwrap();
+        let (assignments, ranges) = load_range_state(&path, 2).unwrap();
+        assert_eq!(assignments.get("all"), Some(&0));
+        assert_eq!(ranges, vec![range.clone()]);
+
+        persist_range_state(&path, &HashMap::from([(String::from("all"), 1)]), &[range]).unwrap();
+        assert!(matches!(load_range_state(&path, 2), Err(RymeError::Corrupt(_))));
+
+        std::fs::write(&path, br#"{"legacy-range":1}"#).unwrap();
+        let (assignments, ranges) = load_range_state(&path, 2).unwrap();
+        assert_eq!(assignments.get("legacy-range"), Some(&1));
+        assert!(ranges.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
