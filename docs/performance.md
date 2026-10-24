@@ -468,7 +468,8 @@ Exact vector search now uses four independent `f64` accumulators for its dot
 product as well. Across three alternating release pairs, exact-search median
 p50 fell 50.3% for 5,000 64D vectors and 49.6% for 3,000 384D vectors; median
 p95/p99 also fell in both workloads. The f64 score error stayed below 1e-12
-for 64D, 384D, and 4096D inputs, and the ANN recall controls were unchanged.
+at dimensions 63–65, 383–385, and 4095–4096, including scalar-tail cases, and
+the ANN recall controls were unchanged.
 All 38 index-crate tests passed. These are local in-memory results; see the
 [paired captures](../bench/results/vector-exact-dot-unrolled-windows-20261024.json).
 

@@ -1561,7 +1561,7 @@ mod tests {
             ((state >> 32) as i32) as f32 / i32::MAX as f32
         };
 
-        for dimension in [64, 384, MAX_DIM] {
+        for dimension in [63, 64, 65, 383, 384, 385, MAX_DIM - 1, MAX_DIM] {
             let left =
                 normalize(&(0..dimension).map(|_| next_value()).collect::<Vec<_>>()).unwrap();
             let right =
