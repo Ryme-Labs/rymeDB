@@ -5909,7 +5909,7 @@ fn parse_getex_option(args: &[Vec<u8>]) -> std::result::Result<GetExOption, Stri
         .map_err(|_| String::from("value is not an integer or out of range"))?
         .parse::<i64>()
         .map_err(|_| String::from("value is not an integer or out of range"))?;
-    if amount < 0 {
+    if amount <= 0 {
         return Err(String::from("invalid expire time in 'getex' command"));
     }
     let now_millis = ryme_txn::now_unix_millis();
@@ -5972,8 +5972,12 @@ fn parse_set_options(args: &[Vec<u8>]) -> std::result::Result<SetOptions, String
                 if amount < 0 {
                     return Err(String::from("invalid expire time in 'set' command"));
                 }
+                let mode = name.to_ascii_uppercase();
+                if amount == 0 && matches!(mode.as_str(), "EXAT" | "PXAT") {
+                    return Err(String::from("invalid expire time in 'set' command"));
+                }
                 let now_millis = ryme_txn::now_unix_millis();
-                options.expires_at = Some(match name.to_ascii_uppercase().as_str() {
+                options.expires_at = Some(match mode.as_str() {
                     "EX" => ryme_storage::expiry_at_millis(
                         now_millis.saturating_add((amount as u64).saturating_mul(1000)),
                     ),
@@ -7107,6 +7111,27 @@ fn slice_list(list: &[String], start: i64, stop: i64) -> Vec<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_absolute_and_getex_reject_zero_expiration_values() {
+        for mode in [b"EX".as_slice(), b"PX"] {
+            assert!(parse_set_options(&[mode.to_vec(), b"0".to_vec()]).is_ok(), "SET {mode:?}");
+            assert!(
+                parse_getex_option(&[mode.to_vec(), b"0".to_vec()]).is_err(),
+                "GETEX {mode:?}"
+            );
+        }
+        for mode in [b"EXAT".as_slice(), b"PXAT"] {
+            assert!(
+                parse_set_options(&[mode.to_vec(), b"0".to_vec()]).is_err(),
+                "SET {mode:?}"
+            );
+            assert!(
+                parse_getex_option(&[mode.to_vec(), b"0".to_vec()]).is_err(),
+                "GETEX {mode:?}"
+            );
+        }
+    }
 
     #[test]
     fn autocommit_get_uses_a_read_only_transaction() {

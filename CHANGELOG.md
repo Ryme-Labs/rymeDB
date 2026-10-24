@@ -44,6 +44,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP `SET` now rejects zero `EXAT` and `PXAT` timestamps, and `GETEX` rejects
+  zero expiration values, matching Redis and avoiding `EXAT 0` becoming no expiry.
 - Snapshot, segment, and WAL rewrites now replace existing files on Windows;
   WAL publication closes the active segment before installing the staged
   generation. This allows repeated snapshots and PITR restore publication.

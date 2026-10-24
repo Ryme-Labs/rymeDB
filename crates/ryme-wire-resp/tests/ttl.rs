@@ -47,6 +47,25 @@ async fn set_ex_immediate_expiry() {
 }
 
 #[tokio::test]
+async fn set_and_getex_reject_zero_absolute_expiry() {
+    let addr = serve().await;
+    assert_eq!(
+        command(addr, &["SET", "exat-zero", "v", "EXAT", "0"]).await,
+        "-ERR invalid expire time in 'set' command"
+    );
+    assert_eq!(
+        command(addr, &["SET", "pxat-zero", "v", "PXAT", "0"]).await,
+        "-ERR invalid expire time in 'set' command"
+    );
+    assert_eq!(command(addr, &["SET", "getex-zero", "v"]).await, "+OK");
+    assert_eq!(
+        command(addr, &["GETEX", "getex-zero", "EXAT", "0"]).await,
+        "-ERR invalid expire time in 'getex' command"
+    );
+    assert_eq!(command(addr, &["TTL", "getex-zero"]).await, ":-1");
+}
+
+#[tokio::test]
 async fn ttl_lifecycle() {
     let addr = serve().await;
     assert_eq!(command(addr, &["SET", "k", "v"]).await, "+OK");
