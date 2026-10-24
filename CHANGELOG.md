@@ -62,8 +62,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - Raft now rejects invalid or duplicate-ID membership configurations at encode,
   replay, and startup instead of silently normalizing conflicting addresses.
-- Fresh Raft startup rejects duplicate, local, or mismatched peer ID/address
-  lists instead of silently truncating or normalizing them.
+- Fresh Raft startup rejects duplicate/local peer IDs, mismatched lists, and
+  blank or malformed peer addresses instead of silently truncating or
+  normalizing them.
 - Raft quorum simulation now ignores duplicate or invalid partition members, and
   rejects replication attempts from unavailable nodes, non-leaders, or leaders
   without a quorum. Reads from invalid node indices now return an argument

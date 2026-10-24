@@ -1314,6 +1314,11 @@ impl Node {
             if peers.len() != peer_ids.len()
                 || peer_ids.len() >= MAX_RAFT_MEMBERS
                 || peer_ids.iter().any(|peer_id| *peer_id == id)
+                || peers.iter().any(|addr| {
+                    addr.trim().is_empty()
+                        || addr.len() > MAX_RAFT_MEMBER_ADDR_BYTES
+                        || addr.contains('\0')
+                })
             {
                 return Err(RymeError::InvalidArgument(String::from("members")));
             }
@@ -7549,6 +7554,8 @@ mod tests {
             ),
             ("mismatched-peer-lists", vec![String::from("127.0.0.1:1")], Vec::new()),
             ("self-in-peer-list", vec![String::from("127.0.0.1:1")], vec![0]),
+            ("empty-peer-address", vec![String::new()], vec![1]),
+            ("nul-peer-address", vec![String::from("127.0.0.1:1\0")], vec![1]),
         ];
         for (label, peers, peer_ids) in cases {
             let dir = temp_dir(label);

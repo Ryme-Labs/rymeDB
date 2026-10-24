@@ -33,9 +33,10 @@ Create one JSON file per node. Use real reachable addresses in production:
 ```
 
 Change the node id, listener addresses, and `node_index` for nodes 1 and 2.
-Each node's `peers` list must contain every other node exactly once and omit
-that node's own ID; mismatched or duplicate peer IDs prevent a fresh cluster
-node from starting.
+Each node's `peers` list must contain every other node exactly once, omit that
+node's own ID, and use a non-empty address for each peer. Mismatched or
+duplicate peer IDs and blank addresses prevent a fresh cluster node from
+starting.
 Start them with `ryme-server --config node-0.json`. Set
 `advertise_addr` whenever a listener binds to a wildcard address. Use TLS/mTLS
 for a network that is not already private; see [configuration](configuration.md).
