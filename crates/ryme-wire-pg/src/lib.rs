@@ -9,9 +9,10 @@ use ryme_observe::{
 use ryme_qos::QosRegistry;
 use ryme_router::RangeLoadHook;
 use ryme_sql::{
-    bind, parse, schema_snapshot_serialized_size, Executor, Field, ForeignKeyAction,
-    IndexDefinition, InsertValue, QueryResult, ReturningField, RoleDefinition, SchemaSnapshot,
-    Statement, TransactionChange, BUILTIN_SQL_ROLES, SQL_NULL_SENTINEL,
+    bind, parameter_count as sql_parameter_count, parse, schema_snapshot_serialized_size, Executor,
+    Field, ForeignKeyAction, IndexDefinition, InsertValue, QueryResult, ReturningField,
+    RoleDefinition, SchemaSnapshot, Statement, TransactionChange, BUILTIN_SQL_ROLES,
+    SQL_NULL_SENTINEL,
 };
 use ryme_txn::{
     Isolation, Transaction, TransactionCheckpoint, TxnBackend, TxnManager,
@@ -2069,76 +2070,7 @@ fn parameter_description(query: &str) -> Vec<u8> {
 }
 
 fn parameter_count(query: &str) -> usize {
-    let chars = query.chars().collect::<Vec<_>>();
-    let mut index = 0;
-    let mut maximum = 0usize;
-    let mut quote = None;
-    let mut line_comment = false;
-    let mut block_comment = false;
-    while index < chars.len() {
-        let current = chars[index];
-        if line_comment {
-            if current == '\n' {
-                line_comment = false;
-            }
-            index += 1;
-            continue;
-        }
-        if block_comment {
-            if current == '*' && chars.get(index + 1) == Some(&'/') {
-                block_comment = false;
-                index += 2;
-            } else {
-                index += 1;
-            }
-            continue;
-        }
-        if let Some(delimiter) = quote {
-            if current == '\\' && delimiter == '\'' {
-                index += 2.min(chars.len().saturating_sub(index));
-                continue;
-            }
-            if current == delimiter {
-                if chars.get(index + 1) == Some(&delimiter) {
-                    index += 2;
-                    continue;
-                }
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
-        if current == '-' && chars.get(index + 1) == Some(&'-') {
-            line_comment = true;
-            index += 2;
-            continue;
-        }
-        if current == '/' && chars.get(index + 1) == Some(&'*') {
-            block_comment = true;
-            index += 2;
-            continue;
-        }
-        if current == '\'' || current == '"' {
-            quote = Some(current);
-            index += 1;
-            continue;
-        }
-        if current == '$' {
-            let mut end = index + 1;
-            while chars.get(end).is_some_and(char::is_ascii_digit) {
-                end += 1;
-            }
-            if end > index + 1 {
-                if let Ok(number) = chars[index + 1..end].iter().collect::<String>().parse() {
-                    maximum = maximum.max(number);
-                }
-                index = end;
-                continue;
-            }
-        }
-        index += 1;
-    }
-    maximum
+    sql_parameter_count(query)
 }
 
 fn describe_query(query: &str) -> Vec<u8> {
@@ -6295,6 +6227,7 @@ mod tests {
     #[test]
     fn parameter_description_ignores_quoted_and_commented_placeholders() {
         assert_eq!(parameter_count("SELECT '$12', \"$13\", $2, $10 -- $20\n/* $30 */"), 10);
+        assert_eq!(parameter_count("SELECT $1, $$ $20 $$, /* outer /* $30 */ $40 */ $2"), 2);
         let description = parameter_description("SELECT $2");
         assert_eq!(description[0], b't');
         assert_eq!(i16::from_be_bytes([description[5], description[6]]), 2);
@@ -6454,6 +6387,7 @@ mod tests {
                 cache: 1,
                 cycle: false,
                 last_value: Some(10),
+                is_called: true,
             },
         );
         executor.restore_schema_snapshot(snapshot).unwrap();

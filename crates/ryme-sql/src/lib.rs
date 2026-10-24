@@ -3180,6 +3180,101 @@ fn dollar_quote_delimiter(chars: &[char], start: usize) -> Option<(Vec<char>, us
     Some((chars[start..end].to_vec(), end))
 }
 
+/// Returns the largest positional parameter referenced outside SQL literals,
+/// comments, and dollar-quoted strings.
+pub fn parameter_count(sql: &str) -> usize {
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut maximum = 0usize;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment_depth = 0usize;
+    let mut dollar_quote: Option<Vec<char>> = None;
+    while index < chars.len() {
+        let current = chars[index];
+        if line_comment {
+            if current == '\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment_depth > 0 {
+            if current == '/' && chars.get(index + 1) == Some(&'*') {
+                block_comment_depth += 1;
+                index += 2;
+            } else if current == '*' && chars.get(index + 1) == Some(&'/') {
+                block_comment_depth -= 1;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = dollar_quote.as_ref() {
+            if chars[index..].starts_with(delimiter.as_slice()) {
+                index += delimiter.len();
+                dollar_quote = None;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if current == '\\' && delimiter == '\'' {
+                index += 2.min(chars.len().saturating_sub(index));
+                continue;
+            }
+            if current == delimiter {
+                if chars.get(index + 1) == Some(&delimiter) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if current == '-' && chars.get(index + 1) == Some(&'-') {
+            line_comment = true;
+            index += 2;
+            continue;
+        }
+        if current == '/' && chars.get(index + 1) == Some(&'*') {
+            block_comment_depth = 1;
+            index += 2;
+            continue;
+        }
+        if current == '$' && dollar_token_boundary(&chars, index) {
+            if let Some((delimiter, end)) = dollar_quote_delimiter(&chars, index) {
+                dollar_quote = Some(delimiter);
+                index = end;
+                continue;
+            }
+        }
+        if current == '\'' || current == '"' {
+            quote = Some(current);
+            index += 1;
+            continue;
+        }
+        if current == '$' && dollar_token_boundary(&chars, index) {
+            let mut end = index + 1;
+            while chars.get(end).is_some_and(char::is_ascii_digit) {
+                end += 1;
+            }
+            if end > index + 1 {
+                if let Ok(number) = chars[index + 1..end].iter().collect::<String>().parse() {
+                    maximum = maximum.max(number);
+                }
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    maximum
+}
+
 fn bind_literal(value: &str) -> String {
     let trimmed = value.trim();
     if value == "\0" {
@@ -22179,6 +22274,16 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT field$tag$part, $body$ $1 /* not a comment */ $body$, 'value', /* outer /* $1 */ still $1 */ 'value'"
+        );
+    }
+
+    #[test]
+    fn parameter_count_uses_the_same_sql_lexical_rules_as_binding() {
+        let query = "SELECT $1, $$ $20 $$, $tag$ $30 $tag$, /* outer /* $40 */ $50 */ $2, field$7";
+        assert_eq!(parameter_count(query), 2);
+        assert_eq!(
+            bind(query, &[String::from("first"), String::from("second")]),
+            "SELECT 'first', $$ $20 $$, $tag$ $30 $tag$, /* outer /* $40 */ $50 */ 'second', field$7"
         );
     }
 

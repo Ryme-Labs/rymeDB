@@ -26,7 +26,8 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
   being rewritten.
 - Text-format `Bind` parameters require valid UTF-8 and reject embedded NULs;
   SQL `NULL` remains represented by PostgreSQL's `-1` parameter length, and
-  the Bind parameter count must match the prepared statement.
+  the Bind parameter count must match the prepared statement. Placeholder
+  counting uses SQL lexical rules for nested comments and dollar-quoted text.
 - Text-format query results preserve SQL `NULL` and reject invalid UTF-8 or
   embedded NUL cell bytes with `22021` rather than rewriting stored values.
 - Startup, TLS negotiation, and authentication must complete within 15 seconds;

@@ -74,7 +74,8 @@ All notable changes to rymeDB are recorded here. Format follows
   NUL bytes instead of silently rewriting client values.
 - PostgreSQL Bind messages now require the parameter count to match the
   prepared statement instead of leaving placeholders unresolved or ignoring
-  extra values.
+  extra values; counting now ignores placeholders in nested comments and
+  dollar-quoted text.
 - PostgreSQL `CopyFail` messages now require a valid NUL-terminated UTF-8
   string and reject embedded NULs or trailing bytes.
 - PostgreSQL `CopyDone` messages now reject unexpected payload bytes, and COPY
