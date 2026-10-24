@@ -12517,7 +12517,9 @@ fn snapshot_live_value(
         .filter(|version| version.commit_ts <= snapshot_ts)
         .max_by_key(|version| version.commit_ts)?;
     match (&version.value, version.expires_at) {
-        (Some(value), expires_at) if expires_at == 0 || expires_at > ryme_txn::now_unix() => {
+        (Some(value), expires_at)
+            if !ryme_storage::expiry_is_expired(expires_at, ryme_txn::now_unix_millis()) =>
+        {
             Some(value.clone())
         }
         _ => None,

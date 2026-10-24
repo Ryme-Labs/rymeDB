@@ -12132,7 +12132,12 @@ where
                 continue;
             }
             match write.value.as_ref() {
-                Some(value) if write.expires_at == 0 || write.expires_at > ryme_txn::now_unix() => {
+                Some(value)
+                    if !ryme_storage::expiry_is_expired(
+                        write.expires_at,
+                        ryme_txn::now_unix_millis(),
+                    ) =>
+                {
                     budget.add_parts(&key.pk, value)?;
                     base.insert(key.pk.clone(), value.clone());
                 }

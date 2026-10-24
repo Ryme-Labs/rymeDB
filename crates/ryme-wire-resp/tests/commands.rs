@@ -391,7 +391,8 @@ async fn string_conditionals_and_getex_are_atomic() {
 
     assert_eq!(command(addr, &["SET", "session", "token", "EX", "30"]).await, "+OK");
     assert_eq!(command(addr, &["GETEX", "session", "EX", "5"]).await, "$5\r\ntoken");
-    assert!(command(addr, &["TTL", "session"]).await.contains(":5"));
+    let ttl: i64 = command(addr, &["TTL", "session"]).await[1..].parse().unwrap();
+    assert!((1..=5).contains(&ttl));
     assert_eq!(command(addr, &["GETEX", "session", "PERSIST"]).await, "$5\r\ntoken");
     assert_eq!(command(addr, &["TTL", "session"]).await, ":-1");
     assert_eq!(command(addr, &["GETEX", "missing", "EX", "5"]).await, "$-1");

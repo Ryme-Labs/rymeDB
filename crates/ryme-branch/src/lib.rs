@@ -676,7 +676,7 @@ where
 
     fn decode(value: &[u8]) -> Option<Option<Vec<u8>>> {
         let (value, expires_at) = Self::decode_with_expiry(value)?;
-        if expires_at != 0 && expires_at <= ryme_txn::now_unix() {
+        if ryme_storage::expiry_is_expired(expires_at, ryme_txn::now_unix_millis()) {
             Some(None)
         } else {
             Some(value)

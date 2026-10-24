@@ -3,6 +3,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 
+/// High bit marks expiry timestamps stored at millisecond precision. Values
+/// without this bit retain the historical Unix-seconds representation.
+const MILLIS_EXPIRY_TAG: u64 = 1 << 63;
+
+/// Encodes an absolute Unix-millisecond expiry without changing the on-disk
+/// version layout. Existing untagged second-based expiries remain readable.
+pub fn expiry_at_millis(unix_millis: u64) -> u64 {
+    MILLIS_EXPIRY_TAG | (unix_millis & !MILLIS_EXPIRY_TAG)
+}
+
+/// Converts a stored expiry into Unix milliseconds, including legacy seconds.
+pub fn expiry_to_millis(expires_at: u64) -> u64 {
+    if expires_at & MILLIS_EXPIRY_TAG != 0 {
+        expires_at & !MILLIS_EXPIRY_TAG
+    } else {
+        expires_at.saturating_mul(1000)
+    }
+}
+
+/// Tests a stored expiry against a Unix-millisecond clock value.
+pub fn expiry_is_expired(expires_at: u64, now_millis: u64) -> bool {
+    expires_at != 0 && expiry_to_millis(expires_at) <= now_millis
+}
+
+/// Returns the remaining lifetime in milliseconds, or `None` for no expiry.
+/// Returns remaining milliseconds, or `None` when the value has no expiry.
+pub fn expiry_remaining_millis(expires_at: u64, now_millis: u64) -> Option<u64> {
+    (expires_at != 0).then(|| expiry_to_millis(expires_at).saturating_sub(now_millis))
+}
+
 mod segment;
 pub use segment::{ImmutableSegment, SegmentCacheStats, SegmentEntry, SegmentMeta, SegmentStore};
 
@@ -155,6 +185,7 @@ struct Version {
 }
 
 #[derive(Debug, Default, Clone)]
+/// In-memory MVCC engine. Read-time arguments are Unix milliseconds.
 pub struct Engine {
     inner: BTreeMap<RecordKey, VecDeque<Version>>,
     bytes_held: u64,
@@ -266,7 +297,7 @@ impl Engine {
     }
 
     fn visible(version: &Version, now: u64) -> Option<Vec<u8>> {
-        if version.expires_at != 0 && version.expires_at <= now {
+        if expiry_is_expired(version.expires_at, now) {
             return None;
         }
         version.value.clone()
@@ -288,12 +319,13 @@ impl Engine {
 
     fn read_versions(versions: &VecDeque<Version>, read_ts: u64, now: u64) -> Option<Vec<u8>> {
         let version = versions.get(Self::version_index_at(versions, read_ts)?)?;
-        if version.expires_at != 0 && version.expires_at <= now {
+        if expiry_is_expired(version.expires_at, now) {
             return None;
         }
         version.value.clone()
     }
 
+    /// Reads at an MVCC timestamp; `now` is the current Unix time in milliseconds.
     pub fn read(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
         self.read_with_presence(key, read_ts, now).map(|(_, value)| value)
     }
@@ -845,7 +877,7 @@ impl Engine {
             }
             if let Some(index) = Self::version_index_at(versions, read_ts) {
                 let version = &versions[index];
-                if version.value.is_some() && version.expires_at != 0 && version.expires_at <= now {
+                if version.value.is_some() && expiry_is_expired(version.expires_at, now) {
                     out.push(key.pk.clone());
                     if out.len() >= limit {
                         break;
@@ -1222,6 +1254,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expiry_formats_preserve_legacy_seconds_and_millisecond_precision() {
+        let legacy_expiry = 1_700_000_000;
+        assert_eq!(expiry_to_millis(legacy_expiry), legacy_expiry * 1000);
+        assert!(!expiry_is_expired(legacy_expiry, legacy_expiry * 1000 - 1));
+        assert!(expiry_is_expired(legacy_expiry, legacy_expiry * 1000));
+
+        let millis_expiry = expiry_at_millis(1_700_000_000_123);
+        assert_eq!(expiry_to_millis(millis_expiry), 1_700_000_000_123);
+        assert_eq!(expiry_remaining_millis(millis_expiry, 1_700_000_000_000), Some(123));
+        assert!(!expiry_is_expired(millis_expiry, 1_700_000_000_122));
+        assert!(expiry_is_expired(millis_expiry, 1_700_000_000_123));
+        assert_eq!(expiry_remaining_millis(0, 1_700_000_000_000), None);
+    }
+
+    #[test]
     fn mvcc_snapshot_isolation() {
         let mut engine = Engine::new();
         let key = RecordKey::new("t", "d", "users", b"1");
@@ -1309,8 +1356,8 @@ mod tests {
         assert_eq!(base.read(&key, 1, 0).unwrap(), Some(b"old".to_vec()));
         assert_eq!(base.read(&key, 2, 0).unwrap(), Some(b"new".to_vec()));
         assert_eq!(base.read(&key, 3, 0).unwrap(), None);
-        assert_eq!(base.read(&expiring, 4, 49).unwrap(), Some(b"ttl".to_vec()));
-        assert_eq!(base.read(&expiring, 4, 50).unwrap(), None);
+        assert_eq!(base.read(&expiring, 4, 49_000).unwrap(), Some(b"ttl".to_vec()));
+        assert_eq!(base.read(&expiring, 4, 50_000).unwrap(), None);
         assert_eq!(base.max_commit_ts(), 4);
         assert_eq!(base.bytes_held(), 9);
     }
@@ -1349,7 +1396,7 @@ mod tests {
             (true, Some(b"value".to_vec()))
         );
         assert_eq!(engine.read_with_presence(&tombstone_key, 2, 0).unwrap(), (true, None));
-        assert_eq!(engine.read_with_presence(&expired_key, 1, 10).unwrap(), (true, None));
+        assert_eq!(engine.read_with_presence(&expired_key, 1, 10_000).unwrap(), (true, None));
         assert_eq!(
             engine
                 .read_with_presence(&RecordKey::new("t", "d", "presence", b"missing"), 1, 0)
@@ -1584,13 +1631,13 @@ mod tests {
         let mut engine = Engine::new();
         let key = RecordKey::new("t", "d", "s", b"k");
         engine.apply_with_expiry(key.clone(), 10, Some(b"a".to_vec()), 100).unwrap();
-        assert_eq!(engine.read(&key, 10, 50).unwrap(), Some(b"a".to_vec()));
-        assert_eq!(engine.read(&key, 10, 100).unwrap(), None);
-        assert_eq!(engine.read(&key, 10, 500).unwrap(), None);
+        assert_eq!(engine.read(&key, 10, 50_000).unwrap(), Some(b"a".to_vec()));
+        assert_eq!(engine.read(&key, 10, 100_000).unwrap(), None);
+        assert_eq!(engine.read(&key, 10, 500_000).unwrap(), None);
         engine.apply(key.clone(), 20, Some(b"b".to_vec())).unwrap();
-        assert_eq!(engine.read(&key, 20, 500).unwrap(), Some(b"b".to_vec()));
-        assert_eq!(engine.scan("t", "d", "s", 20, 500, 10).len(), 1);
-        assert_eq!(engine.scan("t", "d", "s", 10, 500, 10).len(), 0);
+        assert_eq!(engine.read(&key, 20, 500_000).unwrap(), Some(b"b".to_vec()));
+        assert_eq!(engine.scan("t", "d", "s", 20, 500_000, 10).len(), 1);
+        assert_eq!(engine.scan("t", "d", "s", 10, 500_000, 10).len(), 0);
     }
 
     #[test]
@@ -1670,8 +1717,8 @@ mod tests {
         engine.apply_with_expiry(key.clone(), 5, Some(b"v".to_vec()), 50).unwrap();
         let raw = engine.encode_snapshot().unwrap();
         let back = Engine::decode_snapshot(&raw).unwrap();
-        assert_eq!(back.read(&key, 5, 10).unwrap(), Some(b"v".to_vec()));
-        assert_eq!(back.read(&key, 5, 60).unwrap(), None);
+        assert_eq!(back.read(&key, 5, 10_000).unwrap(), Some(b"v".to_vec()));
+        assert_eq!(back.read(&key, 5, 60_000).unwrap(), None);
     }
 
     #[test]

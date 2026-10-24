@@ -85,7 +85,9 @@ type RemoteScanFn = Arc<
 type ScanPageResult = (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>);
 
 fn remote_value_if_live(value: Option<Vec<u8>>, expires_at: Option<u64>) -> Option<Vec<u8>> {
-    if expires_at.is_some_and(|expires_at| expires_at != 0 && expires_at <= ryme_txn::now_unix()) {
+    if expires_at.is_some_and(|expires_at| {
+        ryme_storage::expiry_is_expired(expires_at, ryme_txn::now_unix_millis())
+    }) {
         None
     } else {
         value
@@ -693,12 +695,10 @@ where
             None => Ok(Ttl::Missing),
             Some(0) => Ok(Ttl::Persistent),
             Some(ts) => {
-                let now = ryme_txn::now_unix();
-                if ts <= now {
-                    Ok(Ttl::Missing)
-                } else {
-                    Ok(Ttl::Seconds(ts - now))
-                }
+                let remaining =
+                    ryme_storage::expiry_remaining_millis(ts, ryme_txn::now_unix_millis())
+                        .unwrap_or(0);
+                if remaining == 0 { Ok(Ttl::Missing) } else { Ok(Ttl::Seconds(remaining / 1000)) }
             }
         }
     }
@@ -724,8 +724,18 @@ where
                 }
                 match expires_at.unwrap_or(0) {
                     0 => Ok(Ttl::Persistent),
-                    expires_at if expires_at <= ryme_txn::now_unix() => Ok(Ttl::Missing),
-                    expires_at => Ok(Ttl::Seconds(expires_at - ryme_txn::now_unix())),
+                    expires_at => {
+                        let remaining = ryme_storage::expiry_remaining_millis(
+                            expires_at,
+                            ryme_txn::now_unix_millis(),
+                        )
+                        .unwrap_or(0);
+                        if remaining == 0 {
+                            Ok(Ttl::Missing)
+                        } else {
+                            Ok(Ttl::Seconds(remaining / 1000))
+                        }
+                    }
                 }
             }
         }

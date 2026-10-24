@@ -498,6 +498,7 @@ impl ImmutableSegment {
 }
 
 #[derive(Debug, Clone)]
+/// Durable segment reader and writer. Read-time arguments are Unix milliseconds.
 pub struct SegmentStore {
     dir: PathBuf,
     cache: Arc<Mutex<SegmentReadCache>>,
@@ -701,11 +702,12 @@ impl SegmentStore {
             .map_err(|_| RymeError::Internal(String::from("segment paths lock")))
     }
 
+    /// Reads at an MVCC timestamp; `now` is the current Unix time in milliseconds.
     pub fn get(&self, key: &RecordKey, read_ts: u64, now: u64) -> Result<Option<Vec<u8>>> {
         let Some((_, value, expires_at)) = self.version_at(key, read_ts)? else {
             return Ok(None);
         };
-        if expires_at != 0 && expires_at <= now {
+        if super::expiry_is_expired(expires_at, now) {
             return Ok(None);
         }
         Ok(value)
@@ -788,7 +790,8 @@ impl SegmentStore {
             next_unresolved.clear();
             for index in unresolved.drain(..) {
                 if let Some((_, value, expires_at)) = segment.version_at(key_at(index), read_ts) {
-                    values[index] = if expires_at != 0 && expires_at <= now { None } else { value };
+                    values[index] =
+                        if super::expiry_is_expired(expires_at, now) { None } else { value };
                 } else if !is_snapshot {
                     next_unresolved.push(index);
                 }
@@ -942,8 +945,11 @@ impl SegmentStore {
                 let key = &segment.keys[key_index];
                 if chosen.is_none() {
                     if let Some((_, value, expires_at)) = segment.engine.version_at(key, read_ts) {
-                        chosen =
-                            Some(if expires_at != 0 && expires_at <= now { None } else { value });
+                        chosen = Some(if super::expiry_is_expired(expires_at, now) {
+                            None
+                        } else {
+                            value
+                        });
                     }
                 }
                 let next_index = key_index + 1;
@@ -2387,15 +2393,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.scan("tenant", "db", "items", 3, 10, 2).unwrap(),
+            store.scan("tenant", "db", "items", 3, 10_000, 2).unwrap(),
             vec![(b"b".to_vec(), b"B3".to_vec()), (b"d".to_vec(), b"D".to_vec())]
         );
         assert_eq!(
-            store.scan_after("tenant", "db", "items", 3, 10, b"b", 2).unwrap(),
+            store.scan_after("tenant", "db", "items", 3, 10_000, b"b", 2).unwrap(),
             vec![(b"d".to_vec(), b"D".to_vec()), (b"e".to_vec(), b"E".to_vec())]
         );
         assert_eq!(
-            store.scan("tenant", "db", "items", 2, 10, 10).unwrap(),
+            store.scan("tenant", "db", "items", 2, 10_000, 10).unwrap(),
             vec![
                 (b"b".to_vec(), b"B2".to_vec()),
                 (b"d".to_vec(), b"D".to_vec()),
@@ -2403,7 +2409,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            store.scan("tenant", "db", "items", 1, 10, 10).unwrap(),
+            store.scan("tenant", "db", "items", 1, 10_000, 10).unwrap(),
             vec![
                 (b"a".to_vec(), b"A".to_vec()),
                 (b"b".to_vec(), b"B".to_vec()),

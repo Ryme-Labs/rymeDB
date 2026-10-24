@@ -63,6 +63,30 @@ async fn ttl_lifecycle() {
 }
 
 #[tokio::test]
+async fn millisecond_expiry_keeps_subsecond_precision() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["SET", "short", "v", "PX", "350"]).await, "+OK");
+    let pttl: i64 = command(addr, &["PTTL", "short"]).await[1..].parse().unwrap();
+    assert!((1..=350).contains(&pttl), "expected a positive subsecond TTL, got {pttl}");
+    assert_eq!(command(addr, &["TTL", "short"]).await, ":0");
+
+    assert_eq!(command(addr, &["SET", "reset", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["PEXPIRE", "reset", "300"]).await, ":1");
+    let pttl: i64 = command(addr, &["PTTL", "reset"]).await[1..].parse().unwrap();
+    assert!((1..=300).contains(&pttl), "expected a positive subsecond TTL, got {pttl}");
+
+    assert_eq!(command(addr, &["SET", "getex", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["GETEX", "getex", "PX", "300"]).await, "$1\r\nv");
+    let pttl: i64 = command(addr, &["PTTL", "getex"]).await[1..].parse().unwrap();
+    assert!((1..=300).contains(&pttl), "expected a positive subsecond TTL, got {pttl}");
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(command(addr, &["GET", "short"]).await, "$-1");
+    assert_eq!(command(addr, &["GET", "reset"]).await, "$-1");
+    assert_eq!(command(addr, &["GET", "getex"]).await, "$-1");
+}
+
+#[tokio::test]
 async fn expire_modes_and_nx_xx() {
     let addr = serve().await;
     assert_eq!(command(addr, &["EXPIRE", "missing", "10"]).await, ":0");

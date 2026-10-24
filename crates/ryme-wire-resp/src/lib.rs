@@ -5293,23 +5293,25 @@ where
         match self.manager.expires_at(&record)? {
             Some(0) => Ok(-1),
             Some(ts) => {
-                let now = ryme_txn::now_unix();
-                if ts <= now {
-                    Ok(-2)
-                } else {
-                    Ok((ts - now) as i64)
-                }
+                let now = ryme_txn::now_unix_millis();
+                let remaining = ryme_storage::expiry_remaining_millis(ts, now).unwrap_or(0);
+                if remaining == 0 { Ok(-2) } else { Ok((remaining / 1000) as i64) }
             }
             None => Ok(-2),
         }
     }
 
     fn ttl_millis(&self, key: &[u8]) -> Result<i64> {
-        let secs = self.ttl_secs(key)?;
-        if secs < 0 {
-            Ok(secs)
-        } else {
-            Ok(secs.saturating_mul(1000))
+        let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
+        match self.manager.expires_at(&record)? {
+            Some(0) => Ok(-1),
+            Some(ts) => {
+                let remaining =
+                    ryme_storage::expiry_remaining_millis(ts, ryme_txn::now_unix_millis())
+                        .unwrap_or(0);
+                if remaining == 0 { Ok(-2) } else { Ok(remaining.min(i64::MAX as u64) as i64) }
+            }
+            None => Ok(-2),
         }
     }
 
@@ -5358,7 +5360,9 @@ where
             }
             return Ok(existed);
         }
-        let expires_at = ryme_txn::now_unix().saturating_add(secs as u64);
+        let expires_at = ryme_storage::expiry_at_millis(
+            ryme_txn::now_unix_millis().saturating_add((secs as u64).saturating_mul(1000)),
+        );
         self.apply_expire(txn, key, expires_at, flags)
     }
 
@@ -5376,7 +5380,9 @@ where
         if millis <= 0 {
             return self.expire_key(txn, key, b"0", flags);
         }
-        let expires_at = ryme_txn::now_unix().saturating_add((millis as u64).div_ceil(1000));
+        let expires_at = ryme_storage::expiry_at_millis(
+            ryme_txn::now_unix_millis().saturating_add(millis as u64),
+        );
         self.apply_expire(txn, key, expires_at, flags)
     }
 
@@ -5407,8 +5413,16 @@ where
             ExpireMode::Always => true,
             ExpireMode::OnlyMissing => expiry == 0,
             ExpireMode::OnlyPresent => expiry != 0,
-            ExpireMode::Greater => expiry != 0 && expires_at > expiry,
-            ExpireMode::Less => expiry == 0 || expires_at < expiry,
+            ExpireMode::Greater => {
+                expiry != 0
+                    && ryme_storage::expiry_to_millis(expires_at)
+                        > ryme_storage::expiry_to_millis(expiry)
+            }
+            ExpireMode::Less => {
+                expiry == 0
+                    || ryme_storage::expiry_to_millis(expires_at)
+                        < ryme_storage::expiry_to_millis(expiry)
+            }
         };
         if !allowed {
             return Ok(false);
@@ -5454,14 +5468,16 @@ fn parse_getex_option(args: &[Vec<u8>]) -> std::result::Result<GetExOption, Stri
     if amount < 0 {
         return Err(String::from("invalid expire time in 'getex' command"));
     }
-    let now = ryme_txn::now_unix();
+    let now_millis = ryme_txn::now_unix_millis();
     match mode.to_ascii_uppercase().as_str() {
-        "EX" if amount > 0 => Ok(GetExOption::Expires(now.saturating_add(amount as u64))),
-        "PX" if amount > 0 => {
-            Ok(GetExOption::Expires(now.saturating_add((amount as u64).div_ceil(1000))))
-        }
+        "EX" if amount > 0 => Ok(GetExOption::Expires(ryme_storage::expiry_at_millis(
+            now_millis.saturating_add((amount as u64).saturating_mul(1000)),
+        ))),
+        "PX" if amount > 0 => Ok(GetExOption::Expires(ryme_storage::expiry_at_millis(
+            now_millis.saturating_add(amount as u64),
+        ))),
         "EXAT" => Ok(GetExOption::Expires(amount as u64)),
-        "PXAT" => Ok(GetExOption::Expires((amount as u64).div_ceil(1000))),
+        "PXAT" => Ok(GetExOption::Expires(ryme_storage::expiry_at_millis(amount as u64))),
         "EX" | "PX" => Err(String::from("invalid expire time in 'getex' command")),
         _ => Err(String::from("syntax")),
     }
@@ -5512,12 +5528,16 @@ fn parse_set_options(args: &[Vec<u8>]) -> std::result::Result<SetOptions, String
                 if amount < 0 {
                     return Err(String::from("invalid expire time in 'set' command"));
                 }
-                let now = ryme_txn::now_unix();
+                let now_millis = ryme_txn::now_unix_millis();
                 options.expires_at = Some(match name.to_ascii_uppercase().as_str() {
-                    "EX" => now.saturating_add(amount as u64),
-                    "PX" => now.saturating_add((amount as u64).div_ceil(1000)),
+                    "EX" => ryme_storage::expiry_at_millis(
+                        now_millis.saturating_add((amount as u64).saturating_mul(1000)),
+                    ),
+                    "PX" => ryme_storage::expiry_at_millis(
+                        now_millis.saturating_add(amount as u64),
+                    ),
                     "EXAT" => amount as u64,
-                    _ => (amount as u64).div_ceil(1000),
+                    _ => ryme_storage::expiry_at_millis(amount as u64),
                 });
                 index += 1;
             }
@@ -6466,22 +6486,21 @@ fn encode_array(items: Vec<Option<Vec<u8>>>) -> Vec<u8> {
 }
 
 fn remote_ttl(present: bool, expires_at: Option<u64>, millis: bool) -> i64 {
-    let ttl = match (present, expires_at) {
+    match (present, expires_at) {
         (false, _) | (true, None) => -2,
         (true, Some(0)) => -1,
         (true, Some(ts)) => {
-            let now = ryme_txn::now_unix();
-            if ts <= now {
+            let remaining =
+                ryme_storage::expiry_remaining_millis(ts, ryme_txn::now_unix_millis())
+                    .unwrap_or(0);
+            if remaining == 0 {
                 -2
+            } else if millis {
+                remaining.min(i64::MAX as u64) as i64
             } else {
-                (ts - now) as i64
+                (remaining / 1000) as i64
             }
         }
-    };
-    if millis && ttl >= 0 {
-        ttl.saturating_mul(1000)
-    } else {
-        ttl
     }
 }
 

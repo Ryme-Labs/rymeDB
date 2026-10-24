@@ -30,6 +30,11 @@ Enable `RYME_RESP_PASSWORD` for password authentication. Use the dedicated
 | Pub/sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` |
 | Other | `SCAN`, `KEYS`, HyperLogLog, geospatial commands |
 
+`SET PX`, `SET PXAT`, `PEXPIRE`, `GETEX PX`, and `GETEX PXAT` retain
+millisecond expiry precision. `PTTL` reports the remaining milliseconds;
+`TTL` reports whole seconds and may return `0` while a key has less than one
+second remaining. Existing persisted expiry timestamps remain readable.
+
 The exact compatibility suite is in `crates/ryme-wire-resp/tests/`. Unsupported
 option combinations should be treated as errors, not silently assumed to have
 Redis semantics.

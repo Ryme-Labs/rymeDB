@@ -1,7 +1,7 @@
 use crate::{decode_apply, encode_applied, ApplyPayload, LogEntry, Role};
 use ryme_error::{Result, RymeError};
 use ryme_storage::{Engine, RecordKey};
-use ryme_txn::{decode_writes, encode_writes, now_unix, TxnManager};
+use ryme_txn::{decode_writes, encode_writes, TxnManager};
 use ryme_wal::{Wal, WalRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -664,7 +664,7 @@ fn snapshot_live_value(row: &RangeSnapshotRow, snapshot_ts: u64) -> Option<Vec<u
             continue;
         }
         value = if version.value.is_some()
-            && (version.expires_at == 0 || version.expires_at > now_unix())
+            && !ryme_storage::expiry_is_expired(version.expires_at, ryme_txn::now_unix_millis())
         {
             version.value.clone()
         } else {
@@ -6180,7 +6180,10 @@ impl Node {
                 let mut expires_at = 0;
                 for version in &versions {
                     if version.value.is_some()
-                        && (version.expires_at == 0 || version.expires_at > now_unix())
+                        && !ryme_storage::expiry_is_expired(
+                            version.expires_at,
+                            ryme_txn::now_unix_millis(),
+                        )
                     {
                         value = version.value.clone().unwrap_or_default();
                         expires_at = version.expires_at;
@@ -6746,7 +6749,12 @@ fn merge_scan_page(
             continue;
         }
         match write.value.as_ref() {
-            Some(value) if write.expires_at == 0 || write.expires_at > now_unix() => {
+            Some(value)
+                if !ryme_storage::expiry_is_expired(
+                    write.expires_at,
+                    ryme_txn::now_unix_millis(),
+                ) =>
+            {
                 rows.insert(key.pk.clone(), value.clone());
             }
             _ => {

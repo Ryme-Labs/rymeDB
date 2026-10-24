@@ -901,13 +901,13 @@ impl Transaction {
             return Vec::new();
         }
         let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = rows.into_iter().collect();
-        let now = now_unix();
+        let now = now_unix_millis();
         let start = RecordKey::new(tenant, database, table, start_after.unwrap_or_default());
         let start_bound = start_after.map(|_| Excluded(&start)).unwrap_or(Included(&start));
         for (key, op) in self.writes.range((start_bound, Unbounded)).take_while(|(key, _)| {
             key.tenant == tenant && key.database == database && key.table == table
         }) {
-            let visible = op.expires_at == 0 || op.expires_at > now;
+            let visible = !ryme_storage::expiry_is_expired(op.expires_at, now);
             match (visible, op.value.as_ref()) {
                 (true, Some(value)) => {
                     merged.insert(key.pk.clone(), value.clone());
@@ -937,6 +937,14 @@ pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Returns the current Unix time in milliseconds for storage expiry checks.
+pub fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
 }
 
@@ -1324,7 +1332,7 @@ impl TxnManager {
     pub fn get(&self, txn: &mut Transaction, key: &RecordKey) -> Result<Option<Vec<u8>>> {
         txn.ensure_healthy()?;
         if let Some(staged) = txn.writes.get(key) {
-            if staged.expires_at != 0 && staged.expires_at <= now_unix() {
+            if ryme_storage::expiry_is_expired(staged.expires_at, now_unix_millis()) {
                 return Ok(None);
             }
             return Ok(staged.value.clone());
@@ -1335,7 +1343,7 @@ impl TxnManager {
                 .engine
                 .read()
                 .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-            engine.read(key, txn.read_ts, now_unix())?
+            engine.read(key, txn.read_ts, now_unix_millis())?
         };
         txn.record_read_ref(key, value.is_some())?;
         Ok(value)
@@ -1351,7 +1359,7 @@ impl TxnManager {
             return Ok(Vec::new());
         }
 
-        let now = now_unix();
+        let now = now_unix_millis();
         if txn.writes.is_empty() {
             let values = {
                 let engine = self
@@ -1375,7 +1383,7 @@ impl TxnManager {
             if keys.len() < MIN_ORDERED_BATCH_READ_KEYS {
                 for (index, key) in keys.iter().enumerate() {
                     values[index] = if let Some(staged) = txn.writes.get(key) {
-                        if staged.expires_at != 0 && staged.expires_at <= now {
+                        if ryme_storage::expiry_is_expired(staged.expires_at, now) {
                             None
                         } else {
                             staged.value.clone()
@@ -1389,7 +1397,7 @@ impl TxnManager {
                 let mut pending_keys = Vec::with_capacity(keys.len());
                 for (index, key) in keys.iter().enumerate() {
                     if let Some(staged) = txn.writes.get(key) {
-                        values[index] = if staged.expires_at != 0 && staged.expires_at <= now {
+                        values[index] = if ryme_storage::expiry_is_expired(staged.expires_at, now) {
                             None
                         } else {
                             staged.value.clone()
@@ -1420,12 +1428,12 @@ impl TxnManager {
     ) -> Result<Option<Vec<u8>>> {
         txn.ensure_healthy()?;
         if let Some(staged) = txn.writes.get(key) {
-            if staged.expires_at != 0 && staged.expires_at <= now_unix() {
+            if ryme_storage::expiry_is_expired(staged.expires_at, now_unix_millis()) {
                 return Ok(None);
             }
             return Ok(staged.value.clone());
         }
-        let now = now_unix();
+        let now = now_unix_millis();
         let (has_version, value) = {
             let engine = self
                 .inner
@@ -2197,7 +2205,7 @@ impl TxnManager {
             .engine
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        let rows = engine.scan(tenant, database, table, txn.read_ts, now_unix(), scan_limit);
+        let rows = engine.scan(tenant, database, table, txn.read_ts, now_unix_millis(), scan_limit);
         if overlay_count == 0 {
             Ok(rows)
         } else {
@@ -2249,7 +2257,7 @@ impl TxnManager {
             database,
             table,
             txn.read_ts,
-            now_unix(),
+            now_unix_millis(),
             start_after,
             scan_limit,
         );
@@ -2562,7 +2570,7 @@ impl TxnManager {
             .engine
             .read()
             .map_err(|_| RymeError::Internal(String::from("engine lock")))?;
-        Ok(engine.expired(tenant, database, table, read_ts, now_unix(), limit))
+        Ok(engine.expired(tenant, database, table, read_ts, now_unix_millis(), limit))
     }
 
     pub fn expires_at(&self, key: &RecordKey) -> Result<Option<u64>> {
@@ -3131,7 +3139,7 @@ impl DurableManager {
                 database,
                 table,
                 self.latest_commit(),
-                now_unix(),
+                now_unix_millis(),
                 limit,
             )),
         }
@@ -3503,7 +3511,7 @@ impl DurableManager {
         match self.mode {
             StorageMode::Hot => self.inner.get(txn, key),
             StorageMode::Standard => {
-                self.inner.get_with(txn, key, || self.segments.get(key, read_ts, now_unix()))
+                self.inner.get_with(txn, key, || self.segments.get(key, read_ts, now_unix_millis()))
             }
         }
     }
@@ -3521,7 +3529,7 @@ impl DurableManager {
                 if keys.is_empty() {
                     return Ok(Vec::new());
                 }
-                let now = now_unix();
+                let now = now_unix_millis();
                 if txn.writes.is_empty() {
                     let values = self.segments.get_many(keys, txn.read_ts, now)?;
                     if !txn.read_only {
@@ -3536,7 +3544,7 @@ impl DurableManager {
                 let mut segment_keys = Vec::with_capacity(keys.len());
                 for (index, key) in keys.iter().enumerate() {
                     if let Some(staged) = txn.writes.get(key) {
-                        values[index] = if staged.expires_at != 0 && staged.expires_at <= now {
+                        values[index] = if ryme_storage::expiry_is_expired(staged.expires_at, now) {
                             None
                         } else {
                             staged.value.clone()
@@ -3623,7 +3631,14 @@ impl DurableManager {
             StorageMode::Hot => self.inner.scan(txn, tenant, database, table, limit),
             StorageMode::Standard => {
                 self.inner.scan_with(txn, tenant, database, table, limit, |scan_limit| {
-                    self.segments.scan(tenant, database, table, read_ts, now_unix(), scan_limit)
+                    self.segments.scan(
+                        tenant,
+                        database,
+                        table,
+                        read_ts,
+                        now_unix_millis(),
+                        scan_limit,
+                    )
                 })
             }
         }
@@ -3657,7 +3672,7 @@ impl DurableManager {
                         database,
                         table,
                         read_ts,
-                        now_unix(),
+                        now_unix_millis(),
                         start_after,
                         scan_limit,
                     )

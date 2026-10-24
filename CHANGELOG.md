@@ -36,6 +36,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP millisecond expiry commands retain subsecond precision, and `PTTL`
+  reports the actual remaining milliseconds while legacy persisted expiries
+  remain readable.
 - Ordered SQL scans now sort the full bounded result set or return an overload
   error instead of silently sorting only the first 10,000 rows.
 - Primary-key-ordered SQL scans now size their read window for both `LIMIT` and
