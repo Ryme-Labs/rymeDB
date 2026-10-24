@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- Lua `redis.call` and `redis.pcall` now enforce RESP argument-count and frame-size
+  limits before copying script-generated command arguments.
 - Configured KMS keys now fail closed when invalid, and existing plaintext DEK
   rings are wrapped on startup when KMS is enabled.
 - Public TOTP verification now rejects secrets shorter than 128 bits, matching

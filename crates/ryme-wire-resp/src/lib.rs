@@ -1160,32 +1160,17 @@ where
         let result = lua.scope(|scope| {
             let call_transaction = std::rc::Rc::clone(&transaction);
             let call = scope.create_function_mut(move |lua, values: MultiValue| {
-                let mut values = values.into_iter();
-                let command =
-                    values.next().map(lua_value_bytes).transpose()?.ok_or_else(|| {
-                        mlua::Error::RuntimeError(String::from("missing command"))
-                    })?;
-                let name = std::str::from_utf8(&command)
-                    .map_err(|_| mlua::Error::RuntimeError(String::from("command is not UTF-8")))?
-                    .to_ascii_uppercase();
-                let args = values.map(lua_value_bytes).collect::<mlua::Result<Vec<_>>>()?;
-                let command = RespCommand { name, args };
+                let command = lua_resp_command(values).map_err(mlua::Error::RuntimeError)?;
                 self.authorize_script_command(&command).map_err(mlua::Error::RuntimeError)?;
                 let reply = self.dispatch_in(&mut call_transaction.borrow_mut(), command);
                 parse_lua_resp(&reply).map_err(mlua::Error::RuntimeError)?.into_lua(lua)
             })?;
             let pcall_transaction = std::rc::Rc::clone(&transaction);
             let pcall = scope.create_function_mut(move |lua, values: MultiValue| {
-                let mut values = values.into_iter();
-                let command =
-                    values.next().map(lua_value_bytes).transpose()?.ok_or_else(|| {
-                        mlua::Error::RuntimeError(String::from("missing command"))
-                    })?;
-                let name = std::str::from_utf8(&command)
-                    .map_err(|_| mlua::Error::RuntimeError(String::from("command is not UTF-8")))?
-                    .to_ascii_uppercase();
-                let args = values.map(lua_value_bytes).collect::<mlua::Result<Vec<_>>>()?;
-                let command = RespCommand { name, args };
+                let command = match lua_resp_command(values) {
+                    Ok(command) => command,
+                    Err(error) => return LuaRespValue::Error(error).into_lua_pcall(lua),
+                };
                 self.authorize_script_command(&command).map_err(mlua::Error::RuntimeError)?;
                 let reply = self.dispatch_in(&mut pcall_transaction.borrow_mut(), command);
                 parse_lua_resp(&reply).map_err(mlua::Error::RuntimeError)?.into_lua_pcall(lua)
@@ -6103,14 +6088,77 @@ impl LuaRespValue {
     }
 }
 
-fn lua_value_bytes(value: LuaValue) -> mlua::Result<Vec<u8>> {
+fn lua_value_bytes(value: LuaValue) -> std::result::Result<Vec<u8>, String> {
     match value {
         LuaValue::String(value) => Ok(value.as_bytes().to_vec()),
         LuaValue::Integer(value) => Ok(value.to_string().into_bytes()),
         LuaValue::Number(value) if value.is_finite() => Ok(value.to_string().into_bytes()),
         LuaValue::Boolean(value) => Ok(if value { b"1".to_vec() } else { b"0".to_vec() }),
-        _ => Err(mlua::Error::RuntimeError(String::from("command argument is not a string"))),
+        _ => Err(String::from("command argument is not a string")),
     }
+}
+
+fn lua_value_byte_len(value: &LuaValue) -> std::result::Result<usize, String> {
+    match value {
+        LuaValue::String(value) => Ok(value.as_bytes().len()),
+        LuaValue::Integer(value) => Ok(value.to_string().len()),
+        LuaValue::Number(value) if value.is_finite() => Ok(value.to_string().len()),
+        LuaValue::Boolean(true) => Ok(1),
+        LuaValue::Boolean(false) => Ok(1),
+        _ => Err(String::from("command argument is not a string")),
+    }
+}
+
+fn lua_resp_command(values: MultiValue) -> std::result::Result<RespCommand, String> {
+    let mut values = values.into_iter();
+    let command = values.next().ok_or_else(|| String::from("missing command"))?;
+    let command_len = lua_value_byte_len(&command)?;
+    if command_len > RESP_MAX_FRAME_BYTES {
+        return Err(String::from("command exceeds the request size limit"));
+    }
+    let name = String::from_utf8(lua_value_bytes(command)?)
+        .map_err(|_| String::from("command is not UTF-8"))?
+        .to_ascii_uppercase();
+    let args = lua_command_arguments(values, command_len)?;
+    Ok(RespCommand { name, args })
+}
+
+fn lua_command_arguments(
+    values: impl IntoIterator<Item = LuaValue>,
+    command_bytes: usize,
+) -> std::result::Result<Vec<Vec<u8>>, String> {
+    let mut args = Vec::new();
+    let mut total_payload_bytes = command_bytes;
+    let mut bulk_overhead_bytes = command_bytes.to_string().len() + 5;
+    if total_payload_bytes.saturating_add(bulk_overhead_bytes).saturating_add(4)
+        > RESP_MAX_FRAME_BYTES
+    {
+        return Err(String::from("command exceeds the request size limit"));
+    }
+    for value in values {
+        if args.len() >= RESP_MAX_COMMAND_ARGS {
+            return Err(String::from("command exceeds the argument count limit"));
+        }
+        let value_bytes = lua_value_byte_len(&value)?;
+        let next_payload_bytes = total_payload_bytes
+            .checked_add(value_bytes)
+            .ok_or_else(|| String::from("command exceeds the request size limit"))?;
+        let next_bulk_overhead_bytes = bulk_overhead_bytes
+            .checked_add(value_bytes.to_string().len() + 5)
+            .ok_or_else(|| String::from("command exceeds the request size limit"))?;
+        let array_header_bytes = (args.len() + 2).to_string().len() + 3;
+        let frame_bytes = next_payload_bytes
+            .checked_add(next_bulk_overhead_bytes)
+            .and_then(|bytes| bytes.checked_add(array_header_bytes))
+            .ok_or_else(|| String::from("command exceeds the request size limit"))?;
+        if frame_bytes > RESP_MAX_FRAME_BYTES {
+            return Err(String::from("command exceeds the request size limit"));
+        }
+        total_payload_bytes = next_payload_bytes;
+        bulk_overhead_bytes = next_bulk_overhead_bytes;
+        args.push(lua_value_bytes(value)?);
+    }
+    Ok(args)
 }
 
 fn lua_bytes_table(lua: &Lua, values: &[Vec<u8>]) -> mlua::Result<mlua::Table> {
@@ -7340,6 +7388,50 @@ mod tests {
             parse_lua_resp(b"*1\r\n$1\r\nx\r\n"),
             Ok(LuaRespValue::Array(values)) if values.len() == 1
         ));
+    }
+
+    #[test]
+    fn lua_commands_obey_resp_argument_and_frame_limits() {
+        let lua = Lua::new();
+        let too_many = (0..=RESP_MAX_COMMAND_ARGS).map(|_| LuaValue::Integer(1));
+        assert!(lua_command_arguments(too_many, 3).is_err());
+
+        let oversized =
+            LuaValue::String(lua.create_string(vec![b'x'; RESP_MAX_FRAME_BYTES]).unwrap());
+        assert!(lua_command_arguments(std::iter::once(oversized), 3).is_err());
+
+        let valid = lua_command_arguments(
+            [LuaValue::String(lua.create_string("key").unwrap()), LuaValue::Integer(7)],
+            3,
+        )
+        .unwrap();
+        assert_eq!(valid, vec![b"key".to_vec(), b"7".to_vec()]);
+    }
+
+    #[test]
+    fn lua_call_and_pcall_enforce_internal_command_limits() {
+        let gateway = RespGateway::new(String::from("tenant"), String::from("database"));
+        let mut txn = gateway.manager.begin();
+        let call_script = br#"
+            local args = {}
+            for i = 1, 1025 do args[i] = 'x' end
+            return redis.call('MGET', table.unpack(args))
+        "#;
+        assert!(
+            gateway
+                .run_lua_script(&mut txn, call_script, &[], &[])
+                .unwrap_err()
+                .contains("argument count limit")
+        );
+
+        let pcall_script = br#"
+            local args = {}
+            for i = 1, 1025 do args[i] = 'x' end
+            local result = redis.pcall('MGET', table.unpack(args))
+            return result.err
+        "#;
+        let reply = gateway.run_lua_script(&mut txn, pcall_script, &[], &[]).unwrap();
+        assert!(String::from_utf8_lossy(&reply).contains("argument count limit"));
     }
 
     #[test]
