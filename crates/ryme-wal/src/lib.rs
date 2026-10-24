@@ -339,6 +339,9 @@ impl Wal {
             .unwrap_or(Ok(0))?;
         for record in records {
             validate_payload_len(record.payload.len())?;
+            if record.commit_ts == 0 {
+                return Err(RymeError::InvalidArgument(String::from("commit timestamp")));
+            }
         }
         let temporary = prepare_rewrite_directory(&self.dir)?;
         let mut id = 0u64;
@@ -755,6 +758,9 @@ fn recover_next_lsn(dir: &Path, active_id: u64, active: &mut File) -> Result<u64
 }
 
 fn encode_frame(lsn: u64, commit_ts: u64, payload: &[u8]) -> Result<Bytes> {
+    if commit_ts == 0 {
+        return Err(RymeError::InvalidArgument(String::from("commit timestamp")));
+    }
     validate_payload_len(payload.len())?;
     let mut buf = BytesMut::with_capacity(WAL_FRAME_OVERHEAD_BYTES + payload.len());
     buf.put_u32(WAL_MAGIC);
@@ -873,11 +879,37 @@ mod tests {
 
     #[test]
     fn recovery_rejects_zero_commit_timestamp() {
-        let raw = encode_frame(0, 0, b"invalid").unwrap();
+        let mut raw = encode_frame(0, 1, b"invalid").unwrap().to_vec();
+        raw[16..24].fill(0);
+        let checksum = crc32fast::hash(&raw[..raw.len() - WAL_FRAME_TRAILER_BYTES]);
+        let checksum_offset = raw.len() - WAL_FRAME_TRAILER_BYTES;
+        raw[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
         assert!(matches!(
             decode_frame(&raw),
             Err(RymeError::Corrupt(message)) if message == "wal commit timestamp"
         ));
+    }
+
+    #[test]
+    fn rewrite_rejects_zero_commit_timestamp_without_changing_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-wal-rewrite-zero-commit-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wal = Wal::open(&dir, 1024).unwrap();
+        wal.append(1, b"existing").unwrap();
+        wal.sync().unwrap();
+        assert!(matches!(
+            wal.replace_records(&[
+                WalRecord { lsn: 0, commit_ts: 1, payload: b"valid".to_vec() },
+                WalRecord { lsn: 1, commit_ts: 0, payload: b"invalid".to_vec() },
+            ]),
+            Err(RymeError::InvalidArgument(message)) if message == "commit timestamp"
+        ));
+        assert_eq!(Wal::read_all(&dir).unwrap()[0].payload, b"existing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
