@@ -1,0 +1,69 @@
+{
+  "experiment": "realtime-writer-batch-size",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "4bb5dcc",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "workload": {
+    "server_mode": "standard",
+    "server_durability": "memory",
+    "qos_tier": "dedicated_cluster",
+    "topology": "single local node, one shard",
+    "connections": 100,
+    "connection_concurrency": 256,
+    "messages": 10000,
+    "payload_bytes": 128,
+    "publish_concurrency": 32,
+    "channel_count": 1,
+    "protocol": "HTTP publish with /v1/broadcast WebSocket subscribers",
+    "warmup_ms": 100,
+    "latency_unit": "publish-to-client round trip",
+    "candidate": "same source, with REALTIME_WRITE_BATCH_MAX set to 32 or 128 instead of 64"
+  },
+  "summary": {
+    "batch64_median": {
+      "publish_qps": 4692,
+      "fanout_deliveries_per_second": 465230,
+      "p50_us": 7070,
+      "p95_us": 109940,
+      "p99_us": 274890,
+      "max_us": 644150
+    },
+    "batch32_median": {
+      "publish_qps": 4759,
+      "fanout_deliveries_per_second": 471608,
+      "p50_us": 7040,
+      "p95_us": 136330,
+      "p99_us": 313820,
+      "max_us": 658970
+    },
+    "batch128_median": {
+      "publish_qps": 4723,
+      "fanout_deliveries_per_second": 468649,
+      "p50_us": 7040,
+      "p95_us": 127960,
+      "p99_us": 310360,
+      "max_us": 689280
+    },
+    "interpretation": "Batches of 32 and 128 produced small throughput changes but worse p95 and p99 latency. Keep the existing batch size of 64. All measured captures delivered 1,000,000 of 1,000,000 expected messages with zero errors."
+  },
+  "batch64_captures": [
+    { "publish_qps": 4773, "fanout_deliveries_per_second": 472800, "p50_us": 7070, "p95_us": 109940, "p99_us": 274890, "max_us": 631730, "received": 1000000, "errors": 0 },
+    { "publish_qps": 4628, "fanout_deliveries_per_second": 458636, "p50_us": 7020, "p95_us": 40150, "p99_us": 264440, "max_us": 644150, "received": 1000000, "errors": 0 },
+    { "publish_qps": 4692, "fanout_deliveries_per_second": 465230, "p50_us": 7240, "p95_us": 123170, "p99_us": 307560, "max_us": 676020, "received": 1000000, "errors": 0 }
+  ],
+  "batch32_captures": [
+    { "publish_qps": 4759, "fanout_deliveries_per_second": 471608, "p50_us": 7120, "p95_us": 136330, "p99_us": 299360, "max_us": 658970, "received": 1000000, "errors": 0 },
+    { "publish_qps": 4815, "fanout_deliveries_per_second": 477690, "p50_us": 6920, "p95_us": 118930, "p99_us": 340150, "max_us": 633110, "received": 1000000, "errors": 0 },
+    { "publish_qps": 4719, "fanout_deliveries_per_second": 467407, "p50_us": 7040, "p95_us": 158060, "p99_us": 313820, "max_us": 729370, "received": 1000000, "errors": 0 }
+  ],
+  "batch128_captures": [
+    { "publish_qps": 4723, "fanout_deliveries_per_second": 468649, "p50_us": 7050, "p95_us": 127960, "p99_us": 303550, "max_us": 653780, "received": 1000000, "errors": 0 },
+    { "publish_qps": 4746, "fanout_deliveries_per_second": 470826, "p50_us": 6850, "p95_us": 103270, "p99_us": 320250, "max_us": 689280, "received": 1000000, "errors": 0 },
+    { "publish_qps": 4671, "fanout_deliveries_per_second": 462813, "p50_us": 7040, "p95_us": 128270, "p99_us": 310360, "max_us": 716530, "received": 1000000, "errors": 0 }
+  ]
+}

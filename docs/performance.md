@@ -641,6 +641,13 @@ these Windows results are not directly comparable to the Linux capture. Raw
 results are in
 [`bench/results/realtime-shared-bytes-100x10000-windows.json`](../bench/results/realtime-shared-bytes-100x10000-windows.json).
 
+On that same Windows host and workload, writer batch limits of 32 and 128 were
+compared with the current limit of 64. The 64-frame batch had median p95/p99 of
+110/275 ms; 32 had 136/314 ms and 128 had 128/310 ms. Throughput changed by
+about 1% for both alternatives, without a tail-latency improvement. The current
+64-frame setting is retained. All captures delivered 1,000,000 messages with
+zero errors; see the [batch-size captures](../bench/results/realtime-writer-batch-size-windows-20261024.json).
+
 ## How to read the numbers
 
 - Compare the same protocol and acknowledgement semantics.
