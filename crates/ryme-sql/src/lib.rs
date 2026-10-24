@@ -18272,6 +18272,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_membership_inheritance_respects_noinherit_boundaries() {
+        let executor = Executor::new(String::from("t"), String::from("d"));
+        executor
+            .execute(parse("CREATE TABLE public.direct_docs (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("CREATE TABLE public.inherited_docs (id TEXT PRIMARY KEY)").unwrap())
+            .await
+            .unwrap();
+        executor.execute(parse("CREATE ROLE base_reader").unwrap()).await.unwrap();
+        executor.execute(parse("CREATE ROLE middle_reader").unwrap()).await.unwrap();
+        executor.execute(parse("CREATE ROLE app_user").unwrap()).await.unwrap();
+        executor
+            .execute(parse("GRANT SELECT ON TABLE public.direct_docs TO middle_reader").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT SELECT ON TABLE public.inherited_docs TO base_reader").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT base_reader TO middle_reader").unwrap())
+            .await
+            .unwrap();
+        executor
+            .execute(parse("GRANT middle_reader TO app_user").unwrap())
+            .await
+            .unwrap();
+
+        let app_user = executor.clone().with_role(String::from("app_user"));
+        assert!(app_user.can_table_privilege("public.direct_docs", "SELECT"));
+        assert!(app_user.can_table_privilege("public.inherited_docs", "SELECT"));
+
+        executor.execute(parse("ALTER ROLE middle_reader NOINHERIT").unwrap()).await.unwrap();
+        assert!(app_user.can_table_privilege("public.direct_docs", "SELECT"));
+        assert!(!app_user.can_table_privilege("public.inherited_docs", "SELECT"));
+
+        executor.execute(parse("ALTER ROLE middle_reader INHERIT").unwrap()).await.unwrap();
+        assert!(app_user.can_table_privilege("public.inherited_docs", "SELECT"));
+        executor.execute(parse("ALTER ROLE app_user NOINHERIT").unwrap()).await.unwrap();
+        assert!(!app_user.can_table_privilege("public.direct_docs", "SELECT"));
+        assert!(!app_user.can_table_privilege("public.inherited_docs", "SELECT"));
+    }
+
+    #[tokio::test]
     async fn returning_requires_select_privilege_on_mutated_rows() {
         let executor = Executor::new(String::from("t"), String::from("d"));
         executor
