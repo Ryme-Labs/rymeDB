@@ -449,12 +449,10 @@ fn select_neighbors(candidates: &[(f64, usize)], limit: usize, nodes: &[HnswNode
 }
 
 fn prune_neighbors(pos: usize, layer: usize, limit: usize, nodes: &[HnswNode]) -> Vec<usize> {
-    let mut scored: Vec<(f64, usize)> = nodes[pos]
-        .neighbors
-        .get(layer)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
+    let neighbors = nodes[pos].neighbors.get(layer).map(Vec::as_slice).unwrap_or(&[]);
+    let mut scored: Vec<(f64, usize)> = neighbors
+        .iter()
+        .copied()
         .filter(|p| nodes.get(*p).is_some_and(|n| !n.tombstoned))
         .map(|p| (dot(&nodes[pos].vector, &nodes[p].vector), p))
         .collect();

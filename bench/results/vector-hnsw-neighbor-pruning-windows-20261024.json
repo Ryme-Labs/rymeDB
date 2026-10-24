@@ -1,0 +1,88 @@
+{
+  "captured_date": "2026-10-24",
+  "description": "Three-run release-mode comparison of HNSW build time before and after scoring neighbor adjacency lists without cloning them. Local in-memory index measurements only.",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "parameters": {
+    "vectors": 5000,
+    "dimensions": 64,
+    "partitions": 1,
+    "queries": 500,
+    "top_k": 10,
+    "ann_ef": 64,
+    "vector_payload_bytes": 1280000,
+    "build_profile": "release"
+  },
+  "baseline_revision": "3411271",
+  "change": "Borrow neighbor slices during pruning instead of cloning each adjacency list.",
+  "baseline_runs": [
+    {
+      "index_build_ns": 842977600,
+      "index_build_vectors_per_second": 5931.355708621439,
+      "exact_p50_ns": 384400,
+      "exact_p99_ns": 1494400,
+      "adaptive_ann_p50_ns": 200500,
+      "adaptive_ann_p99_ns": 699500,
+      "mean_recall_at_k": 0.978999999999999
+    },
+    {
+      "index_build_ns": 1066560600,
+      "index_build_vectors_per_second": 4687.966159634999,
+      "exact_p50_ns": 438700,
+      "exact_p99_ns": 1739900,
+      "adaptive_ann_p50_ns": 213300,
+      "adaptive_ann_p99_ns": 712400,
+      "mean_recall_at_k": 0.978999999999999
+    },
+    {
+      "index_build_ns": 851369100,
+      "index_build_vectors_per_second": 5872.893437170787,
+      "exact_p50_ns": 360900,
+      "exact_p99_ns": 1757300,
+      "adaptive_ann_p50_ns": 192900,
+      "adaptive_ann_p99_ns": 772400,
+      "mean_recall_at_k": 0.978999999999999
+    }
+  ],
+  "post_change_runs": [
+    {
+      "index_build_ns": 740756300,
+      "index_build_vectors_per_second": 6749.858219228106,
+      "exact_p50_ns": 310700,
+      "exact_p99_ns": 813800,
+      "adaptive_ann_p50_ns": 171300,
+      "adaptive_ann_p99_ns": 346600,
+      "mean_recall_at_k": 0.978999999999999
+    },
+    {
+      "index_build_ns": 689337500,
+      "index_build_vectors_per_second": 7253.3410702304745,
+      "exact_p50_ns": 308000,
+      "exact_p99_ns": 785300,
+      "adaptive_ann_p50_ns": 169500,
+      "adaptive_ann_p99_ns": 320200,
+      "mean_recall_at_k": 0.978999999999999
+    },
+    {
+      "index_build_ns": 687402700,
+      "index_build_vectors_per_second": 7273.756707676592,
+      "exact_p50_ns": 309200,
+      "exact_p99_ns": 966900,
+      "adaptive_ann_p50_ns": 170000,
+      "adaptive_ann_p99_ns": 450000,
+      "mean_recall_at_k": 0.978999999999999
+    }
+  ],
+  "summary": {
+    "baseline_median_build_ns": 851369100,
+    "post_change_median_build_ns": 689337500,
+    "median_build_time_reduction_percent": 19.032,
+    "recall_at_k_unchanged": true
+  },
+  "limitations": "Index-only microbenchmark; excludes network, persistence, replication, concurrent writes, and production corpus variation. Baseline and post-change runs were not interleaved."
+}

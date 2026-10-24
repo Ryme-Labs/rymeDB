@@ -303,6 +303,15 @@ these samples, at the cost of index-build time and memory. They are not stable
 tail-latency or cross-database claims; see the [dimension profile](../bench/results/vector-hnsw-dimensions.json)
 and repeat on your own corpus.
 
+HNSW neighbor pruning now borrows each adjacency list while scoring candidates
+instead of cloning it. On Windows with an AMD Ryzen 5 4500, a three-run release
+comparison using 5,000 vectors (64 dimensions, one partition, 500 queries,
+top-k 10, `ef=64`) reduced median index build time from 851 ms to 689 ms (19%).
+Mean recall@10 remained 0.979. The build-time ranges were 843–1,067 ms before
+and 687–741 ms after; these index-only runs were not interleaved. See the
+[raw captures](../bench/results/vector-hnsw-neighbor-pruning-windows-20261024.json)
+and repeat on your own corpus.
+
 To measure full-text search when a common term matches every document:
 
 ```bash

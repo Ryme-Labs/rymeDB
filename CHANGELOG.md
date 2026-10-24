@@ -43,6 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Performance
 
+- HNSW neighbor pruning scores adjacency lists without cloning them, reducing
+  median build time by 19% in a three-run, 5,000-vector local benchmark.
 - Same-table shuffled batch reads hash primary-key bytes for duplicate detection,
   avoiding repeated hashing of tenant, database, and table components.
 - RESP benchmark percentiles now use whole pipeline-batch samples when pipelining,
