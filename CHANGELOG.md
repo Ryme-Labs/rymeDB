@@ -58,6 +58,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Transaction apply and replay now validate every key and value before mutating
+  storage, preventing malformed batches from partially changing engine state.
 - WAL retention now validates LSN ordering across all segments before deleting
   any segment.
 - HTTP authentication now accepts the standard `apikey` header, and invalid

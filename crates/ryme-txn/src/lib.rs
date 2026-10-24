@@ -86,6 +86,19 @@ fn transaction_overload(kind: &str) -> RymeError {
     RymeError::Overload(format!("transaction {kind}"))
 }
 
+fn validate_apply_writes(commit_ts: u64, writes: &BTreeMap<RecordKey, WriteOp>) -> Result<()> {
+    if commit_ts == 0 {
+        return Err(RymeError::InvalidArgument(String::from("commit_ts")));
+    }
+    for (key, op) in writes {
+        ryme_storage::validate_record_key(key)?;
+        if let Some(value) = op.value.as_deref() {
+            ryme_storage::validate_record_value(value)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     std::fs::File::open(path)?.sync_all()?;
@@ -1843,6 +1856,7 @@ impl TxnManager {
         writes: &BTreeMap<RecordKey, WriteOp>,
         keep: impl Fn(&RecordKey) -> Result<bool>,
     ) -> Result<()> {
+        validate_apply_writes(commit_ts, writes)?;
         let mut guard = self
             .inner
             .commit
@@ -1865,6 +1879,12 @@ impl TxnManager {
         committed_keys: Option<&[RecordKey]>,
         committed: &mut CommitIndex,
     ) -> Result<()> {
+        validate_apply_writes(commit_ts, writes)?;
+        if let Some(keys) = committed_keys {
+            for key in keys {
+                ryme_storage::validate_record_key(key)?;
+            }
+        }
         let mut engine = self
             .inner
             .engine
@@ -1950,6 +1970,7 @@ impl TxnManager {
         if writes.is_empty() {
             return Ok(false);
         }
+        validate_apply_writes(commit_ts, &writes)?;
         let committed_keys = writes.keys().cloned().collect();
         {
             let mut engine = self
@@ -4448,6 +4469,25 @@ mod tests {
         let mut probe = manager.begin();
         assert_eq!(manager.get(&mut probe, &fresh_key).unwrap(), None);
         assert_eq!(manager.get(&mut probe, &stale_key).unwrap(), Some(b"seed".to_vec()));
+    }
+
+    #[test]
+    fn apply_and_replay_reject_invalid_batches_without_partial_mutation() {
+        for replay in [false, true] {
+            let manager = TxnManager::new();
+            let latest_commit = manager.latest_commit();
+            let valid_key = RecordKey::new("t", "d", "s", b"a");
+            let invalid_key = RecordKey::new("t\0invalid", "d", "s", b"b");
+            let mut writes = BTreeMap::new();
+            writes.insert(valid_key.clone(), WriteOp::put(b"valid".to_vec()));
+            writes.insert(invalid_key, WriteOp::put(b"invalid".to_vec()));
+
+            let result =
+                if replay { manager.replay_at(10, &writes) } else { manager.apply_at(10, &writes) };
+            assert!(matches!(result, Err(RymeError::InvalidArgument(_))));
+            assert_eq!(manager.get(&mut manager.begin(), &valid_key).unwrap(), None);
+            assert_eq!(manager.latest_commit(), latest_commit);
+        }
     }
 
     #[test]
