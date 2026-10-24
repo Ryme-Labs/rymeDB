@@ -60,6 +60,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- PostgreSQL `INSERT`, `UPDATE`, and `DELETE ... RETURNING` now report the
+  correct `CommandComplete` tag and affected-row count.
 - Raft now rejects invalid or duplicate-ID membership configurations at encode,
   replay, and startup instead of silently normalizing conflicting addresses.
 - Fresh Raft startup rejects duplicate/local peer IDs, mismatched lists, and

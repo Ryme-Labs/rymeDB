@@ -3990,6 +3990,7 @@ where
         }
     }
     let write = statement.is_write();
+    let returning_tag = returning_command_tag(&statement);
     let table = statement.table().to_string();
     let range_keys =
         if limits.range_hook.is_armed() { statement_range_keys(&statement) } else { None };
@@ -4053,7 +4054,7 @@ where
                             table,
                             start.elapsed().as_micros() as u64,
                         );
-                        encode_result(result)
+                        encode_result_with_tag(result, returning_tag)
                     }
                     Err(error) => {
                         transaction.failed = true;
@@ -4081,7 +4082,7 @@ where
                     );
                 }
                 record_timing(limits, fingerprint, table, start.elapsed().as_micros() as u64);
-                encode_result(result)
+                encode_result_with_tag(result, returning_tag)
             }
             Err(error) => encode_error_code(error_code(&error), error.to_string()),
         }
@@ -5089,7 +5090,34 @@ fn parse_bind(payload: &[u8]) -> std::result::Result<(String, String, Vec<String
     Ok((portal, statement, params))
 }
 
+fn returning_command_tag(statement: &Statement) -> Option<&'static str> {
+    let Statement::Returning { statement, .. } = statement else {
+        return None;
+    };
+    match statement.as_ref() {
+        Statement::Insert { .. }
+        | Statement::InsertRow { .. }
+        | Statement::InsertRows { .. }
+        | Statement::InsertSelect { .. }
+        | Statement::Upsert { .. }
+        | Statement::InsertIgnore { .. }
+        | Statement::InsertConflict { .. } => Some("INSERT"),
+        Statement::Update { .. }
+        | Statement::UpdateRow { .. }
+        | Statement::UpdateWhere { .. }
+        | Statement::UpdateFrom { .. } => Some("UPDATE"),
+        Statement::Delete { .. } | Statement::DeleteWhere { .. } | Statement::DeleteUsing { .. } => {
+            Some("DELETE")
+        }
+        _ => None,
+    }
+}
+
 fn encode_result(result: QueryResult) -> Vec<u8> {
+    encode_result_with_tag(result, None)
+}
+
+fn encode_result_with_tag(result: QueryResult, returning_tag: Option<&str>) -> Vec<u8> {
     match result {
         QueryResult::Ok => command_complete("OK"),
         QueryResult::Row { pk: _, value } => {
@@ -5136,11 +5164,17 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
             if rows.iter().flatten().any(|value| !pg_text_cell_is_valid(value)) {
                 return invalid_pg_text_encoding();
             }
+            let row_count = rows.len();
+            let command_tag = match returning_tag {
+                Some("INSERT") => format!("INSERT 0 {row_count}"),
+                Some(tag) => format!("{tag} {row_count}"),
+                None => String::from("SELECT"),
+            };
             let mut out = multi_row_description(&columns);
             for row in rows {
                 out.extend(data_row_values(&row));
             }
-            out.extend(command_complete("SELECT"));
+            out.extend(command_complete(&command_tag));
             out
         }
     }
@@ -6599,6 +6633,33 @@ mod tests {
         });
         assert!(packet.windows(b"sum\0".len()).any(|window| window == b"sum\0"));
         assert!(packet.windows(4).any(|window| window == (-1i32).to_be_bytes()));
+    }
+
+    #[test]
+    fn dml_returning_uses_postgres_command_tags_and_affected_row_count() {
+        for (query, expected) in [
+            (
+                "INSERT INTO docs (id, value) VALUES ('a', 'one') RETURNING id",
+                "INSERT 0 2",
+            ),
+            (
+                "UPDATE docs SET value = 'one' WHERE id = 'a' RETURNING id",
+                "UPDATE 2",
+            ),
+            ("DELETE FROM docs WHERE id = 'a' RETURNING id", "DELETE 2"),
+        ] {
+            let statement = parse(query).unwrap();
+            let result = QueryResult::Returning {
+                columns: vec![String::from("id")],
+                rows: vec![vec![b"a".to_vec()], vec![b"b".to_vec()]],
+            };
+            let response = encode_result_with_tag(result, returning_command_tag(&statement));
+            let expected_tag = [expected.as_bytes(), &[0]].concat();
+            assert!(
+                response.windows(expected_tag.len()).any(|window| window == expected_tag),
+                "{query} should end with {expected}"
+            );
+        }
     }
 
     #[test]

@@ -37,6 +37,8 @@ PGPASSWORD="$RYME_PG_PASSWORD" psql -h db.example.com -p 5433 -U app -d app
   the deadline ends before the authenticated session begins.
 - Simple and extended query flows (`Parse`, `Bind`, `Describe`, `Execute`,
   `Sync`) with prepared portal invalidation.
+- `INSERT`, `UPDATE`, and `DELETE ... RETURNING` preserve the mutation command
+  tag and affected-row count in PostgreSQL `CommandComplete` responses.
 - Extended `Execute` supports `max_rows = 0` (unbounded execution); positive
   row limits are explicitly rejected with `0A000` because portal suspension is
   not implemented.
