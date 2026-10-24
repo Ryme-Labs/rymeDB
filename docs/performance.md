@@ -871,6 +871,13 @@ four-way scan is retained; results cover a warmed, single-threaded 100-row page
 over 10,000 snapshot rows with no concurrent writers. This is not evidence of a
 general database-wide speedup. See the [raw captures](../bench/results/segment-scan-four-way-merge-windows-20261024.json).
 
+A candidate that removed `SegmentBatchKey`'s enum discriminant from hashing did
+not show a reliable gain. In Standard mode, repeated-key batch median p50
+improved 1.9% while p95 regressed 2.2%; the 1,024-key unique workload changed
+less than 0.5% at both p50 and p95. The candidate was discarded. Captures were
+grouped by variant instead of alternating, so treat this as directional
+evidence only. See the [raw captures](../bench/results/segment-batch-key-hash-discriminant-windows-20261024.json).
+
 ## How to read the numbers
 
 - Compare the same protocol and acknowledgement semantics.

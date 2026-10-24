@@ -1,0 +1,67 @@
+{
+  "experiment": "segment-batch-key-hash-discriminant",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "9a3a930",
+  "candidate_revision": "working-tree-experiment",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "workload": {
+    "benchmark": "ryme-bench txn-read-batch",
+    "storage_mode": "standard",
+    "durability": "WAL and segment sync disabled",
+    "iterations": 100,
+    "batch_size": 256,
+    "candidates_per_iteration": 1024,
+    "value_bytes": 128,
+    "repeated_keys": {"records": 64, "segment_count": 8},
+    "unique_keys": {"records": 1024, "segment_count": 80},
+    "measured_path": "shuffled read-only batch p50/p95/p99; warmed in-process transaction and segment path"
+  },
+  "candidate_change": "Manually hash the selected SegmentBatchKey payload without the enum discriminant; equality and key variants remained unchanged.",
+  "summary": {
+    "repeated_keys": {
+      "baseline_median_p50_ns": 207400,
+      "candidate_median_p50_ns": 203500,
+      "p50_change_percent": -1.9,
+      "baseline_median_p95_ns": 250400,
+      "candidate_median_p95_ns": 255800,
+      "p95_change_percent": 2.2
+    },
+    "unique_keys": {
+      "baseline_median_p50_ns": 1184300,
+      "candidate_median_p50_ns": 1181100,
+      "p50_change_percent": -0.3,
+      "baseline_median_p95_ns": 1385500,
+      "candidate_median_p95_ns": 1392600,
+      "p95_change_percent": 0.5
+    }
+  },
+  "captures": {
+    "repeated_keys_baseline": [
+      {"p50_ns":206300,"p95_ns":228800,"p99_ns":295700},
+      {"p50_ns":207400,"p95_ns":269200,"p99_ns":322600},
+      {"p50_ns":207700,"p95_ns":250400,"p99_ns":261400}
+    ],
+    "repeated_keys_candidate": [
+      {"p50_ns":200900,"p95_ns":224100,"p99_ns":308700},
+      {"p50_ns":203500,"p95_ns":270800,"p99_ns":367700},
+      {"p50_ns":207100,"p95_ns":255800,"p99_ns":289500}
+    ],
+    "unique_keys_baseline": [
+      {"p50_ns":1184300,"p95_ns":1401500,"p99_ns":1483800},
+      {"p50_ns":1181700,"p95_ns":1379900,"p99_ns":1461400},
+      {"p50_ns":1191500,"p95_ns":1385500,"p99_ns":1627200}
+    ],
+    "unique_keys_candidate": [
+      {"p50_ns":1175600,"p95_ns":1392600,"p99_ns":1739400},
+      {"p50_ns":1181100,"p95_ns":1417500,"p99_ns":1561700},
+      {"p50_ns":1184900,"p95_ns":1381300,"p99_ns":1487300}
+    ]
+  },
+  "decision": "Discarded. The candidate did not show a reliable material gain across repeated and unique-key Standard batches. The six baseline captures preceded the six candidate captures rather than alternating; this is directional evidence, not a controlled paired result.",
+  "notes": "Single-host, warmed in-process benchmark; excludes network latency, durable sync, cold disk, and concurrent writers."
+}
