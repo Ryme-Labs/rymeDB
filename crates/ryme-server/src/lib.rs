@@ -1977,6 +1977,7 @@ impl SharedState {
         self.data_dir.join("branch-schemas").join(tenant).join(format!("{branch}.json"))
     }
 
+    #[cfg(test)]
     fn persist_auth(&self) -> ryme_error::Result<()> {
         let _persist_guard = self
             .auth_persist_lock
@@ -2138,6 +2139,50 @@ impl SharedState {
             if !replaced {
                 self.keys.remove(&key);
                 oidc_states.restore(state_id.to_string(), pending);
+            }
+            return Err(error);
+        }
+        Ok((key, tenant))
+    }
+
+    fn verify_passkey_and_issue_api_key(
+        &self,
+        assertion: &ryme_auth::PasskeyAssertion<'_>,
+        now_secs: u64,
+    ) -> ryme_error::Result<(String, String)> {
+        let _persist_guard = self
+            .auth_persist_lock
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+        let principal = self
+            .credentials
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?
+            .principal(assertion.user)?;
+        let mut passkeys = self
+            .passkeys
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
+        let mut staged = passkeys.clone();
+        staged.verify_assertion(assertion).map_err(|error| match error {
+            ryme_error::RymeError::InvalidArgument(_) => ryme_error::RymeError::Unauthorized,
+            error => error,
+        })?;
+        let (key, tenant) = issue_api_key(&self.keys, &principal, now_secs)?;
+        let snapshot = match self.auth_snapshot(None, Some(staged.snapshot())) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.keys.remove(&key);
+                return Err(error);
+            }
+        };
+        let mut replaced = false;
+        if let Err(error) = self.persist_auth_snapshot_locked(snapshot, || {
+            *passkeys = staged;
+            replaced = true;
+        }) {
+            if !replaced {
+                self.keys.remove(&key);
             }
             return Err(error);
         }
@@ -8027,53 +8072,31 @@ async fn passkey_verify(
     };
     let rp_id = state.passkey_rp_id.clone();
     let origins = state.passkey_origins.clone();
-    let keys = state.keys.clone();
-    let mut registry = match state.passkeys.lock() {
-        Ok(registry) => registry,
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
+    let assertion = ryme_auth::PasskeyAssertion {
+        user: &request.user,
+        credential_id: &request.credential_id,
+        authenticator_data: &authenticator_data,
+        client_data_json: &client_data_json,
+        signature_der: &signature,
+        rp_id: &rp_id,
+        origins: &origins,
+        now_secs: ryme_txn::now_unix(),
     };
-    if registry
-        .verify_assertion(&ryme_auth::PasskeyAssertion {
-            user: &request.user,
-            credential_id: &request.credential_id,
-            authenticator_data: &authenticator_data,
-            client_data_json: &client_data_json,
-            signature_der: &signature,
-            rp_id: &rp_id,
-            origins: &origins,
-            now_secs: ryme_txn::now_unix(),
-        })
-        .is_err()
-    {
-        return error_response(ryme_error::RymeError::Unauthorized);
-    }
-    drop(registry);
-    let principal = match state.credentials.lock() {
-        Ok(store) => store.principal(&request.user),
-        Err(_) => return error_response(ryme_error::RymeError::Internal(String::from("lock"))),
-    };
-    let principal = match principal {
-        Ok(principal) => principal,
-        Err(e) => return error_response(e),
-    };
-    let now = ryme_txn::now_unix();
-    let (key, tenant) = match issue_api_key(&keys, &principal, now) {
-        Ok(issued) => issued,
-        Err(error) => return error_response(error),
-    };
+    let (key, tenant) =
+        match state.verify_passkey_and_issue_api_key(&assertion, assertion.now_secs) {
+            Ok(issued) => issued,
+            Err(error) => return error_response(error),
+        };
     complete_auth_attempt(&state, &attempt_key, client_ip.address);
-    match state.persist_auth() {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "key": key,
-                "tenant": tenant,
-                "expires_in": ACCESS_TOKEN_TTL_SECS,
-            })),
-        )
-            .into_response(),
-        Err(e) => error_response(e),
-    }
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "key": key,
+            "tenant": tenant,
+            "expires_in": ACCESS_TOKEN_TTL_SECS,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -16645,6 +16668,85 @@ mod realtime_policy_tests {
             .into_keys()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(keys_after, keys_before);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_passkey_persistence_preserves_challenge_counter_and_api_keys() {
+        use p256::ecdsa::signature::Signer;
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-passkey-verify-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+        let user = ryme_auth::StoredUser {
+            tenant: String::from("default"),
+            roles: [Role::ReadWrite].into_iter().collect(),
+            password: None,
+            otp_secret: None,
+            otp_last_used_step: None,
+        };
+        *state.credentials.lock().unwrap() =
+            ryme_auth::CredentialStore::from_snapshot(HashMap::from([(String::from("ada"), user)]))
+                .unwrap();
+
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+        let public_key = signing_key.verifying_key().to_sec1_point(false).as_bytes().to_vec();
+        let now_secs = ryme_txn::now_unix();
+        let mut registry = ryme_auth::PasskeyRegistry::new();
+        registry.register("ada", String::from("credential"), &public_key).unwrap();
+        let challenge = registry.challenge_at("ada", now_secs).unwrap();
+        *state.passkeys.lock().unwrap() = registry;
+
+        let rp_id = "auth.test";
+        let origins = vec![String::from("https://auth.test")];
+        let client_data = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{challenge}\",\"origin\":\"https://auth.test\"}}"
+        );
+        let mut authenticator_data = Sha256::digest(rp_id.as_bytes()).to_vec();
+        authenticator_data.push(0x01);
+        authenticator_data.extend_from_slice(&1u32.to_be_bytes());
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&Sha256::digest(client_data.as_bytes()));
+        let signature: p256::ecdsa::Signature = signing_key.sign(&signed);
+        let signature = signature.to_der().as_bytes().to_vec();
+        let assertion = ryme_auth::PasskeyAssertion {
+            user: "ada",
+            credential_id: "credential",
+            authenticator_data: &authenticator_data,
+            client_data_json: client_data.as_bytes(),
+            signature_der: &signature,
+            rp_id,
+            origins: &origins,
+            now_secs,
+        };
+        let keys_before = state
+            .keys
+            .snapshot()
+            .unwrap()
+            .into_keys()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(state.verify_passkey_and_issue_api_key(&assertion, now_secs).is_err());
+        std::fs::remove_dir_all(&state.auth_path).unwrap();
+        let (key, tenant) = state.verify_passkey_and_issue_api_key(&assertion, now_secs).unwrap();
+        assert_eq!(tenant, "default");
+        assert!(state.keys.authenticate(&key).is_ok());
+        assert_eq!(state.passkeys.lock().unwrap().snapshot()["credential"].sign_count, 1);
+        let keys_after = state
+            .keys
+            .snapshot()
+            .unwrap()
+            .into_keys()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys_after.len(), keys_before.len() + 1);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

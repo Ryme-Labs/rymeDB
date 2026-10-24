@@ -57,6 +57,8 @@ All notable changes to rymeDB are recorded here. Format follows
   persistence cannot activate undisclosed secrets or leave volatile accounts.
 - OIDC login now consumes its nonce state and publishes its API key together,
   restoring both when auth snapshot persistence fails before replacement.
+- Passkey verification now commits challenge consumption, the authenticator
+  counter, and its API key together, preserving all three on a failed save.
 - Storage segment merges now validate every key history before appending, so a
   late timestamp conflict cannot leave an in-memory engine partially merged.
 - Raft peer dialing now tries all resolved address families, so DNS names work
