@@ -681,6 +681,7 @@ async fn stream_ops() {
         "*1\r\n*2\r\n$5\r\n100-2\r\n*2\r\n$1\r\nf\r\n$1\r\nb"
     );
     assert_eq!(command(addr, &["XRANGE", "st", "-", "+", "COUNT", "0"]).await, "*-1");
+    assert_eq!(command(addr, &["XRANGE", "st", "-", "+", "COUNT", "-1"]).await, "*-1");
     assert_eq!(
         command(addr, &["XREVRANGE", "st", "+", "-", "COUNT", "0"]).await,
         "*-1"
@@ -733,6 +734,12 @@ async fn stream_reads_treat_zero_count_as_unlimited() {
         xread.contains("$3\r\n1-1") && xread.contains("$3\r\n2-2"),
         "XREAD: {xread}"
     );
+    let negative_xread =
+        command(addr, &["XREAD", "COUNT", "-1", "STREAMS", "read-zero", "0-0"]).await;
+    assert!(
+        negative_xread.contains("$3\r\n1-1") && negative_xread.contains("$3\r\n2-2"),
+        "XREAD: {negative_xread}"
+    );
 
     assert_eq!(
         command(addr, &["XGROUP", "CREATE", "read-zero", "group-zero", "0-0"]).await,
@@ -756,6 +763,30 @@ async fn stream_reads_treat_zero_count_as_unlimited() {
     assert!(
         xreadgroup.contains("$3\r\n1-1") && xreadgroup.contains("$3\r\n2-2"),
         "XREADGROUP: {xreadgroup}"
+    );
+    assert_eq!(
+        command(addr, &["XGROUP", "CREATE", "read-zero", "group-negative", "0-0"]).await,
+        "+OK"
+    );
+    let negative_xreadgroup = command(
+        addr,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "group-negative",
+            "consumer-negative",
+            "COUNT",
+            "-1",
+            "STREAMS",
+            "read-zero",
+            ">",
+        ],
+    )
+    .await;
+    assert!(
+        negative_xreadgroup.contains("$3\r\n1-1")
+            && negative_xreadgroup.contains("$3\r\n2-2"),
+        "XREADGROUP: {negative_xreadgroup}"
     );
 }
 

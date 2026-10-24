@@ -3962,7 +3962,8 @@ where
             index += 1;
             let raw = args.get(index).ok_or_else(|| String::from("syntax"))?;
             let text = std::str::from_utf8(raw).map_err(|_| String::from("syntax"))?;
-            count = Some(text.parse::<usize>().map_err(|_| String::from("syntax"))?.min(10_000));
+            let parsed = text.parse::<i64>().map_err(|_| String::from("syntax"))?;
+            count = Some((parsed.max(0) as usize).min(10_000));
             index += 1;
         }
         let data = match self.read_stream(txn, &args[0])? {
@@ -4054,8 +4055,8 @@ where
                 index += 1;
                 let raw = args.get(index).ok_or_else(|| String::from("syntax"))?;
                 let text = std::str::from_utf8(raw).map_err(|_| String::from("syntax"))?;
-                count =
-                    Some(text.parse::<usize>().map_err(|_| String::from("syntax"))?.min(10_000));
+                let parsed = text.parse::<i64>().map_err(|_| String::from("syntax"))?;
+                count = Some((parsed.max(0) as usize).min(10_000));
                 index += 1;
                 continue;
             }
