@@ -66,6 +66,8 @@ All notable changes to rymeDB are recorded here. Format follows
   objects when an archive fails before manifest publication. Automatic
   archives now reuse the existing `auto-{commit_ts}` manifest at an unchanged
   commit.
+- New archive IDs now reject backslashes for portability to local storage;
+  existing S3 manifests with backslashes remain readable.
 - RESP `XINFO STREAM FULL` now defaults to 10 entries, treats `COUNT 0` as all
   entries, and treats negative counts as the default.
 - RESP `XAUTOCLAIM` now removes deleted stream entries from the consumer

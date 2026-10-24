@@ -93,6 +93,11 @@ published, the archiver attempts to remove the objects it uploaded. When no ID
 is supplied, repeated archive requests at the same commit reuse the existing
 `auto-{commit timestamp}` backup.
 
+New backup IDs may be up to 128 bytes and cannot contain `/`, `\`, or `..`.
+Backslashes are rejected so IDs created on S3 remain portable to local archive
+storage across operating systems. Existing S3 manifests with backslashes remain
+readable, but those IDs cannot be used for new archives.
+
 ## Restore
 
 Always stop application writes or put the service in a controlled maintenance

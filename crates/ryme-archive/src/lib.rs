@@ -131,6 +131,10 @@ fn valid_backup_id(backup_id: &str) -> bool {
         && !backup_id.contains("..")
 }
 
+fn valid_new_backup_id(backup_id: &str) -> bool {
+    valid_backup_id(backup_id) && !backup_id.contains('\\')
+}
+
 fn valid_sha256(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -284,7 +288,7 @@ impl<S: ObjectStore> Archiver<S> {
         I: IntoIterator<Item = Result<(String, Vec<u8>)>>,
         F: Fn(&[u8]) -> Result<(Vec<u8>, Option<FileEncryption>)> + Send + Sync,
     {
-        if !valid_backup_id(backup_id) {
+        if !valid_new_backup_id(backup_id) {
             return Err(RymeError::InvalidArgument(String::from("backup_id")));
         }
         let files = files.into_iter();
@@ -528,6 +532,20 @@ pub async fn copy_backup<S: ObjectStore, D: ObjectStore>(
 mod tests {
     use super::*;
     use crate::local::LocalStore;
+
+    #[test]
+    fn new_backup_ids_are_portable_and_legacy_ids_remain_valid() {
+        assert!(!valid_new_backup_id(r"legacy\id"));
+        assert!(valid_backup_id(r"legacy\id"));
+
+        let manifest = BackupManifest {
+            backup_id: String::from(r"legacy\id"),
+            commit_ts: 1,
+            created_unix: 1,
+            files: Vec::new(),
+        };
+        assert!(validate_manifest(&manifest.manifest_key(), &manifest).is_ok());
+    }
 
     #[tokio::test]
     async fn archive_restore_roundtrip() {
