@@ -16,7 +16,7 @@ const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
 const MIN_SEGMENT_DEDUP_BATCH_READ: usize = 16;
-const SEGMENT_CACHE_BULK_READ_CHUNK: usize = 8;
+const SEGMENT_CACHE_BULK_READ_CHUNK: usize = 16;
 const MAX_DELTA_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
@@ -2382,7 +2382,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.apply(key.clone(), 1, Some(b"old".to_vec())).unwrap();
         store.write(1, &engine).unwrap();
-        for commit_ts in 2..=10 {
+        for commit_ts in 2..=20 {
             store
                 .write_delta(
                     commit_ts,
@@ -2400,12 +2400,19 @@ mod tests {
         let before = store.cache_stats();
         let batch = vec![key; MIN_SEGMENT_DEDUP_BATCH_READ];
         assert_eq!(
-            store.get_many(&batch, 10, 0).unwrap(),
-            vec![Some(b"10".to_vec()); MIN_SEGMENT_DEDUP_BATCH_READ]
+            store.get_many(&batch, 20, 0).unwrap(),
+            vec![Some(b"20".to_vec()); MIN_SEGMENT_DEDUP_BATCH_READ]
         );
         let after = store.cache_stats();
         assert_eq!(after.hits - before.hits, 1);
         assert_eq!(after.misses - before.misses, 0);
+        assert_eq!(
+            store.get_many(&batch, 1, 0).unwrap(),
+            vec![Some(b"old".to_vec()); MIN_SEGMENT_DEDUP_BATCH_READ]
+        );
+        let after_cross_chunk_read = store.cache_stats();
+        assert_eq!(after_cross_chunk_read.hits - after.hits, 20);
+        assert_eq!(after_cross_chunk_read.misses - after.misses, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

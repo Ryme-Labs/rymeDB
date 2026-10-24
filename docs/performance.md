@@ -54,18 +54,19 @@ smoke benchmark, not a production or cross-database comparison; see the
 [raw captures](../bench/results/resp-mget-standard-8clients.json).
 
 Large Standard-mode key batches now inspect cached segments in windows of
-eight, updating hit and LRU state only for segments the read visits. On the
+sixteen, updating hit and LRU state only for segments the read visits. On the
 Windows Ryzen 5 4500, two baseline and three candidate release captures of an
 eight-client localhost workload (80 SET commits over 16 keys, then 16-key MGET,
 16,000 commands per capture, one shard, memory durability, dedicated-cluster
-QoS) measured median throughput rising from 34.8k to 42.3k commands/s. Median
-p50 fell from 212 to 172 µs and p99 from 473 to 406 µs, with zero failures.
+QoS) measured median throughput rising from 34.8k to 41.9k commands/s. Median
+p50 fell from 212 to 176 µs and p99 from 473 to 407 µs, with zero failures.
 The candidate restarted against the same persisted data with an empty process
 cache; a 16,000-command warm-up preceded the three measured captures. These are
 local RESP results, not durable-write or cross-database evidence. A separate
-in-process 80-segment batch-read workload targeting older records measured median p50 rising from 36.1 to 40.5 µs (12%);
-the optimization trades some serial deep-chain batch latency for better
-multi-client MGET throughput and tail latency. Single and small-batch reads
+in-process 80-segment batch-read workload targeting older records measured median
+p50 rising from 36.1 to 38.2 µs (6%), down from 40.5 µs (12%) with eight-entry
+windows. The tuned setting retains the measured multi-client MGET gains while
+reducing the serial deep-chain cost. Single and small-batch reads
 retain their point-cache lookup path. See the [raw before/after captures](../bench/results/resp-mget-standard-segment-cache-prefetch-windows-20261024.json).
 The earlier eager-cache measurements in
 [this capture](../bench/results/resp-mget-standard-80segments-8clients.json)

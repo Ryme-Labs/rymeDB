@@ -21,7 +21,7 @@
                      "commands_per_capture":  16000,
                      "pipeline":  1,
                      "latency_unit":  "command round trip",
-                     "cache":  "candidate was restarted against the same persisted segment set, then given a 16000-command warm-up before three measured captures"
+                     "cache":  "baseline 8-window and candidate 16-window captures used the same 80-segment data; the 16-window candidate was restarted with an empty process cache, then received a 16000-command warm-up before measured captures"
                  },
     "summary":  {
                     "network_mget":  {
@@ -497,8 +497,30 @@
                                                                                  "storage_mode":  "standard",
                                                                                  "value_bytes":  128
                                                                              }
-                                                                         ]
-                                              }
+                                                                         ],
+                                                  "window_16_candidate_median_p50_ns":  38200
+                                              },
+                    "window_16_network":  {
+                                              "captures":  3,
+                                              "p50_us":  [
+                                                             176,
+                                                             176,
+                                                             173
+                                                         ],
+                                              "p99_us":  [
+                                                             413,
+                                                             390,
+                                                             407
+                                                         ],
+                                              "qps":  [
+                                                          41238,
+                                                          41905,
+                                                          41893
+                                                      ],
+                                              "median_p50_us":  176,
+                                              "median_p99_us":  407,
+                                              "median_qps":  41893
+                                          }
                 },
     "warmup":  {
                    "attempted_qps":  29799,
@@ -1025,5 +1047,585 @@
                                  "target":  "127.0.0.1:6390",
                                  "workload":  "mget"
                              }
-                         ]
+                         ],
+    "window_16_warmup":  {
+                             "attempted_qps":  41715,
+                             "errors":  0,
+                             "failed_ops":  0,
+                             "latency_histogram_us":  [
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  10
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  25
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  50
+                                                          },
+                                                          {
+                                                              "count":  172,
+                                                              "le_us":  100
+                                                          },
+                                                          {
+                                                              "count":  13488,
+                                                              "le_us":  250
+                                                          },
+                                                          {
+                                                              "count":  2304,
+                                                              "le_us":  500
+                                                          },
+                                                          {
+                                                              "count":  28,
+                                                              "le_us":  1000
+                                                          },
+                                                          {
+                                                              "count":  8,
+                                                              "le_us":  2500
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  5000
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  10000
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  25000
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  50000
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  100000
+                                                          },
+                                                          {
+                                                              "count":  0,
+                                                              "le_us":  "+Inf"
+                                                          }
+                                                      ],
+                             "latency_sample_unit":  "command",
+                             "latency_samples":  16000,
+                             "machine":  {
+                                             "arch":  "x86_64",
+                                             "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                             "logical_cpus":  12,
+                                             "os":  "windows"
+                                         },
+                             "max_us":  2062,
+                             "mean_us":  190,
+                             "mget_keys_per_command":  16,
+                             "ops":  16000,
+                             "p50_us":  174,
+                             "p90_us":  273,
+                             "p95_us":  311,
+                             "p999_us":  574,
+                             "p99_us":  398,
+                             "pipeline":  1,
+                             "qps":  41715,
+                             "requested_ops":  16000,
+                             "seconds":  0.384,
+                             "successful_ops":  16000,
+                             "target":  "127.0.0.1:6390",
+                             "workload":  "mget"
+                         },
+    "window_16_network_captures":  [
+                                       {
+                                           "attempted_qps":  41238,
+                                           "errors":  0,
+                                           "failed_ops":  0,
+                                           "latency_histogram_us":  [
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  10
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  25
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  50
+                                                                        },
+                                                                        {
+                                                                            "count":  216,
+                                                                            "le_us":  100
+                                                                        },
+                                                                        {
+                                                                            "count":  13153,
+                                                                            "le_us":  250
+                                                                        },
+                                                                        {
+                                                                            "count":  2587,
+                                                                            "le_us":  500
+                                                                        },
+                                                                        {
+                                                                            "count":  44,
+                                                                            "le_us":  1000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  2500
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  5000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  10000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  25000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  50000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  100000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  "+Inf"
+                                                                        }
+                                                                    ],
+                                           "latency_sample_unit":  "command",
+                                           "latency_samples":  16000,
+                                           "machine":  {
+                                                           "arch":  "x86_64",
+                                                           "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                           "logical_cpus":  12,
+                                                           "os":  "windows"
+                                                       },
+                                           "max_us":  695,
+                                           "mean_us":  192,
+                                           "mget_keys_per_command":  16,
+                                           "ops":  16000,
+                                           "p50_us":  176,
+                                           "p90_us":  281,
+                                           "p95_us":  321,
+                                           "p999_us":  551,
+                                           "p99_us":  413,
+                                           "pipeline":  1,
+                                           "qps":  41238,
+                                           "requested_ops":  16000,
+                                           "seconds":  0.388,
+                                           "successful_ops":  16000,
+                                           "target":  "127.0.0.1:6390",
+                                           "workload":  "mget"
+                                       },
+                                       {
+                                           "attempted_qps":  41905,
+                                           "errors":  0,
+                                           "failed_ops":  0,
+                                           "latency_histogram_us":  [
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  10
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  25
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  50
+                                                                        },
+                                                                        {
+                                                                            "count":  221,
+                                                                            "le_us":  100
+                                                                        },
+                                                                        {
+                                                                            "count":  13406,
+                                                                            "le_us":  250
+                                                                        },
+                                                                        {
+                                                                            "count":  2349,
+                                                                            "le_us":  500
+                                                                        },
+                                                                        {
+                                                                            "count":  24,
+                                                                            "le_us":  1000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  2500
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  5000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  10000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  25000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  50000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  100000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  "+Inf"
+                                                                        }
+                                                                    ],
+                                           "latency_sample_unit":  "command",
+                                           "latency_samples":  16000,
+                                           "machine":  {
+                                                           "arch":  "x86_64",
+                                                           "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                           "logical_cpus":  12,
+                                                           "os":  "windows"
+                                                       },
+                                           "max_us":  767,
+                                           "mean_us":  189,
+                                           "mget_keys_per_command":  16,
+                                           "ops":  16000,
+                                           "p50_us":  176,
+                                           "p90_us":  272,
+                                           "p95_us":  308,
+                                           "p999_us":  530,
+                                           "p99_us":  390,
+                                           "pipeline":  1,
+                                           "qps":  41905,
+                                           "requested_ops":  16000,
+                                           "seconds":  0.382,
+                                           "successful_ops":  16000,
+                                           "target":  "127.0.0.1:6390",
+                                           "workload":  "mget"
+                                       },
+                                       {
+                                           "attempted_qps":  41893,
+                                           "errors":  0,
+                                           "failed_ops":  0,
+                                           "latency_histogram_us":  [
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  10
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  25
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  50
+                                                                        },
+                                                                        {
+                                                                            "count":  232,
+                                                                            "le_us":  100
+                                                                        },
+                                                                        {
+                                                                            "count":  13326,
+                                                                            "le_us":  250
+                                                                        },
+                                                                        {
+                                                                            "count":  2415,
+                                                                            "le_us":  500
+                                                                        },
+                                                                        {
+                                                                            "count":  27,
+                                                                            "le_us":  1000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  2500
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  5000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  10000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  25000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  50000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  100000
+                                                                        },
+                                                                        {
+                                                                            "count":  0,
+                                                                            "le_us":  "+Inf"
+                                                                        }
+                                                                    ],
+                                           "latency_sample_unit":  "command",
+                                           "latency_samples":  16000,
+                                           "machine":  {
+                                                           "arch":  "x86_64",
+                                                           "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                           "logical_cpus":  12,
+                                                           "os":  "windows"
+                                                       },
+                                           "max_us":  656,
+                                           "mean_us":  189,
+                                           "mget_keys_per_command":  16,
+                                           "ops":  16000,
+                                           "p50_us":  173,
+                                           "p90_us":  276,
+                                           "p95_us":  316,
+                                           "p999_us":  550,
+                                           "p99_us":  407,
+                                           "pipeline":  1,
+                                           "qps":  41893,
+                                           "requested_ops":  16000,
+                                           "seconds":  0.382,
+                                           "successful_ops":  16000,
+                                           "target":  "127.0.0.1:6390",
+                                           "workload":  "mget"
+                                       }
+                                   ],
+    "window_16_transaction_captures":  {
+                                           "captures":  3,
+                                           "read_only_batch_p50_ns":  [
+                                                                          38200,
+                                                                          38600,
+                                                                          38100
+                                                                      ],
+                                           "median_read_only_batch_p50_ns":  38200,
+                                           "single_read_p50_ns":  [
+                                                                      233400,
+                                                                      233500,
+                                                                      233700
+                                                                  ],
+                                           "median_single_read_p50_ns":  233500,
+                                           "raw":  [
+                                                       {
+                                                           "batch_size":  16,
+                                                           "batched_read":  {
+                                                                                "p50_ns":  44200,
+                                                                                "p95_ns":  47400,
+                                                                                "p99_ns":  52100,
+                                                                                "rows_per_second":  362148
+                                                                            },
+                                                           "benchmark":  "transaction-batch-read",
+                                                           "candidates_per_iteration":  16,
+                                                           "distinct_keys_per_iteration":  16,
+                                                           "durability":  "wal_and_segment_sync_disabled",
+                                                           "iterations":  120,
+                                                           "machine":  {
+                                                                           "arch":  "x86_64",
+                                                                           "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                           "logical_cpus":  12,
+                                                                           "os":  "windows"
+                                                                       },
+                                                           "p50_speedup":  5.42,
+                                                           "read_only_batch_p50_speedup":  6.11,
+                                                           "read_only_batched_read":  {
+                                                                                          "p50_ns":  38200,
+                                                                                          "p95_ns":  39100,
+                                                                                          "p99_ns":  41400,
+                                                                                          "rows_per_second":  424591
+                                                                                      },
+                                                           "read_only_p50_speedup":  1.03,
+                                                           "read_only_single_read":  {
+                                                                                         "p50_ns":  233400,
+                                                                                         "p95_ns":  242400,
+                                                                                         "p99_ns":  269900,
+                                                                                         "rows_per_second":  67331
+                                                                                     },
+                                                           "records":  80,
+                                                           "reversed_read_only_batch_p50_speedup":  6.16,
+                                                           "reversed_read_only_batched_read":  {
+                                                                                                   "p50_ns":  37900,
+                                                                                                   "p95_ns":  39000,
+                                                                                                   "p99_ns":  42900,
+                                                                                                   "rows_per_second":  426648
+                                                                                               },
+                                                           "segment_count":  80,
+                                                           "shuffled_read_only_batched_read":  {
+                                                                                                   "p50_ns":  40900,
+                                                                                                   "p95_ns":  44300,
+                                                                                                   "p99_ns":  49300,
+                                                                                                   "rows_per_second":  392261
+                                                                                               },
+                                                           "single_read":  {
+                                                                               "p50_ns":  239700,
+                                                                               "p95_ns":  251800,
+                                                                               "p99_ns":  304000,
+                                                                               "rows_per_second":  65817
+                                                                           },
+                                                           "staged_write_batch_p50_speedup":  5.39,
+                                                           "staged_write_batched_read":  {
+                                                                                             "p50_ns":  44600,
+                                                                                             "p95_ns":  47900,
+                                                                                             "p99_ns":  50400,
+                                                                                             "rows_per_second":  360117
+                                                                                         },
+                                                           "staged_write_single_read":  {
+                                                                                            "p50_ns":  240200,
+                                                                                            "p95_ns":  248400,
+                                                                                            "p99_ns":  262900,
+                                                                                            "rows_per_second":  66316
+                                                                                        },
+                                                           "storage_mode":  "standard",
+                                                           "value_bytes":  128
+                                                       },
+                                                       {
+                                                           "batch_size":  16,
+                                                           "batched_read":  {
+                                                                                "p50_ns":  44900,
+                                                                                "p95_ns":  53500,
+                                                                                "p99_ns":  57900,
+                                                                                "rows_per_second":  353422
+                                                                            },
+                                                           "benchmark":  "transaction-batch-read",
+                                                           "candidates_per_iteration":  16,
+                                                           "distinct_keys_per_iteration":  16,
+                                                           "durability":  "wal_and_segment_sync_disabled",
+                                                           "iterations":  120,
+                                                           "machine":  {
+                                                                           "arch":  "x86_64",
+                                                                           "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                           "logical_cpus":  12,
+                                                                           "os":  "windows"
+                                                                       },
+                                                           "p50_speedup":  5.35,
+                                                           "read_only_batch_p50_speedup":  6.05,
+                                                           "read_only_batched_read":  {
+                                                                                          "p50_ns":  38600,
+                                                                                          "p95_ns":  44400,
+                                                                                          "p99_ns":  46800,
+                                                                                          "rows_per_second":  408146
+                                                                                      },
+                                                           "read_only_p50_speedup":  1.03,
+                                                           "read_only_single_read":  {
+                                                                                         "p50_ns":  233500,
+                                                                                         "p95_ns":  282100,
+                                                                                         "p99_ns":  366300,
+                                                                                         "rows_per_second":  66615
+                                                                                     },
+                                                           "records":  80,
+                                                           "reversed_read_only_batch_p50_speedup":  6.08,
+                                                           "reversed_read_only_batched_read":  {
+                                                                                                   "p50_ns":  38400,
+                                                                                                   "p95_ns":  42300,
+                                                                                                   "p99_ns":  47600,
+                                                                                                   "rows_per_second":  412132
+                                                                                               },
+                                                           "segment_count":  80,
+                                                           "shuffled_read_only_batched_read":  {
+                                                                                                   "p50_ns":  41200,
+                                                                                                   "p95_ns":  49400,
+                                                                                                   "p99_ns":  54700,
+                                                                                                   "rows_per_second":  384569
+                                                                                               },
+                                                           "single_read":  {
+                                                                               "p50_ns":  240200,
+                                                                               "p95_ns":  250800,
+                                                                               "p99_ns":  330600,
+                                                                               "rows_per_second":  65291
+                                                                           },
+                                                           "staged_write_batch_p50_speedup":  5.29,
+                                                           "staged_write_batched_read":  {
+                                                                                             "p50_ns":  45500,
+                                                                                             "p95_ns":  48800,
+                                                                                             "p99_ns":  65300,
+                                                                                             "rows_per_second":  348521
+                                                                                         },
+                                                           "staged_write_single_read":  {
+                                                                                            "p50_ns":  240700,
+                                                                                            "p95_ns":  283700,
+                                                                                            "p99_ns":  334800,
+                                                                                            "rows_per_second":  64724
+                                                                                        },
+                                                           "storage_mode":  "standard",
+                                                           "value_bytes":  128
+                                                       },
+                                                       {
+                                                           "batch_size":  16,
+                                                           "batched_read":  {
+                                                                                "p50_ns":  44200,
+                                                                                "p95_ns":  45400,
+                                                                                "p99_ns":  47900,
+                                                                                "rows_per_second":  361964
+                                                                            },
+                                                           "benchmark":  "transaction-batch-read",
+                                                           "candidates_per_iteration":  16,
+                                                           "distinct_keys_per_iteration":  16,
+                                                           "durability":  "wal_and_segment_sync_disabled",
+                                                           "iterations":  120,
+                                                           "machine":  {
+                                                                           "arch":  "x86_64",
+                                                                           "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                           "logical_cpus":  12,
+                                                                           "os":  "windows"
+                                                                       },
+                                                           "p50_speedup":  5.43,
+                                                           "read_only_batch_p50_speedup":  6.13,
+                                                           "read_only_batched_read":  {
+                                                                                          "p50_ns":  38100,
+                                                                                          "p95_ns":  38500,
+                                                                                          "p99_ns":  48600,
+                                                                                          "rows_per_second":  421932
+                                                                                      },
+                                                           "read_only_p50_speedup":  1.03,
+                                                           "read_only_single_read":  {
+                                                                                         "p50_ns":  233700,
+                                                                                         "p95_ns":  243900,
+                                                                                         "p99_ns":  281400,
+                                                                                         "rows_per_second":  67666
+                                                                                     },
+                                                           "records":  80,
+                                                           "reversed_read_only_batch_p50_speedup":  6.17,
+                                                           "reversed_read_only_batched_read":  {
+                                                                                                   "p50_ns":  37900,
+                                                                                                   "p95_ns":  38300,
+                                                                                                   "p99_ns":  48900,
+                                                                                                   "rows_per_second":  424103
+                                                                                               },
+                                                           "segment_count":  80,
+                                                           "shuffled_read_only_batched_read":  {
+                                                                                                   "p50_ns":  40800,
+                                                                                                   "p95_ns":  44800,
+                                                                                                   "p99_ns":  59400,
+                                                                                                   "rows_per_second":  387965
+                                                                                               },
+                                                           "single_read":  {
+                                                                               "p50_ns":  240000,
+                                                                               "p95_ns":  259700,
+                                                                               "p99_ns":  313700,
+                                                                               "rows_per_second":  65490
+                                                                           },
+                                                           "staged_write_batch_p50_speedup":  5.35,
+                                                           "staged_write_batched_read":  {
+                                                                                             "p50_ns":  44800,
+                                                                                             "p95_ns":  47500,
+                                                                                             "p99_ns":  50200,
+                                                                                             "rows_per_second":  359006
+                                                                                         },
+                                                           "staged_write_single_read":  {
+                                                                                            "p50_ns":  239800,
+                                                                                            "p95_ns":  250200,
+                                                                                            "p99_ns":  277600,
+                                                                                            "rows_per_second":  65922
+                                                                                        },
+                                                           "storage_mode":  "standard",
+                                                           "value_bytes":  128
+                                                       }
+                                                   ]
+                                       }
 }
