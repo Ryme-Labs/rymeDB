@@ -5435,12 +5435,23 @@ where
             }
         }
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        let Some(value) = self.manager.get(txn, &record).map_err(|e| e.to_string())? else {
-            return Ok(false);
-        };
-        let current = self.manager.expires_at(&record).map_err(|e| e.to_string())?;
-        let Some(expiry) = current else {
-            return Ok(false);
+        let now = ryme_txn::now_unix_millis();
+        let (value, expiry) = if let Some(write) = txn.writes().get(&record) {
+            let Some(value) = write.value.as_ref() else {
+                return Ok(false);
+            };
+            if ryme_storage::expiry_is_expired(write.expires_at, now) {
+                return Ok(false);
+            }
+            (value.clone(), write.expires_at)
+        } else {
+            let Some(value) = self.manager.get(txn, &record).map_err(|e| e.to_string())? else {
+                return Ok(false);
+            };
+            let Some(expiry) = self.manager.expires_at(&record).map_err(|e| e.to_string())? else {
+                return Ok(false);
+            };
+            (value, expiry)
         };
         let allowed = match mode {
             ExpireMode::Always => true,
@@ -5460,7 +5471,7 @@ where
         if !allowed {
             return Ok(false);
         }
-        if ryme_storage::expiry_is_expired(expires_at, ryme_txn::now_unix_millis()) {
+        if ryme_storage::expiry_is_expired(expires_at, now) {
             self.manager.delete(txn, record);
         } else {
             self.manager.put_with_ttl(txn, record, value, expires_at);

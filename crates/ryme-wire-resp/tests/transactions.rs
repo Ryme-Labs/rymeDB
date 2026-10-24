@@ -71,6 +71,22 @@ async fn multi_exec_reads_own_writes() {
 }
 
 #[tokio::test]
+async fn multi_expiry_conditions_observe_staged_values_and_expirations() {
+    let addr = serve().await;
+    let mut session = Session::connect(addr).await;
+    assert_eq!(session.command(&["MULTI"]).await, "+OK");
+    assert_eq!(session.command(&["SET", "tx:expiry", "value"]).await, "+QUEUED");
+    assert_eq!(session.command(&["EXPIRE", "tx:expiry", "30", "NX"]).await, "+QUEUED");
+    assert_eq!(session.command(&["EXPIRE", "tx:expiry", "60", "GT"]).await, "+QUEUED");
+    assert_eq!(session.command(&["SET", "tx:expired", "value"]).await, "+QUEUED");
+    assert_eq!(session.command(&["EXPIRE", "tx:expired", "0", "NX"]).await, "+QUEUED");
+    assert_eq!(session.command(&["EXEC"]).await, "*5\r\n+OK\r\n:1\r\n:1\r\n+OK\r\n:1");
+    let ttl: i64 = session.command(&["TTL", "tx:expiry"]).await[1..].parse().unwrap();
+    assert!((1..=60).contains(&ttl));
+    assert_eq!(session.command(&["GET", "tx:expired"]).await, "$-1");
+}
+
+#[tokio::test]
 async fn multi_get_many_reads_include_staged_values_and_preserve_duplicate_keys() {
     let addr = serve().await;
     let mut session = Session::connect(addr).await;

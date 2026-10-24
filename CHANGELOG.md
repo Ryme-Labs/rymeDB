@@ -43,6 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and `NX`/`XX`/`GT`/`LT` conditions through the transaction expiry path.
 - RESP expiry commands reject repeated or conflicting condition flags instead
   of silently allowing the last flag to override earlier ones.
+- RESP expiry commands inside `MULTI` now honor earlier staged values and
+  expiration deadlines in that transaction.
 - Ordered SQL scans now sort the full bounded result set or return an overload
   error instead of silently sorting only the first 10,000 rows.
 - Primary-key-ordered SQL scans now size their read window for both `LIMIT` and

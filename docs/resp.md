@@ -76,6 +76,8 @@ process-wide memory budget. A command rejected by these limits marks the queue
 dirty, so `EXEC` aborts. Blocking list and stream reads wake on commits and take
 a fresh transaction for each check. The aggregate `EXEC` reply is limited to
 16 MiB; exceeding it aborts the transaction before commit.
+Queued expiry commands evaluate keys and existing deadlines against earlier
+staged writes in the same `MULTI` transaction.
 Sorted sets use score ordering with lexicographic member tie-breaks. Stream
 consumer groups and pending entries are persisted with the stream document.
 
