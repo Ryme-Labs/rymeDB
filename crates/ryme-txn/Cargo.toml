@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+crc32fast = "1"
 ryme-error = { workspace = true }
 ryme-storage = { workspace = true }
 ryme-wal = { workspace = true }

@@ -28,6 +28,8 @@ const MVCC_GC_KEYS_PER_LOCK: usize = 1_024;
 const MVCC_GC_VERSIONS_PER_LOCK: usize = 4_096;
 const MIN_ORDERED_BATCH_READ_KEYS: usize = 16;
 const MAX_SNAPSHOT_POINTER_BYTES: usize = 64;
+const RESTORE_INTENT_BYTES: usize = 28;
+const RESTORE_INTENT_MAGIC: &[u8; 8] = b"RYMEREST";
 static NEXT_SNAPSHOT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 fn configure_private_file(options: &mut OpenOptions) {
@@ -229,6 +231,87 @@ fn read_snapshot_pointer(path: &Path) -> Result<Option<Vec<u8>>> {
         return Err(RymeError::Corrupt(String::from("snapshot pointer")));
     }
     Ok(Some(bytes))
+}
+
+fn write_restore_intent(dir: &Path, target: u64, snapshot_ts: u64) -> Result<()> {
+    let mut contents = Vec::with_capacity(RESTORE_INTENT_BYTES);
+    contents.extend_from_slice(RESTORE_INTENT_MAGIC);
+    contents.extend_from_slice(&target.to_be_bytes());
+    contents.extend_from_slice(&snapshot_ts.to_be_bytes());
+    let checksum = crc32fast::hash(&contents);
+    contents.extend_from_slice(&checksum.to_be_bytes());
+
+    let path = dir.join("restore.pending");
+    let temporary = write_snapshot_temp(dir, "restore.pending", &contents)?;
+    if let Err(error) = replace_snapshot_file(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_directory(dir)
+}
+
+fn write_restore_staged_snapshot(dir: &Path, raw: &[u8]) -> Result<()> {
+    let snapshot_dir = dir.join("snapshots");
+    std::fs::create_dir_all(&snapshot_dir)?;
+    if raw.len() > ryme_storage::MAX_SNAPSHOT_BYTES {
+        return Err(RymeError::Overload(String::from("snapshot")));
+    }
+    let path = snapshot_dir.join("restore-staged.rsnap");
+    let temporary = write_snapshot_temp(&snapshot_dir, "restore-staged.rsnap", raw)?;
+    if let Err(error) = replace_snapshot_file(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_directory(&snapshot_dir)
+}
+
+fn remove_restore_staged_snapshot(dir: &Path) -> Result<()> {
+    let snapshot_dir = dir.join("snapshots");
+    match std::fs::remove_file(snapshot_dir.join("restore-staged.rsnap")) {
+        Ok(()) => sync_directory(&snapshot_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_restore_intent(dir: &Path) -> Result<Option<(u64, u64)>> {
+    let Some(contents) = read_snapshot_pointer(&dir.join("restore.pending"))? else {
+        return Ok(None);
+    };
+    if contents.len() != RESTORE_INTENT_BYTES || &contents[..8] != RESTORE_INTENT_MAGIC {
+        return Err(RymeError::Corrupt(String::from("restore intent")));
+    }
+    let checksum_offset = RESTORE_INTENT_BYTES - 4;
+    let checksum = u32::from_be_bytes(
+        contents[checksum_offset..]
+            .try_into()
+            .map_err(|_| RymeError::Corrupt(String::from("restore intent checksum")))?,
+    );
+    if crc32fast::hash(&contents[..checksum_offset]) != checksum {
+        return Err(RymeError::Corrupt(String::from("restore intent checksum")));
+    }
+    let target = u64::from_be_bytes(
+        contents[8..16]
+            .try_into()
+            .map_err(|_| RymeError::Corrupt(String::from("restore intent target")))?,
+    );
+    let snapshot_ts = u64::from_be_bytes(
+        contents[16..24]
+            .try_into()
+            .map_err(|_| RymeError::Corrupt(String::from("restore intent snapshot")))?,
+    );
+    if snapshot_ts > target {
+        return Err(RymeError::Corrupt(String::from("restore intent bounds")));
+    }
+    Ok(Some((target, snapshot_ts)))
+}
+
+fn remove_restore_intent(dir: &Path) -> Result<()> {
+    match std::fs::remove_file(dir.join("restore.pending")) {
+        Ok(()) => sync_directory(dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3077,6 +3160,7 @@ impl DurableManager {
             mode,
             dir: dir.to_path_buf(),
         };
+        manager.recover_pending_restore()?;
         let floor = match mode {
             StorageMode::Hot => match manager.load_latest_snapshot()? {
                 Some(floor) => floor,
@@ -3580,26 +3664,67 @@ impl DurableManager {
         })?;
         let replayed = replay.len() as u64;
         self.record_persistence_result((|| {
-            self.inner.restore_with_replay(snapshot, &replay)?;
-            let restored_raw = self.inner.encode_snapshot()?;
-            let restored = Engine::decode_snapshot(&restored_raw)?;
-            let restored_max = restored.max_commit_ts();
-            let (_, newest) = self.segments.write(restored_max, &restored)?;
-            self.segments.remove_except(&newest)?;
-            self.publish_restored_snapshot(restored_max, target, &restored_raw)?;
-            {
-                let mut wal =
-                    self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
-                wal.truncate_above(target)?;
-                if self.policy == SyncPolicy::Always {
-                    wal.sync()?;
+            let mut restored = snapshot.clone();
+            for (commit_ts, writes) in &replay {
+                for (key, op) in writes {
+                    restored.apply_with_expiry(
+                        key.clone(),
+                        *commit_ts,
+                        op.value.clone(),
+                        op.expires_at,
+                    )?;
                 }
             }
+            let restored_raw = restored.encode_snapshot()?;
+            let restored = Engine::decode_snapshot(&restored_raw)?;
+            let restored_max = restored.max_commit_ts();
+            write_restore_staged_snapshot(&self.dir, &restored_raw)?;
+            write_restore_intent(&self.dir, target, restored_max)?;
+            self.finish_restore_persistence(target, restored_max, &restored_raw, &restored)?;
+            self.inner.restore_with_replay(snapshot, &replay)?;
             if self.mode == StorageMode::Standard {
                 self.inner.clear_engine()?;
             }
+            remove_restore_intent(&self.dir)?;
+            remove_restore_staged_snapshot(&self.dir)?;
             Ok(replayed)
         })())
+    }
+
+    fn recover_pending_restore(&self) -> Result<()> {
+        let Some((target, snapshot_ts)) = read_restore_intent(&self.dir)? else {
+            return Ok(());
+        };
+        let path = self.snapshot_dir().join("restore-staged.rsnap");
+        let raw = read_snapshot_file(&path)?;
+        let restored = Engine::decode_snapshot(&raw)?;
+        if restored.max_commit_ts() != snapshot_ts {
+            return Err(RymeError::Corrupt(String::from("restore snapshot timestamp")));
+        }
+        self.finish_restore_persistence(target, snapshot_ts, &raw, &restored)?;
+        remove_restore_intent(&self.dir)?;
+        remove_restore_staged_snapshot(&self.dir)
+    }
+
+    fn finish_restore_persistence(
+        &self,
+        target: u64,
+        snapshot_ts: u64,
+        raw: &[u8],
+        restored: &Engine,
+    ) -> Result<()> {
+        if restored.max_commit_ts() != snapshot_ts || snapshot_ts > target {
+            return Err(RymeError::Corrupt(String::from("restore snapshot timestamp")));
+        }
+        let (_, newest) = self.segments.write(snapshot_ts, restored)?;
+        self.segments.remove_except(&newest)?;
+        self.publish_restored_snapshot(snapshot_ts, target, raw)?;
+        let mut wal = self.wal.lock().map_err(|_| RymeError::Internal(String::from("wal lock")))?;
+        wal.truncate_above(target)?;
+        if self.policy == SyncPolicy::Always {
+            wal.sync()?;
+        }
+        Ok(())
     }
 
     fn publish_restored_snapshot(&self, commit_ts: u64, target: u64, raw: &[u8]) -> Result<()> {
@@ -6021,6 +6146,14 @@ mod tests {
         ));
 
         drop(manager);
+        std::fs::remove_file(&segment_dir).unwrap();
+        std::fs::create_dir(&segment_dir).unwrap();
+        let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        let mut probe = reopened.begin();
+        assert_eq!(reopened.get(&mut probe, &key).unwrap(), Some(b"checkpoint".to_vec()));
+        assert!(!dir.join("restore.pending").exists());
+        assert!(!reopened.snapshot_dir().join("restore-staged.rsnap").exists());
+        drop(reopened);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

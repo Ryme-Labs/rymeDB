@@ -62,6 +62,8 @@ All notable changes to rymeDB are recorded here. Format follows
   snapshots, preserving the existing recovery point if publication fails.
 - A point-in-time restore persistence error now marks the durable manager
   unhealthy, preventing reads or writes against state that may not match disk.
+- Startup now completes an interrupted point-in-time restore from its checksummed
+  durable intent before loading snapshots, segments, or WAL records.
 - Raft now broadcasts the committed index for membership changes before
   returning, so followers can apply the new quorum configuration before leader
   loss.
