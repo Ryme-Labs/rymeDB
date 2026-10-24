@@ -54,6 +54,22 @@ pub struct RangePlacement {
     pub shard: usize,
 }
 
+const RANGE_PLACEMENT_STATE_VERSION: u8 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedRangePlacementState {
+    version: u8,
+    ranges: Vec<RangePlacement>,
+    assignments: HashMap<String, usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RangePlacementFile {
+    Current(PersistedRangePlacementState),
+    Legacy(HashMap<String, usize>),
+}
+
 #[derive(Debug)]
 struct ShardCtx {
     shard: Option<usize>,
@@ -301,31 +317,84 @@ fn load_placements(path: &std::path::Path, shard_count: usize) -> Result<HashMap
     Ok(placements)
 }
 
-fn load_range_assignments(
+fn load_range_state(
     path: &std::path::Path,
     shard_count: usize,
-) -> Result<HashMap<String, usize>> {
+) -> Result<(HashMap<String, usize>, Vec<RangePlacement>)> {
     let Some(raw) = read_bounded_metadata(path, "range placements")? else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), Vec::new()));
     };
-    let entries: HashMap<String, usize> = serde_json::from_slice(&raw)
+    let stored: RangePlacementFile = serde_json::from_slice(&raw)
         .map_err(|error| RymeError::Corrupt(format!("range placements: {error}")))?;
-    if entries.values().any(|shard| *shard >= shard_count) {
+    let (assignments, ranges) = match stored {
+        RangePlacementFile::Current(state) => {
+            if state.version != RANGE_PLACEMENT_STATE_VERSION {
+                return Err(RymeError::Corrupt(String::from("range placement version")));
+            }
+            let ranges = normalize_range_topology(state.ranges, shard_count)
+                .map_err(|_| RymeError::Corrupt(String::from("range placements")))?;
+            (state.assignments, ranges)
+        }
+        RangePlacementFile::Legacy(assignments) => (assignments, Vec::new()),
+    };
+    if assignments.values().any(|shard| *shard >= shard_count) {
         return Err(RymeError::Corrupt(String::from("range placement shard")));
     }
-    Ok(entries)
+    Ok((assignments, ranges))
 }
 
-fn persist_range_assignments(
+fn persist_range_state(
     path: &std::path::Path,
     assignments: &HashMap<String, usize>,
+    ranges: &[RangePlacement],
 ) -> Result<()> {
-    let bytes = serde_json::to_vec(assignments)
-        .map_err(|error| RymeError::Internal(format!("range placements: {error}")))?;
+    let bytes = serde_json::to_vec(&PersistedRangePlacementState {
+        version: RANGE_PLACEMENT_STATE_VERSION,
+        ranges: ranges.to_vec(),
+        assignments: assignments.clone(),
+    })
+    .map_err(|error| RymeError::Internal(format!("range placements: {error}")))?;
     if bytes.len() > MAX_SHARD_METADATA_BYTES {
         return Err(RymeError::Overload(String::from("range placements")));
     }
     persist_metadata_file(path, &bytes)
+}
+
+fn normalize_range_topology(
+    mut ranges: Vec<RangePlacement>,
+    shard_count: usize,
+) -> Result<Vec<RangePlacement>> {
+    ranges.sort_by(|left, right| left.start.cmp(&right.start));
+    if let Some(first) = ranges.first() {
+        ryme_storage::validate_routing_version(first.routing_version)?;
+        if ranges.iter().any(|range| range.routing_version != first.routing_version) {
+            return Err(RymeError::InvalidArgument(String::from("mixed routing versions")));
+        }
+    }
+    let mut ids = HashSet::with_capacity(ranges.len());
+    for (index, range) in ranges.iter().enumerate() {
+        if range.id.is_empty() || !ids.insert(range.id.as_str()) {
+            return Err(RymeError::InvalidArgument(String::from("range id")));
+        }
+        if range.shard >= shard_count {
+            return Err(RymeError::InvalidArgument(String::from("range shard")));
+        }
+        if !range.end.is_empty() && range.start >= range.end {
+            return Err(RymeError::InvalidArgument(String::from("range bounds")));
+        }
+        if let Some(next) = ranges.get(index + 1) {
+            if range.end.is_empty() || range.end != next.start {
+                return Err(RymeError::InvalidArgument(String::from("range gap")));
+            }
+        }
+    }
+    if ranges.first().is_some_and(|first| !first.start.is_empty()) {
+        return Err(RymeError::InvalidArgument(String::from("range start")));
+    }
+    if ranges.last().is_some_and(|last| !last.end.is_empty()) {
+        return Err(RymeError::InvalidArgument(String::from("range end")));
+    }
+    Ok(ranges)
 }
 
 fn route_range(ranges: &[RangePlacement], key: &[u8]) -> Option<usize> {
@@ -423,7 +492,7 @@ impl ShardSet {
         let placement_path = data_dir.join("placements.json");
         let range_placement_path = data_dir.join("range-placements.json");
         let place = load_placements(&placement_path, shards)?;
-        let range_assignments = load_range_assignments(&range_placement_path, shards)?;
+        let (range_assignments, ranges) = load_range_state(&range_placement_path, shards)?;
         let latest_commit = managers.iter().map(DurableManager::latest_commit).max().unwrap_or(0);
         let set = Self {
             inner: Arc::new(Mutex::new(ShardInner {
@@ -433,7 +502,7 @@ impl ShardSet {
                 shards: managers,
                 place,
                 range_assignments,
-                ranges: Vec::new(),
+                ranges,
                 paused: HashSet::new(),
                 side: HashMap::new(),
                 coordinator: Mutex::new(coordinator),
@@ -652,36 +721,7 @@ impl ShardSet {
     }
 
     pub fn set_range_topology(&self, mut ranges: Vec<RangePlacement>) -> Result<()> {
-        ranges.sort_by(|left, right| left.start.cmp(&right.start));
-        if let Some(first) = ranges.first() {
-            ryme_storage::validate_routing_version(first.routing_version)?;
-            if ranges.iter().any(|range| range.routing_version != first.routing_version) {
-                return Err(RymeError::InvalidArgument(String::from("mixed routing versions")));
-            }
-        }
-        for (index, range) in ranges.iter().enumerate() {
-            if range.shard >= self.shard_count() {
-                return Err(RymeError::InvalidArgument(String::from("range shard")));
-            }
-            if !range.end.is_empty() && range.start >= range.end {
-                return Err(RymeError::InvalidArgument(String::from("range bounds")));
-            }
-            if let Some(next) = ranges.get(index + 1) {
-                if range.end.is_empty() || range.end != next.start {
-                    return Err(RymeError::InvalidArgument(String::from("range gap")));
-                }
-            }
-        }
-        if let Some(first) = ranges.first() {
-            if !first.start.is_empty() {
-                return Err(RymeError::InvalidArgument(String::from("range start")));
-            }
-        }
-        if let Some(last) = ranges.last() {
-            if !last.end.is_empty() {
-                return Err(RymeError::InvalidArgument(String::from("range end")));
-            }
-        }
+        ranges = normalize_range_topology(ranges, self.shard_count())?;
 
         let _write =
             self.commit.write().map_err(|_| RymeError::Internal(String::from("shard lock")))?;
@@ -725,10 +765,12 @@ impl ShardSet {
         let previous_assignments = inner.range_assignments.clone();
         inner.ranges = ranges;
         inner.range_assignments = assignments;
-        if old_assignments != inner.range_assignments {
-            if let Err(error) =
-                persist_range_assignments(&inner.range_placement_path, &inner.range_assignments)
-            {
+        if old_assignments != inner.range_assignments || previous_ranges != inner.ranges {
+            if let Err(error) = persist_range_state(
+                &inner.range_placement_path,
+                &inner.range_assignments,
+                &inner.ranges,
+            ) {
                 inner.ranges = previous_ranges;
                 inner.range_assignments = previous_assignments;
                 return Err(error);
@@ -1700,9 +1742,7 @@ mod tests {
             if name == "placements.json" {
                 assert_oversized_file_rejected(&path, label, |path| load_placements(path, 4));
             } else {
-                assert_oversized_file_rejected(&path, label, |path| {
-                    load_range_assignments(path, 4)
-                });
+                assert_oversized_file_rejected(&path, label, |path| load_range_state(path, 4));
             }
         }
 
@@ -1841,6 +1881,7 @@ mod tests {
         drop(backend);
 
         let backend = ShardSet::open(&dir, 2, SyncPolicy::Never).unwrap();
+        assert_eq!(backend.range_placements().len(), 2);
         backend
             .set_range_topology(vec![
                 RangePlacement {

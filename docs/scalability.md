@@ -45,8 +45,9 @@ Range movement copies the current version history to the new owner and keeps
 the previous shard's copy so a later move cannot apply a stale migration
 tombstone over newer data. This currently trades disk space for safe repeated
 rebalancing; plan capacity for duplicate shard history. After restart, persisted
-range assignments identify the completed topology, and stale copies are ignored
-when rebuilding ownership.
+range state records the range bounds and owners. On restart, the shard set loads
+that last completed topology so it can reconcile control-plane placement and
+ignore stale copies when rebuilding ownership.
 
 ## Realtime fanout
 
