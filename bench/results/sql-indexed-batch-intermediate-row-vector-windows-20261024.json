@@ -1,0 +1,51 @@
+{
+  "experiment": "sql-indexed-batch-intermediate-row-vector",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "5e40761",
+  "candidate_revision": "working-tree-experiment",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "Windows 11"
+  },
+  "workload": {
+    "benchmark": "ryme-bench sql-local",
+    "rows": 20000,
+    "ops_per_capture": 300,
+    "concurrency": 1,
+    "storage_mode": "hot in-process SQL executor",
+    "query": "tenant = tenant-0001 AND state = active AND seq >= 0; tenant and state indexes",
+    "warmup_ops": 100,
+    "candidate_change": "Stream fetched candidate rows directly into the result vector rather than collecting an intermediate batch_rows vector; preserve per-batch materialization limits and predicates.",
+    "decision": "Discarded. Median p50 regressed for both limits, with a large p95 outlier in the candidate LIMIT 10 workload."
+  },
+  "limit_10": {
+    "baseline_median_p50_ns": 129300,
+    "candidate_median_p50_ns": 133900,
+    "p50_change_percent": 3.6,
+    "baseline_median_p95_ns": 152700,
+    "candidate_median_p95_ns": 190400,
+    "captures": [
+      {"pair":1,"baseline":{"p50_ns":131500,"p95_ns":162400,"p99_ns":337100,"qps":7184},"candidate":{"p50_ns":133900,"p95_ns":181300,"p99_ns":306800,"qps":6946}},
+      {"pair":2,"baseline":{"p50_ns":129300,"p95_ns":157400,"p99_ns":221100,"qps":7392},"candidate":{"p50_ns":133500,"p95_ns":236600,"p99_ns":428900,"qps":6699}},
+      {"pair":3,"baseline":{"p50_ns":127300,"p95_ns":148700,"p99_ns":234900,"qps":7508},"candidate":{"p50_ns":133700,"p95_ns":169400,"p99_ns":278200,"qps":7043}},
+      {"pair":4,"baseline":{"p50_ns":130100,"p95_ns":152700,"p99_ns":214600,"qps":7407},"candidate":{"p50_ns":134500,"p95_ns":190400,"p99_ns":292500,"qps":6892}},
+      {"pair":5,"baseline":{"p50_ns":127800,"p95_ns":151200,"p99_ns":261000,"qps":7451},"candidate":{"p50_ns":135600,"p95_ns":622700,"p99_ns":864400,"qps":4417}}
+    ]
+  },
+  "limit_4000": {
+    "baseline_median_p50_ns": 2859500,
+    "candidate_median_p50_ns": 2880000,
+    "p50_change_percent": 0.7,
+    "baseline_median_p95_ns": 3222400,
+    "candidate_median_p95_ns": 3269000,
+    "captures": [
+      {"pair":1,"baseline":{"p50_ns":2859500,"p95_ns":3222400,"p99_ns":3434000,"qps":345},"candidate":{"p50_ns":2880000,"p95_ns":3269000,"p99_ns":3546000,"qps":342}},
+      {"pair":2,"baseline":{"p50_ns":2880400,"p95_ns":3230600,"p99_ns":3743800,"qps":342},"candidate":{"p50_ns":2938600,"p95_ns":3367200,"p99_ns":4171000,"qps":330}},
+      {"pair":3,"baseline":{"p50_ns":2821400,"p95_ns":3207700,"p99_ns":3705900,"qps":349},"candidate":{"p50_ns":2844500,"p95_ns":3255200,"p99_ns":3469800,"qps":346}},
+      {"pair":4,"baseline":{"p50_ns":2870500,"p95_ns":3268600,"p99_ns":3674500,"qps":342},"candidate":{"p50_ns":2878500,"p95_ns":3562100,"p99_ns":4367800,"qps":336}},
+      {"pair":5,"baseline":{"p50_ns":2848300,"p95_ns":3181000,"p99_ns":3306100,"qps":349},"candidate":{"p50_ns":2882400,"p95_ns":3219900,"p99_ns":3438200,"qps":343}}
+    ]
+  }
+}

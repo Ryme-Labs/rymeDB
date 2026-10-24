@@ -906,3 +906,10 @@ as 80 delta segments, uses 128-byte values, 100 iterations, and disables WAL and
 segment sync; it measures the in-process transaction path with a warmed cache,
 not network latency or durable write performance. Exact segment engine lookups
 still confirm Bloom positives. See the [raw captures](../bench/results/txn-read-batch-segment-bloom-windows-20261024.json).
+
+I tested removing the intermediate row vector from indexed SQL candidate batches
+while retaining per-batch materialization checks and residual filters. Five
+alternating release pairs on the same Windows host regressed median p50 3.6%
+for `LIMIT 10` and 0.7% for `LIMIT 4000`; p95 also regressed in both workloads.
+The change was discarded. These are in-process SQL executor measurements, not
+wire-protocol or concurrent-query latency. See the [raw captures](../bench/results/sql-indexed-batch-intermediate-row-vector-windows-20261024.json).
