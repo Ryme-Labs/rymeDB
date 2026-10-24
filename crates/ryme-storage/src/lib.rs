@@ -908,7 +908,7 @@ impl Engine {
         now: u64,
         limit: usize,
     ) -> Vec<(RecordKey, Vec<u8>)> {
-        if limit == 0 {
+        if limit == 0 || start >= end {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -1710,6 +1710,8 @@ mod tests {
 
         assert!(engine.range(&start, &end, 1, 0, 0).is_empty());
         assert_eq!(engine.range(&start, &end, 1, 0, 1).len(), 1);
+        assert!(engine.range(&end, &start, 1, 0, 1).is_empty());
+        assert!(engine.range(&start, &start, 1, 0, 1).is_empty());
     }
 
     #[test]
