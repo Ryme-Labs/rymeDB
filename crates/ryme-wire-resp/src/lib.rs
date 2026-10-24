@@ -3339,7 +3339,7 @@ where
                 _ => break,
             }
         }
-        if only_add && only_update {
+        if (only_add && only_update) || (greater && less) || (only_add && (greater || less)) {
             return Err(String::from("syntax"));
         }
         let pairs = &args[index..];

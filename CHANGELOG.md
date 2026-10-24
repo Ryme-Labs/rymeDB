@@ -36,6 +36,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP `ZADD` rejects the incompatible `NX`/`GT`/`LT` option combinations
+  defined by Valkey.
 - RESP single-key string and metadata commands now reject extra arguments,
   keeping local command behavior consistent with owner-routed reads.
 - RESP `APPEND` now enforces the shared 4 MiB value limit before extending a

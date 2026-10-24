@@ -532,6 +532,15 @@ async fn zset_ops() {
     assert_eq!(command(addr, &["ZADD", "z", "NX", "9", "c", "0", "new"]).await, ":1");
     assert_eq!(command(addr, &["ZSCORE", "z", "c"]).await, "$3\r\n2.5");
     assert_eq!(command(addr, &["ZADD", "z", "XX", "9", "c", "0", "ghost"]).await, ":0");
+    for args in [
+        ["ZADD", "z", "NX", "GT", "9", "c"],
+        ["ZADD", "z", "NX", "LT", "0", "new"],
+        ["ZADD", "z", "GT", "LT", "0", "a"],
+    ] {
+        assert!(command(addr, &args).await.starts_with("-ERR"), "accepted {args:?}");
+    }
+    assert_eq!(command(addr, &["ZCARD", "z"]).await, ":4");
+    assert_eq!(command(addr, &["ZSCORE", "z", "a"]).await, "$1\r\n5");
     assert_eq!(command(addr, &["ZREM", "z", "a", "ghost"]).await, ":1");
     assert_eq!(command(addr, &["ZCARD", "z"]).await, ":3");
     assert!(command(addr, &["ZADD", "z", "nan", "x"]).await.starts_with("-ERR"));
