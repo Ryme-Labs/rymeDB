@@ -197,7 +197,7 @@ impl BranchManager {
             let _ = std::fs::remove_file(&temporary);
             return Err(error.into());
         }
-        if let Err(error) = std::fs::rename(&temporary, path) {
+        if let Err(error) = ryme_error::replace_file_atomically(&temporary, path) {
             let _ = std::fs::remove_file(&temporary);
             return Err(error.into());
         }
@@ -1350,9 +1350,11 @@ mod tests {
         let mut manager = root_manager();
         manager.create_child(String::from("preview"), "main", 7).unwrap();
         manager.persist(&path).unwrap();
+        manager.reset("preview", 9).unwrap();
+        manager.persist(&path).unwrap();
 
         let restored = BranchManager::load(&path).unwrap();
-        assert_eq!(restored.get("preview").unwrap().base_commit_ts, 7);
+        assert_eq!(restored.get("preview").unwrap().base_commit_ts, 9);
         assert!(restored.diff("main", "preview").unwrap().0.is_empty());
         let _ = std::fs::remove_file(path);
     }
