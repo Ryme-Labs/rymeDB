@@ -2025,6 +2025,25 @@ impl SharedState {
         Ok(())
     }
 
+    fn update_credentials_durably<T>(
+        &self,
+        update: impl FnOnce(&mut ryme_auth::CredentialStore) -> ryme_error::Result<T>,
+    ) -> ryme_error::Result<T> {
+        let _persist_guard = self
+            .auth_persist_lock
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
+        let mut credentials = self
+            .credentials
+            .lock()
+            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
+        let mut staged = credentials.clone();
+        let result = update(&mut staged)?;
+        let snapshot = self.auth_snapshot(Some(staged.snapshot()), None)?;
+        self.persist_auth_snapshot_locked(snapshot, || *credentials = staged)?;
+        Ok(result)
+    }
+
     fn register_passkey(
         &self,
         user: &str,
@@ -2046,18 +2065,7 @@ impl SharedState {
     }
 
     fn set_otp_secret(&self, user: &str, secret: Vec<u8>) -> ryme_error::Result<()> {
-        let _persist_guard = self
-            .auth_persist_lock
-            .lock()
-            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
-        let mut credentials = self
-            .credentials
-            .lock()
-            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
-        let mut staged = credentials.clone();
-        staged.set_otp_secret(user, secret)?;
-        let snapshot = self.auth_snapshot(Some(staged.snapshot()), None)?;
-        self.persist_auth_snapshot_locked(snapshot, || *credentials = staged)
+        self.update_credentials_durably(|credentials| credentials.set_otp_secret(user, secret))
     }
 
     fn verify_otp(
@@ -2066,19 +2074,7 @@ impl SharedState {
         code: &str,
         now_secs: u64,
     ) -> ryme_error::Result<Principal> {
-        let _persist_guard = self
-            .auth_persist_lock
-            .lock()
-            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth persist lock")))?;
-        let mut credentials = self
-            .credentials
-            .lock()
-            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
-        let mut staged = credentials.clone();
-        let principal = staged.verify_otp(user, code, now_secs)?;
-        let snapshot = self.auth_snapshot(Some(staged.snapshot()), None)?;
-        self.persist_auth_snapshot_locked(snapshot, || *credentials = staged)?;
-        Ok(principal)
+        self.update_credentials_durably(|credentials| credentials.verify_otp(user, code, now_secs))
     }
 
     fn persist_control(&self) -> ryme_error::Result<()> {
@@ -4640,14 +4636,13 @@ async fn dashboard_bootstrap(
         Ok(slot) => slot,
         Err(error) => return error_response(error),
     };
-    let credentials = state.credentials.clone();
+    let auth_state = state.clone();
     let registered = tokio::task::spawn_blocking(move || {
         let _hash_slot = hash_slot;
         let password = ryme_auth::hash_password(&request.password);
-        let mut credentials = credentials
-            .lock()
-            .map_err(|_| ryme_error::RymeError::Internal(String::from("auth lock")))?;
-        register_dashboard_admin_with_hash(&mut credentials, request.id, password)
+        auth_state.update_credentials_durably(|credentials| {
+            register_dashboard_admin_with_hash(credentials, request.id, password)
+        })
     })
     .await;
     let registered = match registered {
@@ -4655,12 +4650,9 @@ async fn dashboard_bootstrap(
         Err(_) => Err(ryme_error::RymeError::Internal(String::from("task"))),
     };
     match registered {
-        Ok(()) => match state.persist_auth() {
-            Ok(()) => {
-                (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
-            }
-            Err(error) => error_response(error),
-        },
+        Ok(()) => {
+            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
         Err(error) => error_response(error),
     }
 }
@@ -7187,25 +7179,20 @@ async fn auth_register(
         Ok(slot) => slot,
         Err(error) => return error_response(error),
     };
-    let credentials = state.credentials.clone();
+    let auth_state = state.clone();
     let password = request.password;
     let registered = tokio::task::spawn_blocking(move || {
         let _hash_slot = hash_slot;
         let password = ryme_auth::hash_password(&password);
-        let mut store = match credentials.lock() {
-            Ok(store) => store,
-            Err(_) => return Err(ryme_error::RymeError::Internal(String::from("lock"))),
-        };
-        store.register_password_hash(request.id, tenant, password, roles)
+        auth_state.update_credentials_durably(|store| {
+            store.register_password_hash(request.id, tenant, password, roles)
+        })
     })
     .await;
     match registered {
-        Ok(Ok(())) => match state.persist_auth() {
-            Ok(()) => {
-                (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
-            }
-            Err(e) => error_response(e),
-        },
+        Ok(Ok(())) => {
+            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
         Ok(Err(e)) => error_response(e),
         Err(_) => error_response(ryme_error::RymeError::Internal(String::from("task"))),
     }
@@ -16523,6 +16510,35 @@ mod realtime_policy_tests {
             state.credentials.lock().unwrap().snapshot()["ada"].otp_last_used_step,
             None
         );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_user_registration_persistence_does_not_publish_user_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-user-persist-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut config = Config::default();
+        config.data_dir = dir.clone();
+        let state = SharedState::build(&config).unwrap();
+        std::fs::create_dir(&state.auth_path).unwrap();
+        let password = ryme_auth::hash_password("correct-horse-battery");
+        let roles = [Role::Admin].into_iter().collect();
+
+        assert!(state
+            .update_credentials_durably(|credentials| {
+                credentials.register_password_hash(
+                    String::from("ada"),
+                    String::from("default"),
+                    password,
+                    roles,
+                )
+            })
+            .is_err());
+        assert!(state.credentials.lock().unwrap().principal("ada").is_err());
 
         std::fs::remove_dir_all(dir).unwrap();
     }
