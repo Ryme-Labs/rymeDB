@@ -37,7 +37,8 @@ Each node's `peers` list must contain every other node exactly once, omit that
 node's own ID, and use a valid `host:port` address for each peer (IPv6 literals
 must be bracketed, for example `[2001:db8::10]:9080`). Mismatched or duplicate
 peer IDs, blank addresses, and invalid ports prevent a fresh cluster node from
-starting.
+starting. Runtime membership changes also require an address for every remote
+member; only the local node's address may be omitted.
 Start them with `ryme-server --config node-0.json`. Set
 `advertise_addr` whenever a listener binds to a wildcard address. Use TLS/mTLS
 for a network that is not already private; see [configuration](configuration.md).

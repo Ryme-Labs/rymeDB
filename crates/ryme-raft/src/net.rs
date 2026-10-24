@@ -945,6 +945,11 @@ fn valid_peer_address(address: &str) -> bool {
         })
 }
 
+fn valid_member_set_for_node(members: &[Member], node_id: usize) -> bool {
+    valid_member_set(members)
+        && members.iter().all(|member| member.id == node_id || !member.addr.is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfChange {
     pub old: Vec<Member>,
@@ -5938,6 +5943,9 @@ impl Node {
     }
 
     pub async fn add_member(self: &Arc<Self>, id: usize, addr: String) -> Result<()> {
+        if !valid_peer_address(&addr) {
+            return Err(RymeError::InvalidArgument(String::from("member")));
+        }
         {
             let inner = self.inner.lock().await;
             if inner.role != Role::Leader {
@@ -5968,7 +5976,7 @@ impl Node {
                 return Err(RymeError::Unavailable(String::from("not leader")));
             }
         }
-        if !valid_member_set(&target) {
+        if !valid_member_set_for_node(&target, self.id) {
             return Err(RymeError::InvalidArgument(String::from("member")));
         }
         let target = normalize_members(target);
@@ -6001,7 +6009,7 @@ impl Node {
                 return Err(RymeError::Unavailable(String::from("not leader")));
             }
         }
-        if !valid_member_set(&target) {
+        if !valid_member_set_for_node(&target, self.id) {
             return Err(RymeError::InvalidArgument(String::from("member")));
         }
         let target = normalize_members(target);
@@ -7360,6 +7368,34 @@ mod tests {
             assert!(!valid_peer_address(address), "expected {address} to be invalid");
         }
         assert!(!valid_member_set(&[Member { id: 1, addr: String::from("node:bad") }]));
+    }
+
+    #[tokio::test]
+    async fn membership_changes_require_addresses_for_remote_nodes() {
+        let dir = temp_dir("membership-address-required");
+        let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        node.inner.lock().await.role = Role::Leader;
+        let target = vec![
+            Member { id: 0, addr: String::new() },
+            Member { id: 1, addr: String::new() },
+        ];
+
+        assert!(!valid_member_set_for_node(&target, 0));
+        assert!(matches!(
+            node.propose_joint(target.clone()).await,
+            Err(RymeError::InvalidArgument(message)) if message == "member"
+        ));
+        assert!(matches!(
+            node.replace_members(target).await,
+            Err(RymeError::InvalidArgument(message)) if message == "member"
+        ));
+        assert!(matches!(
+            node.add_member(1, String::from("node-1:not-a-port")).await,
+            Err(RymeError::InvalidArgument(message)) if message == "member"
+        ));
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn encode_untrusted_conf_change(change: &crate::ConfChange) -> Vec<u8> {
