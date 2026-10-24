@@ -5122,28 +5122,38 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
     match result {
         QueryResult::Ok => command_complete("OK"),
         QueryResult::Row { pk: _, value } => {
-            let text = String::from_utf8_lossy(&value).into_owned();
+            if !pg_text_cell_is_valid(&value) {
+                return invalid_pg_text_encoding();
+            }
             let mut out = row_description();
-            out.extend(data_row(text));
+            out.extend(data_row_values(&[value]));
             out.extend(command_complete("SELECT 1"));
             out
         }
         QueryResult::Scalar { label, value } => {
+            if !pg_text_cell_is_valid(&value) {
+                return invalid_pg_text_encoding();
+            }
             let mut out = multi_row_description(&[label]);
             out.extend(data_row_values(&[value]));
             out.extend(command_complete("SELECT 1"));
             out
         }
         QueryResult::Rows { rows } => {
+            if rows.iter().any(|(_, value)| !pg_text_cell_is_valid(value)) {
+                return invalid_pg_text_encoding();
+            }
             let mut out = row_description();
             for (_, value) in rows {
-                let text = String::from_utf8_lossy(&value).into_owned();
-                out.extend(data_row(text));
+                out.extend(data_row_values(&[value]));
             }
             out.extend(command_complete("SELECT"));
             out
         }
         QueryResult::Table { columns, rows } => {
+            if rows.iter().flatten().any(|value| !pg_text_cell_is_valid(value)) {
+                return invalid_pg_text_encoding();
+            }
             let mut out = multi_row_description(&columns);
             for row in rows {
                 out.extend(data_row_values(&row));
@@ -5152,6 +5162,9 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
             out
         }
         QueryResult::Returning { columns, rows } => {
+            if rows.iter().flatten().any(|value| !pg_text_cell_is_valid(value)) {
+                return invalid_pg_text_encoding();
+            }
             let mut out = multi_row_description(&columns);
             for row in rows {
                 out.extend(data_row_values(&row));
@@ -5160,6 +5173,14 @@ fn encode_result(result: QueryResult) -> Vec<u8> {
             out
         }
     }
+}
+
+fn pg_text_cell_is_valid(value: &[u8]) -> bool {
+    value == SQL_NULL_SENTINEL || std::str::from_utf8(value).is_ok_and(|text| !text.contains('\0'))
+}
+
+fn invalid_pg_text_encoding() -> Vec<u8> {
+    encode_error_code("22021", String::from("invalid byte sequence for encoding UTF8"))
 }
 
 fn copy_in_response() -> Vec<u8> {
@@ -5361,10 +5382,6 @@ fn row_description() -> Vec<u8> {
     body.extend_from_slice(&(-1i32).to_be_bytes());
     body.extend_from_slice(&0i16.to_be_bytes());
     frame(b'T', &body)
-}
-
-fn data_row(text: String) -> Vec<u8> {
-    data_row_values(&[text.into_bytes()])
 }
 
 fn data_row_values(values: &[Vec<u8>]) -> Vec<u8> {

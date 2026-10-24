@@ -83,6 +83,8 @@ All notable changes to rymeDB are recorded here. Format follows
   `0A000` instead of silently returning more rows than the client requested.
 - RESP command names and inline commands now reject malformed UTF-8 instead of
   replacing invalid bytes; array bulk arguments remain binary-safe.
+- PostgreSQL text results now reject invalid UTF-8 or embedded NUL cell bytes
+  with `22021` instead of silently replacing stored data in responses.
 - RESP array commands split at TCP read boundaries now remain buffered instead
   of being rejected as malformed.
 - Immutable-segment recovery now accepts only canonical, fixed-width segment
