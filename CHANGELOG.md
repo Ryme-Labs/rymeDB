@@ -42,6 +42,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 - RESP `XINFO STREAM FULL` now defaults to 10 entries, treats `COUNT 0` as all
   entries, and treats negative counts as the default.
+- RESP `XAUTOCLAIM` now removes deleted stream entries from the consumer
+  group's pending list when reporting them as deleted IDs.
 - RESP `CLIENT HELP` now rejects unexpected arguments.
 - RESP `PFMERGE` now requires at least one source key and leaves the destination
   unchanged when the command has invalid arity.

@@ -5170,6 +5170,7 @@ where
         order.sort_by_key(|slot| Self::parse_stream_id(&group.pending[*slot].0).unwrap_or((0, 0)));
         let mut claimed: Vec<&(String, StreamFields)> = Vec::new();
         let mut orphans: Vec<Vec<u8>> = Vec::new();
+        let mut orphan_ids = HashSet::new();
         let mut cursor = String::from("0-0");
         let mut remaining = count;
         for slot in order {
@@ -5192,9 +5193,13 @@ where
                 Some(entry) => claimed.push(entry),
                 None => {
                     orphans.push(format!("${}\r\n{claimed_id}\r\n", claimed_id.len()).into_bytes());
+                    orphan_ids.insert(claimed_id);
                 }
             }
             remaining -= 1;
+        }
+        if !orphan_ids.is_empty() {
+            group.pending.retain(|(id, _, _, _)| !orphan_ids.contains(id));
         }
         self.write_stream(txn, &args[0], &data)?;
         let mut out = format!("*3\r\n${}\r\n{cursor}\r\n", cursor.len()).into_bytes();

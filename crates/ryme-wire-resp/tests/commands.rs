@@ -913,6 +913,36 @@ async fn stream_last_generated_id_survives_entry_deletion() {
 }
 
 #[tokio::test]
+async fn xautoclaim_removes_deleted_entries_from_pending_list() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["XADD", "claim-orphan", "1-1", "f", "a"]).await, "$3\r\n1-1");
+    assert_eq!(command(addr, &["XGROUP", "CREATE", "claim-orphan", "workers", "0-0"]).await, "+OK");
+    assert!(command(
+        addr,
+        &["XREADGROUP", "GROUP", "workers", "first", "STREAMS", "claim-orphan", ">"]
+    )
+    .await
+    .contains("$3\r\n1-1"));
+    assert_eq!(command(addr, &["XDEL", "claim-orphan", "1-1"]).await, ":1");
+    assert!(command(addr, &["XPENDING", "claim-orphan", "workers"]).await.contains("*4\r\n:1"));
+
+    let claimed = command(
+        addr,
+        &["XAUTOCLAIM", "claim-orphan", "workers", "second", "0", "0-0", "COUNT", "10"],
+    )
+    .await;
+    assert!(claimed.contains("*1\r\n$3\r\n1-1"), "deleted IDs: {claimed}");
+    assert!(command(addr, &["XPENDING", "claim-orphan", "workers"]).await.contains("*4\r\n:0"));
+
+    let claimed_again = command(
+        addr,
+        &["XAUTOCLAIM", "claim-orphan", "workers", "second", "0", "0-0", "COUNT", "10"],
+    )
+    .await;
+    assert!(claimed_again.ends_with("*0"), "second response: {claimed_again}");
+}
+
+#[tokio::test]
 async fn blocking_xread_pins_dollar_to_initial_stream_position() {
     let addr = serve().await;
     assert_eq!(
