@@ -3754,6 +3754,9 @@ impl DurableManager {
                 std::fs::remove_file(candidate)?;
             }
         }
+        // Keep pruned future snapshots from reappearing after the restore
+        // intent is cleared and the WAL has been truncated.
+        sync_directory(&dir)?;
         Ok(())
     }
 
@@ -6083,11 +6086,18 @@ mod tests {
         let after = RecordKey::new("t", "d", "s", b"after");
         let mut second = manager.begin();
         manager.put(&mut second, after.clone(), b"two".to_vec());
-        manager.commit(second).unwrap();
+        let future_commit = manager.commit(second).unwrap();
+        manager.write_snapshot().unwrap();
         assert_eq!(manager.restore_to(checkpoint).unwrap(), 0);
+        assert!(!manager.snapshot_dir().join(snapshot_file_name(future_commit)).exists());
         drop(manager);
 
         let reopened = DurableManager::open(&dir, 1024 * 1024, SyncPolicy::Always).unwrap();
+        assert!(reopened
+            .newest_snapshot_at_or_below(future_commit)
+            .unwrap()
+            .is_some_and(|path| snapshot_commit(path.file_name().unwrap().to_str().unwrap())
+                .is_some_and(|commit_ts| commit_ts <= checkpoint)));
         let mut probe = reopened.begin();
         assert_eq!(reopened.get(&mut probe, &before).unwrap(), Some(b"one".to_vec()));
         assert_eq!(reopened.get(&mut probe, &after).unwrap(), None);

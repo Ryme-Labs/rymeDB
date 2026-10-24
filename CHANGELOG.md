@@ -66,6 +66,8 @@ All notable changes to rymeDB are recorded here. Format follows
   unhealthy, preventing reads or writes against state that may not match disk.
 - Startup now completes an interrupted point-in-time restore from its checksummed
   durable intent before loading snapshots, segments, or WAL records.
+- Point-in-time restore now syncs snapshot pruning before clearing its recovery
+  intent, so discarded future snapshots cannot return after a crash.
 - Raft now broadcasts the committed index for membership changes before
   returning, so followers can apply the new quorum configuration before leader
   loss.
