@@ -475,6 +475,13 @@ All 38 index-crate tests passed, including score-bound checks at tail and large
 dimensions. This is a local build-time result, not a general query-latency
 gain; see the [raw captures](../bench/results/vector-hnsw-dot-eight-accumulators-windows-20261024.json).
 
+Spelling out the eight accumulator updates instead of indexing them in a loop
+did not produce a reliable gain. Across eight alternating release pairs on
+the same host, 384D build median changed by -2.0% (six pairs faster), with ANN
+p50/p95 effectively flat and p99 4.4% higher. The 64D build median was 0.6%
+higher and p95 6.7% higher. Recall was unchanged in both workloads. The
+explicit statements were discarded; see the [raw captures](../bench/results/vector-hnsw-explicit-eight-lane-unroll-windows-20261024.json).
+
 An HNSW build experiment moved the selected-neighbor vector into the new node
 instead of cloning it before linking reverse edges. Eight alternating release
 pairs showed median build time effectively flat: 396.2 to 399.0 ms for 5,000

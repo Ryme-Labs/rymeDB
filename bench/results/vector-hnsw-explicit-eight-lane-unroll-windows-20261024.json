@@ -1,0 +1,77 @@
+{
+  "experiment": "hnsw-explicit-eight-lane-unroll",
+  "date": "2026-10-24",
+  "baseline_revision": "cd467b4",
+  "candidate_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "architecture": "x86_64",
+    "os": "Windows"
+  },
+  "method": "Release-mode in-process vector-index benchmark. Eight alternating baseline/candidate pairs per workload. Baseline uses an indexed eight-lane accumulation loop; candidate spells out each lane update. ANN recall is checked against exact top-k results.",
+  "workloads": {
+    "384d": {
+      "vectors": 3000,
+      "dimensions": 384,
+      "queries": 100,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 128,
+      "baseline": [
+        { "build_ns": 506934500, "ann_p50_ns": 495000, "ann_p95_ns": 656100, "ann_p99_ns": 708500, "recall": 0.9710000000000002 },
+        { "build_ns": 485475800, "ann_p50_ns": 496900, "ann_p95_ns": 718300, "ann_p99_ns": 798500, "recall": 0.9710000000000002 },
+        { "build_ns": 509476000, "ann_p50_ns": 469500, "ann_p95_ns": 650700, "ann_p99_ns": 837600, "recall": 0.9710000000000002 },
+        { "build_ns": 484728500, "ann_p50_ns": 473600, "ann_p95_ns": 699600, "ann_p99_ns": 805400, "recall": 0.9710000000000002 },
+        { "build_ns": 489945800, "ann_p50_ns": 440800, "ann_p95_ns": 616700, "ann_p99_ns": 717000, "recall": 0.9710000000000002 },
+        { "build_ns": 468487400, "ann_p50_ns": 467200, "ann_p95_ns": 667400, "ann_p99_ns": 713400, "recall": 0.9710000000000002 },
+        { "build_ns": 499859900, "ann_p50_ns": 502100, "ann_p95_ns": 720500, "ann_p99_ns": 774800, "recall": 0.9710000000000002 },
+        { "build_ns": 475300000, "ann_p50_ns": 440400, "ann_p95_ns": 616300, "ann_p99_ns": 638900, "recall": 0.9710000000000002 }
+      ],
+      "candidate": [
+        { "build_ns": 467286900, "ann_p50_ns": 504300, "ann_p95_ns": 759900, "ann_p99_ns": 937300, "recall": 0.9710000000000002 },
+        { "build_ns": 474523800, "ann_p50_ns": 463200, "ann_p95_ns": 634700, "ann_p99_ns": 668500, "recall": 0.9710000000000002 },
+        { "build_ns": 481791800, "ann_p50_ns": 448300, "ann_p95_ns": 633500, "ann_p99_ns": 777400, "recall": 0.9710000000000002 },
+        { "build_ns": 496274000, "ann_p50_ns": 475200, "ann_p95_ns": 684900, "ann_p99_ns": 855700, "recall": 0.9710000000000002 },
+        { "build_ns": 489762000, "ann_p50_ns": 490700, "ann_p95_ns": 741700, "ann_p99_ns": 842500, "recall": 0.9710000000000002 },
+        { "build_ns": 458879500, "ann_p50_ns": 477500, "ann_p95_ns": 704000, "ann_p99_ns": 779300, "recall": 0.9710000000000002 },
+        { "build_ns": 452828200, "ann_p50_ns": 430900, "ann_p95_ns": 605500, "ann_p99_ns": 678000, "recall": 0.9710000000000002 },
+        { "build_ns": 482622600, "ann_p50_ns": 474700, "ann_p95_ns": 642900, "ann_p99_ns": 732000, "recall": 0.9710000000000002 }
+      ],
+      "median_change_percent": { "index_build": -1.96, "ann_p50": 0.72, "ann_p95": 0.32, "ann_p99": 4.35 },
+      "candidate_faster_build_pairs": 6
+    },
+    "64d": {
+      "vectors": 5000,
+      "dimensions": 64,
+      "queries": 100,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 64,
+      "baseline": [
+        { "build_ns": 396163300, "ann_p50_ns": 91800, "ann_p95_ns": 113000, "ann_p99_ns": 134500, "recall": 0.9820000000000002 },
+        { "build_ns": 386258800, "ann_p50_ns": 95100, "ann_p95_ns": 147300, "ann_p99_ns": 213100, "recall": 0.9820000000000002 },
+        { "build_ns": 387096600, "ann_p50_ns": 95000, "ann_p95_ns": 130800, "ann_p99_ns": 249800, "recall": 0.9820000000000002 },
+        { "build_ns": 371043300, "ann_p50_ns": 91700, "ann_p95_ns": 105400, "ann_p99_ns": 120700, "recall": 0.9820000000000002 },
+        { "build_ns": 397766100, "ann_p50_ns": 95000, "ann_p95_ns": 118300, "ann_p99_ns": 231400, "recall": 0.9820000000000002 },
+        { "build_ns": 374626600, "ann_p50_ns": 94600, "ann_p95_ns": 169600, "ann_p99_ns": 216200, "recall": 0.9820000000000002 },
+        { "build_ns": 375062100, "ann_p50_ns": 91700, "ann_p95_ns": 107700, "ann_p99_ns": 118000, "recall": 0.9820000000000002 },
+        { "build_ns": 369277800, "ann_p50_ns": 92900, "ann_p95_ns": 121800, "ann_p99_ns": 143600, "recall": 0.9820000000000002 }
+      ],
+      "candidate": [
+        { "build_ns": 382190300, "ann_p50_ns": 92600, "ann_p95_ns": 130400, "ann_p99_ns": 154000, "recall": 0.9820000000000002 },
+        { "build_ns": 393609600, "ann_p50_ns": 98100, "ann_p95_ns": 134200, "ann_p99_ns": 164900, "recall": 0.9820000000000002 },
+        { "build_ns": 390421900, "ann_p50_ns": 96000, "ann_p95_ns": 138100, "ann_p99_ns": 177000, "recall": 0.9820000000000002 },
+        { "build_ns": 386389700, "ann_p50_ns": 97400, "ann_p95_ns": 143900, "ann_p99_ns": 154500, "recall": 0.9820000000000002 },
+        { "build_ns": 371609700, "ann_p50_ns": 93000, "ann_p95_ns": 113400, "ann_p99_ns": 120300, "recall": 0.9820000000000002 },
+        { "build_ns": 378253300, "ann_p50_ns": 92900, "ann_p95_ns": 124300, "ann_p99_ns": 165100, "recall": 0.9820000000000002 },
+        { "build_ns": 377170500, "ann_p50_ns": 98000, "ann_p95_ns": 117500, "ann_p99_ns": 147000, "recall": 0.9820000000000002 },
+        { "build_ns": 383465400, "ann_p50_ns": 92300, "ann_p95_ns": 125700, "ann_p99_ns": 166500, "recall": 0.9820000000000002 }
+      ],
+      "median_change_percent": { "index_build": 0.57, "ann_p50": 0.8, "ann_p95": 6.66, "ann_p99": -10.46 },
+      "candidate_faster_build_pairs": 2
+    }
+  },
+  "decision": "Discard explicit lane statements. Build time was effectively flat across both workloads, query p95/p99 moved in different directions, and recall was unchanged. The indexed loop remains.",
+  "caveat": "One Windows host and local in-memory index benchmark; results are workload-specific and do not represent end-to-end database latency."
+}
