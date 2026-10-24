@@ -5788,6 +5788,7 @@ impl Node {
 
     async fn propose_frame(self: &Arc<Self>, payload: Vec<u8>) -> Result<u64> {
         self.ensure_not_isolated()?;
+        let is_configuration_change = matches!(decode_apply(&payload)?, ApplyPayload::Conf { .. });
         let _write = self.write_lock.lock().await;
         self.ensure_not_isolated()?;
         {
@@ -5838,6 +5839,12 @@ impl Node {
                 return Err(RymeError::Unavailable(String::from("no quorum")));
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        if is_configuration_change {
+            // Replicate the updated commit index before returning so a leader
+            // failure cannot leave members with a committed but unapplied
+            // configuration change.
+            self.replicate_once().await?;
         }
         Ok(index)
     }

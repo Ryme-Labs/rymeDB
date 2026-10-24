@@ -58,6 +58,9 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Raft now broadcasts the committed index for membership changes before
+  returning, so followers can apply the new quorum configuration before leader
+  loss.
 - Raft now rejects replicated data entries with commit timestamp zero before
   they can enter the committed log.
 - Raft now rejects recovered or replicated configuration entries with empty
