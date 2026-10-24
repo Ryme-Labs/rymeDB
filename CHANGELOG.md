@@ -36,6 +36,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP `INCR`/`DECR`/`INCRBY`/`DECRBY` now return errors on integer overflow
+  without saturating or modifying the stored value.
 - RESP `INCRBYFLOAT` rejects non-finite stored values and overflowing results
   without writing them back to the key.
 - RESP millisecond expiry commands retain subsecond precision, and `PTTL`

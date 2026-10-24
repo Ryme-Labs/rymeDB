@@ -2451,7 +2451,10 @@ where
                     Ok(delta) => delta,
                     Err(e) => return encode_error(e),
                 };
-                self.incr_by(txn, &command.args[..1], -delta)
+                match delta.checked_neg() {
+                    Some(delta) => self.incr_by(txn, &command.args[..1], delta),
+                    None => encode_error(String::from("increment or decrement would overflow")),
+                }
             }
             "INCRBYFLOAT" => {
                 if command.args.len() != 2 {
@@ -3070,7 +3073,10 @@ where
                 }
             }
         };
-        let next = base.saturating_add(delta);
+        let next = match base.checked_add(delta) {
+            Some(next) => next,
+            None => return encode_error(String::from("increment or decrement would overflow")),
+        };
         self.manager.put(txn, record, next.to_string().into_bytes());
         encode_integer(next)
     }

@@ -372,6 +372,23 @@ async fn float_counter_rejects_non_finite_results_without_changing_value() {
 }
 
 #[tokio::test]
+async fn integer_counters_reject_overflow_without_changing_value() {
+    let addr = serve().await;
+    let max = i64::MAX.to_string();
+    let min = i64::MIN.to_string();
+
+    assert_eq!(command(addr, &["SET", "n", &max]).await, "+OK");
+    assert!(command(addr, &["INCR", "n"]).await.starts_with("-ERR"));
+    assert_eq!(command(addr, &["GET", "n"]).await, format!("${}\r\n{max}", max.len()));
+
+    assert_eq!(command(addr, &["SET", "n", &min]).await, "+OK");
+    assert!(command(addr, &["DECR", "n"]).await.starts_with("-ERR"));
+    assert_eq!(command(addr, &["GET", "n"]).await, format!("${}\r\n{min}", min.len()));
+    assert!(command(addr, &["DECRBY", "n", &min]).await.starts_with("-ERR"));
+    assert_eq!(command(addr, &["GET", "n"]).await, format!("${}\r\n{min}", min.len()));
+}
+
+#[tokio::test]
 async fn multi_key_ops() {
     let addr = serve().await;
     assert_eq!(command(addr, &["MSET", "a", "1", "b", "2"]).await, "+OK");
