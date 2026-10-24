@@ -855,6 +855,13 @@ about 1% for both alternatives, without a tail-latency improvement. The current
 64-frame setting is retained. All captures delivered 1,000,000 messages with
 zero errors; see the [batch-size captures](../bench/results/realtime-writer-batch-size-windows-20261024.json).
 
+A small optimized Rust microbenchmark compared the wall-clock read used by QoS
+token buckets with a process-relative monotonic clock on Windows 11 (AMD Ryzen
+5 4500). Across 10 rounds of 2,000,000 calls, `SystemTime::now()` measured a
+median 35 ns/call and `Instant::elapsed()` measured 39 ns/call. The monotonic
+candidate was discarded; this isolated timing does not establish end-to-end
+realtime impact. No source change was retained from this experiment.
+
 ## How to read the numbers
 
 - Compare the same protocol and acknowledgement semantics.
