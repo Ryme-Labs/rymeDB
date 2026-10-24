@@ -1,0 +1,66 @@
+{
+  "experiment": "exact-vector-search-f64-dot-four-accumulator-unroll",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "212dfc2",
+  "candidate_revision": "working-tree",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "arch": "x86_64",
+    "os": "Windows"
+  },
+  "method": "Release-mode in-process vector-index benchmark, three alternating baseline/candidate pairs per workload. The candidate keeps each product and accumulator in f64. ANN p50 and recall are included as controls.",
+  "workloads": {
+    "dimensions_64": {
+      "vectors": 5000,
+      "queries": 500,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 64,
+      "baseline": [
+        { "exact_p50_ns": 310600, "exact_p95_ns": 630900, "exact_p99_ns": 908700, "adaptive_ann_p50_ns": 101000, "mean_recall_at_k": 0.978999999999999 },
+        { "exact_p50_ns": 694100, "exact_p95_ns": 1360300, "exact_p99_ns": 1589700, "adaptive_ann_p50_ns": 227000, "mean_recall_at_k": 0.978999999999999 },
+        { "exact_p50_ns": 298000, "exact_p95_ns": 608200, "exact_p99_ns": 821800, "adaptive_ann_p50_ns": 99100, "mean_recall_at_k": 0.978999999999999 }
+      ],
+      "candidate": [
+        { "exact_p50_ns": 154500, "exact_p95_ns": 312100, "exact_p99_ns": 444200, "adaptive_ann_p50_ns": 98200, "mean_recall_at_k": 0.978999999999999 },
+        { "exact_p50_ns": 153800, "exact_p95_ns": 321600, "exact_p99_ns": 540700, "adaptive_ann_p50_ns": 97800, "mean_recall_at_k": 0.978999999999999 },
+        { "exact_p50_ns": 154300, "exact_p95_ns": 323900, "exact_p99_ns": 551200, "adaptive_ann_p50_ns": 99100, "mean_recall_at_k": 0.978999999999999 }
+      ],
+      "median_changes_percent": {
+        "exact_p50": -50.3,
+        "exact_p95": -49.0,
+        "exact_p99": -40.5
+      }
+    },
+    "dimensions_384": {
+      "vectors": 3000,
+      "queries": 100,
+      "partitions": 1,
+      "top_k": 10,
+      "ann_ef": 128,
+      "baseline": [
+        { "exact_p50_ns": 1211500, "exact_p95_ns": 1386700, "exact_p99_ns": 1512500, "adaptive_ann_p50_ns": 546500, "mean_recall_at_k": 0.9710000000000002 },
+        { "exact_p50_ns": 1206700, "exact_p95_ns": 1597800, "exact_p99_ns": 2027200, "adaptive_ann_p50_ns": 602000, "mean_recall_at_k": 0.9710000000000002 },
+        { "exact_p50_ns": 1229400, "exact_p95_ns": 1522500, "exact_p99_ns": 1575200, "adaptive_ann_p50_ns": 584700, "mean_recall_at_k": 0.9710000000000002 }
+      ],
+      "candidate": [
+        { "exact_p50_ns": 561700, "exact_p95_ns": 873800, "exact_p99_ns": 938200, "adaptive_ann_p50_ns": 490500, "mean_recall_at_k": 0.9710000000000002 },
+        { "exact_p50_ns": 610700, "exact_p95_ns": 934800, "exact_p99_ns": 1134200, "adaptive_ann_p50_ns": 553700, "mean_recall_at_k": 0.9710000000000002 },
+        { "exact_p50_ns": 628200, "exact_p95_ns": 924700, "exact_p99_ns": 996700, "adaptive_ann_p50_ns": 553700, "mean_recall_at_k": 0.9710000000000002 }
+      ],
+      "median_changes_percent": {
+        "exact_p50": -49.6,
+        "exact_p95": -39.3,
+        "exact_p99": -36.7
+      }
+    }
+  },
+  "correctness": {
+    "exact_dot_absolute_error_bound": 1e-12,
+    "tested_dimensions": [64, 384, 4096],
+    "index_crate_tests": "38 passed",
+    "ann_mean_recall_unchanged": true
+  },
+  "notes": "Single-host local in-memory index measurements. Baseline 64D had one high-latency run; the medians use all three alternating pairs. These results do not establish end-to-end or cross-database latency."
+}

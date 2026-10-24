@@ -202,6 +202,27 @@ fn dot(a: &[f32], b: &[f32]) -> f64 {
     sum as f64
 }
 
+fn exact_dot(a: &[f32], b: &[f32]) -> f64 {
+    let len = a.len().min(b.len());
+    let mut left_sum = 0.0f64;
+    let mut middle_left_sum = 0.0f64;
+    let mut middle_right_sum = 0.0f64;
+    let mut right_sum = 0.0f64;
+    let mut left_chunks = a[..len].chunks_exact(4);
+    let mut right_chunks = b[..len].chunks_exact(4);
+    for (left, right) in left_chunks.by_ref().zip(right_chunks.by_ref()) {
+        left_sum += f64::from(left[0]) * f64::from(right[0]);
+        middle_left_sum += f64::from(left[1]) * f64::from(right[1]);
+        middle_right_sum += f64::from(left[2]) * f64::from(right[2]);
+        right_sum += f64::from(left[3]) * f64::from(right[3]);
+    }
+    let mut sum = (left_sum + middle_left_sum) + (middle_right_sum + right_sum);
+    for (left, right) in left_chunks.remainder().iter().zip(right_chunks.remainder()) {
+        sum += f64::from(*left) * f64::from(*right);
+    }
+    sum
+}
+
 #[derive(Debug, Clone)]
 struct HnswNode {
     id: String,
@@ -533,11 +554,7 @@ impl VectorSpace {
         Ok(top_k_vector_hits(
             self.ann.id_to_pos.iter().map(|(id, pos)| {
                 let stored = &self.ann.nodes[*pos].vector;
-                let dot = stored
-                    .iter()
-                    .zip(query.iter())
-                    .map(|(a, b)| (*a as f64) * (*b as f64))
-                    .sum::<f64>();
+                let dot = exact_dot(stored, query);
                 let score = dot * inverse_norm;
                 (id.as_str(), score)
             }),
@@ -1537,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_dot_score_error_stays_bounded_at_supported_dimensions() {
+    fn vector_dot_score_error_stays_bounded_at_supported_dimensions() {
         let mut state = 0x8f3d_9a21_7c65_b401u64;
         let mut next_value = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1552,6 +1569,10 @@ mod tests {
             let reference =
                 left.iter().zip(&right).map(|(a, b)| (*a as f64) * (*b as f64)).sum::<f64>();
             assert!((dot(&left, &right) - reference).abs() <= 1e-4, "dimension {dimension}");
+            assert!(
+                (exact_dot(&left, &right) - reference).abs() <= 1e-12,
+                "exact dimension {dimension}"
+            );
         }
     }
 
