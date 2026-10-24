@@ -1310,13 +1310,27 @@ impl Node {
             return Err(RymeError::Corrupt(String::from("raft membership metadata")));
         }
         let meta_fresh = meta.members.is_empty() && meta.joint.is_none();
-        let mut members: Vec<Member> =
-            peer_ids.into_iter().zip(peers).map(|(id, addr)| Member { id, addr }).collect();
-        if meta.members.is_empty() {
+        let mut members: Vec<Member> = if meta_fresh {
+            if peers.len() != peer_ids.len()
+                || peer_ids.len() >= MAX_RAFT_MEMBERS
+                || peer_ids.iter().any(|peer_id| *peer_id == id)
+            {
+                return Err(RymeError::InvalidArgument(String::from("members")));
+            }
+            let mut ids = BTreeSet::new();
+            if peer_ids.iter().any(|peer_id| !ids.insert(*peer_id)) {
+                return Err(RymeError::InvalidArgument(String::from("members")));
+            }
+            let mut members: Vec<Member> = peer_ids
+                .into_iter()
+                .zip(peers)
+                .map(|(id, addr)| Member { id, addr })
+                .collect();
             members.push(Member { id, addr: String::new() });
+            members
         } else {
-            members = meta.members.clone();
-        }
+            meta.members.clone()
+        };
         if let Some(addr) = self_addr {
             if !addr.is_empty() {
                 if let Some(self_member) = members.iter_mut().find(|member| member.id == id) {
@@ -7526,6 +7540,28 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_invalid_fresh_peer_lists() {
+        let cases = [
+            (
+                "duplicate-peer-ids",
+                vec![String::from("127.0.0.1:1"), String::from("127.0.0.1:2")],
+                vec![1, 1],
+            ),
+            ("mismatched-peer-lists", vec![String::from("127.0.0.1:1")], Vec::new()),
+            ("self-in-peer-list", vec![String::from("127.0.0.1:1")], vec![0]),
+        ];
+        for (label, peers, peer_ids) in cases {
+            let dir = temp_dir(label);
+            let result = Node::open(0, peers, peer_ids, &dir);
+            assert!(
+                matches!(result, Err(RymeError::InvalidArgument(ref message)) if message == "members"),
+                "{label}: {result:?}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn open_rejects_oversized_metadata_files() {
         for (label, file) in [("raft", "raft-meta.json"), ("range", "range-meta.json")] {
             let dir = temp_dir(label);
@@ -8153,8 +8189,8 @@ mod tests {
         let dir = temp_dir("range-transfer-rpc-auth");
         let node = Node::open(
             1,
-            vec![String::from("peer-0"), String::from("self"), String::from("peer-2")],
-            vec![0, 1, 2],
+            vec![String::from("peer-0"), String::from("peer-2")],
+            vec![0, 2],
             &dir,
         )
         .unwrap();
