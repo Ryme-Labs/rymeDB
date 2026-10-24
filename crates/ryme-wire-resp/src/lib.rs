@@ -4087,18 +4087,24 @@ where
             let key = &rest[pair];
             let last =
                 std::str::from_utf8(&rest[half + pair]).map_err(|_| String::from("syntax"))?;
-            if last == "$" {
-                continue;
-            }
-            let bound = Self::parse_stream_id(last)?;
             let data = self.read_stream(txn, key)?.unwrap_or_default();
             let mut picked: Vec<&(String, Vec<(String, String)>)> = Vec::new();
-            for entry in data.entries.iter() {
-                let id = Self::parse_stream_id(&entry.0).map_err(|_| String::from("corrupt"))?;
-                if id > bound {
+            if last == "+" {
+                if let Some(entry) = data.entries.last() {
                     picked.push(entry);
-                    if count.is_some_and(|n| picked.len() >= n) {
-                        break;
+                }
+            } else {
+                let bound = if last == "$" { None } else { Some(Self::parse_stream_id(last)?) };
+                let Some(bound) = bound else {
+                    continue;
+                };
+                for entry in data.entries.iter() {
+                    let id = Self::parse_stream_id(&entry.0).map_err(|_| String::from("corrupt"))?;
+                    if id > bound {
+                        picked.push(entry);
+                        if count.is_some_and(|n| picked.len() >= n) {
+                            break;
+                        }
                     }
                 }
             }

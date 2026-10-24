@@ -734,12 +734,15 @@ async fn stream_reads_treat_zero_count_as_unlimited() {
         xread.contains("$3\r\n1-1") && xread.contains("$3\r\n2-2"),
         "XREAD: {xread}"
     );
+    let latest = command(addr, &["XREAD", "COUNT", "1", "STREAMS", "read-zero", "+"]).await;
+    assert!(latest.contains("$3\r\n2-2") && !latest.contains("$3\r\n1-1"), "XREAD +: {latest}");
     let negative_xread =
         command(addr, &["XREAD", "COUNT", "-1", "STREAMS", "read-zero", "0-0"]).await;
     assert!(
         negative_xread.contains("$3\r\n1-1") && negative_xread.contains("$3\r\n2-2"),
         "XREAD: {negative_xread}"
     );
+    assert_eq!(command(addr, &["XREAD", "STREAMS", "missing", "+"]).await, "*-1");
 
     assert_eq!(
         command(addr, &["XGROUP", "CREATE", "read-zero", "group-zero", "0-0"]).await,
