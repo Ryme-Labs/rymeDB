@@ -58,6 +58,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Raft now rejects replicated data entries with commit timestamp zero before
+  they can enter the committed log.
 - Raft now rejects recovered or replicated configuration entries with empty
   membership sets instead of applying an unusable cluster configuration.
 - Transaction apply and replay now validate every key and value before mutating

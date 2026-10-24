@@ -1035,7 +1035,10 @@ fn validate_append_batch(entries: &[LogEntry]) -> Result<()> {
 
 fn validate_apply_payload(input: &[u8]) -> Result<()> {
     match decode_apply(input)? {
-        ApplyPayload::Data { writes, .. } => {
+        ApplyPayload::Data { commit_ts, writes } => {
+            if commit_ts == 0 {
+                return Err(RymeError::Corrupt(String::from("applied commit_ts")));
+            }
             decode_writes(&writes)?;
         }
         ApplyPayload::Conf { .. } => {}
@@ -7195,6 +7198,23 @@ impl ResetFlag for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryme_txn::WriteOp;
+
+    #[test]
+    fn raft_data_entries_reject_zero_commit_timestamps() {
+        let mut writes = BTreeMap::new();
+        writes.insert(
+            RecordKey::new("tenant", "db", "table", b"key"),
+            WriteOp::put(b"value".to_vec()),
+        );
+        let encoded = encode_writes(&writes).unwrap();
+
+        assert!(validate_apply_payload(&encode_applied(1, &encoded)).is_ok());
+        assert!(matches!(
+            validate_apply_payload(&encode_applied(0, &encoded)),
+            Err(RymeError::Corrupt(_))
+        ));
+    }
 
     #[test]
     fn rpc_frame_writer_stops_at_the_serialized_size_limit() {
