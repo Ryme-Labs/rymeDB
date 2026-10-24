@@ -2279,14 +2279,14 @@ where
                 }
             }
             "TTL" => match command.args.first() {
-                Some(key) => match self.ttl_secs(key) {
+                Some(key) => match self.ttl_secs(txn, key) {
                     Ok(ttl) => encode_integer(ttl),
                     Err(error) => encode_error(error.to_string()),
                 },
                 None => encode_error(String::from("wrong args")),
             },
             "PTTL" => match command.args.first() {
-                Some(key) => match self.ttl_millis(key) {
+                Some(key) => match self.ttl_millis(txn, key) {
                     Ok(ttl) => encode_integer(ttl),
                     Err(error) => encode_error(error.to_string()),
                 },
@@ -2308,17 +2308,38 @@ where
             "PERSIST" => match command.args.first() {
                 Some(key) => {
                     let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-                    match self.manager.expires_at(&record) {
-                        Ok(Some(ts)) if ts != 0 => match self.manager.get(txn, &record) {
+                    let staged_expiry = txn.writes().get(&record).is_some_and(|write| {
+                        write.value.is_some()
+                            && write.expires_at != 0
+                            && !ryme_storage::expiry_is_expired(
+                                write.expires_at,
+                                ryme_txn::now_unix_millis(),
+                            )
+                    });
+                    if staged_expiry {
+                        match self.manager.get(txn, &record) {
                             Ok(Some(value)) => {
                                 self.manager.put(txn, record, value);
                                 encode_integer(1)
                             }
                             Ok(None) => encode_integer(0),
                             Err(error) => encode_error(error.to_string()),
-                        },
-                        Ok(_) => encode_integer(0),
-                        Err(error) => encode_error(error.to_string()),
+                        }
+                    } else if txn.writes().contains_key(&record) {
+                        encode_integer(0)
+                    } else {
+                        match self.manager.expires_at_at(&record, txn.read_ts) {
+                            Ok(Some(ts)) if ts != 0 => match self.manager.get(txn, &record) {
+                                Ok(Some(value)) => {
+                                    self.manager.put(txn, record, value);
+                                    encode_integer(1)
+                                }
+                                Ok(None) => encode_integer(0),
+                                Err(error) => encode_error(error.to_string()),
+                            },
+                            Ok(_) => encode_integer(0),
+                            Err(error) => encode_error(error.to_string()),
+                        }
                     }
                 }
                 None => encode_error(String::from("wrong args")),
@@ -5330,9 +5351,21 @@ where
         Ok(out)
     }
 
-    fn ttl_secs(&self, key: &[u8]) -> Result<i64> {
+    fn ttl_secs(&self, txn: &Transaction, key: &[u8]) -> Result<i64> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.expires_at(&record)? {
+        if let Some(write) = txn.writes().get(&record) {
+            let now = ryme_txn::now_unix_millis();
+            if write.value.is_none() || ryme_storage::expiry_is_expired(write.expires_at, now) {
+                return Ok(-2);
+            }
+            if write.expires_at == 0 {
+                return Ok(-1);
+            }
+            let remaining =
+                ryme_storage::expiry_remaining_millis(write.expires_at, now).unwrap_or(0);
+            return Ok((remaining / 1000) as i64);
+        }
+        match self.manager.expires_at_at(&record, txn.read_ts)? {
             Some(0) => Ok(-1),
             Some(ts) => {
                 let now = ryme_txn::now_unix_millis();
@@ -5343,9 +5376,21 @@ where
         }
     }
 
-    fn ttl_millis(&self, key: &[u8]) -> Result<i64> {
+    fn ttl_millis(&self, txn: &Transaction, key: &[u8]) -> Result<i64> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        match self.manager.expires_at(&record)? {
+        if let Some(write) = txn.writes().get(&record) {
+            let now = ryme_txn::now_unix_millis();
+            if write.value.is_none() || ryme_storage::expiry_is_expired(write.expires_at, now) {
+                return Ok(-2);
+            }
+            if write.expires_at == 0 {
+                return Ok(-1);
+            }
+            let remaining =
+                ryme_storage::expiry_remaining_millis(write.expires_at, now).unwrap_or(0);
+            return Ok(remaining.min(i64::MAX as u64) as i64);
+        }
+        match self.manager.expires_at_at(&record, txn.read_ts)? {
             Some(0) => Ok(-1),
             Some(ts) => {
                 let remaining =
@@ -5369,7 +5414,7 @@ where
             if self.manager.get(txn, &record)?.is_none() {
                 return Ok(-2);
             }
-            self.manager.expires_at(&record)?.unwrap_or(0)
+            self.manager.expires_at_at(&record, txn.read_ts)?.unwrap_or(0)
         };
         if expires_at == 0 {
             return Ok(-1);
@@ -5500,7 +5545,9 @@ where
             let Some(value) = self.manager.get(txn, &record).map_err(|e| e.to_string())? else {
                 return Ok(false);
             };
-            let Some(expiry) = self.manager.expires_at(&record).map_err(|e| e.to_string())? else {
+            let Some(expiry) =
+                self.manager.expires_at_at(&record, txn.read_ts).map_err(|e| e.to_string())?
+            else {
                 return Ok(false);
             };
             (value, expiry)

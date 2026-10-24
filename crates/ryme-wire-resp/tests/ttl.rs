@@ -140,6 +140,12 @@ async fn expire_time_commands_distinguish_persistent_and_missing_keys() {
     assert_eq!(command(addr, &["SET", "expired", "v", "PX", "0"]).await, "+OK");
     assert_eq!(command(addr, &["EXPIRETIME", "expired"]).await, ":-2");
     assert_eq!(command(addr, &["PEXPIRETIME", "expired"]).await, ":-2");
+    assert_eq!(command(addr, &["SET", "deleted", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["DEL", "deleted"]).await, ":1");
+    assert_eq!(command(addr, &["TTL", "deleted"]).await, ":-2");
+    assert_eq!(command(addr, &["PTTL", "deleted"]).await, ":-2");
+    assert_eq!(command(addr, &["EXPIRETIME", "deleted"]).await, ":-2");
+    assert_eq!(command(addr, &["PEXPIRETIME", "deleted"]).await, ":-2");
 }
 
 #[tokio::test]

@@ -87,6 +87,24 @@ async fn multi_expiry_conditions_observe_staged_values_and_expirations() {
 }
 
 #[tokio::test]
+async fn multi_ttl_and_persist_observe_staged_expiry() {
+    let addr = serve().await;
+    let mut session = Session::connect(addr).await;
+    assert_eq!(session.command(&["MULTI"]).await, "+OK");
+    assert_eq!(session.command(&["SET", "tx:persist", "value", "PX", "5000"]).await, "+QUEUED");
+    assert_eq!(session.command(&["PTTL", "tx:persist"]).await, "+QUEUED");
+    assert_eq!(session.command(&["PERSIST", "tx:persist"]).await, "+QUEUED");
+    let replies = session.command(&["EXEC"]).await;
+    let mut replies = replies.split("\r\n");
+    assert_eq!(replies.next(), Some("*3"));
+    assert_eq!(replies.next(), Some("+OK"));
+    let pttl: i64 = replies.next().unwrap().strip_prefix(':').unwrap().parse().unwrap();
+    assert!((1..=5000).contains(&pttl));
+    assert_eq!(replies.next(), Some(":1"));
+    assert_eq!(session.command(&["TTL", "tx:persist"]).await, ":-1");
+}
+
+#[tokio::test]
 async fn multi_get_many_reads_include_staged_values_and_preserve_duplicate_keys() {
     let addr = serve().await;
     let mut session = Session::connect(addr).await;

@@ -43,8 +43,8 @@ All notable changes to rymeDB are recorded here. Format follows
   and `NX`/`XX`/`GT`/`LT` conditions through the transaction expiry path.
 - RESP expiry commands reject repeated or conflicting condition flags instead
   of silently allowing the last flag to override earlier ones.
-- RESP expiry commands inside `MULTI` now honor earlier staged values and
-  expiration deadlines in that transaction.
+- RESP expiry commands and `TTL`/`PTTL` inside `MULTI` now honor earlier
+  staged values and expiration deadlines in that transaction.
 - RESP implements `EXPIRETIME` and `PEXPIRETIME` for local and remote keys,
   including the standard `-1` persistent and `-2` missing results.
 - Ordered SQL scans now sort the full bounded result set or return an overload
