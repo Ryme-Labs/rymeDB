@@ -52,6 +52,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Storage segment merges now validate every key history before appending, so a
+  late timestamp conflict cannot leave an in-memory engine partially merged.
 - Raft peer dialing now tries all resolved address families, so DNS names work
   when only an IPv4 or IPv6 listener is available.
 - Range election ticks no longer restore the configured owner after a vote clears

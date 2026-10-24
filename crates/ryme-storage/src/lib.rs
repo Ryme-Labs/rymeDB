@@ -277,19 +277,29 @@ impl Engine {
     }
 
     pub(crate) fn merge_owned(&mut self, other: Engine) -> Result<()> {
+        // Validate the complete merge before appending any history. A conflict
+        // late in key order must not leave the target partially updated.
+        for (key, incoming) in &other.inner {
+            if incoming.is_empty() {
+                continue;
+            }
+            if self
+                .inner
+                .get(key)
+                .and_then(|versions| versions.back())
+                .zip(incoming.front())
+                .is_some_and(|(last, first)| last.commit_ts >= first.commit_ts)
+            {
+                return Err(RymeError::Conflict(String::from("stale commit_ts")));
+            }
+        }
+
         let Engine { inner, bytes_held } = other;
         for (key, mut incoming) in inner {
             if incoming.is_empty() {
                 continue;
             }
             let versions = self.inner.entry(key).or_default();
-            if versions
-                .back()
-                .zip(incoming.front())
-                .is_some_and(|(last, first)| last.commit_ts >= first.commit_ts)
-            {
-                return Err(RymeError::Conflict(String::from("stale commit_ts")));
-            }
             versions.append(&mut incoming);
         }
         self.bytes_held += bytes_held;
@@ -1363,6 +1373,23 @@ mod tests {
         assert_eq!(base.read(&expiring, 4, 50_000).unwrap(), None);
         assert_eq!(base.max_commit_ts(), 4);
         assert_eq!(base.bytes_held(), 9);
+    }
+
+    #[test]
+    fn failed_owned_engine_merge_does_not_partially_mutate_target() {
+        let earlier_key = RecordKey::new("t", "d", "items", b"a");
+        let conflicting_key = RecordKey::new("t", "d", "items", b"z");
+        let mut base = Engine::new();
+        base.apply(conflicting_key.clone(), 5, Some(b"base".to_vec())).unwrap();
+
+        let mut delta = Engine::new();
+        delta.apply(earlier_key.clone(), 2, Some(b"delta".to_vec())).unwrap();
+        delta.apply(conflicting_key.clone(), 4, Some(b"stale".to_vec())).unwrap();
+
+        assert!(base.merge_owned(delta).is_err());
+        assert_eq!(base.read(&earlier_key, 2, 0).unwrap(), None);
+        assert_eq!(base.read(&conflicting_key, 5, 0).unwrap(), Some(b"base".to_vec()));
+        assert_eq!(base.bytes_held(), 4);
     }
 
     #[test]
