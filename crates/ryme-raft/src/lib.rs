@@ -196,7 +196,15 @@ pub fn encode_conf(members: &[crate::net::Member]) -> Result<Vec<u8>> {
     encode_conf_change(&ConfChange::single(members.to_vec()))
 }
 
+/// Encodes a single or joint membership change after validating its member sets.
+/// Each set must be non-empty, within the Raft member/address bounds, and use
+/// unique node IDs. Invalid sets return [`RymeError::InvalidArgument`].
 pub fn encode_conf_change(change: &ConfChange) -> Result<Vec<u8>> {
+    if !crate::net::valid_member_set(&change.old)
+        || change.new.as_ref().is_some_and(|members| !crate::net::valid_member_set(members))
+    {
+        return Err(RymeError::InvalidArgument(String::from("conf membership")));
+    }
     let mut out = vec![1u8];
     let raw = serde_json::to_vec(change).map_err(|e| RymeError::Internal(e.to_string()))?;
     out.extend_from_slice(&raw);

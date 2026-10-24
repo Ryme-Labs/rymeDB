@@ -900,9 +900,14 @@ pub struct Member {
 }
 
 pub(crate) fn valid_member_set(members: &[Member]) -> bool {
-    !members.is_empty()
-        && members.len() <= MAX_RAFT_MEMBERS
-        && members.iter().all(|member| member.addr.len() <= MAX_RAFT_MEMBER_ADDR_BYTES)
+    if members.is_empty()
+        || members.len() > MAX_RAFT_MEMBERS
+        || members.iter().any(|member| member.addr.len() > MAX_RAFT_MEMBER_ADDR_BYTES)
+    {
+        return false;
+    }
+    let mut ids = BTreeSet::new();
+    members.iter().all(|member| ids.insert(member.id))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -7244,13 +7249,40 @@ mod tests {
         let too_many = (0..=MAX_RAFT_MEMBERS)
             .map(|id| Member { id, addr: String::from("127.0.0.1:1") })
             .collect();
-        let too_many = crate::encode_conf_change(&crate::ConfChange::single(too_many)).unwrap();
+        let too_many_change = crate::ConfChange::single(too_many);
+        assert!(matches!(
+            crate::encode_conf_change(&too_many_change),
+            Err(RymeError::InvalidArgument(_))
+        ));
+        let too_many = encode_untrusted_conf_change(&too_many_change);
         assert!(matches!(decode_apply(&too_many), Err(RymeError::Corrupt(_))));
 
         let long_address = vec![Member { id: 1, addr: "a".repeat(MAX_RAFT_MEMBER_ADDR_BYTES + 1) }];
-        let long_address =
-            crate::encode_conf_change(&crate::ConfChange::single(long_address)).unwrap();
+        let long_address_change = crate::ConfChange::single(long_address);
+        assert!(matches!(
+            crate::encode_conf_change(&long_address_change),
+            Err(RymeError::InvalidArgument(_))
+        ));
+        let long_address = encode_untrusted_conf_change(&long_address_change);
         assert!(matches!(decode_apply(&long_address), Err(RymeError::Corrupt(_))));
+
+        let duplicate_ids = vec![
+            Member { id: 1, addr: String::from("127.0.0.1:1") },
+            Member { id: 1, addr: String::from("127.0.0.1:2") },
+        ];
+        let duplicate_change = crate::ConfChange::single(duplicate_ids);
+        assert!(matches!(
+            crate::encode_conf_change(&duplicate_change),
+            Err(RymeError::InvalidArgument(_))
+        ));
+        let duplicate_ids = encode_untrusted_conf_change(&duplicate_change);
+        assert!(matches!(decode_apply(&duplicate_ids), Err(RymeError::Corrupt(_))));
+    }
+
+    fn encode_untrusted_conf_change(change: &crate::ConfChange) -> Vec<u8> {
+        let mut payload = vec![1];
+        payload.extend_from_slice(&serde_json::to_vec(change).unwrap());
+        payload
     }
 
     #[test]
@@ -7460,6 +7492,29 @@ mod tests {
             commit_index: 0,
             members: vec![Member { id: 0, addr: String::new() }],
             joint: Some(Vec::new()),
+        };
+        std::fs::write(dir.join("raft-meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let result = Node::open(0, Vec::new(), Vec::new(), &dir);
+        assert!(
+            matches!(result, Err(RymeError::Corrupt(message)) if message == "raft membership metadata")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_rejects_duplicate_member_ids_in_metadata() {
+        let dir = temp_dir("duplicate-member-meta");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = Meta {
+            term: 1,
+            voted_for: None,
+            commit_index: 0,
+            members: vec![
+                Member { id: 0, addr: String::from("127.0.0.1:1") },
+                Member { id: 0, addr: String::from("127.0.0.1:2") },
+            ],
+            joint: None,
         };
         std::fs::write(dir.join("raft-meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
 
