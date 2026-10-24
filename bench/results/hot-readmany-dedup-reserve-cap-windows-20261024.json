@@ -1,0 +1,54 @@
+{
+  "experiment": "hot-read-many-duplicate-map-initial-reserve-cap",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500 6-Core Processor",
+    "host_memory_bytes": 17042579456,
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "protocol": "in_process_transaction_core",
+  "storage_mode": "hot",
+  "durability": "in_memory_only",
+  "iterations": 100,
+  "batch_size": 1024,
+  "value_bytes": 128,
+  "baseline_revision": "71509f2",
+  "candidate_change": "Cap first_indices HashMap initial capacity at 256 entries; allow normal growth for larger unique sets.",
+  "repeated_keys": {
+    "records": 64,
+    "candidates_per_iteration": 1024,
+    "baseline": [
+      { "p50_ns": 204900, "p95_ns": 317000, "p99_ns": 370900 },
+      { "p50_ns": 202800, "p95_ns": 237500, "p99_ns": 304600 },
+      { "p50_ns": 192100, "p95_ns": 235200, "p99_ns": 247900 },
+      { "p50_ns": 188000, "p95_ns": 232100, "p99_ns": 255500 },
+      { "p50_ns": 199700, "p95_ns": 249600, "p99_ns": 314000 }
+    ],
+    "reserve_cap_256": [
+      { "p50_ns": 190500, "p95_ns": 229100, "p99_ns": 274800 },
+      { "p50_ns": 177100, "p95_ns": 217600, "p99_ns": 267900 },
+      { "p50_ns": 201300, "p95_ns": 235000, "p99_ns": 250400 },
+      { "p50_ns": 184100, "p95_ns": 231100, "p99_ns": 250400 },
+      { "p50_ns": 190500, "p95_ns": 225200, "p99_ns": 250500 }
+    ],
+    "median_capture_p50_change_percent": -4.6
+  },
+  "near_unique_keys": {
+    "records": 1023,
+    "candidates_per_iteration": 1024,
+    "baseline": [
+      { "p50_ns": 434900, "p95_ns": 538100, "p99_ns": 671300 },
+      { "p50_ns": 478400, "p95_ns": 574200, "p99_ns": 672000 },
+      { "p50_ns": 438100, "p95_ns": 555200, "p99_ns": 626900 }
+    ],
+    "reserve_cap_256": [
+      { "p50_ns": 480100, "p95_ns": 595400, "p99_ns": 789400 },
+      { "p50_ns": 466500, "p95_ns": 621300, "p99_ns": 864600 },
+      { "p50_ns": 465100, "p95_ns": 624500, "p99_ns": 818000 }
+    ],
+    "median_capture_p50_change_percent": 6.5
+  },
+  "decision": "Discarded. The cap helped the duplicate-heavy batch but regressed the near-unique batch, whose map must grow after the smaller initial reservation. Keep full batch reservation on the Hot engine path.",
+  "notes": "Five alternating pairs for repeated keys and three for near-unique keys. Same Windows host and release benchmark. This is an in-process Hot-mode result, not an end-to-end database claim."
+}

@@ -222,6 +222,13 @@ keys and 4.3% higher for unique keys, so the candidate was discarded. The
 existing set check remains useful for batches without duplicates; see the
 [raw experiment](../bench/results/hot-readmany-single-pass-dedup-windows-20261024.json).
 
+I also tested capping the Hot-mode duplicate map's initial reservation at 256
+entries. With a single 1,024-key batch, five alternating pairs measured
+repeated-key median p50 4.6% lower, but three near-unique pairs (1,023 distinct
+keys) regressed median p50 by 6.5% as the map grew. Since the workload shape is
+unknown when reserving, this candidate was discarded; the Hot path retains its
+full-batch reservation. See the [raw captures](../bench/results/hot-readmany-dedup-reserve-cap-windows-20261024.json).
+
 Standard segment batch reads now bypass duplicate detection for strictly
 ascending and descending batches. For other batches of at least 16 keys, they
 resolve each distinct key once and fan its value back to duplicate positions.
