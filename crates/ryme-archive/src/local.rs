@@ -219,6 +219,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_store_put_replaces_existing_object() {
+        let root = std::env::temp_dir().join(format!(
+            "ryme-local-store-replace-{}-{}",
+            std::process::id(),
+            crate::now_unix()
+        ));
+        let store = LocalStore::new(root.clone());
+        store.put("backups/object", b"first".to_vec()).await.unwrap();
+        store.put("backups/object", b"second".to_vec()).await.unwrap();
+        assert_eq!(store.get("backups/object").await.unwrap(), b"second");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn local_store_conditional_put_preserves_existing_object() {
         let root = std::env::temp_dir().join(format!(
             "ryme-local-store-conditional-{}-{}",
@@ -251,7 +265,7 @@ impl crate::ObjectStore for LocalStore {
             std::io::Write::write_all(&mut file, &bytes)?;
             file.sync_all()?;
             drop(file);
-            std::fs::rename(&tmp, &path)?;
+            ryme_error::replace_file_atomically(&tmp, &path)?;
             sync_archive_directory(parent)?;
             for directory in &missing_directories {
                 if let Some(parent) = directory.parent() {

@@ -187,7 +187,7 @@ fn persist_metadata_file(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
-    if let Err(error) = std::fs::rename(&temporary, path) {
+    if let Err(error) = ryme_error::replace_file_atomically(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
@@ -1719,6 +1719,21 @@ impl TxnBackend for HybridBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shard_metadata_persistence_replaces_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-shard-metadata-replace-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("placement.json");
+        persist_metadata_file(&path, b"first").unwrap();
+        persist_metadata_file(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn placement_metadata_reads_are_bounded() {

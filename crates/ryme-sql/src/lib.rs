@@ -1401,7 +1401,7 @@ pub fn persist_schema_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
-    if let Err(error) = std::fs::rename(&temporary, path) {
+    if let Err(error) = ryme_error::replace_file_atomically(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
@@ -17216,6 +17216,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_snapshot_persistence_replaces_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ryme-schema-replace-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = SchemaSnapshot::default();
+        let mut second = SchemaSnapshot::default();
+        second.rls_tables.insert(String::from("messages"), String::from("tenant_id"));
+
+        persist_schema_snapshot(&path, &first).unwrap();
+        persist_schema_snapshot(&path, &second).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), schema_snapshot_bytes(&second).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn json_projection_parses_only_selected_roots_and_keeps_projection_semantics() {

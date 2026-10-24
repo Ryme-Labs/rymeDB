@@ -64,6 +64,8 @@ All notable changes to rymeDB are recorded here. Format follows
   file already exists.
 - Server metadata and keyring snapshots now use atomic replacement on Windows,
   so existing auth, control, and journal files can be updated.
+- Local archive objects, SQL schema snapshots, Raft metadata, and shard placement
+  metadata now also replace existing files atomically on Windows.
 - Point-in-time restore now publishes its recovery pointer before pruning newer
   snapshots, preserving the existing recovery point if publication fails.
 - A point-in-time restore persistence error now marks the durable manager
