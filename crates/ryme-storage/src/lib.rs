@@ -10,7 +10,7 @@ const MILLIS_EXPIRY_TAG: u64 = 1 << 63;
 /// Encodes an absolute Unix-millisecond expiry without changing the on-disk
 /// version layout. Existing untagged second-based expiries remain readable.
 pub fn expiry_at_millis(unix_millis: u64) -> u64 {
-    MILLIS_EXPIRY_TAG | (unix_millis & !MILLIS_EXPIRY_TAG)
+    MILLIS_EXPIRY_TAG | unix_millis.min(!MILLIS_EXPIRY_TAG)
 }
 
 /// Converts a stored expiry into Unix milliseconds, including legacy seconds.
@@ -1265,6 +1265,7 @@ mod tests {
         assert_eq!(expiry_remaining_millis(millis_expiry, 1_700_000_000_000), Some(123));
         assert!(!expiry_is_expired(millis_expiry, 1_700_000_000_122));
         assert!(expiry_is_expired(millis_expiry, 1_700_000_000_123));
+        assert_eq!(expiry_to_millis(expiry_at_millis(MILLIS_EXPIRY_TAG + 1)), !MILLIS_EXPIRY_TAG);
         assert_eq!(expiry_remaining_millis(0, 1_700_000_000_000), None);
     }
 

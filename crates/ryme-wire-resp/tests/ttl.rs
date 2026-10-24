@@ -87,6 +87,39 @@ async fn millisecond_expiry_keeps_subsecond_precision() {
 }
 
 #[tokio::test]
+async fn absolute_expiry_commands_handle_units_and_conditional_flags() {
+    let addr = serve().await;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let expires_at_secs = now.as_secs() + 10;
+    assert_eq!(command(addr, &["SET", "seconds", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["EXPIREAT", "seconds", &expires_at_secs.to_string()]).await, ":1");
+    let ttl: i64 = command(addr, &["TTL", "seconds"]).await[1..].parse().unwrap();
+    assert!((1..=10).contains(&ttl));
+
+    let expires_at_millis = now.as_millis() + 350;
+    assert_eq!(command(addr, &["SET", "millis", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["PEXPIREAT", "millis", &expires_at_millis.to_string()]).await, ":1");
+    let pttl: i64 = command(addr, &["PTTL", "millis"]).await[1..].parse().unwrap();
+    assert!((1..=350).contains(&pttl));
+
+    assert_eq!(command(addr, &["SET", "conditional", "v", "EX", "10"]).await, "+OK");
+    assert_eq!(
+        command(addr, &["EXPIREAT", "conditional", &now.as_secs().to_string(), "NX"]).await,
+        ":0"
+    );
+    assert_eq!(command(addr, &["GET", "conditional"]).await, "$1\r\nv");
+    assert_eq!(
+        command(addr, &["EXPIREAT", "conditional", &now.as_secs().to_string(), "XX"]).await,
+        ":1"
+    );
+    assert_eq!(command(addr, &["GET", "conditional"]).await, "$-1");
+
+    assert_eq!(command(addr, &["SET", "past", "v"]).await, "+OK");
+    assert_eq!(command(addr, &["EXPIREAT", "past", "0", "NX"]).await, ":1");
+    assert_eq!(command(addr, &["GET", "past"]).await, "$-1");
+}
+
+#[tokio::test]
 async fn expire_modes_and_nx_xx() {
     let addr = serve().await;
     assert_eq!(command(addr, &["EXPIRE", "missing", "10"]).await, ":0");

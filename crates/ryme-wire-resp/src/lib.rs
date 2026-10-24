@@ -2249,6 +2249,21 @@ where
                     Err(e) => encode_error(e),
                 }
             }
+            "EXPIREAT" | "PEXPIREAT" => {
+                if command.args.len() < 2 {
+                    return encode_error(String::from("wrong args"));
+                }
+                match self.expire_key_at(
+                    txn,
+                    &command.args[0],
+                    &command.args[1],
+                    command.name == "PEXPIREAT",
+                    &command.args[2..],
+                ) {
+                    Ok(applied) => encode_integer(i64::from(applied)),
+                    Err(error) => encode_error(error),
+                }
+            }
             "TTL" => match command.args.first() {
                 Some(key) => match self.ttl_secs(key) {
                     Ok(ttl) => encode_integer(ttl),
@@ -5352,16 +5367,9 @@ where
             .map_err(|_| String::from("value is not an integer or out of range"))?
             .parse()
             .map_err(|_| String::from("value is not an integer or out of range"))?;
-        if secs <= 0 {
-            let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-            let existed = self.manager.get(txn, &record).map_err(|e| e.to_string())?.is_some();
-            if existed {
-                self.manager.delete(txn, record);
-            }
-            return Ok(existed);
-        }
         let expires_at = ryme_storage::expiry_at_millis(
-            ryme_txn::now_unix_millis().saturating_add((secs as u64).saturating_mul(1000)),
+            ryme_txn::now_unix_millis()
+                .saturating_add((secs.max(0) as u64).saturating_mul(1000)),
         );
         self.apply_expire(txn, key, expires_at, flags)
     }
@@ -5377,12 +5385,31 @@ where
             .map_err(|_| String::from("value is not an integer or out of range"))?
             .parse()
             .map_err(|_| String::from("value is not an integer or out of range"))?;
-        if millis <= 0 {
-            return self.expire_key(txn, key, b"0", flags);
-        }
         let expires_at = ryme_storage::expiry_at_millis(
-            ryme_txn::now_unix_millis().saturating_add(millis as u64),
+            ryme_txn::now_unix_millis().saturating_add(millis.max(0) as u64),
         );
+        self.apply_expire(txn, key, expires_at, flags)
+    }
+
+    fn expire_key_at(
+        &self,
+        txn: &mut Transaction,
+        key: &[u8],
+        timestamp_raw: &[u8],
+        millis: bool,
+        flags: &[Vec<u8>],
+    ) -> std::result::Result<bool, String> {
+        let timestamp: i64 = std::str::from_utf8(timestamp_raw)
+            .map_err(|_| String::from("value is not an integer or out of range"))?
+            .parse()
+            .map_err(|_| String::from("value is not an integer or out of range"))?;
+        let expires_at = if millis {
+            ryme_storage::expiry_at_millis(timestamp.max(0) as u64)
+        } else if timestamp <= 0 {
+            ryme_storage::expiry_at_millis(0)
+        } else {
+            timestamp as u64
+        };
         self.apply_expire(txn, key, expires_at, flags)
     }
 
@@ -5405,6 +5432,9 @@ where
             }
         }
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
+        let Some(value) = self.manager.get(txn, &record).map_err(|e| e.to_string())? else {
+            return Ok(false);
+        };
         let current = self.manager.expires_at(&record).map_err(|e| e.to_string())?;
         let Some(expiry) = current else {
             return Ok(false);
@@ -5427,10 +5457,11 @@ where
         if !allowed {
             return Ok(false);
         }
-        let Some(value) = self.manager.get(txn, &record).map_err(|e| e.to_string())? else {
-            return Ok(false);
-        };
-        self.manager.put_with_ttl(txn, record, value, expires_at);
+        if ryme_storage::expiry_is_expired(expires_at, ryme_txn::now_unix_millis()) {
+            self.manager.delete(txn, record);
+        } else {
+            self.manager.put_with_ttl(txn, record, value, expires_at);
+        }
         Ok(true)
     }
 }
@@ -6080,6 +6111,8 @@ fn is_known(name: &str) -> bool {
             | "GETDEL"
             | "EXPIRE"
             | "PEXPIRE"
+            | "EXPIREAT"
+            | "PEXPIREAT"
             | "TTL"
             | "PTTL"
             | "PERSIST"
