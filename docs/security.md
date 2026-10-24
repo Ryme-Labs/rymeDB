@@ -47,6 +47,9 @@ those updates as executable supply-chain changes.
 - Restrict superuser credentials and archive/membership routes; tenant
   owner/admin roles are not platform operators.
 - Apply filesystem and object-store least privilege to `data_dir` and backups.
+- Branch and shard placement metadata readers reject final-component symlinks
+  and reparse points; keep their parent data directories writable only by the
+  database service account.
 - Run restore verification drills and rotate keys without publishing secrets.
 
 ## Scope notes

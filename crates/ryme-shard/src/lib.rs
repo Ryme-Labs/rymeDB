@@ -189,7 +189,7 @@ fn read_bounded_metadata(path: &std::path::Path, label: &str) -> Result<Option<V
     if !path_metadata.file_type().is_file() {
         return Err(RymeError::Corrupt(format!("{label} file type")));
     }
-    let file = match std::fs::File::open(path) {
+    let file = match ryme_error::open_read_no_follow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),

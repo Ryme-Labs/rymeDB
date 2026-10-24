@@ -86,7 +86,7 @@ impl BranchManager {
         if !path_metadata.file_type().is_file() {
             return Err(RymeError::Corrupt(String::from("branch metadata file type")));
         }
-        let file = match std::fs::File::open(path) {
+        let file = match ryme_error::open_read_no_follow(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
             Err(error) => return Err(error.into()),
