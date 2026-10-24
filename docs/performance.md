@@ -862,6 +862,15 @@ median 35 ns/call and `Instant::elapsed()` measured 39 ns/call. The monotonic
 candidate was discarded; this isolated timing does not establish end-to-end
 realtime impact. No source change was retained from this experiment.
 
+For a snapshot with three deltas (four sorted segments total), eight alternating
+baseline/candidate scan pairs on the same Windows host measured median p50 at
+33.3 µs for the generic heap merge and 31.2 µs for the fixed four-segment merge;
+the candidate p50 was lower in all eight pairs. Median p95 moved from 40.05 µs
+to 37.15 µs, although p95 was noisy and worsened in three pairs. The bounded
+four-way scan is retained; results cover a warmed, single-threaded 100-row page
+over 10,000 snapshot rows with no concurrent writers. This is not evidence of a
+general database-wide speedup. See the [raw captures](../bench/results/segment-scan-four-way-merge-windows-20261024.json).
+
 ## How to read the numbers
 
 - Compare the same protocol and acknowledgement semantics.
