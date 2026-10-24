@@ -1578,6 +1578,17 @@ fn merge_rls_policy_column(map: &mut HashMap<String, String>, table: &str, colum
     }
 }
 
+fn normalize_configured_rls_tables(
+    mut rls_tables: HashMap<String, String>,
+) -> HashMap<String, String> {
+    for column in rls_tables.values_mut() {
+        if column.is_empty() {
+            *column = String::from(RLS_CONFLICT_COLUMN);
+        }
+    }
+    rls_tables
+}
+
 fn merge_uid_rls_policy_column(map: &mut HashMap<String, Vec<String>>, table: &str, column: &str) {
     let columns = map.entry(table.to_string()).or_default();
     if columns.iter().any(String::is_empty) {
@@ -1675,6 +1686,7 @@ fn rls_tenant_column_allows(
     match column {
         None => true,
         Some(column) if column.is_empty() => true,
+        Some(column) if column == RLS_CONFLICT_COLUMN => false,
         Some(column) => tenant_field_matches(object, column, tenant),
     }
 }
@@ -8366,6 +8378,7 @@ where
     }
 
     pub fn with_rls_tables(mut self, rls_tables: HashMap<String, String>) -> Self {
+        let rls_tables = normalize_configured_rls_tables(rls_tables);
         let policies = rls_tables
             .iter()
             .map(|(table, column)| {
@@ -8401,6 +8414,7 @@ where
     }
 
     pub fn set_rls_tables(&mut self, rls_tables: HashMap<String, String>) {
+        let rls_tables = normalize_configured_rls_tables(rls_tables);
         if let Ok(mut platform_tables) = self.platform_rls_tables.write() {
             platform_tables.extend(rls_tables.keys().cloned());
         }
@@ -19262,6 +19276,20 @@ mod tests {
             "docs",
             br#"{"tenant_id":"tenant-b","body":"must stay hidden"}"#,
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_configured_tenant_column_fails_closed() {
+        let row = br#"{"tenant_id":"tenant-a","body":"must stay hidden"}"#;
+        let configured = Executor::new(String::from("tenant-a"), String::from("d"))
+            .with_rls_tables(HashMap::from([(String::from("docs"), String::new())]));
+        assert!(!configured.row_allowed_by_rls("docs", row));
+        assert!(!configured.row_allowed_for_write("docs", row));
+
+        let mut executor = Executor::new(String::from("tenant-a"), String::from("d"));
+        executor.set_rls_tables(HashMap::from([(String::from("docs"), String::new())]));
+        assert!(!executor.row_allowed_by_rls("docs", row));
+        assert!(!executor.row_allowed_for_write("docs", row));
     }
 
     #[tokio::test]

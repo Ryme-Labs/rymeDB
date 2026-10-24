@@ -18,6 +18,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Security
 
+- SQL row-level security now denies rows when an explicitly configured tenant
+  column name is empty, matching configuration validation and failing closed.
 - CI and the scheduled dependency workflow now audit all pnpm dependencies,
   including documentation and build tooling, instead of production packages only.
 
