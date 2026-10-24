@@ -34,6 +34,8 @@ enum Command {
         value_bytes: usize,
         #[arg(long, help = "Number of distinct keys (defaults to ops)")]
         keyspace: Option<usize>,
+        #[arg(long, default_value_t = 1, help = "Writes per transaction")]
+        batch_size: usize,
     },
     ShardedLocal {
         #[arg(long, default_value_t = 20000)]
@@ -243,8 +245,8 @@ enum Command {
 async fn main() {
     let args = Args::parse();
     match args.command {
-        Some(Command::Local { ops, concurrency, value_bytes, keyspace }) => {
-            local_bench(ops, concurrency, value_bytes, keyspace);
+        Some(Command::Local { ops, concurrency, value_bytes, keyspace, batch_size }) => {
+            local_bench(ops, concurrency, value_bytes, keyspace, batch_size);
         }
         Some(Command::ShardedLocal {
             ops,
@@ -419,7 +421,7 @@ async fn main() {
             .await;
         }
         None => {
-            local_bench(args.ops, args.concurrency, args.value_bytes, None);
+            local_bench(args.ops, args.concurrency, args.value_bytes, None, 1);
         }
     }
 }
@@ -720,20 +722,58 @@ async fn realtime_bench(config: RealtimeBench) {
     }
 }
 
-fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Option<usize>) {
+fn local_bench(
+    ops: usize,
+    concurrency: usize,
+    value_bytes: usize,
+    keyspace: Option<usize>,
+    batch_size: usize,
+) {
+    const MAX_LOCAL_BATCH_WRITES: usize = 20_000;
+    const MAX_LOCAL_BATCH_BYTES: usize = 8 * 1024 * 1024;
+    let requested_writes = match ops.checked_mul(batch_size) {
+        Some(writes) => writes,
+        None => {
+            eprintln!("requested write count overflows");
+            std::process::exit(2);
+        }
+    };
+    let batch_bytes = batch_size.checked_mul(value_bytes);
+    if ops == 0
+        || batch_size == 0
+        || batch_size > MAX_LOCAL_BATCH_WRITES
+        || batch_bytes.is_none_or(|bytes| bytes > MAX_LOCAL_BATCH_BYTES)
+    {
+        eprintln!("ops or batch size are outside benchmark bounds");
+        std::process::exit(2);
+    }
     let manager = Arc::new(TxnManager::new());
     let value = vec![7u8; value_bytes];
     let workers = concurrency.max(1).min(ops.max(1));
-    let keyspace = keyspace.unwrap_or(ops).max(1);
-    let warmup_ops = if keyspace < ops { keyspace } else { 0 };
+    let keyspace = keyspace.unwrap_or(requested_writes).max(1);
+    if keyspace < batch_size {
+        eprintln!("keyspace must be at least the writes per transaction");
+        std::process::exit(2);
+    }
+    let warmup_ops = if keyspace < requested_writes { keyspace.div_ceil(batch_size) } else { 0 };
     for index in 0..warmup_ops {
-        let key = RecordKey::new("bench", "bench", "kv", format!("k-{index}").as_bytes());
         let mut txn = manager.begin();
-        manager.put(&mut txn, key, value.clone());
+        let first_write = index.saturating_mul(batch_size);
+        let writes = batch_size.min(keyspace.saturating_sub(first_write));
+        for offset in 0..writes {
+            let key_index = first_write.saturating_add(offset);
+            let key = RecordKey::new(
+                "bench",
+                "bench",
+                "kv",
+                format!("k-{}", key_index % keyspace).as_bytes(),
+            );
+            manager.put(&mut txn, key, value.clone());
+        }
         manager.commit(txn).expect("local benchmark warmup commit failed");
     }
     println!(
-        "benchmark=txn-local value_bytes={value_bytes} keyspace={keyspace} warmup_ops={warmup_ops} metadata={}",
+        "benchmark=txn-local value_bytes={value_bytes} keyspace={keyspace} warmup_ops={warmup_ops} writes_per_transaction={batch_size} metadata={}",
         machine_metadata()
     );
     let start_gate = Arc::new(Barrier::new(workers + 1));
@@ -751,14 +791,18 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Opt
             let mut applied = 0usize;
             let mut failed = 0usize;
             for index in first..end {
-                let key = RecordKey::new(
-                    "bench",
-                    "bench",
-                    "kv",
-                    format!("k-{}", index % keyspace).as_bytes(),
-                );
                 let mut txn = manager.begin();
-                manager.put(&mut txn, key, value.clone());
+                let first_write = index.saturating_mul(batch_size);
+                for offset in 0..batch_size {
+                    let key_index = first_write.saturating_add(offset);
+                    let key = RecordKey::new(
+                        "bench",
+                        "bench",
+                        "kv",
+                        format!("k-{}", key_index % keyspace).as_bytes(),
+                    );
+                    manager.put(&mut txn, key, value.clone());
+                }
                 if manager.commit(txn).is_ok() {
                     applied += 1;
                 } else {
@@ -778,8 +822,8 @@ fn local_bench(ops: usize, concurrency: usize, value_bytes: usize, keyspace: Opt
         });
     let elapsed = start.elapsed();
     let seconds = elapsed.as_secs_f64().max(0.000001);
-    let throughput = applied as f64 / seconds;
-    println!("successful_ops={applied} failed_ops={failed} requested_ops={ops} workers={workers} seconds={seconds:.3} qps={throughput:.0}");
+    let throughput = applied.saturating_mul(batch_size) as f64 / seconds;
+    println!("successful_ops={} failed_ops={} requested_ops={requested_writes} successful_transactions={applied} failed_transactions={failed} requested_transactions={ops} workers={workers} seconds={seconds:.3} qps={throughput:.0} transaction_qps={:.0}", applied.saturating_mul(batch_size), failed.saturating_mul(batch_size), applied as f64 / seconds);
     let probe_ops = 10000.min(ops);
     if probe_ops > 0 {
         let probe_workers = concurrency.max(1).min(probe_ops);

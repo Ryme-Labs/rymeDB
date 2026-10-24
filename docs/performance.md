@@ -88,6 +88,16 @@ under optimistic concurrency control. Use a single worker when measuring
 overwrite cost without concurrent conflicts. This is a core microbenchmark, not
 an end-to-end database comparison.
 
+Use `--batch-size 64` to stage 64 writes per transaction. In batch mode,
+`--ops` counts transactions, `qps` counts individual writes per second, and
+`transaction_qps` reports transactions per second. Batches are bounded by the
+benchmark to 20,000 writes and 8 MiB of values per transaction. Five alternating
+release-run pairs on a Windows Ryzen 5 4500 with one worker and 64 writes per
+transaction measured median throughput at 329.2k writes/s before and 327.9k
+with a candidate that skipped the redundant whole-write-set validation pass.
+The difference is below run-to-run variation, so the transaction change was
+discarded. See the [raw captures](../bench/results/txn-local-write-validation-batch-20261024.json).
+
 To benchmark the SQL executor in-process without PostgreSQL-wire or network
 overhead:
 

@@ -1,0 +1,35 @@
+{
+  "experiment": "txn-local-prevalidated-write-set-batch",
+  "command": "ryme-bench local --ops 2000 --concurrency 1 --value-bytes 128 --batch-size 64",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "baseline_revision": "886fbaa",
+  "method": "Five alternating baseline/candidate pairs using release binaries. Each run committed 2000 transactions containing 64 distinct 128-byte writes, with one worker and no WAL. All transactions succeeded.",
+  "baseline_runs": [
+    { "qps": 273191, "transaction_qps": 4269, "seconds": 0.469, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 333416, "transaction_qps": 5210, "seconds": 0.384, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 322106, "transaction_qps": 5033, "seconds": 0.397, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 334934, "transaction_qps": 5256, "seconds": 0.381, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 329235, "transaction_qps": 5144, "seconds": 0.389, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 }
+  ],
+  "candidate_change": "Skip validate_apply_writes for transaction-owned write sets validated during staging, while retaining Engine::apply_with_expiry validation on every write. Candidate discarded after measurement.",
+  "candidate_runs": [
+    { "qps": 306540, "transaction_qps": 4790, "seconds": 0.418, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 336368, "transaction_qps": 5256, "seconds": 0.381, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 327949, "transaction_qps": 5124, "seconds": 0.390, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 336949, "transaction_qps": 5233, "seconds": 0.380, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 },
+    { "qps": 319274, "transaction_qps": 4989, "seconds": 0.401, "successful_transactions": 2000, "failed_transactions": 0, "successful_ops": 128000 }
+  ],
+  "median_summary": {
+    "baseline_qps": 329235,
+    "candidate_qps": 327949,
+    "baseline_transaction_qps": 5144,
+    "candidate_transaction_qps": 5124
+  },
+  "result": "No measurable improvement. Median write throughput differed by less than 0.4%, while individual runs varied by much more. The transaction shortcut was not retained.",
+  "caveat": "Hot in-memory transaction benchmark on one Windows host. It does not measure durable commits, multi-worker contention, network overhead, or latency percentiles."
+}
