@@ -7228,6 +7228,18 @@ mod tests {
         ))
     }
 
+    fn configure_test_range(node: &Node, replicas: Vec<usize>) {
+        node.set_range_owners(vec![RangeOwner {
+            id: String::from("range-a"),
+            start: Vec::new(),
+            end: Vec::new(),
+            routing_version: ryme_storage::LEGACY_ROUTING_VERSION,
+            owner: 0,
+            replicas,
+            epoch: 1,
+        }]);
+    }
+
     #[test]
     fn constraint_scans_enlist_all_table_ranges_and_conflict_with_inserts() {
         let dir = temp_dir("constraint-scan-ranges");
@@ -7680,6 +7692,7 @@ mod tests {
         let encoded = encode_writes(&writes).unwrap();
         {
             let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            configure_test_range(&node, vec![0]);
             assert_eq!(
                 node.append_range_follower("range-a", 3, 0, 0, 0, 1, 7, &encoded, 0).unwrap(),
                 1
@@ -7834,10 +7847,12 @@ mod tests {
         let encoded = encode_writes(&writes).unwrap();
         {
             let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            configure_test_range(&node, vec![0]);
             node.append_range_follower("range-a", 4, 0, 0, 0, 1, 9, &encoded, 0).unwrap();
         }
 
         let reopened = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        configure_test_range(&reopened, vec![0]);
         let mut pending = reopened.manager.begin();
         assert_eq!(reopened.manager.get(&mut pending, &key).unwrap(), None);
         reopened.append_range_follower("range-a", 4, 0, 1, 4, 0, 0, &[], 1).unwrap();
@@ -7846,6 +7861,7 @@ mod tests {
         drop(reopened);
 
         let reopened_again = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+        configure_test_range(&reopened_again, vec![0]);
         let mut probe = reopened_again.manager.begin();
         assert_eq!(
             reopened_again.manager.get(&mut probe, &key).unwrap(),
@@ -8064,6 +8080,7 @@ mod tests {
         let new = encode_writes(&new).unwrap();
         {
             let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
+            configure_test_range(&node, vec![0, 1, 2]);
             node.append_range_follower("range-a", 1, 0, 0, 0, 1, 7, &first, 0).unwrap();
             node.append_range_follower("range-a", 1, 0, 1, 1, 2, 8, &old, 0).unwrap();
             node.append_range_follower("range-a", 2, 1, 1, 1, 2, 9, &new, 0).unwrap();
