@@ -364,6 +364,8 @@ pub(crate) enum Rpc {
         group_id: String,
         index: u64,
         term: u64,
+        #[serde(default)]
+        entry_term: u64,
         leader: usize,
         prev_index: u64,
         prev_term: u64,
@@ -833,11 +835,10 @@ impl PeerPool {
         }
         let socket = tokio::time::timeout(
             Duration::from_millis(800),
-            TcpStream::connect(self.addr.as_str()),
+            ryme_tls::connect_tcp(self.addr.as_str()),
         )
         .await
-        .map_err(|_| RymeError::Timeout)?
-        .map_err(|e| RymeError::Io(e.to_string()))?;
+        .map_err(|_| RymeError::Timeout)??;
         let _ = socket.set_nodelay(true);
         Ok(MeshStream::Plain(socket))
     }
@@ -1874,6 +1875,48 @@ impl Node {
         350 + hash % 250
     }
 
+    async fn sync_range_replicas_to_quorum(
+        self: &Arc<Self>,
+        group_id: &str,
+        replicas: &[usize],
+        term: u64,
+        leader_last: u64,
+        leader_last_term: u64,
+        leader_commit: u64,
+    ) -> Result<Vec<usize>> {
+        let quorum = majority(replicas.len());
+        let mut acknowledged = vec![self.id];
+        let mut tasks = tokio::task::JoinSet::new();
+        for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
+            let node = Arc::clone(self);
+            let group_id = group_id.to_string();
+            tasks.spawn(async move {
+                let result = node
+                    .sync_range_replica(
+                        &group_id,
+                        replica,
+                        term,
+                        leader_last,
+                        leader_last_term,
+                        leader_commit,
+                    )
+                    .await;
+                (replica, result)
+            });
+        }
+        while acknowledged.len() < quorum {
+            let Some(result) = tasks.join_next().await else { break };
+            if let Ok((replica, Ok(()))) = result {
+                acknowledged.push(replica);
+            }
+        }
+        if acknowledged.len() < quorum {
+            return Err(RymeError::Unavailable(String::from("range quorum")));
+        }
+        tasks.detach_all();
+        Ok(acknowledged)
+    }
+
     async fn range_tick(self: &Arc<Self>) {
         if self.isolated.load(std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -1977,27 +2020,16 @@ impl Node {
         replicas.sort_unstable();
         replicas.dedup();
         let (last_index, last_term) = self.try_range_last_position(group_id)?;
-        let mut acknowledgements = 1usize;
-        for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
-            if self
-                .sync_range_replica(
-                    group_id,
-                    replica,
-                    state.term.max(1),
-                    last_index,
-                    last_term,
-                    state.commit_index,
-                )
-                .await
-                .is_ok()
-            {
-                acknowledgements += 1;
-            }
-        }
+        self.sync_range_replicas_to_quorum(
+            group_id,
+            &replicas,
+            state.term.max(1),
+            last_index,
+            last_term,
+            state.commit_index,
+        )
+        .await?;
         self.ensure_not_isolated()?;
-        if acknowledgements < majority(replicas.len()) {
-            return Err(RymeError::Unavailable(String::from("range quorum")));
-        }
         let current = self
             .range_groups
             .lock()
@@ -2028,6 +2060,7 @@ impl Node {
                 group_id: group_id.to_string(),
                 index: 0,
                 term,
+                entry_term: 0,
                 leader: self.id,
                 prev_index: leader_last,
                 prev_term: leader_last_term,
@@ -2083,6 +2116,7 @@ impl Node {
                     group_id: group_id.to_string(),
                     index,
                     term,
+                    entry_term: record.term,
                     leader: self.id,
                     prev_index,
                     prev_term,
@@ -2152,6 +2186,7 @@ impl Node {
                 group_id: group_id.to_string(),
                 index: 0,
                 term,
+                entry_term: 0,
                 leader: self.id,
                 prev_index: leader_last,
                 prev_term: leader_last_term,
@@ -3232,6 +3267,7 @@ impl Node {
                 group_id,
                 index,
                 term,
+                entry_term,
                 leader,
                 prev_index,
                 prev_term,
@@ -3244,6 +3280,7 @@ impl Node {
                 let result = self.append_range_follower_marked(
                     &group_id,
                     term,
+                    if entry_term == 0 { term } else { entry_term },
                     leader,
                     prev_index,
                     prev_term,
@@ -3271,7 +3308,7 @@ impl Node {
                             prev_index,
                             prev_term,
                             index,
-                            term,
+                            if entry_term == 0 { term } else { entry_term },
                             commit_ts,
                             &writes,
                             publish_data,
@@ -4490,8 +4527,6 @@ impl Node {
         let state = groups.entry(group_id.to_string()).or_default();
         if state.term == 0 {
             state.term = 1;
-        }
-        if state.leader.is_none() {
             state.leader = Some(leader);
         }
         Ok(state.clone())
@@ -4790,7 +4825,7 @@ impl Node {
         prev_index: u64,
         prev_term: u64,
         index: u64,
-        term: u64,
+        entry_term: u64,
         commit_ts: u64,
         encoded_writes: &[u8],
         publish_data: bool,
@@ -4812,7 +4847,7 @@ impl Node {
             let existing = self
                 .try_range_entry(group_id, index)?
                 .ok_or_else(|| RymeError::Corrupt(String::from("range log gap")))?;
-            if existing.term != term
+            if existing.term != entry_term
                 || existing.commit_ts != commit_ts
                 || existing.writes != encoded_writes
                 || existing.publish_data != publish_data
@@ -4845,6 +4880,7 @@ impl Node {
         self.append_range_follower_marked(
             group_id,
             term,
+            term,
             leader,
             prev_index,
             prev_term,
@@ -4862,6 +4898,7 @@ impl Node {
         &self,
         group_id: &str,
         term: u64,
+        entry_term: u64,
         leader: usize,
         prev_index: u64,
         prev_term: u64,
@@ -4874,6 +4911,10 @@ impl Node {
     ) -> Result<u64> {
         if term == 0 {
             return Err(RymeError::InvalidArgument(String::from("range term")));
+        }
+        let entry_term = if entry_term == 0 { term } else { entry_term };
+        if index > 0 && entry_term == 0 {
+            return Err(RymeError::InvalidArgument(String::from("range entry term")));
         }
         let Some(range) = self.try_range_owner_by_id(group_id)? else {
             return Err(RymeError::NotFound(String::from("range group")));
@@ -4936,7 +4977,7 @@ impl Node {
                 let existing = self
                     .try_range_entry(group_id, index)?
                     .ok_or_else(|| RymeError::Unavailable(String::from("range log gap")))?;
-                if existing.term == term
+                if existing.term == entry_term
                     && existing.commit_ts == commit_ts
                     && existing.writes == encoded_writes
                     && existing.publish_data == publish_data
@@ -4947,7 +4988,7 @@ impl Node {
                     }
                     return Ok(last);
                 }
-                if existing.term != term
+                if existing.term != entry_term
                     || existing.commit_ts != commit_ts
                     || existing.writes != encoded_writes
                     || existing.publish_data != publish_data
@@ -4966,7 +5007,7 @@ impl Node {
             last = self.append_range_entry(
                 group_id,
                 index,
-                term,
+                entry_term,
                 commit_ts,
                 encoded_writes,
                 publish_data,
@@ -5024,18 +5065,16 @@ impl Node {
             publish_data,
             kind,
         )?;
-        let mut acknowledgements = 1usize;
-        let mut acknowledged = vec![self.id];
-        for replica in replicas.iter().copied().filter(|replica| *replica != self.id) {
-            if self.sync_range_replica(group_id, replica, term, index, term, 0).await.is_ok() {
-                acknowledgements += 1;
-                acknowledged.push(replica);
+        let acknowledged = match self
+            .sync_range_replicas_to_quorum(group_id, &replicas, term, index, term, 0)
+            .await
+        {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                self.abort_range_entry(group_id, index, &replicas).await?;
+                return Err(error);
             }
-        }
-        if acknowledgements < replicas.len() / 2 + 1 {
-            self.abort_range_entry(group_id, index, &replicas).await?;
-            return Err(RymeError::Unavailable(String::from("range quorum")));
-        }
+        };
         Ok((index, term, acknowledged))
     }
 
@@ -7241,6 +7280,28 @@ mod tests {
     }
 
     #[test]
+    fn range_group_initialization_preserves_an_election_in_progress() {
+        let dir = temp_dir("range-election-state");
+        let node = Node::open(1, Vec::new(), Vec::new(), &dir).unwrap();
+        configure_test_range(&node, vec![0, 1, 2]);
+        node.range_groups.lock().unwrap().insert(
+            String::from("range-a"),
+            RangeGroupState {
+                term: 2,
+                voted_for: Some(1),
+                leader: None,
+                ..RangeGroupState::default()
+            },
+        );
+
+        let state = node.try_ensure_range_group("range-a", 0).unwrap();
+        assert_eq!(state.term, 2);
+        assert_eq!(state.voted_for, Some(1));
+        assert_eq!(state.leader, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn constraint_scans_enlist_all_table_ranges_and_conflict_with_inserts() {
         let dir = temp_dir("constraint-scan-ranges");
         let node = Node::open(0, Vec::new(), Vec::new(), &dir).unwrap();
@@ -7795,6 +7856,7 @@ mod tests {
             node.append_range_follower_marked(
                 "range-a",
                 1,
+                1,
                 0,
                 0,
                 0,
@@ -7808,6 +7870,7 @@ mod tests {
             .unwrap();
             node.append_range_follower_marked(
                 "range-a",
+                1,
                 1,
                 0,
                 1,

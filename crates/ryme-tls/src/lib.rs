@@ -2,6 +2,33 @@ use ryme_error::{Result, RymeError};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Connects to the first resolved TCP address that accepts a connection.
+///
+/// Iterating resolved addresses allows hostnames with both IPv6 and IPv4 records
+/// to work when the peer is listening on only one address family.
+pub async fn connect_tcp(addr: &str) -> Result<tokio::net::TcpStream> {
+    let addresses = tokio::net::lookup_host(addr).await?;
+    let mut last_error = None;
+    let mut attempts = tokio::task::JoinSet::new();
+    for address in addresses {
+        attempts.spawn(async move { tokio::net::TcpStream::connect(address).await });
+    }
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok(Ok(stream)) => {
+                attempts.abort_all();
+                return Ok(stream);
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => return Err(RymeError::Internal(String::from("peer address attempt"))),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error.into()),
+        None => Err(RymeError::InvalidArgument(String::from("peer address"))),
+    }
+}
 use std::time::Duration;
 
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -201,8 +228,7 @@ impl MeshConnector {
         addr: &str,
         server_name: &str,
     ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
-        let stream =
-            tokio::net::TcpStream::connect(addr).await.map_err(|e| RymeError::Io(e.to_string()))?;
+        let stream = connect_tcp(addr).await?;
         let _ = stream.set_nodelay(true);
         let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|_| RymeError::InvalidArgument(String::from("server name")))?;
@@ -232,5 +258,23 @@ mod tests {
     fn acceptor_rejects_empty() {
         assert!(TlsAcceptor::from_pem_bytes(b"junk", b"junk").is_err());
         assert!(MeshConnector::from_pem_bytes(b"junk", None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_tries_later_addresses_when_the_first_is_unavailable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
+        let client = tokio::spawn(async move { connect_tcp(&addr).await.unwrap() });
+        let (server, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let client = client.await.unwrap();
+        assert_eq!(
+            client.local_addr().unwrap().ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        drop((client, server));
     }
 }

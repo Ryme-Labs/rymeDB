@@ -216,7 +216,11 @@ async fn range_group_elects_a_new_owner_after_leader_loss() {
     }
     let mut after = backends[new_global_leader].begin();
     backends[new_global_leader].put(&mut after, key("after-failover"), b"new".to_vec());
-    backends[new_global_leader].commit(after).await.unwrap();
+    let commit = backends[new_global_leader].commit(after).await;
+    assert!(
+        commit.is_ok(),
+        "range write failed after failover: {commit:?}; global leader {new_global_leader}, range leader {range_leader}"
+    );
 
     let remaining = (0..nodes.len()).filter(|id| *id != old_owner).collect::<Vec<_>>();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);

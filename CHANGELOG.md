@@ -52,6 +52,14 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- Raft peer dialing now tries all resolved address families, so DNS names work
+  when only an IPv4 or IPv6 listener is available.
+- Range election ticks no longer restore the configured owner after a vote clears
+  the leader, allowing a surviving replica to take over after owner loss.
+- Range heartbeats and writes stop waiting for additional replicas after quorum,
+  so an offline non-quorum replica cannot stall range commits.
+- Range follower catch-up preserves each log entry's original term during a new
+  leader's replication, keeping lagging replicas consistent after failover.
 - MVCC now rejects restored or restamped transactions before they read below
   the version-retention floor.
 - Archive replication now preserves conflicting destination objects and
