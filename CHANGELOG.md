@@ -36,6 +36,8 @@ All notable changes to rymeDB are recorded here. Format follows
 
 ### Fixed
 
+- RESP sorted sets now preserve `+inf` and `-inf` scores across reads and writes
+  while continuing to read existing finite-score JSON values.
 - RESP `ZADD` rejects the incompatible `NX`/`GT`/`LT` option combinations
   defined by Valkey.
 - RESP single-key string and metadata commands now reject extra arguments,

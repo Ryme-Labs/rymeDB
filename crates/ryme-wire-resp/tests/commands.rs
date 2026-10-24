@@ -551,6 +551,18 @@ async fn zset_ops() {
 }
 
 #[tokio::test]
+async fn sorted_sets_preserve_infinite_scores() {
+    let addr = serve().await;
+    assert_eq!(command(addr, &["ZADD", "z", "+inf", "high"]).await, ":1");
+    assert_eq!(command(addr, &["ZSCORE", "z", "high"]).await, "$3\r\ninf");
+    assert_eq!(command(addr, &["ZADD", "z", "-inf", "low"]).await, ":1");
+    assert_eq!(
+        command(addr, &["ZRANGE", "z", "0", "-1"]).await,
+        "*2\r\n$3\r\nlow\r\n$4\r\nhigh"
+    );
+}
+
+#[tokio::test]
 async fn set_ops() {
     let addr = serve().await;
     assert_eq!(command(addr, &["DEL", "s"]).await, ":0");

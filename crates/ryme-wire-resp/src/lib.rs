@@ -3270,7 +3270,27 @@ where
             Some(value) if value.is_empty() => Ok(Some(std::collections::HashMap::new())),
             Some(value) => {
                 check_collection_bytes(&value)?;
-                serde_json::from_slice(&value).map(Some).map_err(|_| String::from("wrong type"))
+                let values: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_slice(&value).map_err(|_| String::from("wrong type"))?;
+                let scores = values
+                    .into_iter()
+                    .map(|(member, value)| {
+                        let score = match value {
+                            serde_json::Value::Number(number) => {
+                                number.as_f64().filter(|score| score.is_finite())
+                            }
+                            serde_json::Value::String(value) => match value.as_str() {
+                                "inf" | "+inf" => Some(f64::INFINITY),
+                                "-inf" => Some(f64::NEG_INFINITY),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                        .ok_or_else(|| String::from("wrong type"))?;
+                        Ok((member, score))
+                    })
+                    .collect::<std::result::Result<_, String>>()?;
+                Ok(Some(scores))
             }
             None => Ok(None),
         }
@@ -3283,7 +3303,20 @@ where
         set: &std::collections::HashMap<String, f64>,
     ) -> std::result::Result<(), String> {
         let record = RecordKey::new(&self.tenant, &self.database, KV_TABLE, key);
-        let raw = serde_json::to_vec(set).map_err(|_| String::from("wrong type"))?;
+        let values = set
+            .iter()
+            .map(|(member, score)| {
+                let value = if score.is_infinite() {
+                    serde_json::Value::String(format_float(*score))
+                } else {
+                    serde_json::Number::from_f64(*score)
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| String::from("value is not a valid float"))?
+                };
+                Ok((member.clone(), value))
+            })
+            .collect::<std::result::Result<serde_json::Map<_, _>, String>>()?;
+        let raw = serde_json::to_vec(&values).map_err(|_| String::from("wrong type"))?;
         check_collection_bytes(&raw)?;
         self.manager.put(txn, record, raw);
         Ok(())
