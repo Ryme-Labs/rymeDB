@@ -1702,8 +1702,10 @@ where
         if secs == 0.0 {
             return Ok(None);
         }
+        let timeout = std::time::Duration::try_from_secs_f64(secs)
+            .map_err(|_| String::from("timeout is not a float or out of range"))?;
         std::time::Instant::now()
-            .checked_add(std::time::Duration::from_secs_f64(secs))
+            .checked_add(timeout)
             .map(Some)
             .ok_or_else(|| String::from("timeout is not a float or out of range"))
     }
@@ -6999,6 +7001,19 @@ mod tests {
         );
         assert!(next_resp_value_len(ryme_gateway::MAX_VALUE_BYTES, 1).is_err());
         assert!(next_resp_value_len(usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn blocking_timeout_rejects_values_outside_duration_range() {
+        assert!(RespGateway::<TxnManager>::blocking_timeout(&[b"1e100".to_vec()]).is_err());
+        assert!(RespGateway::<TxnManager>::blocking_timeout(&[b"NaN".to_vec()]).is_err());
+        assert!(RespGateway::<TxnManager>::blocking_timeout(&[b"-1".to_vec()]).is_err());
+        assert!(RespGateway::<TxnManager>::blocking_timeout(&[b"0".to_vec()])
+            .unwrap()
+            .is_none());
+        assert!(RespGateway::<TxnManager>::blocking_timeout(&[b"0.5".to_vec()])
+            .unwrap()
+            .is_some());
     }
 
     #[test]
