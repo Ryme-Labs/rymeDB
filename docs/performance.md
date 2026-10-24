@@ -536,6 +536,14 @@ three candidate p50 captures were faster. The one-term control was effectively
 flat. The fast path was discarded. A test now pins exact scores and stable ID
 ties for shared postings. See the [raw captures](../bench/results/text-search-shared-postings-experiment-windows-20261024.json).
 
+A single-term fast path also tried bypassing the temporary document-frequency
+map in both local and partitioned indexes. Eight alternating release pairs
+showed effectively flat p50 for the 10,000-document, four-partition, common
+single-term query (76.0 to 76.0 µs); only three candidate p50 captures were
+faster, and p99 was 1.7% higher. The two-term control was flat. The change was
+discarded; a test now checks partitioned single-term scores against the
+unpartitioned index. See the [raw captures](../bench/results/text-search-single-term-direct-experiment-windows-20261024.json).
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash

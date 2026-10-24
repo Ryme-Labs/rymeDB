@@ -1,0 +1,402 @@
+{
+  "experiment": "text-search-single-term-document-frequency-allocation",
+  "date": "2026-10-24",
+  "baseline_revision": "0f851e4",
+  "candidate_revision": "working-tree-not-retained",
+  "machine": {
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "architecture": "x86_64",
+    "os": "Windows"
+  },
+  "parameters": {
+    "documents": 10000,
+    "queries": 500,
+    "partitions": 4,
+    "top_k": 10,
+    "build_profile": "release",
+    "method": "Eight alternating baseline/candidate release pairs per workload. Candidate bypassed the temporary term-frequency HashMap for single-term queries in single and partitioned indexes."
+  },
+  "single_term_workload": {
+    "query_terms": 1,
+    "baseline": [
+      {
+        "terms": 1,
+        "pair": 1,
+        "variant": "baseline",
+        "index_build_ns": 29912100,
+        "p50_ns": 76300,
+        "p95_ns": 84700,
+        "p99_ns": 139100,
+        "qps": 12673.72508662491
+      },
+      {
+        "terms": 1,
+        "pair": 2,
+        "variant": "baseline",
+        "index_build_ns": 31040100,
+        "p50_ns": 75600,
+        "p95_ns": 123700,
+        "p99_ns": 207700,
+        "qps": 11970.54288806106
+      },
+      {
+        "terms": 1,
+        "pair": 3,
+        "variant": "baseline",
+        "index_build_ns": 28755200,
+        "p50_ns": 77000,
+        "p95_ns": 86800,
+        "p99_ns": 128600,
+        "qps": 12539.436527880183
+      },
+      {
+        "terms": 1,
+        "pair": 4,
+        "variant": "baseline",
+        "index_build_ns": 30990200,
+        "p50_ns": 76400,
+        "p95_ns": 114400,
+        "p99_ns": 188400,
+        "qps": 12117.070286277902
+      },
+      {
+        "terms": 1,
+        "pair": 5,
+        "variant": "baseline",
+        "index_build_ns": 28498800,
+        "p50_ns": 76400,
+        "p95_ns": 88500,
+        "p99_ns": 181500,
+        "qps": 12329.969717594373
+      },
+      {
+        "terms": 1,
+        "pair": 6,
+        "variant": "baseline",
+        "index_build_ns": 31969000,
+        "p50_ns": 75700,
+        "p95_ns": 92300,
+        "p99_ns": 175500,
+        "qps": 12398.579618718879
+      },
+      {
+        "terms": 1,
+        "pair": 7,
+        "variant": "baseline",
+        "index_build_ns": 29274100,
+        "p50_ns": 75300,
+        "p95_ns": 84600,
+        "p99_ns": 103300,
+        "qps": 12794.759266604398
+      },
+      {
+        "terms": 1,
+        "pair": 8,
+        "variant": "baseline",
+        "index_build_ns": 31249700,
+        "p50_ns": 74800,
+        "p95_ns": 101300,
+        "p99_ns": 141800,
+        "qps": 12488.41699323877
+      }
+    ],
+    "candidate": [
+      {
+        "terms": 1,
+        "pair": 1,
+        "variant": "candidate",
+        "index_build_ns": 31834200,
+        "p50_ns": 75700,
+        "p95_ns": 103600,
+        "p99_ns": 202400,
+        "qps": 12233.67294009415
+      },
+      {
+        "terms": 1,
+        "pair": 2,
+        "variant": "candidate",
+        "index_build_ns": 30300800,
+        "p50_ns": 76200,
+        "p95_ns": 83100,
+        "p99_ns": 95600,
+        "qps": 12913.323192070187
+      },
+      {
+        "terms": 1,
+        "pair": 3,
+        "variant": "candidate",
+        "index_build_ns": 30457900,
+        "p50_ns": 75500,
+        "p95_ns": 107500,
+        "p99_ns": 182100,
+        "qps": 12258.74784246038
+      },
+      {
+        "terms": 1,
+        "pair": 4,
+        "variant": "candidate",
+        "index_build_ns": 28763700,
+        "p50_ns": 76500,
+        "p95_ns": 83100,
+        "p99_ns": 95600,
+        "qps": 12856.742461449057
+      },
+      {
+        "terms": 1,
+        "pair": 5,
+        "variant": "candidate",
+        "index_build_ns": 30830000,
+        "p50_ns": 77000,
+        "p95_ns": 93800,
+        "p99_ns": 192600,
+        "qps": 12184.571895066467
+      },
+      {
+        "terms": 1,
+        "pair": 6,
+        "variant": "candidate",
+        "index_build_ns": 31034100,
+        "p50_ns": 74800,
+        "p95_ns": 86400,
+        "p99_ns": 140500,
+        "qps": 12769.076361630458
+      },
+      {
+        "terms": 1,
+        "pair": 7,
+        "variant": "candidate",
+        "index_build_ns": 31534100,
+        "p50_ns": 76300,
+        "p95_ns": 92900,
+        "p99_ns": 198400,
+        "qps": 12308.358852664021
+      },
+      {
+        "terms": 1,
+        "pair": 8,
+        "variant": "candidate",
+        "index_build_ns": 30290100,
+        "p50_ns": 75600,
+        "p95_ns": 84500,
+        "p99_ns": 126800,
+        "qps": 12814.335653582375
+      }
+    ],
+    "median_change": {
+      "p50_ns": {
+        "baseline_median": 76000.0,
+        "candidate_median": 75950.0,
+        "change_percent": -0.07
+      },
+      "p95_ns": {
+        "baseline_median": 90400.0,
+        "candidate_median": 89650.0,
+        "change_percent": -0.83
+      },
+      "p99_ns": {
+        "baseline_median": 158650.0,
+        "candidate_median": 161300.0,
+        "change_percent": 1.67
+      },
+      "qps": {
+        "baseline_median": 12443.498305978825,
+        "candidate_median": 12538.717607147239,
+        "change_percent": 0.77
+      }
+    },
+    "candidate_faster_p50_pairs": 3
+  },
+  "two_term_control": {
+    "query_terms": 2,
+    "baseline": [
+      {
+        "terms": 2,
+        "pair": 1,
+        "variant": "baseline",
+        "index_build_ns": 29311600,
+        "p50_ns": 684300,
+        "p95_ns": 1411000,
+        "p99_ns": 1596200,
+        "qps": 1224.6908451665004
+      },
+      {
+        "terms": 2,
+        "pair": 2,
+        "variant": "baseline",
+        "index_build_ns": 29591700,
+        "p50_ns": 697400,
+        "p95_ns": 1341600,
+        "p99_ns": 1579200,
+        "qps": 1193.65272774715
+      },
+      {
+        "terms": 2,
+        "pair": 3,
+        "variant": "baseline",
+        "index_build_ns": 29341900,
+        "p50_ns": 665200,
+        "p95_ns": 1207200,
+        "p99_ns": 1511000,
+        "qps": 1296.1715757868928
+      },
+      {
+        "terms": 2,
+        "pair": 4,
+        "variant": "baseline",
+        "index_build_ns": 30553900,
+        "p50_ns": 695000,
+        "p95_ns": 1363800,
+        "p99_ns": 1622700,
+        "qps": 1207.957930207573
+      },
+      {
+        "terms": 2,
+        "pair": 5,
+        "variant": "baseline",
+        "index_build_ns": 30859500,
+        "p50_ns": 766000,
+        "p95_ns": 1430400,
+        "p99_ns": 1605500,
+        "qps": 1139.3427587361955
+      },
+      {
+        "terms": 2,
+        "pair": 6,
+        "variant": "baseline",
+        "index_build_ns": 29123500,
+        "p50_ns": 679500,
+        "p95_ns": 1401300,
+        "p99_ns": 1642400,
+        "qps": 1220.9833311355633
+      },
+      {
+        "terms": 2,
+        "pair": 7,
+        "variant": "baseline",
+        "index_build_ns": 28747000,
+        "p50_ns": 661900,
+        "p95_ns": 1324100,
+        "p99_ns": 1519200,
+        "qps": 1285.914631213829
+      },
+      {
+        "terms": 2,
+        "pair": 8,
+        "variant": "baseline",
+        "index_build_ns": 30901100,
+        "p50_ns": 738300,
+        "p95_ns": 2389200,
+        "p99_ns": 3340300,
+        "qps": 997.8014442976346
+      }
+    ],
+    "candidate": [
+      {
+        "terms": 2,
+        "pair": 1,
+        "variant": "candidate",
+        "index_build_ns": 31943700,
+        "p50_ns": 761700,
+        "p95_ns": 1474200,
+        "p99_ns": 1750900,
+        "qps": 1118.0129778946473
+      },
+      {
+        "terms": 2,
+        "pair": 2,
+        "variant": "candidate",
+        "index_build_ns": 31076100,
+        "p50_ns": 686500,
+        "p95_ns": 1410800,
+        "p99_ns": 1617700,
+        "qps": 1200.5182397137196
+      },
+      {
+        "terms": 2,
+        "pair": 3,
+        "variant": "candidate",
+        "index_build_ns": 32109700,
+        "p50_ns": 726500,
+        "p95_ns": 1407600,
+        "p99_ns": 1642200,
+        "qps": 1165.736214877825
+      },
+      {
+        "terms": 2,
+        "pair": 4,
+        "variant": "candidate",
+        "index_build_ns": 31896700,
+        "p50_ns": 674000,
+        "p95_ns": 1298100,
+        "p99_ns": 1621900,
+        "qps": 1263.45516578806
+      },
+      {
+        "terms": 2,
+        "pair": 5,
+        "variant": "candidate",
+        "index_build_ns": 32064800,
+        "p50_ns": 666700,
+        "p95_ns": 1358700,
+        "p99_ns": 2763000,
+        "qps": 1234.7831498527892
+      },
+      {
+        "terms": 2,
+        "pair": 6,
+        "variant": "candidate",
+        "index_build_ns": 29085400,
+        "p50_ns": 655600,
+        "p95_ns": 1175700,
+        "p99_ns": 1549300,
+        "qps": 1321.5811290901945
+      },
+      {
+        "terms": 2,
+        "pair": 7,
+        "variant": "candidate",
+        "index_build_ns": 31428000,
+        "p50_ns": 778600,
+        "p95_ns": 1513800,
+        "p99_ns": 2045900,
+        "qps": 1102.0743463762362
+      },
+      {
+        "terms": 2,
+        "pair": 8,
+        "variant": "candidate",
+        "index_build_ns": 31770600,
+        "p50_ns": 673700,
+        "p95_ns": 1304400,
+        "p99_ns": 1508000,
+        "qps": 1267.797339045521
+      }
+    ],
+    "median_change": {
+      "p50_ns": {
+        "baseline_median": 689650.0,
+        "candidate_median": 680250.0,
+        "change_percent": -1.36
+      },
+      "p95_ns": {
+        "baseline_median": 1382550.0,
+        "candidate_median": 1383150.0,
+        "change_percent": 0.04
+      },
+      "p99_ns": {
+        "baseline_median": 1600850.0,
+        "candidate_median": 1632050.0,
+        "change_percent": 1.95
+      },
+      "qps": {
+        "baseline_median": 1214.4706306715682,
+        "candidate_median": 1217.6506947832545,
+        "change_percent": 0.26
+      }
+    },
+    "candidate_faster_p50_pairs": 5
+  },
+  "decision": "Discarded. Single-term p50 was effectively unchanged and only three of eight candidate captures were faster. The two-term control was also effectively flat.",
+  "caveat": "One Windows host, in-process local text index. Common-term workload matches all 10,000 documents; results do not measure network or end-to-end database latency."
+}
