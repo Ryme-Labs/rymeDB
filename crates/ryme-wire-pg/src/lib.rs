@@ -105,6 +105,7 @@ const MAX_LISTENING_CHANNELS: usize = 4_096;
 const MAX_NOTIFICATION_CHANNEL_BYTES: usize = 63;
 const MAX_NOTIFICATION_PAYLOAD_BYTES: usize = 8_000;
 const MAX_COPY_BYTES_PER_CONNECTION: usize = 64 * 1024 * 1024;
+const MAX_COPY_FIELD_BYTES: usize = 4 * 1024 * 1024;
 const COPY_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const COPY_MEMORY_UNIT_BYTES: usize = 64 * 1024;
 static COPY_MEMORY_BUDGET: LazyLock<Arc<Semaphore>> =
@@ -5253,9 +5254,6 @@ fn decode_copy_rows(
             let mut values = Vec::with_capacity(fields.len());
             for field in fields {
                 let value = decode_copy_field(field)?;
-                if value.as_ref().is_some_and(|value| value.len() > 4 * 1024 * 1024) {
-                    return Err(String::from("COPY field exceeds the 4 MiB limit"));
-                }
                 values.push(value.map_or(InsertValue::Null, InsertValue::Value));
             }
             rows.push(values);
@@ -5299,26 +5297,31 @@ fn decode_copy_field(field: &[u8]) -> std::result::Result<Option<Vec<u8>>, Strin
     if field == b"\\N" {
         return Ok(None);
     }
-    let mut decoded = Vec::with_capacity(field.len());
+    let mut decoded = Vec::with_capacity(field.len().min(MAX_COPY_FIELD_BYTES));
     let mut index = 0;
     while index < field.len() {
-        if field[index] != b'\\' {
-            decoded.push(field[index]);
+        let byte = if field[index] != b'\\' {
+            let byte = field[index];
             index += 1;
-            continue;
-        }
-        index += 1;
-        let Some(escaped) = field.get(index).copied() else {
-            return Err(String::from("COPY field ends with an incomplete escape"));
+            byte
+        } else {
+            index += 1;
+            let Some(escaped) = field.get(index).copied() else {
+                return Err(String::from("COPY field ends with an incomplete escape"));
+            };
+            index += 1;
+            match escaped {
+                b't' => b'\t',
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b'\\' => b'\\',
+                other => other,
+            }
         };
-        decoded.push(match escaped {
-            b't' => b'\t',
-            b'n' => b'\n',
-            b'r' => b'\r',
-            b'\\' => b'\\',
-            other => other,
-        });
-        index += 1;
+        if decoded.len() == MAX_COPY_FIELD_BYTES {
+            return Err(String::from("COPY field exceeds the 4 MiB limit"));
+        }
+        decoded.push(byte);
     }
     Ok(Some(decoded))
 }
@@ -5503,6 +5506,18 @@ mod tests {
         DefaultPrivilegeGrant, FunctionDefinition, PrivilegeGrant, RlsPolicy, RoleDefinition,
         SchemaSnapshot, SequenceDefinition, TriggerDefinition, ViewDefinition,
     };
+
+    #[test]
+    fn copy_field_decoding_enforces_the_decoded_size_limit() {
+        let maximum = vec![b'x'; MAX_COPY_FIELD_BYTES];
+        assert_eq!(decode_copy_field(&maximum).unwrap().unwrap().len(), MAX_COPY_FIELD_BYTES);
+
+        let oversized = vec![b'x'; MAX_COPY_FIELD_BYTES + 1];
+        assert_eq!(
+            decode_copy_field(&oversized).unwrap_err(),
+            "COPY field exceeds the 4 MiB limit"
+        );
+    }
 
     #[test]
     fn split_statements_respects_quotes() {
