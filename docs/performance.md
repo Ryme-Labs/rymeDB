@@ -359,6 +359,13 @@ posting lengths reduced median p50 from 1.279 ms to 696 µs and raised QPS from
 745 to 1,270 in three runs. The estimate is capped at the table's document
 count to bound memory. See the [raw profile](../bench/results/text-search-multiterm-capacity.json).
 
+An experiment replaced the temporary document-frequency hash map with a vector
+aligned to query terms, avoiding cloned term strings. On a Windows Ryzen 5 4500,
+10,000-document, four-partition, two-common-term benchmark, median p50 was
+644.5 microseconds before and 650.7 microseconds after, with no measured latency improvement. The
+change was not retained; allocation effects for long queries remain unmeasured.
+See the [raw captures](../bench/results/text-search-document-frequency-vector-20261024.json).
+
 To measure the sharded Hot-mode WAL write path independently of network protocols:
 
 ```bash

@@ -1,0 +1,48 @@
+{
+  "experiment": "text-search-document-frequency-vector",
+  "captured_date": "2026-10-24",
+  "baseline_revision": "3945759",
+  "candidate": "working tree with query-aligned document-frequency storage",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "parameters": {
+    "documents": 10000,
+    "matched_documents_per_query": 10000,
+    "partitions": 4,
+    "queries": 500,
+    "top_k": 10,
+    "query_terms": 2,
+    "build_profile": "release",
+    "command": "ryme-bench text-index --documents 10000 --queries 500 --partitions 4 --top-k 10 --query-terms 2 --json"
+  },
+  "summary": {
+    "baseline_median": {
+      "query_p50_ns": 644500,
+      "query_p95_ns": 1151700,
+      "query_p99_ns": 1452800,
+      "query_qps": 1407.641
+    },
+    "candidate_median": {
+      "query_p50_ns": 650700,
+      "query_p95_ns": 1307600,
+      "query_p99_ns": 1604200,
+      "query_qps": 1356.414
+    },
+    "interpretation": "No latency improvement was observed in this two-term all-documents-match workload. The candidate removes cloned query terms and temporary hash-map storage; long-query allocation behavior is not measured here."
+  },
+  "baseline_runs": [
+    { "index_build_ns": 29365600, "query_p50_ns": 644500, "query_p95_ns": 1289100, "query_p99_ns": 1745500, "query_qps": 1327.354 },
+    { "index_build_ns": 28052600, "query_p50_ns": 640500, "query_p95_ns": 887600, "query_p99_ns": 1334400, "query_qps": 1485.867 },
+    { "index_build_ns": 27582800, "query_p50_ns": 647200, "query_p95_ns": 1151700, "query_p99_ns": 1452800, "query_qps": 1407.641 }
+  ],
+  "candidate_runs": [
+    { "index_build_ns": 35611400, "query_p50_ns": 650700, "query_p95_ns": 1052500, "query_p99_ns": 1413500, "query_qps": 1405.617 },
+    { "index_build_ns": 33208200, "query_p50_ns": 647700, "query_p95_ns": 1307600, "query_p99_ns": 2087000, "query_qps": 1356.414 },
+    { "index_build_ns": 27573000, "query_p50_ns": 651600, "query_p95_ns": 1353800, "query_p99_ns": 1604200, "query_qps": 1344.345 }
+  ],
+  "caveat": "Three sequential runs per version on one Windows host. The benchmark is in-process and its two-term query does not measure allocation savings for long queries."
+}
