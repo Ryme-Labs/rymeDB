@@ -122,6 +122,38 @@ fn safe_relative_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('\\')
         && Path::new(name).components().all(|component| matches!(component, Component::Normal(_)))
+        && name.split('/').all(safe_path_component)
+}
+
+fn safe_path_component(component: &str) -> bool {
+    if component.is_empty()
+        || component.ends_with([' ', '.'])
+        || component.chars().any(|character| {
+            character <= '\u{1f}'
+                || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\' | '/')
+        })
+    {
+        return false;
+    }
+
+    let device_base = component.split('.').next().unwrap_or(component).trim_end_matches([' ', '.']);
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|name| device_base.eq_ignore_ascii_case(name))
+    {
+        return false;
+    }
+
+    !["COM", "LPT"].iter().any(|prefix| {
+        let Some(prefix_part) = device_base.get(..3) else {
+            return false;
+        };
+        let Some(suffix) = device_base.get(3..) else {
+            return false;
+        };
+        prefix_part.eq_ignore_ascii_case(prefix)
+            && (matches!(suffix.as_bytes(), [b'1'..=b'9']) || matches!(suffix, "¹" | "²" | "³"))
+    })
 }
 
 fn valid_backup_id(backup_id: &str) -> bool {
@@ -893,11 +925,41 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let archiver = Archiver::new(LocalStore::new(root.clone()));
-        for name in ["../escape", "nested/../../escape", "/absolute", "nested\\escape"] {
+        for name in [
+            "../escape",
+            "nested/../../escape",
+            "/absolute",
+            "nested\\escape",
+            "CON",
+            "nested/NUL.txt",
+            "COM1.log",
+            "name.",
+            "name ",
+            "a:b",
+            "a?b",
+        ] {
             let result =
                 archiver.archive_files("unsafe", 1, vec![(String::from(name), Vec::new())]).await;
             assert!(matches!(result, Err(RymeError::InvalidArgument(_))), "{name}");
         }
+        assert!(safe_relative_name("nested/résumé.txt"));
+
+        let mut manifest = BackupManifest {
+            backup_id: String::from("legacy"),
+            commit_ts: 2,
+            created_unix: 1,
+            files: Vec::new(),
+        };
+        manifest.files.push(FileEntry {
+            key: format!("{}CON.txt", manifest.prefix()),
+            bytes: 0,
+            sha256: String::from("0").repeat(64),
+            encryption: None,
+        });
+        assert!(matches!(
+            validate_manifest(&manifest.manifest_key(), &manifest),
+            Err(RymeError::Corrupt(_))
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

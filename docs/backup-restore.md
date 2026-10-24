@@ -35,6 +35,8 @@ and `delta-compaction` metadata needed to recover that chain.
 Local archive objects and restored files are written through unique temporary
 files created exclusively in their destination directories. Archive reads
 also reject final-component reparse points on Windows.
+Archive paths reject Windows device names, alternate-stream syntax, control
+characters, and components ending in dots or spaces before writing or restore.
 On Unix, local archive writes sync the published object's containing directory
 and any newly created directory entries before reporting success.
 The configured local archive root must be a directory, not a symlink; missing

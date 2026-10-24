@@ -143,6 +143,11 @@ mod tests {
             "nested\\escape",
             "C:\\outside",
             "\\\\server\\share",
+            "backups/CON/file",
+            "backups/NUL.txt/file",
+            "backups/COM1.log/file",
+            "backups/a:b/file",
+            "backups/trailing./file",
         ] {
             assert!(matches!(store.path(key), Err(RymeError::InvalidArgument(_))), "{key}");
         }
@@ -150,6 +155,14 @@ mod tests {
             store.path("backups/backup-1/file.wal").unwrap(),
             PathBuf::from("archive/backups/backup-1/file.wal")
         );
+    }
+
+    #[tokio::test]
+    async fn local_store_validates_list_prefixes_without_accepting_root() {
+        let store = LocalStore::new(PathBuf::from("archive"));
+        assert!(store.list("backups/").await.is_ok());
+        assert!(matches!(store.list("/").await, Err(RymeError::InvalidArgument(_))));
+        assert!(matches!(store.list("backups/CON/").await, Err(RymeError::InvalidArgument(_))));
     }
 
     #[cfg(unix)]
@@ -291,7 +304,10 @@ impl crate::ObjectStore for LocalStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        if !prefix.is_empty() && !super::safe_relative_name(prefix) {
+        let validated_prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+        if (!prefix.is_empty() && validated_prefix.is_empty())
+            || (!validated_prefix.is_empty() && !super::safe_relative_name(validated_prefix))
+        {
             return Err(RymeError::InvalidArgument(String::from("prefix")));
         }
         self.validate_root()?;
