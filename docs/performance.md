@@ -756,6 +756,16 @@ deterministic pseudo-random point hits against one already-built segment. This
 includes the segment Bloom/key checks, engine lookup, and returned-value clone;
 compare only identical entry counts, payloads, build profiles, and hardware.
 
+`ImmutableSegment` now derives sparse-index positions from the fixed stride
+instead of retaining cloned keys or an ordinal vector. The encoded metadata
+still emits the same key and ordinal sequence. Five paired release runs with
+100,000 entries and 16-byte values showed no reliable latency gain: borrowed
+build p50 was 0.6% lower by median, owned build was 1.4% lower, and decode was
+2.5% higher. Three sampled process runs did show lower peak memory: median
+working set fell by 0.9 MiB and peak paged memory by 1.4 MiB. This change is
+retained for the repeatable memory reduction; segment roundtrip and corrupted
+sparse-metadata tests pass. See the [raw captures](../bench/results/segment-sparse-index-ordinal-windows-20261025.json).
+
 ## Delta-segment pointer experiment
 
 A paired release microbenchmark used the same 12-logical-CPU AMD Ryzen 5 4500,

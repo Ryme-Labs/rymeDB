@@ -280,7 +280,6 @@ pub struct ImmutableSegment {
     kind: SegmentKind,
     engine: Engine,
     keys: Vec<RecordKey>,
-    sparse_index: Vec<(RecordKey, usize)>,
     bloom: Vec<u8>,
 }
 
@@ -291,12 +290,6 @@ impl ImmutableSegment {
 
     fn from_engine_owned(id: u64, engine: Engine, kind: SegmentKind) -> Self {
         let keys = engine.record_keys();
-        let sparse_index = keys
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| index % INDEX_STRIDE == 0)
-            .map(|(index, key)| (key.clone(), index))
-            .collect();
         let bloom = build_bloom(&keys);
         let meta = SegmentMeta {
             id,
@@ -304,7 +297,7 @@ impl ImmutableSegment {
             entries: keys.len() as u64,
             bytes: engine.bytes_held(),
         };
-        Self { meta, kind, engine, keys, sparse_index, bloom }
+        Self { meta, kind, engine, keys, bloom }
     }
 
     pub fn from_entries(id: u64, entries: &[SegmentEntry]) -> Result<Self> {
@@ -340,7 +333,7 @@ impl ImmutableSegment {
     }
 
     pub fn sparse_index_len(&self) -> usize {
-        self.sparse_index.len()
+        self.keys.len().div_ceil(INDEX_STRIDE)
     }
 
     pub fn bloom_might_contain(&self, key: &RecordKey) -> bool {
@@ -424,12 +417,14 @@ impl ImmutableSegment {
         push_segment_bytes(&mut out, &payload)?;
         push_segment_bytes(&mut out, &(self.bloom.len() as u32).to_be_bytes())?;
         push_segment_bytes(&mut out, &self.bloom)?;
-        push_segment_bytes(&mut out, &(self.sparse_index.len() as u32).to_be_bytes())?;
-        for (key, ordinal) in &self.sparse_index {
+        let sparse_index_len = self.sparse_index_len();
+        push_segment_bytes(&mut out, &(sparse_index_len as u32).to_be_bytes())?;
+        for ordinal in (0..self.keys.len()).step_by(INDEX_STRIDE) {
+            let key = &self.keys[ordinal];
             push_key(&mut out, key)?;
             push_segment_bytes(
                 &mut out,
-                &u32::try_from(*ordinal)
+                &u32::try_from(ordinal)
                     .map_err(|_| RymeError::InvalidArgument(String::from("segment index")))?
                     .to_be_bytes(),
             )?;
@@ -491,15 +486,16 @@ impl ImmutableSegment {
         let bloom = &cursor[..bloom_len];
         cursor = &cursor[bloom_len..];
         let index_count = take_u32(&mut cursor)? as usize;
-        if index_count != segment.sparse_index.len() {
+        if index_count != segment.sparse_index_len() {
             return Err(RymeError::Corrupt(String::from("segment index")));
         }
-        for (key, expected_ordinal) in &segment.sparse_index {
+        for expected_ordinal in (0..segment.keys.len()).step_by(INDEX_STRIDE) {
+            let key = &segment.keys[expected_ordinal];
             if !take_key_matches(&mut cursor, key)? {
                 return Err(RymeError::Corrupt(String::from("segment metadata")));
             }
             let ordinal = take_u32(&mut cursor)? as usize;
-            if ordinal != *expected_ordinal {
+            if ordinal != expected_ordinal {
                 return Err(RymeError::Corrupt(String::from("segment metadata")));
             }
         }

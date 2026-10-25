@@ -1,0 +1,279 @@
+{
+  "benchmark": "immutable segment construction, decode, and peak memory",
+  "host": {
+    "os": "Windows",
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 5 4500",
+    "logical_cpus": 12
+  },
+  "workload": {
+    "entries": 100000,
+    "value_bytes": 16,
+    "iterations_per_run": 10
+  },
+  "candidate": "derive sparse index ordinals at encode/decode time instead of storing cloned sparse keys or an ordinal vector",
+  "paired_runs": [
+    {
+      "pair": 1,
+      "baseline": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 159917400,
+        "borrowed_clone_p95_ns": 167250700,
+        "decode_p50_ns": 227996000,
+        "decode_p95_ns": 238965800,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 3134,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 139908600,
+        "owned_p50_speedup": 1.143013367298365,
+        "owned_p95_ns": 144576900,
+        "value_bytes": 16
+      },
+      "candidate": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 168490900,
+        "borrowed_clone_p95_ns": 181490800,
+        "decode_p50_ns": 249319900,
+        "decode_p95_ns": 263967700,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 5152,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 147730500,
+        "owned_p50_speedup": 1.1405288684462584,
+        "owned_p95_ns": 151385800,
+        "value_bytes": 16
+      }
+    },
+    {
+      "pair": 2,
+      "baseline": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 169424800,
+        "borrowed_clone_p95_ns": 186603800,
+        "decode_p50_ns": 244522600,
+        "decode_p95_ns": 258154000,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 2701,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 145928600,
+        "owned_p50_speedup": 1.1610116180104517,
+        "owned_p95_ns": 165922700,
+        "value_bytes": 16
+      },
+      "candidate": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 165294000,
+        "borrowed_clone_p95_ns": 188510700,
+        "decode_p50_ns": 242726100,
+        "decode_p95_ns": 259171200,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 4770,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 143813500,
+        "owned_p50_speedup": 1.149363585477024,
+        "owned_p95_ns": 166689500,
+        "value_bytes": 16
+      }
+    },
+    {
+      "pair": 3,
+      "baseline": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 169333300,
+        "borrowed_clone_p95_ns": 196126900,
+        "decode_p50_ns": 238292900,
+        "decode_p95_ns": 280981800,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 3469,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 146598300,
+        "owned_p50_speedup": 1.15508365376679,
+        "owned_p95_ns": 168520400,
+        "value_bytes": 16
+      },
+      "candidate": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 157563700,
+        "borrowed_clone_p95_ns": 169346200,
+        "decode_p50_ns": 235643000,
+        "decode_p95_ns": 258422900,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 6211,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 137714300,
+        "owned_p50_speedup": 1.1441346323511792,
+        "owned_p95_ns": 146407400,
+        "value_bytes": 16
+      }
+    },
+    {
+      "pair": 4,
+      "baseline": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 169593400,
+        "borrowed_clone_p95_ns": 234872800,
+        "decode_p50_ns": 236333600,
+        "decode_p95_ns": 311855300,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 2960,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 142225200,
+        "owned_p50_speedup": 1.1924286272756164,
+        "owned_p95_ns": 176440600,
+        "value_bytes": 16
+      },
+      "candidate": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 173526300,
+        "borrowed_clone_p95_ns": 298453100,
+        "decode_p50_ns": 271205000,
+        "decode_p95_ns": 329378400,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 5673,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 147759100,
+        "owned_p50_speedup": 1.1743865521649766,
+        "owned_p95_ns": 229836800,
+        "value_bytes": 16
+      }
+    },
+    {
+      "pair": 5,
+      "baseline": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 160554100,
+        "borrowed_clone_p95_ns": 190049700,
+        "decode_p50_ns": 228724900,
+        "decode_p95_ns": 240878300,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 2584,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 141143800,
+        "owned_p50_speedup": 1.1375214497554975,
+        "owned_p95_ns": 144142400,
+        "value_bytes": 16
+      },
+      "candidate": {
+        "benchmark": "segment-build-ownership",
+        "borrowed_clone_p50_ns": 159667300,
+        "borrowed_clone_p95_ns": 168287900,
+        "decode_p50_ns": 234454500,
+        "decode_p95_ns": 243971400,
+        "encoded_bytes": 8573525,
+        "entries": 100000,
+        "iterations": 10,
+        "lookup_mean_ns": 6358,
+        "lookup_ops": 2560,
+        "machine": {
+          "arch": "x86_64",
+          "cpu_model": "AMD Ryzen 5 4500",
+          "logical_cpus": 12,
+          "os": "windows"
+        },
+        "owned_p50_ns": 135453000,
+        "owned_p50_speedup": 1.1787653281950197,
+        "owned_p95_ns": 141275500,
+        "value_bytes": 16
+      }
+    }
+  ],
+  "memory_probe": {
+    "sample_interval_ms": 10,
+    "units": "MiB",
+    "runs": [
+      {
+        "pair": 1,
+        "baseline_peak_working_set": 185.6,
+        "candidate_peak_working_set": 184.6,
+        "baseline_peak_paged": 196.7,
+        "candidate_peak_paged": 194.4
+      },
+      {
+        "pair": 2,
+        "baseline_peak_working_set": 185.5,
+        "candidate_peak_working_set": 184.6,
+        "baseline_peak_paged": 195.9,
+        "candidate_peak_paged": 194.5
+      },
+      {
+        "pair": 3,
+        "baseline_peak_working_set": 185.5,
+        "candidate_peak_working_set": 184.6,
+        "baseline_peak_paged": 195.3,
+        "candidate_peak_paged": 194.4
+      }
+    ]
+  }
+}
