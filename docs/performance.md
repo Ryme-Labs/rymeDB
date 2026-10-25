@@ -913,3 +913,10 @@ alternating release pairs on the same Windows host regressed median p50 3.6%
 for `LIMIT 10` and 0.7% for `LIMIT 4000`; p95 also regressed in both workloads.
 The change was discarded. These are in-process SQL executor measurements, not
 wire-protocol or concurrent-query latency. See the [raw captures](../bench/results/sql-indexed-batch-intermediate-row-vector-windows-20261024.json).
+
+A one-staged-write fast path for batched transaction reads was measured and
+discarded. Across eight alternating release pairs, repeated-key batches
+regressed median p50 by 2.5% and p99 by 6.4%; unique-key p50 and p99 were
+within 1% of baseline. The existing vector-building path remains. A regression
+test covers an unrelated staged write without changing the returned values or
+read set. See the [raw captures](../bench/results/one-staged-write-batch-read-windows-20261025.json).

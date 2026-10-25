@@ -1,0 +1,76 @@
+{
+  "experiment": "one-staged-write-batch-read-fast-path",
+  "captured_date": "2026-10-25",
+  "baseline_revision": "8a32e94",
+  "candidate_revision": "working-tree-experiment",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "workload": {
+    "benchmark": "ryme-bench txn-read-batch",
+    "storage_mode": "hot",
+    "durability": "in_memory_only",
+    "records_repeated": 64,
+    "records_unique": 1024,
+    "candidates_per_iteration": 1024,
+    "iterations": 100,
+    "batch_size": 256,
+    "value_bytes": 128,
+    "staged_write": "one pending key in a different table from the requested keys",
+    "metric": "staged_write_batched_read p50/p95/p99",
+    "candidate_change": "For transactions with one staged write, bypass pending-index/key vectors; read the requested batch directly when the staged key is out-of-scope, or map around its input position when in-scope.",
+    "method": "Eight alternating release-build pairs per workload, baseline executable saved before the candidate build."
+  },
+  "summary": {
+    "repeated_64": {
+      "baseline_median_p50_ns": 399750,
+      "candidate_median_p50_ns": 409600,
+      "p50_change_percent": 2.5,
+      "baseline_median_p95_ns": 576800,
+      "candidate_median_p95_ns": 582500,
+      "p95_change_percent": 1.0,
+      "baseline_median_p99_ns": 667100,
+      "candidate_median_p99_ns": 709500,
+      "p99_change_percent": 6.4,
+      "p50_candidate_faster_pairs": 3
+    },
+    "unique_1024": {
+      "baseline_median_p50_ns": 993900,
+      "candidate_median_p50_ns": 995350,
+      "p50_change_percent": 0.1,
+      "baseline_median_p95_ns": 1578900,
+      "candidate_median_p95_ns": 1549800,
+      "p95_change_percent": -1.8,
+      "baseline_median_p99_ns": 1886600,
+      "candidate_median_p99_ns": 1897950,
+      "p99_change_percent": 0.6
+    },
+    "decision": "Discarded. The repeated-key workload regressed p50 and p99; the unique-key workload was effectively flat at p50 and p99. No robust cross-workload performance gain."
+  },
+  "captures": {
+    "repeated_64": [
+      {"pair":1,"baseline":{"p50_ns":395400,"p95_ns":429400,"p99_ns":487600,"rows_per_second":2571288},"candidate":{"p50_ns":388400,"p95_ns":578000,"p99_ns":734500,"rows_per_second":2424707}},
+      {"pair":2,"baseline":{"p50_ns":427600,"p95_ns":679700,"p99_ns":912900,"rows_per_second":2124984},"candidate":{"p50_ns":433900,"p95_ns":625300,"p99_ns":684500,"rows_per_second":2136404}},
+      {"pair":3,"baseline":{"p50_ns":392900,"p95_ns":570600,"p99_ns":620800,"rows_per_second":2457852},"candidate":{"p50_ns":409100,"p95_ns":631100,"p99_ns":782600,"rows_per_second":2255124}},
+      {"pair":4,"baseline":{"p50_ns":398300,"p95_ns":553900,"p99_ns":689400,"rows_per_second":2420752},"candidate":{"p50_ns":411900,"p95_ns":585500,"p99_ns":803100,"rows_per_second":2252039}},
+      {"pair":5,"baseline":{"p50_ns":391400,"p95_ns":497700,"p99_ns":664200,"rows_per_second":2535639},"candidate":{"p50_ns":410100,"p95_ns":579500,"p99_ns":639700,"rows_per_second":2359469}},
+      {"pair":6,"baseline":{"p50_ns":403700,"p95_ns":602100,"p99_ns":634100,"rows_per_second":2340133},"candidate":{"p50_ns":419200,"p95_ns":598900,"p99_ns":640200,"rows_per_second":2302992}},
+      {"pair":7,"baseline":{"p50_ns":401200,"p95_ns":664200,"p99_ns":741700,"rows_per_second":2277458},"candidate":{"p50_ns":395900,"p95_ns":551400,"p99_ns":614800,"rows_per_second":2493249}},
+      {"pair":8,"baseline":{"p50_ns":405600,"p95_ns":583000,"p99_ns":670000,"rows_per_second":2398896},"candidate":{"p50_ns":396100,"p95_ns":566600,"p99_ns":785000,"rows_per_second":2375820}}
+    ],
+    "unique_1024": [
+      {"pair":1,"baseline":{"p50_ns":956000,"p95_ns":1407200,"p99_ns":1604300,"rows_per_second":984845},"candidate":{"p50_ns":857300,"p95_ns":1341100,"p99_ns":1569200,"rows_per_second":1137629}},
+      {"pair":2,"baseline":{"p50_ns":1010500,"p95_ns":1698600,"p99_ns":2068200,"rows_per_second":896265},"candidate":{"p50_ns":1141800,"p95_ns":1737800,"p99_ns":1912500,"rows_per_second":830091}},
+      {"pair":3,"baseline":{"p50_ns":1072800,"p95_ns":1735100,"p99_ns":2441800,"rows_per_second":825793},"candidate":{"p50_ns":1092100,"p95_ns":1744000,"p99_ns":2079700,"rows_per_second":857525}},
+      {"pair":4,"baseline":{"p50_ns":983400,"p95_ns":1581200,"p99_ns":1624500,"rows_per_second":953087},"candidate":{"p50_ns":983200,"p95_ns":1413000,"p99_ns":1549900,"rows_per_second":976320}},
+      {"pair":5,"baseline":{"p50_ns":1004400,"p95_ns":1576600,"p99_ns":1993400,"rows_per_second":925404},"candidate":{"p50_ns":1118000,"p95_ns":1890500,"p99_ns":2039000,"rows_per_second":838038}},
+      {"pair":6,"baseline":{"p50_ns":941800,"p95_ns":1492900,"p99_ns":1779800,"rows_per_second":1016892},"candidate":{"p50_ns":927600,"p95_ns":1551100,"p99_ns":2054900,"rows_per_second":990686}},
+      {"pair":7,"baseline":{"p50_ns":970500,"p95_ns":1529500,"p99_ns":1764600,"rows_per_second":970932},"candidate":{"p50_ns":964400,"p95_ns":1435900,"p99_ns":1657600,"rows_per_second":1009755}},
+      {"pair":8,"baseline":{"p50_ns":1025500,"p95_ns":1648900,"p99_ns":2024900,"rows_per_second":897296},"candidate":{"p50_ns":1007500,"p95_ns":1548500,"p99_ns":1883400,"rows_per_second":932838}}
+    ]
+  },
+  "notes": "Warmed single-host in-memory transaction benchmark. It excludes network, durable sync, and concurrent clients. Tests cover the staged key both inside the requested batch and outside its table scope."
+}
