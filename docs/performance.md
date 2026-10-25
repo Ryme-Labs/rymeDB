@@ -98,6 +98,15 @@ with a candidate that skipped the redundant whole-write-set validation pass.
 The difference is below run-to-run variation, so the transaction change was
 discarded. See the [raw captures](../bench/results/txn-local-write-validation-batch-20261024.json).
 
+Transaction commit metadata now updates `latest_by_table` once per contiguous
+table group in the sorted write set. The local commit benchmark showed median
+paired write-throughput ratios of 1.025 for 1,000 transactions with 64 writes,
+1.056 for 500 transactions with 512 writes, and 1.049 for 400 transactions
+with 512 writes across four workers. The candidate was faster in 15/20 pairs
+for both single-worker sizes and 9/10 four-worker pairs. This benchmark reports
+throughput only; it does not measure commit latency percentiles, WAL durability,
+or network overhead. See the [raw captures](../bench/results/txn-latest-table-update-windows-20261025.json).
+
 To benchmark the SQL executor in-process without PostgreSQL-wire or network
 overhead:
 

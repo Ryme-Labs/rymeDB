@@ -501,12 +501,20 @@ impl CommitIndex {
     }
 
     fn record_latest(&mut self, commit_ts: u64, keys: &[RecordKey]) {
+        // Commit write keys are collected from a BTreeMap, so each table is
+        // contiguous and its latest timestamp only needs one update per run.
+        let mut previous_table = None;
         for key in keys {
+            let table = (key.tenant.as_str(), key.database.as_str(), key.table.as_str());
+            if previous_table == Some(table) {
+                continue;
+            }
             let table = (key.tenant.clone(), key.database.clone(), key.table.clone());
             self.latest_by_table
                 .entry(table)
                 .and_modify(|latest| *latest = (*latest).max(commit_ts))
                 .or_insert(commit_ts);
+            previous_table = Some((key.tenant.as_str(), key.database.as_str(), key.table.as_str()));
         }
     }
 
@@ -4331,6 +4339,24 @@ mod tests {
 
         let mut reader = manager.begin();
         assert_eq!(manager.get(&mut reader, &key).unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn record_latest_updates_each_contiguous_table_once_and_keeps_max_timestamp() {
+        let mut index = CommitIndex::default();
+        let keys = vec![
+            RecordKey::new("t", "d", "a", b"1"),
+            RecordKey::new("t", "d", "a", b"2"),
+            RecordKey::new("t", "d", "b", b"1"),
+            RecordKey::new("t", "d", "b", b"2"),
+        ];
+
+        index.record_latest(7, &keys);
+        index.record_latest(5, &keys);
+
+        assert_eq!(index.latest_by_table.len(), 2);
+        assert_eq!(index.latest_by_table.get(&("t".into(), "d".into(), "a".into())), Some(&7));
+        assert_eq!(index.latest_by_table.get(&("t".into(), "d".into(), "b".into())), Some(&7));
     }
 
     #[test]
