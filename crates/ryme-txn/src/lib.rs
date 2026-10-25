@@ -5,7 +5,7 @@ use ryme_storage::{
 };
 use ryme_wal::Wal;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -478,7 +478,9 @@ struct TxnInner {
 #[derive(Debug, Default)]
 struct CommitIndex {
     by_timestamp: BTreeMap<u64, Vec<RecordKey>>,
-    by_key: BTreeMap<RecordKey, Vec<u64>>,
+    // Conflict checks and pruning address key histories by key; they never
+    // depend on key iteration order.
+    by_key: HashMap<RecordKey, Vec<u64>>,
     by_table: BTreeMap<(String, String, String), Vec<u64>>,
     latest_by_table: BTreeMap<(String, String, String), u64>,
     pruned_through: u64,

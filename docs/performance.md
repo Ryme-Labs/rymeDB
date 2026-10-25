@@ -116,6 +116,19 @@ throughput ratio of 1.062. This is an in-memory throughput measurement, without
 latency percentiles or WAL/network costs; see the
 [raw captures](../bench/results/txn-table-conflict-history-windows-20261025.json).
 
+The per-key conflict history index uses a `HashMap`; its callers only look up,
+insert, and remove histories by key, while ordered pruning is driven by the
+separate timestamp index. Eight alternating release pairs on this Windows
+12-logical-CPU host measured median paired write-throughput gains of 25.1% for
+four workers with 512 writes per transaction and 22.2% for four workers with
+64 writes per transaction; all 16 pairs favored the hash index. Four-worker
+single-write transactions gained 6.6% by median (6/8 pairs favored the
+candidate). Single-worker throughput was flat for 512-write transactions and
+1.6% lower by median for 64-write transactions, so the gain is concentrated in
+concurrent commit workloads. Three sampled 1,024,000-write process-memory runs
+showed overlapping peak working-set ranges for the old and new indexes. This
+benchmark excludes WAL and network costs; see the [raw captures](../bench/results/txn-conflict-key-hashmap-windows-20261025.json).
+
 To benchmark the SQL executor in-process without PostgreSQL-wire or network
 overhead:
 
