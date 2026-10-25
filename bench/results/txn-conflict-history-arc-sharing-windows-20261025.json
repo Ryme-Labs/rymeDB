@@ -1,0 +1,229 @@
+{
+  "benchmark": "transaction commit throughput; writes per second",
+  "host": {
+    "os": "Windows",
+    "arch": "x86_64",
+    "logical_cpus": 12
+  },
+  "candidate": "share RecordKey allocations between CommitIndex.by_key and by_timestamp using Arc<RecordKey>",
+  "groups": {
+    "four_workers_512_writes": {
+      "command": "ryme-bench local --ops 500 --concurrency 4 --batch-size 512 --value-bytes 128",
+      "runs": [
+        {
+          "pair": 1,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.805 qps=318163 transaction_qps=621",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.854 probe_qps=539491"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.857 qps=298825 transaction_qps=584",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=2.511 probe_qps=398311"
+          ]
+        },
+        {
+          "pair": 2,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.855 qps=299558 transaction_qps=585",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.871 probe_qps=534359"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.803 qps=318859 transaction_qps=623",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.538 probe_qps=650364"
+          ]
+        },
+        {
+          "pair": 3,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.820 qps=312121 transaction_qps=610",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.513 probe_qps=660851"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.803 qps=318759 transaction_qps=623",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.567 probe_qps=638081"
+          ]
+        },
+        {
+          "pair": 4,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.862 qps=296876 transaction_qps=580",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=2.209 probe_qps=452612"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.804 qps=318292 transaction_qps=622",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.686 probe_qps=593190"
+          ]
+        },
+        {
+          "pair": 5,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.810 qps=316187 transaction_qps=618",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.882 probe_qps=531463"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.771 qps=332249 transaction_qps=649",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=2.730 probe_qps=366247"
+          ]
+        },
+        {
+          "pair": 6,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.795 qps=321913 transaction_qps=629",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.802 probe_qps=555062"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.783 qps=327014 transaction_qps=639",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.555 probe_qps=643004"
+          ]
+        },
+        {
+          "pair": 7,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.878 qps=291500 transaction_qps=569",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=2.710 probe_qps=369031"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.798 qps=320726 transaction_qps=626",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=2.585 probe_qps=386907"
+          ]
+        },
+        {
+          "pair": 8,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.852 qps=300431 transaction_qps=587",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.569 probe_qps=637430"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=256000 warmup_ops=0 writes_per_transaction=512 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=256000 failed_ops=0 requested_ops=256000 successful_transactions=500 failed_transactions=0 requested_transactions=500 workers=4 seconds=0.796 qps=321530 transaction_qps=628",
+            "probe_hits=500 probe_workers=4 probe_mean_micros=1.560 probe_qps=640861"
+          ]
+        }
+      ]
+    },
+    "four_workers_64_writes": {
+      "command": "ryme-bench local --ops 1000 --concurrency 4 --batch-size 64 --value-bytes 128",
+      "runs": [
+        {
+          "pair": 1,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.177 qps=361863 transaction_qps=5654",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.126 probe_qps=888336"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.193 qps=331197 transaction_qps=5175",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=0.977 probe_qps=1024066"
+          ]
+        },
+        {
+          "pair": 2,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.182 qps=352002 transaction_qps=5500",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.466 probe_qps=682035"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.213 qps=300068 transaction_qps=4689",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.208 probe_qps=827472"
+          ]
+        },
+        {
+          "pair": 3,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.180 qps=354616 transaction_qps=5541",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.046 probe_qps=955566"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.196 qps=326067 transaction_qps=5095",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.115 probe_qps=896539"
+          ]
+        },
+        {
+          "pair": 4,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.185 qps=346780 transaction_qps=5418",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=0.982 probe_qps=1017915"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.196 qps=326647 transaction_qps=5104",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.113 probe_qps=898392"
+          ]
+        },
+        {
+          "pair": 5,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.192 qps=332681 transaction_qps=5198",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.073 probe_qps=931966"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.200 qps=320195 transaction_qps=5003",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.134 probe_qps=881679"
+          ]
+        },
+        {
+          "pair": 6,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.195 qps=327900 transaction_qps=5123",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.233 probe_qps=810898"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.206 qps=310683 transaction_qps=4854",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.027 probe_qps=973994"
+          ]
+        },
+        {
+          "pair": 7,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.189 qps=338316 transaction_qps=5286",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.196 probe_qps=835841"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.196 qps=326863 transaction_qps=5107",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.258 probe_qps=794913"
+          ]
+        },
+        {
+          "pair": 8,
+          "baseline": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.198 qps=322957 transaction_qps=5046",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.106 probe_qps=904241"
+          ],
+          "candidate": [
+            "benchmark=txn-local value_bytes=128 keyspace=64000 warmup_ops=0 writes_per_transaction=64 metadata={\"arch\":\"x86_64\",\"cpu_model\":\"AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD\",\"logical_cpus\":12,\"os\":\"windows\"}",
+            "successful_ops=64000 failed_ops=0 requested_ops=64000 successful_transactions=1000 failed_transactions=0 requested_transactions=1000 workers=4 seconds=0.193 qps=331222 transaction_qps=5175",
+            "probe_hits=1000 probe_workers=4 probe_mean_micros=1.136 probe_qps=879972"
+          ]
+        }
+      ]
+    }
+  }
+}

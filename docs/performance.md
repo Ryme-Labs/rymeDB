@@ -129,6 +129,13 @@ concurrent commit workloads. Three sampled 1,024,000-write process-memory runs
 showed overlapping peak working-set ranges for the old and new indexes. This
 benchmark excludes WAL and network costs; see the [raw captures](../bench/results/txn-conflict-key-hashmap-windows-20261025.json).
 
+Sharing each committed `RecordKey` between the per-key and per-timestamp
+conflict indexes with `Arc` raised four-worker 512-write throughput by 5.8% at
+the median across eight pairs (7/8 faster), but lowered four-worker 64-write
+throughput by 5.5% (only 1/8 faster). The shared-key representation was
+discarded because it regressed the smaller transaction workload. See the
+[raw captures](../bench/results/txn-conflict-history-arc-sharing-windows-20261025.json).
+
 To benchmark the SQL executor in-process without PostgreSQL-wire or network
 overhead:
 
