@@ -1,0 +1,1762 @@
+﻿{
+    "host":  "Windows x86_64, AMD Ryzen 5 4500, 12 logical CPUs",
+    "threshold_sweep_baseline_runs":  [
+                                          {
+                                              "batch_size":  16,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4242200,
+                                                                   "p95_ns":  5364100,
+                                                                   "p99_ns":  6116900,
+                                                                   "rows_per_second":  935680
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.79,
+                                              "read_only_batch_p50_speedup":  1.99,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  1120000,
+                                                                             "p95_ns":  1504100,
+                                                                             "p99_ns":  1881400,
+                                                                             "rows_per_second":  3514581
+                                                                         },
+                                              "read_only_p50_speedup":  3.4,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2231800,
+                                                                            "p95_ns":  2899400,
+                                                                            "p99_ns":  3415100,
+                                                                            "rows_per_second":  1774096
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.39,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  935600,
+                                                                                      "p95_ns":  1371600,
+                                                                                      "p99_ns":  1795000,
+                                                                                      "rows_per_second":  4200054
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2834300,
+                                                                                      "p95_ns":  4404100,
+                                                                                      "p99_ns":  5972300,
+                                                                                      "rows_per_second":  1386473
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7582600,
+                                                                  "p95_ns":  9283200,
+                                                                  "p99_ns":  10451000,
+                                                                  "rows_per_second":  527471
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.68,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4544700,
+                                                                                "p95_ns":  5632000,
+                                                                                "p99_ns":  6441000,
+                                                                                "rows_per_second":  874408
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7657500,
+                                                                               "p95_ns":  9117800,
+                                                                               "p99_ns":  9932000,
+                                                                               "rows_per_second":  525314
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  16,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4183200,
+                                                                   "p95_ns":  4846000,
+                                                                   "p99_ns":  5902300,
+                                                                   "rows_per_second":  959108
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.8,
+                                              "read_only_batch_p50_speedup":  2.04,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  1082400,
+                                                                             "p95_ns":  1407600,
+                                                                             "p99_ns":  1923100,
+                                                                             "rows_per_second":  3638415
+                                                                         },
+                                              "read_only_p50_speedup":  3.4,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2210300,
+                                                                            "p95_ns":  2690100,
+                                                                            "p99_ns":  3308500,
+                                                                            "rows_per_second":  1807566
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.48,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  891500,
+                                                                                      "p95_ns":  1237200,
+                                                                                      "p99_ns":  1635800,
+                                                                                      "rows_per_second":  4401530
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2739600,
+                                                                                      "p95_ns":  4131900,
+                                                                                      "p99_ns":  5806800,
+                                                                                      "rows_per_second":  1433813
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7510600,
+                                                                  "p95_ns":  8421000,
+                                                                  "p99_ns":  10444900,
+                                                                  "rows_per_second":  537611
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.69,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4486500,
+                                                                                "p95_ns":  5132500,
+                                                                                "p99_ns":  6575100,
+                                                                                "rows_per_second":  899087
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7571900,
+                                                                               "p95_ns":  8358100,
+                                                                               "p99_ns":  10047700,
+                                                                               "rows_per_second":  533530
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  16,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4243000,
+                                                                   "p95_ns":  5203400,
+                                                                   "p99_ns":  6111300,
+                                                                   "rows_per_second":  943822
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.8,
+                                              "read_only_batch_p50_speedup":  2.05,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  1096100,
+                                                                             "p95_ns":  1477100,
+                                                                             "p99_ns":  1786300,
+                                                                             "rows_per_second":  3598709
+                                                                         },
+                                              "read_only_p50_speedup":  3.39,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2248600,
+                                                                            "p95_ns":  2689400,
+                                                                            "p99_ns":  3364100,
+                                                                            "rows_per_second":  1782673
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.52,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  892600,
+                                                                                      "p95_ns":  1343600,
+                                                                                      "p99_ns":  1650400,
+                                                                                      "rows_per_second":  4373822
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2740300,
+                                                                                      "p95_ns":  4143000,
+                                                                                      "p99_ns":  5257800,
+                                                                                      "rows_per_second":  1436990
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7625500,
+                                                                  "p95_ns":  8616300,
+                                                                  "p99_ns":  9991900,
+                                                                  "rows_per_second":  529833
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.69,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4522700,
+                                                                                "p95_ns":  5227700,
+                                                                                "p99_ns":  6826400,
+                                                                                "rows_per_second":  887310
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7646600,
+                                                                               "p95_ns":  8972300,
+                                                                               "p99_ns":  9836900,
+                                                                               "rows_per_second":  527216
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  32,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4165300,
+                                                                   "p95_ns":  5450200,
+                                                                   "p99_ns":  6551100,
+                                                                   "rows_per_second":  947524
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.84,
+                                              "read_only_batch_p50_speedup":  2.11,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  1080200,
+                                                                             "p95_ns":  1653300,
+                                                                             "p99_ns":  2214100,
+                                                                             "rows_per_second":  3540444
+                                                                         },
+                                              "read_only_p50_speedup":  3.36,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2275200,
+                                                                            "p95_ns":  3059800,
+                                                                            "p99_ns":  3816200,
+                                                                            "rows_per_second":  1717990
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.52,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  903900,
+                                                                                      "p95_ns":  1432000,
+                                                                                      "p99_ns":  2408900,
+                                                                                      "rows_per_second":  4252644
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  3122100,
+                                                                                      "p95_ns":  5473900,
+                                                                                      "p99_ns":  7043100,
+                                                                                      "rows_per_second":  1227347
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7653600,
+                                                                  "p95_ns":  9721100,
+                                                                  "p99_ns":  11597400,
+                                                                  "rows_per_second":  518470
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.72,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4446600,
+                                                                                "p95_ns":  5860900,
+                                                                                "p99_ns":  6876300,
+                                                                                "rows_per_second":  887001
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7667800,
+                                                                               "p95_ns":  9475400,
+                                                                               "p99_ns":  10715100,
+                                                                               "rows_per_second":  517064
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  32,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4092100,
+                                                                   "p95_ns":  5123300,
+                                                                   "p99_ns":  6053300,
+                                                                   "rows_per_second":  971546
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.85,
+                                              "read_only_batch_p50_speedup":  2.18,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  1040200,
+                                                                             "p95_ns":  1620400,
+                                                                             "p99_ns":  2072000,
+                                                                             "rows_per_second":  3706110
+                                                                         },
+                                              "read_only_p50_speedup":  3.34,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2265500,
+                                                                            "p95_ns":  2958100,
+                                                                            "p99_ns":  3832200,
+                                                                            "rows_per_second":  1744247
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.65,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  855000,
+                                                                                      "p95_ns":  1391700,
+                                                                                      "p99_ns":  1870900,
+                                                                                      "rows_per_second":  4577698
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2929900,
+                                                                                      "p95_ns":  4683400,
+                                                                                      "p99_ns":  5992900,
+                                                                                      "rows_per_second":  1345687
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7577800,
+                                                                  "p95_ns":  8799500,
+                                                                  "p99_ns":  10033000,
+                                                                  "rows_per_second":  529818
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.75,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4386000,
+                                                                                "p95_ns":  5355900,
+                                                                                "p99_ns":  6359000,
+                                                                                "rows_per_second":  907716
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7671900,
+                                                                               "p95_ns":  9362800,
+                                                                               "p99_ns":  10835200,
+                                                                               "rows_per_second":  521823
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  32,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4057200,
+                                                                   "p95_ns":  5244100,
+                                                                   "p99_ns":  6126600,
+                                                                   "rows_per_second":  976963
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.87,
+                                              "read_only_batch_p50_speedup":  2.18,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  1020100,
+                                                                             "p95_ns":  1547700,
+                                                                             "p99_ns":  1946900,
+                                                                             "rows_per_second":  3762435
+                                                                         },
+                                              "read_only_p50_speedup":  3.41,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2219700,
+                                                                            "p95_ns":  2923900,
+                                                                            "p99_ns":  3582200,
+                                                                            "rows_per_second":  1770559
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.67,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  830400,
+                                                                                      "p95_ns":  1355700,
+                                                                                      "p99_ns":  2078600,
+                                                                                      "rows_per_second":  4641210
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2755400,
+                                                                                      "p95_ns":  5180200,
+                                                                                      "p99_ns":  7780500,
+                                                                                      "rows_per_second":  1340961
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7574600,
+                                                                  "p95_ns":  9142400,
+                                                                  "p99_ns":  11538600,
+                                                                  "rows_per_second":  526516
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.77,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4326100,
+                                                                                "p95_ns":  6017800,
+                                                                                "p99_ns":  7203600,
+                                                                                "rows_per_second":  900026
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7670300,
+                                                                               "p95_ns":  9590600,
+                                                                               "p99_ns":  10706600,
+                                                                               "rows_per_second":  520262
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  4,
+                                              "batched_read":  {
+                                                                   "p50_ns":  5759600,
+                                                                   "p95_ns":  6428800,
+                                                                   "p99_ns":  8010700,
+                                                                   "rows_per_second":  700706
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.3,
+                                              "read_only_batch_p50_speedup":  1.04,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  2112100,
+                                                                             "p95_ns":  2648400,
+                                                                             "p99_ns":  3147500,
+                                                                             "rows_per_second":  1881235
+                                                                         },
+                                              "read_only_p50_speedup":  3.39,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2202900,
+                                                                            "p95_ns":  2601600,
+                                                                            "p99_ns":  3390400,
+                                                                            "rows_per_second":  1814021
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  1.11,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  1989500,
+                                                                                      "p95_ns":  2400500,
+                                                                                      "p99_ns":  3061000,
+                                                                                      "rows_per_second":  2032388
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2563800,
+                                                                                      "p95_ns":  3788900,
+                                                                                      "p99_ns":  5312500,
+                                                                                      "rows_per_second":  1535747
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7474800,
+                                                                  "p95_ns":  8371900,
+                                                                  "p99_ns":  9971100,
+                                                                  "rows_per_second":  541641
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.28,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  5965100,
+                                                                                "p95_ns":  6582700,
+                                                                                "p99_ns":  8013900,
+                                                                                "rows_per_second":  675729
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7627600,
+                                                                               "p95_ns":  8407300,
+                                                                               "p99_ns":  9918900,
+                                                                               "rows_per_second":  533000
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  4,
+                                              "batched_read":  {
+                                                                   "p50_ns":  5835200,
+                                                                   "p95_ns":  6768100,
+                                                                   "p99_ns":  8259100,
+                                                                   "rows_per_second":  688581
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.29,
+                                              "read_only_batch_p50_speedup":  1.05,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  2146000,
+                                                                             "p95_ns":  2752800,
+                                                                             "p99_ns":  3311400,
+                                                                             "rows_per_second":  1840546
+                                                                         },
+                                              "read_only_p50_speedup":  3.35,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2254000,
+                                                                            "p95_ns":  2770400,
+                                                                            "p99_ns":  3689600,
+                                                                            "rows_per_second":  1758494
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  1.12,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  2017800,
+                                                                                      "p95_ns":  2633000,
+                                                                                      "p99_ns":  3388300,
+                                                                                      "rows_per_second":  1974791
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2748600,
+                                                                                      "p95_ns":  4225900,
+                                                                                      "p99_ns":  5360300,
+                                                                                      "rows_per_second":  1413481
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7547500,
+                                                                  "p95_ns":  8798200,
+                                                                  "p99_ns":  11111300,
+                                                                  "rows_per_second":  530078
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.28,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  6035600,
+                                                                                "p95_ns":  6974900,
+                                                                                "p99_ns":  9337000,
+                                                                                "rows_per_second":  662869
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7696600,
+                                                                               "p95_ns":  8968200,
+                                                                               "p99_ns":  9862800,
+                                                                               "rows_per_second":  522007
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  4,
+                                              "batched_read":  {
+                                                                   "p50_ns":  5823300,
+                                                                   "p95_ns":  6857400,
+                                                                   "p99_ns":  8071000,
+                                                                   "rows_per_second":  687750
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.3,
+                                              "read_only_batch_p50_speedup":  1.03,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  2177600,
+                                                                             "p95_ns":  2839000,
+                                                                             "p99_ns":  3658700,
+                                                                             "rows_per_second":  1805077
+                                                                         },
+                                              "read_only_p50_speedup":  3.35,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2253000,
+                                                                            "p95_ns":  2864400,
+                                                                            "p99_ns":  3389300,
+                                                                            "rows_per_second":  1761874
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  1.1,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  2054100,
+                                                                                      "p95_ns":  2863300,
+                                                                                      "p99_ns":  3457600,
+                                                                                      "rows_per_second":  1924055
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2821400,
+                                                                                      "p95_ns":  4604700,
+                                                                                      "p99_ns":  5748200,
+                                                                                      "rows_per_second":  1382927
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7546100,
+                                                                  "p95_ns":  8846300,
+                                                                  "p99_ns":  10090800,
+                                                                  "rows_per_second":  532871
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.27,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  6048900,
+                                                                                "p95_ns":  6994100,
+                                                                                "p99_ns":  7950800,
+                                                                                "rows_per_second":  663152
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7661400,
+                                                                               "p95_ns":  8914500,
+                                                                               "p99_ns":  11173000,
+                                                                               "rows_per_second":  523862
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  64,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4006600,
+                                                                   "p95_ns":  4661000,
+                                                                   "p99_ns":  5685000,
+                                                                   "rows_per_second":  1002292
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.91,
+                                              "read_only_batch_p50_speedup":  2.27,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  990800,
+                                                                             "p95_ns":  1291300,
+                                                                             "p99_ns":  1587600,
+                                                                             "rows_per_second":  4000295
+                                                                         },
+                                              "read_only_p50_speedup":  3.4,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2246100,
+                                                                            "p95_ns":  2731500,
+                                                                            "p99_ns":  3349600,
+                                                                            "rows_per_second":  1775442
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.81,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  800600,
+                                                                                      "p95_ns":  1136200,
+                                                                                      "p99_ns":  1420800,
+                                                                                      "rows_per_second":  4999210
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2884700,
+                                                                                      "p95_ns":  4277200,
+                                                                                      "p99_ns":  5548700,
+                                                                                      "rows_per_second":  1388734
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7636800,
+                                                                  "p95_ns":  8677000,
+                                                                  "p99_ns":  10234800,
+                                                                  "rows_per_second":  528545
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.78,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4284800,
+                                                                                "p95_ns":  4954200,
+                                                                                "p99_ns":  6174200,
+                                                                                "rows_per_second":  936466
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7637800,
+                                                                               "p95_ns":  8666800,
+                                                                               "p99_ns":  9794300,
+                                                                               "rows_per_second":  528714
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  64,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4071500,
+                                                                   "p95_ns":  5174300,
+                                                                   "p99_ns":  6597700,
+                                                                   "rows_per_second":  970534
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.89,
+                                              "read_only_batch_p50_speedup":  2.25,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  1020100,
+                                                                             "p95_ns":  1483000,
+                                                                             "p99_ns":  1781100,
+                                                                             "rows_per_second":  3799780
+                                                                         },
+                                              "read_only_p50_speedup":  3.36,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2294000,
+                                                                            "p95_ns":  2965700,
+                                                                            "p99_ns":  3620100,
+                                                                            "rows_per_second":  1718038
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.7,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  851200,
+                                                                                      "p95_ns":  1270600,
+                                                                                      "p99_ns":  1745800,
+                                                                                      "rows_per_second":  4619027
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  3080600,
+                                                                                      "p95_ns":  4850300,
+                                                                                      "p99_ns":  6919900,
+                                                                                      "rows_per_second":  1250500
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7704400,
+                                                                  "p95_ns":  9287100,
+                                                                  "p99_ns":  10741900,
+                                                                  "rows_per_second":  517459
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.79,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4352200,
+                                                                                "p95_ns":  5535900,
+                                                                                "p99_ns":  6687300,
+                                                                                "rows_per_second":  912090
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7786100,
+                                                                               "p95_ns":  9420600,
+                                                                               "p99_ns":  12423100,
+                                                                               "rows_per_second":  512467
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  64,
+                                              "batched_read":  {
+                                                                   "p50_ns":  4024800,
+                                                                   "p95_ns":  4963800,
+                                                                   "p99_ns":  6052100,
+                                                                   "rows_per_second":  989075
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.91,
+                                              "read_only_batch_p50_speedup":  2.35,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  977000,
+                                                                             "p95_ns":  1405200,
+                                                                             "p99_ns":  2013200,
+                                                                             "rows_per_second":  3958922
+                                                                         },
+                                              "read_only_p50_speedup":  3.35,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2291900,
+                                                                            "p95_ns":  2915500,
+                                                                            "p99_ns":  3777500,
+                                                                            "rows_per_second":  1725607
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  2.87,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  798100,
+                                                                                      "p95_ns":  1269700,
+                                                                                      "p99_ns":  1654100,
+                                                                                      "rows_per_second":  4877368
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2877400,
+                                                                                      "p95_ns":  4623400,
+                                                                                      "p99_ns":  6659000,
+                                                                                      "rows_per_second":  1327976
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7684900,
+                                                                  "p95_ns":  8802800,
+                                                                  "p99_ns":  11308200,
+                                                                  "rows_per_second":  521835
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.79,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  4293100,
+                                                                                "p95_ns":  5529900,
+                                                                                "p99_ns":  6524200,
+                                                                                "rows_per_second":  919280
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7676200,
+                                                                               "p95_ns":  9265300,
+                                                                               "p99_ns":  11799900,
+                                                                               "rows_per_second":  516709
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  8,
+                                              "batched_read":  {
+                                                                   "p50_ns":  5494500,
+                                                                   "p95_ns":  6462300,
+                                                                   "p99_ns":  7460400,
+                                                                   "rows_per_second":  732061
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.37,
+                                              "read_only_batch_p50_speedup":  1.07,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  2100400,
+                                                                             "p95_ns":  2535400,
+                                                                             "p99_ns":  2900900,
+                                                                             "rows_per_second":  1900629
+                                                                         },
+                                              "read_only_p50_speedup":  3.36,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2245900,
+                                                                            "p95_ns":  2777700,
+                                                                            "p99_ns":  3408500,
+                                                                            "rows_per_second":  1778061
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  1.14,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  1962900,
+                                                                                      "p95_ns":  2417500,
+                                                                                      "p99_ns":  2947200,
+                                                                                      "rows_per_second":  2055847
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2543300,
+                                                                                      "p95_ns":  3783000,
+                                                                                      "p99_ns":  6396300,
+                                                                                      "rows_per_second":  1533100
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7540500,
+                                                                  "p95_ns":  8618900,
+                                                                  "p99_ns":  10292100,
+                                                                  "rows_per_second":  534220
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.35,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  5668500,
+                                                                                "p95_ns":  6677200,
+                                                                                "p99_ns":  7512600,
+                                                                                "rows_per_second":  709338
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7649000,
+                                                                               "p95_ns":  8568800,
+                                                                               "p99_ns":  10337600,
+                                                                               "rows_per_second":  528358
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  8,
+                                              "batched_read":  {
+                                                                   "p50_ns":  5499100,
+                                                                   "p95_ns":  6830900,
+                                                                   "p99_ns":  8264400,
+                                                                   "rows_per_second":  720378
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.37,
+                                              "read_only_batch_p50_speedup":  1.06,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  2117900,
+                                                                             "p95_ns":  2809600,
+                                                                             "p99_ns":  4179900,
+                                                                             "rows_per_second":  1842700
+                                                                         },
+                                              "read_only_p50_speedup":  3.37,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2244700,
+                                                                            "p95_ns":  2911600,
+                                                                            "p99_ns":  3698100,
+                                                                            "rows_per_second":  1753330
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  1.12,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  1998300,
+                                                                                      "p95_ns":  2853900,
+                                                                                      "p99_ns":  3753300,
+                                                                                      "rows_per_second":  1946809
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2744600,
+                                                                                      "p95_ns":  4698600,
+                                                                                      "p99_ns":  5949600,
+                                                                                      "rows_per_second":  1401334
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7558900,
+                                                                  "p95_ns":  8962600,
+                                                                  "p99_ns":  10508200,
+                                                                  "rows_per_second":  529293
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.34,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  5704900,
+                                                                                "p95_ns":  6836400,
+                                                                                "p99_ns":  8272400,
+                                                                                "rows_per_second":  698159
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7653800,
+                                                                               "p95_ns":  9202500,
+                                                                               "p99_ns":  10363900,
+                                                                               "rows_per_second":  522187
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          },
+                                          {
+                                              "batch_size":  8,
+                                              "batched_read":  {
+                                                                   "p50_ns":  5585500,
+                                                                   "p95_ns":  6895700,
+                                                                   "p99_ns":  8007700,
+                                                                   "rows_per_second":  712748
+                                                               },
+                                              "benchmark":  "transaction-batch-read",
+                                              "candidates_per_iteration":  4096,
+                                              "distinct_keys_per_iteration":  4096,
+                                              "durability":  "in_memory_only",
+                                              "iterations":  500,
+                                              "machine":  {
+                                                              "arch":  "x86_64",
+                                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                                              "logical_cpus":  12,
+                                                              "os":  "windows"
+                                                          },
+                                              "p50_speedup":  1.37,
+                                              "read_only_batch_p50_speedup":  1.07,
+                                              "read_only_batched_read":  {
+                                                                             "p50_ns":  2143400,
+                                                                             "p95_ns":  2841100,
+                                                                             "p99_ns":  3620000,
+                                                                             "rows_per_second":  1829566
+                                                                         },
+                                              "read_only_p50_speedup":  3.35,
+                                              "read_only_single_read":  {
+                                                                            "p50_ns":  2287100,
+                                                                            "p95_ns":  3051900,
+                                                                            "p99_ns":  3895300,
+                                                                            "rows_per_second":  1711680
+                                                                        },
+                                              "records":  4096,
+                                              "reversed_read_only_batch_p50_speedup":  1.12,
+                                              "reversed_read_only_batched_read":  {
+                                                                                      "p50_ns":  2049400,
+                                                                                      "p95_ns":  2661500,
+                                                                                      "p99_ns":  3375100,
+                                                                                      "rows_per_second":  1923366
+                                                                                  },
+                                              "segment_count":  0,
+                                              "shuffled_read_only_batched_read":  {
+                                                                                      "p50_ns":  2857400,
+                                                                                      "p95_ns":  4437700,
+                                                                                      "p99_ns":  6635200,
+                                                                                      "rows_per_second":  1360416
+                                                                                  },
+                                              "single_read":  {
+                                                                  "p50_ns":  7660200,
+                                                                  "p95_ns":  9518400,
+                                                                  "p99_ns":  10929900,
+                                                                  "rows_per_second":  519715
+                                                              },
+                                              "staged_write_batch_p50_speedup":  1.35,
+                                              "staged_write_batched_read":  {
+                                                                                "p50_ns":  5773100,
+                                                                                "p95_ns":  7429900,
+                                                                                "p99_ns":  8930300,
+                                                                                "rows_per_second":  681947
+                                                                            },
+                                              "staged_write_single_read":  {
+                                                                               "p50_ns":  7788100,
+                                                                               "p95_ns":  9585300,
+                                                                               "p99_ns":  11401500,
+                                                                               "rows_per_second":  511588
+                                                                           },
+                                              "storage_mode":  "hot",
+                                              "value_bytes":  128
+                                          }
+                                      ],
+    "ordered_batch_comparison":  {
+                                     "baseline_threshold":  16,
+                                     "candidate_threshold":  8,
+                                     "workload":  "4096 records, 4096 candidates, 500 iterations, batch size 8, 128-byte values",
+                                     "baseline_runs":  [
+                                                           {
+                                                               "batch_size":  8,
+                                                               "batched_read":  {
+                                                                                    "p50_ns":  5534300,
+                                                                                    "p95_ns":  6777000,
+                                                                                    "p99_ns":  8047800,
+                                                                                    "rows_per_second":  720353
+                                                                                },
+                                                               "benchmark":  "transaction-batch-read",
+                                                               "candidates_per_iteration":  4096,
+                                                               "distinct_keys_per_iteration":  4096,
+                                                               "durability":  "in_memory_only",
+                                                               "iterations":  500,
+                                                               "machine":  {
+                                                                               "arch":  "x86_64",
+                                                                               "cpu_model":  "AMD Ryzen 5 4500",
+                                                                               "logical_cpus":  12,
+                                                                               "os":  "windows"
+                                                                           },
+                                                               "p50_speedup":  1.36,
+                                                               "read_only_batch_p50_speedup":  1.06,
+                                                               "read_only_batched_read":  {
+                                                                                              "p50_ns":  2111800,
+                                                                                              "p95_ns":  2807700,
+                                                                                              "p99_ns":  3406400,
+                                                                                              "rows_per_second":  1856903
+                                                                                          },
+                                                               "read_only_p50_speedup":  3.36,
+                                                               "read_only_single_read":  {
+                                                                                             "p50_ns":  2243100,
+                                                                                             "p95_ns":  2881300,
+                                                                                             "p99_ns":  3574300,
+                                                                                             "rows_per_second":  1745266
+                                                                                         },
+                                                               "records":  4096,
+                                                               "reversed_read_only_batch_p50_speedup":  1.12,
+                                                               "reversed_read_only_batched_read":  {
+                                                                                                       "p50_ns":  1995600,
+                                                                                                       "p95_ns":  2606400,
+                                                                                                       "p99_ns":  3144800,
+                                                                                                       "rows_per_second":  1861022
+                                                                                                   },
+                                                               "segment_count":  0,
+                                                               "shuffled_read_only_batched_read":  {
+                                                                                                       "p50_ns":  2653800,
+                                                                                                       "p95_ns":  4409700,
+                                                                                                       "p99_ns":  6107100,
+                                                                                                       "rows_per_second":  1410237
+                                                                                                   },
+                                                               "single_read":  {
+                                                                                   "p50_ns":  7544400,
+                                                                                   "p95_ns":  8809400,
+                                                                                   "p99_ns":  11019400,
+                                                                                   "rows_per_second":  529536
+                                                                               },
+                                                               "staged_write_batch_p50_speedup":  1.34,
+                                                               "staged_write_batched_read":  {
+                                                                                                 "p50_ns":  5691900,
+                                                                                                 "p95_ns":  7003900,
+                                                                                                 "p99_ns":  8684300,
+                                                                                                 "rows_per_second":  698319
+                                                                                             },
+                                                               "staged_write_single_read":  {
+                                                                                                "p50_ns":  7651100,
+                                                                                                "p95_ns":  9083500,
+                                                                                                "p99_ns":  11650200,
+                                                                                                "rows_per_second":  520788
+                                                                                            },
+                                                               "storage_mode":  "hot",
+                                                               "value_bytes":  128
+                                                           },
+                                                           {
+                                                               "batch_size":  8,
+                                                               "batched_read":  {
+                                                                                    "p50_ns":  5478900,
+                                                                                    "p95_ns":  6477100,
+                                                                                    "p99_ns":  7315300,
+                                                                                    "rows_per_second":  734011
+                                                                                },
+                                                               "benchmark":  "transaction-batch-read",
+                                                               "candidates_per_iteration":  4096,
+                                                               "distinct_keys_per_iteration":  4096,
+                                                               "durability":  "in_memory_only",
+                                                               "iterations":  500,
+                                                               "machine":  {
+                                                                               "arch":  "x86_64",
+                                                                               "cpu_model":  "AMD Ryzen 5 4500",
+                                                                               "logical_cpus":  12,
+                                                                               "os":  "windows"
+                                                                           },
+                                                               "p50_speedup":  1.36,
+                                                               "read_only_batch_p50_speedup":  1.06,
+                                                               "read_only_batched_read":  {
+                                                                                              "p50_ns":  2108400,
+                                                                                              "p95_ns":  2715200,
+                                                                                              "p99_ns":  3460400,
+                                                                                              "rows_per_second":  1881799
+                                                                                          },
+                                                               "read_only_p50_speedup":  3.32,
+                                                               "read_only_single_read":  {
+                                                                                             "p50_ns":  2240400,
+                                                                                             "p95_ns":  2750700,
+                                                                                             "p99_ns":  3398900,
+                                                                                             "rows_per_second":  1774863
+                                                                                         },
+                                                               "records":  4096,
+                                                               "reversed_read_only_batch_p50_speedup":  1.14,
+                                                               "reversed_read_only_batched_read":  {
+                                                                                                       "p50_ns":  1960200,
+                                                                                                       "p95_ns":  2528000,
+                                                                                                       "p99_ns":  2979800,
+                                                                                                       "rows_per_second":  2030078
+                                                                                                   },
+                                                               "segment_count":  0,
+                                                               "shuffled_read_only_batched_read":  {
+                                                                                                       "p50_ns":  2600800,
+                                                                                                       "p95_ns":  3938900,
+                                                                                                       "p99_ns":  5377500,
+                                                                                                       "rows_per_second":  1499255
+                                                                                                   },
+                                                               "single_read":  {
+                                                                                   "p50_ns":  7438600,
+                                                                                   "p95_ns":  8530700,
+                                                                                   "p99_ns":  9475100,
+                                                                                   "rows_per_second":  541721
+                                                                               },
+                                                               "staged_write_batch_p50_speedup":  1.34,
+                                                               "staged_write_batched_read":  {
+                                                                                                 "p50_ns":  5670100,
+                                                                                                 "p95_ns":  6348200,
+                                                                                                 "p99_ns":  7152100,
+                                                                                                 "rows_per_second":  712801
+                                                                                             },
+                                                               "staged_write_single_read":  {
+                                                                                                "p50_ns":  7598600,
+                                                                                                "p95_ns":  8673000,
+                                                                                                "p99_ns":  9952600,
+                                                                                                "rows_per_second":  530559
+                                                                                            },
+                                                               "storage_mode":  "hot",
+                                                               "value_bytes":  128
+                                                           },
+                                                           {
+                                                               "batch_size":  8,
+                                                               "batched_read":  {
+                                                                                    "p50_ns":  5555800,
+                                                                                    "p95_ns":  6639500,
+                                                                                    "p99_ns":  7659200,
+                                                                                    "rows_per_second":  721989
+                                                                                },
+                                                               "benchmark":  "transaction-batch-read",
+                                                               "candidates_per_iteration":  4096,
+                                                               "distinct_keys_per_iteration":  4096,
+                                                               "durability":  "in_memory_only",
+                                                               "iterations":  500,
+                                                               "machine":  {
+                                                                               "arch":  "x86_64",
+                                                                               "cpu_model":  "AMD Ryzen 5 4500",
+                                                                               "logical_cpus":  12,
+                                                                               "os":  "windows"
+                                                                           },
+                                                               "p50_speedup":  1.36,
+                                                               "read_only_batch_p50_speedup":  1.03,
+                                                               "read_only_batched_read":  {
+                                                                                              "p50_ns":  2166400,
+                                                                                              "p95_ns":  2833900,
+                                                                                              "p99_ns":  3466500,
+                                                                                              "rows_per_second":  1829817
+                                                                                          },
+                                                               "read_only_p50_speedup":  3.38,
+                                                               "read_only_single_read":  {
+                                                                                             "p50_ns":  2241100,
+                                                                                             "p95_ns":  2711300,
+                                                                                             "p99_ns":  3494600,
+                                                                                             "rows_per_second":  1775941
+                                                                                         },
+                                                               "records":  4096,
+                                                               "reversed_read_only_batch_p50_speedup":  1.11,
+                                                               "reversed_read_only_batched_read":  {
+                                                                                                       "p50_ns":  2025500,
+                                                                                                       "p95_ns":  2725200,
+                                                                                                       "p99_ns":  3325700,
+                                                                                                       "rows_per_second":  1954620
+                                                                                                   },
+                                                               "segment_count":  0,
+                                                               "shuffled_read_only_batched_read":  {
+                                                                                                       "p50_ns":  2653100,
+                                                                                                       "p95_ns":  3989500,
+                                                                                                       "p99_ns":  6105500,
+                                                                                                       "rows_per_second":  1460854
+                                                                                                   },
+                                                               "single_read":  {
+                                                                                   "p50_ns":  7575900,
+                                                                                   "p95_ns":  8774000,
+                                                                                   "p99_ns":  10024800,
+                                                                                   "rows_per_second":  530915
+                                                                               },
+                                                               "staged_write_batch_p50_speedup":  1.34,
+                                                               "staged_write_batched_read":  {
+                                                                                                 "p50_ns":  5704500,
+                                                                                                 "p95_ns":  6796900,
+                                                                                                 "p99_ns":  8867200,
+                                                                                                 "rows_per_second":  697476
+                                                                                             },
+                                                               "staged_write_single_read":  {
+                                                                                                "p50_ns":  7664700,
+                                                                                                "p95_ns":  9085600,
+                                                                                                "p99_ns":  10824000,
+                                                                                                "rows_per_second":  521846
+                                                                                            },
+                                                               "storage_mode":  "hot",
+                                                               "value_bytes":  128
+                                                           }
+                                                       ],
+                                     "candidate_runs":  [
+                                                            {
+                                                                "batch_size":  8,
+                                                                "batched_read":  {
+                                                                                     "p50_ns":  4570900,
+                                                                                     "p95_ns":  5742300,
+                                                                                     "p99_ns":  7010800,
+                                                                                     "rows_per_second":  862722
+                                                                                 },
+                                                                "benchmark":  "transaction-batch-read",
+                                                                "candidates_per_iteration":  4096,
+                                                                "distinct_keys_per_iteration":  4096,
+                                                                "durability":  "in_memory_only",
+                                                                "iterations":  500,
+                                                                "machine":  {
+                                                                                "arch":  "x86_64",
+                                                                                "cpu_model":  "AMD Ryzen 5 4500",
+                                                                                "logical_cpus":  12,
+                                                                                "os":  "windows"
+                                                                            },
+                                                                "p50_speedup":  1.66,
+                                                                "read_only_batch_p50_speedup":  1.78,
+                                                                "read_only_batched_read":  {
+                                                                                               "p50_ns":  1272100,
+                                                                                               "p95_ns":  1788200,
+                                                                                               "p99_ns":  2491800,
+                                                                                               "rows_per_second":  3043472
+                                                                                           },
+                                                                "read_only_p50_speedup":  3.33,
+                                                                "read_only_single_read":  {
+                                                                                              "p50_ns":  2268600,
+                                                                                              "p95_ns":  3199500,
+                                                                                              "p99_ns":  3946400,
+                                                                                              "rows_per_second":  1720005
+                                                                                          },
+                                                                "records":  4096,
+                                                                "reversed_read_only_batch_p50_speedup":  1.98,
+                                                                "reversed_read_only_batched_read":  {
+                                                                                                        "p50_ns":  1147400,
+                                                                                                        "p95_ns":  1699900,
+                                                                                                        "p99_ns":  2229700,
+                                                                                                        "rows_per_second":  3450608
+                                                                                                    },
+                                                                "segment_count":  0,
+                                                                "shuffled_read_only_batched_read":  {
+                                                                                                        "p50_ns":  2876300,
+                                                                                                        "p95_ns":  4548500,
+                                                                                                        "p99_ns":  5603200,
+                                                                                                        "rows_per_second":  1363858
+                                                                                                    },
+                                                                "single_read":  {
+                                                                                    "p50_ns":  7565100,
+                                                                                    "p95_ns":  9246700,
+                                                                                    "p99_ns":  10758900,
+                                                                                    "rows_per_second":  526065
+                                                                                },
+                                                                "staged_write_batch_p50_speedup":  1.33,
+                                                                "staged_write_batched_read":  {
+                                                                                                  "p50_ns":  5779400,
+                                                                                                  "p95_ns":  6929200,
+                                                                                                  "p99_ns":  8534100,
+                                                                                                  "rows_per_second":  689910
+                                                                                              },
+                                                                "staged_write_single_read":  {
+                                                                                                 "p50_ns":  7687200,
+                                                                                                 "p95_ns":  9139200,
+                                                                                                 "p99_ns":  10851300,
+                                                                                                 "rows_per_second":  521035
+                                                                                             },
+                                                                "storage_mode":  "hot",
+                                                                "value_bytes":  128
+                                                            },
+                                                            {
+                                                                "batch_size":  8,
+                                                                "batched_read":  {
+                                                                                     "p50_ns":  4505600,
+                                                                                     "p95_ns":  5387300,
+                                                                                     "p99_ns":  6623500,
+                                                                                     "rows_per_second":  881272
+                                                                                 },
+                                                                "benchmark":  "transaction-batch-read",
+                                                                "candidates_per_iteration":  4096,
+                                                                "distinct_keys_per_iteration":  4096,
+                                                                "durability":  "in_memory_only",
+                                                                "iterations":  500,
+                                                                "machine":  {
+                                                                                "arch":  "x86_64",
+                                                                                "cpu_model":  "AMD Ryzen 5 4500",
+                                                                                "logical_cpus":  12,
+                                                                                "os":  "windows"
+                                                                            },
+                                                                "p50_speedup":  1.67,
+                                                                "read_only_batch_p50_speedup":  1.83,
+                                                                "read_only_batched_read":  {
+                                                                                               "p50_ns":  1230700,
+                                                                                               "p95_ns":  1697300,
+                                                                                               "p99_ns":  2216700,
+                                                                                               "rows_per_second":  3118799
+                                                                                           },
+                                                                "read_only_p50_speedup":  3.34,
+                                                                "read_only_single_read":  {
+                                                                                              "p50_ns":  2251800,
+                                                                                              "p95_ns":  2727900,
+                                                                                              "p99_ns":  3521300,
+                                                                                              "rows_per_second":  1755773
+                                                                                          },
+                                                                "records":  4096,
+                                                                "reversed_read_only_batch_p50_speedup":  2.16,
+                                                                "reversed_read_only_batched_read":  {
+                                                                                                        "p50_ns":  1043800,
+                                                                                                        "p95_ns":  1526200,
+                                                                                                        "p99_ns":  1976600,
+                                                                                                        "rows_per_second":  3675224
+                                                                                                    },
+                                                                "segment_count":  0,
+                                                                "shuffled_read_only_batched_read":  {
+                                                                                                        "p50_ns":  2546700,
+                                                                                                        "p95_ns":  4104700,
+                                                                                                        "p99_ns":  6048300,
+                                                                                                        "rows_per_second":  1485126
+                                                                                                    },
+                                                                "single_read":  {
+                                                                                    "p50_ns":  7532100,
+                                                                                    "p95_ns":  8764000,
+                                                                                    "p99_ns":  10671100,
+                                                                                    "rows_per_second":  532072
+                                                                                },
+                                                                "staged_write_batch_p50_speedup":  1.33,
+                                                                "staged_write_batched_read":  {
+                                                                                                  "p50_ns":  5671700,
+                                                                                                  "p95_ns":  6617000,
+                                                                                                  "p99_ns":  7918700,
+                                                                                                  "rows_per_second":  703572
+                                                                                              },
+                                                                "staged_write_single_read":  {
+                                                                                                 "p50_ns":  7519900,
+                                                                                                 "p95_ns":  9013900,
+                                                                                                 "p99_ns":  11029700,
+                                                                                                 "rows_per_second":  524325
+                                                                                             },
+                                                                "storage_mode":  "hot",
+                                                                "value_bytes":  128
+                                                            },
+                                                            {
+                                                                "batch_size":  8,
+                                                                "batched_read":  {
+                                                                                     "p50_ns":  4746500,
+                                                                                     "p95_ns":  6185200,
+                                                                                     "p99_ns":  7265700,
+                                                                                     "rows_per_second":  832965
+                                                                                 },
+                                                                "benchmark":  "transaction-batch-read",
+                                                                "candidates_per_iteration":  4096,
+                                                                "distinct_keys_per_iteration":  4096,
+                                                                "durability":  "in_memory_only",
+                                                                "iterations":  500,
+                                                                "machine":  {
+                                                                                "arch":  "x86_64",
+                                                                                "cpu_model":  "AMD Ryzen 5 4500",
+                                                                                "logical_cpus":  12,
+                                                                                "os":  "windows"
+                                                                            },
+                                                                "p50_speedup":  1.65,
+                                                                "read_only_batch_p50_speedup":  1.79,
+                                                                "read_only_batched_read":  {
+                                                                                               "p50_ns":  1345600,
+                                                                                               "p95_ns":  2090500,
+                                                                                               "p99_ns":  2667800,
+                                                                                               "rows_per_second":  2828514
+                                                                                           },
+                                                                "read_only_p50_speedup":  3.25,
+                                                                "read_only_single_read":  {
+                                                                                              "p50_ns":  2402900,
+                                                                                              "p95_ns":  3512500,
+                                                                                              "p99_ns":  4403600,
+                                                                                              "rows_per_second":  1605282
+                                                                                          },
+                                                                "records":  4096,
+                                                                "reversed_read_only_batch_p50_speedup":  1.95,
+                                                                "reversed_read_only_batched_read":  {
+                                                                                                        "p50_ns":  1231200,
+                                                                                                        "p95_ns":  1915400,
+                                                                                                        "p99_ns":  2764500,
+                                                                                                        "rows_per_second":  3129203
+                                                                                                    },
+                                                                "segment_count":  0,
+                                                                "shuffled_read_only_batched_read":  {
+                                                                                                        "p50_ns":  3183800,
+                                                                                                        "p95_ns":  5177400,
+                                                                                                        "p99_ns":  6951300,
+                                                                                                        "rows_per_second":  1221755
+                                                                                                    },
+                                                                "single_read":  {
+                                                                                    "p50_ns":  7810600,
+                                                                                    "p95_ns":  9894300,
+                                                                                    "p99_ns":  11310900,
+                                                                                    "rows_per_second":  505898
+                                                                                },
+                                                                "staged_write_batch_p50_speedup":  1.32,
+                                                                "staged_write_batched_read":  {
+                                                                                                  "p50_ns":  5999800,
+                                                                                                  "p95_ns":  7331500,
+                                                                                                  "p99_ns":  8858400,
+                                                                                                  "rows_per_second":  665196
+                                                                                              },
+                                                                "staged_write_single_read":  {
+                                                                                                 "p50_ns":  7896000,
+                                                                                                 "p95_ns":  9971600,
+                                                                                                 "p99_ns":  11641500,
+                                                                                                 "rows_per_second":  501601
+                                                                                             },
+                                                                "storage_mode":  "hot",
+                                                                "value_bytes":  128
+                                                            }
+                                                        ]
+                                 },
+    "indexed_sql_comparison":  {
+                                   "workload":  "20000 seeded rows, 300 operations, LIMIT 8, concurrency 1",
+                                   "baseline_runs":  [
+                                                         {
+                                                             "composite_key_projection":  false,
+                                                             "concurrency":  1,
+                                                             "execution":  "in-process",
+                                                             "limit":  8,
+                                                             "machine":  {
+                                                                             "arch":  "x86_64",
+                                                                             "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                             "logical_cpus":  12,
+                                                                             "os":  "windows"
+                                                                         },
+                                                             "max_ns":  469500,
+                                                             "ops":  300,
+                                                             "p50_ns":  132800,
+                                                             "p95_ns":  233700,
+                                                             "p99_ns":  377600,
+                                                             "protocol":  "ryme-sql-executor",
+                                                             "qps":  6715,
+                                                             "result_rows":  8,
+                                                             "rows":  20000,
+                                                             "seconds":  0.045,
+                                                             "seq_min":  0,
+                                                             "warmup_ops":  100,
+                                                             "workload":  "indexed-filtered-projection-three-predicates"
+                                                         },
+                                                         {
+                                                             "composite_key_projection":  false,
+                                                             "concurrency":  1,
+                                                             "execution":  "in-process",
+                                                             "limit":  8,
+                                                             "machine":  {
+                                                                             "arch":  "x86_64",
+                                                                             "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                             "logical_cpus":  12,
+                                                                             "os":  "windows"
+                                                                         },
+                                                             "max_ns":  742700,
+                                                             "ops":  300,
+                                                             "p50_ns":  131000,
+                                                             "p95_ns":  403200,
+                                                             "p99_ns":  626200,
+                                                             "protocol":  "ryme-sql-executor",
+                                                             "qps":  5972,
+                                                             "result_rows":  8,
+                                                             "rows":  20000,
+                                                             "seconds":  0.05,
+                                                             "seq_min":  0,
+                                                             "warmup_ops":  100,
+                                                             "workload":  "indexed-filtered-projection-three-predicates"
+                                                         },
+                                                         {
+                                                             "composite_key_projection":  false,
+                                                             "concurrency":  1,
+                                                             "execution":  "in-process",
+                                                             "limit":  8,
+                                                             "machine":  {
+                                                                             "arch":  "x86_64",
+                                                                             "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                             "logical_cpus":  12,
+                                                                             "os":  "windows"
+                                                                         },
+                                                             "max_ns":  588500,
+                                                             "ops":  300,
+                                                             "p50_ns":  127200,
+                                                             "p95_ns":  305700,
+                                                             "p99_ns":  445300,
+                                                             "protocol":  "ryme-sql-executor",
+                                                             "qps":  6466,
+                                                             "result_rows":  8,
+                                                             "rows":  20000,
+                                                             "seconds":  0.046,
+                                                             "seq_min":  0,
+                                                             "warmup_ops":  100,
+                                                             "workload":  "indexed-filtered-projection-three-predicates"
+                                                         },
+                                                         {
+                                                             "composite_key_projection":  false,
+                                                             "concurrency":  1,
+                                                             "execution":  "in-process",
+                                                             "limit":  8,
+                                                             "machine":  {
+                                                                             "arch":  "x86_64",
+                                                                             "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                             "logical_cpus":  12,
+                                                                             "os":  "windows"
+                                                                         },
+                                                             "max_ns":  1648700,
+                                                             "ops":  300,
+                                                             "p50_ns":  149500,
+                                                             "p95_ns":  901200,
+                                                             "p99_ns":  1206600,
+                                                             "protocol":  "ryme-sql-executor",
+                                                             "qps":  3385,
+                                                             "result_rows":  8,
+                                                             "rows":  20000,
+                                                             "seconds":  0.089,
+                                                             "seq_min":  0,
+                                                             "warmup_ops":  100,
+                                                             "workload":  "indexed-filtered-projection-three-predicates"
+                                                         },
+                                                         {
+                                                             "composite_key_projection":  false,
+                                                             "concurrency":  1,
+                                                             "execution":  "in-process",
+                                                             "limit":  8,
+                                                             "machine":  {
+                                                                             "arch":  "x86_64",
+                                                                             "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                             "logical_cpus":  12,
+                                                                             "os":  "windows"
+                                                                         },
+                                                             "max_ns":  730000,
+                                                             "ops":  300,
+                                                             "p50_ns":  133300,
+                                                             "p95_ns":  385400,
+                                                             "p99_ns":  554500,
+                                                             "protocol":  "ryme-sql-executor",
+                                                             "qps":  5752,
+                                                             "result_rows":  8,
+                                                             "rows":  20000,
+                                                             "seconds":  0.052,
+                                                             "seq_min":  0,
+                                                             "warmup_ops":  100,
+                                                             "workload":  "indexed-filtered-projection-three-predicates"
+                                                         }
+                                                     ],
+                                   "candidate_runs":  [
+                                                          {
+                                                              "composite_key_projection":  false,
+                                                              "concurrency":  1,
+                                                              "execution":  "in-process",
+                                                              "limit":  8,
+                                                              "machine":  {
+                                                                              "arch":  "x86_64",
+                                                                              "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                              "logical_cpus":  12,
+                                                                              "os":  "windows"
+                                                                          },
+                                                              "max_ns":  467300,
+                                                              "ops":  300,
+                                                              "p50_ns":  129200,
+                                                              "p95_ns":  318300,
+                                                              "p99_ns":  394500,
+                                                              "protocol":  "ryme-sql-executor",
+                                                              "qps":  6130,
+                                                              "result_rows":  8,
+                                                              "rows":  20000,
+                                                              "seconds":  0.049,
+                                                              "seq_min":  0,
+                                                              "warmup_ops":  100,
+                                                              "workload":  "indexed-filtered-projection-three-predicates"
+                                                          },
+                                                          {
+                                                              "composite_key_projection":  false,
+                                                              "concurrency":  1,
+                                                              "execution":  "in-process",
+                                                              "limit":  8,
+                                                              "machine":  {
+                                                                              "arch":  "x86_64",
+                                                                              "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                              "logical_cpus":  12,
+                                                                              "os":  "windows"
+                                                                          },
+                                                              "max_ns":  476400,
+                                                              "ops":  300,
+                                                              "p50_ns":  135700,
+                                                              "p95_ns":  196000,
+                                                              "p99_ns":  301500,
+                                                              "protocol":  "ryme-sql-executor",
+                                                              "qps":  6741,
+                                                              "result_rows":  8,
+                                                              "rows":  20000,
+                                                              "seconds":  0.045,
+                                                              "seq_min":  0,
+                                                              "warmup_ops":  100,
+                                                              "workload":  "indexed-filtered-projection-three-predicates"
+                                                          },
+                                                          {
+                                                              "composite_key_projection":  false,
+                                                              "concurrency":  1,
+                                                              "execution":  "in-process",
+                                                              "limit":  8,
+                                                              "machine":  {
+                                                                              "arch":  "x86_64",
+                                                                              "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                              "logical_cpus":  12,
+                                                                              "os":  "windows"
+                                                                          },
+                                                              "max_ns":  582000,
+                                                              "ops":  300,
+                                                              "p50_ns":  135100,
+                                                              "p95_ns":  251500,
+                                                              "p99_ns":  386700,
+                                                              "protocol":  "ryme-sql-executor",
+                                                              "qps":  6413,
+                                                              "result_rows":  8,
+                                                              "rows":  20000,
+                                                              "seconds":  0.047,
+                                                              "seq_min":  0,
+                                                              "warmup_ops":  100,
+                                                              "workload":  "indexed-filtered-projection-three-predicates"
+                                                          },
+                                                          {
+                                                              "composite_key_projection":  false,
+                                                              "concurrency":  1,
+                                                              "execution":  "in-process",
+                                                              "limit":  8,
+                                                              "machine":  {
+                                                                              "arch":  "x86_64",
+                                                                              "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                              "logical_cpus":  12,
+                                                                              "os":  "windows"
+                                                                          },
+                                                              "max_ns":  582100,
+                                                              "ops":  300,
+                                                              "p50_ns":  139700,
+                                                              "p95_ns":  390700,
+                                                              "p99_ns":  511000,
+                                                              "protocol":  "ryme-sql-executor",
+                                                              "qps":  5597,
+                                                              "result_rows":  8,
+                                                              "rows":  20000,
+                                                              "seconds":  0.054,
+                                                              "seq_min":  0,
+                                                              "warmup_ops":  100,
+                                                              "workload":  "indexed-filtered-projection-three-predicates"
+                                                          },
+                                                          {
+                                                              "composite_key_projection":  false,
+                                                              "concurrency":  1,
+                                                              "execution":  "in-process",
+                                                              "limit":  8,
+                                                              "machine":  {
+                                                                              "arch":  "x86_64",
+                                                                              "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                                                                              "logical_cpus":  12,
+                                                                              "os":  "windows"
+                                                                          },
+                                                              "max_ns":  676400,
+                                                              "ops":  300,
+                                                              "p50_ns":  148600,
+                                                              "p95_ns":  394300,
+                                                              "p99_ns":  552600,
+                                                              "protocol":  "ryme-sql-executor",
+                                                              "qps":  5241,
+                                                              "result_rows":  8,
+                                                              "rows":  20000,
+                                                              "seconds":  0.057,
+                                                              "seq_min":  0,
+                                                              "warmup_ops":  100,
+                                                              "workload":  "indexed-filtered-projection-three-predicates"
+                                                          }
+                                                      ]
+                               }
+}

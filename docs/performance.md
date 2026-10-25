@@ -876,8 +876,8 @@ zero errors; see the [batch-size captures](../bench/results/realtime-writer-batc
 The outgoing WebSocket queue capacity was also compared at 128 versus the
 current 256 entries on the same Windows host and workload. Each run delivered
 all 1,000,000 expected messages with zero receive errors. The three 256-entry
-baseline runs had p95 of 192â€“199 ms and p99 of 380â€“470 ms; the three 128-entry
-runs had p95 of 104â€“184 ms and p99 of 384â€“540 ms. The candidate did not improve
+baseline runs had p95 of 192-199 ms and p99 of 380-470 ms; the three 128-entry
+runs had p95 of 104-184 ms and p99 of 384-540 ms. The candidate did not improve
 tail latency consistently, so the 256-entry queue remains. These runs also
 showed substantial host-level tail variance; see the [raw queue-capacity
 captures](../bench/results/realtime-writer-queue-capacity-windows-20261025.json).
@@ -947,3 +947,11 @@ regressed median p50 by 2.5% and p99 by 6.4%; unique-key p50 and p99 were
 within 1% of baseline. The existing vector-building path remains. A regression
 test covers an unrelated staged write without changing the returned values or
 read set. See the [raw captures](../bench/results/one-staged-write-batch-read-windows-20261025.json).
+
+I also measured lowering the Hot-mode ordered-read cutoff from 16 to 8 keys.
+Three paired in-process runs improved ordered batch p50 by 39.8% and reverse-
+ordered p50 by 42.5% for 8-key batches, but shuffled unique batches regressed
+median p50 by 8.4% and p95 by 14%. Five paired indexed SQL runs with `LIMIT 8`
+did not confirm an end-to-end gain: median p50 was 135.7 us with the candidate
+versus 132.8 us at the existing cutoff. The candidate was discarded; the
+16-key threshold remains. See the [raw threshold captures](../bench/results/hot-readmany-ordered-threshold-windows-20261025.json).
