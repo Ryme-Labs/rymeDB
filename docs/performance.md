@@ -873,6 +873,15 @@ about 1% for both alternatives, without a tail-latency improvement. The current
 64-frame setting is retained. All captures delivered 1,000,000 messages with
 zero errors; see the [batch-size captures](../bench/results/realtime-writer-batch-size-windows-20261024.json).
 
+The outgoing WebSocket queue capacity was also compared at 128 versus the
+current 256 entries on the same Windows host and workload. Each run delivered
+all 1,000,000 expected messages with zero receive errors. The three 256-entry
+baseline runs had p95 of 192â€“199 ms and p99 of 380â€“470 ms; the three 128-entry
+runs had p95 of 104â€“184 ms and p99 of 384â€“540 ms. The candidate did not improve
+tail latency consistently, so the 256-entry queue remains. These runs also
+showed substantial host-level tail variance; see the [raw queue-capacity
+captures](../bench/results/realtime-writer-queue-capacity-windows-20261025.json).
+
 A small optimized Rust microbenchmark compared the wall-clock read used by QoS
 token buckets with a process-relative monotonic clock on Windows 11 (AMD Ryzen
 5 4500). Across 10 rounds of 2,000,000 calls, `SystemTime::now()` measured a

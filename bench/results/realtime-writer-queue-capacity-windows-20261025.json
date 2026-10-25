@@ -1,0 +1,532 @@
+﻿{
+    "workload":  "100 connections, 256 connection concurrency, 10000 publishes, 128-byte payload, single hot channel",
+    "host":  "Windows x86_64, AMD Ryzen 5 4500, 12 logical CPUs",
+    "baseline_capacity":  256,
+    "baseline_runs":  [
+                          {
+                              "channel":  "bench",
+                              "channel_count":  1,
+                              "connections":  100,
+                              "delivery_percent":  100.0,
+                              "fanout_deliveries_per_second":  402968,
+                              "latency_samples":  1000000,
+                              "machine":  {
+                                              "arch":  "x86_64",
+                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                              "logical_cpus":  12,
+                                              "os":  "windows"
+                                          },
+                              "max_reader_messages":  10000,
+                              "messages":  10000,
+                              "min_reader_messages":  10000,
+                              "publish_errors":  0,
+                              "publish_qps":  4076,
+                              "publish_to_client_latency_histogram_us":  [
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  10
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  25
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  50
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  100
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  250
+                                                                             },
+                                                                             {
+                                                                                 "count":  1,
+                                                                                 "le_us":  500
+                                                                             },
+                                                                             {
+                                                                                 "count":  282,
+                                                                                 "le_us":  1000
+                                                                             },
+                                                                             {
+                                                                                 "count":  21036,
+                                                                                 "le_us":  2500
+                                                                             },
+                                                                             {
+                                                                                 "count":  146357,
+                                                                                 "le_us":  5000
+                                                                             },
+                                                                             {
+                                                                                 "count":  421231,
+                                                                                 "le_us":  10000
+                                                                             },
+                                                                             {
+                                                                                 "count":  248681,
+                                                                                 "le_us":  25000
+                                                                             },
+                                                                             {
+                                                                                 "count":  33221,
+                                                                                 "le_us":  50000
+                                                                             },
+                                                                             {
+                                                                                 "count":  47239,
+                                                                                 "le_us":  100000
+                                                                             },
+                                                                             {
+                                                                                 "count":  81952,
+                                                                                 "le_us":  "+Inf"
+                                                                             }
+                                                                         ],
+                              "publish_to_client_max_us":  706553,
+                              "publish_to_client_p50_us":  8749,
+                              "publish_to_client_p95_us":  192491,
+                              "publish_to_client_p99_us":  460208,
+                              "published":  10000,
+                              "receive_errors":  0,
+                              "received":  1000000,
+                              "slowest_reader_ms":  2.477,
+                              "target":  "127.0.0.1:18080",
+                              "total_seconds":  2.482
+                          },
+                          {
+                              "channel":  "bench",
+                              "channel_count":  1,
+                              "connections":  100,
+                              "delivery_percent":  100.0,
+                              "fanout_deliveries_per_second":  415637,
+                              "latency_samples":  1000000,
+                              "machine":  {
+                                              "arch":  "x86_64",
+                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                              "logical_cpus":  12,
+                                              "os":  "windows"
+                                          },
+                              "max_reader_messages":  10000,
+                              "messages":  10000,
+                              "min_reader_messages":  10000,
+                              "publish_errors":  0,
+                              "publish_qps":  4199,
+                              "publish_to_client_latency_histogram_us":  [
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  10
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  25
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  50
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  100
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  250
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  500
+                                                                             },
+                                                                             {
+                                                                                 "count":  337,
+                                                                                 "le_us":  1000
+                                                                             },
+                                                                             {
+                                                                                 "count":  23645,
+                                                                                 "le_us":  2500
+                                                                             },
+                                                                             {
+                                                                                 "count":  167971,
+                                                                                 "le_us":  5000
+                                                                             },
+                                                                             {
+                                                                                 "count":  449196,
+                                                                                 "le_us":  10000
+                                                                             },
+                                                                             {
+                                                                                 "count":  218877,
+                                                                                 "le_us":  25000
+                                                                             },
+                                                                             {
+                                                                                 "count":  23738,
+                                                                                 "le_us":  50000
+                                                                             },
+                                                                             {
+                                                                                 "count":  27796,
+                                                                                 "le_us":  100000
+                                                                             },
+                                                                             {
+                                                                                 "count":  88440,
+                                                                                 "le_us":  "+Inf"
+                                                                             }
+                                                                         ],
+                              "publish_to_client_max_us":  738614,
+                              "publish_to_client_p50_us":  8145,
+                              "publish_to_client_p95_us":  199002,
+                              "publish_to_client_p99_us":  380216,
+                              "published":  10000,
+                              "receive_errors":  0,
+                              "received":  1000000,
+                              "slowest_reader_ms":  2.404,
+                              "target":  "127.0.0.1:18080",
+                              "total_seconds":  2.406
+                          },
+                          {
+                              "channel":  "bench",
+                              "channel_count":  1,
+                              "connections":  100,
+                              "delivery_percent":  100.0,
+                              "fanout_deliveries_per_second":  395186,
+                              "latency_samples":  1000000,
+                              "machine":  {
+                                              "arch":  "x86_64",
+                                              "cpu_model":  "AMD Ryzen 5 4500",
+                                              "logical_cpus":  12,
+                                              "os":  "windows"
+                                          },
+                              "max_reader_messages":  10000,
+                              "messages":  10000,
+                              "min_reader_messages":  10000,
+                              "publish_errors":  0,
+                              "publish_qps":  3988,
+                              "publish_to_client_latency_histogram_us":  [
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  10
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  25
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  50
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  100
+                                                                             },
+                                                                             {
+                                                                                 "count":  0,
+                                                                                 "le_us":  250
+                                                                             },
+                                                                             {
+                                                                                 "count":  1,
+                                                                                 "le_us":  500
+                                                                             },
+                                                                             {
+                                                                                 "count":  404,
+                                                                                 "le_us":  1000
+                                                                             },
+                                                                             {
+                                                                                 "count":  19259,
+                                                                                 "le_us":  2500
+                                                                             },
+                                                                             {
+                                                                                 "count":  140925,
+                                                                                 "le_us":  5000
+                                                                             },
+                                                                             {
+                                                                                 "count":  455105,
+                                                                                 "le_us":  10000
+                                                                             },
+                                                                             {
+                                                                                 "count":  283439,
+                                                                                 "le_us":  25000
+                                                                             },
+                                                                             {
+                                                                                 "count":  20296,
+                                                                                 "le_us":  50000
+                                                                             },
+                                                                             {
+                                                                                 "count":  15399,
+                                                                                 "le_us":  100000
+                                                                             },
+                                                                             {
+                                                                                 "count":  65172,
+                                                                                 "le_us":  "+Inf"
+                                                                             }
+                                                                         ],
+                              "publish_to_client_max_us":  698948,
+                              "publish_to_client_p50_us":  8576,
+                              "publish_to_client_p95_us":  194729,
+                              "publish_to_client_p99_us":  470142,
+                              "published":  10000,
+                              "receive_errors":  0,
+                              "received":  1000000,
+                              "slowest_reader_ms":  2.529,
+                              "target":  "127.0.0.1:18080",
+                              "total_seconds":  2.53
+                          }
+                      ],
+    "candidate_capacity":  128,
+    "candidate_runs":  [
+                           {
+                               "channel":  "bench",
+                               "channel_count":  1,
+                               "connections":  100,
+                               "delivery_percent":  100.0,
+                               "fanout_deliveries_per_second":  401579,
+                               "latency_samples":  1000000,
+                               "machine":  {
+                                               "arch":  "x86_64",
+                                               "cpu_model":  "AMD Ryzen 5 4500",
+                                               "logical_cpus":  12,
+                                               "os":  "windows"
+                                           },
+                               "max_reader_messages":  10000,
+                               "messages":  10000,
+                               "min_reader_messages":  10000,
+                               "publish_errors":  0,
+                               "publish_qps":  4057,
+                               "publish_to_client_latency_histogram_us":  [
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  10
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  25
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  50
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  100
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  250
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  500
+                                                                              },
+                                                                              {
+                                                                                  "count":  143,
+                                                                                  "le_us":  1000
+                                                                              },
+                                                                              {
+                                                                                  "count":  21641,
+                                                                                  "le_us":  2500
+                                                                              },
+                                                                              {
+                                                                                  "count":  165032,
+                                                                                  "le_us":  5000
+                                                                              },
+                                                                              {
+                                                                                  "count":  465582,
+                                                                                  "le_us":  10000
+                                                                              },
+                                                                              {
+                                                                                  "count":  243628,
+                                                                                  "le_us":  25000
+                                                                              },
+                                                                              {
+                                                                                  "count":  23337,
+                                                                                  "le_us":  50000
+                                                                              },
+                                                                              {
+                                                                                  "count":  29382,
+                                                                                  "le_us":  100000
+                                                                              },
+                                                                              {
+                                                                                  "count":  51255,
+                                                                                  "le_us":  "+Inf"
+                                                                              }
+                                                                          ],
+                               "publish_to_client_max_us":  732114,
+                               "publish_to_client_p50_us":  8116,
+                               "publish_to_client_p95_us":  104565,
+                               "publish_to_client_p99_us":  433577,
+                               "published":  10000,
+                               "receive_errors":  0,
+                               "received":  1000000,
+                               "slowest_reader_ms":  2.488,
+                               "target":  "127.0.0.1:18080",
+                               "total_seconds":  2.49
+                           },
+                           {
+                               "channel":  "bench",
+                               "channel_count":  1,
+                               "connections":  100,
+                               "delivery_percent":  100.0,
+                               "fanout_deliveries_per_second":  417011,
+                               "latency_samples":  1000000,
+                               "machine":  {
+                                               "arch":  "x86_64",
+                                               "cpu_model":  "AMD Ryzen 5 4500",
+                                               "logical_cpus":  12,
+                                               "os":  "windows"
+                                           },
+                               "max_reader_messages":  10000,
+                               "messages":  10000,
+                               "min_reader_messages":  10000,
+                               "publish_errors":  0,
+                               "publish_qps":  4216,
+                               "publish_to_client_latency_histogram_us":  [
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  10
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  25
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  50
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  100
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  250
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  500
+                                                                              },
+                                                                              {
+                                                                                  "count":  288,
+                                                                                  "le_us":  1000
+                                                                              },
+                                                                              {
+                                                                                  "count":  20896,
+                                                                                  "le_us":  2500
+                                                                              },
+                                                                              {
+                                                                                  "count":  155405,
+                                                                                  "le_us":  5000
+                                                                              },
+                                                                              {
+                                                                                  "count":  455249,
+                                                                                  "le_us":  10000
+                                                                              },
+                                                                              {
+                                                                                  "count":  226407,
+                                                                                  "le_us":  25000
+                                                                              },
+                                                                              {
+                                                                                  "count":  23937,
+                                                                                  "le_us":  50000
+                                                                              },
+                                                                              {
+                                                                                  "count":  31736,
+                                                                                  "le_us":  100000
+                                                                              },
+                                                                              {
+                                                                                  "count":  86082,
+                                                                                  "le_us":  "+Inf"
+                                                                              }
+                                                                          ],
+                               "publish_to_client_max_us":  680643,
+                               "publish_to_client_p50_us":  8309,
+                               "publish_to_client_p95_us":  183540,
+                               "publish_to_client_p99_us":  383967,
+                               "published":  10000,
+                               "receive_errors":  0,
+                               "received":  1000000,
+                               "slowest_reader_ms":  2.397,
+                               "target":  "127.0.0.1:18080",
+                               "total_seconds":  2.398
+                           },
+                           {
+                               "channel":  "bench",
+                               "channel_count":  1,
+                               "connections":  100,
+                               "delivery_percent":  100.0,
+                               "fanout_deliveries_per_second":  404620,
+                               "latency_samples":  1000000,
+                               "machine":  {
+                                               "arch":  "x86_64",
+                                               "cpu_model":  "AMD Ryzen 5 4500",
+                                               "logical_cpus":  12,
+                                               "os":  "windows"
+                                           },
+                               "max_reader_messages":  10000,
+                               "messages":  10000,
+                               "min_reader_messages":  10000,
+                               "publish_errors":  0,
+                               "publish_qps":  4090,
+                               "publish_to_client_latency_histogram_us":  [
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  10
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  25
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  50
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  100
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  250
+                                                                              },
+                                                                              {
+                                                                                  "count":  0,
+                                                                                  "le_us":  500
+                                                                              },
+                                                                              {
+                                                                                  "count":  270,
+                                                                                  "le_us":  1000
+                                                                              },
+                                                                              {
+                                                                                  "count":  22364,
+                                                                                  "le_us":  2500
+                                                                              },
+                                                                              {
+                                                                                  "count":  142023,
+                                                                                  "le_us":  5000
+                                                                              },
+                                                                              {
+                                                                                  "count":  443802,
+                                                                                  "le_us":  10000
+                                                                              },
+                                                                              {
+                                                                                  "count":  259929,
+                                                                                  "le_us":  25000
+                                                                              },
+                                                                              {
+                                                                                  "count":  19655,
+                                                                                  "le_us":  50000
+                                                                              },
+                                                                              {
+                                                                                  "count":  27739,
+                                                                                  "le_us":  100000
+                                                                              },
+                                                                              {
+                                                                                  "count":  84218,
+                                                                                  "le_us":  "+Inf"
+                                                                              }
+                                                                          ],
+                               "publish_to_client_max_us":  769786,
+                               "publish_to_client_p50_us":  8588,
+                               "publish_to_client_p95_us":  166385,
+                               "publish_to_client_p99_us":  540422,
+                               "published":  10000,
+                               "receive_errors":  0,
+                               "received":  1000000,
+                               "slowest_reader_ms":  2.467,
+                               "target":  "127.0.0.1:18080",
+                               "total_seconds":  2.471
+                           }
+                       ]
+}
