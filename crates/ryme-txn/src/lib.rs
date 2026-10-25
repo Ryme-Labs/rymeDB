@@ -4575,6 +4575,36 @@ mod tests {
     }
 
     #[test]
+    fn one_unrelated_staged_write_keeps_ordered_batch_reads_unchanged() {
+        let manager = TxnManager::new();
+        let mut seed = manager.begin();
+        for id in 0u64..32 {
+            manager.put(
+                &mut seed,
+                RecordKey::new("t", "d", "items", &id.to_be_bytes()),
+                id.to_be_bytes().to_vec(),
+            );
+        }
+        manager.commit(seed).unwrap();
+
+        let keys = (0u64..32)
+            .map(|id| RecordKey::new("t", "d", "items", &id.to_be_bytes()))
+            .collect::<Vec<_>>();
+        let mut txn = manager.begin();
+        manager.put(
+            &mut txn,
+            RecordKey::new("t", "d", "other", b"outside-batch"),
+            b"pending".to_vec(),
+        );
+
+        assert_eq!(
+            manager.get_many(&mut txn, &keys).unwrap(),
+            (0u64..32).map(|id| Some(id.to_be_bytes().to_vec())).collect::<Vec<_>>()
+        );
+        assert_eq!(txn.read_keys(), &keys.iter().cloned().collect());
+    }
+
+    #[test]
     fn commit_advances_clock_past_an_older_manager_snapshot() {
         let manager = TxnManager::new();
         let mut txn = manager.begin();
