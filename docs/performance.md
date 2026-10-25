@@ -373,6 +373,18 @@ the candidate was discarded. Captures were grouped by revision rather than
 alternated, and this warmed in-process benchmark excludes network and durable
 write costs. See the [raw captures](../bench/results/segment-batch-cache-lock-experiment-windows-20261025.json).
 
+For deep Standard-mode segment stacks, batch reads now walk each segment's
+sorted keys and binary-search the sorted unresolved request indices, rather
+than probing every unresolved key in every segment. Five grouped release
+captures on the same host used 256 records, 80 delta segments, 64-key batches,
+and a warmed cache. Ordered read-only median p50/p95/p99 fell 38.0%/40.8%/38.6%;
+shuffled read-only medians fell 9.1%/18.5%/24.5%. The runs were grouped by
+revision rather than alternated, and cover this deep-stack workload only; they
+exclude network and durable-write costs. A storage regression test compares
+batch and point reads across snapshot and delta versions, tombstones, duplicate
+and missing keys, and multiple MVCC timestamps. See the
+[raw captures](../bench/results/segment-batch-segment-driven-windows-20261025.json).
+
 Standard segment point reads previously Bloom-checked, binary-searched the
 segment key vector, then searched the same key in the segment engine. Removing
 the redundant vector search reduced read-only batched p50 from 490 µs to

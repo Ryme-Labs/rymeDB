@@ -16,6 +16,7 @@ const INDEX_STRIDE: usize = 64;
 const BLOOM_BITS_PER_KEY: usize = 8;
 const MIN_BLOOM_BYTES: usize = 64;
 const MIN_SEGMENT_DEDUP_BATCH_READ: usize = 16;
+const MIN_SEGMENT_DRIVEN_BATCH_PATHS: usize = 4;
 const MAX_SEGMENT_DEDUP_INITIAL_CAPACITY: usize = 256;
 const MAX_DELTA_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -816,26 +817,68 @@ impl SegmentStore {
             deduplicated.unwrap_or_else(|| ((0..key_count).collect(), Vec::new()));
         let mut next_unresolved = Vec::with_capacity(unresolved.len());
 
-        for path in paths.iter().rev() {
-            let segment = self.read_segment_under_lock(path)?;
-            let is_snapshot = segment.is_snapshot();
-            next_unresolved.clear();
-            for index in unresolved.drain(..) {
-                let key = key_at(index);
-                let version = match key_hashes.as_ref() {
-                    Some(hashes) => segment.version_at_prehashed(key, read_ts, hashes[index]),
-                    None => segment.version_at(key, read_ts),
-                };
-                if let Some((_, value, expires_at)) = version {
-                    values[index] =
-                        if super::expiry_is_expired(expires_at, now) { None } else { value };
-                } else if !is_snapshot {
-                    next_unresolved.push(index);
+        if paths.len() >= MIN_SEGMENT_DRIVEN_BATCH_PATHS
+            && key_count >= MIN_SEGMENT_DEDUP_BATCH_READ
+        {
+            unresolved.sort_unstable_by(|left, right| key_at(*left).cmp(key_at(*right)));
+            let mut resolved = Vec::new();
+            resolved
+                .try_reserve_exact(key_count)
+                .map_err(|_| RymeError::Overload(String::from("segment batch")))?;
+            resolved.resize(key_count, false);
+            let mut remaining = unresolved.len();
+
+            for path in paths.iter().rev() {
+                let segment = self.read_segment_under_lock(path)?;
+                for segment_key in &segment.keys {
+                    let Ok(position) =
+                        unresolved.binary_search_by(|index| key_at(*index).cmp(segment_key))
+                    else {
+                        continue;
+                    };
+                    let index = unresolved[position];
+                    if resolved[index] {
+                        continue;
+                    }
+                    let version = match key_hashes.as_ref() {
+                        Some(hashes) => {
+                            segment.version_at_prehashed(segment_key, read_ts, hashes[index])
+                        }
+                        None => segment.version_at(segment_key, read_ts),
+                    };
+                    if let Some((_, value, expires_at)) = version {
+                        values[index] =
+                            if super::expiry_is_expired(expires_at, now) { None } else { value };
+                        resolved[index] = true;
+                        remaining -= 1;
+                    }
+                }
+                if remaining == 0 || segment.is_snapshot() {
+                    break;
                 }
             }
-            std::mem::swap(&mut unresolved, &mut next_unresolved);
-            if unresolved.is_empty() || is_snapshot {
-                break;
+        } else {
+            for path in paths.iter().rev() {
+                let segment = self.read_segment_under_lock(path)?;
+                let is_snapshot = segment.is_snapshot();
+                next_unresolved.clear();
+                for index in unresolved.drain(..) {
+                    let key = key_at(index);
+                    let version = match key_hashes.as_ref() {
+                        Some(hashes) => segment.version_at_prehashed(key, read_ts, hashes[index]),
+                        None => segment.version_at(key, read_ts),
+                    };
+                    if let Some((_, value, expires_at)) = version {
+                        values[index] =
+                            if super::expiry_is_expired(expires_at, now) { None } else { value };
+                    } else if !is_snapshot {
+                        next_unresolved.push(index);
+                    }
+                }
+                std::mem::swap(&mut unresolved, &mut next_unresolved);
+                if unresolved.is_empty() || is_snapshot {
+                    break;
+                }
             }
         }
 
@@ -2534,6 +2577,52 @@ mod tests {
             .map(|index| Some(if index % 2 == 0 { b"item".to_vec() } else { b"audit".to_vec() }))
             .collect::<Vec<_>>();
         assert_eq!(store.get_many(&keys, 1, 0).unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deep_segment_batch_reads_match_point_reads_across_mvcc_and_tombstones() {
+        let dir = std::env::temp_dir().join(format!(
+            "ryme-segment-deep-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SegmentStore::open(&dir).unwrap();
+        let keys = (0..MIN_SEGMENT_DEDUP_BATCH_READ)
+            .map(|index| RecordKey::new("tenant", "db", "items", &index.to_be_bytes()))
+            .collect::<Vec<_>>();
+        let mut snapshot = Engine::new();
+        for (index, key) in keys.iter().enumerate() {
+            snapshot.apply(key.clone(), 1, Some(format!("base-{index}").into_bytes())).unwrap();
+        }
+        store.write(1, &snapshot).unwrap();
+        for (commit_ts, selected) in [(2, 0..8), (3, 8..16)] {
+            let entries = selected
+                .map(|index| SegmentEntry {
+                    key: keys[index].clone(),
+                    commit_ts,
+                    value: Some(format!("update-{commit_ts}-{index}").into_bytes()),
+                    expires_at: 0,
+                })
+                .collect::<Vec<_>>();
+            store.write_delta(commit_ts, &entries).unwrap();
+        }
+        store
+            .write_delta(
+                4,
+                &[SegmentEntry { key: keys[0].clone(), commit_ts: 4, value: None, expires_at: 0 }],
+            )
+            .unwrap();
+
+        let mut batch = keys.iter().rev().cloned().collect::<Vec<_>>();
+        batch.push(keys[3].clone());
+        batch.push(RecordKey::new("tenant", "db", "items", b"missing"));
+        for read_ts in [1, 3, 4] {
+            let expected =
+                batch.iter().map(|key| store.get(key, read_ts, 0).unwrap()).collect::<Vec<_>>();
+            assert_eq!(store.get_many(&batch, read_ts, 0).unwrap(), expected);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

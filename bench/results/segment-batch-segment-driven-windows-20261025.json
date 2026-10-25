@@ -1,0 +1,66 @@
+{
+  "benchmark": "transaction-batch-read-segment-driven-experiment",
+  "capture_date": "2026-10-25",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "workload": {
+    "storage_mode": "standard",
+    "records": 256,
+    "delta_segments": 80,
+    "candidates_per_iteration": 256,
+    "batch_size": 64,
+    "iterations": 500,
+    "value_bytes": 128,
+    "durability": "wal_and_segment_sync_disabled",
+    "binary": "release",
+    "harness": "in-process transaction benchmark; warmed cache"
+  },
+  "comparison": {
+    "method": "five baseline runs followed by five candidate runs on the same host and release workload; revisions were grouped, not alternated",
+    "ordered_read_only_batch": {
+      "p50_ns": {
+        "baseline": [271200, 275400, 274900, 276300, 270800],
+        "candidate": [168300, 170600, 169100, 172600, 170400]
+      },
+      "p95_ns": {
+        "baseline": [365600, 375300, 372600, 353700, 338600],
+        "candidate": [190200, 234400, 188900, 216500, 222900]
+      },
+      "p99_ns": {
+        "baseline": [433200, 440800, 449600, 444400, 410700],
+        "candidate": [233600, 306800, 253700, 270600, 282900]
+      },
+      "median_p50_change_percent": -38.01,
+      "median_p95_change_percent": -40.78,
+      "median_p99_change_percent": -38.61
+    },
+    "shuffled_read_only_batch": {
+      "p50_ns": {
+        "baseline": [307200, 312800, 312200, 314100, 306600],
+        "candidate": [280500, 283900, 281900, 286600, 284200]
+      },
+      "p95_ns": {
+        "baseline": [409200, 408300, 413300, 399300, 379100],
+        "candidate": [318600, 357100, 306900, 332900, 389400]
+      },
+      "p99_ns": {
+        "baseline": [588400, 577400, 495100, 571000, 441300],
+        "candidate": [413900, 463800, 408700, 430900, 445100]
+      },
+      "median_p50_change_percent": -9.07,
+      "median_p95_change_percent": -18.47,
+      "median_p99_change_percent": -24.53
+    }
+  },
+  "candidate": "For batches of at least 16 keys with at least four segment paths, sort unresolved request indices once, walk each segment's sorted key list, and binary-search the request list. Resolve MVCC-visible values newest-first, leaving keys unresolved when the segment has no version at the requested timestamp.",
+  "correctness_coverage": "Storage test compares batch reads with point reads across snapshot and delta versions, tombstones, duplicate and missing keys, and read timestamps 1, 3, and 4.",
+  "limitations": [
+    "Baseline and candidate runs were grouped rather than alternated, so host drift may affect the difference.",
+    "The benchmark is in-process with warmed segment cache and excludes network latency and durable writes.",
+    "The workload uses 80 delta segments and does not establish behavior for every segment depth or batch shape."
+  ]
+}
