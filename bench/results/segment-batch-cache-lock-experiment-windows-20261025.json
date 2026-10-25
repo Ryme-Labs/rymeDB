@@ -1,0 +1,46 @@
+{
+  "benchmark": "transaction-batch-read-cache-lock-experiment",
+  "capture_date": "2026-10-25",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+    "logical_cpus": 12,
+    "os": "windows"
+  },
+  "workload": {
+    "storage_mode": "standard",
+    "records": 256,
+    "delta_segments": 80,
+    "candidates_per_iteration": 256,
+    "batch_size": 64,
+    "iterations": 500,
+    "value_bytes": 128,
+    "durability": "wal_and_segment_sync_disabled",
+    "binary": "release",
+    "harness": "in-process transaction benchmark; warmed cache"
+  },
+  "comparison": {
+    "method": "five sequential baseline runs followed by five sequential candidate runs; build and source revisions switched between groups",
+    "metric": "read_only_batched_read_p50_ns",
+    "baseline": [271800, 270300, 269200, 272900, 272800],
+    "candidate": [289200, 284800, 291800, 284600, 284500],
+    "median_baseline": 271800,
+    "median_candidate": 284800,
+    "candidate_change_percent": 4.78,
+    "candidate_faster_pairs": 0,
+    "shuffled_read_only_batched_read_p50_ns": {
+      "baseline": [307900, 306400, 304400, 309100, 309100],
+      "candidate": [307300, 302700, 310000, 303200, 303000],
+      "median_baseline": 307900,
+      "median_candidate": 303200,
+      "candidate_change_percent": -1.53
+    }
+  },
+  "candidate": "Resolve all cached segment handles in one cache-lock acquisition before scanning; retain per-segment loading for cache misses.",
+  "decision": "discarded: ordered read-only batch p50 regressed; shuffled median change is small and inconsistent with the primary workload",
+  "limitations": [
+    "Runs were grouped by revision rather than alternated, so drift may affect the comparison.",
+    "The benchmark is in-process and excludes network latency and durable writes.",
+    "No tail-latency improvement is claimed."
+  ]
+}

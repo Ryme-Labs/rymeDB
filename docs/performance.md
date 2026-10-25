@@ -363,6 +363,16 @@ three shuffled unique-key captures regressed p50 (median 11.2% higher), so that
 change was discarded and the vector keeps full batch capacity. See the
 [raw experiment](../bench/results/segment-readmany-unique-indices-cap-windows-20261024.json).
 
+I tested resolving all cached segment handles with one cache-lock acquisition
+before scanning a batch, instead of checking the cache once per segment. Five
+release captures per revision used 256 records, 80 delta segments, and 64-key
+read-only batches on the same Windows Ryzen 5 4500 host. Ordered-batch median
+p50 rose from 271.8 to 284.8 us (4.8% slower); shuffled-batch median p50 fell
+1.5%, a small mixed result. Because the primary ordered workload regressed,
+the candidate was discarded. Captures were grouped by revision rather than
+alternated, and this warmed in-process benchmark excludes network and durable
+write costs. See the [raw captures](../bench/results/segment-batch-cache-lock-experiment-windows-20261025.json).
+
 Standard segment point reads previously Bloom-checked, binary-searched the
 segment key vector, then searched the same key in the segment engine. Removing
 the redundant vector search reduced read-only batched p50 from 490 µs to
