@@ -107,6 +107,15 @@ for both single-worker sizes and 9/10 four-worker pairs. This benchmark reports
 throughput only; it does not measure commit latency percentiles, WAL durability,
 or network overhead. See the [raw captures](../bench/results/txn-latest-table-update-windows-20261025.json).
 
+When older transactions are active, the conflict index also records a
+table-level timestamp for each commit. That update now runs once per contiguous
+table group while preserving every per-key history entry. Twelve alternating
+release pairs of four-worker commits (512 distinct 128-byte writes per
+transaction) favored the candidate in all pairs, with a median paired write
+throughput ratio of 1.062. This is an in-memory throughput measurement, without
+latency percentiles or WAL/network costs; see the
+[raw captures](../bench/results/txn-table-conflict-history-windows-20261025.json).
+
 To benchmark the SQL executor in-process without PostgreSQL-wire or network
 overhead:
 

@@ -486,14 +486,21 @@ struct CommitIndex {
 
 impl CommitIndex {
     fn record(&mut self, commit_ts: u64, keys: Vec<RecordKey>) {
+        // Write keys come from a BTreeMap, so one commit's table keys are
+        // contiguous and its table conflict timestamp only needs one insert.
+        let mut previous_table = None;
         for key in &keys {
             record_commit_timestamp(self.by_key.entry(key.clone()).or_default(), commit_ts);
-            record_commit_timestamp(
-                self.by_table
-                    .entry((key.tenant.clone(), key.database.clone(), key.table.clone()))
-                    .or_default(),
-                commit_ts,
-            );
+            let table_ref = (key.tenant.as_str(), key.database.as_str(), key.table.as_str());
+            if previous_table != Some(table_ref) {
+                record_commit_timestamp(
+                    self.by_table
+                        .entry((key.tenant.clone(), key.database.clone(), key.table.clone()))
+                        .or_default(),
+                    commit_ts,
+                );
+                previous_table = Some(table_ref);
+            }
         }
         if !keys.is_empty() {
             self.by_timestamp.entry(commit_ts).or_default().extend(keys);
@@ -4416,6 +4423,23 @@ mod tests {
         index.prune_through(3);
         assert!(!index.by_key.contains_key(&key));
         assert!(index.by_table.is_empty());
+    }
+
+    #[test]
+    fn commit_index_records_one_table_timestamp_per_commit_group() {
+        let mut index = CommitIndex::default();
+        let keys = vec![
+            RecordKey::new("t", "d", "a", b"1"),
+            RecordKey::new("t", "d", "a", b"2"),
+            RecordKey::new("t", "d", "b", b"1"),
+            RecordKey::new("t", "d", "b", b"2"),
+        ];
+
+        index.record(7, keys.clone());
+        index.record(9, keys);
+
+        assert_eq!(index.by_table.get(&("t".into(), "d".into(), "a".into())), Some(&vec![7, 9]));
+        assert_eq!(index.by_table.get(&("t".into(), "d".into(), "b".into())), Some(&vec![7, 9]));
     }
 
     #[test]

@@ -1,0 +1,178 @@
+﻿{
+    "experiment":  "transaction-table-conflict-history-batching",
+    "command":  "ryme-bench local --ops 400 --concurrency 4 --value-bytes 128 --batch-size 512",
+    "machine":  {
+                    "arch":  "x86_64",
+                    "cpu_model":  "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
+                    "logical_cpus":  12,
+                    "os":  "windows"
+                },
+    "baseline_revision":  "ba43fc3",
+    "method":  "Twelve alternating baseline/candidate release-executable pairs. Four local workers each commit batches of 512 distinct 128-byte values in memory, with no WAL or segment durability. Throughput counts writes per second. The benchmark does not report latency percentiles.",
+    "candidate_change":  "Record per-key conflict histories as before, but update the table-level conflict timestamp once for each contiguous table group in sorted commit keys.",
+    "baseline_runs":  [
+                          {
+                              "writes_per_second":  242946,
+                              "seconds":  0.843,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  241719,
+                              "seconds":  0.847,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  249135,
+                              "seconds":  0.822,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  255009,
+                              "seconds":  0.803,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  254824,
+                              "seconds":  0.804,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  249941,
+                              "seconds":  0.819,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  249044,
+                              "seconds":  0.822,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  249908,
+                              "seconds":  0.82,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  250638,
+                              "seconds":  0.817,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  250269,
+                              "seconds":  0.818,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  243717,
+                              "seconds":  0.84,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          },
+                          {
+                              "writes_per_second":  250682,
+                              "seconds":  0.817,
+                              "successful_transactions":  400,
+                              "failed_transactions":  0
+                          }
+                      ],
+    "candidate_runs":  [
+                           {
+                               "writes_per_second":  259173,
+                               "seconds":  0.79,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  268498,
+                               "seconds":  0.763,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  265640,
+                               "seconds":  0.771,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  259172,
+                               "seconds":  0.79,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  270635,
+                               "seconds":  0.757,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  269232,
+                               "seconds":  0.761,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  262195,
+                               "seconds":  0.781,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  264631,
+                               "seconds":  0.774,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  263004,
+                               "seconds":  0.779,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  262280,
+                               "seconds":  0.781,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  264904,
+                               "seconds":  0.773,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           },
+                           {
+                               "writes_per_second":  258311,
+                               "seconds":  0.793,
+                               "successful_transactions":  400,
+                               "failed_transactions":  0
+                           }
+                       ],
+    "paired_throughput_ratios":  [
+                                     1.0667926205823517,
+                                     1.1107856643457898,
+                                     1.0662492223091897,
+                                     1.0163249140226422,
+                                     1.0620467459893888,
+                                     1.0771822150027406,
+                                     1.0528059298758452,
+                                     1.0589136802343262,
+                                     1.0493380891963708,
+                                     1.0479923602204029,
+                                     1.0869327950040415,
+                                     1.0304329788337416
+                                 ],
+    "median_paired_throughput_ratio":  1.0620467459893888,
+    "faster_pairs":  12,
+    "result":  "Candidate was faster in all 12 pairs; median paired throughput ratio was 1.062."
+}
